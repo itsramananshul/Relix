@@ -3,53 +3,43 @@
 //! Plugin authors depend on this crate, register their capability
 //! handlers, and call [`PluginServer::serve`]. The SDK:
 //!
-//! 1. Binds an axum HTTP server to `127.0.0.1:0` (kernel picks a
-//!    free port).
-//! 2. Writes `RELIX_PLUGIN_PORT=<port>` to stdout on its first
-//!    line so the host loader can find it.
-//! 3. Serves three endpoints:
-//!    - `GET /health` → `{ "ok": true }` once the server is up.
-//!    - `GET /ready`  → `{ "ok": true }` once
-//!      [`PluginServer::mark_ready`] is called.
-//!    - `POST /invoke` → routes to the registered handler.
+//! 1. Reads the loopback-TLS certificate + key the host passes in
+//!    via [`PLUGIN_TLS_CERT_ENV`] / [`PLUGIN_TLS_KEY_ENV`]
+//!    (base64-DER), and the per-plugin bearer via
+//!    [`PLUGIN_BEARER_ENV`]. If the TLS material or the bearer is
+//!    absent, `serve()` FAILS CLOSED — it refuses to start rather
+//!    than fall back to a plaintext listener the hardened host can
+//!    no longer talk to anyway.
+//! 2. Binds a TCP listener on `127.0.0.1:0` (kernel picks a free
+//!    port), wraps every accepted connection in TLS using exactly
+//!    the host-provided cert/key, and writes
+//!    `RELIX_PLUGIN_PORT=<port>` to stdout so the host loader can
+//!    find it.
+//! 3. Speaks the host dispatcher's framing: newline-delimited JSON,
+//!    one request frame per line, one response frame per line, over
+//!    the TLS stream.
 //!
-//! ## Invoke wire shape
+//! ## Wire shape (SEC §11 / §11b)
 //!
-//! Request body:
+//! Request frame (one JSON object + `\n`), an `op`-tagged enum:
 //!
 //! ```json
-//! {
-//!   "method":            "<dotted.method>",
-//!   "args":              "<pipe-delimited utf-8>",
-//!   "trace_id":          "<hex16>",
-//!   "request_id":        "<hex16>",
-//!   "caller_subject_id": "<hex32>",
-//!   "deadline_unix":     <i64>
-//! }
+//! {"op":"health"}
+//! {"op":"invoke","bearer":"<hex>","request":{ "method": "...", "args": "...",
+//!   "trace_id":"...", "request_id":"...", "caller_subject_id":"...", "deadline_unix":0 }}
 //! ```
 //!
-//! Successful response body:
+//! Response frame (one JSON object + `\n`):
 //!
 //! ```json
-//! { "ok": true, "body": "<response string>" }
-//! ```
-//!
-//! Error response body:
-//!
-//! ```json
-//! { "ok": false, "error_kind": <u32>, "error_cause": "<msg>" }
+//! {"ok":true}                                  // health
+//! {"ok":true,"body":"<response string>"}       // invoke success
+//! {"ok":false,"error_kind":<u32>,"error_cause":"<msg>"}  // invoke error / unauthorized
 //! ```
 //!
 //! Where `error_kind` mirrors `relix_core::types::error_kinds::*`
-//! (a few stable constants exported as `ErrorKind` for SDK
-//! consumers — `INVALID_ARGS = 5`, `RESPONDER_INTERNAL = 11`, …).
-//!
-//! ## Threading model
-//!
-//! Handlers are `async fn(InvokeRequest) -> Result<String,
-//! PluginError>`. They run on the SDK's tokio runtime. Long-
-//! running handlers do not block the server — axum dispatches
-//! each call on its own task.
+//! (`INVALID_ARGS = 5`, `RESPONDER_INTERNAL = 11`, …), plus
+//! [`error_kind::UNAUTHORIZED`] for a missing/wrong bearer.
 //!
 //! ## Lifecycle
 //!
@@ -60,7 +50,7 @@
 //! server.register("hello.greet", |req: InvokeRequest| async move {
 //!     Ok(format!("Hello, {}!", req.args))
 //! });
-//! server.serve().await?;
+//! server.serve().await?; // reads TLS cert/key + bearer from env
 //! # Ok(())
 //! # }
 //! ```
@@ -68,94 +58,131 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::{
-    Json, Router,
-    extract::{Request, State},
-    http::{StatusCode, header},
-    middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio_rustls::TlsAcceptor;
 
-/// SEC PART 2: the env var the host loader sets when it
-/// spawns a plugin. The SDK reads this once at `serve()`
-/// time; when set, every `/invoke` is gated on a matching
-/// `Authorization: Bearer <token>` header.
+/// SEC PART 2: env var the host loader sets when it spawns a
+/// plugin. Read once at `serve()` time; every `invoke` frame is
+/// gated on a matching `bearer`.
 pub const PLUGIN_BEARER_ENV: &str = "RELIX_PLUGIN_BEARER";
 
-/// Stable error kinds plugins return through the protocol. Mirror
-/// of the subset of `relix_core::types::error_kinds` that makes
-/// sense across the SDK boundary — see `docs/plugins.md` for the
-/// full table.
+/// SEC §11b: env vars the host loader sets carrying the
+/// per-plugin self-signed TLS certificate + private key, each
+/// base64-encoded DER. The plugin serves TLS with exactly these
+/// bytes; the host dispatcher pins the same cert.
+pub const PLUGIN_TLS_CERT_ENV: &str = "RELIX_PLUGIN_TLS_CERT_DER_B64";
+pub const PLUGIN_TLS_KEY_ENV: &str = "RELIX_PLUGIN_TLS_KEY_DER_B64";
+
+/// Stable error kinds plugins return through the protocol.
 pub mod error_kind {
-    /// Caller supplied bad args (parse failure, missing fields,
-    /// out-of-range values, …).
+    /// Caller supplied bad args.
     pub const INVALID_ARGS: u32 = 5;
-    /// Plugin-internal error (panic-recovered handler, downstream
-    /// API rejection, …).
+    /// Plugin-internal error.
     pub const RESPONDER_INTERNAL: u32 = 11;
-    /// Plugin received the call but its own backend is rate-
-    /// limited / overloaded.
+    /// Plugin's backend is rate-limited / overloaded.
     pub const RESPONDER_OVERLOADED: u32 = 12;
-    /// Plugin doesn't know the requested method. Should only
-    /// happen if the host's manifest is out of sync.
+    /// Plugin doesn't know the requested method.
     pub const UNKNOWN_METHOD: u32 = 4;
+    /// SEC §11b: invoke frame carried a missing/wrong bearer. The
+    /// host dispatcher surfaces this as an unauthorized transport
+    /// rejection (HTTP-401-equivalent).
+    pub const UNAUTHORIZED: u32 = 401;
 }
 
-/// One inbound /invoke call after JSON decoding.
+/// One inbound invoke call after JSON decoding. Field-compatible
+/// with the host dispatcher's `InvokeRequest`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InvokeRequest {
     /// Dotted method name (`my_plugin.do_thing`).
     pub method: String,
     /// Pipe-delimited UTF-8 args.
     pub args: String,
-    /// Hex-encoded TraceId from the host.
     #[serde(default)]
     pub trace_id: String,
-    /// Hex-encoded RequestId from the host.
     #[serde(default)]
     pub request_id: String,
-    /// Hex-encoded subject_id of the calling identity.
     #[serde(default)]
     pub caller_subject_id: String,
-    /// Unix-seconds deadline. Plugins are expected to short-circuit
-    /// past this, but the SDK does not enforce it — handlers
-    /// can ignore the field if they don't have async cancellation.
     #[serde(default)]
     pub deadline_unix: i64,
 }
 
-/// Successful response body sent back through /invoke.
-#[derive(Debug, Serialize)]
-struct InvokeOkBody<'a> {
-    ok: bool,
-    body: &'a str,
+/// One framed request on the wire. Mirrors the host dispatcher's
+/// `WireRequest` so the JSON is byte-compatible.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "lowercase")]
+enum WireRequest {
+    Health,
+    Invoke {
+        #[serde(default)]
+        bearer: String,
+        request: InvokeRequest,
+    },
 }
 
-/// Error response body.
+/// One framed response. Field-compatible with the host
+/// dispatcher's `InvokeResponse` / `HealthResponse` (all fields
+/// optional with serde defaults on the reader side).
 #[derive(Debug, Serialize)]
-struct InvokeErrBody<'a> {
+struct WireResponse {
     ok: bool,
-    error_kind: u32,
-    error_cause: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_kind: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_cause: Option<String>,
 }
 
-/// Plugin-side error. Caught and rendered into the wire shape by
-/// the dispatcher. `Internal` is the default; use
-/// [`PluginError::invalid_args`] for caller-side mistakes.
+impl WireResponse {
+    fn health(ok: bool) -> Self {
+        Self {
+            ok,
+            body: None,
+            error_kind: None,
+            error_cause: None,
+        }
+    }
+    fn ok_body(body: String) -> Self {
+        Self {
+            ok: true,
+            body: Some(body),
+            error_kind: None,
+            error_cause: None,
+        }
+    }
+    fn error(kind: u32, cause: String) -> Self {
+        Self {
+            ok: false,
+            body: None,
+            error_kind: Some(kind),
+            error_cause: Some(cause),
+        }
+    }
+    fn to_line(&self) -> String {
+        // The static struct shape always serialises; if it ever
+        // fails we still emit a valid error frame so we never
+        // panic mid-connection.
+        serde_json::to_string(self).unwrap_or_else(|e| {
+            format!(
+                "{{\"ok\":false,\"error_kind\":{},\"error_cause\":\"response serialise failed: {e}\"}}",
+                error_kind::RESPONDER_INTERNAL
+            )
+        })
+    }
+}
+
+/// Plugin-side error.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum PluginError {
-    /// 4xx-equivalent: the args were malformed.
     #[error("invalid args: {0}")]
     InvalidArgs(String),
-    /// 5xx-equivalent: the plugin itself failed.
     #[error("internal: {0}")]
     Internal(String),
-    /// Plugin's own upstream is overloaded; the caller may retry.
     #[error("overloaded: {0}")]
     Overloaded(String),
 }
@@ -193,20 +220,14 @@ type HandlerFn = Arc<
 /// [`PluginServer::serve`].
 pub struct PluginServer {
     handlers: HashMap<String, HandlerFn>,
-    /// Listen address. Default is `127.0.0.1:0` — the kernel
-    /// picks a free port and we write it back on stdout. Tests
-    /// can override via [`PluginServer::with_bind`].
     bind: String,
-    /// Where to write the `RELIX_PLUGIN_PORT=<n>` line. Default
-    /// is stdout; tests override.
     port_sink: PortSink,
-    /// Wrapped in an Arc<Mutex<>> so /ready can flip from false
-    /// to true atomically.
     ready: Arc<Mutex<bool>>,
-    /// SEC PART 2: test-only override for the expected bearer.
-    /// Production callers leave this `None` and let `serve()`
-    /// read [`PLUGIN_BEARER_ENV`] from the process environment.
+    /// Test-only override for the expected bearer.
     expected_bearer_override: Option<String>,
+    /// Test-only override for the TLS cert + key (DER). Production
+    /// callers leave this `None` and let `serve()` read the env.
+    tls_override: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 enum PortSink {
@@ -222,39 +243,38 @@ impl PluginServer {
             port_sink: PortSink::Stdout,
             ready: Arc::new(Mutex::new(true)),
             expected_bearer_override: None,
+            tls_override: None,
         }
     }
 
-    /// SEC PART 2: explicitly require `Authorization: Bearer
-    /// <token>` for `/invoke`, overriding (or supplying) the
-    /// value the SDK would otherwise read from
-    /// [`PLUGIN_BEARER_ENV`]. Test seam — production callers
-    /// rely on the env var the host loader sets.
+    /// Test seam: supply the expected bearer directly instead of
+    /// reading [`PLUGIN_BEARER_ENV`].
     pub fn with_bearer_for_test(mut self, token: impl Into<String>) -> Self {
         self.expected_bearer_override = Some(token.into());
         self
     }
 
-    /// Override the listen address. Used by tests to pin a known
-    /// port; production always uses `127.0.0.1:0` and lets the
-    /// kernel pick.
+    /// Test seam: supply the TLS cert + key (DER) directly instead
+    /// of reading [`PLUGIN_TLS_CERT_ENV`] / [`PLUGIN_TLS_KEY_ENV`].
+    pub fn with_tls_for_test(mut self, cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
+        self.tls_override = Some((cert_der, key_der));
+        self
+    }
+
+    /// Override the listen address (host:port). Production uses
+    /// `127.0.0.1:0`.
     pub fn with_bind(mut self, bind: impl Into<String>) -> Self {
         self.bind = bind.into();
         self
     }
 
-    /// Capture the port line into a buffer instead of writing to
-    /// stdout. Test-only — production callers should not need
-    /// this.
+    /// Capture the announced port into a buffer instead of stdout.
     pub fn with_captured_port(mut self, sink: Arc<Mutex<Vec<u8>>>) -> Self {
         self.port_sink = PortSink::Captured(sink);
         self
     }
 
-    /// Mark the plugin as ready to serve traffic. Defaults to
-    /// `true` — call [`PluginServer::with_lazy_ready`] to start
-    /// with `/ready` returning `not ready` until the plugin's
-    /// own warmup completes.
+    /// Mark the plugin ready (health frames report `ok`).
     pub fn mark_ready(&self, ready: bool) {
         let r = self.ready.clone();
         tokio::spawn(async move {
@@ -263,17 +283,13 @@ impl PluginServer {
         });
     }
 
-    /// Start with `/ready = false`. The plugin author calls
-    /// [`PluginServer::mark_ready`] from inside their warmup
-    /// future once initialisation is done.
+    /// Start with health `ok=false` until [`PluginServer::mark_ready`].
     pub fn with_lazy_ready(mut self) -> Self {
         self.ready = Arc::new(Mutex::new(false));
         self
     }
 
-    /// Register a capability. `method` is the dotted method name
-    /// the host will route to (`my_plugin.do_thing`); `f` is the
-    /// async handler.
+    /// Register a capability handler.
     pub fn register<F, Fut>(&mut self, method: impl Into<String>, f: F)
     where
         F: Fn(InvokeRequest) -> Fut + Send + Sync + 'static,
@@ -287,15 +303,53 @@ impl PluginServer {
         self.handlers.insert(method.into(), wrapped);
     }
 
-    /// Bind, announce the port, and serve forever.
+    /// Resolve the TLS cert + key, failing closed when neither an
+    /// override nor the env provides them. SEC §11b: there is NO
+    /// plaintext fallback — a plugin that cannot serve TLS refuses
+    /// to start.
+    fn resolve_tls(&self) -> Result<(Vec<u8>, Vec<u8>), ServeError> {
+        if let Some((c, k)) = &self.tls_override {
+            return Ok((c.clone(), k.clone()));
+        }
+        let cert_b64 = std::env::var(PLUGIN_TLS_CERT_ENV)
+            .ok()
+            .filter(|s| !s.is_empty());
+        let key_b64 = std::env::var(PLUGIN_TLS_KEY_ENV)
+            .ok()
+            .filter(|s| !s.is_empty());
+        match (cert_b64, key_b64) {
+            (Some(c), Some(k)) => {
+                let cert = base64::engine::general_purpose::STANDARD
+                    .decode(c)
+                    .map_err(|e| ServeError::TlsConfig(format!("{PLUGIN_TLS_CERT_ENV} base64: {e}")))?;
+                let key = base64::engine::general_purpose::STANDARD
+                    .decode(k)
+                    .map_err(|e| ServeError::TlsConfig(format!("{PLUGIN_TLS_KEY_ENV} base64: {e}")))?;
+                Ok((cert, key))
+            }
+            _ => Err(ServeError::TlsConfigMissing),
+        }
+    }
+
+    /// Resolve the expected bearer, failing closed when absent.
+    fn resolve_bearer(&self) -> Result<String, ServeError> {
+        self.expected_bearer_override
+            .clone()
+            .or_else(|| std::env::var(PLUGIN_BEARER_ENV).ok())
+            .filter(|s| !s.is_empty())
+            .ok_or(ServeError::BearerMissing)
+    }
+
+    /// Bind the loopback-TLS listener, announce the port, and serve
+    /// forever.
     ///
-    /// SEC PART 2: when `RELIX_PLUGIN_BEARER` is set in the
-    /// process environment, `/invoke` is gated on a matching
-    /// `Authorization: Bearer <token>` header. Requests without
-    /// (or with a wrong) bearer get HTTP 401. `/health` and
-    /// `/ready` stay open so the host loader's readiness probe
-    /// works.
+    /// SEC §11b: fails closed (returns `Err`) if the TLS cert/key
+    /// or the bearer are not provided — never a plaintext fallback.
     pub async fn serve(self) -> Result<(), ServeError> {
+        let (cert_der, key_der) = self.resolve_tls()?;
+        let expected_bearer = self.resolve_bearer()?;
+        let acceptor = build_tls_acceptor(cert_der, key_der)?;
+
         let listener = TcpListener::bind(&self.bind)
             .await
             .map_err(|e| ServeError::Bind(format!("{}: {e}", self.bind)))?;
@@ -303,74 +357,123 @@ impl PluginServer {
             .local_addr()
             .map_err(|e| ServeError::Bind(format!("local_addr: {e}")))?;
         announce_port(&self.port_sink, local.port()).await?;
-        let expected_bearer = self
-            .expected_bearer_override
-            .clone()
-            .or_else(|| std::env::var(PLUGIN_BEARER_ENV).ok())
-            .filter(|s| !s.is_empty());
-        let state = AppState {
-            handlers: Arc::new(self.handlers),
+
+        let state = Arc::new(ServerState {
+            handlers: self.handlers,
             ready: self.ready,
-            expected_bearer: expected_bearer.map(Arc::new),
-        };
-        let app = Router::new()
-            .route("/health", get(handle_health))
-            .route("/ready", get(handle_ready))
-            .route("/invoke", post(handle_invoke))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                require_bearer_for_invoke,
-            ))
-            .with_state(state);
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| ServeError::Serve(format!("{e}")))
-    }
-}
-
-/// SEC PART 2: middleware that requires
-/// `Authorization: Bearer <token>` for `/invoke` when the
-/// expected bearer was set at `serve()` time. Other routes
-/// (`/health`, `/ready`) pass through so the host loader can
-/// probe the plugin before the bearer is required.
-async fn require_bearer_for_invoke(
-    State(state): State<AppState>,
-    req: Request,
-    next: Next,
-) -> Response {
-    let path = req.uri().path();
-    if path != "/invoke" {
-        return next.run(req).await;
-    }
-    let Some(expected) = state.expected_bearer.as_ref() else {
-        // Operator opted out (no env var). Behaves like the
-        // pre-fix path for backwards compatibility with
-        // tests that run the plugin in-process.
-        return next.run(req).await;
-    };
-    let presented = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.strip_prefix("Bearer ")
-                .or_else(|| v.strip_prefix("bearer "))
-        })
-        .map(str::trim)
-        .unwrap_or("");
-    if presented.is_empty() || !ct_eq(presented, expected.as_str()) {
-        let body = serde_json::json!({
-            "ok": false,
-            "error_kind": error_kind::INVALID_ARGS,
-            "error_cause": "/invoke requires Authorization: Bearer <token> matching RELIX_PLUGIN_BEARER",
+            bearer: expected_bearer,
         });
-        return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+
+        loop {
+            let (tcp, _peer) = listener
+                .accept()
+                .await
+                .map_err(|e| ServeError::Serve(format!("accept: {e}")))?;
+            let acceptor = acceptor.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                match acceptor.accept(tcp).await {
+                    Ok(tls) => {
+                        if let Err(e) = serve_connection(tls, state).await {
+                            tracing::debug!("plugin connection ended: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        // A non-TLS / wrong-cert client fails here —
+                        // it never reaches a handler. This is the
+                        // hardening: plaintext probes are rejected.
+                        tracing::debug!("plugin TLS handshake rejected: {e}");
+                    }
+                }
+            });
+        }
     }
-    next.run(req).await
 }
 
-/// Constant-time string compare so the SDK doesn't leak a
-/// token prefix via per-byte short-circuit timing.
+struct ServerState {
+    handlers: HashMap<String, HandlerFn>,
+    ready: Arc<Mutex<bool>>,
+    /// SEC §11b: every `invoke` frame must carry this bearer.
+    bearer: String,
+}
+
+/// Build a rustls TLS acceptor from a DER cert + PKCS#8 key.
+fn build_tls_acceptor(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<TlsAcceptor, ServeError> {
+    use tokio_rustls::rustls::ServerConfig;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    let provider = Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
+    let certs = vec![CertificateDer::from(cert_der)];
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
+    let config = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| ServeError::TlsConfig(format!("tls versions: {e}")))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| ServeError::TlsConfig(format!("server cert: {e}")))?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Serve newline-JSON frames over one (already TLS-wrapped)
+/// connection until the peer closes it.
+async fn serve_connection<S>(stream: S, state: Arc<ServerState>) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            return Ok(()); // peer closed
+        }
+        let resp = dispatch_frame(line.trim(), &state).await;
+        write_half.write_all(resp.to_line().as_bytes()).await?;
+        write_half.write_all(b"\n").await?;
+        write_half.flush().await?;
+    }
+}
+
+async fn dispatch_frame(line: &str, state: &ServerState) -> WireResponse {
+    let frame: WireRequest = match serde_json::from_str(line) {
+        Ok(f) => f,
+        Err(e) => {
+            return WireResponse::error(error_kind::INVALID_ARGS, format!("bad frame: {e}"));
+        }
+    };
+    match frame {
+        WireRequest::Health => {
+            let ready = *state.ready.lock().await;
+            WireResponse::health(ready)
+        }
+        WireRequest::Invoke { bearer, request } => {
+            // SEC §11b: the OS-pinned TLS channel is the primary
+            // boundary; the bearer is the secondary defense and
+            // must still reject a caller without the right token.
+            if bearer.is_empty() || !ct_eq(&bearer, &state.bearer) {
+                return WireResponse::error(
+                    error_kind::UNAUTHORIZED,
+                    "invoke requires the per-plugin bearer matching RELIX_PLUGIN_BEARER".to_string(),
+                );
+            }
+            let Some(handler) = state.handlers.get(&request.method).cloned() else {
+                return WireResponse::error(
+                    error_kind::UNKNOWN_METHOD,
+                    format!("plugin has no handler for `{}`", request.method),
+                );
+            };
+            let method = request.method.clone();
+            match handler(request).await {
+                Ok(body) => WireResponse::ok_body(body),
+                Err(e) => WireResponse::error(e.kind(), format!("{method}: {e}")),
+            }
+        }
+    }
+}
+
+/// Constant-time string compare so the SDK doesn't leak a token
+/// prefix via per-byte short-circuit timing.
 fn ct_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
@@ -410,97 +513,46 @@ async fn announce_port(sink: &PortSink, port: u16) -> Result<(), ServeError> {
     Ok(())
 }
 
-#[derive(Clone)]
-struct AppState {
-    handlers: Arc<HashMap<String, HandlerFn>>,
-    ready: Arc<Mutex<bool>>,
-    /// SEC PART 2: when `Some`, every `/invoke` requires
-    /// `Authorization: Bearer <token>` matching this value.
-    /// `None` means the operator did not set
-    /// `RELIX_PLUGIN_BEARER` and the server admits requests
-    /// without a bearer (legacy path for in-process tests).
-    expected_bearer: Option<Arc<String>>,
-}
-
-async fn handle_health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true }))
-}
-
-async fn handle_ready(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let r = *state.ready.lock().await;
-    if r {
-        (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
-    } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "ok": false, "reason": "not ready" })),
-        )
-    }
-}
-
-async fn handle_invoke(
-    State(state): State<AppState>,
-    Json(req): Json<InvokeRequest>,
-) -> Json<serde_json::Value> {
-    let Some(handler) = state.handlers.get(&req.method).cloned() else {
-        return Json(serde_json::json!({
-            "ok": false,
-            "error_kind": error_kind::UNKNOWN_METHOD,
-            "error_cause": format!("plugin has no handler for `{}`", req.method),
-        }));
-    };
-    let method = req.method.clone();
-    match handler(req).await {
-        Ok(body) => Json(
-            serde_json::to_value(InvokeOkBody {
-                ok: true,
-                body: &body,
-            })
-            .unwrap_or_else(|e| {
-                // The static struct shape always serialises; if
-                // this ever fires (e.g. a future field carries
-                // non-UTF-8 bytes), fall back to a hand-built
-                // error so we never panic out of an HTTP handler.
-                serde_json::json!({
-                    "ok": false,
-                    "error_kind": error_kind::RESPONDER_INTERNAL,
-                    "error_cause": format!("response serialise failed: {e}"),
-                })
-            }),
-        ),
-        Err(e) => Json(
-            serde_json::to_value(InvokeErrBody {
-                ok: false,
-                error_kind: e.kind(),
-                error_cause: &format!("{method}: {e}"),
-            })
-            .unwrap_or_else(|se| {
-                serde_json::json!({
-                    "ok": false,
-                    "error_kind": error_kind::RESPONDER_INTERNAL,
-                    "error_cause": format!("{method}: {e} (serialise failed: {se})"),
-                })
-            }),
-        ),
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
     #[error("bind: {0}")]
     Bind(String),
     #[error("serve: {0}")]
     Serve(String),
+    /// SEC §11b: no TLS cert/key provided (env unset and no test
+    /// override). The server refuses to start rather than fall
+    /// back to plaintext.
+    #[error(
+        "loopback-TLS cert/key not provided ({PLUGIN_TLS_CERT_ENV} / {PLUGIN_TLS_KEY_ENV} unset); \
+         refusing to start a plaintext plugin server"
+    )]
+    TlsConfigMissing,
+    /// SEC §11b: TLS cert/key were provided but malformed.
+    #[error("tls config: {0}")]
+    TlsConfig(String),
+    /// SEC §11b: no bearer provided ({PLUGIN_BEARER_ENV} unset and
+    /// no test override). The server refuses to start unauthenticated.
+    #[error("per-plugin bearer not provided ({PLUGIN_BEARER_ENV} unset); refusing to start")]
+    BearerMissing,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
+    use relix_runtime::plugin::{InvokeRequest as RtInvokeRequest, PluginDispatcher, PluginEndpoint};
 
-    /// Pull the line `RELIX_PLUGIN_PORT=<n>` out of a captured
-    /// byte buffer, parse the port, panic on failure.
+    /// Mint a self-signed cert + key (DER) bound to 127.0.0.1 —
+    /// the shape the host loader produces and pins.
+    fn loopback_cert() -> (Vec<u8>, Vec<u8>) {
+        use rcgen::{CertificateParams, SanType};
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = vec![SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::new(127, 0, 0, 1),
+        ))];
+        let cert = rcgen::Certificate::from_params(params).unwrap();
+        (cert.serialize_der().unwrap(), cert.serialize_private_key_der())
+    }
+
     fn parse_announced_port(buf: &[u8]) -> u16 {
         let s = std::str::from_utf8(buf).unwrap();
         s.lines()
@@ -509,16 +561,18 @@ mod tests {
             .expect("port line")
     }
 
-    async fn start(server: PluginServer) -> (u16, Arc<Mutex<Vec<u8>>>) {
+    /// Start a TLS plugin server in-process; return (port, cert_der)
+    /// so a dispatcher can pin the cert and dial it.
+    async fn start_tls(mut server: PluginServer, bearer: &str) -> (u16, Vec<u8>) {
+        let (cert_der, key_der) = loopback_cert();
         let buf = Arc::new(Mutex::new(Vec::new()));
-        let buf_clone = buf.clone();
-        let server = server.with_captured_port(buf_clone);
-        // Server takes itself by value and serves forever; we
-        // spawn it and consume the captured port line.
+        server = server
+            .with_tls_for_test(cert_der.clone(), key_der)
+            .with_bearer_for_test(bearer)
+            .with_captured_port(buf.clone());
         tokio::spawn(async move { server.serve().await.unwrap() });
-        // Spin until the announce happens.
         let mut port = 0u16;
-        for _ in 0..100 {
+        for _ in 0..200 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             let g = buf.lock().await;
             if !g.is_empty() {
@@ -527,53 +581,71 @@ mod tests {
             }
         }
         assert_ne!(port, 0, "port not announced");
-        (port, buf)
+        (port, cert_der)
+    }
+
+    fn dispatcher(port: u16, cert: Vec<u8>, bearer: &str) -> PluginDispatcher {
+        PluginDispatcher::connect(
+            PluginEndpoint::new(format!("127.0.0.1:{port}"), cert),
+            5,
+            bearer.to_string(),
+        )
+    }
+
+    fn req(method: &str, args: &str) -> RtInvokeRequest {
+        RtInvokeRequest {
+            method: method.to_string(),
+            args: args.to_string(),
+            trace_id: "t".to_string(),
+            request_id: "r".to_string(),
+            caller_subject_id: "alice".to_string(),
+            deadline_unix: 0,
+        }
+    }
+
+    async fn await_healthy(d: &PluginDispatcher) {
+        for _ in 0..100 {
+            if let Ok(true) = d.health().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("server never became healthy");
     }
 
     #[tokio::test]
-    async fn server_announces_port_to_captured_sink() {
-        let (port, _buf) = start(PluginServer::new()).await;
-        assert!(port > 0);
+    async fn serve_fails_closed_without_tls_env() {
+        // SEC §11b criterion 1: no TLS material → refuse to start.
+        let server = PluginServer::new().with_bearer_for_test("tok");
+        let err = server.serve().await.unwrap_err();
+        assert!(matches!(err, ServeError::TlsConfigMissing), "got {err:?}");
     }
 
     #[tokio::test]
-    async fn health_returns_ok() {
-        let (port, _) = start(PluginServer::new()).await;
-        let r = reqwest::get(format!("http://127.0.0.1:{port}/health"))
-            .await
-            .unwrap();
-        assert_eq!(r.status().as_u16(), 200);
-        let body: serde_json::Value = r.json().await.unwrap();
-        assert_eq!(body.get("ok").and_then(|v| v.as_bool()), Some(true));
+    async fn serve_fails_closed_without_bearer() {
+        let (cert, key) = loopback_cert();
+        let server = PluginServer::new().with_tls_for_test(cert, key);
+        let err = server.serve().await.unwrap_err();
+        assert!(matches!(err, ServeError::BearerMissing), "got {err:?}");
     }
 
     #[tokio::test]
-    async fn ready_defaults_to_true() {
-        let (port, _) = start(PluginServer::new()).await;
-        let r = reqwest::get(format!("http://127.0.0.1:{port}/ready"))
-            .await
-            .unwrap();
-        assert_eq!(r.status().as_u16(), 200);
+    async fn health_returns_ok_over_tls() {
+        let (port, cert) = start_tls(PluginServer::new(), "tok").await;
+        let d = dispatcher(port, cert, "tok");
+        assert!(matches!(d.health().await, Ok(true)));
     }
 
     #[tokio::test]
-    async fn lazy_ready_returns_503_until_marked() {
+    async fn lazy_ready_health_false_until_marked() {
         let mut server = PluginServer::new().with_lazy_ready();
-        // Use a side channel so we can flip ready from the test
-        // after the server starts.
         let ready_handle = server.ready.clone();
         server.register("noop.touch", |_| async move { Ok(String::new()) });
-        let (port, _) = start(server).await;
-        let r = reqwest::get(format!("http://127.0.0.1:{port}/ready"))
-            .await
-            .unwrap();
-        assert_eq!(r.status().as_u16(), 503);
-        // Flip and recheck.
+        let (port, cert) = start_tls(server, "tok").await;
+        let d = dispatcher(port, cert, "tok");
+        assert!(matches!(d.health().await, Ok(false)));
         *ready_handle.lock().await = true;
-        let r2 = reqwest::get(format!("http://127.0.0.1:{port}/ready"))
-            .await
-            .unwrap();
-        assert_eq!(r2.status().as_u16(), 200);
+        assert!(matches!(d.health().await, Ok(true)));
     }
 
     #[tokio::test]
@@ -582,53 +654,26 @@ mod tests {
         server.register("hello.greet", |req: InvokeRequest| async move {
             Ok(format!("Hello, {}!", req.args))
         });
-        let (port, _) = start(server).await;
-        let client = reqwest::Client::new();
-        let r = client
-            .post(format!("http://127.0.0.1:{port}/invoke"))
-            .json(&serde_json::json!({
-                "method": "hello.greet",
-                "args": "alice",
-                "trace_id": "deadbeef",
-                "request_id": "cafef00d",
-                "caller_subject_id": "00".repeat(32),
-                "deadline_unix": 0,
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status().as_u16(), 200);
-        let body: serde_json::Value = r.json().await.unwrap();
-        assert_eq!(body["ok"], serde_json::json!(true));
-        assert_eq!(body["body"], serde_json::json!("Hello, alice!"));
+        let (port, cert) = start_tls(server, "tok").await;
+        let d = dispatcher(port, cert, "tok");
+        await_healthy(&d).await;
+        let out = d.invoke(req("hello.greet", "alice")).await.unwrap();
+        assert_eq!(out, "Hello, alice!");
     }
 
     #[tokio::test]
     async fn invoke_unknown_method_returns_protocol_error() {
-        let server = PluginServer::new();
-        let (port, _) = start(server).await;
-        let client = reqwest::Client::new();
-        let r = client
-            .post(format!("http://127.0.0.1:{port}/invoke"))
-            .json(&serde_json::json!({
-                "method": "no.such.thing",
-                "args": "",
-                "trace_id": "",
-                "request_id": "",
-                "caller_subject_id": "",
-                "deadline_unix": 0,
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status().as_u16(), 200);
-        let body: serde_json::Value = r.json().await.unwrap();
-        assert_eq!(body["ok"], serde_json::json!(false));
-        assert_eq!(
-            body["error_kind"].as_u64().unwrap(),
-            error_kind::UNKNOWN_METHOD as u64
-        );
-        assert!(body["error_cause"].as_str().unwrap().contains("no handler"));
+        let (port, cert) = start_tls(PluginServer::new(), "tok").await;
+        let d = dispatcher(port, cert, "tok");
+        await_healthy(&d).await;
+        let err = d.invoke(req("no.such", "")).await.unwrap_err();
+        match err {
+            relix_runtime::plugin::PluginInvokeError::Plugin { kind, cause } => {
+                assert_eq!(kind, error_kind::UNKNOWN_METHOD);
+                assert!(cause.contains("no handler"), "cause: {cause}");
+            }
+            o => panic!("expected Plugin error, got {o:?}"),
+        }
     }
 
     #[tokio::test]
@@ -637,28 +682,17 @@ mod tests {
         server.register("x.bad", |_| async move {
             Err::<String, _>(PluginError::invalid_args("nope"))
         });
-        let (port, _) = start(server).await;
-        let client = reqwest::Client::new();
-        let r = client
-            .post(format!("http://127.0.0.1:{port}/invoke"))
-            .json(&serde_json::json!({
-                "method": "x.bad",
-                "args": "",
-                "trace_id": "",
-                "request_id": "",
-                "caller_subject_id": "",
-                "deadline_unix": 0,
-            }))
-            .send()
-            .await
-            .unwrap();
-        let body: serde_json::Value = r.json().await.unwrap();
-        assert_eq!(body["ok"], serde_json::json!(false));
-        assert_eq!(
-            body["error_kind"].as_u64().unwrap(),
-            error_kind::INVALID_ARGS as u64
-        );
-        assert!(body["error_cause"].as_str().unwrap().contains("nope"));
+        let (port, cert) = start_tls(server, "tok").await;
+        let d = dispatcher(port, cert, "tok");
+        await_healthy(&d).await;
+        let err = d.invoke(req("x.bad", "")).await.unwrap_err();
+        match err {
+            relix_runtime::plugin::PluginInvokeError::Plugin { kind, cause } => {
+                assert_eq!(kind, error_kind::INVALID_ARGS);
+                assert!(cause.contains("nope"), "cause: {cause}");
+            }
+            o => panic!("expected Plugin error, got {o:?}"),
+        }
     }
 
     #[tokio::test]
@@ -667,112 +701,63 @@ mod tests {
         server.register("x.broken", |_| async move {
             Err::<String, _>(PluginError::internal("boom"))
         });
-        let (port, _) = start(server).await;
-        let client = reqwest::Client::new();
-        let r = client
-            .post(format!("http://127.0.0.1:{port}/invoke"))
-            .json(&serde_json::json!({
-                "method": "x.broken",
-                "args": "",
-                "trace_id": "",
-                "request_id": "",
-                "caller_subject_id": "",
-                "deadline_unix": 0,
-            }))
-            .send()
-            .await
-            .unwrap();
-        let body: serde_json::Value = r.json().await.unwrap();
-        assert_eq!(
-            body["error_kind"].as_u64().unwrap(),
-            error_kind::RESPONDER_INTERNAL as u64
+        let (port, cert) = start_tls(server, "tok").await;
+        let d = dispatcher(port, cert, "tok");
+        await_healthy(&d).await;
+        let err = d.invoke(req("x.broken", "")).await.unwrap_err();
+        match err {
+            relix_runtime::plugin::PluginInvokeError::Plugin { kind, .. } => {
+                assert_eq!(kind, error_kind::RESPONDER_INTERNAL);
+            }
+            o => panic!("expected Plugin error, got {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invoke_with_wrong_bearer_rejected() {
+        let mut server = PluginServer::new();
+        server.register("ok.method", |_| async move { Ok("body".to_string()) });
+        let (port, cert) = start_tls(server, "expected-token").await;
+        let d = dispatcher(port, cert, "attacker-guess");
+        await_healthy(&d).await;
+        let err = d.invoke(req("ok.method", "")).await.unwrap_err();
+        match err {
+            relix_runtime::plugin::PluginInvokeError::Plugin { kind, .. } => {
+                assert_eq!(kind, error_kind::UNAUTHORIZED);
+            }
+            o => panic!("expected unauthorized, got {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unpinned_cert_fails_tls_handshake() {
+        // SEC §11b criterion 3: a dispatcher holding the WRONG cert
+        // cannot complete the TLS handshake to the SDK server, so it
+        // never reports healthy and invoke surfaces a transport error.
+        let (port, _real_cert) = start_tls(PluginServer::new(), "tok").await;
+        let (wrong_cert, _k) = loopback_cert();
+        let d = dispatcher(port, wrong_cert, "tok");
+        for _ in 0..10 {
+            assert!(
+                !matches!(d.health().await, Ok(true)),
+                "handshake succeeded with an unpinned cert"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let err = d.invoke(req("ok.method", "")).await.unwrap_err();
+        assert!(
+            matches!(err, relix_runtime::plugin::PluginInvokeError::Transport(_)),
+            "expected TLS transport error, got {err:?}"
         );
-        assert!(body["error_cause"].as_str().unwrap().contains("boom"));
-    }
-
-    // ── SEC PART 2: per-plugin bearer enforcement ────────
-
-    #[tokio::test]
-    async fn sec_p2_invoke_without_bearer_returns_401_when_required() {
-        let mut server = PluginServer::new().with_bearer_for_test("expected-token");
-        server.register("ok.method", |_| async move { Ok(String::new()) });
-        let (port, _) = start(server).await;
-        let client = reqwest::Client::new();
-        let r = client
-            .post(format!("http://127.0.0.1:{port}/invoke"))
-            .json(&serde_json::json!({
-                "method": "ok.method",
-                "args": "",
-                "trace_id": "",
-                "request_id": "",
-                "caller_subject_id": "",
-                "deadline_unix": 0,
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status().as_u16(), 401);
     }
 
     #[tokio::test]
-    async fn sec_p2_invoke_with_wrong_bearer_returns_401() {
-        let mut server = PluginServer::new().with_bearer_for_test("expected-token");
-        server.register("ok.method", |_| async move { Ok(String::new()) });
-        let (port, _) = start(server).await;
-        let client = reqwest::Client::new();
-        let r = client
-            .post(format!("http://127.0.0.1:{port}/invoke"))
-            .bearer_auth("not-the-right-one")
-            .json(&serde_json::json!({
-                "method": "ok.method",
-                "args": "",
-                "trace_id": "",
-                "request_id": "",
-                "caller_subject_id": "",
-                "deadline_unix": 0,
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status().as_u16(), 401);
-    }
-
-    #[tokio::test]
-    async fn sec_p2_invoke_with_correct_bearer_admitted() {
-        let mut server = PluginServer::new().with_bearer_for_test("expected-token");
+    async fn invoke_with_correct_bearer_admitted() {
+        let mut server = PluginServer::new();
         server.register("ok.method", |_| async move { Ok("ok-body".to_string()) });
-        let (port, _) = start(server).await;
-        let client = reqwest::Client::new();
-        let r = client
-            .post(format!("http://127.0.0.1:{port}/invoke"))
-            .bearer_auth("expected-token")
-            .json(&serde_json::json!({
-                "method": "ok.method",
-                "args": "",
-                "trace_id": "",
-                "request_id": "",
-                "caller_subject_id": "",
-                "deadline_unix": 0,
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status().as_u16(), 200);
-        let body: serde_json::Value = r.json().await.unwrap();
-        assert_eq!(body["ok"], serde_json::json!(true));
-        assert_eq!(body["body"], serde_json::json!("ok-body"));
-    }
-
-    #[tokio::test]
-    async fn sec_p2_health_path_open_even_when_bearer_required() {
-        // Host loader probes /health BEFORE it has called
-        // /invoke; the bearer middleware must let /health
-        // through.
-        let server = PluginServer::new().with_bearer_for_test("expected-token");
-        let (port, _) = start(server).await;
-        let r = reqwest::get(format!("http://127.0.0.1:{port}/health"))
-            .await
-            .unwrap();
-        assert_eq!(r.status().as_u16(), 200);
+        let (port, cert) = start_tls(server, "expected-token").await;
+        let d = dispatcher(port, cert, "expected-token");
+        await_healthy(&d).await;
+        assert_eq!(d.invoke(req("ok.method", "")).await.unwrap(), "ok-body");
     }
 }

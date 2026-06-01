@@ -3763,12 +3763,15 @@ name = "relix-plugin-sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "axum",
- "reqwest",
+ "base64 0.22.1",
+ "rcgen",
+ "relix-runtime",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

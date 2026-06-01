@@ -1,6 +1,6 @@
 [package]
 name        = "relix-plugin-sdk"
-description = "Plugin author SDK for the relix-plugin-v1 protocol. Tiny axum-based HTTP server that exposes registered capabilities to a hosting Relix mesh node."
+description = "Plugin author SDK for the relix-plugin-v1 protocol. Serves registered capabilities to a hosting Relix mesh node over a hardened loopback-TLS transport."
 edition.workspace      = true
 rust-version.workspace = true
 version.workspace      = true
@@ -10,16 +10,33 @@ authors.workspace      = true
 
 [dependencies]
 # Deliberately MINIMAL — plugin authors should be able to pull this
-# in without inheriting relix-runtime / relix-core. Only axum + tokio
-# + serde + tracing live here.
+# in without inheriting relix-runtime / relix-core. SEC §11b: the
+# transport is loopback TLS (tokio-rustls) speaking newline-JSON,
+# not plaintext HTTP, so the bearer + payload are never readable by
+# a co-located process. `base64` decodes the DER cert/key the host
+# passes via env.
 serde.workspace      = true
 serde_json.workspace = true
 thiserror.workspace  = true
 async-trait.workspace = true
 tokio                = { workspace = true, features = ["sync", "macros", "time", "rt-multi-thread", "net", "io-util", "io-std"] }
 tracing.workspace    = true
-axum.workspace       = true
+tokio-rustls         = "0.26"
+base64.workspace     = true
+
+# SEC §11b: reference plugin used by the end-to-end transport test
+# (and a working example for plugin authors). Built as part of this
+# crate so the e2e test can locate it via CARGO_BIN_EXE_*.
+[[bin]]
+name = "relix-tls-echo-plugin"
+path = "src/bin/relix-tls-echo-plugin.rs"
 
 [dev-dependencies]
-reqwest.workspace = true
 tokio              = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "sync"] }
+# SEC §11b: the end-to-end test launches a real SDK-built plugin via
+# the production runtime loader/dispatcher and invokes it over the
+# hardened TLS transport — proving the two halves meet. relix-runtime
+# does NOT depend on relix-plugin-sdk, so this dev-dep is acyclic.
+relix-runtime      = { path = "../relix-runtime" }
+rcgen              = "0.11"
+tempfile.workspace = true
