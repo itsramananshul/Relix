@@ -286,11 +286,17 @@ impl FsJail {
             let basename = joined.file_name().ok_or(JailError::Empty)?.to_owned();
             parent_canonical.join(basename)
         };
-        // Walk the resolved path under the jail and refuse if any
-        // component is a symlink. `must_exist == false` paths may
-        // not exist yet so the last component is allowed to be
-        // missing; only intermediate symlinks fail the check.
-        refuse_symlinks_within_jail(&self.canonical_root, &resolved)?;
+        // Walk the LEXICAL in-jail path (`joined`, before
+        // canonicalisation) and refuse if any component is a symlink.
+        // Using `resolved` here would be a no-op for `must_exist` paths:
+        // `canonicalize()` has already followed every symlink away, so
+        // the resolved path never contains one — the documented "no
+        // symlinks" policy would silently accept an in-jail symlink.
+        // `joined` still has the original `alias`/symdir component, so
+        // `symlink_metadata` on each component catches it. `must_exist
+        // == false` paths may not exist yet, so the missing leaf is
+        // allowed; only existing symlinked components fail the check.
+        refuse_symlinks_within_jail(&self.canonical_root, &joined)?;
         Ok(resolved)
     }
 
