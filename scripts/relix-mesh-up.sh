@@ -256,6 +256,12 @@ BRIDGE_KEY="dev-keys/$RUN-bridge.key"
 
 BRIDGE_AIC="dev-keys/$RUN-bridge.aic"
 MEMORY_AIC="dev-keys/$RUN-memory.bundle"
+# The AI node is itself a mesh client of the memory peer (`[ai.memory_peer]`)
+# for automatic history injection. Its dispatcher loads the identity bundle
+# next to its signing key (`<ai-key>.bundle`), so it must be minted too —
+# without it the AI node logs "identity bundle missing; memory injection
+# disabled" and silently drops auto-history fetch.
+AI_AIC="dev-keys/$RUN-ai.bundle"
 TELEGRAM_BUNDLE="dev-keys/$RUN-telegram.bundle"
 DISCORD_BUNDLE="dev-keys/$RUN-discord.bundle"
 SLACK_BUNDLE="dev-keys/$RUN-slack.bundle"
@@ -300,6 +306,11 @@ if [[ ! -f "$MEMORY_AIC" ]]; then
     echo "minting memory identity ..."
     "$CLI" identity mint --root-key "$ORG_KEY" --name memory \
         --groups chat-users --out "$MEMORY_AIC"
+fi
+if [[ ! -f "$AI_AIC" ]]; then
+    echo "minting ai identity ..."
+    "$CLI" identity mint --root-key "$ORG_KEY" --name ai \
+        --groups chat-users --out "$AI_AIC"
 fi
 
 # ---- 2. Memory config ----
