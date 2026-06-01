@@ -186,7 +186,18 @@ resolve_dir() {
     local cand
     for cand in "$@"; do
         if [[ -d "$cand" ]]; then
-            (cd "$cand" && pwd)
+            local abs
+            abs="$(cd "$cand" && pwd)"
+            # The generated config paths are consumed by native binaries. On
+            # Windows (Git Bash/MSYS) `pwd` yields an MSYS path like /d/... that
+            # the native .exe cannot resolve (os error 3). Convert to a mixed
+            # Windows path (D:/...) which is both Windows-resolvable and safe in
+            # TOML. cygpath is absent on Linux/macOS, where pwd is already native.
+            if command -v cygpath >/dev/null 2>&1; then
+                cygpath -m "$abs"
+            else
+                printf '%s\n' "$abs"
+            fi
             return 0
         fi
     done
