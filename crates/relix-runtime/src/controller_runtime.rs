@@ -1299,6 +1299,17 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                     "peer connected"
                 );
             }
+            TransportEvent::PeerDisconnected { peer_id } => {
+                // SEC §18: drop the peer_id → alias surface mapping so a
+                // departed peer's PeerId can't carry a stale caller
+                // surface if the id is later reused. (Knowledge-share
+                // source keys are removed by the knowledge mesh's own
+                // disconnect consumer over its discovery transport.)
+                if let Ok(mut g) = peer_alias_map.write() {
+                    g.remove(&peer_id);
+                }
+                tracing::info!(peer = %peer_id, "peer disconnected");
+            }
         }
     }
 

@@ -1153,10 +1153,17 @@ pub async fn discover_and_pin(opts: DiscoveryOptions) -> Option<(ManifestCache, 
         }
     }
 
-    // After discovery, drop the events receiver so the swarm task's
-    // back-pressure on `event_sender` becomes a fast no-op (Sender::send sees
-    // a closed channel and returns Err immediately, which the swarm ignores).
-    drop(events);
+    // SEC §18: do NOT drop the events receiver here. When a
+    // source-key registry is configured (knowledge mesh), we hand the
+    // stream to a persistent consumer task at the end of discovery so
+    // peer-disconnect events promptly drop trust (no stale keys). When
+    // no registry is configured we drop it there instead, restoring
+    // the original fast-no-op back-pressure behaviour.
+
+    // SEC §18: directory of handshake-verified peers learned below,
+    // mapping the Noise-verified PeerId to (node_name, pubkey) so the
+    // disconnect consumer removes the exact key registered on connect.
+    let mut peer_directory: PeerKeyDirectory = std::collections::HashMap::new();
 
     // Build alias → Multiaddr book from the input config so the MeshClient
     // can re-dial after a transient disconnect (A.4 reconnect support).
@@ -1267,6 +1274,10 @@ pub async fn discover_and_pin(opts: DiscoveryOptions) -> Option<(ManifestCache, 
             match peer_id_from_ed25519_pubkey(&signed.signer_pubkey) {
                 Some(derived) if derived == peer_id => {
                     registry.register(manifest.node_name.clone(), signed.signer_pubkey);
+                    // SEC §18: remember peer_id -> (name, key) so the
+                    // disconnect consumer can remove the right key.
+                    peer_directory
+                        .insert(peer_id, (manifest.node_name.clone(), signed.signer_pubkey));
                     tracing::info!(
                         alias = %alias,
                         node_name = %manifest.node_name,
@@ -1285,6 +1296,25 @@ pub async fn discover_and_pin(opts: DiscoveryOptions) -> Option<(ManifestCache, 
         }
         cache.insert(Some(alias), manifest);
     }
+
+    // SEC §18: hand the live event stream to a persistent consumer so
+    // a peer's source key is removed PROMPTLY when its connection
+    // closes (and re-registered if it reconnects) — not only on the
+    // next discovery refresh. Only runs when knowledge auto-learning
+    // is configured (registry present); otherwise the stream is
+    // dropped, as before.
+    match opts.source_key_registry.clone() {
+        Some(registry) => {
+            tokio::spawn(async move {
+                let mut events = events;
+                while let Some(ev) = events.recv().await {
+                    apply_mesh_connection_event(&ev, &peer_directory, &registry);
+                }
+            });
+        }
+        None => drop(events),
+    }
+
     Some((cache, mesh_client))
 }
 
@@ -1295,6 +1325,50 @@ pub async fn discover_and_pin(opts: DiscoveryOptions) -> Option<(ManifestCache, 
 fn peer_id_from_ed25519_pubkey(pubkey: &[u8; 32]) -> Option<PeerId> {
     let ed = libp2p::identity::ed25519::PublicKey::try_from_bytes(pubkey).ok()?;
     Some(libp2p::identity::PublicKey::from(ed).to_peer_id())
+}
+
+/// SEC §18: directory of handshake-verified peers, mapping the
+/// Noise-authenticated `PeerId` to the `(node_name, identity pubkey)`
+/// learned during discovery. Used by [`apply_mesh_connection_event`]
+/// to resolve a disconnecting peer back to the exact source-key it
+/// registered on connect.
+pub(crate) type PeerKeyDirectory = std::collections::HashMap<PeerId, (String, [u8; 32])>;
+
+/// SEC §18: apply a live mesh connection lifecycle event to the
+/// knowledge source-key registry, so trust tracks the actual
+/// connection state of each peer:
+///
+/// * `PeerDisconnected` → REMOVE the peer's source key (no stale
+///   trust survives the connection drop; a subsequent share claiming
+///   that peer is then rejected until it reconnects).
+/// * `PeerConnected` (of a peer whose handshake-verified identity we
+///   already learned during discovery) → RE-REGISTER its key, so a
+///   reconnect restores trust without a manual step.
+///
+/// The key is only ever the one learned from the cryptographically-
+/// verified handshake/manifest (via `directory`), preserving Section
+/// 17's "only trust a handshake-verified key" guarantee. Unregister
+/// is idempotent, so a spurious disconnect for a still-multiply-
+/// connected peer is harmless (it re-registers on its next exchange).
+pub(crate) fn apply_mesh_connection_event(
+    ev: &TransportEvent,
+    directory: &PeerKeyDirectory,
+    registry: &crate::knowledge::service::SourceNodeKeyRegistry,
+) {
+    match ev {
+        TransportEvent::PeerConnected { peer_id, .. } => {
+            if let Some((node_name, pubkey)) = directory.get(peer_id) {
+                registry.register(node_name.clone(), *pubkey);
+            }
+        }
+        TransportEvent::PeerDisconnected { peer_id } => {
+            if let Some((node_name, _)) = directory.get(peer_id) {
+                registry.unregister(node_name);
+            }
+        }
+        // Inbound RPC requests are not connection-lifecycle events.
+        TransportEvent::Request { .. } => {}
+    }
 }
 
 /// Convenience: discover with sensible defaults for tests that already have

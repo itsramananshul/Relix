@@ -76,6 +76,14 @@ pub enum Event {
         /// The address it was reached at.
         address: Multiaddr,
     },
+    /// SEC §18: a peer's last connection closed. Surfaced so a
+    /// persistent consumer can promptly drop any trust learned for
+    /// that peer (e.g. its knowledge-share source key) — no stale
+    /// trust lingering after the connection drops.
+    PeerDisconnected {
+        /// The peer whose connection closed.
+        peer_id: PeerId,
+    },
 }
 
 /// Reply handle for an inbound request.
@@ -285,7 +293,20 @@ impl EventLoop {
             SwarmEvent::Behaviour(BehaviourEvent::Kademlia(_)) => {}
             SwarmEvent::NewListenAddr { .. } => {}
             SwarmEvent::IncomingConnection { .. } => {}
-            SwarmEvent::ConnectionClosed { .. } => {}
+            // SEC §18: surface the disconnect so a persistent consumer
+            // can drop trust learned for this peer. libp2p emits one
+            // `ConnectionClosed` per closed connection; a peer may
+            // briefly have multiple, so consumers must tolerate a
+            // disconnect for a peer that still has another live
+            // connection (the source-key registry treats unregister
+            // idempotently, and a still-live peer re-registers on its
+            // next manifest exchange).
+            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                let _ = self
+                    .event_sender
+                    .send(Event::PeerDisconnected { peer_id })
+                    .await;
+            }
             SwarmEvent::OutgoingConnectionError { .. } => {}
             _ => {}
         }

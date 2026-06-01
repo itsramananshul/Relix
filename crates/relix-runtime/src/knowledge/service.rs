@@ -2427,4 +2427,89 @@ mod tests {
             o => panic!("after disconnect the key must be gone (no stale trust), got {o:?}"),
         }
     }
+
+    // ── SEC §18: live disconnect events remove the peer key ────────
+
+    #[tokio::test]
+    async fn sec18_live_disconnect_event_removes_peer_key_and_reconnect_restores_it() {
+        // CRITERION 3 + 4: drive the ACTUAL live-event consumer
+        // (`apply_mesh_connection_event`) — not unregister directly —
+        // with synthetic PeerConnected/PeerDisconnected events through
+        // the same peer directory the discovery path builds, and prove:
+        //   * connect auto-registers the verified key (Section 17 path,
+        //     no [knowledge_trust] config) → share accepted;
+        //   * a live PeerDisconnected removes it → share rejected (no
+        //     stale trust);
+        //   * a reconnect (PeerConnected) re-registers it → accepted.
+        use crate::knowledge::remote::SignedSharePayload;
+        use crate::manifest::{PeerKeyDirectory, apply_mesh_connection_event};
+        use crate::transport::rpc::{Event as TransportEvent, PeerId};
+
+        let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let peer_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        // No [knowledge_trust] config — trust comes solely from the
+        // handshake-learned directory, applied via the live consumer.
+        let svc = KnowledgeService::new(store.clone(), &section9_cfg())
+            .unwrap()
+            .with_local_node("node-2");
+        let registry = svc.source_node_key_registry();
+
+        // The directory the discovery path would have built for the
+        // handshake-verified peer "node-1".
+        let peer_id = PeerId::random();
+        let mut directory: PeerKeyDirectory = std::collections::HashMap::new();
+        directory.insert(
+            peer_id,
+            ("node-1".to_string(), peer_key.verifying_key().to_bytes()),
+        );
+        let addr: crate::transport::rpc::Multiaddr = "/ip4/127.0.0.1/tcp/9001".parse().unwrap();
+
+        let share = |id: &str| {
+            SignedSharePayload::sign(
+                &peer_key,
+                "node-1",
+                "alice",
+                "bob",
+                obs(id, "alice", "fact", true),
+                None,
+            )
+        };
+
+        // (connect) live event auto-registers the verified key.
+        apply_mesh_connection_event(
+            &TransportEvent::PeerConnected {
+                peer_id,
+                address: addr.clone(),
+            },
+            &directory,
+            &registry,
+        );
+        svc.accept_shared(share("a1"))
+            .expect("auto-learned peer accepted after connect event (no config)");
+
+        // (disconnect) live event removes the key → share rejected.
+        apply_mesh_connection_event(
+            &TransportEvent::PeerDisconnected { peer_id },
+            &directory,
+            &registry,
+        );
+        match svc.accept_shared(share("a2")).unwrap_err() {
+            ShareError::Rejected(RejectReason::SourceKeyMismatch { node, .. }) => {
+                assert_eq!(node, "node-1")
+            }
+            o => panic!("after live disconnect the key must be gone, got {o:?}"),
+        }
+
+        // (reconnect) live event re-registers → accepted again.
+        apply_mesh_connection_event(
+            &TransportEvent::PeerConnected {
+                peer_id,
+                address: addr,
+            },
+            &directory,
+            &registry,
+        );
+        svc.accept_shared(share("a3"))
+            .expect("reconnect re-registers the verified key");
+    }
 }
