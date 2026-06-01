@@ -411,7 +411,14 @@ impl PluginLoader {
 /// allowlist. SEC §11: this fn is `#[cfg(unix)]` only — non-Unix
 /// targets fail closed in [`SandboxLimits::ensure_enforceable`]
 /// before spawn rather than running unsandboxed.
+// SAFETY-island: this fn is the only place in relix-runtime (besides
+// `install_seccomp_program`) permitted to use `unsafe`. It hooks
+// `Command::pre_exec`, which is `unsafe` because the closure runs in the
+// child between fork() and execve() where only async-signal-safe work is
+// allowed. The closure here does exactly that — `setrlimit`, raw
+// `prctl`, and the pre-built seccomp install — with no heap allocation.
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn apply_sandbox(cmd: &mut Command, limits: &SandboxLimits) {
     let limits_copy = *limits;
     // SEC PART 2: on Linux, compile the seccomp BPF program
@@ -455,10 +462,18 @@ fn apply_sandbox(cmd: &mut Command, limits: &SandboxLimits) {
             let _ = setrlimit(Resource::CORE, 0, 0);
             #[cfg(target_os = "linux")]
             {
-                // PR_SET_NO_NEW_PRIVS = 38.
+                // PR_SET_NO_NEW_PRIVS = 38. SAFETY: async-signal-safe
+                // prctl with constant args; no allocation. These calls
+                // sit inside the enclosing `unsafe { cmd.pre_exec(..) }`
+                // block, which already establishes the unsafe context
+                // for this closure body — no inner `unsafe` needed.
                 const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
                 libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
                 if let Some(prog) = seccomp_program.as_ref() {
+                    // SAFETY: `prog` is a `Vec<sock_filter>` built in the
+                    // parent before fork; install_seccomp_program only
+                    // makes the async-signal-safe `prctl(PR_SET_SECCOMP)`
+                    // call over it.
                     install_seccomp_program(prog);
                 }
             }
@@ -494,16 +509,33 @@ fn build_linux_seccomp_program() -> Option<Vec<libc::sock_filter>> {
     )
     .ok()?;
     let program: BpfProgram = filter.try_into().ok()?;
-    // BpfProgram is Vec<sock_filter> — we use it directly
-    // when installing via the raw prctl path.
-    Some(program)
+    // seccompiler's `BpfProgram` is `Vec<seccompiler::sock_filter>` — a
+    // distinct nominal type from `libc::sock_filter` despite the
+    // identical `#[repr(C)]` layout. Map field-for-field (in the parent,
+    // before fork — allocation here is fine) so the install path can
+    // pass a `*const libc::sock_filter` to the kernel.
+    Some(
+        program
+            .into_iter()
+            .map(|f| libc::sock_filter {
+                code: f.code,
+                jt: f.jt,
+                jf: f.jf,
+                k: f.k,
+            })
+            .collect(),
+    )
 }
 
 /// SEC PART 2: install a pre-compiled seccomp BPF program
 /// via raw `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)`.
 /// async-signal-safe; no heap allocation. Failure is silent
 /// (we cannot log inside pre_exec).
+// SAFETY-island (see `apply_sandbox`): installs a pre-built seccomp
+// filter via a single async-signal-safe `prctl` call. Caller guarantees
+// `program` outlives the call and the process is between fork and execve.
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 unsafe fn install_seccomp_program(program: &[libc::sock_filter]) {
     const PR_SET_SECCOMP: libc::c_int = 22;
     const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
@@ -516,13 +548,18 @@ unsafe fn install_seccomp_program(program: &[libc::sock_filter]) {
         len: program.len().min(u16::MAX as usize) as u16,
         filter: program.as_ptr(),
     };
-    let _ = libc::prctl(
-        PR_SET_SECCOMP,
-        SECCOMP_MODE_FILTER,
-        &prog as *const _ as libc::c_ulong,
-        0,
-        0,
-    );
+    // SAFETY: `&prog` is a valid `sock_fprog` pointing at `program`'s
+    // buffer (alive for this call); constant prctl op. Explicit unsafe
+    // block required even inside `unsafe fn` (unsafe_op_in_unsafe_fn).
+    unsafe {
+        let _ = libc::prctl(
+            PR_SET_SECCOMP,
+            SECCOMP_MODE_FILTER,
+            &prog as *const _ as libc::c_ulong,
+            0,
+            0,
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]

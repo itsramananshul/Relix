@@ -12,7 +12,14 @@
 //! - [`coordinator`] — per-flow event-log ownership (RELIX-3 / RELIX-8 alpha).
 //! - [`nodes`] — node-type implementations (memory, ai, tool, web_bridge).
 
-#![forbid(unsafe_code)]
+// Unsafe is denied crate-wide by default. The ONLY exception is the
+// Linux plugin sandbox in `plugin::loader` (seccomp + setrlimit via a
+// `pre_exec` hook), which is inherently FFI: those two functions carry a
+// narrowly-scoped `#[allow(unsafe_code)]` with `// SAFETY:` notes. We use
+// `deny` (overridable per-item) rather than `forbid` (un-overridable) so
+// that audited island can compile on Unix while every other module stays
+// unsafe-free.
+#![deny(unsafe_code)]
 
 pub mod admission;
 pub mod approval;
