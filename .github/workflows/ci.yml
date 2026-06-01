@@ -1,11 +1,18 @@
 name: CI
 
-# Restored: gate every push to main and every PR opened against main
-# in addition to the manual workflow_dispatch entry point. The full
-# fmt / clippy / test / deny matrix runs on every commit so CI catches
-# regressions before review instead of relying on contributors running
-# the same gates locally. heavy-ci.yml stays label-gated; fast-ci.yml
-# already runs on push / pull_request as the cheap fast lane.
+# Actions-minute policy (see scripts/ci-local.ps1):
+#
+# On push / PR, GitHub runs ONLY the macOS + Linux workspace test — the
+# platform coverage a Windows-only local dev box cannot reproduce
+# (OS-specific code under #[cfg(unix)] / #[cfg(target_os=...)], path and
+# line-ending differences). Everything platform-independent — rustfmt,
+# clippy, cargo deny — and the Windows test leg are run locally via
+# `scripts/ci-local.ps1` before tagging. Those jobs are KEPT here (not
+# deleted) but gated to manual `workflow_dispatch` so they no longer
+# burn Actions minutes on every commit.
+#
+# (release.yml still runs on v* tags; fast-ci.yml / heavy-ci.yml /
+# nightly-security.yml are disabled in the Actions UI.)
 on:
   push:
     branches: [main]
@@ -18,8 +25,11 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Platform-independent — run locally via scripts/ci-local.ps1.
+  # Manual-only: runs on workflow_dispatch, SKIPPED on push / PR.
   fmt:
     name: rustfmt
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,8 +38,11 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # Platform-independent — run locally via scripts/ci-local.ps1.
+  # Manual-only: runs on workflow_dispatch, SKIPPED on push / PR.
   clippy:
     name: clippy
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,49 +50,43 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-        # The cache post-step intermittently fails on the Windows
-        # runner when target/ is large (tar/zstd compression + cache
-        # upload occasionally errors with no diagnostic). Cache is a
-        # build-speed optimisation, not a correctness gate, so a
-        # cache restore / save failure must never fail CI for an
-        # otherwise-green commit.
+        # Cache is a build-speed optimisation, not a correctness gate; a
+        # restore/save failure must never fail an otherwise-green commit.
         continue-on-error: true
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # KEPT auto-running on push / PR. The macOS + Linux workspace test is
+  # the coverage a Windows-only local run cannot give. The
+  # windows-latest leg was intentionally dropped — it is run locally via
+  # scripts/ci-local.ps1 (which also covers fmt / clippy / deny).
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        # See note on the clippy job — cache is a build-speed
-        # optimisation, not a correctness gate. Without this, the
-        # Windows runner's cache-save post-step (large target/, slow
-        # tar pipeline) intermittently fails the job AFTER every
-        # test has already passed.
+        # Cache is a build-speed optimisation, not a correctness gate; a
+        # restore/save failure must never fail an otherwise-green commit.
         continue-on-error: true
       - run: cargo test --workspace
 
+  # Supply-chain gate (license allowlist + advisories + sources). Reads
+  # the lockfile, so it is platform-independent — run locally via
+  # scripts/ci-local.ps1 (`cargo deny check --all-features`). Manual-only:
+  # runs on workflow_dispatch, SKIPPED on push / PR.
   deny:
-    # Supply-chain gate. License allowlist + advisory check + source
-    # allowlist. See deny.toml for the policy and the per-rule
-    # rationale. Runs once on Linux because the policy is platform-
-    # independent (license info comes from the lockfile, not the
-    # built artifact).
     name: cargo deny
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          # Only license, advisory, source, ban checks — bans default
-          # is `warn` for multiple-versions, so the action picks that
-          # up from deny.toml automatically.
           command: check
           arg: --all-features
