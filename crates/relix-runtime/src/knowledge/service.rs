@@ -247,15 +247,22 @@ pub struct KnowledgeService {
     /// `knowledge.autoshare_stats` cap returns zeros in that
     /// case.
     autoshare_stats: Option<super::autoshare::AutoShareLifetimeStats>,
-    /// SECTION 9: receiver-side registry binding a source node's
-    /// friendly name to its ED25519 public key (32 raw bytes).
-    /// `accept_shared` rejects any payload whose `source_pubkey`
-    /// does not match the key configured here for the claimed
-    /// `source_node` — a valid signature is not enough, the key
-    /// must BELONG to the claimed node. Empty ⇒ no binding
-    /// configured (signature-only legacy behaviour); the binding
-    /// is enforced the moment any node key is registered.
+    /// SECTION 9 / SEC §16: receiver-side registry binding a
+    /// source node's friendly name to its ED25519 public key (32
+    /// raw bytes). `accept_shared` rejects any payload whose
+    /// `source_pubkey` does not match the key configured here for
+    /// the claimed `source_node` — a valid signature is not enough,
+    /// the key must BELONG to the claimed node. SEC §16: a source
+    /// with NO entry here is REJECTED by default (fail closed) —
+    /// the registry no longer silently disables binding when empty.
     source_node_keys: Arc<std::collections::BTreeMap<String, [u8; 32]>>,
+    /// SEC §16: explicit, deliberate opt-out of source-node binding.
+    /// When `true`, a payload whose `source_node` has no configured
+    /// key is accepted on signature ALONE (the pre-§16 weak
+    /// behaviour). Default `false` ⇒ unconfigured sources are
+    /// rejected. Operators must set this on purpose (it is logged
+    /// loudly at startup); it is never the accidental default.
+    allow_unbound_sources: bool,
 }
 
 impl KnowledgeService {
@@ -271,6 +278,7 @@ impl KnowledgeService {
             remote: None,
             autoshare_stats: None,
             source_node_keys: Arc::new(std::collections::BTreeMap::new()),
+            allow_unbound_sources: false,
         })
     }
 
@@ -282,6 +290,15 @@ impl KnowledgeService {
         let mut map = (*self.source_node_keys).clone();
         map.insert(node.into(), pubkey);
         self.source_node_keys = Arc::new(map);
+        self
+    }
+
+    /// SEC §16: explicit opt-out of source-node binding for sources
+    /// with no configured key (signature-only). Default is `false`
+    /// (fail closed). Setting `true` must be a deliberate operator
+    /// choice and is logged loudly at startup.
+    pub fn with_allow_unbound_sources(mut self, allow: bool) -> Self {
+        self.allow_unbound_sources = allow;
         self
     }
 
@@ -301,6 +318,7 @@ impl KnowledgeService {
             remote: None,
             autoshare_stats: None,
             source_node_keys: Arc::new(std::collections::BTreeMap::new()),
+            allow_unbound_sources: false,
         }
     }
 
@@ -594,13 +612,18 @@ impl KnowledgeService {
         // tampering any of them breaks it) against the carried
         // pubkey.
         let verifying = payload.verify().map_err(ShareError::Rejected)?;
-        // SECTION 9 (2): BIND the carried pubkey to the claimed
-        // source_node. A valid signature only proves the payload
-        // was signed by SOME keypair; it must be the keypair the
-        // receiver knows for `source_node`, else any node holding
-        // any key could impersonate `memory-node-2`. Enforced once
-        // any node key is registered.
-        if !self.source_node_keys.is_empty() {
+        // SECTION 9 (2) / SEC §16: BIND the carried pubkey to the
+        // claimed source_node. A valid signature only proves the
+        // payload was signed by SOME keypair; it must be the keypair
+        // the receiver knows for `source_node`, else any node holding
+        // any key could impersonate `memory-node-2`.
+        //
+        // SEC §16: binding is enforced UNCONDITIONALLY — there is no
+        // longer a silent "empty registry ⇒ skip" fallback. A source
+        // with no configured key is REJECTED, unless the operator has
+        // deliberately set `allow_unbound_sources` (logged at
+        // startup), which restores signature-only acceptance.
+        {
             let presented = verifying.to_bytes();
             match self.source_node_keys.get(&payload.source_node) {
                 Some(expected) if *expected == presented => { /* bound */ }
@@ -611,10 +634,14 @@ impl KnowledgeService {
                             .to_string(),
                     }));
                 }
+                None if self.allow_unbound_sources => { /* explicit opt-out: signature-only */ }
                 None => {
                     return Err(ShareError::Rejected(RejectReason::SourceKeyMismatch {
                         node: payload.source_node.clone(),
-                        detail: "claimed source_node has no configured key on this receiver"
+                        detail: "claimed source_node has no configured key on this receiver — \
+                                 configure [knowledge_trust].source_nodes with this node's \
+                                 identity pubkey, or set [knowledge_trust] allow_unbound_sources \
+                                 = true to accept on signature alone (insecure)"
                             .to_string(),
                     }));
                 }
@@ -1790,15 +1817,18 @@ mod tests {
             auto_share_per_tick_budget: None,
             auto_share_per_agent_limit: None,
         };
-        // Remote-side service (no mesh; it accepts inbound).
+        let signer = Arc::new(ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng));
+        // Remote-side service (no mesh; it accepts inbound). SEC §16:
+        // the standard setup — the receiver KNOWS node-1's identity
+        // key, so source-node binding passes for a legitimate share.
         let remote_svc = Arc::new(
             KnowledgeService::new(remote_store.clone(), &cfg)
                 .unwrap()
-                .with_local_node("node-2"),
+                .with_local_node("node-2")
+                .with_source_node_key("node-1", signer.verifying_key().to_bytes()),
         );
         let dispatcher: Arc<dyn RemoteKnowledgeDispatcher> =
             Arc::new(InMemoryRemoteDispatcher::new().with_node("node-2", remote_svc.clone()));
-        let signer = Arc::new(ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng));
         let local_svc = KnowledgeService::new(local_store.clone(), &cfg)
             .unwrap()
             .with_mesh("node-1", signer, dispatcher);
@@ -1994,9 +2024,13 @@ mod tests {
             auto_share_per_tick_budget: None,
             auto_share_per_agent_limit: None,
         };
+        // SEC §16: this test exercises insert/idempotency, not the
+        // source binding — opt out explicitly so the no-key default
+        // (fail closed) doesn't reject before the insert path runs.
         let svc = KnowledgeService::new(store.clone(), &cfg)
             .unwrap()
-            .with_local_node("node-2");
+            .with_local_node("node-2")
+            .with_allow_unbound_sources(true);
         let signer = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let record = obs("a1", "alice", "fact", true);
         let payload = crate::knowledge::remote::SignedSharePayload::sign(
@@ -2117,6 +2151,119 @@ mod tests {
         );
         svc.accept_shared(payload)
             .expect("matching key must be accepted");
+        assert!(store.get(&mint_copy_id("a1", "bob")).unwrap().is_some());
+    }
+
+    // ── SEC §16: binding is ON by default, not dormant ──────────
+
+    #[tokio::test]
+    async fn sec16_default_setup_accepts_known_peer_and_rejects_impostor() {
+        // CRITERION 3: in a standard setup (the receiver KNOWS the
+        // peer's real identity key via [knowledge_trust]), a payload
+        // from that peer signed by its real key is ACCEPTED, while a
+        // payload CLAIMING that peer but signed by a different key is
+        // REJECTED — binding is live, not dormant.
+        use crate::knowledge::remote::SignedSharePayload;
+        let peer_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let mk = |store| {
+            KnowledgeService::new(store, &section9_cfg())
+                .unwrap()
+                .with_local_node("node-2")
+                // The receiver knows node-1's REAL identity pubkey.
+                .with_source_node_key("node-1", peer_key.verifying_key().to_bytes())
+        };
+
+        // Known peer, real key → accepted.
+        let store_ok = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let svc_ok = mk(store_ok.clone());
+        let good = SignedSharePayload::sign(
+            &peer_key,
+            "node-1",
+            "alice",
+            "bob",
+            obs("a1", "alice", "fact", true),
+            None,
+        );
+        svc_ok
+            .accept_shared(good)
+            .expect("known peer's real key accepted");
+        assert!(store_ok.get(&mint_copy_id("a1", "bob")).unwrap().is_some());
+
+        // Same claimed peer, DIFFERENT key → rejected.
+        let store_bad = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let svc_bad = mk(store_bad);
+        let impostor = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let forged = SignedSharePayload::sign(
+            &impostor,
+            "node-1",
+            "alice",
+            "bob",
+            obs("a2", "alice", "fact", true),
+            None,
+        );
+        match svc_bad.accept_shared(forged).unwrap_err() {
+            ShareError::Rejected(RejectReason::SourceKeyMismatch { node, .. }) => {
+                assert_eq!(node, "node-1");
+            }
+            o => panic!("impostor must be rejected with SourceKeyMismatch, got {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sec16_empty_registry_rejects_by_default_no_silent_fallback() {
+        // CRITERION 4: the silent empty-registry fallback is GONE.
+        // With no configured key and the default (allow_unbound_sources
+        // = false), an otherwise-valid payload is REJECTED — not
+        // accepted on signature alone.
+        use crate::knowledge::remote::SignedSharePayload;
+        let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let signer = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let svc = KnowledgeService::new(store.clone(), &section9_cfg())
+            .unwrap()
+            .with_local_node("node-2"); // NO source key, default opt-out=false
+        let payload = SignedSharePayload::sign(
+            &signer,
+            "node-1",
+            "alice",
+            "bob",
+            obs("a1", "alice", "fact", true),
+            None,
+        );
+        match svc.accept_shared(payload).unwrap_err() {
+            ShareError::Rejected(RejectReason::SourceKeyMismatch { node, detail }) => {
+                assert_eq!(node, "node-1");
+                assert!(
+                    detail.contains("no configured key"),
+                    "must explain the missing key + opt-out, got: {detail}"
+                );
+            }
+            o => panic!("unconfigured source must be rejected, not silently accepted; got {o:?}"),
+        }
+        // Nothing was inserted.
+        assert!(store.get(&mint_copy_id("a1", "bob")).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sec16_explicit_opt_out_restores_signature_only() {
+        // CRITERION 4 (other half): a no-binding mode is only
+        // reachable by a DELIBERATE opt-out, never by accident.
+        use crate::knowledge::remote::SignedSharePayload;
+        let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let signer = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let svc = KnowledgeService::new(store.clone(), &section9_cfg())
+            .unwrap()
+            .with_local_node("node-2")
+            .with_allow_unbound_sources(true); // explicit, logged opt-out
+        let payload = SignedSharePayload::sign(
+            &signer,
+            "node-1",
+            "alice",
+            "bob",
+            obs("a1", "alice", "fact", true),
+            None,
+        );
+        svc.accept_shared(payload)
+            .expect("explicit opt-out accepts on signature alone");
         assert!(store.get(&mint_copy_id("a1", "bob")).unwrap().is_some());
     }
 }

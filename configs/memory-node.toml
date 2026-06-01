@@ -27,3 +27,26 @@ db_path = "dev-data/memory/sessions.db"
 [peers]
 # Peer aliases used by SOL `remote_call("memory", ...)` — memory node typically has no peers it dials.
 # Other nodes (web-bridge, etc.) include `memory = { port = 9001 }` in their [peers].
+
+# SEC §16 — knowledge-share source binding.
+# When this node accepts `knowledge.accept_shared` from peer memory
+# nodes (RELIX-7.16 `[knowledge]` cross-node sharing), it BINDS each
+# inbound payload's signature to the claimed source node's real
+# identity key — a valid signature alone is not enough. List every
+# trusted peer's `[controller] name` and its identity Ed25519 PUBLIC
+# key (the 64-char hex of its `[identity] key_path` verifying key;
+# obtain it from that node's operator).
+#
+# Default (no entries below, allow_unbound_sources unset): inbound
+# shares from a source with no configured key are REJECTED (fail
+# closed) — the binding is enforced, not dormant. A standard
+# multi-node deployment MUST list its peers here for sharing to work.
+#
+# [knowledge_trust]
+# source_nodes = [
+#   { node = "memory-node-2", pubkey = "<64-char hex ed25519 pubkey>" },
+#   { node = "memory-node-3", pubkey = "<64-char hex ed25519 pubkey>" },
+# ]
+# # Deliberate, logged opt-out (INSECURE) — accept unconfigured
+# # sources on signature alone. Leave false/unset in production.
+# allow_unbound_sources = false

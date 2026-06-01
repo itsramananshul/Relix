@@ -132,6 +132,15 @@ pub struct ControllerConfig {
     /// registered and the AutoShareTask is not spawned.
     #[serde(default)]
     pub knowledge: Option<crate::knowledge::KnowledgeConfig>,
+    /// SEC §16: `[knowledge_trust]` — receiver-side source-node
+    /// binding for `knowledge.accept_shared`. Maps each trusted peer
+    /// `source_node` NAME to its identity Ed25519 PUBLIC key so an
+    /// inbound share's signature is bound to the claimed source node
+    /// (not just "some valid key"). Absent ⇒ no peer keys known ⇒
+    /// inbound mesh shares from unconfigured sources are REJECTED
+    /// (fail closed) unless `allow_unbound_sources` is set.
+    #[serde(default)]
+    pub knowledge_trust: Option<KnowledgeTrustConfig>,
     /// `[confidence]` block — RELIX-7.19 per-step confidence
     /// scoring and fallback. Absent OR `enabled = false` keeps
     /// every node's `DispatchBridge` in pre-7.19 byte-identical
@@ -534,6 +543,56 @@ pub struct GatewaySection {
 pub struct PeerConfig {
     /// libp2p TCP port to dial.
     pub port: u16,
+}
+
+/// SEC §16: `[knowledge_trust]` — receiver-side source-node binding
+/// for knowledge sharing. Lists the identity public keys of trusted
+/// peer nodes so `accept_shared` can bind a payload's signature to
+/// the claimed `source_node`.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct KnowledgeTrustConfig {
+    /// Each trusted peer: its `source_node` name + identity key.
+    #[serde(default)]
+    pub source_nodes: Vec<TrustedSourceNode>,
+    /// Explicit, logged opt-out: accept shares from a source with no
+    /// configured key on signature ALONE (pre-§16 weak behaviour).
+    /// Default `false` ⇒ such sources are rejected (fail closed).
+    #[serde(default)]
+    pub allow_unbound_sources: bool,
+}
+
+/// One trusted peer's identity, for knowledge-share source binding.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TrustedSourceNode {
+    /// The peer's `[controller] name` — the `source_node` it stamps
+    /// on outbound `knowledge.accept_shared` payloads.
+    pub node: String,
+    /// The peer's identity Ed25519 PUBLIC key as 64-char lowercase
+    /// hex (the verifying key of its `[identity] key_path`).
+    pub pubkey: String,
+}
+
+impl KnowledgeTrustConfig {
+    /// Parse each `pubkey` hex into 32 raw bytes, returning
+    /// `(node, key)` pairs. Errors on malformed hex / wrong length.
+    fn parsed_keys(&self) -> Result<Vec<(String, [u8; 32])>, String> {
+        let mut out = Vec::with_capacity(self.source_nodes.len());
+        for tsn in &self.source_nodes {
+            let bytes = hex::decode(tsn.pubkey.trim())
+                .map_err(|e| format!("source_node `{}`: pubkey not hex: {e}", tsn.node))?;
+            if bytes.len() != 32 {
+                return Err(format!(
+                    "source_node `{}`: pubkey must be 32 bytes (64 hex chars), got {}",
+                    tsn.node,
+                    bytes.len()
+                ));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            out.push((tsn.node.clone(), key));
+        }
+        Ok(out)
+    }
 }
 
 /// SOL session declaration. Used by M6 once the SOL VM is wired.
@@ -6576,6 +6635,40 @@ fn register_node_type_handlers(
                     let signer = Arc::new(ed25519_dalek::SigningKey::from_bytes(&key_bytes));
                     svc_inner =
                         svc_inner.with_mesh(local_node_name.clone(), signer, late_dispatcher);
+                }
+                // SEC §16: populate the source-node key registry from
+                // [knowledge_trust] so accept_shared binds each inbound
+                // share's signature to the claimed source node by
+                // default. With no keys configured (and no explicit
+                // opt-out) inbound shares from unconfigured sources are
+                // REJECTED — the binding is live, not dormant.
+                let kt = cfg.knowledge_trust.clone().unwrap_or_default();
+                let trusted_keys = kt
+                    .parsed_keys()
+                    .map_err(|e| format!("[knowledge_trust] {e}"))?;
+                for (node, pubkey) in &trusted_keys {
+                    svc_inner = svc_inner.with_source_node_key(node.clone(), *pubkey);
+                }
+                if kt.allow_unbound_sources {
+                    tracing::warn!(
+                        "knowledge: [knowledge_trust] allow_unbound_sources = true — inbound \
+                         shares from sources with NO configured identity key are accepted on \
+                         SIGNATURE ALONE; source-node binding is DISABLED for those sources \
+                         (insecure, deliberate opt-out)"
+                    );
+                    svc_inner = svc_inner.with_allow_unbound_sources(true);
+                } else if trusted_keys.is_empty() {
+                    tracing::warn!(
+                        "knowledge: no [knowledge_trust].source_nodes configured and \
+                         allow_unbound_sources = false — inbound mesh shares from unconfigured \
+                         sources will be REJECTED (source-node binding enforced/fail-closed). \
+                         Configure each peer's identity pubkey to enable cross-node sharing."
+                    );
+                } else {
+                    tracing::info!(
+                        trusted_source_nodes = trusted_keys.len(),
+                        "knowledge: source-node binding enforced for inbound shares (SEC §16)"
+                    );
                 }
                 // RELIX-7.16 GAP 4: build the AutoShareTask
                 // FIRST so we can grab its lifetime stats
