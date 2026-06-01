@@ -250,6 +250,10 @@ pub enum AuditEvent {
     Accessed,
     Rotated,
     Revoked,
+    /// SEC §10: a one-way KDF migration (legacy SHA-256 →
+    /// Argon2id) was applied to the vault. Recorded so the
+    /// weak-KDF retirement is attributable and observable.
+    KdfMigrated,
 }
 
 impl AuditEvent {
@@ -259,6 +263,7 @@ impl AuditEvent {
             Self::Accessed => "accessed",
             Self::Rotated => "rotated",
             Self::Revoked => "revoked",
+            Self::KdfMigrated => "kdf_migrated",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -267,6 +272,7 @@ impl AuditEvent {
             "accessed" => Some(Self::Accessed),
             "rotated" => Some(Self::Rotated),
             "revoked" => Some(Self::Revoked),
+            "kdf_migrated" => Some(Self::KdfMigrated),
             _ => None,
         }
     }
@@ -1329,6 +1335,28 @@ pub fn migrate_kdf(
         )?;
         rows_rotated += 1;
     }
+    // SEC §10: record the one-way KDF migration in the credential
+    // audit log, inside the same tx so it is atomic with the
+    // re-encryption (no audit row exists for a rolled-back
+    // migration, and a committed migration always carries one).
+    // `credential_id` uses the `__vault__` sentinel because this
+    // is a vault-level event, not tied to a single credential.
+    let audit_id = format!("audit_{}", uuid::Uuid::new_v4().simple());
+    let audit_details = format!(
+        "kdf migration sha256->argon2id: {rows_rotated} rows re-encrypted under active version {active_version}"
+    );
+    tx.execute(
+        "INSERT INTO credential_audit (id, credential_id, event, actor, timestamp_ms, details) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            audit_id,
+            "__vault__",
+            AuditEvent::KdfMigrated.as_str(),
+            Option::<&str>::None,
+            unix_ms(),
+            audit_details
+        ],
+    )?;
     tx.commit()?;
     Ok(MigrateKdfReport {
         rows_rotated,
@@ -1632,10 +1660,14 @@ fn derive_aes_key_argon2id(
     Ok(out)
 }
 
-/// SEC PART 1: legacy SHA-256 derivation kept only to power
-/// [`migrate_kdf`] — never reachable from the normal open
-/// path. Removing the legacy path entirely would leave v1
-/// vaults unrecoverable, defeating the migration.
+/// SEC §10 / SEC PART 1: legacy SHA-256 derivation. This fn is
+/// PRIVATE (never `pub`) and has exactly one production call
+/// site — [`migrate_kdf`], the audited one-way (legacy →
+/// Argon2id) migration path. It is unreachable from the normal
+/// open path and uncallable from outside this module, so no
+/// in-process caller can derive a key with SHA-256. Removing the
+/// legacy path entirely would leave v1 vaults unrecoverable,
+/// defeating the migration.
 fn derive_legacy_sha256_key(master_secret: &str) -> Zeroizing<[u8; AES_KEY_LEN]> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -2084,6 +2116,96 @@ mod tests {
             Err(CredentialError::LegacyFormat { .. }) => {}
             Err(other) => panic!("expected LegacyFormat, got {other:?}"),
         }
+    }
+
+    /// SEC §10 criterion 2: the one-way migration path converts a
+    /// legacy-KDF store to Argon2id AND is audited. A `kdf_migrated`
+    /// audit row is written atomically with the migration, and the
+    /// path is one-way (a second migrate is rejected). The legacy
+    /// SHA-256 derivation cannot be invoked directly from outside
+    /// the module — `derive_legacy_sha256_key` is a private fn (see
+    /// the grep in the section transcript); attempting to call it
+    /// from another crate/module would not compile.
+    #[test]
+    fn migrate_kdf_is_audited_and_one_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.db");
+        legacy_seed_vault(&path, "alpha", "k1", "secret-1");
+        legacy_append_to_vault(&path, "alpha", "k2", "secret-2");
+
+        let report = migrate_kdf(
+            &path,
+            "alpha",
+            single_version_map("alpha").unwrap(),
+            KdfParams::for_tests(),
+        )
+        .unwrap();
+        assert_eq!(report.rows_rotated, 2);
+
+        // The migration must have left an audit trail: exactly one
+        // `kdf_migrated` row, recorded against the `__vault__`
+        // sentinel, naming the rows migrated.
+        let conn = Connection::open(&path).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT credential_id, event, details FROM credential_audit \
+                 WHERE event = ?1",
+            )
+            .unwrap();
+        let rows: Vec<(String, String, Option<String>)> = stmt
+            .query_map(params![AuditEvent::KdfMigrated.as_str()], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1, "expected exactly one kdf_migrated audit row");
+        assert_eq!(rows[0].0, "__vault__");
+        assert_eq!(rows[0].1, "kdf_migrated");
+        assert_eq!(
+            AuditEvent::parse(&rows[0].1),
+            Some(AuditEvent::KdfMigrated)
+        );
+        assert!(
+            rows[0]
+                .2
+                .as_deref()
+                .unwrap_or_default()
+                .contains("sha256->argon2id"),
+            "audit details should describe the KDF transition: {:?}",
+            rows[0].2
+        );
+
+        // One-way: a second migrate against the now-v2 vault is
+        // rejected — there is no path back to the legacy KDF.
+        let err = migrate_kdf(
+            &path,
+            "alpha",
+            single_version_map("alpha").unwrap(),
+            KdfParams::for_tests(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CredentialError::NotLegacyFormat));
+    }
+
+    /// SEC §10 criterion 3: normal credential open/store on the
+    /// Argon2id path (the only KDF a fresh vault ever uses) still
+    /// works end to end — store, then read back the plaintext.
+    #[test]
+    fn argon2id_open_store_path_still_works() {
+        let s = fresh_store();
+        s.store(
+            "argon_cred",
+            "argon-secret",
+            CredentialKind::ApiKey,
+            Some("alice"),
+            None,
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+        let got = s.get("argon_cred", Some("alice")).unwrap().unwrap();
+        assert_eq!(got.value.as_str(), "argon-secret");
     }
 
     /// SEC PART 2: Zeroizing wipes the derived key on drop.
