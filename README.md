@@ -63,7 +63,7 @@ Both installers do the same four things:
    pick provider, paste API key, tick channels, confirm.
 4. Save your choices to `~/.relix/config.toml`.
 
-Set `RELIX_VERSION=v0.4.1` to pin a specific release.
+Set `RELIX_VERSION=v0.4.2` to pin a specific release.
 
 ## Quick start
 

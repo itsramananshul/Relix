@@ -7,6 +7,40 @@ once a stable release is cut.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-06-01
+
+Self-healing, long-lived node identities; documentation reconciliation;
+manual-only CI; beta/stable release channels.
+
+### Fixed
+
+- **Identity bundles no longer lapse.** Locally-minted node/service
+  identities now default to a **365-day** lifetime (was 24h), and the
+  mesh-up scripts self-heal at boot via `relix identity ensure` —
+  (re)minting any bundle that is missing, expired, signed by a stale org
+  root, or within its renewal window. A fresh install always boots; a
+  long-running mesh renews ahead of expiry. Expiry remains enforced.
+- Stopped committing pre-minted `dev-keys/*.bundle` files (carried a
+  wall-clock expiry + a local org root absent on fresh checkouts).
+
+### Added
+
+- **`relix identity ensure`** — self-healing/renewing mint used by boot
+  and the mesh-up renewal loop. `BundleHeader::needs_renewal` /
+  `seconds_until_expiry` renewal primitives in `relix-core`.
+- **Beta + stable release channels** driven by tag shape: `vX.Y.Z` =
+  stable (Latest), `vX.Y.Z-beta.N` = GitHub pre-release. See
+  `docs/releasing.md`.
+
+### Changed
+
+- **CI is manual-only** (`workflow_dispatch`) — no pass/fail status on
+  every commit; the CI badge was removed from the README.
+- **Documentation reconciled with the 0.4 codebase** — 78 docs updated,
+  8 new (planning, four-layer-memory, memory-security, reasoning-pipeline,
+  credentials, approval-tokens, embedded, channels/email).
+- Workspace version bumped to `0.4.2`.
+
 ## [0.4.1] - 2026-06-01
 
 Release engineering fix for the `aarch64-unknown-linux-gnu` cross build.
