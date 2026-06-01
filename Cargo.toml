@@ -31,9 +31,10 @@ edition = "2024"
 rust-version = "1.95"
 # Single source of truth for the build version. Every crate sets
 # `version.workspace = true`, so `env!("CARGO_PKG_VERSION")` — used by the
-# setup banner, `relix --version`, and the bridge /v1/info — reports this.
-# Bumped to match the v0.3.0 release tag (was stale at 0.1.0).
-version = "0.3.0"
+# setup banner, `relix --version`, the bridge /v1/info, the MCP client
+# info, and the Discord/Slack user-agents — reports this. Keep it in lock
+# step with the release tag so no binary ever reports a stale version.
+version = "0.4.0"
 license = "MIT OR Apache-2.0"
 publish = false
 repository = "https://github.com/itsramananshul/Relix"
@@ -44,14 +45,14 @@ authors = ["Anshul Raman <ramanal@mail.uc.edu>"]
 [workspace.dependencies]
 
 # Internal crates — version pinned so cargo-deny does not treat them as wildcards.
-relix-core        = { path = "crates/relix-core",        version = "0.3.0" }
-relix-runtime     = { path = "crates/relix-runtime",     version = "0.3.0" }
-relix-web-bridge  = { path = "crates/relix-web-bridge",  version = "0.3.0" }
+relix-core        = { path = "crates/relix-core",        version = "0.4.0" }
+relix-runtime     = { path = "crates/relix-runtime",     version = "0.4.0" }
+relix-web-bridge  = { path = "crates/relix-web-bridge",  version = "0.4.0" }
 # Channel crates — declared at the workspace level so binaries and the
 # bridge can opt in to one with `<crate>.workspace = true`.
-relix-telegram    = { path = "crates/relix-telegram",    version = "0.3.0" }
-relix-discord     = { path = "crates/relix-discord",     version = "0.3.0" }
-relix-slack       = { path = "crates/relix-slack",       version = "0.3.0" }
+relix-telegram    = { path = "crates/relix-telegram",    version = "0.4.0" }
+relix-discord     = { path = "crates/relix-discord",     version = "0.4.0" }
+relix-slack       = { path = "crates/relix-slack",       version = "0.4.0" }
 # Cryptography
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "rand_core", "zeroize"] }
 blake3        = { version = "1.5", default-features = false, features = ["std"] }

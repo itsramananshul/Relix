@@ -131,7 +131,10 @@ impl LiveDiscordApi {
                 .http
                 .request(method.clone(), &url)
                 .header(reqwest::header::AUTHORIZATION, self.auth_header())
-                .header(reqwest::header::USER_AGENT, "Relix (relix.local, 0.1.0)");
+                .header(
+                    reqwest::header::USER_AGENT,
+                    concat!("Relix (relix.local, ", env!("CARGO_PKG_VERSION"), ")"),
+                );
             if let Some(b) = body {
                 req = req.json(b);
             }

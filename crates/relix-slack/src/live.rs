@@ -127,7 +127,10 @@ impl LiveSlackApi {
                 .http
                 .post(&url)
                 .header(reqwest::header::AUTHORIZATION, self.auth_header())
-                .header(reqwest::header::USER_AGENT, "Relix (relix.local, 0.1.0)")
+                .header(
+                    reqwest::header::USER_AGENT,
+                    concat!("Relix (relix.local, ", env!("CARGO_PKG_VERSION"), ")"),
+                )
                 .json(body)
                 .send()
                 .await;
