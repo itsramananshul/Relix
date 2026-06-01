@@ -21,6 +21,12 @@
 #     any zip entry whose resolved path escapes the staging directory
 #     (zip-slip protection — CVE-2018-1002200 class).
 
+param(
+    # SEC §15: run the offline installer self-test (allowlist +
+    # tamper rejection) instead of downloading/installing.
+    [switch]$SelfTest
+)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -153,6 +159,92 @@ function Invoke-SafeExtract {
             Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+}
+
+# ---------------------------------------------------------------------------
+# SEC §15: explicit binary allowlist + tamper-rejecting installer.
+#
+# The release archive ships exactly these executables. We install ONLY
+# these by name and ABORT if the archive carries any other .exe. The
+# pre-fix code located relix.exe then glob-installed every sibling
+# *.exe — so a tampered archive could drop arbitrary executables into
+# the operator's bin dir even when the SHA matched a hash the attacker
+# chose (only the cosign signature binds the SHA to a real release).
+# ---------------------------------------------------------------------------
+$ExpectedBins = @('relix.exe', 'relix-controller.exe', 'relix-web-bridge.exe')
+
+function Install-ExpectedBinaries {
+    param(
+        [Parameter(Mandatory=$true)][string]$ExtractDir,
+        [Parameter(Mandatory=$true)][string]$InstallDir
+    )
+    $allExe = @(Get-ChildItem -LiteralPath $ExtractDir -Recurse -File -Filter '*.exe' -ErrorAction SilentlyContinue)
+
+    # (a) Reject unexpected executables: any *.exe whose name is not in
+    #     the allowlist aborts the install (no glob-install).
+    $unexpected = @($allExe | Where-Object { $ExpectedBins -notcontains $_.Name })
+    if ($unexpected.Count -gt 0) {
+        $names = ($unexpected | ForEach-Object { $_.Name }) -join ', '
+        throw "archive contains unexpected executable(s) outside the allowlist ($($ExpectedBins -join ', ')): $names; refusing to install a tampered archive"
+    }
+
+    # (b) Install each expected executable by EXACT name.
+    $installed = 0
+    foreach ($name in $ExpectedBins) {
+        $src = $allExe | Where-Object { $_.Name -ieq $name } | Select-Object -First 1
+        if (-not $src) { continue }
+        $dest = Join-Path $InstallDir $name
+        Copy-Item -LiteralPath $src.FullName -Destination $dest -Force
+        Write-Host "  installed: $dest"
+        $installed++
+    }
+    if ($installed -eq 0) {
+        throw "archive did not contain any expected binary ($($ExpectedBins -join ', ')) in $ExtractDir"
+    }
+}
+
+# Invoke-SelfTest: `install.ps1 -SelfTest`. Offline harness proving a
+# clean archive installs ONLY the allowlisted binaries and a tampered
+# archive with an extra executable is rejected with nothing installed.
+function Invoke-SelfTest {
+    $root = Join-Path ([System.IO.Path]::GetTempPath()) ("relix-selftest-" + [System.IO.Path]::GetRandomFileName())
+    try {
+        # -- clean archive: relix.exe + relix-controller.exe + README.md --
+        $extract = Join-Path $root 'clean\relix-x86_64'
+        $bindir  = Join-Path $root 'bin'
+        New-Item -ItemType Directory -Force -Path $extract | Out-Null
+        New-Item -ItemType Directory -Force -Path $bindir  | Out-Null
+        Set-Content -LiteralPath (Join-Path $extract 'relix.exe')            -Value 'bin'  -Encoding Ascii
+        Set-Content -LiteralPath (Join-Path $extract 'relix-controller.exe') -Value 'bin'  -Encoding Ascii
+        Set-Content -LiteralPath (Join-Path $extract 'README.md')            -Value 'docs' -Encoding Ascii
+        Install-ExpectedBinaries -ExtractDir (Join-Path $root 'clean') -InstallDir $bindir
+        if (-not (Test-Path -LiteralPath (Join-Path $bindir 'relix.exe')))            { throw 'SELF-TEST FAIL: relix.exe not installed' }
+        if (-not (Test-Path -LiteralPath (Join-Path $bindir 'relix-controller.exe'))) { throw 'SELF-TEST FAIL: relix-controller.exe not installed' }
+        if (Test-Path -LiteralPath (Join-Path $bindir 'README.md'))                   { throw 'SELF-TEST FAIL: README.md was installed' }
+        Write-Host "self-test: clean archive installed ONLY allowlisted binaries (README.md skipped)"
+
+        # -- tampered archive: extra executable 'evil.exe' --
+        $textract = Join-Path $root 'tampered'
+        $tbindir  = Join-Path $root 'bin2'
+        New-Item -ItemType Directory -Force -Path $textract | Out-Null
+        New-Item -ItemType Directory -Force -Path $tbindir  | Out-Null
+        Set-Content -LiteralPath (Join-Path $textract 'relix.exe') -Value 'bin' -Encoding Ascii
+        Set-Content -LiteralPath (Join-Path $textract 'evil.exe')  -Value 'bin' -Encoding Ascii
+        $rejected = $false
+        try { Install-ExpectedBinaries -ExtractDir $textract -InstallDir $tbindir } catch { $rejected = $true }
+        if (-not $rejected)                                            { throw 'SELF-TEST FAIL: tampered archive (extra exe) NOT rejected' }
+        if (Test-Path -LiteralPath (Join-Path $tbindir 'relix.exe'))   { throw 'SELF-TEST FAIL: tampered archive installed a binary' }
+        Write-Host "self-test: tampered archive (extra executable 'evil.exe') rejected; nothing installed"
+
+        Write-Host 'SELF-TEST PASS'
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+if ($SelfTest) {
+    Invoke-SelfTest
+    exit 0
 }
 
 # Track temp paths for cleanup
@@ -324,36 +416,12 @@ try {
     Write-Host "Extracting archive (zip-slip-safe)..."
     Invoke-SafeExtract -Archive $TmpZip -Dest $TmpExtract
 
-    # Locate the main relix.exe first. `Select-Object -First 1` always
-    # returns a single object (or $null) regardless of how many .exe
-    # files matched — avoiding the strict-mode trap where .Count on a
-    # single-result `Get-ChildItem` throws "property 'Count' cannot be
-    # found on this object".
-    $relixSrc = Get-ChildItem -LiteralPath $TmpExtract -Recurse -File `
-            -Filter 'relix.exe' -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if (-not $relixSrc) {
-        Write-Error "archive did not contain relix.exe (extract dir: $TmpExtract)"
-        return
-    }
+    # SEC §15: install ONLY the explicit allowlisted binary names and
+    # abort if the archive carries any unexpected .exe. No glob-install
+    # of whatever sibling executables happen to be present.
+    Install-ExpectedBinaries -ExtractDir $TmpExtract -InstallDir $InstallDir
 
     $relixDest = Join-Path $InstallDir 'relix.exe'
-    Copy-Item -LiteralPath $relixSrc.FullName -Destination $relixDest -Force
-    Write-Host "  installed: $relixDest"
-
-    # Install any sibling .exe files (e.g. relix-controller.exe,
-    # relix-web-bridge.exe if a future archive ships them) from the
-    # same directory as relix.exe. A `foreach` over an empty / single /
-    # multi result is safe under strict mode — no .Count access.
-    $payloadDir = $relixSrc.Directory.FullName
-    foreach ($exe in (Get-ChildItem -LiteralPath $payloadDir -File `
-                          -Filter '*.exe' -ErrorAction SilentlyContinue)) {
-        if ($exe.Name -ieq 'relix.exe') { continue }
-        $siblingDest = Join-Path $InstallDir $exe.Name
-        Copy-Item -LiteralPath $exe.FullName -Destination $siblingDest -Force
-        Write-Host "  installed: $siblingDest"
-    }
-
     if (-not (Test-Path -LiteralPath $relixDest)) {
         Write-Error "expected 'relix.exe' not found at $relixDest after install"
         return

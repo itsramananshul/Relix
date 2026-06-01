@@ -61,6 +61,123 @@ have() {
 }
 
 # ---------------------------------------------------------------------------
+# SEC §15: explicit binary allowlist + tamper-rejecting installer.
+#
+# The release archive ships exactly these executables. We install
+# ONLY these by name and ABORT if the archive carries any other
+# executable. The pre-fix code globbed `find -perm -u+x` and even
+# had a fallback that copied EVERY regular file — so a tampered
+# archive could drop arbitrary executables into the operator's bin
+# dir even though the SHA matched a hash the attacker chose (only
+# the cosign signature binds the SHA to a real release).
+# ---------------------------------------------------------------------------
+EXPECTED_BINS="relix relix-controller relix-web-bridge"
+
+# install_expected_binaries <extract_dir> <install_dir>
+install_expected_binaries() {
+    extract_dir="$1"
+    install_dir="$2"
+
+    # (a) Reject unexpected executables. Any +x regular file or *.exe
+    #     whose basename is not in the allowlist aborts the install.
+    #     Documented non-binary payload (docs / config / shell +
+    #     PowerShell scripts — the scripts are hash-verified
+    #     separately against SHA256SUMS) is tolerated.
+    unexpected=""
+    while IFS= read -r f; do
+        [ -z "${f}" ] && continue
+        b="$(basename "${f}")"
+        case " ${EXPECTED_BINS} " in *" ${b} "*) continue ;; esac
+        case "${b}" in
+            *.md|*.txt|*.json|*.toml|*.yaml|*.yml|*.sh|*.ps1|LICENSE*|README*|CHANGELOG*) continue ;;
+        esac
+        unexpected="${unexpected}  ${f}
+"
+    done <<EOF
+$(find "${extract_dir}" -type f \( -perm -u+x -o -name '*.exe' \) 2>/dev/null)
+EOF
+    if [ -n "${unexpected}" ]; then
+        printf 'unexpected executable(s) in archive:\n%s' "${unexpected}" >&2
+        err "archive contains executable(s) outside the allowlist (${EXPECTED_BINS}); refusing to install a tampered archive"
+    fi
+
+    # (b) Install each expected binary by EXACT name — never a glob.
+    installed=0
+    for name in ${EXPECTED_BINS}; do
+        src="$(find "${extract_dir}" -type f -name "${name}" 2>/dev/null | head -n1)"
+        [ -z "${src}" ] && continue
+        dest="${install_dir}/${name}"
+        cp -f "${src}" "${dest}" || err "failed to copy ${src} -> ${dest}"
+        chmod +x "${dest}"        || err "failed to chmod +x ${dest}"
+        installed=1
+        info "  installed: ${dest}"
+    done
+    if [ "${installed}" -eq 0 ]; then
+        err "archive did not contain any expected binary (${EXPECTED_BINS}) in ${extract_dir}"
+    fi
+}
+
+# run_self_test: `install.sh --self-test`. Offline harness proving
+# (1) a clean archive installs only the allowlisted binaries,
+# (2) a tampered archive with an extra executable is rejected and
+#     nothing is installed, and
+# (3) the SHA256 gate accepts the correct hash and rejects a wrong
+#     one. Exits non-zero on any failure.
+run_self_test() {
+    root="$(mktemp -d)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '${root}'" EXIT
+
+    # -- clean archive: relix + relix-controller + README.md --
+    extract="${root}/clean"; bindir="${root}/bin"
+    mkdir -p "${extract}/relix-x86_64" "${bindir}"
+    printf '#!/bin/sh\n' > "${extract}/relix-x86_64/relix";            chmod +x "${extract}/relix-x86_64/relix"
+    printf '#!/bin/sh\n' > "${extract}/relix-x86_64/relix-controller"; chmod +x "${extract}/relix-x86_64/relix-controller"
+    printf 'docs\n'      > "${extract}/relix-x86_64/README.md"
+    install_expected_binaries "${extract}" "${bindir}"
+    [ -x "${bindir}/relix" ]            || { printf 'SELF-TEST FAIL: relix not installed\n' >&2; exit 1; }
+    [ -x "${bindir}/relix-controller" ] || { printf 'SELF-TEST FAIL: relix-controller not installed\n' >&2; exit 1; }
+    [ -e "${bindir}/README.md" ]        && { printf 'SELF-TEST FAIL: README.md was installed\n' >&2; exit 1; }
+    info "self-test: clean archive installed ONLY allowlisted binaries (README.md skipped)"
+
+    # -- tampered archive: extra executable 'evilbin' --
+    extract="${root}/tampered"; bindir="${root}/bin2"
+    mkdir -p "${extract}" "${bindir}"
+    printf '#!/bin/sh\n' > "${extract}/relix";   chmod +x "${extract}/relix"
+    printf '#!/bin/sh\n' > "${extract}/evilbin"; chmod +x "${extract}/evilbin"
+    rc=0
+    ( install_expected_binaries "${extract}" "${bindir}" ) >/dev/null 2>&1 || rc=$?
+    [ "${rc}" -ne 0 ]            || { printf 'SELF-TEST FAIL: tampered archive (extra exe) NOT rejected\n' >&2; exit 1; }
+    [ ! -e "${bindir}/relix" ]  || { printf 'SELF-TEST FAIL: tampered archive installed a binary\n' >&2; exit 1; }
+    info "self-test: tampered archive (extra executable 'evilbin') rejected; nothing installed"
+
+    # -- SHA256 gate: right hash passes, wrong hash fails --
+    f="${root}/payload.bin"; printf 'payload-bytes' > "${f}"
+    sha=""; SHACHK=""
+    if have sha256sum; then sha="$(sha256sum "${f}" | awk '{print $1}')"; SHACHK="sha256sum";
+    elif have shasum; then sha="$(shasum -a 256 "${f}" | awk '{print $1}')"; SHACHK="shasum -a 256";
+    fi
+    if [ -n "${sha}" ]; then
+        printf '%s  %s\n' "${sha}" "${f}" | ${SHACHK} -c - >/dev/null 2>&1 \
+            || { printf 'SELF-TEST FAIL: correct hash rejected\n' >&2; exit 1; }
+        rc=0
+        printf '%s  %s\n' "0000000000000000000000000000000000000000000000000000000000000000" "${f}" \
+            | ${SHACHK} -c - >/dev/null 2>&1 || rc=$?
+        [ "${rc}" -ne 0 ] || { printf 'SELF-TEST FAIL: wrong hash accepted\n' >&2; exit 1; }
+        info "self-test: SHA256 gate accepts correct hash, rejects wrong hash"
+    else
+        warn "self-test: no sha256 tool available; skipped the hash-gate check"
+    fi
+
+    info "SELF-TEST PASS"
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+    run_self_test
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # Download / verify helpers (PART 3 + PART 4 + PART 5)
 # ---------------------------------------------------------------------------
 
@@ -403,47 +520,10 @@ fi
 info "Extracting archive (tar-slip-safe)..."
 safe_extract "${ARCHIVE_PATH}" "${EXTRACT_DIR}"
 
-# Collect every regular executable file from the extract dir (handles either
-# a flat archive or one with a top-level subdir).
-INSTALLED_ANY=0
-# shellcheck disable=SC2044
-while IFS= read -r bin; do
-    [ -z "${bin}" ] && continue
-    base="$(basename "${bin}")"
-    # Skip non-binary metadata files
-    case "${base}" in
-        *.md|*.txt|*.json|*.toml|LICENSE*|README*|CHANGELOG*) continue ;;
-    esac
-    dest="${INSTALL_DIR}/${base}"
-    cp -f "${bin}" "${dest}" || err "failed to copy ${bin} -> ${dest}"
-    chmod +x "${dest}"      || err "failed to chmod +x ${dest}"
-    INSTALLED_ANY=1
-    info "  installed: ${dest}"
-done <<EOF
-$(find "${EXTRACT_DIR}" -type f \( -perm -u+x -o -name 'relix' -o -name 'relix-*' \) 2>/dev/null)
-EOF
-
-if [ "${INSTALLED_ANY}" -eq 0 ]; then
-    # Fallback: try installing every regular file (some archives strip the +x bit)
-    while IFS= read -r bin; do
-        [ -z "${bin}" ] && continue
-        base="$(basename "${bin}")"
-        case "${base}" in
-            *.md|*.txt|*.json|*.toml|LICENSE*|README*|CHANGELOG*) continue ;;
-        esac
-        dest="${INSTALL_DIR}/${base}"
-        cp -f "${bin}" "${dest}" || err "failed to copy ${bin} -> ${dest}"
-        chmod +x "${dest}"      || err "failed to chmod +x ${dest}"
-        INSTALLED_ANY=1
-        info "  installed: ${dest}"
-    done <<EOF2
-$(find "${EXTRACT_DIR}" -type f 2>/dev/null)
-EOF2
-fi
-
-if [ "${INSTALLED_ANY}" -eq 0 ]; then
-    err "archive did not contain any binaries (looked in ${EXTRACT_DIR})"
-fi
+# SEC §15: install ONLY the explicit allowlisted binary names and
+# abort if the archive carries any unexpected executable. No
+# glob / perm scan, no install-everything fallback.
+install_expected_binaries "${EXTRACT_DIR}" "${INSTALL_DIR}"
 
 if [ ! -x "${INSTALL_DIR}/relix" ]; then
     err "expected 'relix' binary not found at ${INSTALL_DIR}/relix after install"
