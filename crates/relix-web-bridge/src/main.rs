@@ -299,6 +299,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         deadline_secs: state.cfg.transport.deadline_secs.min(10),
         overall_timeout: std::time::Duration::from_secs(6),
         local_port: None,
+        source_key_registry: None,
     };
     match relix_runtime::manifest::discover_and_pin(discovery_opts).await {
         Some((discovered, mesh_client)) => {

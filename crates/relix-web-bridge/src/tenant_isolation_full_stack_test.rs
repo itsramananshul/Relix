@@ -803,6 +803,7 @@ async fn boot_harness(
         deadline_secs: 30,
         overall_timeout: Duration::from_secs(8),
         local_port: None,
+        source_key_registry: None,
     };
     let (_cache, mesh) = discover_and_pin(opts).await.expect("discover_and_pin");
     let state = AppState {
