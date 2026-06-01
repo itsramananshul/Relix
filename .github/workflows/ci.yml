@@ -2,22 +2,16 @@ name: CI
 
 # Actions-minute policy (see scripts/ci-local.ps1):
 #
-# On push / PR, GitHub runs ONLY the macOS + Linux workspace test — the
-# platform coverage a Windows-only local dev box cannot reproduce
-# (OS-specific code under #[cfg(unix)] / #[cfg(target_os=...)], path and
-# line-ending differences). Everything platform-independent — rustfmt,
-# clippy, cargo deny — and the Windows test leg are run locally via
-# `scripts/ci-local.ps1` before tagging. Those jobs are KEPT here (not
-# deleted) but gated to manual `workflow_dispatch` so they no longer
-# burn Actions minutes on every commit.
+# CI does NOT run automatically on push or PR — it is manual-only
+# (workflow_dispatch), so no red/green pass-fail status is attached to
+# every commit. Run the full gate locally via `scripts/ci-local.ps1`
+# before tagging, or trigger this workflow by hand from the Actions tab
+# when you want the macOS + Linux coverage a Windows-only dev box cannot
+# reproduce (OS-specific code under #[cfg(unix)] / #[cfg(target_os=...)],
+# path and line-ending differences).
 #
-# (release.yml still runs on v* tags; fast-ci.yml / heavy-ci.yml /
-# nightly-security.yml are disabled in the Actions UI.)
+# (release.yml still runs on v* tags.)
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 env:
@@ -25,11 +19,8 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Platform-independent — run locally via scripts/ci-local.ps1.
-  # Manual-only: runs on workflow_dispatch, SKIPPED on push / PR.
   fmt:
     name: rustfmt
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,11 +29,8 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  # Platform-independent — run locally via scripts/ci-local.ps1.
-  # Manual-only: runs on workflow_dispatch, SKIPPED on push / PR.
   clippy:
     name: clippy
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,13 +39,12 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         # Cache is a build-speed optimisation, not a correctness gate; a
-        # restore/save failure must never fail an otherwise-green commit.
+        # restore/save failure must never fail an otherwise-green run.
         continue-on-error: true
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # KEPT auto-running on push / PR. The macOS + Linux workspace test is
-  # the coverage a Windows-only local run cannot give. The
-  # windows-latest leg was intentionally dropped — it is run locally via
+  # The macOS + Linux workspace test is the coverage a Windows-only local
+  # run cannot give. The windows-latest leg is run locally via
   # scripts/ci-local.ps1 (which also covers fmt / clippy / deny).
   test:
     name: test (${{ matrix.os }})
@@ -71,17 +58,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         # Cache is a build-speed optimisation, not a correctness gate; a
-        # restore/save failure must never fail an otherwise-green commit.
+        # restore/save failure must never fail an otherwise-green run.
         continue-on-error: true
       - run: cargo test --workspace
 
   # Supply-chain gate (license allowlist + advisories + sources). Reads
-  # the lockfile, so it is platform-independent — run locally via
-  # scripts/ci-local.ps1 (`cargo deny check --all-features`). Manual-only:
-  # runs on workflow_dispatch, SKIPPED on push / PR.
+  # the lockfile, so it is platform-independent — also available locally
+  # via scripts/ci-local.ps1 (`cargo deny check --all-features`).
   deny:
     name: cargo deny
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

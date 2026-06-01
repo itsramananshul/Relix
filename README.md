@@ -10,7 +10,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/itsramananshul/Relix/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/itsramananshul/Relix/ci.yml?branch=main&style=for-the-badge" alt="CI"></a>
   <a href="https://github.com/itsramananshul/Relix/releases"><img src="https://img.shields.io/github/v/release/itsramananshul/Relix?include_prereleases&style=for-the-badge" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg?style=for-the-badge" alt="MIT OR Apache-2.0"></a>
 </p>
