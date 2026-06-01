@@ -7,6 +7,16 @@ once a stable release is cut.
 
 ## [Unreleased]
 
+## [0.4.3-beta.1] - 2026-06-01
+
+First build on the **beta** channel (GitHub pre-release; not "Latest").
+
+### Added
+
+- **Beta install channel.** `RELIX_CHANNEL=beta` (install.sh /
+  install.ps1) installs the newest pre-release; `RELIX_VERSION` pins any
+  exact tag. Per-OS one-liners documented in the README.
+
 ## [0.4.2] - 2026-06-01
 
 Self-healing, long-lived node identities; documentation reconciliation;
