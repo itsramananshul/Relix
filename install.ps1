@@ -483,18 +483,42 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # 5c. Mesh scripts (PART 5)
+    # 5c. Mesh scripts + flow templates
     #
-    # Pinned to the resolved release tag (not `main`) and each file's
-    # SHA256 is checked against the cosign-verified SHA256SUMS.txt
-    # above. `relix boot` spawns the mesh through
-    # scripts/relix-mesh-up.ps1; users who installed via 'irm | iex'
-    # don't have a repo checkout. Drop the scripts in
-    # $env:USERPROFILE\.local\scripts\ — the relix-cli locate_script
-    # helper falls back to this path after the repo and binary-dir
-    # lookups.
+    # Preferred path: the release archive bundles scripts\ + flows\ (covered
+    # by the archive SHA256 + cosign signature verified above), so place them
+    # straight from the extracted tree into the dirs `relix boot` searches
+    # ($env:USERPROFILE\.local\scripts, \.local\flows). Only when the archive
+    # predates that packaging do we fall back to per-file fetch + SHA256SUMS.
     # -----------------------------------------------------------------------
     $ScriptsDir = Join-Path $env:USERPROFILE '.local\scripts'
+    $FlowsDir   = Join-Path $env:USERPROFILE '.local\flows'
+    $auxFromArchive = $false
+    $extractScripts = Join-Path $TmpExtract 'scripts'
+    $extractFlows   = Join-Path $TmpExtract 'flows'
+    if (Test-Path -LiteralPath $extractScripts) {
+        New-Item -ItemType Directory -Path $ScriptsDir -Force -ErrorAction SilentlyContinue | Out-Null
+        foreach ($s in @('relix-mesh-up.ps1', 'relix-mesh-down.ps1')) {
+            $src = Join-Path $extractScripts $s
+            if (Test-Path -LiteralPath $src) {
+                Copy-Item -LiteralPath $src -Destination (Join-Path $ScriptsDir $s) -Force
+                Write-Host "  installed: $(Join-Path $ScriptsDir $s)"
+                if ($s -eq 'relix-mesh-up.ps1') { $auxFromArchive = $true }
+            }
+        }
+    }
+    if (Test-Path -LiteralPath $extractFlows) {
+        New-Item -ItemType Directory -Path $FlowsDir -Force -ErrorAction SilentlyContinue | Out-Null
+        Get-ChildItem -LiteralPath $extractFlows -File -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $FlowsDir $_.Name) -Force
+            Write-Host "  installed: $(Join-Path $FlowsDir $_.Name)"
+        }
+    }
+    if ($auxFromArchive) {
+        Write-Host "Mesh scripts + flow templates installed from the release archive."
+    } else {
+        Write-Warning "release archive did not bundle scripts/flows; falling back to per-file fetch + SHA256SUMS verification."
+        $ScriptsDir = Join-Path $env:USERPROFILE '.local\scripts'
     if (-not (Test-Path -LiteralPath $ScriptsDir)) {
         try {
             New-Item -ItemType Directory -Path $ScriptsDir -Force | Out-Null
@@ -548,6 +572,7 @@ try {
             Write-Warning "no SHA256 for flows/$flow in SHA256SUMS.txt; skipping (use a repo checkout)"
         }
     }
+    }  # end fallback: scripts/flows not bundled in the archive
 
     # -----------------------------------------------------------------------
     # 6. PATH wiring (user scope)

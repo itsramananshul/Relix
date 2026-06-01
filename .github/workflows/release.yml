@@ -157,24 +157,38 @@ jobs:
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
-          mkdir -p dist
+          mkdir -p dist dist/scripts dist/flows
           cp "target/${{ matrix.target }}/release/relix-cli"        dist/relix
           cp "target/${{ matrix.target }}/release/relix-controller" dist/relix-controller
           cp "target/${{ matrix.target }}/release/relix-web-bridge" dist/relix-web-bridge
           chmod +x dist/relix dist/relix-controller dist/relix-web-bridge
+          # Bundle the mesh boot scripts + flow templates that `relix boot`
+          # needs. A binary-only archive left fresh installs unable to boot
+          # (the installers fall back to a fragile separate raw fetch). Both
+          # OS' scripts ride along so either installer finds what it needs.
+          cp scripts/relix-mesh-up.sh scripts/relix-mesh-down.sh \
+             scripts/relix-mesh-up.ps1 scripts/relix-mesh-down.ps1 dist/scripts/
+          cp flows/chat_template.sol flows/chat.sol flows/chat_with_tool.sol \
+             flows/chat_with_retry.sflow dist/flows/
+          chmod +x dist/scripts/*.sh
           tar -C dist -czf "relix-${{ matrix.target }}.tar.gz" \
-            relix relix-controller relix-web-bridge
+            relix relix-controller relix-web-bridge scripts flows
 
       - name: Package (zip)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          New-Item -ItemType Directory -Force -Path dist, dist/scripts, dist/flows | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/relix-cli.exe"        "dist/relix.exe"
           Copy-Item "target/${{ matrix.target }}/release/relix-controller.exe" "dist/relix-controller.exe"
           Copy-Item "target/${{ matrix.target }}/release/relix-web-bridge.exe" "dist/relix-web-bridge.exe"
+          # Bundle the mesh boot scripts + flow templates `relix boot` needs.
+          Copy-Item "scripts/relix-mesh-up.sh","scripts/relix-mesh-down.sh",`
+            "scripts/relix-mesh-up.ps1","scripts/relix-mesh-down.ps1" "dist/scripts/"
+          Copy-Item "flows/chat_template.sol","flows/chat.sol",`
+            "flows/chat_with_tool.sol","flows/chat_with_retry.sflow" "dist/flows/"
           Compress-Archive `
-            -Path "dist/relix.exe","dist/relix-controller.exe","dist/relix-web-bridge.exe" `
+            -Path "dist/relix.exe","dist/relix-controller.exe","dist/relix-web-bridge.exe","dist/scripts","dist/flows" `
             -DestinationPath "relix-${{ matrix.target }}.zip" -Force
 
       # PART 3: Sigstore keyless signing. cosign uses the workflow's

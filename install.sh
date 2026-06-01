@@ -121,6 +121,44 @@ EOF
     fi
 }
 
+# install_aux_payload: place the mesh boot scripts + flow templates that
+# ship inside the release archive (since the packaging fix) into the dirs
+# `relix boot` searches — ~/.local/scripts (scripts, chmod +x) and
+# ~/.local/flows (flows). Returns 0 if at least the mesh-up script was
+# placed from the archive, so the caller can skip the remote fallback.
+# Args: <extract_dir> <scripts_dir> <flows_dir>
+install_aux_payload() {
+    extract_dir="$1"
+    scripts_dir="$2"
+    flows_dir="$3"
+    placed_up=0
+
+    if [ -d "${extract_dir}/scripts" ]; then
+        mkdir -p "${scripts_dir}" 2>/dev/null || true
+        for s in relix-mesh-up.sh relix-mesh-down.sh; do
+            src="${extract_dir}/scripts/${s}"
+            [ -f "${src}" ] || continue
+            if cp -f "${src}" "${scripts_dir}/${s}" 2>/dev/null; then
+                chmod +x "${scripts_dir}/${s}" 2>/dev/null || true
+                info "  installed: ${scripts_dir}/${s}"
+                [ "${s}" = "relix-mesh-up.sh" ] && placed_up=1
+            fi
+        done
+    fi
+
+    if [ -d "${extract_dir}/flows" ]; then
+        mkdir -p "${flows_dir}" 2>/dev/null || true
+        for src in "${extract_dir}/flows/"*; do
+            [ -f "${src}" ] || continue
+            if cp -f "${src}" "${flows_dir}/$(basename "${src}")" 2>/dev/null; then
+                info "  installed: ${flows_dir}/$(basename "${src}")"
+            fi
+        done
+    fi
+
+    [ "${placed_up}" -eq 1 ]
+}
+
 # run_self_test: `install.sh --self-test`. Offline harness proving
 # (1) a clean archive installs only the allowlisted binaries,
 # (2) a tampered archive with an extra executable is rejected and
@@ -172,6 +210,25 @@ run_self_test() {
     else
         warn "self-test: no sha256 tool available; skipped the hash-gate check"
     fi
+
+    # -- aux payload: scripts/ + flows/ from an extracted archive land in
+    #    ~/.local-style dirs (scripts executable), matching where relix boot
+    #    looks. Offline; no network. --
+    aux="${root}/extract-aux"
+    sdir="${root}/scripts-out"; fdir="${root}/flows-out"
+    mkdir -p "${aux}/scripts" "${aux}/flows"
+    printf '#!/usr/bin/env bash\necho up\n'   > "${aux}/scripts/relix-mesh-up.sh"
+    printf '#!/usr/bin/env bash\necho down\n' > "${aux}/scripts/relix-mesh-down.sh"
+    printf 'flow up\n'                         > "${aux}/flows/chat_template.sol"
+    printf 'flow retry\n'                      > "${aux}/flows/chat_with_retry.sflow"
+    if install_aux_payload "${aux}" "${sdir}" "${fdir}" >/dev/null; then :; else
+        printf 'SELF-TEST FAIL: install_aux_payload reported no mesh-up script placed\n' >&2; exit 1
+    fi
+    [ -x "${sdir}/relix-mesh-up.sh" ]   || { printf 'SELF-TEST FAIL: relix-mesh-up.sh not placed/executable\n' >&2; exit 1; }
+    [ -x "${sdir}/relix-mesh-down.sh" ] || { printf 'SELF-TEST FAIL: relix-mesh-down.sh not placed/executable\n' >&2; exit 1; }
+    [ -f "${fdir}/chat_template.sol" ]  || { printf 'SELF-TEST FAIL: chat_template.sol not placed\n' >&2; exit 1; }
+    [ -f "${fdir}/chat_with_retry.sflow" ] || { printf 'SELF-TEST FAIL: chat_with_retry.sflow not placed\n' >&2; exit 1; }
+    info "self-test: mesh scripts placed executable + flows placed from archive payload"
 
     info "SELF-TEST PASS"
 }
@@ -565,12 +622,22 @@ if [ ! -x "${INSTALL_DIR}/relix" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 6b. Per-release SHA256SUMS + cosign verification (PART 3 + 5)
+# 6b. Mesh scripts + flow templates
 #
-# Fetch the per-tag SHA256SUMS file along with its cosign signature
-# and certificate. Verify the signature (when cosign is present),
-# then keep the file around for per-script verification below.
+# Preferred path: the release archive bundles scripts/ + flows/ (covered by
+# the archive's SHA256 + cosign signature verified above), so place them
+# straight from the extracted tree into the dirs `relix boot` searches
+# (~/.local/scripts, ~/.local/flows). Only when the archive predates that
+# packaging (no scripts/ dir in it) do we fall back to fetching each file
+# from the release tag and gating on the per-release SHA256SUMS.txt.
 # ---------------------------------------------------------------------------
+SCRIPTS_DIR="${HOME}/.local/scripts"
+FLOWS_DIR="${HOME}/.local/flows"
+if install_aux_payload "${EXTRACT_DIR}" "${SCRIPTS_DIR}" "${FLOWS_DIR}"; then
+    info "Mesh scripts + flow templates installed from the release archive."
+else
+    warn "release archive did not bundle scripts/flows; falling back to per-file fetch + SHA256SUMS verification."
+
 SUMS_AVAILABLE=0
 if have curl; then
     if curl -fsSL -o "${SUMS_PATH}" "${SUMS_URL}" 2>/dev/null \
@@ -661,6 +728,7 @@ for flow in chat_template.sol chat.sol chat_with_tool.sol chat_with_retry.sflow;
         warn "no SHA256 for flows/${flow} in SHA256SUMS.txt; skipping (use a repo checkout)"
     fi
 done
+fi  # end fallback: scripts/flows not bundled in the archive
 
 # ---------------------------------------------------------------------------
 # 7. PATH wiring
