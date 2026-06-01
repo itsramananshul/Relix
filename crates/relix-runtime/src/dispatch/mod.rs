@@ -442,12 +442,20 @@ pub struct DispatchBridge {
     /// rids inside the freshness window return
     /// [`error_kinds::REPLAY_REJECTED`].
     replay_cache: replay::ReplayCache,
-    /// P2 — maximum clock-skew tolerance in ms between the
-    /// caller's `issued_at_ms` and the responder's `now_ms`.
-    /// Envelopes older OR farther in the future than this
-    /// margin are rejected as stale. Default 5 s; tunable per
-    /// deployment via [`Self::set_max_clock_skew_ms`].
+    /// SECTION 7 — ONE-SIDED future clock-skew allowance in ms.
+    /// An envelope stamped more than this far in the FUTURE
+    /// (`issued_at_ms - now_ms > max_clock_skew_ms`) is rejected;
+    /// a future-stamped envelope must never be admitted just for
+    /// being "within window". Default 5 s; tune via
+    /// [`Self::set_max_clock_skew_ms`].
     max_clock_skew_ms: i64,
+    /// SECTION 7 — freshness window in ms for PAST envelopes
+    /// (RELIX-1 §1.9 — 5 minutes). An envelope older than this
+    /// (`now_ms - issued_at_ms > freshness_window_ms`) is
+    /// rejected as stale. Also the replay cache's retention
+    /// window, since a nonce older than this is necessarily
+    /// stale. Tune via [`Self::set_freshness_window_ms`].
+    freshness_window_ms: i64,
     /// P5 — optional session-token verification gate. When
     /// `Some` AND `verify_on_dispatch_enabled = true`, every
     /// admitted call MUST carry a wire-encoded session token
@@ -668,7 +676,8 @@ impl DispatchBridge {
             approval_keyset: crate::approval::ApprovalKeySet::new(),
             approval_signer: None,
             replay_cache: replay::ReplayCache::new(replay::DEFAULT_WINDOW_MS),
-            max_clock_skew_ms: replay::DEFAULT_WINDOW_MS,
+            max_clock_skew_ms: replay::DEFAULT_CLOCK_SKEW_MS,
+            freshness_window_ms: replay::DEFAULT_WINDOW_MS,
             session_service: None,
             verify_on_dispatch_enabled: false,
             clock: Arc::new(relix_core::clock::SystemClock),
@@ -724,27 +733,37 @@ impl DispatchBridge {
         &self.approval_keyset
     }
 
-    /// P2: set the maximum clock-skew tolerance in ms. The
-    /// admission step rejects envelopes whose
-    /// `|now_ms - issued_at_ms| > max_clock_skew_ms` as
-    /// `REPLAY_REJECTED`. Also resizes the replay cache so the
-    /// freshness window matches the tolerance — any nonce
-    /// past the window is necessarily stale and can be evicted.
+    /// SECTION 7: set the ONE-SIDED future clock-skew allowance
+    /// in ms. Admission rejects an envelope stamped more than
+    /// this far in the future. This is independent of the
+    /// replay cache window (which tracks the freshness window) —
+    /// see [`Self::set_freshness_window_ms`].
     pub fn set_max_clock_skew_ms(&mut self, max_skew_ms: i64) {
-        let skew = max_skew_ms.max(1);
-        self.max_clock_skew_ms = skew;
-        // Resize the cache by replacing it. Existing entries
-        // are dropped — operators tuning skew live want a
-        // clean window, and the freshness check above the
-        // cache already rejects any envelope older than the
-        // new window.
-        self.replay_cache = replay::ReplayCache::new(skew);
+        self.max_clock_skew_ms = max_skew_ms.max(1);
     }
 
-    /// P2: read the configured maximum clock-skew tolerance in
-    /// ms. Used by tests + the controller startup log.
+    /// SECTION 7: read the configured future clock-skew
+    /// allowance in ms. Used by tests + the controller log.
     pub fn max_clock_skew_ms(&self) -> i64 {
         self.max_clock_skew_ms
+    }
+
+    /// SECTION 7: set the PAST freshness window in ms (RELIX-1
+    /// §1.9 mandates 5 minutes by default). Resizes the replay
+    /// cache to the same window — a nonce older than the window
+    /// is necessarily stale, so it can be evicted. Existing
+    /// entries are dropped on resize (operators tuning the
+    /// window live want a clean cache; the freshness check
+    /// rejects anything older than the new window anyway).
+    pub fn set_freshness_window_ms(&mut self, window_ms: i64) {
+        let window = window_ms.max(1);
+        self.freshness_window_ms = window;
+        self.replay_cache = replay::ReplayCache::new(window);
+    }
+
+    /// SECTION 7: read the configured past freshness window.
+    pub fn freshness_window_ms(&self) -> i64 {
+        self.freshness_window_ms
     }
 
     /// P2: borrow a clone of the replay-cache handle so the
@@ -1315,16 +1334,24 @@ impl DispatchBridge {
                 .await;
         }
 
-        // === Admission step 4a: freshness (RELIX-1 §1.7) ===
-        // P2 — reject envelopes whose `issued_at_ms` is more
-        // than `max_clock_skew_ms` away from `now_ms` in
-        // either direction. Bounds the worst-case replay window
-        // (set to a few seconds rather than 30) so an attacker
-        // who captures a still-fresh envelope has very little
-        // time to act, and lets the replay cache safely evict
-        // entries past the same window.
-        let skew = (now_ms - req.issued_at_ms).abs();
-        if skew > self.max_clock_skew_ms {
+        // === Admission step 4a: freshness (RELIX-1 §1.9) ===
+        // SECTION 7 — ONE-SIDED skew. A future-stamped envelope
+        // must NOT be admitted just for being "within window":
+        // reject anything stamped more than `max_clock_skew_ms`
+        // ahead of the responder. Separately reject anything
+        // OLDER than the freshness window (5 min) as stale.
+        let age_ms = now_ms - req.issued_at_ms; // >0 past, <0 future
+        if age_ms < -self.max_clock_skew_ms {
+            return self
+                .audit_and_err(
+                    req,
+                    started_at,
+                    "admission:future_envelope",
+                    error_kinds::REPLAY_REJECTED,
+                )
+                .await;
+        }
+        if age_ms > self.freshness_window_ms {
             return self
                 .audit_and_err(
                     req,
@@ -1335,26 +1362,11 @@ impl DispatchBridge {
                 .await;
         }
 
-        // === Admission step 4b: replay-cache check (RELIX-1 §1.9) ===
-        // P2 — the envelope's `rid` is 16 random bytes (per
-        // `types.rs::RequestId::new`) per envelope, so it
-        // doubles as the replay nonce. Duplicate rid inside
-        // the freshness window → REPLAY_REJECTED.
-        let nonce_hex = hex::encode(req.rid.0);
-        if let Err(replay::ReplayError::Replayed) =
-            self.replay_cache.check_and_insert(&nonce_hex, now_ms)
-        {
-            return self
-                .audit_and_err(
-                    req,
-                    started_at,
-                    "admission:replay_rejected",
-                    error_kinds::REPLAY_REJECTED,
-                )
-                .await;
-        }
-
         // === Admission step 5: verify identity bundle ===
+        // SECTION 7: identity verification happens BEFORE the
+        // replay-cache insert (step 5b below) so an
+        // unauthenticated attacker who can post raw bytes cannot
+        // pin nonces into the cache (a no-auth DoS).
         let verified = match validate_identity_bundle(&req.identity_bundle, &self.trust_root, now) {
             Ok(v) => v,
             Err(e) => {
@@ -1368,6 +1380,33 @@ impl DispatchBridge {
                     .await;
             }
         };
+
+        // === Admission step 5b: replay-cache check (RELIX-1 §1.9) ===
+        // SECTION 7 — key the cache on (caller_peer_id, rid, n)
+        // so two distinct peers reusing the same rid do NOT
+        // collide. `n` is the envelope's `issued_at_ms` (a true
+        // replay re-sends the identical envelope, including its
+        // timestamp). Runs only after identity verified.
+        let replay_key = format!(
+            "{}|{}|{}",
+            verified.subject_id,
+            hex::encode(req.rid.0),
+            req.issued_at_ms
+        );
+        if let Err(replay::ReplayError::Replayed) =
+            self.replay_cache.check_and_insert(&replay_key, now_ms)
+        {
+            return self
+                .audit_and_err_with_id(
+                    &req,
+                    &verified,
+                    started_at,
+                    "admission:replay_rejected".to_string(),
+                    error_kinds::REPLAY_REJECTED,
+                    AuditStatus::Denied,
+                )
+                .await;
+        }
 
         // === Admission step 6: session-token verification (P5) ===
         // Spec `identity-employees.md` §H.5 / SessionIdentityConfig:
@@ -2302,9 +2341,24 @@ impl DispatchBridge {
             return;
         }
 
-        // === Admission step 4a: freshness (RELIX-1 §1.7) ===
-        let skew = (now_ms - req.issued_at_ms).abs();
-        if skew > self.max_clock_skew_ms {
+        // === Admission step 4a: freshness (RELIX-1 §1.9) ===
+        // SECTION 7 — ONE-SIDED skew (see the unary path).
+        let age_ms = now_ms - req.issued_at_ms; // >0 past, <0 future
+        if age_ms < -self.max_clock_skew_ms {
+            let _ = writer
+                .write_err(error_kinds::REPLAY_REJECTED, "admission:future_envelope")
+                .await;
+            let _ = self
+                .audit_and_err(
+                    req,
+                    started_at,
+                    "admission:future_envelope",
+                    error_kinds::REPLAY_REJECTED,
+                )
+                .await;
+            return;
+        }
+        if age_ms > self.freshness_window_ms {
             let _ = writer
                 .write_err(error_kinds::REPLAY_REJECTED, "admission:stale_envelope")
                 .await;
@@ -2319,26 +2373,9 @@ impl DispatchBridge {
             return;
         }
 
-        // === Admission step 4b: replay-cache check (RELIX-1 §1.9) ===
-        let nonce_hex = hex::encode(req.rid.0);
-        if let Err(replay::ReplayError::Replayed) =
-            self.replay_cache.check_and_insert(&nonce_hex, now_ms)
-        {
-            let _ = writer
-                .write_err(error_kinds::REPLAY_REJECTED, "admission:replay_rejected")
-                .await;
-            let _ = self
-                .audit_and_err(
-                    req,
-                    started_at,
-                    "admission:replay_rejected",
-                    error_kinds::REPLAY_REJECTED,
-                )
-                .await;
-            return;
-        }
-
         // === Admission step 5: verify identity ===
+        // SECTION 7: replay-cache insert happens AFTER this, so
+        // an unauthenticated caller cannot pin nonces (no-auth DoS).
         let verified = match validate_identity_bundle(&req.identity_bundle, &self.trust_root, now) {
             Ok(v) => v,
             Err(e) => {
@@ -2357,6 +2394,34 @@ impl DispatchBridge {
                 return;
             }
         };
+
+        // === Admission step 5b: replay-cache check (RELIX-1 §1.9) ===
+        // SECTION 7 — keyed on (caller_peer_id, rid, n); runs
+        // only after identity verified.
+        let replay_key = format!(
+            "{}|{}|{}",
+            verified.subject_id,
+            hex::encode(req.rid.0),
+            req.issued_at_ms
+        );
+        if let Err(replay::ReplayError::Replayed) =
+            self.replay_cache.check_and_insert(&replay_key, now_ms)
+        {
+            let _ = writer
+                .write_err(error_kinds::REPLAY_REJECTED, "admission:replay_rejected")
+                .await;
+            let _ = self
+                .audit_and_err_with_id(
+                    &req,
+                    &verified,
+                    started_at,
+                    "admission:replay_rejected".to_string(),
+                    error_kinds::REPLAY_REJECTED,
+                    AuditStatus::Denied,
+                )
+                .await;
+            return;
+        }
 
         // === Admission step 6: session-token verification (P5) ===
         if self.verify_on_dispatch_enabled {
@@ -5533,14 +5598,12 @@ mod tests {
     async fn p2_replayed_nonce_is_rejected_second_time_with_replay_rejected() {
         let (bridge, bundle, _dir, _root) = allow_health_bridge();
         let fixed_rid = relix_core::types::RequestId([7u8; 16]);
-        // First call admits.
-        let envelope_1 = build_request_with_clock(
-            "node.health",
-            bundle.clone(),
-            30,
-            unix_now_ms(),
-            Some(fixed_rid),
-        );
+        // SECTION 7 criterion 1: a true replay re-sends the
+        // IDENTICAL envelope — same (caller_peer_id, rid, n) —
+        // so we pin a single `issued_at` for both calls.
+        let issued = unix_now_ms();
+        let envelope_1 =
+            build_request_with_clock("node.health", bundle.clone(), 30, issued, Some(fixed_rid));
         let resp_bytes_1 = bridge.handle_inbound(envelope_1).await;
         let resp_1 = decode_response(&resp_bytes_1).unwrap();
         assert!(
@@ -5548,9 +5611,9 @@ mod tests {
             "first observation must admit, got {:?}",
             resp_1.res
         );
-        // Second call with the same rid → REPLAY_REJECTED.
+        // Second call with the same (peer, rid, n) → REPLAY_REJECTED.
         let envelope_2 =
-            build_request_with_clock("node.health", bundle, 30, unix_now_ms(), Some(fixed_rid));
+            build_request_with_clock("node.health", bundle, 30, issued, Some(fixed_rid));
         let resp_bytes_2 = bridge.handle_inbound(envelope_2).await;
         let resp_2 = decode_response(&resp_bytes_2).unwrap();
         match resp_2.res {
@@ -5610,26 +5673,48 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn p2_request_outside_skew_tolerance_is_rejected_with_replay_rejected() {
-        // P2 test: "A request arriving 6 seconds after its
-        // issued_at with 5-second skew tolerance is rejected".
+    async fn p2_section7_future_rejected_and_within_window_past_accepted() {
+        // SECTION 7 criterion 3 (one-sided freshness):
+        //  (a) an envelope stamped beyond the FUTURE skew
+        //      allowance is rejected; AND
+        //  (b) an envelope 6s in the PAST — which the OLD 5s
+        //      two-sided window WRONGLY rejected — is now
+        //      ACCEPTED, because the past freshness window is
+        //      5 minutes (RELIX-1 §1.9).
         let (mut bridge, bundle, _dir, _root) = allow_health_bridge();
-        bridge.set_max_clock_skew_ms(5_000);
+        bridge.set_max_clock_skew_ms(5_000); // 5s future allowance
         let fake = Arc::new(relix_core::clock::FakeClock::new(1_000_000));
         bridge.set_clock(fake.clone());
-        let issued_at_ms = fake.now_ms();
-        // Responder clock 6 s ahead of issuer → past skew window.
-        fake.set(issued_at_ms + 6_000);
-        let envelope = build_request_with_clock("node.health", bundle, 60, issued_at_ms, None);
-        let resp_bytes = bridge.handle_inbound(envelope).await;
-        let resp = decode_response(&resp_bytes).unwrap();
+
+        // (a) Envelope stamped 10s in the FUTURE → rejected.
+        let now0 = fake.now_ms();
+        let future_envelope =
+            build_request_with_clock("node.health", bundle.clone(), 60, now0 + 10_000, None);
+        let resp = decode_response(&bridge.handle_inbound(future_envelope).await).unwrap();
         match resp.res {
             ResponseResult::Err(env) => {
                 assert_eq!(env.kind, error_kinds::REPLAY_REJECTED);
-                assert!(env.cause.contains("stale_envelope"), "cause: {}", env.cause);
+                assert!(
+                    env.cause.contains("future_envelope"),
+                    "future stamp must be rejected one-sided, cause: {}",
+                    env.cause
+                );
             }
-            other => panic!("expected REPLAY_REJECTED stale, got {other:?}"),
+            other => panic!("expected future_envelope rejection, got {other:?}"),
         }
+
+        // (b) Envelope issued 6s in the PAST → now ADMITTED
+        // (within the 5-minute freshness window).
+        let issued_past = fake.now_ms();
+        fake.set(issued_past + 6_000);
+        let past_envelope =
+            build_request_with_clock("node.health", bundle, 60, issued_past, None);
+        let resp = decode_response(&bridge.handle_inbound(past_envelope).await).unwrap();
+        assert!(
+            matches!(resp.res, ResponseResult::Ok(_)),
+            "a request 6s after issuance must be admitted (5-min window), got {:?}",
+            resp.res
+        );
     }
 
     #[tokio::test]
@@ -5642,18 +5727,113 @@ mod tests {
         let cache = bridge.replay_cache();
         cache.check_and_insert("nonce-evict", 0).unwrap();
         assert_eq!(cache.len(), 1);
-        let removed = cache.evict_expired(bridge.max_clock_skew_ms() + 1);
+        // SECTION 7: cache window = freshness window (5 min);
+        // evict just past it.
+        let removed = cache.evict_expired(bridge.freshness_window_ms() + 1);
         assert_eq!(removed, 1);
         assert_eq!(cache.len(), 0);
     }
 
     #[tokio::test]
-    async fn p2_max_clock_skew_setter_resizes_replay_cache() {
+    async fn p2_section7_freshness_window_sizes_cache_skew_is_independent() {
+        // SECTION 7: the replay cache window tracks the
+        // FRESHNESS window (5 min default), NOT the future
+        // clock-skew allowance — they are decoupled.
         let (mut bridge, _bundle, _dir, _root) = allow_health_bridge();
+        // Defaults: 5-min window, 5s future skew.
+        assert_eq!(bridge.freshness_window_ms(), replay::DEFAULT_WINDOW_MS);
+        assert_eq!(bridge.replay_cache().window_ms(), replay::DEFAULT_WINDOW_MS);
+        assert_eq!(bridge.max_clock_skew_ms(), replay::DEFAULT_CLOCK_SKEW_MS);
+        // Tuning the future skew does NOT resize the cache.
         bridge.set_max_clock_skew_ms(2_000);
         assert_eq!(bridge.max_clock_skew_ms(), 2_000);
-        assert_eq!(bridge.replay_cache().window_ms(), 2_000);
-        bridge.set_max_clock_skew_ms(10_000);
-        assert_eq!(bridge.replay_cache().window_ms(), 10_000);
+        assert_eq!(bridge.replay_cache().window_ms(), replay::DEFAULT_WINDOW_MS);
+        // Tuning the freshness window DOES resize the cache.
+        bridge.set_freshness_window_ms(120_000);
+        assert_eq!(bridge.freshness_window_ms(), 120_000);
+        assert_eq!(bridge.replay_cache().window_ms(), 120_000);
+    }
+
+    #[tokio::test]
+    async fn p2_section7_identity_failure_does_not_insert_into_replay_cache() {
+        // SECTION 7 criterion 2: an inbound whose identity fails
+        // verification must NOT pin a nonce — the cache insert
+        // happens only AFTER identity verify, so an
+        // unauthenticated attacker cannot fill the cache (DoS).
+        let (bridge, _bundle, _dir, _root) = allow_health_bridge();
+        // Forge a bundle signed by a DIFFERENT (untrusted) org
+        // root so `validate_identity_bundle` rejects it.
+        let rogue_root = SigningKey::generate(&mut OsRng);
+        let rogue_caller = SigningKey::generate(&mut OsRng);
+        let id = IdentityBundle {
+            subject_id: NodeId::from_pubkey(&rogue_caller.verifying_key().to_bytes()),
+            name: "mallory".into(),
+            org_id: NodeId::from_pubkey(&rogue_root.verifying_key().to_bytes()),
+            groups: vec!["chat-users".into()],
+            role: "agent".into(),
+            clearance: "internal".into(),
+            supervisors: vec![],
+        };
+        let rogue_bundle = issue_identity(id, &rogue_root, 3600).unwrap();
+        assert_eq!(bridge.replay_cache().len(), 0);
+        let envelope = build_request_with_clock(
+            "node.health",
+            rogue_bundle,
+            30,
+            unix_now_ms(),
+            Some(relix_core::types::RequestId([9u8; 16])),
+        );
+        let resp = decode_response(&bridge.handle_inbound(envelope).await).unwrap();
+        match resp.res {
+            ResponseResult::Err(env) => assert_eq!(env.kind, error_kinds::IDENTITY_INVALID),
+            other => panic!("expected IDENTITY_INVALID, got {other:?}"),
+        }
+        assert_eq!(
+            bridge.replay_cache().len(),
+            0,
+            "an identity-failed request must NOT insert into the replay cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn p2_section7_two_peers_same_rid_both_admitted() {
+        // SECTION 7 criterion 4: the cache key is
+        // (caller_peer_id, rid, n), so two DISTINCT peers using
+        // the same rid do not collide — both admit on first use.
+        let (bridge, bundle_a, _dir, root) = allow_health_bridge();
+        let shared_rid = relix_core::types::RequestId([3u8; 16]);
+        let issued = unix_now_ms();
+
+        // Peer A (alice) admits.
+        let env_a =
+            build_request_with_clock("node.health", bundle_a, 30, issued, Some(shared_rid));
+        let resp_a = decode_response(&bridge.handle_inbound(env_a).await).unwrap();
+        assert!(
+            matches!(resp_a.res, ResponseResult::Ok(_)),
+            "peer A must admit, got {:?}",
+            resp_a.res
+        );
+
+        // Peer B — a DIFFERENT subject under the SAME org root —
+        // reusing the same rid must ALSO admit (no collision).
+        let caller_b = SigningKey::generate(&mut OsRng);
+        let id_b = IdentityBundle {
+            subject_id: NodeId::from_pubkey(&caller_b.verifying_key().to_bytes()),
+            name: "bob".into(),
+            org_id: NodeId::from_pubkey(&root.verifying_key().to_bytes()),
+            groups: vec!["chat-users".into()],
+            role: "agent".into(),
+            clearance: "internal".into(),
+            supervisors: vec![],
+        };
+        let bundle_b = issue_identity(id_b, &root, 3600).unwrap();
+        let env_b =
+            build_request_with_clock("node.health", bundle_b, 30, issued, Some(shared_rid));
+        let resp_b = decode_response(&bridge.handle_inbound(env_b).await).unwrap();
+        assert!(
+            matches!(resp_b.res, ResponseResult::Ok(_)),
+            "peer B with the same rid must NOT collide with peer A, got {:?}",
+            resp_b.res
+        );
     }
 }

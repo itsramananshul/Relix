@@ -33,10 +33,26 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-/// Default freshness window in ms. Matches the default
-/// `max_clock_skew_ms`. Operators tune via the dispatch
-/// builder.
-pub const DEFAULT_WINDOW_MS: i64 = 5_000;
+/// Default freshness window in ms — RELIX-1 §1.9 mandates 5
+/// minutes. A nonce is remembered for at least this long; the
+/// admission freshness check rejects any envelope older than
+/// this, so an entry past the window is necessarily stale and
+/// safe to evict. Operators tune via the dispatch builder
+/// (`set_freshness_window_ms`).
+pub const DEFAULT_WINDOW_MS: i64 = 300_000;
+
+/// Default ONE-SIDED future clock-skew allowance in ms. An
+/// envelope stamped more than this far in the FUTURE is
+/// rejected (a future-stamped envelope must never be admitted
+/// just because it is "within window"). Kept small — real
+/// callers are at most a few seconds ahead of the responder.
+pub const DEFAULT_CLOCK_SKEW_MS: i64 = 5_000;
+
+/// Hard cap on live cache entries. Bounds memory so a flood of
+/// distinct nonces inside the window cannot grow the map
+/// without limit; at the cap the oldest-expiry entry is evicted
+/// to make room. ~1M entries ≈ a few hundred MB worst case.
+pub const DEFAULT_MAX_ENTRIES: usize = 1_048_576;
 
 /// Eager-eviction interval the background sweeper uses when
 /// no inbound traffic is driving `check_and_insert` calls.
@@ -63,21 +79,35 @@ pub struct ReplayCache {
 struct ReplayCacheInner {
     seen: Mutex<HashMap<String, i64>>,
     window_ms: i64,
+    max_entries: usize,
 }
 
 impl ReplayCache {
     /// Build a new cache with the requested freshness window
-    /// in ms. Values below 1ms saturate to 1ms — a zero-width
-    /// window would let every envelope through regardless of
-    /// nonce reuse.
+    /// in ms and the default entry cap. Values below 1ms
+    /// saturate to 1ms — a zero-width window would let every
+    /// envelope through regardless of nonce reuse.
     pub fn new(window_ms: i64) -> Self {
+        Self::with_cap(window_ms, DEFAULT_MAX_ENTRIES)
+    }
+
+    /// Build a cache with an explicit entry cap. Used by tests
+    /// that want to exercise the bounded-eviction path without
+    /// inserting a million rows.
+    pub fn with_cap(window_ms: i64, max_entries: usize) -> Self {
         let window = window_ms.max(1);
         Self {
             inner: Arc::new(ReplayCacheInner {
                 seen: Mutex::new(HashMap::new()),
                 window_ms: window,
+                max_entries: max_entries.max(1),
             }),
         }
+    }
+
+    /// The hard entry cap — read-only accessor for diagnostics.
+    pub fn max_entries(&self) -> usize {
+        self.inner.max_entries
     }
 
     /// Check whether `nonce` has been observed in the current
@@ -96,6 +126,19 @@ impl ReplayCache {
         seen.retain(|_, &mut expires_at| expires_at > now_ms);
         if seen.contains_key(nonce) {
             return Err(ReplayError::Replayed);
+        }
+        // Bound memory: if we are at the hard cap after evicting
+        // expired entries, drop the entry that expires soonest
+        // to make room. A flood of distinct in-window nonces
+        // therefore cannot grow the map past `max_entries`.
+        if seen.len() >= self.inner.max_entries {
+            let oldest = seen
+                .iter()
+                .min_by_key(|(_, expires_at)| **expires_at)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                seen.remove(&oldest);
+            }
         }
         // `saturating_add` so an i64::MAX window (the
         // "freshness disabled" sentinel used in some tests
@@ -228,6 +271,18 @@ mod tests {
         cache
             .check_and_insert("nonce-A", 5_001)
             .expect("expiry not extended by replay attempt");
+    }
+
+    #[test]
+    fn cache_is_bounded_by_the_entry_cap() {
+        // SECTION 7: with a hard cap of 3 and a large window
+        // (nothing expires), inserting 5 distinct nonces must
+        // leave the map at the cap — never unbounded growth.
+        let cache = ReplayCache::with_cap(1_000_000, 3);
+        for (i, k) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            cache.check_and_insert(k, i as i64).unwrap();
+        }
+        assert_eq!(cache.len(), 3, "cache must stay bounded at the entry cap");
     }
 
     #[test]
