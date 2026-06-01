@@ -648,6 +648,20 @@ registry_db_path = "$DataBase/plugin-registry.db"
 
 # 4.5) Coordinator controller config. Owns the durable Task ledger
 #      (SQLite). Optional -- pass -NoCoordinator to skip.
+#
+# Opt-in subsystem sections (enabled via `relix setup` -> forwarded by
+# `relix boot`, or set the RELIX_* env vars directly). Emitting these
+# registers the credential-vault / approval-delivery caps so the
+# dashboard's Credentials and Approval panels return real data.
+$CredBlock = ""
+if ($env:RELIX_CREDENTIAL_VAULT -eq "1" -and $env:RELIX_CREDENTIAL_KEY) {
+    $CredBlock = "`n[credentials]`nenabled = true`n"
+}
+$ApprovalBlock = ""
+if ($env:RELIX_APPROVALS -eq "1") {
+    $ApprovalChannel = if ($env:RELIX_APPROVAL_CHANNEL) { $env:RELIX_APPROVAL_CHANNEL } else { "dashboard" }
+    $ApprovalBlock = "`n[approval]`n`n[approval.delivery]`ndefault_channel = `"$ApprovalChannel`"`n"
+}
 if (-not $NoCoordinator) {
 @"
 [controller]
@@ -667,7 +681,7 @@ file = "$Policy"
 [coordinator]
 db_path = "$DataBase/tasks.db"
 max_list = 200
-
+$CredBlock$ApprovalBlock
 [peers]
 "@ | Set-Content -Encoding utf8 $CoordinatorConfig
 }
@@ -1198,6 +1212,31 @@ allow_groups = ["chat-users"]
 [[rules]]
 name = "planning_find_agents"
 method = "planning.find_agents"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "credentials_list"
+method = "credentials.list"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "credentials_audit"
+method = "credentials.audit"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "approval_list_pending"
+method = "approval.list_pending"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "approval_failed_deliveries"
+method = "approval.failed_deliveries"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "approval_delivery_status"
+method = "approval.delivery_status"
 allow_groups = ["chat-users"]
 "@ | Set-Content -Encoding utf8 $Policy
 

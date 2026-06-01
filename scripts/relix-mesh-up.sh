@@ -510,6 +510,28 @@ fi
 
 # ---- 5. Coordinator config ----
 
+# Opt-in subsystem sections (enabled via `relix setup` → forwarded by
+# `relix boot`, or set the RELIX_* env vars directly). Emitting these
+# registers the credential-vault / approval-delivery caps on the
+# coordinator so the dashboard's Credentials and Approval panels return
+# real data instead of "unavailable".
+#
+# Credential vault: needs the master key in RELIX_CREDENTIAL_KEY (the
+# vault's default master_key_env); the coordinator process inherits it
+# from this script's environment. Without a key the vault stays off —
+# never a hardcoded default.
+cred_block=""
+if [[ "${RELIX_CREDENTIAL_VAULT:-0}" == "1" && -n "${RELIX_CREDENTIAL_KEY:-}" ]]; then
+    cred_block=$'\n[credentials]\nenabled = true\n'
+fi
+# Approval delivery: the default channel is the in-process dashboard
+# (no external secret). Emitting [approval] + [approval.delivery]
+# registers approval.list_pending / approval.failed_deliveries.
+approval_block=""
+if [[ "${RELIX_APPROVALS:-0}" == "1" ]]; then
+    approval_block=$'\n[approval]\n\n[approval.delivery]\ndefault_channel = "'"${RELIX_APPROVAL_CHANNEL:-dashboard}"$'"\n'
+fi
+
 if [[ "$NO_COORDINATOR" -eq 0 ]]; then
     cat > "$COORDINATOR_CONFIG" <<EOF
 [controller]
@@ -529,7 +551,7 @@ file = "$POLICY"
 [coordinator]
 db_path = "$DATA_BASE/coordinator.db"
 max_list = 200
-
+$cred_block$approval_block
 [peers]
 EOF
 fi
@@ -1140,6 +1162,31 @@ allow_groups = ["chat-users"]
 [[rules]]
 name = "planning_find_agents"
 method = "planning.find_agents"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "credentials_list"
+method = "credentials.list"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "credentials_audit"
+method = "credentials.audit"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "approval_list_pending"
+method = "approval.list_pending"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "approval_failed_deliveries"
+method = "approval.failed_deliveries"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "approval_delivery_status"
+method = "approval.delivery_status"
 allow_groups = ["chat-users"]
 EOF
 
