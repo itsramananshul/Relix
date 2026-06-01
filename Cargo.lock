@@ -3652,7 +3652,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "relix-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -3679,7 +3679,7 @@ dependencies = [
 
 [[package]]
 name = "relix-controller"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "clap",
  "relix-core",
@@ -3694,7 +3694,7 @@ dependencies = [
 
 [[package]]
 name = "relix-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3719,7 +3719,7 @@ dependencies = [
 
 [[package]]
 name = "relix-discord"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3739,7 +3739,7 @@ dependencies = [
 
 [[package]]
 name = "relix-embedded"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3757,7 +3757,7 @@ dependencies = [
 
 [[package]]
 name = "relix-flow-inspect"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "clap",
  "ed25519-dalek",
@@ -3772,7 +3772,7 @@ dependencies = [
 
 [[package]]
 name = "relix-plugin-sdk"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3789,7 +3789,7 @@ dependencies = [
 
 [[package]]
 name = "relix-runtime"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3853,7 +3853,7 @@ dependencies = [
 
 [[package]]
 name = "relix-sdk"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-stream",
  "bytes",
@@ -3867,7 +3867,7 @@ dependencies = [
 
 [[package]]
 name = "relix-slack"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3888,7 +3888,7 @@ dependencies = [
 
 [[package]]
 name = "relix-telegram"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3908,7 +3908,7 @@ dependencies = [
 
 [[package]]
 name = "relix-web-bridge"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-stream",
  "axum",

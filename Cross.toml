@@ -1,0 +1,30 @@
+# cross-rs build configuration. Read automatically by `cross build` in
+# .github/workflows/release.yml for the cross-compiled legs.
+#
+# Only the aarch64-linux target needs anything special. The runtime pulls
+# `openssl-sys` transitively (async-imap -> async-native-tls -> native-tls),
+# and openssl-sys's build script runs `pkg-config` to locate libssl. The
+# stock cross aarch64 image carries no arm64 OpenSSL, so the build fails
+# with:
+#
+#     error: failed to run custom build command for `openssl-sys`
+#     Package openssl was not found in the pkg-config search path.
+#
+# Fix: install the arm64 OpenSSL dev libs (+ pkg-config) into the build
+# container before cargo runs, and tell pkg-config it's allowed to
+# cross-compile and where the arm64 .pc files live. `$CROSS_DEB_ARCH` is
+# provided by cross (= `arm64` for this target).
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update",
+    "apt-get install --assume-yes --no-install-recommends libssl-dev:$CROSS_DEB_ARCH pkg-config",
+]
+
+[target.aarch64-unknown-linux-gnu.env]
+# Forward the pkg-config cross-compile hints set on the runner (see the
+# release.yml build step) into the cross build container.
+passthrough = [
+    "PKG_CONFIG_ALLOW_CROSS",
+    "PKG_CONFIG_PATH",
+]

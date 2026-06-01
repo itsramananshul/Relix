@@ -111,6 +111,14 @@ jobs:
 
       - name: Build (all three binaries)
         shell: bash
+        # PKG_CONFIG_* are only consumed by the cross (aarch64-linux) leg:
+        # openssl-sys's build script cross-compiles against the arm64 libssl
+        # that Cross.toml's pre-build installs into the container, and these
+        # are forwarded in via Cross.toml's `env.passthrough`. They are inert
+        # for the native legs (no pkg-config cross step runs there).
+        env:
+          PKG_CONFIG_ALLOW_CROSS: '1'
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
         run: |
           # relix-cli ships as `relix`; the controller + bridge ship
           # under their own names. `relix boot` needs all three to be
