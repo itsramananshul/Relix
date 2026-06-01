@@ -985,6 +985,13 @@ pub struct DiscoveryOptions {
     pub overall_timeout: Duration,
     /// Optional override for the ephemeral libp2p port (used in tests).
     pub local_port: Option<u16>,
+    /// SEC §17: when set, discovery AUTO-REGISTERS each peer's
+    /// handshake-verified identity key into this registry as
+    /// `(node_name -> pubkey)`, so knowledge-share source binding
+    /// works with no manual `[knowledge_trust]` config. Only a key
+    /// whose derived libp2p PeerId equals the Noise-authenticated
+    /// connection PeerId is registered (cryptographically verified).
+    pub source_key_registry: Option<crate::knowledge::service::SourceNodeKeyRegistry>,
 }
 
 impl Default for DiscoveryOptions {
@@ -996,6 +1003,7 @@ impl Default for DiscoveryOptions {
             deadline_secs: 10,
             overall_timeout: Duration::from_secs(6),
             local_port: None,
+            source_key_registry: None,
         }
     }
 }
@@ -1247,9 +1255,46 @@ pub async fn discover_and_pin(opts: DiscoveryOptions) -> Option<(ManifestCache, 
             fingerprint = %signed.signer_fingerprint,
             "discovery: cached peer manifest"
         );
+        // SEC §17: auto-learn the peer's identity key for
+        // knowledge-share source binding — but ONLY if the manifest's
+        // signer key is the SAME key the Noise handshake authenticated
+        // for this connection (derive its libp2p PeerId and compare to
+        // the connection `peer_id`). This guarantees we only ever
+        // trust a key the handshake cryptographically verified — a
+        // peer cannot register a name→key pair it doesn't actually
+        // hold the private key for.
+        if let Some(registry) = opts.source_key_registry.as_ref() {
+            match peer_id_from_ed25519_pubkey(&signed.signer_pubkey) {
+                Some(derived) if derived == peer_id => {
+                    registry.register(manifest.node_name.clone(), signed.signer_pubkey);
+                    tracing::info!(
+                        alias = %alias,
+                        node_name = %manifest.node_name,
+                        "discovery: auto-registered handshake-verified peer key for knowledge binding (SEC §17)"
+                    );
+                }
+                _ => {
+                    tracing::warn!(
+                        alias = %alias,
+                        node_name = %manifest.node_name,
+                        "discovery: manifest signer key does NOT match the handshake-verified PeerId — \
+                         NOT auto-registering (possible impersonation)"
+                    );
+                }
+            }
+        }
         cache.insert(Some(alias), manifest);
     }
     Some((cache, mesh_client))
+}
+
+/// SEC §17: derive a peer's libp2p `PeerId` from its raw 32-byte
+/// Ed25519 public key. Used to confirm a manifest's signer key is
+/// the same key the Noise handshake authenticated for the
+/// connection. Returns `None` if the bytes aren't a valid key.
+fn peer_id_from_ed25519_pubkey(pubkey: &[u8; 32]) -> Option<PeerId> {
+    let ed = libp2p::identity::ed25519::PublicKey::try_from_bytes(pubkey).ok()?;
+    Some(libp2p::identity::PublicKey::from(ed).to_peer_id())
 }
 
 /// Convenience: discover with sensible defaults for tests that already have
@@ -1267,6 +1312,7 @@ pub fn default_discovery_options(
         deadline_secs: 10,
         overall_timeout: Duration::from_secs(6),
         local_port: None,
+        source_key_registry: None,
     }
 }
 

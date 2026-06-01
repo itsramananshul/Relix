@@ -217,6 +217,41 @@ pub enum ShareError {
     Rejected(RejectReason),
 }
 
+/// SEC §17: interior-mutable registry of `source_node name -> raw
+/// Ed25519 identity pubkey`. A `Clone` of this handle shares the
+/// same underlying map, so the mesh layer can auto-register peers as
+/// their connections come up (with handshake-verified keys) and
+/// `unregister` them on disconnect, while the `KnowledgeService`
+/// reads it on every `accept_shared`. Cheap to clone (`Arc`-backed).
+#[derive(Clone, Default)]
+pub struct SourceNodeKeyRegistry {
+    map: Arc<std::sync::RwLock<std::collections::BTreeMap<String, [u8; 32]>>>,
+}
+
+impl SourceNodeKeyRegistry {
+    /// Register (or replace) the verified identity key for a source
+    /// node name. Called by the mesh layer when a peer connects and
+    /// its key is cryptographically verified by the handshake.
+    pub fn register(&self, node: impl Into<String>, pubkey: [u8; 32]) {
+        if let Ok(mut g) = self.map.write() {
+            g.insert(node.into(), pubkey);
+        }
+    }
+
+    /// Remove a source node's key — called on peer disconnect so
+    /// stale trust never lingers after the connection drops.
+    pub fn unregister(&self, node: &str) {
+        if let Ok(mut g) = self.map.write() {
+            g.remove(node);
+        }
+    }
+
+    /// Look up the registered key for a source node.
+    fn get(&self, node: &str) -> Option<[u8; 32]> {
+        self.map.read().ok().and_then(|g| g.get(node).copied())
+    }
+}
+
 /// The knowledge-transfer service. Cheap to clone (every
 /// field is `Arc`-backed).
 #[derive(Clone)]
@@ -247,15 +282,19 @@ pub struct KnowledgeService {
     /// `knowledge.autoshare_stats` cap returns zeros in that
     /// case.
     autoshare_stats: Option<super::autoshare::AutoShareLifetimeStats>,
-    /// SECTION 9 / SEC §16: receiver-side registry binding a
-    /// source node's friendly name to its ED25519 public key (32
+    /// SECTION 9 / SEC §16 / SEC §17: receiver-side registry binding
+    /// a source node's friendly name to its ED25519 public key (32
     /// raw bytes). `accept_shared` rejects any payload whose
-    /// `source_pubkey` does not match the key configured here for
-    /// the claimed `source_node` — a valid signature is not enough,
-    /// the key must BELONG to the claimed node. SEC §16: a source
-    /// with NO entry here is REJECTED by default (fail closed) —
-    /// the registry no longer silently disables binding when empty.
-    source_node_keys: Arc<std::collections::BTreeMap<String, [u8; 32]>>,
+    /// `source_pubkey` does not match the key registered for the
+    /// claimed `source_node` — a valid signature is not enough, the
+    /// key must BELONG to the claimed node. SEC §16: a source with NO
+    /// entry is REJECTED by default (fail closed). SEC §17: the map is
+    /// interior-mutable (a [`SourceNodeKeyRegistry`] handle) so the
+    /// mesh layer can AUTO-REGISTER `(node_name -> verified pubkey)`
+    /// as peers connect (learned from the cryptographically-verified
+    /// handshake) and remove them on disconnect — no manual
+    /// `[knowledge_trust]` config required.
+    source_node_keys: SourceNodeKeyRegistry,
     /// SEC §16: explicit, deliberate opt-out of source-node binding.
     /// When `true`, a payload whose `source_node` has no configured
     /// key is accepted on signature ALONE (the pre-§16 weak
@@ -277,20 +316,26 @@ impl KnowledgeService {
             signing_key: None,
             remote: None,
             autoshare_stats: None,
-            source_node_keys: Arc::new(std::collections::BTreeMap::new()),
+            source_node_keys: SourceNodeKeyRegistry::default(),
             allow_unbound_sources: false,
         })
     }
 
-    /// SECTION 9: register the known ED25519 public key (32 raw
-    /// bytes) for a source node's friendly name. Once any key is
-    /// registered, `accept_shared` enforces the source-node
-    /// binding for every inbound payload. Builder-style.
-    pub fn with_source_node_key(mut self, node: impl Into<String>, pubkey: [u8; 32]) -> Self {
-        let mut map = (*self.source_node_keys).clone();
-        map.insert(node.into(), pubkey);
-        self.source_node_keys = Arc::new(map);
+    /// SECTION 9 / SEC §16: register the known ED25519 public key
+    /// (32 raw bytes) for a source node's friendly name. Builder-
+    /// style; used for the `[knowledge_trust]` manual OVERRIDE at
+    /// construction. Inserts into the shared registry.
+    pub fn with_source_node_key(self, node: impl Into<String>, pubkey: [u8; 32]) -> Self {
+        self.source_node_keys.register(node, pubkey);
         self
+    }
+
+    /// SEC §17: a `Clone` handle on the source-node key registry.
+    /// The mesh layer holds this to AUTO-REGISTER peers' verified
+    /// identity keys on connect and `unregister` them on disconnect,
+    /// while this service reads them on every `accept_shared`.
+    pub fn source_node_key_registry(&self) -> SourceNodeKeyRegistry {
+        self.source_node_keys.clone()
     }
 
     /// SEC §16: explicit opt-out of source-node binding for sources
@@ -317,7 +362,7 @@ impl KnowledgeService {
             signing_key: None,
             remote: None,
             autoshare_stats: None,
-            source_node_keys: Arc::new(std::collections::BTreeMap::new()),
+            source_node_keys: SourceNodeKeyRegistry::default(),
             allow_unbound_sources: false,
         }
     }
@@ -626,7 +671,7 @@ impl KnowledgeService {
         {
             let presented = verifying.to_bytes();
             match self.source_node_keys.get(&payload.source_node) {
-                Some(expected) if *expected == presented => { /* bound */ }
+                Some(expected) if expected == presented => { /* bound */ }
                 Some(_) => {
                     return Err(ShareError::Rejected(RejectReason::SourceKeyMismatch {
                         node: payload.source_node.clone(),
@@ -638,10 +683,11 @@ impl KnowledgeService {
                 None => {
                     return Err(ShareError::Rejected(RejectReason::SourceKeyMismatch {
                         node: payload.source_node.clone(),
-                        detail: "claimed source_node has no configured key on this receiver — \
-                                 configure [knowledge_trust].source_nodes with this node's \
-                                 identity pubkey, or set [knowledge_trust] allow_unbound_sources \
-                                 = true to accept on signature alone (insecure)"
+                        detail: "claimed source_node has no verified identity key on this \
+                                 receiver — its key is normally auto-learned when the peer \
+                                 connects via the verified handshake (SEC §17); if the peer is \
+                                 not connected, add it to [knowledge_trust].source_nodes, or set \
+                                 [knowledge_trust] allow_unbound_sources = true (insecure)"
                             .to_string(),
                     }));
                 }
@@ -2233,7 +2279,8 @@ mod tests {
             ShareError::Rejected(RejectReason::SourceKeyMismatch { node, detail }) => {
                 assert_eq!(node, "node-1");
                 assert!(
-                    detail.contains("no configured key"),
+                    detail.contains("no verified identity key")
+                        && detail.contains("allow_unbound_sources"),
                     "must explain the missing key + opt-out, got: {detail}"
                 );
             }
@@ -2265,5 +2312,119 @@ mod tests {
         svc.accept_shared(payload)
             .expect("explicit opt-out accepts on signature alone");
         assert!(store.get(&mint_copy_id("a1", "bob")).unwrap().is_some());
+    }
+
+    // ── SEC §17: auto-learn peer keys from the verified handshake ──
+
+    #[tokio::test]
+    async fn sec17_auto_registered_peer_is_accepted_with_no_knowledge_trust_config() {
+        // CRITERION 3: the service starts with NO [knowledge_trust]
+        // config (empty registry). The mesh layer auto-registers the
+        // peer's handshake-VERIFIED key when it connects (here we call
+        // the same registry hook the connect path uses). A share from
+        // that peer is then accepted — the manual config step is gone.
+        use crate::knowledge::remote::SignedSharePayload;
+        let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let peer_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        // NO with_source_node_key / no [knowledge_trust].
+        let svc = KnowledgeService::new(store.clone(), &section9_cfg())
+            .unwrap()
+            .with_local_node("node-2");
+
+        // Sanity: before the peer connects, its share is rejected
+        // (fail closed — registry empty).
+        let pre = SignedSharePayload::sign(
+            &peer_key,
+            "node-1",
+            "alice",
+            "bob",
+            obs("a0", "alice", "fact", true),
+            None,
+        );
+        assert!(matches!(
+            svc.accept_shared(pre).unwrap_err(),
+            ShareError::Rejected(RejectReason::SourceKeyMismatch { .. })
+        ));
+
+        // Peer connects: the mesh layer auto-registers its verified
+        // identity key (this is exactly what the connect hook does).
+        svc.source_node_key_registry()
+            .register("node-1", peer_key.verifying_key().to_bytes());
+
+        let good = SignedSharePayload::sign(
+            &peer_key,
+            "node-1",
+            "alice",
+            "bob",
+            obs("a1", "alice", "fact", true),
+            None,
+        );
+        svc.accept_shared(good)
+            .expect("auto-registered verified peer accepted with NO config");
+        assert!(store.get(&mint_copy_id("a1", "bob")).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn sec17_impostor_rejected_and_key_removed_on_disconnect() {
+        // CRITERION 4: an impostor (claims node-1 but signs with a
+        // DIFFERENT key than node-1's auto-registered one) is rejected;
+        // and once node-1 disconnects (the mesh layer `unregister`s its
+        // key), even node-1's own real key is no longer trusted — no
+        // stale trust survives the disconnect.
+        use crate::knowledge::remote::SignedSharePayload;
+        let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let real = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let svc = KnowledgeService::new(store.clone(), &section9_cfg())
+            .unwrap()
+            .with_local_node("node-2");
+        let registry = svc.source_node_key_registry();
+        registry.register("node-1", real.verifying_key().to_bytes());
+
+        // Impostor: right name, WRONG key → rejected even while node-1
+        // is "connected".
+        let impostor = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let forged = SignedSharePayload::sign(
+            &impostor,
+            "node-1",
+            "alice",
+            "bob",
+            obs("a1", "alice", "fact", true),
+            None,
+        );
+        match svc.accept_shared(forged).unwrap_err() {
+            ShareError::Rejected(RejectReason::SourceKeyMismatch { node, .. }) => {
+                assert_eq!(node, "node-1")
+            }
+            o => panic!("impostor must be rejected, got {o:?}"),
+        }
+
+        // node-1's REAL key is accepted while connected...
+        let live = SignedSharePayload::sign(
+            &real,
+            "node-1",
+            "alice",
+            "bob",
+            obs("a2", "alice", "fact", true),
+            None,
+        );
+        svc.accept_shared(live)
+            .expect("real key accepted while connected");
+
+        // ...then node-1 disconnects: the mesh layer removes its key.
+        registry.unregister("node-1");
+
+        // Now even node-1's real key is rejected — no stale trust.
+        let after = SignedSharePayload::sign(
+            &real,
+            "node-1",
+            "alice",
+            "bob",
+            obs("a3", "alice", "fact", true),
+            None,
+        );
+        match svc.accept_shared(after).unwrap_err() {
+            ShareError::Rejected(RejectReason::SourceKeyMismatch { .. }) => {}
+            o => panic!("after disconnect the key must be gone (no stale trust), got {o:?}"),
+        }
     }
 }

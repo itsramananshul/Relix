@@ -1211,10 +1211,18 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 cell,
                 peers,
                 deadline_secs,
+                source_key_registry,
             } => {
                 let key_path = cfg.identity.key_path.clone();
                 tokio::spawn(async move {
-                    populate_knowledge_mesh_cell(cell, peers, key_path, deadline_secs).await;
+                    populate_knowledge_mesh_cell(
+                        cell,
+                        peers,
+                        key_path,
+                        deadline_secs,
+                        source_key_registry,
+                    )
+                    .await;
                 });
             }
         }
@@ -2159,6 +2167,7 @@ async fn populate_ai_memory_cell(
         deadline_secs: cfg.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(6),
         local_port: None,
+        source_key_registry: None,
     };
 
     let (_cache, mesh) = match discover_and_pin(opts).await {
@@ -3441,6 +3450,7 @@ async fn populate_delegation_ai_cell(
         deadline_secs: cfg.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(6),
         local_port: None,
+        source_key_registry: None,
     };
 
     let (_cache, mesh) = match discover_and_pin(opts).await {
@@ -3542,6 +3552,7 @@ async fn populate_cron_ai_cell(
         deadline_secs: cfg.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(6),
         local_port: None,
+        source_key_registry: None,
     };
 
     let (_cache, mesh) = match discover_and_pin(opts).await {
@@ -3665,6 +3676,7 @@ async fn populate_telegram_outbound_cell(
         deadline_secs: cfg.ai_peer.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
         local_port: None,
+        source_key_registry: None,
     };
 
     let (_cache, mesh) = match discover_and_pin(opts).await {
@@ -3791,6 +3803,7 @@ async fn populate_discord_outbound_cell(
         deadline_secs: cfg.ai_peer.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
         local_port: None,
+        source_key_registry: None,
     };
 
     let (_cache, mesh) = match discover_and_pin(opts).await {
@@ -3909,6 +3922,7 @@ async fn populate_slack_outbound_cell(
         deadline_secs: cfg.ai_peer.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
         local_port: None,
+        source_key_registry: None,
     };
 
     let (_cache, mesh) = match discover_and_pin(opts).await {
@@ -4033,6 +4047,7 @@ async fn populate_email_outbound_cell(
         deadline_secs: cfg.ai_peer.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
         local_port: None,
+        source_key_registry: None,
     };
 
     let (_cache, mesh) = match discover_and_pin(opts).await {
@@ -4141,6 +4156,7 @@ async fn populate_memory_curator_cell(
         deadline_secs: cfg.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(6),
         local_port: None,
+        source_key_registry: None,
     };
 
     let (_cache, mesh) = match discover_and_pin(opts).await {
@@ -4259,6 +4275,7 @@ async fn populate_memory_curator_coord_cell(
         deadline_secs: cfg.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(6),
         local_port: None,
+        source_key_registry: None,
     };
 
     let (_cache, mesh) = match discover_and_pin(opts).await {
@@ -4354,6 +4371,7 @@ async fn populate_drift_embedder_cell(
         deadline_secs: cfg.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
         local_port: None,
+        source_key_registry: None,
     };
     let (_cache, mesh) = match discover_and_pin(opts).await {
         Some(p) => p,
@@ -4453,6 +4471,7 @@ async fn populate_workflow_dispatcher_cell(
         deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
         local_port: None,
+        source_key_registry: None,
     };
     let (_cache, mesh) = match discover_and_pin(opts).await {
         Some(p) => p,
@@ -4489,6 +4508,7 @@ async fn populate_knowledge_mesh_cell(
     peers: std::collections::BTreeMap<String, PeerConfig>,
     key_path: std::path::PathBuf,
     deadline_secs: i64,
+    source_key_registry: crate::knowledge::service::SourceNodeKeyRegistry,
 ) {
     use crate::flow_runner::{PeerEntry, PeersFile};
     use crate::manifest::{DiscoveryOptions, discover_and_pin};
@@ -4546,6 +4566,10 @@ async fn populate_knowledge_mesh_cell(
         deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
         local_port: None,
+        // SEC §17: discovery auto-registers each peer's
+        // handshake-verified identity key here, so knowledge-share
+        // source binding works with zero manual config.
+        source_key_registry: Some(source_key_registry),
     };
     let (_cache, mesh) = match discover_and_pin(opts).await {
         Some(p) => p,
@@ -4648,6 +4672,7 @@ async fn populate_alert_mesh_cell(
         deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
         local_port: None,
+        source_key_registry: None,
     };
     let (_cache, mesh) = match discover_and_pin(opts).await {
         Some(p) => p,
@@ -4734,6 +4759,7 @@ async fn populate_memory_embedding_cell(
         deadline_secs: cfg.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
         local_port: None,
+        source_key_registry: None,
     };
     let (_cache, mesh) = match discover_and_pin(opts).await {
         Some(p) => p,
@@ -5141,6 +5167,9 @@ pub(crate) enum StartupWiring {
         cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::knowledge::RemoteKnowledgeDispatcher>>>,
         peers: std::collections::BTreeMap<String, PeerConfig>,
         deadline_secs: i64,
+        /// SEC §17: registry to auto-populate with handshake-verified
+        /// peer identity keys as connections come up.
+        source_key_registry: crate::knowledge::service::SourceNodeKeyRegistry,
     },
 }
 
@@ -6714,6 +6743,10 @@ fn register_node_type_handlers(
                     cell: mesh_cell,
                     peers: cfg.peers.clone(),
                     deadline_secs: 30,
+                    // SEC §17: hand the service's source-key registry to
+                    // the discovery task so connecting peers' verified
+                    // identity keys auto-populate it — no manual config.
+                    source_key_registry: svc.source_node_key_registry(),
                 });
                 // Spawn the AutoShareTask. The handle is dropped
                 // — the task runs for the process lifetime;
