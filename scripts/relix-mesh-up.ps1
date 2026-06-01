@@ -1513,7 +1513,15 @@ try {
     Write-Host "starting web bridge ..."
     [void]$started.Add( (Start-Node -Exe $Bridge -Cfg $BridgeConfig -OutLog $BridgeLog -ErrLog $BridgeErr -RustLog 'relix_web_bridge=info,relix_runtime=info') )
 
-    if (-not (Wait-Log -Path $BridgeLog -Needle 'web bridge starting' -Desc 'web bridge')) { throw 'web bridge never came up' }
+    if (-not (Wait-Log -Path $BridgeLog -Needle 'web bridge starting' -Desc 'web bridge')) {
+        # The bridge binds its port BEFORE logging 'web bridge starting',
+        # so a missing needle usually means the bind failed — most often
+        # a stale bridge from a prior boot is already holding the port.
+        # Surface the bridge's own error so the cause is obvious.
+        Write-Host "web bridge did not come up. Bridge error log tail:"
+        if (Test-Path $BridgeErr) { Get-Content $BridgeErr -Tail 30 | ForEach-Object { Write-Host "    $_" } }
+        throw 'web bridge never came up (port may be shadowed by a stale instance; run relix-mesh-down)'
+    }
     Start-Sleep -Milliseconds 400
 
     Write-Host ""

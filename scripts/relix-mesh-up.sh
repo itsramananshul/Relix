@@ -1350,11 +1350,40 @@ echo "starting web bridge ..."
 : > "$BRIDGE_LOG"; : > "$BRIDGE_ERR"
 RUST_LOG="relix_web_bridge=info,relix_runtime=info" \
     "$BRIDGE" --config "$BRIDGE_CONFIG" >>"$BRIDGE_LOG" 2>>"$BRIDGE_ERR" &
-PIDS+=($!)
+BRIDGE_PID=$!
+PIDS+=("$BRIDGE_PID")
 
-# Bridge health = HTTP 200 on /health
+# Wait for OUR bridge to confirm it bound the port. The bridge logs
+# "web bridge starting" ONLY after a successful bind, into OUR log file
+# ($BRIDGE_LOG). A stale bridge already holding the port logs elsewhere
+# and would answer /health itself — so waiting on /health alone can be
+# fooled into a false "ready" by the stale instance. Waiting for the
+# needle in our own log (plus watching that the process we started is
+# still alive) is not fooled: on a port collision our bridge exits with
+# its actionable error and never emits the needle.
+elapsed=0
+until grep -q "web bridge starting" "$BRIDGE_LOG" 2>/dev/null; do
+    if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
+        echo "  web bridge exited during startup (port likely shadowed by a stale instance). tail:"
+        tail -n 30 "$BRIDGE_ERR" "$BRIDGE_LOG" | sed 's/^/    /'
+        exit 1
+    fi
+    sleep 0.5
+    elapsed=$((elapsed + 1))
+    if [[ "$elapsed" -ge 60 ]]; then
+        echo "  web bridge did not start within 30s. tail:"
+        tail -n 30 "$BRIDGE_ERR" "$BRIDGE_LOG" | sed 's/^/    /'
+        exit 1
+    fi
+done
+# Our bridge bound the port; confirm it serves.
 elapsed=0
 until curl -fsS "http://127.0.0.1:$BRIDGE_PORT/health" >/dev/null 2>&1; do
+    if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
+        echo "  web bridge exited during startup. tail:"
+        tail -n 30 "$BRIDGE_ERR" "$BRIDGE_LOG" | sed 's/^/    /'
+        exit 1
+    fi
     sleep 0.5
     elapsed=$((elapsed + 1))
     if [[ "$elapsed" -ge 60 ]]; then

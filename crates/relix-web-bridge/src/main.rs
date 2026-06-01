@@ -1138,6 +1138,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // every route registered above.
         .layer(axum::middleware::from_fn(route_latency_log));
 
+    // Bind the HTTP listener FIRST — before the "web bridge starting"
+    // log and the token banner. If the port is already held (typically
+    // a stale bridge from an earlier boot), fail loudly with an
+    // actionable message instead of letting the stale instance keep
+    // serving while this boot prints a fresh, MISMATCHED token. Binding
+    // before the success needle also means a collision never emits
+    // "web bridge starting", so the boot scripts report the failure
+    // rather than being fooled by the stale instance answering /health.
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            return Err(format!(
+                "a Relix bridge (or another process) is already listening on {addr}; \
+                 stop it first (`relix-mesh-down`, or `relix stop`) — otherwise the stale \
+                 instance shadows this boot and keeps serving with a different setup token"
+            )
+            .into());
+        }
+        Err(e) => return Err(format!("bind {addr}: {e}").into()),
+    };
     tracing::info!(
         listen = %addr,
         flow_template = %cfg.flow.template_path.display(),
@@ -1156,7 +1176,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bridge_token_path.display()
     );
     println!("Dashboard:    http://{}/dashboard", addr);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     // Telegram FIX 1: `into_make_service_with_connect_info::<SocketAddr>()`
     // populates the `ConnectInfo<SocketAddr>` extractor on
     // every request, used by the `/v1/channels/telegram/webhook`
