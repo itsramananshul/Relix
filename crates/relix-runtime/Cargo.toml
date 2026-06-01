@@ -10,7 +10,14 @@ repository.workspace = true
 authors.workspace = true
 
 [lints.rust]
-unsafe_code = "forbid"
+# Relaxed from `forbid` to `deny` (same rationale as relix-core's
+# CORR-D1) because the Linux plugin sandbox in `plugin::loader`
+# (`Command::pre_exec` + seccomp install + `libc::prctl`) is inherently
+# unsafe FFI. The two call sites carry a scoped `#[allow(unsafe_code)]`
+# with load-bearing `// SAFETY:` comments; every other site in the crate
+# remains denied by default. `forbid` is set on the command line by
+# Cargo's lint table, so it cannot be overridden per-item — `deny` can.
+unsafe_code = "deny"
 
 [dependencies]
 relix-core.workspace = true
