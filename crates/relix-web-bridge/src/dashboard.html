@@ -37,6 +37,11 @@ input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); ou
 .sidebar {
   background: var(--panel); border-right: 1px solid var(--border);
   display: flex; flex-direction: column; height: 100vh; position: sticky; top: 0;
+  /* Above the modal backdrop (.modal-bg z-index:99) so the nav is never
+     covered by an open overlay at full width — matches the z-index the
+     narrow breakpoint already gives the sidebar. Without this the sticky
+     sidebar has z-index:auto and an open modal eats every nav click. */
+  z-index: 101;
 }
 .sidebar-header { padding: 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
 .brand { font-weight: 700; font-size: 16px; color: var(--text-strong); }
@@ -2344,7 +2349,14 @@ function openModal(title, body) {
     el('button', { class: 'modal-close', onclick: closeModal }, '×'),
     el('h2', { class: 'modal-title' }, title), body);
   bg.classList.add('open');
-  bg.addEventListener('click', function (ev) { if (ev.target === bg) closeModal(); }, { once: true });
+  // Backdrop-click dismiss. Assigned via the `onclick` PROPERTY (not
+  // addEventListener) so it is idempotent across re-opens and persists:
+  // the previous `{ once: true }` listener was consumed by the first
+  // click anywhere on the backdrop — including a click that bubbled up
+  // from modal content — leaving the overlay unable to close via the
+  // backdrop. Only a click on the backdrop itself (ev.target === bg),
+  // not on modal content, dismisses.
+  bg.onclick = function (ev) { if (ev.target === bg) closeModal(); };
 }
 function closeModal() { document.getElementById('modal').classList.remove('open'); }
 
