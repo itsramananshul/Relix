@@ -74,10 +74,11 @@ Current progress:
   durable activity, and return scope metadata in mutation responses
 - memory write proxies (`/v1/memory/ingest`, `/v1/memory/ingest_image`,
   `/v1/memory/context_flush`, quarantine decisions, record edits/freezes, and
-  model refresh requests) accept optional `task_id`/`run_id`, strip that bridge
-  metadata before forwarding, stamp `task_id` into the mesh dispatch envelope,
-  record durable activity without copying document/image payloads, and add scope
-  metadata to object responses
+  model refresh requests) plus `/v1/memory/export` accept optional
+  `task_id`/`run_id`, strip that bridge metadata before forwarding, stamp
+  `task_id` into the mesh dispatch envelope, record durable activity without
+  copying document/image/export payloads, and add scope metadata to object
+  responses
 - manual memory curation (`POST /v1/memory/curate`) accepts optional
   `task_id`/`run_id`, stamps `task_id` into the mesh dispatch envelope, records
   durable activity, appends best-effort task events for bound calls, and returns
@@ -296,7 +297,7 @@ Current producers:
 - browser capture reads from `/v1/browser/captures/:filename`
 - plugin management mutations from `/v1/plugins/:id/reload` and
   `/v1/plugins/:id/disable`
-- memory writes from GAP 5 bridge proxies
+- memory writes and exports from GAP 5 bridge proxies
 - manual memory curation from `/v1/memory/curate`
 - memory embedding writes from `/v1/memory/embed` and `/v1/memory/embed_all`
 - knowledge share/broadcast/revoke/recall calls from `/v1/knowledge`

@@ -441,6 +441,7 @@ fn should_record_activity(method: &str) -> bool {
             | "memory.freeze_record"
             | "memory.unfreeze_record"
             | "memory.request_model_refresh"
+            | "memory.bulk_export"
     )
 }
 
@@ -567,8 +568,8 @@ mod tests {
     fn activity_filter_records_only_memory_write_methods() {
         assert!(should_record_activity("memory.ingest_document"));
         assert!(should_record_activity("memory.edit_record"));
+        assert!(should_record_activity("memory.bulk_export"));
         assert!(!should_record_activity("memory.dialectic"));
-        assert!(!should_record_activity("memory.bulk_export"));
         assert!(!should_record_activity("memory.quarantine_list"));
     }
 
