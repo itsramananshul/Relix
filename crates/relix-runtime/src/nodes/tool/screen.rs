@@ -401,7 +401,9 @@ async fn run_capture_command(
     Ok((backend.to_string(), bytes))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+// Only the Linux capture path probes for tools; macOS calls screencapture
+// directly, so this would be dead code there.
+#[cfg(target_os = "linux")]
 async fn which_exists(name: &str) -> bool {
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
