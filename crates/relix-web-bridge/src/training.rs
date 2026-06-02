@@ -30,7 +30,9 @@ use serde_json::Value;
 use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
+use crate::activity::{ToolInvocationActivity, append_tool_invocation_activity};
 use crate::config::AppState;
+use crate::tenant::{DEFAULT_TENANT, current_subject, current_tenant};
 
 const DEFAULT_PEER: &str = "coordinator";
 
@@ -75,6 +77,10 @@ pub struct StatsQuery {
 pub struct PeerQuery {
     #[serde(default)]
     pub peer: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 /// `GET /v1/training/interactions`
@@ -117,6 +123,7 @@ pub async fn list_interactions(
         &peer,
         "training.list_interactions",
         &Value::Object(body),
+        None,
     )
     .await
     {
@@ -137,7 +144,7 @@ pub async fn get_interaction(
     }
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({ "interaction_id": id });
-    match call_peer_json(&state, &peer, "training.get_interaction", &body).await {
+    match call_peer_json(&state, &peer, "training.get_interaction", &body, None).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -165,6 +172,10 @@ pub struct ExportRequest {
     pub include_tool_calls: Option<bool>,
     #[serde(default)]
     pub peer: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 /// `POST /v1/training/export`
@@ -179,6 +190,12 @@ pub async fn export(
     if req.export_set.trim().is_empty() {
         return bad_request("export_set is required");
     }
+    let task_id = match clean_optional_id(req.task_id.as_deref(), "task_id") {
+        Ok(id) => id,
+        Err(e) => return bad_request(&e),
+    };
+    let run_id = clean_optional(req.run_id.as_deref());
+    let detail = export_detail(&req);
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let mut body = serde_json::Map::new();
     body.insert("format".into(), Value::from(req.format));
@@ -207,9 +224,40 @@ pub async fn export(
     if let Some(v) = req.include_tool_calls {
         body.insert("include_tool_calls".into(), Value::from(v));
     }
-    match call_peer_json(&state, &peer, "training.export", &Value::Object(body)).await {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(resp) => resp,
+    match call_peer_json(
+        &state,
+        &peer,
+        "training.export",
+        &Value::Object(body),
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(mut v) => {
+            attach_scope(&mut v, task_id.as_deref(), run_id.as_deref());
+            record_training_activity(
+                &state,
+                &peer,
+                "training.export",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "ok",
+                &detail,
+            );
+            (StatusCode::OK, Json(v)).into_response()
+        }
+        Err(resp) => {
+            record_training_activity(
+                &state,
+                &peer,
+                "training.export",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "err",
+                &detail,
+            );
+            resp
+        }
     }
 }
 
@@ -223,11 +271,48 @@ pub async fn score_interaction(
     if id.trim().is_empty() {
         return bad_request("interaction_id is required");
     }
+    let task_id = match clean_optional_id(q.task_id.as_deref(), "task_id") {
+        Ok(id) => id,
+        Err(e) => return bad_request(&e),
+    };
+    let run_id = clean_optional(q.run_id.as_deref());
+    let detail = interaction_detail(&id);
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({ "interaction_id": id });
-    match call_peer_json(&state, &peer, "training.score_interaction", &body).await {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(resp) => resp,
+    match call_peer_json(
+        &state,
+        &peer,
+        "training.score_interaction",
+        &body,
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(mut v) => {
+            attach_scope(&mut v, task_id.as_deref(), run_id.as_deref());
+            record_training_activity(
+                &state,
+                &peer,
+                "training.score_interaction",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "ok",
+                &detail,
+            );
+            (StatusCode::OK, Json(v)).into_response()
+        }
+        Err(resp) => {
+            record_training_activity(
+                &state,
+                &peer,
+                "training.score_interaction",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "err",
+                &detail,
+            );
+            resp
+        }
     }
 }
 
@@ -238,7 +323,7 @@ pub async fn stats(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
-    match call_peer_json(&state, &peer, "training.stats", &Value::Null).await {
+    match call_peer_json(&state, &peer, "training.stats", &Value::Null, None).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -254,11 +339,48 @@ pub async fn delete_interaction(
     if id.trim().is_empty() {
         return bad_request("interaction_id is required");
     }
+    let task_id = match clean_optional_id(q.task_id.as_deref(), "task_id") {
+        Ok(id) => id,
+        Err(e) => return bad_request(&e),
+    };
+    let run_id = clean_optional(q.run_id.as_deref());
+    let detail = interaction_detail(&id);
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({ "interaction_id": id });
-    match call_peer_json(&state, &peer, "training.delete_interaction", &body).await {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(resp) => resp,
+    match call_peer_json(
+        &state,
+        &peer,
+        "training.delete_interaction",
+        &body,
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(mut v) => {
+            attach_scope(&mut v, task_id.as_deref(), run_id.as_deref());
+            record_training_activity(
+                &state,
+                &peer,
+                "training.delete_interaction",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "ok",
+                &detail,
+            );
+            (StatusCode::OK, Json(v)).into_response()
+        }
+        Err(resp) => {
+            record_training_activity(
+                &state,
+                &peer,
+                "training.delete_interaction",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "err",
+                &detail,
+            );
+            resp
+        }
     }
 }
 
@@ -282,7 +404,7 @@ pub async fn pii_scan(
     }
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({ "text": req.text });
-    match call_peer_json(&state, &peer, "training.pii_scan", &body).await {
+    match call_peer_json(&state, &peer, "training.pii_scan", &body, None).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -317,6 +439,7 @@ pub async fn pii_preview(
         &peer,
         "training.anonymize_preview",
         &Value::Object(body),
+        None,
     )
     .await
     {
@@ -343,6 +466,7 @@ async fn call_peer_json(
     alias: &str,
     method: &str,
     args: &Value,
+    task_id: Option<&str>,
 ) -> Result<Value, axum::response::Response> {
     use axum::response::IntoResponse;
     let mesh = match state.mesh_client.as_ref() {
@@ -377,7 +501,7 @@ async fn call_peer_json(
         deadline_secs,
         None,
         None,
-        None,
+        task_id.map(str::to_string),
         crate::tenant::current_tenant_or_none(),
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
@@ -473,6 +597,103 @@ async fn call_peer_json(
     }
 }
 
+fn clean_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn clean_optional_id(value: Option<&str>, field: &str) -> Result<Option<String>, String> {
+    let Some(clean) = clean_optional(value) else {
+        return Ok(None);
+    };
+    if clean.len() == 32 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(Some(clean))
+    } else {
+        Err(format!("{field} must be 32 hex chars"))
+    }
+}
+
+fn attach_scope(value: &mut Value, task_id: Option<&str>, run_id: Option<&str>) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(task_id) = task_id {
+        obj.insert("task_id".into(), Value::String(task_id.to_string()));
+    }
+    if let Some(run_id) = run_id {
+        obj.insert("run_id".into(), Value::String(run_id.to_string()));
+    }
+}
+
+fn export_detail(req: &ExportRequest) -> String {
+    format!(
+        "format={}; export_set={}; agent={}; session_filter={}; max_interactions={}; output_dir_present={}",
+        req.format.trim(),
+        req.export_set.trim(),
+        req.agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("all"),
+        req.session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some(),
+        req.max_interactions
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        req.output_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some()
+    )
+}
+
+fn interaction_detail(interaction_id: &str) -> String {
+    format!("interaction_id={}", interaction_id.trim())
+}
+
+fn record_training_activity(
+    state: &AppState,
+    peer: &str,
+    method: &str,
+    task_id: Option<&str>,
+    run_id: Option<&str>,
+    decision: &str,
+    detail: &str,
+) {
+    let tenant_id = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    let actor = current_subject().unwrap_or_else(|| "training".into());
+    if let Err(e) = append_tool_invocation_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        ToolInvocationActivity {
+            tenant_id: &tenant_id,
+            actor: &actor,
+            peer,
+            method,
+            task_id,
+            run_id,
+            decision,
+            detail,
+        },
+    ) {
+        tracing::warn!(error = %e, method, "failed to append training activity");
+    }
+    if let (Some(rec), Some(task_id)) = (state.task_recorder.as_ref(), task_id) {
+        let payload = format!("peer={peer} outcome={decision} {detail}");
+        let rec = rec.clone();
+        let task_id = task_id.to_string();
+        let event_type = method.to_string();
+        tokio::spawn(async move {
+            rec.event(&task_id, &event_type, &payload).await;
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +722,78 @@ mod tests {
         assert!(q.page_size.is_none());
         assert!(q.agent.is_none());
         assert!(q.peer.is_none());
+    }
+
+    #[test]
+    fn export_request_accepts_scope_context_and_redacts_path_detail() {
+        let req: ExportRequest = serde_json::from_str(
+            r#"{
+                "format":"openai",
+                "export_set":"launch-eval",
+                "output_dir":"C:/very/private/path",
+                "agent":"alice",
+                "session_id":"session-1",
+                "max_interactions":25,
+                "task_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "run_id":"run-1"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.task_id.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(req.run_id.as_deref(), Some("run-1"));
+        let detail = export_detail(&req);
+        assert!(detail.contains("format=openai"));
+        assert!(detail.contains("export_set=launch-eval"));
+        assert!(detail.contains("agent=alice"));
+        assert!(detail.contains("session_filter=true"));
+        assert!(detail.contains("max_interactions=25"));
+        assert!(detail.contains("output_dir_present=true"));
+        assert!(!detail.contains("C:/very/private/path"));
+        assert!(!detail.contains("session-1"));
+    }
+
+    #[test]
+    fn peer_query_accepts_scope_context() {
+        let q: PeerQuery = serde_json::from_str(
+            r#"{"task_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","run_id":"run-2"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            q.task_id.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(q.run_id.as_deref(), Some("run-2"));
+        assert_eq!(interaction_detail("abc123"), "interaction_id=abc123");
+    }
+
+    #[test]
+    fn attach_scope_only_mutates_object_responses() {
+        let mut value = serde_json::json!({ "exported": true });
+        attach_scope(
+            &mut value,
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Some("run-1"),
+        );
+        assert_eq!(value["task_id"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(value["run_id"], "run-1");
+
+        let mut scalar = serde_json::json!("ok");
+        attach_scope(&mut scalar, Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), None);
+        assert_eq!(scalar, serde_json::json!("ok"));
+    }
+
+    #[test]
+    fn clean_optional_id_rejects_invalid_task_id() {
+        assert_eq!(
+            clean_optional_id(Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "task_id")
+                .unwrap()
+                .as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert!(clean_optional_id(Some("bad"), "task_id").is_err());
+        assert_eq!(clean_optional_id(Some(" "), "task_id").unwrap(), None);
     }
 }
