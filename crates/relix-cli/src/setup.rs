@@ -148,15 +148,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!();
-    println!("Next steps:");
-    println!("  relix boot        # start the mesh now");
-    println!("  relix stop        # stop it");
-    println!("  relix status      # check on it later");
-    println!("  relix reconfigure # re-run this wizard");
-    if !missing.is_empty() {
-        println!("  relix install --fix    # auto-install remaining dependencies");
-    }
+    print_first_run_checklist(&final_cfg, &missing);
     println!();
     Ok(())
 }
@@ -1099,6 +1091,52 @@ fn channel_diff(prior: &ChannelsConfig, now: &ChannelsConfig) -> Vec<String> {
     out
 }
 
+fn first_run_checklist(
+    cfg: &RelixConfig,
+    missing_deps: &[&crate::install::DependencyStatus],
+) -> Vec<String> {
+    let dashboard_url = format!("http://127.0.0.1:{}/dashboard", cfg.mesh.bridge_port);
+    let chat_url = format!("http://127.0.0.1:{}/v1/chat", cfg.mesh.bridge_port);
+    let mut out = vec![
+        "Next steps:".to_string(),
+        "  1. Start Relix:        relix boot".to_string(),
+        format!("  2. Open dashboard:     {dashboard_url}"),
+        "  3. Bridge token file:  ~/.relix/bridge-token (created on first boot)".to_string(),
+        format!(
+            "  4. First chat smoke:   curl -H \"Authorization: Bearer $(cat ~/.relix/bridge-token)\" -H \"Content-Type: application/json\" -d '{{\"message\":\"hello Relix\"}}' {chat_url}"
+        ),
+        "  5. Check health:       relix status".to_string(),
+        "  6. Reconfigure later:  relix reconfigure".to_string(),
+        "  7. Stop Relix:         relix stop".to_string(),
+    ];
+    if !missing_deps.is_empty() {
+        out.push("  ! Missing deps:        relix install --fix".to_string());
+    }
+    if cfg.provider.name != "mock" && cfg.provider.api_key.trim().is_empty() {
+        out.push(format!(
+            "  ! Provider key:        set the API key for provider `{}` or rerun `relix setup`",
+            cfg.provider.name
+        ));
+    }
+    if cfg.credentials.enabled && cfg.credentials.master_key.trim().is_empty() {
+        out.push(
+            "  ! Credential vault:    master key missing; rerun `relix setup` before using vault caps"
+                .to_string(),
+        );
+    }
+    out
+}
+
+fn print_first_run_checklist(
+    cfg: &RelixConfig,
+    missing_deps: &[&crate::install::DependencyStatus],
+) {
+    println!();
+    for line in first_run_checklist(cfg, missing_deps) {
+        println!("{line}");
+    }
+}
+
 // ---- key + terminal helpers ---------------------------------------------
 
 enum Key {
@@ -1308,5 +1346,50 @@ mod tests {
         let init = 9999usize;
         let clamped = init.min(PROVIDER_CHOICES.len() - 1);
         assert_eq!(clamped, PROVIDER_CHOICES.len() - 1);
+    }
+
+    #[test]
+    fn first_run_checklist_uses_configured_bridge_port_and_chat_smoke() {
+        let mut cfg = RelixConfig::default();
+        cfg.mesh.bridge_port = 19999;
+        let lines = first_run_checklist(&cfg, &[]);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("http://127.0.0.1:19999/dashboard"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("http://127.0.0.1:19999/v1/chat"))
+        );
+        assert!(lines.iter().any(|l| l.contains("~/.relix/bridge-token")));
+        assert!(lines.iter().any(|l| l.contains("relix boot")));
+        assert!(!lines.iter().any(|l| l.contains("relix install --fix")));
+    }
+
+    #[test]
+    fn first_run_checklist_flags_missing_dependency_and_provider_key() {
+        let mut cfg = RelixConfig::default();
+        cfg.provider.name = "openai".into();
+        cfg.provider.api_key.clear();
+        let missing = crate::install::DependencyStatus {
+            dependency: crate::install::Dependency::Qdrant,
+            found: false,
+            version: None,
+            detail: "not running".into(),
+        };
+        let lines = first_run_checklist(&cfg, &[&missing]);
+        assert!(lines.iter().any(|l| l.contains("relix install --fix")));
+        assert!(lines.iter().any(|l| l.contains("provider `openai`")));
+    }
+
+    #[test]
+    fn first_run_checklist_flags_missing_vault_master_key() {
+        let mut cfg = RelixConfig::default();
+        cfg.credentials.enabled = true;
+        cfg.credentials.master_key.clear();
+        let lines = first_run_checklist(&cfg, &[]);
+        assert!(lines.iter().any(|l| l.contains("master key missing")));
     }
 }

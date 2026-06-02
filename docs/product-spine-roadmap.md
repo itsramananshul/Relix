@@ -246,3 +246,12 @@ watch first run
 
 Every required config value should be either generated, validated, or explained
 with the exact fix.
+
+Current progress:
+
+- `relix setup` runs dependency preflight before entering raw terminal mode
+- non-interactive setup writes defaults instead of hanging on key reads
+- the final setup screen now prints a concrete first-run checklist: `relix boot`,
+  the configured dashboard URL, bridge token file path, a first `/v1/chat` curl
+  smoke test, health/stop/reconfigure commands, and explicit warnings for
+  missing dependencies, provider keys, or credential-vault master keys
