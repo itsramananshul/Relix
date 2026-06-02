@@ -353,7 +353,10 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("<title>Relix"), "missing title");
-        assert!(body.contains("Operator Console"), "missing brand subtitle");
+        assert!(
+            body.contains("Agent Control Plane"),
+            "missing brand subtitle"
+        );
         assert!(body.contains("id=\"sidebar\""), "missing sidebar shell");
         assert!(
             body.contains("id=\"theme-toggle\""),
@@ -363,6 +366,37 @@ mod tests {
             body.contains("data-section=\"overview\""),
             "missing nav routing data"
         );
+    }
+
+    /// Paperclip-inspired product shell guard: the embedded dashboard
+    /// must ship as an actual control-plane surface, not a flat dump of
+    /// unrelated panels. These landmarks keep the grouped navigation,
+    /// topbar context, and bridge/spine status wiring intact.
+    #[tokio::test]
+    async fn page_carries_grouped_control_plane_shell() {
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "class=\"brand-mark\"",
+            "id=\"dashboard-topbar\"",
+            "id=\"topbar-section\"",
+            "id=\"topbar-spine\"",
+            "id=\"topbar-bridge\"",
+            "class: 'nav-group-label'",
+            "data-nav-group",
+            "function updateTopbar(",
+            "function updateSpineTopbar(",
+            "function setStatusPill(",
+        ] {
+            assert!(
+                body.contains(needle),
+                "missing dashboard shell marker {needle:?}"
+            );
+        }
+        for group in ["Work", "Agent Runtime", "Operations", "System"] {
+            assert!(body.contains(group), "missing nav group {group}");
+        }
     }
 
     /// Dark-mode toggle wires through to the `<html>` root via
