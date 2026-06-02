@@ -502,14 +502,12 @@ mod tests {
         );
     }
 
-    /// P4 test: "Dashboard with no token shows the auth error
-    /// screen and makes no further requests." We assert the
-    /// shape of the bootstrap path: when /v1/auth/token returns
-    /// no token, Bridge.authFailed flips and initApp aborts
-    /// before wiring any handlers — no Bridge.get/post calls
-    /// run.
+    /// Dashboard bootstrap no longer replaces the entire console
+    /// with a setup-token wall. When `/v1/auth/token` is absent or
+    /// refuses the request, the shell still initializes and surfaces
+    /// the auth state as a status pill/panel-level request failures.
     #[tokio::test]
-    async fn page_bootstrap_aborts_when_auth_token_endpoint_refuses() {
+    async fn page_bootstrap_continues_when_auth_token_endpoint_refuses() {
         let resp = page().await.into_response();
         let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
@@ -519,21 +517,17 @@ mod tests {
             body.contains("self.authFailed = true"),
             "bootstrap missing authFailed flag flip"
         );
-        // initApp MUST check the flag before wiring handlers.
         assert!(
             body.contains("if (Bridge.authFailed)"),
-            "initApp does not gate on Bridge.authFailed"
+            "initApp does not inspect Bridge.authFailed"
         );
-        // showAuthErrorScreen is the visible surface.
         assert!(
-            body.contains("function showAuthErrorScreen("),
-            "showAuthErrorScreen helper is missing"
+            body.contains("setStatusPill('topbar-bridge', 'Bridge auth not loaded', 'warn')"),
+            "auth failure is not surfaced in the dashboard shell"
         );
-        // Auth-error screen renders the brand-name text the
-        // operator expects.
         assert!(
-            body.contains("Authentication Required"),
-            "auth error screen body text missing"
+            !body.contains("Authentication Required"),
+            "dashboard still carries a full-page auth wall"
         );
     }
 
@@ -580,9 +574,10 @@ mod tests {
         );
     }
 
-    /// P4 test: "Dashboard session that expires shows the
-    /// auth error screen automatically." The probe interval
-    /// is 5 minutes and it checks /v1/health for 401/403.
+    /// P4 test: "Dashboard session that expires marks the
+    /// bridge status stale." The probe interval is 5 minutes
+    /// and it checks /v1/health for 401/403 without replacing
+    /// the page.
     #[tokio::test]
     async fn page_session_expiry_probe_calls_health_every_five_minutes() {
         let resp = page().await.into_response();
@@ -602,10 +597,14 @@ mod tests {
             body.contains("fetch('/v1/health'"),
             "session probe does not call /v1/health"
         );
-        // 401/403 from the probe MUST trigger showAuthErrorScreen.
+        // 401/403 from the probe MUST mark the bridge status.
         assert!(
             body.contains("r.status === 401 || r.status === 403"),
             "session probe does not check 401/403"
+        );
+        assert!(
+            body.contains("Bridge session expired"),
+            "session expiry is not surfaced in the shell"
         );
     }
 
