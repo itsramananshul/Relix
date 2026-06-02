@@ -240,7 +240,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/logs/stream",
                 "/v1/provenance/recent",
             ],
-            gap: "Durable activity JSONL now captures workspace and operator-intervention events; policy, cost, model, memory, and dispatch producers still need to write into the same ledger.",
+            gap: "Durable activity JSONL now captures workspace, intervention, approval, and policy-denial events; cost, model, memory, and dispatch producers still need the same ledger path.",
         },
         SpineSurface {
             id: "memory",

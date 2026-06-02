@@ -136,7 +136,8 @@ Unify scattered rings/logs/provenance into one durable activity ledger:
 - decision: implemented
 - cost: schema field exists, producers missing
 - approval id: implemented for REST/dashboard and channel approval decisions
-- policy result: schema field exists, producers missing
+- policy result: implemented for recent policy-denial rows with idempotent
+  activity ids
 - timestamp: implemented
 
 The operator question "what happened?" should not require scraping five
@@ -159,6 +160,7 @@ Current producers:
 - workspace lease create/release
 - operator intervention audit rows
 - approval decisions from the dashboard/API and channel callbacks
+- policy denials discovered through `/v1/policy/denials`
 
 ## Phase 6: Dashboard Decomposition
 

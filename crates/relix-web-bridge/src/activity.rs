@@ -65,6 +65,18 @@ pub struct ActivityRecentResponse {
     pub durable: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PolicyDenialActivity<'a> {
+    pub tenant_id: &'a str,
+    pub peer: &'a str,
+    pub at_ms: i64,
+    pub method: &'a str,
+    pub caller_subject_id: &'a str,
+    pub caller_name: &'a str,
+    pub rule: &'a str,
+    pub reason: &'a str,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ApiError {
     pub error: String,
@@ -167,6 +179,48 @@ pub fn append_approval_activity(
     )
 }
 
+pub fn append_policy_denial_activity(
+    data_dir: Option<&Path>,
+    denial: PolicyDenialActivity<'_>,
+) -> Result<bool, String> {
+    let Some(path) = data_dir.map(activity_path_for_data_dir) else {
+        return Ok(false);
+    };
+    let actor = non_empty(denial.caller_name)
+        .or_else(|| non_empty(denial.caller_subject_id))
+        .unwrap_or("unknown");
+    append_entry_once(
+        &path,
+        &ActivityEntry {
+            activity_id: policy_denial_activity_id(
+                denial.tenant_id,
+                denial.at_ms,
+                denial.method,
+                denial.caller_subject_id,
+                denial.rule,
+                denial.reason,
+            ),
+            ts_ms: denial.at_ms,
+            source: "policy".into(),
+            actor: actor.into(),
+            tenant_id: denial.tenant_id.into(),
+            task_id: None,
+            run_id: None,
+            action: "policy.denied".into(),
+            target: denial.method.into(),
+            decision: "denied".into(),
+            method: Some(denial.method.into()),
+            approval_id: None,
+            policy_result: Some(denial.rule.into()),
+            cost_micros: None,
+            detail: format!(
+                "peer={}; subject={}; reason={}",
+                denial.peer, denial.caller_subject_id, denial.reason
+            ),
+        },
+    )
+}
+
 pub fn activity_path_from_intervention_path(path: &Path) -> PathBuf {
     path.with_file_name("bridge-activity.jsonl")
 }
@@ -225,6 +279,34 @@ fn append_entry(path: &Path, entry: &ActivityEntry) -> Result<(), String> {
         .map_err(|e| format!("open activity ledger: {e}"))?;
     file.write_all(line.as_bytes())
         .map_err(|e| format!("write activity ledger: {e}"))
+}
+
+fn append_entry_once(path: &Path, entry: &ActivityEntry) -> Result<bool, String> {
+    if activity_id_exists(path, &entry.activity_id)? {
+        return Ok(false);
+    }
+    append_entry(path, entry)?;
+    Ok(true)
+}
+
+fn activity_id_exists(path: &Path, activity_id: &str) -> Result<bool, String> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("read activity ledger: {e}")),
+    };
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<ActivityEntry>(line) else {
+            continue;
+        };
+        if entry.activity_id == activity_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn read_recent(path: &Path, q: &ActivityQuery, limit: usize) -> Result<Vec<ActivityEntry>, String> {
@@ -296,6 +378,19 @@ fn new_activity_id() -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+fn policy_denial_activity_id(
+    tenant_id: &str,
+    at_ms: i64,
+    method: &str,
+    caller_subject_id: &str,
+    rule: &str,
+    reason: &str,
+) -> String {
+    let material = format!("{tenant_id}\n{at_ms}\n{method}\n{caller_subject_id}\n{rule}\n{reason}");
+    let digest = blake3::hash(material.as_bytes());
+    format!("act_policy_{}", &digest.to_hex().as_str()[..24])
 }
 
 fn internal(error: impl Into<String>) -> ErrorReply {
@@ -435,5 +530,53 @@ mod tests {
         assert_eq!(items[0].approval_id.as_deref(), Some("apr-1"));
         assert_eq!(items[0].method.as_deref(), Some("approval.record_decision"));
         assert_eq!(items[0].decision, "approved");
+    }
+
+    #[test]
+    fn policy_denial_activity_is_idempotent_and_queryable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = append_policy_denial_activity(
+            Some(tmp.path()),
+            PolicyDenialActivity {
+                tenant_id: "tenant-a",
+                peer: "tool",
+                at_ms: 1_716_000,
+                method: "tool.web_fetch",
+                caller_subject_id: "subj-1",
+                caller_name: "agent-1",
+                rule: "default_deny",
+                reason: "no rule matched",
+            },
+        )
+        .unwrap();
+        let second = append_policy_denial_activity(
+            Some(tmp.path()),
+            PolicyDenialActivity {
+                tenant_id: "tenant-a",
+                peer: "tool",
+                at_ms: 1_716_000,
+                method: "tool.web_fetch",
+                caller_subject_id: "subj-1",
+                caller_name: "agent-1",
+                rule: "default_deny",
+                reason: "no rule matched",
+            },
+        )
+        .unwrap();
+        assert!(first);
+        assert!(!second);
+
+        let q = ActivityQuery {
+            limit: None,
+            tenant_id: Some("tenant-a".into()),
+            source: Some("policy".into()),
+            task_id: None,
+        };
+        let items = read_recent(&activity_path_for_data_dir(tmp.path()), &q, 10).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].action, "policy.denied");
+        assert_eq!(items[0].method.as_deref(), Some("tool.web_fetch"));
+        assert_eq!(items[0].policy_result.as_deref(), Some("default_deny"));
+        assert_eq!(items[0].decision, "denied");
     }
 }
