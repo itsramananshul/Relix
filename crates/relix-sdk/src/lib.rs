@@ -708,7 +708,10 @@ mod tests {
         assert!(reply.workspace_lease_id.is_none());
         let req = handle.await.unwrap();
         // No lease id requested → not present in the body.
-        assert!(!req.contains("workspace_lease_id"), "unexpected lease: {req}");
+        assert!(
+            !req.contains("workspace_lease_id"),
+            "unexpected lease: {req}"
+        );
     }
 
     /// PART 1 — real-server test that chat_stream() yields at

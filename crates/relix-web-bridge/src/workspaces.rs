@@ -223,8 +223,9 @@ impl WorkspaceLeaseStore {
 
     /// Phase 4 — bind the active durable task (and optional run) onto
     /// a lease so the workspace reflects which work is currently using
-    /// it. Only mutates an active lease and bumps `updated_at_ms`;
-    /// re-binding the same task is idempotent in effect.
+    /// it. Only mutates an active lease and bumps `updated_at_ms`.
+    /// A missing run id explicitly clears any prior run binding so a
+    /// reused lease cannot show a new task with a stale old run.
     pub fn bind_active_run(
         &mut self,
         tenant_id: &str,
@@ -244,9 +245,10 @@ impl WorkspaceLeaseStore {
             return Err(format!("workspace lease is not active: {lease_id}"));
         }
         lease.task_id = Some(task_id);
-        if let Some(run) = run_id.map(str::trim).filter(|s| !s.is_empty()) {
-            lease.run_id = Some(run.to_string());
-        }
+        lease.run_id = run_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         lease.updated_at_ms = now;
         let out = lease.clone();
         self.persist()?;
@@ -708,6 +710,14 @@ mod tests {
         assert_eq!(bound.run_id.as_deref(), Some("run-9"));
         assert!(bound.updated_at_ms >= lease.updated_at_ms);
 
+        // Rebinding without a run clears the old run id instead of
+        // leaving a misleading task=new/run=old pair on the lease.
+        let rebound = store
+            .bind_active_run("tenant-a", &lease.lease_id, "task-10", None)
+            .expect("rebind");
+        assert_eq!(rebound.task_id.as_deref(), Some("task-10"));
+        assert!(rebound.run_id.is_none());
+
         // Cross-tenant bind is rejected: the lease belongs to tenant-a.
         assert!(
             store
@@ -719,7 +729,7 @@ mod tests {
         store.release("tenant-a", &lease.lease_id, None).unwrap();
         assert!(
             store
-                .bind_active_run("tenant-a", &lease.lease_id, "task-10", None)
+                .bind_active_run("tenant-a", &lease.lease_id, "task-11", None)
                 .is_err()
         );
     }
