@@ -194,6 +194,12 @@ pub struct CoordinatorSection {
     /// `MeshClient::call(alias, ...)` to send `task.*` calls, so the
     /// reconnect-on-drop behaviour applies for free.
     pub alias: String,
+    /// When true, chat execution requires durable task creation. The bridge
+    /// fails startup if the alias is not discovered, and each chat request
+    /// fails before dispatch if `task.create` cannot return a task id.
+    /// Defaults to false for local/dev fail-soft compatibility.
+    #[serde(default)]
+    pub required: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -892,6 +898,32 @@ mod tests {
     }
 
     // ── W7: bridge-side OTel wiring ──────────────────────────────
+
+    #[test]
+    fn bridge_config_parses_required_coordinator_flag() {
+        let toml_str = r#"
+            [bridge]
+            listen_addr = "127.0.0.1:9100"
+
+            [identity]
+            bundle_path     = "dev-keys/bridge.aic"
+            client_key_path = "dev-keys/bridge.key"
+
+            [transport]
+            peers_path = "configs/peers-chained.toml"
+
+            [flow]
+            template_path = "flows/chat_template.sol"
+
+            [coordinator]
+            alias = "coordinator"
+            required = true
+        "#;
+        let cfg: BridgeConfig = toml::from_str(toml_str).expect("parse");
+        let coord = cfg.coordinator.expect("coordinator section");
+        assert_eq!(coord.alias, "coordinator");
+        assert!(coord.required);
+    }
 
     #[test]
     fn bridge_config_parses_observability_otel_section() {

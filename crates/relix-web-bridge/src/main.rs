@@ -373,6 +373,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "bridge: task persistence enabled (coordinator reachable at startup)"
                     );
                 } else {
+                    if coord_cfg.required {
+                        return Err(format!(
+                            "bridge: [coordinator] required=true but alias '{}' was not discovered; refusing to start without durable task persistence",
+                            coord_cfg.alias
+                        )
+                        .into());
+                    }
                     tracing::warn!(
                         coordinator_alias = %coord_cfg.alias,
                         "bridge: [coordinator] alias configured but peer not in discovered set; task persistence disabled (chat still works)"
@@ -387,6 +394,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.mesh_client = Some(mesh_arc);
         }
         None => {
+            if state
+                .cfg
+                .coordinator
+                .as_ref()
+                .is_some_and(|coord| coord.required)
+            {
+                return Err(
+                    "bridge: [coordinator] required=true but mesh discovery did not return a client; refusing to start without durable task persistence"
+                        .into(),
+                );
+            }
             tracing::warn!(
                 "bridge discovery did not return a mesh client; chat requests will fall back to per-request transport"
             );

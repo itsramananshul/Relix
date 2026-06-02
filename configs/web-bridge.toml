@@ -71,3 +71,10 @@ description = "Mesh route — AI node currently set to openrouter"
 [[openai_compat.models]]
 id          = "relix-anthropic"
 description = "Mesh route — AI node currently set to anthropic"
+# Optional task persistence. In local/dev this can stay absent or fail-soft.
+# For production, configure the coordinator alias and set required = true so
+# chat requests fail before dispatch if a durable task cannot be created.
+#
+# [coordinator]
+# alias = "coordinator"
+# required = true

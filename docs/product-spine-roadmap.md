@@ -56,7 +56,9 @@ Current progress:
 
 Remaining launch work:
 
-- make task creation fail-closed for production modes instead of fail-soft
+- make task creation fail-closed for production modes: implemented through
+  `[coordinator] required = true`, which refuses startup when the coordinator
+  alias is unavailable and refuses chat dispatch when `task.create` fails
 - bind plugin/MCP/direct bridge utility calls to tasks or explicit ad-hoc runs
 - attach run ids to the same execution context; bridge chat/OpenAI/WS paths
   now accept a workspace lease id and stamp the resolved workspace path into

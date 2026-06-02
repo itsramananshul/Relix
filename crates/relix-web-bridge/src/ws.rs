@@ -170,6 +170,7 @@ async fn run_ws_session(
             let msg = match e {
                 FlowExecError::InvalidInput(s) => s,
                 FlowExecError::Transport(s) => format!("mesh transport: {s}"),
+                FlowExecError::Unavailable(s) => s,
                 FlowExecError::Internal(s) => s,
             };
             let payload = json!({ "type": "error", "message": msg }).to_string();

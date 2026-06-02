@@ -192,6 +192,14 @@ pub fn exec_error_to_http(e: FlowExecError) -> (StatusCode, Json<ErrorResponse>)
                 flow_log: None,
             }),
         ),
+        FlowExecError::Unavailable(msg) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: msg,
+                flow_id: None,
+                flow_log: None,
+            }),
+        ),
         FlowExecError::Internal(msg) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -214,5 +222,14 @@ mod tests {
         )
         .expect("request parses");
         assert_eq!(req.workspace_lease_id.as_deref(), Some("wsl_abc"));
+    }
+
+    #[test]
+    fn unavailable_flow_error_maps_to_503() {
+        let (status, body) = exec_error_to_http(FlowExecError::Unavailable(
+            "coordinator task persistence is required but unavailable".into(),
+        ));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.error.contains("task persistence"));
     }
 }

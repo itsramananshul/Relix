@@ -231,6 +231,11 @@ enable only what your flows actually need.
 - [ ] **Task list `stuck?` filter checked periodically.** M53's
       filter narrows to running/retrying tasks older than 120s.
       A spike in stuck tasks is a runtime backpressure signal.
+- [ ] **Bridge task persistence fails closed.** Production bridge
+      config should set `[coordinator] required = true`. Verify bridge
+      startup fails if the coordinator alias is not discovered, and verify
+      chat requests return 503 instead of dispatching when `task.create`
+      fails. Anonymous execution with no task ledger is a launch blocker.
 
 ## Pre-traffic smoke test
 

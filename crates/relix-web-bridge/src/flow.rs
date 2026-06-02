@@ -145,6 +145,9 @@ pub enum FlowExecError {
     /// Mesh transport / dial / RPC layer failure — 502 Bad Gateway.
     #[error("mesh transport: {0}")]
     Transport(String),
+    /// Required production dependency is unavailable.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
     /// Anything else surfaced by the runner — 500 Internal Server Error.
     #[error("{0}")]
     Internal(String),
@@ -162,13 +165,14 @@ pub async fn execute_chat_flow(
 
     // B1.2: best-effort task creation. None when coordinator is absent
     // or the call failed (TaskRecorder logs the warning).
-    let task_id = create_task_fail_soft(
+    let task_id = create_task(
         state.task_recorder.as_ref(),
+        task_persistence_required(state),
         "chat",
         "flows/chat_template.sol",
         &chat_params_json(session_id, message),
     )
-    .await;
+    .await?;
     // C2b.1: mint the trace_id upfront so the Coordinator's attempt
     // row and the per-flow event log share the same correlation id.
     let trace_id = TraceId::new();
@@ -371,13 +375,14 @@ pub async fn execute_chat_with_tool_flow(
     validate_url(url).map_err(FlowExecError::InvalidInput)?;
     let workspace = resolve_workspace_binding(state, workspace_lease_id)?;
 
-    let task_id = create_task_fail_soft(
+    let task_id = create_task(
         state.task_recorder.as_ref(),
+        task_persistence_required(state),
         "chat_with_tool",
         "flows/chat_with_tool.sol",
         &chat_with_tool_params_json(session_id, message, url),
     )
-    .await;
+    .await?;
     let trace_id = TraceId::new();
     let trace_hex = trace_id.to_string();
     if let (Some(rec), Some(tid)) = (state.task_recorder.as_ref(), task_id.as_ref()) {
@@ -478,24 +483,51 @@ pub async fn execute_chat_with_tool_flow(
     .await
 }
 
-/// Best-effort task creation. Returns `None` when persistence isn't
-/// configured or the Coordinator call failed; the chat path continues
-/// in either case (fail-soft per B1.9).
+fn task_persistence_required(state: &AppState) -> bool {
+    state
+        .cfg
+        .coordinator
+        .as_ref()
+        .is_some_and(|coord| coord.required)
+}
+
+/// Task creation. In local/dev mode this is fail-soft and returns `None`
+/// when persistence is not configured or the Coordinator call fails. When
+/// `[coordinator] required = true`, it fails before flow dispatch so work
+/// cannot run without a durable task id.
 ///
 /// On success, emits a `task.created` chronology event so the
 /// timeline is self-describing from line 1 (no need to cross-
 /// reference `tasks.created_at`).
-async fn create_task_fail_soft(
+async fn create_task(
     recorder: Option<&TaskRecorder>,
+    required: bool,
     flow_label: &str,
     flow_template: &str,
     params_json: &str,
-) -> Option<String> {
-    let rec = recorder?;
+) -> Result<Option<String>, FlowExecError> {
+    let Some(rec) = recorder else {
+        return if required {
+            Err(FlowExecError::Unavailable(
+                "coordinator task persistence is required but unavailable".into(),
+            ))
+        } else {
+            Ok(None)
+        };
+    };
     let title = make_title(flow_label, params_json, 64);
-    let tid = rec.create(&title, flow_template, params_json).await?;
+    let tid = if required {
+        rec.create_required(&title, flow_template, params_json)
+            .await
+            .map_err(FlowExecError::Unavailable)?
+    } else {
+        let Some(tid) = rec.create(&title, flow_template, params_json).await else {
+            return Ok(None);
+        };
+        tid
+    };
     rec.event(&tid, "task.created", flow_template).await;
-    Some(tid)
+    Ok(Some(tid))
 }
 
 /// Build the wire payload for a `chat.user_turn` /
@@ -591,13 +623,14 @@ pub async fn execute_chat_flow_streaming(
     validate_input(session_id, message).map_err(FlowExecError::InvalidInput)?;
     let workspace = resolve_workspace_binding(state, workspace_lease_id)?;
 
-    let task_id = create_task_fail_soft(
+    let task_id = create_task(
         state.task_recorder.as_ref(),
+        task_persistence_required(state),
         "chat",
         "flows/chat_template_streaming.sol",
         &chat_params_json(session_id, message),
     )
-    .await;
+    .await?;
     let trace_id = TraceId::new();
     let trace_hex = trace_id.to_string();
     if let (Some(rec), Some(tid)) = (state.task_recorder.as_ref(), task_id.as_ref()) {
@@ -721,6 +754,22 @@ mod tests {
     fn chat_params_json_shape() {
         let s = chat_params_json("demo", "hello world");
         assert_eq!(s, r#"{"session_id":"demo","message":"hello world"}"#);
+    }
+
+    #[tokio::test]
+    async fn required_task_creation_fails_when_recorder_unavailable() {
+        let err = create_task(None, true, "chat", "flows/chat_template.sol", "{}")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FlowExecError::Unavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn optional_task_creation_stays_fail_soft_without_recorder() {
+        let task_id = create_task(None, false, "chat", "flows/chat_template.sol", "{}")
+            .await
+            .expect("optional create should not fail");
+        assert!(task_id.is_none());
     }
 
     #[test]

@@ -8,6 +8,10 @@
 //! durable records; when it's down, requests still go through and
 //! `task_id` ends up `None` in the response.
 //!
+//! Production-required chat paths call [`TaskRecorder::create_required`]
+//! before dispatch and fail the request if `task.create` cannot return a
+//! durable task id. The remaining task update/event methods stay best-effort.
+//!
 //! All `task.*` calls go through `MeshClient::call(alias, envelope)` so
 //! they benefit from the M11 connection pool *and* the A.4 reconnect
 //! retry. The Coordinator's own admission pipeline (identity → policy →
@@ -52,6 +56,27 @@ impl TaskRecorder {
         flow_template: &str,
         params_json: &str,
     ) -> Option<String> {
+        match self
+            .create_required(title, flow_template, params_json)
+            .await
+        {
+            Ok(task_id) => Some(task_id),
+            Err(e) => {
+                tracing::warn!(error = %e, "coordinator task.create failed; request persistence skipped");
+                None
+            }
+        }
+    }
+
+    /// Create a Task and surface the failure. Production-mode chat
+    /// paths use this when `[coordinator] required = true`, because
+    /// anonymous execution is worse than rejecting the request.
+    pub async fn create_required(
+        &self,
+        title: &str,
+        flow_template: &str,
+        params_json: &str,
+    ) -> Result<String, String> {
         // SIMP-016 pipe-delim. owner_subject_id left empty so the
         // Coordinator defaults to the caller's verified subject_id.
         let arg = format!("{title}|{flow_template}|{params_json}|");
@@ -60,21 +85,14 @@ impl TaskRecorder {
                 Ok(s) => {
                     let id = s.trim().to_string();
                     if id.is_empty() {
-                        tracing::warn!("coordinator returned empty task_id");
-                        None
+                        Err("coordinator returned empty task_id".into())
                     } else {
-                        Some(id)
+                        Ok(id)
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "coordinator task.create response not utf-8");
-                    None
-                }
+                Err(e) => Err(format!("coordinator task.create response not utf-8: {e}")),
             },
-            Err(e) => {
-                tracing::warn!(error = %e, "coordinator task.create failed; request persistence skipped");
-                None
-            }
+            Err(e) => Err(format!("coordinator task.create failed: {e}")),
         }
     }
 
