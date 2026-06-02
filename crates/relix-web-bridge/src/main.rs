@@ -186,6 +186,8 @@ mod tenant_isolation_full_stack_test;
 mod term_audit;
 mod tool_screen;
 mod tools;
+#[cfg(test)]
+mod tools_mini_mesh_test;
 mod topology;
 mod training;
 #[cfg(test)]
@@ -314,6 +316,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             let cache_arc = std::sync::Arc::new(discovered);
             state.manifest_cache = cache_arc.clone();
+
+            // RELA-24: build the discoverable tool registry from the
+            // tool node's advertised capabilities now that discovery
+            // has pulled its manifest. Backs `/v1/tools`,
+            // `/v1/tools/search`, and `/v1/tools/manifest`. Stays the
+            // empty fallback when no tool peer was discovered.
+            let tool_registry = crate::tools::registry_from_manifest(&cache_arc);
+            tracing::info!(
+                tools = tool_registry.len(),
+                "bridge: tool registry built from discovered capabilities"
+            );
+            state.tool_registry = tool_registry;
 
             // A.4: spawn a background manifest-refresh loop. Every 60s
             // re-pulls each peer's manifest so capabilities added /
