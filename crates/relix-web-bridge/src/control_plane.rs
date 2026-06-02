@@ -240,7 +240,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/logs/stream",
                 "/v1/provenance/recent",
             ],
-            gap: "Durable activity JSONL now captures workspace, intervention, approval, standing-approval, budget-reset, identity-token/research, policy-denial, cost-observation, planning, execution rollback, memory-write, MCP, screen, browser-capture, plugin management, outbound email, and agent-message events; model and dispatch producers still need the same ledger path.",
+            gap: "Durable activity JSONL now captures workspace, intervention, approval, standing-approval, budget-reset, identity-token/research, policy-denial, cost-observation, planning, execution rollback, memory-write/manual-curation, MCP, screen, browser-capture, plugin management, outbound email, and agent-message events; model and dispatch producers still need the same ledger path.",
         },
         SpineSurface {
             id: "memory",
@@ -254,7 +254,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/knowledge/share",
                 "/v1/knowledge/recall",
             ],
-            gap: "Bridge memory-write proxies can carry task/run provenance; default binding still needs to expand into every background memory producer.",
+            gap: "Bridge memory-write proxies and manual curator runs can carry task/run provenance; default binding still needs to expand into every background memory producer.",
         },
         SpineSurface {
             id: "extensions",

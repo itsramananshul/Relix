@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
+use crate::activity::{ToolInvocationActivity, append_tool_invocation_activity};
 use crate::config::AppState;
+use crate::tenant::{DEFAULT_TENANT, current_subject, current_tenant};
 
 const DEFAULT_PEER: &str = "memory";
 const DEFAULT_AI_PEER: &str = "ai";
@@ -56,6 +58,10 @@ pub struct CurateRequest {
     /// routing).
     #[serde(default)]
     pub ai_peer: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 /// Parsed curation summary (one entry per field in the
@@ -78,6 +84,10 @@ pub struct CurateResponse {
     pub peer: String,
     pub subject_id: String,
     pub result: CurateSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,10 +108,47 @@ pub async fn curate(
             }),
         ));
     }
-    let peer = req.peer.unwrap_or_else(|| DEFAULT_PEER.to_string());
-    let ai_peer = req.ai_peer.unwrap_or_else(|| DEFAULT_AI_PEER.to_string());
+    let task_id = clean_optional_id(req.task_id.as_deref(), "task_id").map_err(bad)?;
+    let run_id = clean_optional(req.run_id.as_deref());
+    let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let ai_peer = req
+        .ai_peer
+        .clone()
+        .unwrap_or_else(|| DEFAULT_AI_PEER.to_string());
+    let detail = curate_detail(&subject_id, &ai_peer);
     let arg = format!("{subject_id}|{ai_peer}");
-    let body = call_peer_string(&state, &peer, "memory.agent_curate", arg.as_bytes()).await?;
+    let body = match call_peer_string(
+        &state,
+        &peer,
+        "memory.agent_curate",
+        arg.as_bytes(),
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(body) => {
+            record_curator_activity(
+                &state,
+                &peer,
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "ok",
+                &detail,
+            );
+            body
+        }
+        Err(err) => {
+            record_curator_activity(
+                &state,
+                &peer,
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "err",
+                &detail,
+            );
+            return Err(err);
+        }
+    };
     let summary = parse_curate_body(&body).ok_or((
         StatusCode::BAD_GATEWAY,
         Json(ApiError {
@@ -115,6 +162,8 @@ pub async fn curate(
         peer,
         subject_id,
         result: summary,
+        task_id,
+        run_id,
     }))
 }
 
@@ -161,7 +210,7 @@ pub async fn status(
     Query(q): Query<StatusQuery>,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ApiError>)> {
     let peer = q.peer.unwrap_or_else(|| DEFAULT_PEER.to_string());
-    let body = call_peer_string(&state, &peer, "memory.curator_status", &[]).await?;
+    let body = call_peer_string(&state, &peer, "memory.curator_status", &[], None).await?;
     let parsed = parse_status_body(&body).ok_or((
         StatusCode::BAD_GATEWAY,
         Json(ApiError {
@@ -305,6 +354,7 @@ async fn call_peer_string(
     alias: &str,
     method: &str,
     arg: &[u8],
+    task_id: Option<&str>,
 ) -> Result<String, (StatusCode, Json<ApiError>)> {
     let mesh = state.mesh_client.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -323,7 +373,7 @@ async fn call_peer_string(
         deadline_secs,
         None,
         None,
-        None,
+        task_id.map(str::to_string),
         crate::tenant::current_tenant_or_none(),
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
@@ -365,6 +415,76 @@ async fn call_peer_string(
                 error: "unexpected stream response from memory.agent_curate".into(),
             }),
         )),
+    }
+}
+
+fn bad(error: impl Into<String>) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiError {
+            error: error.into(),
+        }),
+    )
+}
+
+fn clean_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn clean_optional_id(value: Option<&str>, field: &str) -> Result<Option<String>, String> {
+    let Some(clean) = clean_optional(value) else {
+        return Ok(None);
+    };
+    if clean.len() == 32 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(Some(clean))
+    } else {
+        Err(format!("{field} must be 32 hex chars"))
+    }
+}
+
+fn curate_detail(subject_id: &str, ai_peer: &str) -> String {
+    format!(
+        "subject_id={}; ai_peer={}",
+        subject_id.trim(),
+        ai_peer.trim()
+    )
+}
+
+fn record_curator_activity(
+    state: &AppState,
+    peer: &str,
+    task_id: Option<&str>,
+    run_id: Option<&str>,
+    decision: &str,
+    detail: &str,
+) {
+    let tenant_id = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    let actor = current_subject().unwrap_or_else(|| "memory.curator".into());
+    if let Err(e) = append_tool_invocation_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        ToolInvocationActivity {
+            tenant_id: &tenant_id,
+            actor: &actor,
+            peer,
+            method: "memory.agent_curate",
+            task_id,
+            run_id,
+            decision,
+            detail,
+        },
+    ) {
+        tracing::warn!(error = %e, "failed to append memory curator activity");
+    }
+    if let (Some(rec), Some(task_id)) = (state.task_recorder.as_ref(), task_id) {
+        let payload = format!("peer={peer} outcome={decision} {detail}");
+        let rec = rec.clone();
+        let task_id = task_id.to_string();
+        tokio::spawn(async move {
+            rec.event(&task_id, "memory.agent_curate", &payload).await;
+        });
     }
 }
 
@@ -448,5 +568,56 @@ mod tests {
         let body = "subject_id=alice|agent_entries_before=1|agent_entries_after=1|agent_chars_before=10|agent_chars_after=10|user_entries_before=0|user_entries_after=0|user_chars_before=0|user_chars_after=0|chars_saved=0|model=gpt-99\n";
         let s = parse_curate_body(body).unwrap();
         assert_eq!(s.agent_chars_before, 10);
+    }
+
+    #[test]
+    fn curate_request_accepts_task_and_run_context() {
+        let req: CurateRequest = serde_json::from_str(
+            r#"{
+                "subject_id":"alice",
+                "ai_peer":"ai-fast",
+                "task_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "run_id":"run-1"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.task_id.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(req.run_id.as_deref(), Some("run-1"));
+        assert_eq!(
+            curate_detail(
+                req.subject_id.as_deref().unwrap(),
+                req.ai_peer.as_deref().unwrap()
+            ),
+            "subject_id=alice; ai_peer=ai-fast"
+        );
+    }
+
+    #[test]
+    fn clean_optional_id_rejects_invalid_task_id() {
+        assert_eq!(
+            clean_optional_id(Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "task_id")
+                .unwrap()
+                .as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert!(clean_optional_id(Some("bad"), "task_id").is_err());
+        assert_eq!(clean_optional_id(Some(" "), "task_id").unwrap(), None);
+    }
+
+    #[test]
+    fn curate_response_serialises_optional_scope() {
+        let response = CurateResponse {
+            peer: "memory".into(),
+            subject_id: "alice".into(),
+            result: CurateSummary::default(),
+            task_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            run_id: Some("run-1".into()),
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["task_id"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(value["run_id"], "run-1");
     }
 }

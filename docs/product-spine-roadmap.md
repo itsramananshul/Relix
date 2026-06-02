@@ -76,6 +76,10 @@ Current progress:
   metadata before forwarding, stamp `task_id` into the mesh dispatch envelope,
   record durable activity without copying document/image payloads, and add scope
   metadata to object responses
+- manual memory curation (`POST /v1/memory/curate`) accepts optional
+  `task_id`/`run_id`, stamps `task_id` into the mesh dispatch envelope, records
+  durable activity, appends best-effort task events for bound calls, and returns
+  scope metadata in the response
 - standalone memory embedding writes (`/v1/memory/embed` and
   `/v1/memory/embed_all`) accept optional `task_id`/`run_id`, stamp `task_id`
   into the mesh dispatch envelope, record durable activity without copying raw
@@ -257,6 +261,7 @@ Current producers:
 - plugin management mutations from `/v1/plugins/:id/reload` and
   `/v1/plugins/:id/disable`
 - memory writes from GAP 5 bridge proxies
+- manual memory curation from `/v1/memory/curate`
 - memory embedding writes from `/v1/memory/embed` and `/v1/memory/embed_all`
 - skill-store mutations from `/v1/skills`
 - credential vault reads and mutations from `/v1/credentials`
