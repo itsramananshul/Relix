@@ -402,6 +402,34 @@ mod tests {
     // P4 — dashboard auth-error contract tests
     // ─────────────────────────────────────────────────────
 
+    /// Product-spine hook: the dashboard must consume the
+    /// server-side control-plane manifest instead of carrying an
+    /// unrelated, permanent copy of product surfaces. This does not
+    /// decompose the monolith yet; it establishes the contract the
+    /// split dashboard modules will hang from.
+    #[tokio::test]
+    async fn page_consumes_control_plane_dashboard_manifest() {
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("/v1/control-plane/dashboard"),
+            "dashboard does not fetch the control-plane dashboard manifest"
+        );
+        assert!(
+            body.contains("function applyDashboardManifest"),
+            "dashboard has no manifest application hook"
+        );
+        assert!(
+            body.contains("data-spine-id"),
+            "dashboard nav does not expose spine ids"
+        );
+        assert!(
+            body.contains("data-spine-status"),
+            "dashboard nav does not expose spine status"
+        );
+    }
+
     /// P4 test: "Dashboard with no token shows the auth error
     /// screen and makes no further requests." We assert the
     /// shape of the bootstrap path: when /v1/auth/token returns

@@ -59,8 +59,31 @@ pub struct SpineSurface {
     pub gap: &'static str,
 }
 
+/// `GET /v1/control-plane/dashboard` response.
+#[derive(Debug, Serialize)]
+pub struct DashboardManifest {
+    pub schema_version: u32,
+    pub source: &'static str,
+    pub surfaces: Vec<DashboardSurface>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct DashboardSurface {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub section_id: &'static str,
+    pub nav_group: &'static str,
+    pub status: SpineStatus,
+    pub routes: &'static [&'static str],
+    pub gap: &'static str,
+}
+
 pub async fn spine(State(state): State<AppState>) -> Json<ControlPlaneSpine> {
     Json(build_spine(&state))
+}
+
+pub async fn dashboard_manifest() -> Json<DashboardManifest> {
+    Json(build_dashboard_manifest())
 }
 
 pub fn build_spine(state: &AppState) -> ControlPlaneSpine {
@@ -250,6 +273,60 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
     ]
 }
 
+pub fn build_dashboard_manifest() -> DashboardManifest {
+    DashboardManifest {
+        schema_version: 1,
+        source: "control-plane-spine",
+        surfaces: dashboard_manifest_surfaces(),
+    }
+}
+
+pub fn dashboard_manifest_surfaces() -> Vec<DashboardSurface> {
+    let spine = spine_surfaces();
+    let lookup = |id: &str| -> SpineSurface {
+        spine
+            .iter()
+            .find(|surface| surface.id == id)
+            .map(|surface| SpineSurface {
+                id: surface.id,
+                label: surface.label,
+                status: surface.status,
+                purpose: surface.purpose,
+                routes: surface.routes,
+                gap: surface.gap,
+            })
+            .unwrap_or_else(|| panic!("dashboard manifest references missing spine surface {id}"))
+    };
+    let surface =
+        |id: &str, section_id: &'static str, nav_group: &'static str| -> DashboardSurface {
+            let spine_surface = lookup(id);
+            DashboardSurface {
+                id: spine_surface.id,
+                label: spine_surface.label,
+                section_id,
+                nav_group,
+                status: spine_surface.status,
+                routes: spine_surface.routes,
+                gap: spine_surface.gap,
+            }
+        };
+
+    vec![
+        surface("tenant", "tenant", "Settings"),
+        surface("goals", "planning", "Work"),
+        surface("agents", "identity", "Work"),
+        surface("tasks", "tasks", "Work"),
+        surface("runs", "tasks", "Work"),
+        surface("workspaces", "tasks", "Work"),
+        surface("schedules", "cron", "Work"),
+        surface("approvals", "approvals", "Governance"),
+        surface("budget", "cost", "Governance"),
+        surface("activity", "observability", "Operations"),
+        surface("memory", "memory", "Knowledge"),
+        surface("extensions", "plugins", "Extensions"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +379,55 @@ mod tests {
         let approvals = surfaces.iter().find(|s| s.id == "approvals").unwrap();
         assert!(approvals.gap.contains("Task/session/method/workspace"));
         assert!(approvals.gap.contains("budget/call-count"));
+    }
+
+    #[test]
+    fn dashboard_manifest_is_derived_from_spine_surfaces() {
+        let spine_ids: Vec<&str> = spine_surfaces()
+            .into_iter()
+            .map(|surface| surface.id)
+            .collect();
+        let manifest = build_dashboard_manifest();
+        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifest.source, "control-plane-spine");
+
+        for surface in manifest.surfaces {
+            assert!(
+                spine_ids.contains(&surface.id),
+                "dashboard surface {} is not in the product spine",
+                surface.id
+            );
+            assert!(
+                !surface.section_id.trim().is_empty(),
+                "dashboard surface {} has no section",
+                surface.id
+            );
+            assert!(
+                !surface.nav_group.trim().is_empty(),
+                "dashboard surface {} has no nav group",
+                surface.id
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_manifest_maps_spine_to_existing_operator_sections() {
+        let manifest = build_dashboard_manifest();
+        for (surface_id, expected_section) in [
+            ("tenant", "tenant"),
+            ("goals", "planning"),
+            ("tasks", "tasks"),
+            ("approvals", "approvals"),
+            ("activity", "observability"),
+            ("memory", "memory"),
+            ("extensions", "plugins"),
+        ] {
+            let surface = manifest
+                .surfaces
+                .iter()
+                .find(|surface| surface.id == surface_id)
+                .unwrap_or_else(|| panic!("missing dashboard surface {surface_id}"));
+            assert_eq!(surface.section_id, expected_section);
+        }
     }
 }

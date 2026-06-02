@@ -675,6 +675,7 @@ var State = {
   logFilter: { level: '', search: '', target: '' },
   selectedTraceA: null,
   selectedTraceB: null,
+  dashboardManifest: null,
   // P4 — session-expiry probe timer handle. Set by
   // startSessionExpiryProbe(); cleared when the probe sees
   // 401/403 and shows the auth-error screen.
@@ -707,6 +708,65 @@ function buildNav() {
     document.getElementById('sidebar').classList.toggle('open');
   });
 }
+
+function spineStatusLabel(status) {
+  if (!status) return 'unknown';
+  return String(status).replace(/_/g, ' ');
+}
+
+function findNavItem(sectionId) {
+  var items = document.querySelectorAll('.nav-item');
+  for (var i = 0; i < items.length; i++) {
+    if (items[i].getAttribute('data-nav') === sectionId) return items[i];
+  }
+  return null;
+}
+
+function applyDashboardManifest(manifest) {
+  if (!manifest || !Array.isArray(manifest.surfaces)) return;
+  State.dashboardManifest = manifest;
+  var bySection = {};
+  manifest.surfaces.forEach(function (surface) {
+    if (!surface || !surface.section_id) return;
+    if (!bySection[surface.section_id]) bySection[surface.section_id] = [];
+    bySection[surface.section_id].push(surface);
+  });
+  for (var sectionId in bySection) {
+    var item = findNavItem(sectionId);
+    if (!item) continue;
+    var surfaces = bySection[sectionId];
+    var ids = surfaces.map(function (s) { return s.id; }).join(',');
+    var statuses = surfaces.map(function (s) { return spineStatusLabel(s.status); }).join(',');
+    var title = surfaces.map(function (s) {
+      return s.label + ' [' + spineStatusLabel(s.status) + ']: ' + (s.gap || '');
+    }).join('\n');
+    item.setAttribute('data-spine-id', ids);
+    item.setAttribute('data-spine-status', statuses);
+    item.setAttribute('data-spine-source', manifest.source || 'control-plane-spine');
+    item.setAttribute('title', title);
+  }
+}
+
+function loadControlPlane() {
+  return Bridge.get('/v1/control-plane/dashboard')
+    .then(function (manifest) {
+      applyDashboardManifest(manifest);
+      return manifest;
+    })
+    .catch(function () {
+      return Bridge.get('/v1/control-plane/spine')
+        .then(function (spine) {
+          State.dashboardManifest = {
+            schema_version: 1,
+            source: 'control-plane-spine',
+            surfaces: (spine && spine.surfaces) || []
+          };
+          return spine;
+        })
+        .catch(function () { return null; });
+    });
+}
+
 function navigate(id) {
   if (State.active === id) return;
   for (var k in State.autoRefresh) clearInterval(State.autoRefresh[k]);
@@ -3269,6 +3329,7 @@ function initApp() {
       return;
     }
     startSessionExpiryProbe();
+    loadControlPlane();
     // Make the dashboard interactive FIRST: show the overview and let
     // navigation work before wiring any optional controls. Nav-item
     // click handlers are already bound in buildNav(); activating the

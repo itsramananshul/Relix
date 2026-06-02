@@ -125,6 +125,8 @@ Current durable source:
 
 ## Phase 6: Dashboard Decomposition
 
+Status: started.
+
 The embedded dashboard should stop growing as one giant HTML file. Split the UI
 into product surfaces aligned with the spine:
 
@@ -140,6 +142,17 @@ into product surfaces aligned with the spine:
 
 The dashboard should consume `/v1/control-plane/spine` so navigation reflects
 the real product contract instead of hard-coded endpoint guesses.
+
+Current endpoint:
+
+```text
+GET /v1/control-plane/dashboard
+```
+
+The current dashboard now consumes the dashboard manifest and annotates sidebar
+surfaces with spine ids/status. The remaining work is the real split: move each
+surface into maintainable modules without losing the strict single-page CSP and
+auth bootstrap guarantees.
 
 ## Phase 7: Tenant as a Hard Invariant
 
