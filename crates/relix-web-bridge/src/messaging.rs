@@ -102,12 +102,20 @@ pub struct InboxQuery {
 pub struct ReadRequest {
     #[serde(default)]
     pub reader_subject_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 pub struct DeleteRequest {
     #[serde(default)]
     pub subject_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -119,6 +127,10 @@ pub struct ThreadQuery {
 #[derive(Debug, Serialize)]
 pub struct OkResponse {
     pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 // ── Handlers ─────────────────────────────────────────────
@@ -237,9 +249,46 @@ pub async fn read(
     if reader.contains('|') || message_id.contains('|') {
         return Err(bad("ids must not contain `|`".into()));
     }
+    let task_id = clean_optional_id(req.task_id.as_deref(), "task_id")?;
+    let run_id = clean_optional(req.run_id.as_deref());
+    let detail = message_state_detail(&message_id);
     let arg = format!("{message_id}|{reader}");
-    let _ = call_peer_string(&state, DEFAULT_PEER, "msg.read", arg.as_bytes(), None).await?;
-    Ok(Json(OkResponse { ok: true }))
+    match call_peer_string(
+        &state,
+        DEFAULT_PEER,
+        "msg.read",
+        arg.as_bytes(),
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(_) => {
+            record_message_activity(
+                &state,
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "msg.read",
+                "ok",
+                &detail,
+            );
+            Ok(Json(OkResponse {
+                ok: true,
+                task_id,
+                run_id,
+            }))
+        }
+        Err(err) => {
+            record_message_activity(
+                &state,
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "msg.read",
+                "err",
+                &detail,
+            );
+            Err(err)
+        }
+    }
 }
 
 pub async fn thread(
@@ -273,9 +322,46 @@ pub async fn delete(
     if subject.contains('|') || message_id.contains('|') {
         return Err(bad("ids must not contain `|`".into()));
     }
+    let task_id = clean_optional_id(req.task_id.as_deref(), "task_id")?;
+    let run_id = clean_optional(req.run_id.as_deref());
+    let detail = message_state_detail(&message_id);
     let arg = format!("{message_id}|{subject}");
-    let _ = call_peer_string(&state, DEFAULT_PEER, "msg.delete", arg.as_bytes(), None).await?;
-    Ok(Json(OkResponse { ok: true }))
+    match call_peer_string(
+        &state,
+        DEFAULT_PEER,
+        "msg.delete",
+        arg.as_bytes(),
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(_) => {
+            record_message_activity(
+                &state,
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "msg.delete",
+                "ok",
+                &detail,
+            );
+            Ok(Json(OkResponse {
+                ok: true,
+                task_id,
+                run_id,
+            }))
+        }
+        Err(err) => {
+            record_message_activity(
+                &state,
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "msg.delete",
+                "err",
+                &detail,
+            );
+            Err(err)
+        }
+    }
 }
 
 // ── Parsers ──────────────────────────────────────────────
@@ -395,6 +481,10 @@ fn send_detail(
     format!(
         "to_subject_id={to_subject_id}; subject_len={subject_len}; body_len={body_len}; ttl_secs={ttl_secs}; origin_surface={origin_surface}"
     )
+}
+
+fn message_state_detail(message_id: &str) -> String {
+    format!("message_id={}", message_id.trim())
 }
 
 fn record_message_activity(
@@ -559,7 +649,35 @@ mod tests {
     }
 
     #[test]
-    fn send_response_omits_empty_scope_and_includes_present_scope() {
+    fn read_and_delete_requests_accept_task_and_run_context() {
+        let read: ReadRequest = serde_json::from_value(serde_json::json!({
+            "reader_subject_id": "agent-a",
+            "task_id": "0123456789abcdef0123456789abcdef",
+            "run_id": "run-1"
+        }))
+        .unwrap();
+        assert_eq!(
+            read.task_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(read.run_id.as_deref(), Some("run-1"));
+
+        let delete: DeleteRequest = serde_json::from_value(serde_json::json!({
+            "subject_id": "agent-a",
+            "task_id": "fedcba9876543210fedcba9876543210",
+            "run_id": "run-2"
+        }))
+        .unwrap();
+        assert_eq!(
+            delete.task_id.as_deref(),
+            Some("fedcba9876543210fedcba9876543210")
+        );
+        assert_eq!(delete.run_id.as_deref(), Some("run-2"));
+        assert_eq!(message_state_detail("m1"), "message_id=m1");
+    }
+
+    #[test]
+    fn mutation_responses_omit_empty_scope_and_include_present_scope() {
         let bare = serde_json::to_value(SendResponse {
             message_id: "m1".into(),
             task_id: None,
@@ -577,6 +695,15 @@ mod tests {
         .unwrap();
         assert_eq!(scoped["task_id"], "0123456789abcdef0123456789abcdef");
         assert_eq!(scoped["run_id"], "run-2");
+
+        let ok = serde_json::to_value(OkResponse {
+            ok: true,
+            task_id: Some("fedcba9876543210fedcba9876543210".into()),
+            run_id: Some("run-3".into()),
+        })
+        .unwrap();
+        assert_eq!(ok["task_id"], "fedcba9876543210fedcba9876543210");
+        assert_eq!(ok["run_id"], "run-3");
     }
 
     #[test]
