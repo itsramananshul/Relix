@@ -28,7 +28,9 @@ use serde::{Deserialize, Serialize};
 use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
+use crate::activity::{ToolInvocationActivity, append_tool_invocation_activity};
 use crate::config::AppState;
+use crate::tenant::{DEFAULT_TENANT, current_subject, current_tenant};
 
 const DEFAULT_PEER: &str = "tool";
 
@@ -36,6 +38,10 @@ const DEFAULT_PEER: &str = "tool";
 pub struct CapturesQuery {
     #[serde(default)]
     pub peer: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -54,15 +60,42 @@ pub async fn capture(
     if let Err(msg) = validate_filename(&filename) {
         return Err((StatusCode::BAD_REQUEST, Json(ApiError { error: msg })));
     }
+    let task_id = clean_optional_id(q.task_id.as_deref(), "task_id")?;
+    let run_id = clean_optional(q.run_id.as_deref());
     let peer = q.peer.as_deref().unwrap_or(DEFAULT_PEER);
-    let bytes = call_peer_bytes(
+    let bytes = match call_peer_bytes(
         &state,
         peer,
         "tool.browser.capture_read",
         filename.as_bytes(),
+        task_id.as_deref(),
     )
-    .await?;
-    Ok(axum::response::Response::builder()
+    .await
+    {
+        Ok(bytes) => {
+            record_capture_activity(
+                &state,
+                peer,
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "ok",
+                &filename,
+            );
+            bytes
+        }
+        Err(err) => {
+            record_capture_activity(
+                &state,
+                peer,
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "err",
+                &filename,
+            );
+            return Err(err);
+        }
+    };
+    let mut builder = axum::response::Response::builder()
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, "image/png")
         // Captures are immutable once written (filename is
@@ -70,7 +103,14 @@ pub async fn capture(
         // saves repeat fetches when an operator scrolls back
         // and forth in the chronicle.
         .header(axum::http::header::CACHE_CONTROL, "public, max-age=60")
-        .header("X-Frame-Options", "DENY")
+        .header("X-Frame-Options", "DENY");
+    if let Some(task_id) = task_id.as_deref() {
+        builder = builder.header("X-Relix-Task-Id", task_id);
+    }
+    if let Some(run_id) = run_id.as_deref() {
+        builder = builder.header("X-Relix-Run-Id", run_id);
+    }
+    Ok(builder
         .body(axum::body::Body::from(bytes))
         .expect("captures response builds"))
 }
@@ -107,6 +147,7 @@ async fn call_peer_bytes(
     alias: &str,
     method: &str,
     arg: &[u8],
+    task_id: Option<&str>,
 ) -> Result<Vec<u8>, (StatusCode, Json<ApiError>)> {
     let mesh = state.mesh_client.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -121,7 +162,7 @@ async fn call_peer_bytes(
         state.cfg.transport.deadline_secs,
         None,
         None,
-        None,
+        task_id.map(str::to_string),
         crate::tenant::current_tenant_or_none(),
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
@@ -167,6 +208,69 @@ async fn call_peer_bytes(
                 error: "unexpected stream response from tool.browser.capture_read".into(),
             }),
         )),
+    }
+}
+
+fn record_capture_activity(
+    state: &AppState,
+    peer: &str,
+    task_id: Option<&str>,
+    run_id: Option<&str>,
+    decision: &str,
+    filename: &str,
+) {
+    let tenant_id = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    let actor = current_subject().unwrap_or_else(|| "tool.browser.capture_read".to_string());
+    let detail = format!("filename={filename}; bytes_format=png");
+    if let Err(e) = append_tool_invocation_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        ToolInvocationActivity {
+            tenant_id: &tenant_id,
+            actor: &actor,
+            peer,
+            method: "tool.browser.capture_read",
+            task_id,
+            run_id,
+            decision,
+            detail: &detail,
+        },
+    ) {
+        tracing::warn!(error = %e, "failed to append browser capture activity");
+    }
+    if let (Some(rec), Some(task_id)) = (state.task_recorder.as_ref(), task_id) {
+        let payload = format!("peer={peer} outcome={decision} {detail}");
+        let rec = rec.clone();
+        let task_id = task_id.to_string();
+        tokio::spawn(async move {
+            rec.event(&task_id, "tool.browser.capture_read", &payload)
+                .await;
+        });
+    }
+}
+
+fn clean_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn clean_optional_id(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<String>, (StatusCode, Json<ApiError>)> {
+    let Some(clean) = clean_optional(value) else {
+        return Ok(None);
+    };
+    if clean.len() == 32 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(Some(clean))
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: format!("{field} must be 32 hex chars"),
+            }),
+        ))
     }
 }
 
@@ -226,5 +330,35 @@ mod tests {
     #[test]
     fn accepts_uppercase_png_extension() {
         validate_filename("CAPTURE.PNG").unwrap();
+    }
+
+    #[test]
+    fn captures_query_accepts_task_and_run_context() {
+        let q: CapturesQuery = serde_json::from_value(serde_json::json!({
+            "peer": "tool",
+            "task_id": "0123456789abcdef0123456789abcdef",
+            "run_id": "run-1"
+        }))
+        .unwrap();
+        assert_eq!(q.peer.as_deref(), Some("tool"));
+        assert_eq!(
+            q.task_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(q.run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn clean_optional_id_rejects_invalid_task_id() {
+        assert!(clean_optional_id(None, "task_id").unwrap().is_none());
+        assert_eq!(
+            clean_optional_id(Some(" 0123456789abcdef0123456789abcdef "), "task_id")
+                .unwrap()
+                .as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        let err = clean_optional_id(Some("bad"), "task_id").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1.0.error, "task_id must be 32 hex chars");
     }
 }

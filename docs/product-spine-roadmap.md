@@ -57,6 +57,9 @@ Current progress:
 - `/v1/tools/screen` accepts optional `task_id`/`run_id`, stamps `task_id` into
   the mesh dispatch envelope, records durable activity, and adds scope metadata
   to object responses
+- `/v1/browser/captures/:filename` accepts optional `task_id`/`run_id`, stamps
+  `task_id` into the mesh dispatch envelope, records durable activity, and
+  returns scope metadata as response headers for the PNG payload
 - `/v1/email/send` and `/v1/email/send_template` accept optional
   `task_id`/`run_id`, stamp `task_id` into the mesh dispatch envelope, record
   durable activity without leaking message body/subject content, and add scope
@@ -175,6 +178,7 @@ Current producers:
 - cost aggregate observations from `/v1/metrics/cost`
 - MCP invocations from `/v1/mcp/invoke`
 - screen captures from `/v1/tools/screen`
+- browser capture reads from `/v1/browser/captures/:filename`
 - outbound email sends from `/v1/email/send` and `/v1/email/send_template`
 
 ## Phase 6: Dashboard Decomposition
