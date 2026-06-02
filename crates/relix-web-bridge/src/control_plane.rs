@@ -134,7 +134,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/planning/approvals",
                 "/v1/planning/export/:id",
             ],
-            gap: "Plans are not yet a durable first-class goal/project hierarchy.",
+            gap: "Planning mutations can carry task/run provenance and durable activity; plans are still not a durable first-class goal/project hierarchy.",
         },
         SpineSurface {
             id: "agents",
@@ -161,7 +161,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/tasks/:id/summary",
                 "/v1/tasks/:id/todos",
             ],
-            gap: "Chat, memory-write proxies, MCP invoke, screen-capture, browser-capture, plugin management mutations, standing approval mutations, outbound email, and agent-message send paths can attach to a task; remaining direct utility invocations still need forced task or explicit ad-hoc run binding.",
+            gap: "Chat, planning mutations, memory-write proxies, MCP invoke, screen-capture, browser-capture, plugin management mutations, standing approval mutations, outbound email, and agent-message send paths can attach to a task; remaining direct utility invocations still need forced task or explicit ad-hoc run binding.",
         },
         SpineSurface {
             id: "runs",
@@ -240,7 +240,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/logs/stream",
                 "/v1/provenance/recent",
             ],
-            gap: "Durable activity JSONL now captures workspace, intervention, approval, standing-approval, policy-denial, cost-observation, memory-write, MCP, screen, browser-capture, plugin management, outbound email, and agent-message events; model and dispatch producers still need the same ledger path.",
+            gap: "Durable activity JSONL now captures workspace, intervention, approval, standing-approval, policy-denial, cost-observation, planning, memory-write, MCP, screen, browser-capture, plugin management, outbound email, and agent-message events; model and dispatch producers still need the same ledger path.",
         },
         SpineSurface {
             id: "memory",

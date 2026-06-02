@@ -106,6 +106,11 @@ Current progress:
   `DELETE /v1/standing-approvals/{id}`) stamp available task scope into mesh
   dispatch envelopes, record durable activity without copying operator notes,
   and return scope metadata for create/revoke responses
+- planning mutations (`POST /v1/planning/plan`, `POST /v1/planning/approve`,
+  and `POST /v1/planning/reject`) accept optional `task_id`/`run_id`, stamp
+  `task_id` into mesh dispatch envelopes, record durable activity without
+  copying plan specs or operator notes, and return scope metadata for object
+  responses
 - standalone CLI flow runs remain unbound unless the caller explicitly grows a
   task binding path
 
@@ -197,12 +202,12 @@ Unify scattered rings/logs/provenance into one durable activity ledger:
   activity
 - policy result: implemented for recent policy-denial rows with idempotent
   activity ids
-- memory, skill-store, credential, workflow, delegation, and cron operations:
+- planning, memory, skill-store, credential, workflow, delegation, and cron operations:
   implemented for the GAP 5 bridge memory-write proxies, standalone embedding
   writes, skill-store mutations, credential vault reads/mutations, workflow
-  run/reload calls, delegation spawn/cancel calls, and scheduler mutations
-  without logging raw document/image/text/skill/secret/workflow-input/
-  delegation/cron-prompt payloads
+  run/reload calls, delegation spawn/cancel calls, scheduler mutations, and
+  planning create/approve/reject calls without logging raw document/image/text/
+  skill/secret/workflow-input/delegation/cron-prompt/spec/note payloads
 - timestamp: implemented
 
 The operator question "what happened?" should not require scraping five
@@ -240,6 +245,7 @@ Current producers:
 - delegation spawn/cancel calls from `/v1/delegate`
 - cron scheduler mutations from `/v1/cron/jobs`
 - standing approval create/revoke calls from `/v1/agents`
+- planning create/approve/reject calls from `/v1/planning`
 - outbound email sends from `/v1/email/send` and `/v1/email/send_template`
 - agent-message sends from `/v1/messages`
 
