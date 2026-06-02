@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
+use crate::activity::{ToolInvocationActivity, append_tool_invocation_activity};
 use crate::config::AppState;
+use crate::tenant::{DEFAULT_TENANT, current_subject};
 
 const DEFAULT_PEER: &str = "coordinator";
 
@@ -90,11 +92,19 @@ pub struct CreateRequest {
     pub prompt: Option<String>,
     #[serde(default)]
     pub subject_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CreateResponse {
     pub job_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -105,16 +115,36 @@ pub struct UpdateRequest {
     pub schedule: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ScopeQuery {
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct OkResponse {
     pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct TriggerResponse {
     pub task_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 // ── Handlers ─────────────────────────────────────────────
@@ -124,7 +154,8 @@ pub async fn list(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<CronListResponse>, (StatusCode, Json<ApiError>)> {
     let subject = q.subject_id.unwrap_or_default();
-    let body = call_peer_string(&state, DEFAULT_PEER, "cron.list", subject.as_bytes()).await?;
+    let body =
+        call_peer_string(&state, DEFAULT_PEER, "cron.list", subject.as_bytes(), None).await?;
     let jobs = parse_list_body(&body);
     let count = jobs.len();
     Ok(Json(CronListResponse { jobs, count }))
@@ -134,6 +165,8 @@ pub async fn create(
     State(state): State<AppState>,
     Json(req): Json<CreateRequest>,
 ) -> Result<Json<CreateResponse>, (StatusCode, Json<ApiError>)> {
+    let task_id = clean_optional_task_id(req.task_id.as_deref(), "task_id")?;
+    let run_id = clean_optional(req.run_id.as_deref());
     let name = require_field(&req.name, "name")?;
     let schedule = require_field(&req.schedule, "schedule")?;
     let flow_template = req
@@ -145,6 +178,7 @@ pub async fn create(
         .to_string();
     let prompt = req.prompt.unwrap_or_default();
     let subject_id = require_field(&req.subject_id, "subject_id")?;
+    let detail = create_detail(&name, &schedule, &flow_template, prompt.len(), &subject_id);
     // Reject pipes inside any field — they'd break the wire
     // format. Render a stable error rather than letting the
     // coordinator misparse.
@@ -163,16 +197,55 @@ pub async fn create(
     // the coordinator's parser uses splitn(5, '|') and absorbs
     // the rest.
     let arg = format!("{name}|{schedule}|{flow_template}|{prompt}|{subject_id}");
-    let body = call_peer_string(&state, DEFAULT_PEER, "cron.create", arg.as_bytes()).await?;
+    let body = match call_peer_string(
+        &state,
+        DEFAULT_PEER,
+        "cron.create",
+        arg.as_bytes(),
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(body) => {
+            record_cron_activity(
+                &state,
+                CronActivity {
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "cron.create",
+                    decision: "ok",
+                    detail: &detail,
+                },
+            );
+            body
+        }
+        Err(err) => {
+            record_cron_activity(
+                &state,
+                CronActivity {
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "cron.create",
+                    decision: "err",
+                    detail: &detail,
+                },
+            );
+            return Err(err);
+        }
+    };
     let job_id = body.trim().to_string();
-    Ok(Json(CreateResponse { job_id }))
+    Ok(Json(CreateResponse {
+        job_id,
+        task_id,
+        run_id,
+    }))
 }
 
 pub async fn get_one(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<CronJobDetail>, (StatusCode, Json<ApiError>)> {
-    let body = call_peer_string(&state, DEFAULT_PEER, "cron.get", job_id.as_bytes()).await?;
+    let body = call_peer_string(&state, DEFAULT_PEER, "cron.get", job_id.as_bytes(), None).await?;
     let parsed = parse_job_body(&body).ok_or((
         StatusCode::BAD_GATEWAY,
         Json(ApiError {
@@ -187,48 +260,213 @@ pub async fn update(
     Path(job_id): Path<String>,
     Json(req): Json<UpdateRequest>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<ApiError>)> {
+    let task_id = clean_optional_task_id(req.task_id.as_deref(), "task_id")?;
+    let run_id = clean_optional(req.run_id.as_deref());
     if req.enabled.is_none() && req.schedule.is_none() && req.prompt.is_none() {
         return Err(bad(
             "at least one of `enabled`, `schedule`, `prompt` is required".into(),
         ));
     }
+    let detail = update_detail(&job_id, &req);
     // One coordinator round-trip per provided field; the
     // coordinator's cron.update only accepts one field at a
     // time. Order: enabled → schedule → prompt.
     if let Some(e) = req.enabled {
         let v = if e { "1" } else { "0" };
         let arg = format!("{job_id}|enabled|{v}");
-        let _ = call_peer_string(&state, DEFAULT_PEER, "cron.update", arg.as_bytes()).await?;
+        if let Err(err) = call_peer_string(
+            &state,
+            DEFAULT_PEER,
+            "cron.update",
+            arg.as_bytes(),
+            task_id.as_deref(),
+        )
+        .await
+        {
+            record_cron_activity(
+                &state,
+                CronActivity {
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "cron.update",
+                    decision: "err",
+                    detail: &detail,
+                },
+            );
+            return Err(err);
+        }
     }
     if let Some(s) = req.schedule {
         if s.contains('|') {
             return Err(bad("schedule must not contain `|`".into()));
         }
         let arg = format!("{job_id}|schedule|{s}");
-        let _ = call_peer_string(&state, DEFAULT_PEER, "cron.update", arg.as_bytes()).await?;
+        if let Err(err) = call_peer_string(
+            &state,
+            DEFAULT_PEER,
+            "cron.update",
+            arg.as_bytes(),
+            task_id.as_deref(),
+        )
+        .await
+        {
+            record_cron_activity(
+                &state,
+                CronActivity {
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "cron.update",
+                    decision: "err",
+                    detail: &detail,
+                },
+            );
+            return Err(err);
+        }
     }
     if let Some(p) = req.prompt {
         let arg = format!("{job_id}|prompt|{p}");
-        let _ = call_peer_string(&state, DEFAULT_PEER, "cron.update", arg.as_bytes()).await?;
+        if let Err(err) = call_peer_string(
+            &state,
+            DEFAULT_PEER,
+            "cron.update",
+            arg.as_bytes(),
+            task_id.as_deref(),
+        )
+        .await
+        {
+            record_cron_activity(
+                &state,
+                CronActivity {
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "cron.update",
+                    decision: "err",
+                    detail: &detail,
+                },
+            );
+            return Err(err);
+        }
     }
-    Ok(Json(OkResponse { ok: true }))
+    record_cron_activity(
+        &state,
+        CronActivity {
+            task_id: task_id.as_deref(),
+            run_id: run_id.as_deref(),
+            method: "cron.update",
+            decision: "ok",
+            detail: &detail,
+        },
+    );
+    Ok(Json(OkResponse {
+        ok: true,
+        task_id,
+        run_id,
+    }))
 }
 
 pub async fn delete(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
+    Query(q): Query<ScopeQuery>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<ApiError>)> {
-    let _ = call_peer_string(&state, DEFAULT_PEER, "cron.delete", job_id.as_bytes()).await?;
-    Ok(Json(OkResponse { ok: true }))
+    let task_id = clean_optional_task_id(q.task_id.as_deref(), "task_id")?;
+    let run_id = clean_optional(q.run_id.as_deref());
+    let detail = job_detail("cron.delete", &job_id);
+    match call_peer_string(
+        &state,
+        DEFAULT_PEER,
+        "cron.delete",
+        job_id.as_bytes(),
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(_) => {
+            record_cron_activity(
+                &state,
+                CronActivity {
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "cron.delete",
+                    decision: "ok",
+                    detail: &detail,
+                },
+            );
+            Ok(Json(OkResponse {
+                ok: true,
+                task_id,
+                run_id,
+            }))
+        }
+        Err(err) => {
+            record_cron_activity(
+                &state,
+                CronActivity {
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "cron.delete",
+                    decision: "err",
+                    detail: &detail,
+                },
+            );
+            Err(err)
+        }
+    }
 }
 
 pub async fn trigger(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
+    Query(q): Query<ScopeQuery>,
 ) -> Result<Json<TriggerResponse>, (StatusCode, Json<ApiError>)> {
-    let body = call_peer_string(&state, DEFAULT_PEER, "cron.trigger", job_id.as_bytes()).await?;
+    let scope_task_id = clean_optional_task_id(q.task_id.as_deref(), "task_id")?;
+    let run_id = clean_optional(q.run_id.as_deref());
+    let detail = job_detail("cron.trigger", &job_id);
+    let body = match call_peer_string(
+        &state,
+        DEFAULT_PEER,
+        "cron.trigger",
+        job_id.as_bytes(),
+        scope_task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(err) => {
+            record_cron_activity(
+                &state,
+                CronActivity {
+                    task_id: scope_task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "cron.trigger",
+                    decision: "err",
+                    detail: &detail,
+                },
+            );
+            return Err(err);
+        }
+    };
     let task_id = body.trim().to_string();
-    Ok(Json(TriggerResponse { task_id }))
+    let activity_task_id = if is_valid_task_id(&task_id) {
+        Some(task_id.as_str())
+    } else {
+        scope_task_id.as_deref()
+    };
+    record_cron_activity(
+        &state,
+        CronActivity {
+            task_id: activity_task_id,
+            run_id: run_id.as_deref(),
+            method: "cron.trigger",
+            decision: "ok",
+            detail: &detail,
+        },
+    );
+    Ok(Json(TriggerResponse {
+        task_id,
+        scope_task_id,
+        run_id,
+    }))
 }
 
 // ── Parsers ──────────────────────────────────────────────
@@ -337,11 +575,114 @@ fn bad(msg: String) -> (StatusCode, Json<ApiError>) {
     (StatusCode::BAD_REQUEST, Json(ApiError { error: msg }))
 }
 
+fn clean_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn clean_optional_task_id(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<String>, (StatusCode, Json<ApiError>)> {
+    let Some(clean) = clean_optional(value) else {
+        return Ok(None);
+    };
+    if is_valid_task_id(&clean) {
+        Ok(Some(clean))
+    } else {
+        Err(bad(format!("{field} must be 32 hex chars")))
+    }
+}
+
+fn is_valid_task_id(s: &str) -> bool {
+    s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn create_detail(
+    name: &str,
+    schedule: &str,
+    flow_template: &str,
+    prompt_len: usize,
+    subject_id: &str,
+) -> String {
+    format!(
+        "method=cron.create; name={name}; schedule={schedule}; flow_template={flow_template}; prompt_len={prompt_len}; subject_id={subject_id}"
+    )
+}
+
+fn update_detail(job_id: &str, req: &UpdateRequest) -> String {
+    let fields = [
+        req.enabled.map(|_| "enabled"),
+        req.schedule.as_ref().map(|_| "schedule"),
+        req.prompt.as_ref().map(|_| "prompt"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(",");
+    let prompt_len = req.prompt.as_ref().map(|p| p.len()).unwrap_or(0);
+    format!("method=cron.update; job_id={job_id}; fields={fields}; prompt_len={prompt_len}")
+}
+
+fn job_detail(method: &str, job_id: &str) -> String {
+    format!("method={method}; job_id={job_id}")
+}
+
+struct CronActivity<'a> {
+    task_id: Option<&'a str>,
+    run_id: Option<&'a str>,
+    method: &'a str,
+    decision: &'a str,
+    detail: &'a str,
+}
+
+fn record_cron_activity(state: &AppState, activity: CronActivity<'_>) {
+    let tenant_id = crate::tenant::current_tenant_or_none()
+        .as_deref()
+        .unwrap_or(DEFAULT_TENANT)
+        .to_string();
+    let actor = current_subject().unwrap_or_else(|| activity.method.to_string());
+    if let Err(e) = append_tool_invocation_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        ToolInvocationActivity {
+            tenant_id: &tenant_id,
+            actor: &actor,
+            peer: DEFAULT_PEER,
+            method: activity.method,
+            task_id: activity.task_id,
+            run_id: activity.run_id,
+            decision: activity.decision,
+            detail: activity.detail,
+        },
+    ) {
+        tracing::warn!(
+            error = %e,
+            method = activity.method,
+            "failed to append cron activity"
+        );
+    }
+    if let (Some(rec), Some(task_id)) = (state.task_recorder.as_ref(), activity.task_id) {
+        let payload = format!(
+            "peer={DEFAULT_PEER} outcome={} {}",
+            activity.decision, activity.detail
+        );
+        let rec = rec.clone();
+        let task_id = task_id.to_string();
+        let event_type = activity.method.to_string();
+        tokio::spawn(async move {
+            rec.event(&task_id, &event_type, &payload).await;
+        });
+    }
+}
+
 async fn call_peer_string(
     state: &AppState,
     alias: &str,
     method: &str,
     arg: &[u8],
+    task_id: Option<&str>,
 ) -> Result<String, (StatusCode, Json<ApiError>)> {
     let mesh = state.mesh_client.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -357,7 +698,7 @@ async fn call_peer_string(
         deadline_secs,
         None,
         None,
-        None,
+        task_id.map(str::to_string),
         crate::tenant::current_tenant_or_none(),
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
@@ -471,5 +812,102 @@ mod tests {
     #[test]
     fn parse_job_body_empty_is_none() {
         assert!(parse_job_body("").is_none());
+    }
+
+    #[test]
+    fn create_request_accepts_task_and_run_context() {
+        let req: CreateRequest = serde_json::from_value(serde_json::json!({
+            "name": "daily",
+            "schedule": "1d",
+            "flow_template": "flows/chat_template.sol",
+            "prompt": "summarize privately",
+            "subject_id": "agent-1",
+            "task_id": "0123456789abcdef0123456789abcdef",
+            "run_id": "run-1"
+        }))
+        .unwrap();
+        assert_eq!(
+            req.task_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(req.run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn update_request_accepts_task_and_run_context() {
+        let req: UpdateRequest = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "prompt": "new private prompt",
+            "task_id": "0123456789abcdef0123456789abcdef",
+            "run_id": "run-1"
+        }))
+        .unwrap();
+        assert_eq!(
+            req.task_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(req.run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn clean_optional_task_id_accepts_only_32_hex() {
+        assert!(clean_optional_task_id(None, "task_id").unwrap().is_none());
+        assert_eq!(
+            clean_optional_task_id(Some(" 0123456789abcdef0123456789abcdef "), "task_id")
+                .unwrap()
+                .as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        let err = clean_optional_task_id(Some("task-1"), "task_id").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1.0.error, "task_id must be 32 hex chars");
+    }
+
+    #[test]
+    fn create_detail_does_not_copy_prompt() {
+        let prompt = "private recurring instruction";
+        let detail = create_detail(
+            "daily",
+            "1d",
+            "flows/chat_template.sol",
+            prompt.len(),
+            "agent-1",
+        );
+        assert!(detail.contains("name=daily"));
+        assert!(detail.contains("schedule=1d"));
+        assert!(detail.contains("flow_template=flows/chat_template.sol"));
+        assert!(detail.contains("prompt_len=29"));
+        assert!(detail.contains("subject_id=agent-1"));
+        assert!(!detail.contains(prompt));
+    }
+
+    #[test]
+    fn update_detail_does_not_copy_prompt() {
+        let prompt = "sensitive changed prompt";
+        let req = UpdateRequest {
+            enabled: Some(false),
+            schedule: Some("2d".into()),
+            prompt: Some(prompt.into()),
+            task_id: None,
+            run_id: None,
+        };
+        let detail = update_detail("job-1", &req);
+        assert!(detail.contains("job_id=job-1"));
+        assert!(detail.contains("fields=enabled,schedule,prompt"));
+        assert!(detail.contains(&format!("prompt_len={}", prompt.len())));
+        assert!(!detail.contains(prompt));
+    }
+
+    #[test]
+    fn trigger_response_keeps_launched_task_and_scope_separate() {
+        let value = serde_json::to_value(TriggerResponse {
+            task_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            scope_task_id: Some("0123456789abcdef0123456789abcdef".into()),
+            run_id: Some("run-1".into()),
+        })
+        .unwrap();
+        assert_eq!(value["task_id"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(value["scope_task_id"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(value["run_id"], "run-1");
     }
 }

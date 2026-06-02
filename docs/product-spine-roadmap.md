@@ -97,6 +97,11 @@ Current progress:
   `POST /v1/delegate/cancel/{child_id}`) stamp the parent/child task id into
   mesh dispatch envelopes, record durable activity without copying delegated
   goal/context/reason text, and return scope metadata for mutation responses
+- cron scheduler mutations (`POST/PATCH/DELETE /v1/cron/jobs` and
+  `POST /v1/cron/jobs/{id}/trigger`) accept optional `task_id`/`run_id`, stamp
+  scope task ids into mesh dispatch envelopes, record durable activity without
+  copying recurring prompts, and keep trigger-launched task ids separate from
+  request scope ids
 - standalone CLI flow runs remain unbound unless the caller explicitly grows a
   task binding path
 
@@ -185,11 +190,12 @@ Unify scattered rings/logs/provenance into one durable activity ledger:
 - approval id: implemented for REST/dashboard and channel approval decisions
 - policy result: implemented for recent policy-denial rows with idempotent
   activity ids
-- memory, skill-store, credential, workflow, and delegation operations:
+- memory, skill-store, credential, workflow, delegation, and cron operations:
   implemented for the GAP 5 bridge memory-write proxies, standalone embedding
   writes, skill-store mutations, credential vault reads/mutations, workflow
-  run/reload calls, and delegation spawn/cancel calls without logging raw
-  document/image/text/skill/secret/workflow-input/delegation payloads
+  run/reload calls, delegation spawn/cancel calls, and scheduler mutations
+  without logging raw document/image/text/skill/secret/workflow-input/
+  delegation/cron-prompt payloads
 - timestamp: implemented
 
 The operator question "what happened?" should not require scraping five
@@ -225,6 +231,7 @@ Current producers:
 - credential vault reads and mutations from `/v1/credentials`
 - workflow execution and reload calls from `/v1/workflows`
 - delegation spawn/cancel calls from `/v1/delegate`
+- cron scheduler mutations from `/v1/cron/jobs`
 - outbound email sends from `/v1/email/send` and `/v1/email/send_template`
 - agent-message sends from `/v1/messages`
 
