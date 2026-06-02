@@ -192,6 +192,8 @@ mod topology;
 mod training;
 #[cfg(test)]
 mod training_mini_mesh_test;
+#[cfg(test)]
+mod usage_mini_mesh_test;
 mod validate;
 mod workflows;
 #[cfg(test)]
