@@ -139,6 +139,11 @@ Current progress:
   stamp `task_id` into the mesh dispatch envelope, record durable activity
   without copying export paths or training examples, append best-effort task
   events for bound calls, and return scope metadata for object responses
+- config mutations/tests (`PUT /v1/config/providers/default`,
+  `PUT /v1/config/telegram`, and `POST /v1/config/telegram/test`) accept
+  optional `task_id`/`run_id`, record durable activity without copying raw
+  tokens, webhook URLs, or upstream failure text, append best-effort task
+  events for bound calls, and return scope metadata for mutation/test responses
 - identity mutations (`POST /v1/identity/tokens`,
   `POST /v1/identity/tokens/revoke`, and `POST /v1/identity/research`) accept
   optional `task_id`/`run_id`, stamp `task_id` into mesh dispatch envelopes,
@@ -240,16 +245,17 @@ Unify scattered rings/logs/provenance into one durable activity ledger:
 - policy result: implemented for recent policy-denial rows with idempotent
   activity ids
 - planning, execution rollback, memory, knowledge-transfer, skill-store,
-  training export/score/delete, credential, workflow, delegation, and cron
-  operations:
+  training export/score/delete, config mutation/test, credential, workflow,
+  delegation, and cron operations:
   implemented for the GAP 5 bridge memory-write proxies, standalone embedding
   writes, knowledge share/broadcast/revoke/recall calls, skill-store mutations,
-  training export/score/delete calls, credential vault reads/mutations,
-  workflow run/reload calls, delegation spawn/cancel calls, scheduler
-  mutations, planning create/approve/reject calls, and execution rollback calls
-  without logging raw document/image/text/knowledge-message/skill/training
-  examples/export paths/secret/workflow-input/delegation/cron-prompt/spec/note
-  payloads
+  training export/score/delete calls, config mutation/test calls, credential
+  vault reads/mutations, workflow run/reload calls, delegation spawn/cancel
+  calls, scheduler mutations, planning create/approve/reject calls, and
+  execution rollback calls without logging raw
+  document/image/text/knowledge-message/skill/training examples/export
+  paths/config-secret/webhook URL/upstream failure text/secret/workflow-input/
+  delegation/cron-prompt/spec/note payloads
 - timestamp: implemented
 - budget reset: implemented as task-aware governance activity
 - confidence reset: implemented as task-aware governance activity
@@ -277,6 +283,7 @@ Current producers:
 - budget reset calls from `/v1/budget/reset`
 - confidence reset calls from `/v1/confidence/reset`
 - training export/score/delete calls from `/v1/training`
+- provider default, Telegram save, and Telegram test calls from `/v1/config`
 - identity token issue/revoke and research-backed identity calls from
   `/v1/identity`
 - belief reset calls from `/v1/belief/{session_id}`
