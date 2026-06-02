@@ -213,7 +213,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/approval/:id/decision",
                 "/v1/approvals",
             ],
-            gap: "Task/session/method/workspace scoped approvals exist in the runtime/API with call-count and estimated-cost limits; dashboard UX and run binding still need launch work.",
+            gap: "Task/session/method/workspace scoped approvals exist in the runtime/API with call-count and estimated-cost limits; budget reset now records task-aware governance activity, while dashboard UX and run binding still need launch work.",
         },
         SpineSurface {
             id: "budget",
@@ -226,7 +226,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/metrics/cost-baselines",
                 "/v1/metrics/cost-spikes",
             ],
-            gap: "Cost surfaces exist; task/run-level hard-stop semantics need to be more visible and uniform.",
+            gap: "Cost surfaces exist and budget resets can carry task/run provenance; task/run-level hard-stop semantics need to be more visible and uniform.",
         },
         SpineSurface {
             id: "activity",
@@ -240,7 +240,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/logs/stream",
                 "/v1/provenance/recent",
             ],
-            gap: "Durable activity JSONL now captures workspace, intervention, approval, standing-approval, policy-denial, cost-observation, planning, execution rollback, memory-write, MCP, screen, browser-capture, plugin management, outbound email, and agent-message events; model and dispatch producers still need the same ledger path.",
+            gap: "Durable activity JSONL now captures workspace, intervention, approval, standing-approval, budget-reset, policy-denial, cost-observation, planning, execution rollback, memory-write, MCP, screen, browser-capture, plugin management, outbound email, and agent-message events; model and dispatch producers still need the same ledger path.",
         },
         SpineSurface {
             id: "memory",

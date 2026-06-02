@@ -115,6 +115,10 @@ Current progress:
   `task_id`/`run_id`, stamps `task_id` into the mesh dispatch envelope, records
   durable activity, appends best-effort task events for bound calls, and returns
   scope metadata for object responses
+- budget reset (`POST /v1/budget/reset`) accepts optional `task_id`/`run_id`,
+  stamps `task_id` into the mesh dispatch envelope, records durable governance
+  activity, appends best-effort task events for bound calls, and returns scope
+  metadata for object responses
 - standalone CLI flow runs remain unbound unless the caller explicitly grows a
   task binding path
 
@@ -215,6 +219,7 @@ Unify scattered rings/logs/provenance into one durable activity ledger:
   logging raw document/image/text/skill/secret/workflow-input/delegation/
   cron-prompt/spec/note payloads
 - timestamp: implemented
+- budget reset: implemented as task-aware governance activity
 
 The operator question "what happened?" should not require scraping five
 different surfaces.
@@ -236,6 +241,7 @@ Current producers:
 - workspace lease create/release
 - operator intervention audit rows
 - approval decisions from the dashboard/API and channel callbacks
+- budget reset calls from `/v1/budget/reset`
 - policy denials discovered through `/v1/policy/denials`
 - cost aggregate observations from `/v1/metrics/cost`
 - MCP invocations from `/v1/mcp/invoke`
