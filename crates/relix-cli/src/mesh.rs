@@ -8,8 +8,10 @@
 //! opens `/dashboard` in the operator's default browser unless
 //! `--no-browser` is set.
 //!
-//! `stop` kills `relix-controller` and `relix-web-bridge` by name —
-//! `taskkill /F /IM` on Windows, `pkill -x` everywhere else.
+//! `stop` shells out to `scripts/relix-mesh-down.ps1` (Windows) or
+//! `scripts/relix-mesh-down.sh` (POSIX), which read the pidfile mesh-up
+//! wrote and signal only those PIDs. It never matches by process name,
+//! so an unrelated mesh on the same machine survives.
 //!
 //! `status` polls the bridge's `/health` and `/v1/topology` endpoints
 //! and prints a one-line-per-peer table. Exits 1 if the bridge is down.
@@ -65,6 +67,15 @@ pub struct BootArgs {
     /// healthy.
     #[arg(long)]
     pub no_browser: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct StopArgs {
+    /// Runtime data root the mesh was booted with. Must match the
+    /// `relix boot --data-dir` value so the down script finds the right
+    /// pidfile. Defaults to the boot script's own default (`dev-data`).
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -176,10 +187,11 @@ pub async fn boot(args: BootArgs) -> Result<(), Box<dyn std::error::Error>> {
     //     the script's exit, instead of dying first and leaving the
     //     script's cleanup output racing the returned shell prompt.
     //
-    //   * `relix stop` from another terminal taskkill's the
-    //     controllers — the boot script's HasExited / wait loop
-    //     catches the early exit, runs cleanup, and exits. Our
-    //     `child.wait()` returns and we follow it out.
+    //   * `relix stop` from another terminal signals the controllers by
+    //     their recorded PID (via the mesh-down script). The boot
+    //     script's HasExited / wait loop catches the early exit, runs
+    //     cleanup, and exits. Our `child.wait()` returns and we follow
+    //     it out.
     //
     // `child.wait()` is a blocking syscall, so it goes through
     // spawn_blocking to keep the tokio runtime healthy.
@@ -213,26 +225,45 @@ fn report_wait_result(
     }
 }
 
-/// Stop every running `relix-controller` and `relix-web-bridge`.
-pub fn stop() -> Result<(), Box<dyn std::error::Error>> {
-    let targets = ["relix-controller", "relix-web-bridge"];
-    let mut killed = 0;
-    let mut errors: Vec<String> = Vec::new();
+/// Stop the local mesh by terminating only the PIDs the boot script
+/// recorded. Shells out to `scripts/relix-mesh-down.ps1` (Windows) or
+/// `scripts/relix-mesh-down.sh` (POSIX), which read the pidfile mesh-up
+/// wrote and signal exactly those processes. A relix-controller or
+/// relix-web-bridge belonging to another mesh is never touched.
+pub fn stop(args: StopArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let script = locate_script("relix-mesh-down")?;
 
-    for name in &targets {
-        match kill_by_name(name) {
-            Ok(count) => killed += count,
-            Err(e) => errors.push(format!("{name}: {e}")),
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("powershell");
+        c.arg("-NoProfile").arg("-ExecutionPolicy").arg("Bypass");
+        c.arg("-File").arg(&script);
+        c
+    } else {
+        let mut c = Command::new("bash");
+        c.arg(&script);
+        c
+    };
+
+    // Point the down script at the same data root the boot script used so
+    // it resolves the right pidfile. PascalCase param on Windows,
+    // kebab-case long option on POSIX, same split as build_boot_command.
+    if let Some(data_dir) = &args.data_dir {
+        if cfg!(windows) {
+            cmd.arg("-DataDir").arg(data_dir);
+        } else {
+            cmd.arg("--data-dir").arg(data_dir);
         }
     }
 
-    if killed == 0 && errors.is_empty() {
-        println!("no relix-controller / relix-web-bridge processes were running.");
-    }
-    if !errors.is_empty() {
-        for e in &errors {
-            eprintln!("warning: {e}");
-        }
+    println!("stopping mesh via {} ...", script.display());
+    let status = cmd
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("failed to spawn mesh-down script: {e}"))?;
+
+    if !status.success() {
+        return Err(format!("mesh-down script exited with status {status}").into());
     }
     Ok(())
 }
@@ -588,49 +619,6 @@ fn open_browser(url: &str) -> Result<(), String> {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => Err(format!("browser command exited {s}")),
         Err(e) => Err(e.to_string()),
-    }
-}
-
-fn kill_by_name(name: &str) -> Result<usize, String> {
-    if cfg!(windows) {
-        let exe_name = format!("{name}.exe");
-        let out = Command::new("taskkill")
-            .args(["/F", "/IM", &exe_name])
-            .output()
-            .map_err(|e| e.to_string())?;
-        if out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let count = stdout.matches("SUCCESS").count();
-            for line in stdout.lines() {
-                if line.starts_with("SUCCESS") {
-                    println!("  {line}");
-                }
-            }
-            Ok(count)
-        } else {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if stderr.contains("not found") || stderr.contains("ERROR: The process") {
-                Ok(0)
-            } else {
-                Err(stderr.trim().to_string())
-            }
-        }
-    } else {
-        // Use pkill -x for an exact match. Returns 0 on a kill, 1 if no
-        // processes matched, 2+ on error.
-        let status = Command::new("pkill")
-            .args(["-x", name])
-            .status()
-            .map_err(|e| e.to_string())?;
-        match status.code() {
-            Some(0) => {
-                println!("  stopped {name}");
-                Ok(1)
-            }
-            Some(1) => Ok(0),
-            Some(c) => Err(format!("pkill exited {c}")),
-            None => Err("pkill terminated by signal".into()),
-        }
     }
 }
 
