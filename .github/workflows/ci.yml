@@ -84,6 +84,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      # Check the default-feature graph (the shipped build). The action
+      # defaults `arguments` to `--all-features`, which pulls optional-feature
+      # build dependencies that are not in the default build; the full
+      # `--all-features` sweep stays in nightly-security.yml as the backstop.
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+          arguments: ""
