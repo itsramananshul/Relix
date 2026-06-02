@@ -14,8 +14,9 @@
 //!
 //! - `POST /v1/mcp/invoke` (PH-BRIDGE-MCP-INVOKE) — proxies
 //!   `tool.mcp.invoke`. Body JSON: `{peer?, server_id,
-//!   tool_name, args}`. Response: `{peer, server_id, tool_name,
-//!   result}` on success. Honest about D-009: the underlying
+//!   tool_name, task_id?, run_id?, args}`. Response: `{peer,
+//!   server_id, tool_name, task_id?, run_id?, result}` on
+//!   success. Honest about D-009: the underlying
 //!   runtime returns `RuntimeNotConnected` today, which the
 //!   bridge surfaces as 502 Bad Gateway with the responder's
 //!   cause string. The proxy itself is ready for the moment
@@ -51,8 +52,10 @@ use serde::{Deserialize, Serialize};
 use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
+use crate::activity::{McpInvocationActivity, append_mcp_invocation_activity};
 use crate::config::AppState;
 use crate::mcp_audit::McpAuditEntry;
+use crate::tenant::{DEFAULT_TENANT, current_subject, current_tenant};
 
 /// Default peer alias when the caller doesn't supply `?peer=`.
 /// Matches the `peers.toml` convention for the tool node.
@@ -103,7 +106,7 @@ pub async fn servers(
     Query(q): Query<ServersQuery>,
 ) -> Result<Json<ServersResponse>, (StatusCode, Json<ApiError>)> {
     let peer = q.peer.as_deref().unwrap_or(DEFAULT_PEER).to_string();
-    let body = call_peer(&state, &peer, "tool.mcp.list_servers", b"")
+    let body = call_peer(&state, &peer, "tool.mcp.list_servers", b"", None)
         .await
         .map_err(drop_kind)?;
     let servers = parse_servers(&body);
@@ -123,9 +126,15 @@ pub async fn tools(
         ));
     }
     let peer = q.peer.as_deref().unwrap_or(DEFAULT_PEER).to_string();
-    let body = call_peer(&state, &peer, "tool.mcp.list_tools", q.server_id.as_bytes())
-        .await
-        .map_err(drop_kind)?;
+    let body = call_peer(
+        &state,
+        &peer,
+        "tool.mcp.list_tools",
+        q.server_id.as_bytes(),
+        None,
+    )
+    .await
+    .map_err(drop_kind)?;
     let tools = parse_tools(&body);
     Ok(Json(ToolsResponse {
         peer,
@@ -169,6 +178,10 @@ pub struct InvokeRequest {
     pub peer: Option<String>,
     pub server_id: String,
     pub tool_name: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
     /// Tool arguments forwarded verbatim. Typically a JSON
     /// string (matching the tool's declared `inputSchema`), but
     /// the bridge does not interpret it — it joins
@@ -187,6 +200,10 @@ pub struct InvokeResponse {
     pub peer: String,
     pub server_id: String,
     pub tool_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     /// Verbatim responder body. Today (D-009) the runtime is
     /// not wired so this path returns 502 BadGateway with a
     /// `RuntimeNotConnected` cause — but the response shape is
@@ -219,16 +236,27 @@ pub async fn invoke(
             }),
         ));
     }
+    let task_id = clean_optional_id(req.task_id.as_deref(), "task_id")?;
+    let run_id = clean_optional(req.run_id.as_deref());
     let peer = req.peer.as_deref().unwrap_or(DEFAULT_PEER).to_string();
     let wire_arg = build_invoke_arg(&req.server_id, &req.tool_name, &req.args);
     let args_len = req.args.len();
     let started = Instant::now();
-    let dispatched = call_peer(&state, &peer, "tool.mcp.invoke", wire_arg.as_bytes()).await;
+    let dispatched = call_peer(
+        &state,
+        &peer,
+        "tool.mcp.invoke",
+        wire_arg.as_bytes(),
+        task_id.as_deref(),
+    )
+    .await;
     let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let ts_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    let tenant_id = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    let actor = current_subject().unwrap_or_else(|| "mcp.invoke".into());
     match dispatched {
         Ok(result) => {
             state.mcp_audit.push(McpAuditEntry {
@@ -241,26 +269,136 @@ pub async fn invoke(
                 error_kind: None,
                 duration_ms,
             });
+            record_mcp_activity(
+                &state,
+                McpActivityParts {
+                    tenant_id: &tenant_id,
+                    actor: &actor,
+                    peer: &peer,
+                    server_id: &req.server_id,
+                    tool_name: &req.tool_name,
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    decision: "ok",
+                    args_len,
+                    duration_ms,
+                    error_kind: None,
+                },
+            )
+            .await;
             Ok(Json(InvokeResponse {
                 peer,
                 server_id: req.server_id,
                 tool_name: req.tool_name,
+                task_id,
+                run_id,
                 result,
             }))
         }
         Err((status, kind, body)) => {
             state.mcp_audit.push(McpAuditEntry {
                 ts_secs,
-                peer_alias: peer,
-                server_id: req.server_id,
-                tool_name: req.tool_name,
+                peer_alias: peer.clone(),
+                server_id: req.server_id.clone(),
+                tool_name: req.tool_name.clone(),
                 args_len,
                 outcome: "err".into(),
-                error_kind: Some(kind),
+                error_kind: Some(kind.clone()),
                 duration_ms,
             });
+            record_mcp_activity(
+                &state,
+                McpActivityParts {
+                    tenant_id: &tenant_id,
+                    actor: &actor,
+                    peer: &peer,
+                    server_id: &req.server_id,
+                    tool_name: &req.tool_name,
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    decision: "err",
+                    args_len,
+                    duration_ms,
+                    error_kind: Some(&kind),
+                },
+            )
+            .await;
             Err((status, body))
         }
+    }
+}
+
+struct McpActivityParts<'a> {
+    tenant_id: &'a str,
+    actor: &'a str,
+    peer: &'a str,
+    server_id: &'a str,
+    tool_name: &'a str,
+    task_id: Option<&'a str>,
+    run_id: Option<&'a str>,
+    decision: &'a str,
+    args_len: usize,
+    duration_ms: u64,
+    error_kind: Option<&'a str>,
+}
+
+async fn record_mcp_activity(state: &AppState, parts: McpActivityParts<'_>) {
+    if let Err(e) = append_mcp_invocation_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        McpInvocationActivity {
+            tenant_id: parts.tenant_id,
+            actor: parts.actor,
+            peer: parts.peer,
+            server_id: parts.server_id,
+            tool_name: parts.tool_name,
+            task_id: parts.task_id,
+            run_id: parts.run_id,
+            decision: parts.decision,
+            args_len: parts.args_len,
+            duration_ms: parts.duration_ms,
+            error_kind: parts.error_kind,
+        },
+    ) {
+        tracing::warn!(error = %e, "failed to append MCP activity");
+    }
+    if let (Some(rec), Some(task_id)) = (state.task_recorder.as_ref(), parts.task_id) {
+        let payload = format!(
+            "peer={} server_id={} tool_name={} outcome={} args_len={} duration_ms={} error_kind={}",
+            parts.peer,
+            parts.server_id,
+            parts.tool_name,
+            parts.decision,
+            parts.args_len,
+            parts.duration_ms,
+            parts.error_kind.unwrap_or("")
+        );
+        rec.event(task_id, "mcp.invoke", &payload).await;
+    }
+}
+
+fn clean_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn clean_optional_id(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<String>, (StatusCode, Json<ApiError>)> {
+    let Some(clean) = clean_optional(value) else {
+        return Ok(None);
+    };
+    if clean.len() == 32 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(Some(clean))
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: format!("{field} must be 32 hex chars"),
+            }),
+        ))
     }
 }
 
@@ -294,6 +432,7 @@ async fn call_peer(
     alias: &str,
     method: &str,
     arg: &[u8],
+    task_id: Option<&str>,
 ) -> Result<String, (StatusCode, String, Json<ApiError>)> {
     let mesh = state.mesh_client.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -309,7 +448,7 @@ async fn call_peer(
         state.cfg.transport.deadline_secs,
         None,
         None,
-        None,
+        task_id.map(str::to_string),
         crate::tenant::current_tenant_or_none(),
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
@@ -497,6 +636,73 @@ mod tests {
     }
 
     // ── PH-BRIDGE-MCP-AUDIT: error_kind classification ──────────────
+
+    #[test]
+    fn invoke_request_accepts_optional_task_and_run_context() {
+        let req: InvokeRequest = serde_json::from_str(
+            r##"{
+                "server_id": "browser",
+                "tool_name": "click",
+                "task_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "run_id": "run-1",
+                "args": "{\"selector\":\"#ok\"}"
+            }"##,
+        )
+        .unwrap();
+
+        assert_eq!(
+            req.task_id.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(req.run_id.as_deref(), Some("run-1"));
+        assert_eq!(req.peer, None);
+    }
+
+    #[test]
+    fn clean_optional_id_rejects_non_task_ids() {
+        let err = clean_optional_id(Some("not-a-task"), "task_id").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1.0.error, "task_id must be 32 hex chars");
+        assert_eq!(clean_optional_id(Some("   "), "task_id").unwrap(), None);
+        assert_eq!(
+            clean_optional_id(Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "task_id")
+                .unwrap()
+                .as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn invoke_response_includes_scope_when_present() {
+        let response = InvokeResponse {
+            peer: "tool".into(),
+            server_id: "browser".into(),
+            tool_name: "click".into(),
+            task_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            run_id: Some("run-1".into()),
+            result: "ok".into(),
+        };
+
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["task_id"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(value["run_id"], "run-1");
+    }
+
+    #[test]
+    fn invoke_response_omits_empty_scope() {
+        let response = InvokeResponse {
+            peer: "tool".into(),
+            server_id: "browser".into(),
+            tool_name: "click".into(),
+            task_id: None,
+            run_id: None,
+            result: "ok".into(),
+        };
+
+        let value = serde_json::to_value(response).unwrap();
+        assert!(value.get("task_id").is_none());
+        assert!(value.get("run_id").is_none());
+    }
 
     #[test]
     fn drop_kind_collapses_three_tuple_to_two() {

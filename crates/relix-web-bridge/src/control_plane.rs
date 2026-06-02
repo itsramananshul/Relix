@@ -161,7 +161,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/tasks/:id/summary",
                 "/v1/tasks/:id/todos",
             ],
-            gap: "Every chat/tool/capability invocation should be forced to attach to a task or explicit ad-hoc run.",
+            gap: "Chat and MCP invoke paths can carry task context; plugin and remaining direct utility invocations still need forced task or explicit ad-hoc run binding.",
         },
         SpineSurface {
             id: "runs",

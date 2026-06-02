@@ -26,8 +26,10 @@
 //!
 //! ## What this is NOT
 //!
-//! - **Not the chronicle.** MCP invocations don't write task
-//!   events; this is pure bridge-process observability.
+//! - **Not the chronicle.** The ring is bridge-process
+//!   observability. When `/v1/mcp/invoke` carries a task id, the
+//!   handler also writes a best-effort task event and durable
+//!   activity entry.
 //! - **Not a per-caller log.** The bridge holds a single
 //!   identity bundle; per-request caller identification lands
 //!   when bridge auth ships.

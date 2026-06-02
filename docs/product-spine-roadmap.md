@@ -51,6 +51,9 @@ Current progress:
 - flow-issued unary and streaming `remote_call` envelopes now carry that
   `task_id`, so responder-side approval gates can bind risky calls back to the
   durable task
+- `/v1/mcp/invoke` accepts optional `task_id`/`run_id`, stamps `task_id` into
+  the mesh dispatch envelope, and records durable activity plus best-effort task
+  events for bound calls
 - standalone CLI flow runs remain unbound unless the caller explicitly grows a
   task binding path
 
@@ -59,7 +62,7 @@ Remaining launch work:
 - make task creation fail-closed for production modes: implemented through
   `[coordinator] required = true`, which refuses startup when the coordinator
   alias is unavailable and refuses chat dispatch when `task.create` fails
-- bind plugin/MCP/direct bridge utility calls to tasks or explicit ad-hoc runs
+- bind plugin/direct bridge utility calls to tasks or explicit ad-hoc runs
 - attach run ids to the same execution context; bridge chat/OpenAI/WS paths
   now accept a workspace lease id and stamp the resolved workspace path into
   dispatch envelopes
@@ -163,6 +166,7 @@ Current producers:
 - approval decisions from the dashboard/API and channel callbacks
 - policy denials discovered through `/v1/policy/denials`
 - cost aggregate observations from `/v1/metrics/cost`
+- MCP invocations from `/v1/mcp/invoke`
 
 ## Phase 6: Dashboard Decomposition
 
