@@ -96,11 +96,15 @@ Running these locally catches issues before they consume Actions minutes.
 
 ## Toolchain
 
-`rust-toolchain.toml` pins **Rust 1.95** with `rustfmt` and `clippy`. Every
-workflow uses `dtolnay/rust-toolchain@stable` plus `Swatinem/rust-cache@v2`
-for layered caching of the registry, git database, and target directory.
-Cache keys are per-lane and, for the matrix, per-OS, to avoid cross-lane and
-cross-OS invalidation.
+`rust-toolchain.toml` pins **Rust 1.95** with `rustfmt` and `clippy`. The
+required gate (`ci.yml`) installs that exact version via
+`dtolnay/rust-toolchain@1.95.0` so fmt output and the clippy lint set are
+reproducible; a floating `stable` pulls newer tools whose formatting and
+lints drift from the pin and fail the gate for reasons unrelated to the
+change under review. When the pin in `rust-toolchain.toml` moves, update the
+workflow version in the same PR. `Swatinem/rust-cache@v2` provides layered
+caching of the registry, git database, and target directory; cache keys are
+per-OS to avoid cross-OS invalidation.
 
 MSRV is documented in `README.md`.
 
