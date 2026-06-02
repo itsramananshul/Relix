@@ -757,6 +757,7 @@ async fn forward_record_decision(
         }
     };
     let deadline_secs = state.cfg.transport.deadline_secs.clamp(5, 30);
+    let tenant = crate::tenant::current_tenant_or_none();
     let envelope = build_request_with_tenant(
         "approval.record_decision",
         arg_bytes,
@@ -765,12 +766,35 @@ async fn forward_record_decision(
         None,
         None,
         None,
-        crate::tenant::current_tenant_or_none(),
+        tenant.clone(),
     );
     match mesh.call(COORDINATOR_ALIAS, envelope).await {
         Ok(bytes) => match decode_response(&bytes) {
             Ok(resp) => match resp.res {
                 ResponseResult::Ok(_) => {
+                    let tenant_id = tenant.clone().unwrap_or_else(|| "default".into());
+                    let detail = if note.trim().is_empty() {
+                        format!("approval decision recorded via {channel_tag}")
+                    } else {
+                        note.to_string()
+                    };
+                    if let Err(e) = crate::activity::append_approval_activity(
+                        state.cfg.transport.data_dir.as_deref(),
+                        &tenant_id,
+                        channel_tag,
+                        approval_id,
+                        decision,
+                        None,
+                        detail,
+                    ) {
+                        tracing::warn!(
+                            channel = channel_tag,
+                            approval_id = approval_id,
+                            decision = decision,
+                            error = %e,
+                            "channel interact: decision recorded but activity ledger append failed"
+                        );
+                    }
                     tracing::info!(
                         channel = channel_tag,
                         approval_id = approval_id,

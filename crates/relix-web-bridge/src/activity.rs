@@ -133,6 +133,40 @@ pub fn append_intervention_activity(
     append_entry(&path, &activity_from_intervention(entry))
 }
 
+pub fn append_approval_activity(
+    data_dir: Option<&Path>,
+    tenant_id: &str,
+    actor: &str,
+    approval_id: &str,
+    decision: &str,
+    task_id: Option<&str>,
+    detail: impl Into<String>,
+) -> Result<(), String> {
+    let Some(path) = data_dir.map(activity_path_for_data_dir) else {
+        return Ok(());
+    };
+    append_entry(
+        &path,
+        &ActivityEntry {
+            activity_id: new_activity_id(),
+            ts_ms: now_ms(),
+            source: "approval".into(),
+            actor: actor.into(),
+            tenant_id: tenant_id.into(),
+            task_id: task_id.map(str::to_string),
+            run_id: None,
+            action: "approval.record_decision".into(),
+            target: approval_id.into(),
+            decision: decision.into(),
+            method: Some("approval.record_decision".into()),
+            approval_id: Some(approval_id.into()),
+            policy_result: None,
+            cost_micros: None,
+            detail: detail.into(),
+        },
+    )
+}
+
 pub fn activity_path_from_intervention_path(path: &Path) -> PathBuf {
     path.with_file_name("bridge-activity.jsonl")
 }
@@ -373,5 +407,33 @@ mod tests {
             activity.task_id.as_deref(),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
+    }
+
+    #[test]
+    fn approval_activity_records_decision_and_approval_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        append_approval_activity(
+            Some(tmp.path()),
+            "tenant-a",
+            "operator",
+            "apr-1",
+            "approved",
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "approved from dashboard",
+        )
+        .unwrap();
+
+        let q = ActivityQuery {
+            limit: None,
+            tenant_id: Some("tenant-a".into()),
+            source: Some("approval".into()),
+            task_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+        };
+        let items = read_recent(&activity_path_for_data_dir(tmp.path()), &q, 10).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].action, "approval.record_decision");
+        assert_eq!(items[0].approval_id.as_deref(), Some("apr-1"));
+        assert_eq!(items[0].method.as_deref(), Some("approval.record_decision"));
+        assert_eq!(items[0].decision, "approved");
     }
 }

@@ -131,7 +131,7 @@ Unify scattered rings/logs/provenance into one durable activity ledger:
 - method/action: implemented as `action`; method remains optional
 - decision: implemented
 - cost: schema field exists, producers missing
-- approval id: schema field exists, producers missing
+- approval id: implemented for REST/dashboard and channel approval decisions
 - policy result: schema field exists, producers missing
 - timestamp: implemented
 
@@ -149,6 +149,12 @@ Current durable source:
 ```text
 <data_dir>/bridge-activity.jsonl
 ```
+
+Current producers:
+
+- workspace lease create/release
+- operator intervention audit rows
+- approval decisions from the dashboard/API and channel callbacks
 
 ## Phase 6: Dashboard Decomposition
 
