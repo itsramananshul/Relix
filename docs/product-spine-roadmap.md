@@ -64,6 +64,9 @@ Current progress:
   `task_id`/`run_id`, stamp `task_id` into the mesh dispatch envelope, record
   durable activity without leaking message body/subject content, and add scope
   metadata to object responses
+- `/v1/messages` send accepts optional `task_id`/`run_id`, stamps `task_id`
+  into the mesh dispatch envelope, records durable activity without leaking
+  message body/subject content, and returns scope metadata in the send response
 - standalone CLI flow runs remain unbound unless the caller explicitly grows a
   task binding path
 
@@ -180,6 +183,7 @@ Current producers:
 - screen captures from `/v1/tools/screen`
 - browser capture reads from `/v1/browser/captures/:filename`
 - outbound email sends from `/v1/email/send` and `/v1/email/send_template`
+- agent-message sends from `/v1/messages`
 
 ## Phase 6: Dashboard Decomposition
 

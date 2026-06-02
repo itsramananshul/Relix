@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
+use crate::activity::{ToolInvocationActivity, append_tool_invocation_activity};
 use crate::config::AppState;
-use crate::tenant::SubjectError;
+use crate::tenant::{DEFAULT_TENANT, SubjectError, current_subject, current_tenant};
 
 const DEFAULT_PEER: &str = "coordinator";
 
@@ -72,11 +73,19 @@ pub struct SendRequest {
     pub ttl_secs: Option<i64>,
     #[serde(default)]
     pub origin_surface: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SendResponse {
     pub message_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -155,10 +164,46 @@ pub async fn send(
     if body.contains('|') {
         return Err(bad("body must not contain `|`".into()));
     }
+    let task_id = clean_optional_id(req.task_id.as_deref(), "task_id")?;
+    let run_id = clean_optional(req.run_id.as_deref());
     let arg = format!("{from}|{to}|{subject}|{body}|{thread_id}|{reply_to}|{ttl}|{origin}");
-    let body = call_peer_string(&state, DEFAULT_PEER, "msg.send", arg.as_bytes()).await?;
+    let detail = send_detail(&to, subject.len(), body.len(), ttl, &origin);
+    let body = match call_peer_string(
+        &state,
+        DEFAULT_PEER,
+        "msg.send",
+        arg.as_bytes(),
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(body) => {
+            record_message_activity(
+                &state,
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "msg.send",
+                "ok",
+                &detail,
+            );
+            body
+        }
+        Err(err) => {
+            record_message_activity(
+                &state,
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "msg.send",
+                "err",
+                &detail,
+            );
+            return Err(err);
+        }
+    };
     Ok(Json(SendResponse {
         message_id: body.trim().to_string(),
+        task_id,
+        run_id,
     }))
 }
 
@@ -175,7 +220,7 @@ pub async fn inbox(
     let include_read = q.include_read.unwrap_or(0);
     let since = q.since_message_id.unwrap_or_default();
     let arg = format!("{subject_id}|{limit}|{include_read}|{since}");
-    let body = call_peer_string(&state, DEFAULT_PEER, "msg.inbox", arg.as_bytes()).await?;
+    let body = call_peer_string(&state, DEFAULT_PEER, "msg.inbox", arg.as_bytes(), None).await?;
     let messages = parse_rows(&body);
     let count = messages.len();
     Ok(Json(MessageListResponse { messages, count }))
@@ -193,7 +238,7 @@ pub async fn read(
         return Err(bad("ids must not contain `|`".into()));
     }
     let arg = format!("{message_id}|{reader}");
-    let _ = call_peer_string(&state, DEFAULT_PEER, "msg.read", arg.as_bytes()).await?;
+    let _ = call_peer_string(&state, DEFAULT_PEER, "msg.read", arg.as_bytes(), None).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -209,7 +254,7 @@ pub async fn thread(
         return Err(bad("ids must not contain `|`".into()));
     }
     let arg = format!("{thread_id}|{subject}");
-    let body = call_peer_string(&state, DEFAULT_PEER, "msg.thread", arg.as_bytes()).await?;
+    let body = call_peer_string(&state, DEFAULT_PEER, "msg.thread", arg.as_bytes(), None).await?;
     let messages = parse_rows(&body);
     Ok(Json(ThreadResponse {
         thread_id,
@@ -229,7 +274,7 @@ pub async fn delete(
         return Err(bad("ids must not contain `|`".into()));
     }
     let arg = format!("{message_id}|{subject}");
-    let _ = call_peer_string(&state, DEFAULT_PEER, "msg.delete", arg.as_bytes()).await?;
+    let _ = call_peer_string(&state, DEFAULT_PEER, "msg.delete", arg.as_bytes(), None).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -314,11 +359,86 @@ fn bad(msg: String) -> (StatusCode, Json<ApiError>) {
     (StatusCode::BAD_REQUEST, Json(ApiError { error: msg }))
 }
 
+fn clean_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn clean_optional_id(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<String>, (StatusCode, Json<ApiError>)> {
+    let Some(clean) = clean_optional(value) else {
+        return Ok(None);
+    };
+    if clean.len() == 32 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(Some(clean))
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: format!("{field} must be 32 hex chars"),
+            }),
+        ))
+    }
+}
+
+fn send_detail(
+    to_subject_id: &str,
+    subject_len: usize,
+    body_len: usize,
+    ttl_secs: i64,
+    origin_surface: &str,
+) -> String {
+    format!(
+        "to_subject_id={to_subject_id}; subject_len={subject_len}; body_len={body_len}; ttl_secs={ttl_secs}; origin_surface={origin_surface}"
+    )
+}
+
+fn record_message_activity(
+    state: &AppState,
+    task_id: Option<&str>,
+    run_id: Option<&str>,
+    method: &str,
+    decision: &str,
+    detail: &str,
+) {
+    let tenant_id = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    let actor = current_subject().unwrap_or_else(|| method.to_string());
+    if let Err(e) = append_tool_invocation_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        ToolInvocationActivity {
+            tenant_id: &tenant_id,
+            actor: &actor,
+            peer: DEFAULT_PEER,
+            method,
+            task_id,
+            run_id,
+            decision,
+            detail,
+        },
+    ) {
+        tracing::warn!(error = %e, method, "failed to append messaging activity");
+    }
+    if let (Some(rec), Some(task_id)) = (state.task_recorder.as_ref(), task_id) {
+        let payload = format!("peer={DEFAULT_PEER} outcome={decision} {detail}");
+        let rec = rec.clone();
+        let task_id = task_id.to_string();
+        let event_type = method.to_string();
+        tokio::spawn(async move {
+            rec.event(&task_id, &event_type, &payload).await;
+        });
+    }
+}
+
 async fn call_peer_string(
     state: &AppState,
     alias: &str,
     method: &str,
     arg: &[u8],
+    task_id: Option<&str>,
 ) -> Result<String, (StatusCode, Json<ApiError>)> {
     let mesh = state.mesh_client.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -334,7 +454,7 @@ async fn call_peer_string(
         deadline_secs,
         None,
         None,
-        None,
+        task_id.map(str::to_string),
         crate::tenant::current_tenant_or_none(),
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
@@ -419,5 +539,74 @@ mod tests {
         let v = parse_rows(body);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].message_id, "m1");
+    }
+
+    #[test]
+    fn send_request_accepts_task_and_run_context() {
+        let req: SendRequest = serde_json::from_value(serde_json::json!({
+            "to_subject_id": "agent-b",
+            "subject": "handoff",
+            "body": "details",
+            "task_id": "0123456789abcdef0123456789abcdef",
+            "run_id": "run-1"
+        }))
+        .unwrap();
+        assert_eq!(
+            req.task_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(req.run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn send_response_omits_empty_scope_and_includes_present_scope() {
+        let bare = serde_json::to_value(SendResponse {
+            message_id: "m1".into(),
+            task_id: None,
+            run_id: None,
+        })
+        .unwrap();
+        assert!(bare.get("task_id").is_none());
+        assert!(bare.get("run_id").is_none());
+
+        let scoped = serde_json::to_value(SendResponse {
+            message_id: "m2".into(),
+            task_id: Some("0123456789abcdef0123456789abcdef".into()),
+            run_id: Some("run-2".into()),
+        })
+        .unwrap();
+        assert_eq!(scoped["task_id"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(scoped["run_id"], "run-2");
+    }
+
+    #[test]
+    fn clean_optional_id_rejects_invalid_task_id() {
+        assert!(clean_optional_id(None, "task_id").unwrap().is_none());
+        assert_eq!(
+            clean_optional_id(Some(" 0123456789abcdef0123456789abcdef "), "task_id")
+                .unwrap()
+                .as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        let err = clean_optional_id(Some("not-a-task"), "task_id").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1.0.error, "task_id must be 32 hex chars");
+    }
+
+    #[test]
+    fn send_detail_records_lengths_without_message_content() {
+        let detail = send_detail(
+            "agent-b",
+            "secret subject".len(),
+            "secret body".len(),
+            60,
+            "api",
+        );
+        assert_eq!(
+            detail,
+            "to_subject_id=agent-b; subject_len=14; body_len=11; ttl_secs=60; origin_surface=api"
+        );
+        assert!(!detail.contains("secret subject"));
+        assert!(!detail.contains("secret body"));
     }
 }
