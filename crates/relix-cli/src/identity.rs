@@ -704,12 +704,12 @@ fn ensure(
     match reason {
         None => {
             // Healthy and outside the renewal window — report remaining life.
-            if let Ok(bytes) = fs::read(out_path) {
-                if let Ok(bundle) = codec::decode::<Bundle>(&bytes) {
-                    let days = bundle.header.seconds_until_expiry(now_unix_secs()) / 86_400;
-                    println!("ensure: {name} bundle valid ({days}d remaining); no action");
-                    return Ok(());
-                }
+            if let Ok(bytes) = fs::read(out_path)
+                && let Ok(bundle) = codec::decode::<Bundle>(&bytes)
+            {
+                let days = bundle.header.seconds_until_expiry(now_unix_secs()) / 86_400;
+                println!("ensure: {name} bundle valid ({days}d remaining); no action");
+                return Ok(());
             }
             println!("ensure: {name} bundle valid; no action");
             Ok(())
