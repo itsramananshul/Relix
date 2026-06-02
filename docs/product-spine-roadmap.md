@@ -76,6 +76,10 @@ Current progress:
   metadata before forwarding, stamp `task_id` into the mesh dispatch envelope,
   record durable activity without copying document/image payloads, and add scope
   metadata to object responses
+- standalone memory embedding writes (`/v1/memory/embed` and
+  `/v1/memory/embed_all`) accept optional `task_id`/`run_id`, stamp `task_id`
+  into the mesh dispatch envelope, record durable activity without copying raw
+  text payloads, and return scope metadata
 - standalone CLI flow runs remain unbound unless the caller explicitly grows a
   task binding path
 
@@ -164,8 +168,8 @@ Unify scattered rings/logs/provenance into one durable activity ledger:
 - approval id: implemented for REST/dashboard and channel approval decisions
 - policy result: implemented for recent policy-denial rows with idempotent
   activity ids
-- memory writes: implemented for the GAP 5 bridge memory-write proxies without
-  logging raw document/image payloads
+- memory writes: implemented for the GAP 5 bridge memory-write proxies and
+  standalone embedding writes without logging raw document/image/text payloads
 - timestamp: implemented
 
 The operator question "what happened?" should not require scraping five
@@ -196,6 +200,7 @@ Current producers:
 - plugin management mutations from `/v1/plugins/:id/reload` and
   `/v1/plugins/:id/disable`
 - memory writes from GAP 5 bridge proxies
+- memory embedding writes from `/v1/memory/embed` and `/v1/memory/embed_all`
 - outbound email sends from `/v1/email/send` and `/v1/email/send_template`
 - agent-message sends from `/v1/messages`
 
