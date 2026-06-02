@@ -94,7 +94,7 @@ pub fn build_spine(state: &AppState) -> ControlPlaneSpine {
             tenant_model: "tenant header + policy/audit partitioning; still being forced into every route",
             work_model: "task ledger is the canonical work object; chat/capability calls still need tighter task binding",
             execution_model: "attempts/events exist; cooperative cancellation and run ownership are still partial",
-            approval_model: "single-call and scoped standing approvals exist; call-count limits are enforced, budget-bound approval windows remain missing",
+            approval_model: "single-call and scoped standing approvals exist; call-count and estimated-cost windows are enforced",
             dashboard_model: "single embedded operator console; useful, but still too monolithic for long-term product work",
         },
         runtime: RuntimeReadiness {
@@ -213,7 +213,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/approval/:id/decision",
                 "/v1/approvals",
             ],
-            gap: "Task/session/method/workspace scoped approvals exist in the runtime/API; dashboard UX, run binding, and budget/call-count limits still need launch work.",
+            gap: "Task/session/method/workspace scoped approvals exist in the runtime/API with call-count and estimated-cost limits; dashboard UX and run binding still need launch work.",
         },
         SpineSurface {
             id: "budget",
@@ -378,7 +378,7 @@ mod tests {
         assert!(tasks.gap.contains("attach to a task"));
         let approvals = surfaces.iter().find(|s| s.id == "approvals").unwrap();
         assert!(approvals.gap.contains("Task/session/method/workspace"));
-        assert!(approvals.gap.contains("budget/call-count"));
+        assert!(approvals.gap.contains("call-count and estimated-cost"));
     }
 
     #[test]

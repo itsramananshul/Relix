@@ -3415,8 +3415,8 @@ async fn standing_list(
         return Ok(());
     }
     println!(
-        "{:<22} {:<16} {:<32} expires",
-        "standing_id", "category", "path"
+        "{:<22} {:<16} {:<32} {:<10} {:<12} expires",
+        "standing_id", "category", "path", "calls", "cost_micros"
     );
     for s in rows {
         let id = s.get("standing_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -3429,11 +3429,26 @@ async fn standing_list(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let exp = s.get("expires_at").and_then(|v| v.as_i64()).unwrap_or(0);
+        let calls_used = s.get("calls_used").and_then(|v| v.as_i64()).unwrap_or(0);
+        let max_calls = s.get("max_calls").and_then(|v| v.as_i64());
+        let cost_used = s
+            .get("cost_used_micros")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let max_cost = s.get("max_cost_micros").and_then(|v| v.as_i64());
+        let calls = max_calls
+            .map(|max| format!("{calls_used}/{max}"))
+            .unwrap_or_else(|| format!("{calls_used}/-"));
+        let cost = max_cost
+            .map(|max| format!("{cost_used}/{max}"))
+            .unwrap_or_else(|| format!("{cost_used}/-"));
         println!(
-            "{:<22} {:<16} {:<32} {}",
+            "{:<22} {:<16} {:<32} {:<10} {:<12} {}",
             short(id, 22),
             short(cat, 16),
             short(path, 32),
+            short(&calls, 10),
+            short(&cost, 12),
             exp
         );
     }

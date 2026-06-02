@@ -245,6 +245,8 @@ pub struct StandingApproval {
     pub granted_by: String,
     pub max_calls: Option<i64>,
     pub calls_used: i64,
+    pub max_cost_micros: Option<i64>,
+    pub cost_used_micros: i64,
     pub note: String,
     pub created_at: i64,
 }
@@ -262,6 +264,7 @@ pub struct StandingApprovalCreate<'a> {
     pub expires_at: i64,
     pub granted_by: &'a str,
     pub max_calls: Option<i64>,
+    pub max_cost_micros: Option<i64>,
     pub note: &'a str,
     pub tenant_id: &'a str,
 }
@@ -275,6 +278,7 @@ pub struct StandingApprovalMatch<'a> {
     pub session_id: Option<&'a str>,
     pub workspace_path: Option<&'a str>,
     pub tenant_id: Option<&'a str>,
+    pub estimated_cost_micros: i64,
     pub now: i64,
 }
 
@@ -1293,6 +1297,7 @@ impl AgentStore {
             expires_at,
             granted_by,
             max_calls: None,
+            max_cost_micros: None,
             note,
             tenant_id,
         })
@@ -1320,6 +1325,11 @@ impl AgentStore {
                 "standing approval max_calls must be positive".into(),
             ));
         }
+        if input.max_cost_micros.is_some_and(|n| n <= 0) {
+            return Err(AgentStoreError::BadInput(
+                "standing approval max_cost_micros must be positive".into(),
+            ));
+        }
         let tenant = if input.tenant_id.trim().is_empty() {
             "default"
         } else {
@@ -1332,8 +1342,9 @@ impl AgentStore {
             "INSERT INTO standing_approvals (
                  standing_id, agent_id, match_category, match_path_glob,
                  scope_kind, task_id, session_id, method_prefix, workspace_path_glob,
-                 expires_at, granted_by, max_calls, calls_used, note, created_at, tenant_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13, ?14, ?15)",
+                 expires_at, granted_by, max_calls, calls_used, max_cost_micros,
+                 cost_used_micros, note, created_at, tenant_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13, 0, ?14, ?15, ?16)",
             params![
                 standing_id,
                 input.agent_id,
@@ -1347,6 +1358,7 @@ impl AgentStore {
                 input.expires_at,
                 input.granted_by,
                 input.max_calls,
+                input.max_cost_micros,
                 input.note,
                 now,
                 tenant,
@@ -1385,7 +1397,8 @@ impl AgentStore {
         let mut stmt = conn.prepare(
             "SELECT standing_id, agent_id, match_category, match_path_glob,
                     scope_kind, task_id, session_id, method_prefix, workspace_path_glob,
-                    expires_at, granted_by, max_calls, calls_used, note, created_at
+                    expires_at, granted_by, max_calls, calls_used, max_cost_micros,
+                    cost_used_micros, note, created_at
              FROM standing_approvals WHERE tenant_id = ?1 AND agent_id = ?2
              ORDER BY created_at DESC",
         )?;
@@ -1405,8 +1418,10 @@ impl AgentStore {
                     granted_by: r.get(10)?,
                     max_calls: r.get(11)?,
                     calls_used: r.get(12)?,
-                    note: r.get(13)?,
-                    created_at: r.get(14)?,
+                    max_cost_micros: r.get(13)?,
+                    cost_used_micros: r.get(14)?,
+                    note: r.get(15)?,
+                    created_at: r.get(16)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1430,6 +1445,7 @@ impl AgentStore {
             session_id: None,
             workspace_path: None,
             tenant_id: None,
+            estimated_cost_micros: 0,
             now,
         })
     }
@@ -1445,11 +1461,18 @@ impl AgentStore {
                     method_prefix, workspace_path_glob
              FROM standing_approvals
              WHERE tenant_id = ?1 AND agent_id = ?2 AND match_category = ?3 AND expires_at > ?4
-               AND (max_calls IS NULL OR calls_used < max_calls)",
+               AND (max_calls IS NULL OR calls_used < max_calls)
+               AND (max_cost_micros IS NULL OR cost_used_micros + ?5 <= max_cost_micros)",
         )?;
         let rows = stmt
             .query_map(
-                params![tenant, input.agent_id, input.category, input.now],
+                params![
+                    tenant,
+                    input.agent_id,
+                    input.category,
+                    input.now,
+                    input.estimated_cost_micros.max(0)
+                ],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -1497,14 +1520,21 @@ impl AgentStore {
         let candidates = {
             let mut stmt = conn.prepare(
                 "SELECT standing_id, match_path_glob, scope_kind, task_id, session_id,
-                        method_prefix, workspace_path_glob, max_calls
+                        method_prefix, workspace_path_glob, max_calls, max_cost_micros
                  FROM standing_approvals
                  WHERE tenant_id = ?1 AND agent_id = ?2 AND match_category = ?3 AND expires_at > ?4
                    AND (max_calls IS NULL OR calls_used < max_calls)
+                   AND (max_cost_micros IS NULL OR cost_used_micros + ?5 <= max_cost_micros)
                  ORDER BY created_at ASC, standing_id ASC",
             )?;
             stmt.query_map(
-                params![tenant, input.agent_id, input.category, input.now],
+                params![
+                    tenant,
+                    input.agent_id,
+                    input.category,
+                    input.now,
+                    input.estimated_cost_micros.max(0)
+                ],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -1515,6 +1545,7 @@ impl AgentStore {
                         r.get::<_, Option<String>>(5)?,
                         r.get::<_, Option<String>>(6)?,
                         r.get::<_, Option<i64>>(7)?,
+                        r.get::<_, Option<i64>>(8)?,
                     ))
                 },
             )?
@@ -1529,6 +1560,7 @@ impl AgentStore {
             method_prefix,
             workspace_path_glob,
             max_calls,
+            max_cost_micros,
         ) in candidates
         {
             if !standing_scope_matches(
@@ -1544,14 +1576,17 @@ impl AgentStore {
             ) {
                 continue;
             }
-            if max_calls.is_none() {
+            if max_calls.is_none() && max_cost_micros.is_none() {
                 return Ok(Some(standing_id));
             }
             let changed = conn.execute(
                 "UPDATE standing_approvals
-                 SET calls_used = calls_used + 1
-                 WHERE standing_id = ?1 AND calls_used < max_calls",
-                params![standing_id],
+                 SET calls_used = calls_used + CASE WHEN max_calls IS NULL THEN 0 ELSE 1 END,
+                     cost_used_micros = cost_used_micros + CASE WHEN max_cost_micros IS NULL THEN 0 ELSE ?2 END
+                 WHERE standing_id = ?1
+                   AND (max_calls IS NULL OR calls_used < max_calls)
+                   AND (max_cost_micros IS NULL OR cost_used_micros + ?2 <= max_cost_micros)",
+                params![standing_id, input.estimated_cost_micros.max(0)],
             )?;
             if changed > 0 {
                 return Ok(Some(standing_id));
@@ -1657,6 +1692,8 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              granted_by      TEXT NOT NULL,
              max_calls       INTEGER,
              calls_used      INTEGER NOT NULL DEFAULT 0,
+             max_cost_micros INTEGER,
+             cost_used_micros INTEGER NOT NULL DEFAULT 0,
              note            TEXT NOT NULL DEFAULT '',
              created_at      INTEGER NOT NULL
          );
@@ -1741,6 +1778,13 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         conn,
         "standing_approvals",
         "calls_used",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(conn, "standing_approvals", "max_cost_micros", "INTEGER")?;
+    ensure_column(
+        conn,
+        "standing_approvals",
+        "cost_used_micros",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     conn.execute_batch(
@@ -2791,6 +2835,7 @@ mod tests {
             expires_at: unix_now() + 60,
             granted_by: "alice",
             max_calls: None,
+            max_cost_micros: None,
             note: "single task",
             tenant_id: "default",
         })
@@ -2805,6 +2850,7 @@ mod tests {
                 session_id: None,
                 workspace_path: None,
                 tenant_id: Some("default"),
+                estimated_cost_micros: 0,
                 now: unix_now(),
             })
             .unwrap()
@@ -2818,6 +2864,7 @@ mod tests {
                 session_id: None,
                 workspace_path: None,
                 tenant_id: Some("default"),
+                estimated_cost_micros: 0,
                 now: unix_now(),
             })
             .unwrap()
@@ -2839,6 +2886,7 @@ mod tests {
             expires_at: unix_now() + 60,
             granted_by: "alice",
             max_calls: None,
+            max_cost_micros: None,
             note: "read-only browsing",
             tenant_id: "default",
         })
@@ -2853,6 +2901,7 @@ mod tests {
                 session_id: None,
                 workspace_path: None,
                 tenant_id: Some("default"),
+                estimated_cost_micros: 0,
                 now: unix_now(),
             })
             .unwrap()
@@ -2866,6 +2915,7 @@ mod tests {
                 session_id: None,
                 workspace_path: None,
                 tenant_id: Some("default"),
+                estimated_cost_micros: 0,
                 now: unix_now(),
             })
             .unwrap()
@@ -2888,6 +2938,7 @@ mod tests {
                 expires_at: unix_now() + 60,
                 granted_by: "alice",
                 max_calls: Some(2),
+                max_cost_micros: None,
                 note: "two calls",
                 tenant_id: "default",
             })
@@ -2900,6 +2951,7 @@ mod tests {
             session_id: None,
             workspace_path: None,
             tenant_id: Some("default"),
+            estimated_cost_micros: 0,
             now: unix_now(),
         };
 
@@ -2917,5 +2969,55 @@ mod tests {
         let rows = s.list_standing("agt-1").unwrap();
         assert_eq!(rows[0].max_calls, Some(2));
         assert_eq!(rows[0].calls_used, 2);
+    }
+
+    #[test]
+    fn cost_bounded_standing_approval_is_consumed_until_budget_exhausted() {
+        let s = store();
+        let id = s
+            .create_scoped_standing(StandingApprovalCreate {
+                agent_id: "agt-1",
+                match_category: "external_api:write",
+                match_path_glob: None,
+                scope_kind: Some("agent_category"),
+                task_id: None,
+                session_id: None,
+                method_prefix: None,
+                workspace_path_glob: None,
+                expires_at: unix_now() + 60,
+                granted_by: "alice",
+                max_calls: None,
+                max_cost_micros: Some(20_000),
+                note: "two paid calls",
+                tenant_id: "default",
+            })
+            .unwrap();
+        let input = || StandingApprovalMatch {
+            agent_id: "agt-1",
+            category: "external_api:write",
+            method: "tool.web_post",
+            task_id: None,
+            session_id: None,
+            workspace_path: None,
+            tenant_id: Some("default"),
+            estimated_cost_micros: 10_000,
+            now: unix_now(),
+        };
+
+        assert_eq!(
+            s.consume_active_standing_for(input()).unwrap().as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(
+            s.consume_active_standing_for(input()).unwrap().as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(s.consume_active_standing_for(input()).unwrap(), None);
+        assert!(!s.has_active_standing_for(input()).unwrap());
+
+        let rows = s.list_standing("agt-1").unwrap();
+        assert_eq!(rows[0].max_cost_micros, Some(20_000));
+        assert_eq!(rows[0].cost_used_micros, 20_000);
+        assert_eq!(rows[0].calls_used, 0);
     }
 }

@@ -122,8 +122,8 @@ Status: started.
 
 Single-call approvals are not enough for autonomous work. Relix now supports
 standing approvals scoped by task, session, capability/method prefix, workspace
-path, category, expiry time, and call count. The remaining launch-critical work
-is making that scope obvious in the dashboard/CLI and adding hard budget limits.
+path, category, expiry time, call count, and estimated spend. The remaining
+launch-critical work is making that scope obvious in the dashboard.
 
 Approval scopes:
 
@@ -137,7 +137,8 @@ Approval scopes:
 - until a time limit: implemented through `expires_at`
 - until a call-count limit: implemented through `max_calls` and atomic
   `calls_used` consumption in the admission gate
-- until a budget limit: still missing
+- until a budget limit: implemented through `max_cost_micros` and atomic
+  `cost_used_micros` consumption in the standing-approval admission gate
 
 Approval decisions write durable activity events; standing approvals are
 revocable.

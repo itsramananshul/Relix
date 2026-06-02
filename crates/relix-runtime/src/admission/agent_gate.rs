@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use relix_core::capability::CapabilityDescriptor;
+use relix_core::capability::{CapabilityDescriptor, CostClass};
 use relix_core::identity::VerifiedIdentity;
 
 use crate::approval::{ApprovalKeySet, ApprovalToken, TokenError};
@@ -525,6 +525,7 @@ fn evaluate_against_view(
                         .as_deref()
                         .and_then(non_empty_str),
                     tenant_id: inputs.envelope.tenant_id.as_deref(),
+                    estimated_cost_micros: standing_estimated_cost_micros(cap.cost_class),
                     now: inputs.now,
                 })
                 .unwrap_or(None);
@@ -616,6 +617,14 @@ fn non_empty_str(s: &str) -> Option<&str> {
         None
     } else {
         Some(trimmed)
+    }
+}
+
+fn standing_estimated_cost_micros(cost_class: CostClass) -> i64 {
+    match cost_class {
+        CostClass::Cheap => 0,
+        CostClass::Expensive => 1_000,
+        CostClass::ExternalPaid => 10_000,
     }
 }
 
@@ -1128,6 +1137,7 @@ mod tests {
             expires_at: 9_999_999_999,
             granted_by: "alice",
             max_calls: None,
+            max_cost_micros: None,
             note: "",
             tenant_id: "default",
         })
@@ -1165,6 +1175,7 @@ mod tests {
             expires_at: 9_999_999_999,
             granted_by: "alice",
             max_calls: None,
+            max_cost_micros: None,
             note: "",
             tenant_id: "default",
         })
@@ -1202,11 +1213,44 @@ mod tests {
             expires_at: 9_999_999_999,
             granted_by: "alice",
             max_calls: Some(1),
+            max_cost_micros: None,
             note: "one call only",
             tenant_id: "default",
         })
         .unwrap();
         let c = cap(&["payments"], &[], RiskLevel::Low);
+        let e = env("tool.payments.refund", None);
+
+        assert!(matches!(run(&s, &id, &e, Some(&c)), GateDecision::Allow(_)));
+        assert!(matches!(
+            run(&s, &id, &e, Some(&c)),
+            GateDecision::RequireApproval(_)
+        ));
+    }
+
+    #[test]
+    fn cost_bounded_standing_approval_stops_admitting_after_budget() {
+        let (s, id) = setup_with_profile("high", "active", &[], &[], &["payments"]);
+        let agent_id = s.list_agents(None).unwrap()[0].agent_id.clone();
+        s.create_scoped_standing(StandingApprovalCreate {
+            agent_id: &agent_id,
+            match_category: "payments",
+            match_path_glob: None,
+            scope_kind: Some("agent_category"),
+            task_id: None,
+            session_id: None,
+            method_prefix: None,
+            workspace_path_glob: None,
+            expires_at: 9_999_999_999,
+            granted_by: "alice",
+            max_calls: None,
+            max_cost_micros: Some(10_000),
+            note: "one paid call only",
+            tenant_id: "default",
+        })
+        .unwrap();
+        let mut c = cap(&["payments"], &[], RiskLevel::Low);
+        c.cost_class = CostClass::ExternalPaid;
         let e = env("tool.payments.refund", None);
 
         assert!(matches!(run(&s, &id, &e, Some(&c)), GateDecision::Allow(_)));

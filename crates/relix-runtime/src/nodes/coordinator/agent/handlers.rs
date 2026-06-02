@@ -591,6 +591,8 @@ struct StandingCreateJson {
     workspace_path_glob: Option<String>,
     #[serde(default)]
     max_calls: Option<i64>,
+    #[serde(default)]
+    max_cost_micros: Option<i64>,
 }
 
 /// Legacy wire arg:
@@ -626,6 +628,7 @@ pub fn handle_standing_create(store: &AgentStore, ctx: &InvocationCtx) -> Handle
             expires_at: req.expires_at,
             granted_by,
             max_calls: req.max_calls,
+            max_cost_micros: req.max_cost_micros,
             note,
             tenant_id: ctx.tenant_id_or_default(),
         }) {
@@ -686,7 +689,7 @@ pub fn handle_standing_list(store: &AgentStore, ctx: &InvocationCtx) -> HandlerO
             let mut out = String::new();
             for r in &rows {
                 out.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                     r.standing_id,
                     r.match_category,
                     r.match_path_glob.as_deref().unwrap_or(""),
@@ -699,6 +702,8 @@ pub fn handle_standing_list(store: &AgentStore, ctx: &InvocationCtx) -> HandlerO
                     r.granted_by,
                     r.max_calls.map(|n| n.to_string()).unwrap_or_default(),
                     r.calls_used,
+                    r.max_cost_micros.map(|n| n.to_string()).unwrap_or_default(),
+                    r.cost_used_micros,
                     sanitize(&r.note)
                 ));
             }

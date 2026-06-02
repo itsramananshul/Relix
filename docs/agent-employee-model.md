@@ -247,14 +247,17 @@ Standing approvals let an operator pre-authorise an
 agent + category pair for a bounded window. The gate's
 approval check consults active standing approvals first; a
 match admits the call without creating an approval request
-and without notifying the operator.
+and without notifying the operator. A standing approval can
+also be bounded by call count (`max_calls`) and estimated spend
+(`max_cost_micros`); both counters are consumed atomically by
+the admission gate.
 
 ```bash
 # Grant a 24-hour standing approval for payments
 curl -X POST localhost:9100/v1/agents/<agent_id>/standing-approvals \
     -H 'authorization: Bearer <bridge-token>' \
     -H 'content-type: application/json' \
-    -d '{"match_category":"payments","expires_at": 1717200000}'
+    -d '{"category":"payments","expires_at":1717200000,"max_calls":20,"max_cost_micros":200000}'
 ```
 
 ```bash
@@ -269,8 +272,10 @@ Standing approvals match by **category**, not method. An
 operator who grants `match_category="browser"` admits every
 capability whose `categories` include `browser` for that
 agent. Expiry is operator-controlled; `expires_at` is unix
-seconds. Revocation is a hard delete on the row — the next
-gate fire falls through to the standard approval flow.
+seconds. Cost budgeting is an admission-time estimate based on
+the capability cost class, not a post-hoc provider invoice.
+Revocation is a hard delete on the row; the next gate fire
+falls through to the standard approval flow.
 
 ---
 

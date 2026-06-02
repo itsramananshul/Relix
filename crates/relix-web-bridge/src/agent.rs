@@ -423,6 +423,8 @@ pub struct StandingRow {
     pub granted_by: String,
     pub max_calls: Option<i64>,
     pub calls_used: i64,
+    pub max_cost_micros: Option<i64>,
+    pub cost_used_micros: i64,
     pub note: String,
 }
 
@@ -454,6 +456,8 @@ pub struct StandingCreateRequest {
     pub workspace_path_glob: Option<String>,
     #[serde(default)]
     pub max_calls: Option<i64>,
+    #[serde(default)]
+    pub max_cost_micros: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -477,6 +481,8 @@ struct StandingCreateForward<'a> {
     workspace_path_glob: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_calls: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_cost_micros: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -514,6 +520,9 @@ pub async fn create_standing(
     if req.max_calls.is_some_and(|n| n <= 0) {
         return Err(bad("max_calls must be positive when provided".into()));
     }
+    if req.max_cost_micros.is_some_and(|n| n <= 0) {
+        return Err(bad("max_cost_micros must be positive when provided".into()));
+    }
     let granted_by = req.granted_by.unwrap_or_else(|| "operator".to_string());
     let note = req.note.unwrap_or_default();
     let forward = StandingCreateForward {
@@ -529,6 +538,7 @@ pub async fn create_standing(
         method_prefix: req.method_prefix.as_deref(),
         workspace_path_glob: req.workspace_path_glob.as_deref(),
         max_calls: req.max_calls,
+        max_cost_micros: req.max_cost_micros,
     };
     let arg = serde_json::to_vec(&forward).map_err(|e| {
         (
@@ -657,7 +667,7 @@ pub fn parse_standing_body(body: &str) -> Vec<StandingRow> {
     body.lines()
         .filter(|line| !line.starts_with("count=") && !line.trim().is_empty())
         .filter_map(|line| {
-            let cols: Vec<&str> = line.splitn(13, '\t').collect();
+            let cols: Vec<&str> = line.splitn(15, '\t').collect();
             if cols.len() == 6 {
                 return Some(StandingRow {
                     standing_id: cols[0].into(),
@@ -672,6 +682,8 @@ pub fn parse_standing_body(body: &str) -> Vec<StandingRow> {
                     granted_by: cols[4].into(),
                     max_calls: None,
                     calls_used: 0,
+                    max_cost_micros: None,
+                    cost_used_micros: 0,
                     note: cols[5].into(),
                 });
             }
@@ -689,10 +701,31 @@ pub fn parse_standing_body(body: &str) -> Vec<StandingRow> {
                     granted_by: cols[9].into(),
                     max_calls: None,
                     calls_used: 0,
+                    max_cost_micros: None,
+                    cost_used_micros: 0,
                     note: cols[10].into(),
                 });
             }
-            if cols.len() != 13 {
+            if cols.len() == 13 {
+                return Some(StandingRow {
+                    standing_id: cols[0].into(),
+                    match_category: cols[1].into(),
+                    match_path_glob: opt_string(cols[2]),
+                    scope_kind: cols[3].into(),
+                    task_id: opt_string(cols[4]),
+                    session_id: opt_string(cols[5]),
+                    method_prefix: opt_string(cols[6]),
+                    workspace_path_glob: opt_string(cols[7]),
+                    expires_at: cols[8].parse().ok()?,
+                    granted_by: cols[9].into(),
+                    max_calls: cols[10].parse().ok(),
+                    calls_used: cols[11].parse().ok()?,
+                    max_cost_micros: None,
+                    cost_used_micros: 0,
+                    note: cols[12].into(),
+                });
+            }
+            if cols.len() != 15 {
                 return None;
             }
             Some(StandingRow {
@@ -708,7 +741,9 @@ pub fn parse_standing_body(body: &str) -> Vec<StandingRow> {
                 granted_by: cols[9].into(),
                 max_calls: cols[10].parse().ok(),
                 calls_used: cols[11].parse().ok()?,
-                note: cols[12].into(),
+                max_cost_micros: cols[12].parse().ok(),
+                cost_used_micros: cols[13].parse().ok()?,
+                note: cols[14].into(),
             })
         })
         .collect()
@@ -1001,6 +1036,18 @@ mod tests {
         assert_eq!(v[0].scope_kind, "method_prefix");
         assert_eq!(v[0].method_prefix.as_deref(), Some("tool.web_read"));
         assert_eq!(v[0].expires_at, 9999);
+    }
+
+    #[test]
+    fn parse_budgeted_standing_returns_call_and_cost_bounds() {
+        let body = "std-1\tpayments\t\tagent_category\t\t\t\t\t9999\talice\t2\t1\t20000\t10000\tone paid call\ncount=1\n";
+        let v = parse_standing_body(body);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].max_calls, Some(2));
+        assert_eq!(v[0].calls_used, 1);
+        assert_eq!(v[0].max_cost_micros, Some(20_000));
+        assert_eq!(v[0].cost_used_micros, 10_000);
+        assert_eq!(v[0].note, "one paid call");
     }
 
     #[test]
