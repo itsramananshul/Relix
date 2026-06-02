@@ -244,7 +244,12 @@ Unify scattered rings/logs/provenance into one durable activity ledger:
 - method/action: implemented as `action`; method remains optional
 - decision: implemented
 - cost: implemented for idempotent `/v1/metrics/cost` aggregate
-  observations; per-run/per-call spend producers are still missing
+  observations. Per-run/per-call spend producers remain coordinator-side
+  work: the bridge chat/OpenAI/WS execution paths do not observe token
+  usage or provider cost (the OpenAI shim deliberately omits usage rather
+  than report zeros), so honest per-run spend rows must be emitted by the
+  coordinator/provider that actually meters the call, not synthesized at
+  the bridge
 - approval id: implemented for REST/dashboard and channel approval decisions;
   standing approval grants/revocations are recorded as approval-control tool
   activity
