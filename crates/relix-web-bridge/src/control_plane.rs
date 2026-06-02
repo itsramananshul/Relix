@@ -240,7 +240,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/logs/stream",
                 "/v1/provenance/recent",
             ],
-            gap: "Durable activity JSONL now captures workspace, intervention, approval, standing-approval, budget-reset, identity-token/research, belief-reset, policy-denial, cost-observation, planning, execution rollback, memory-write/manual-curation, knowledge-transfer, MCP, screen, browser-capture, plugin management, outbound email, and agent-message events; model and dispatch producers still need the same ledger path.",
+            gap: "Durable activity JSONL now captures workspace, intervention, approval, standing-approval, budget-reset, identity-token/research, belief-reset, confidence-reset, policy-denial, cost-observation, planning, execution rollback, memory-write/manual-curation, knowledge-transfer, MCP, screen, browser-capture, plugin management, outbound email, and agent-message events; model and dispatch producers still need the same ledger path.",
         },
         SpineSurface {
             id: "memory",

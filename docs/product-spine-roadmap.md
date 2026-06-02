@@ -129,6 +129,10 @@ Current progress:
   stamps `task_id` into the mesh dispatch envelope, records durable governance
   activity, appends best-effort task events for bound calls, and returns scope
   metadata for object responses
+- confidence reset (`POST /v1/confidence/reset`) accepts optional
+  `task_id`/`run_id`, stamps `task_id` into the mesh dispatch envelope, records
+  durable governance activity, appends best-effort task events for bound calls,
+  and returns scope metadata for object responses
 - identity mutations (`POST /v1/identity/tokens`,
   `POST /v1/identity/tokens/revoke`, and `POST /v1/identity/research`) accept
   optional `task_id`/`run_id`, stamp `task_id` into mesh dispatch envelopes,
@@ -240,6 +244,7 @@ Unify scattered rings/logs/provenance into one durable activity ledger:
   cron-prompt/spec/note payloads
 - timestamp: implemented
 - budget reset: implemented as task-aware governance activity
+- confidence reset: implemented as task-aware governance activity
 
 The operator question "what happened?" should not require scraping five
 different surfaces.
@@ -262,6 +267,7 @@ Current producers:
 - operator intervention audit rows
 - approval decisions from the dashboard/API and channel callbacks
 - budget reset calls from `/v1/budget/reset`
+- confidence reset calls from `/v1/confidence/reset`
 - identity token issue/revoke and research-backed identity calls from
   `/v1/identity`
 - belief reset calls from `/v1/belief/{session_id}`
