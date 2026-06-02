@@ -39,7 +39,8 @@ const SDK_USER_AGENT = "relix-typescript-sdk/0.1.0";
  * Coerce an arbitrary unknown-shaped value into a `ChatResponse`.
  *
  * The bridge body is
- * `{ "reply": "...", "flow_id": "...", "trace_id": "...", "flow_log": "...", "task_id"?: "..." }`;
+ * `{ "reply": "...", "flow_id": "...", "trace_id": "...", "flow_log": "...",
+ *    "task_id"?: "...", "workspace_lease_id"?: "...", "workspace_path"?: "..." }`;
  * we normalise to camelCase + alias `reply` → `text` for parity with
  * the OpenAI shim's `choices[0].message.content`. Unknown extras
  * pass through verbatim so a future bridge addition does not break
@@ -68,9 +69,26 @@ function parseChatResponse(body: unknown): ChatResponse {
     traceId: typeof body["trace_id"] === "string" ? (body["trace_id"] as string) : "",
     flowLog: typeof body["flow_log"] === "string" ? (body["flow_log"] as string) : "",
     taskId: typeof body["task_id"] === "string" ? (body["task_id"] as string) : undefined,
+    workspaceLeaseId:
+      typeof body["workspace_lease_id"] === "string"
+        ? (body["workspace_lease_id"] as string)
+        : undefined,
+    workspacePath:
+      typeof body["workspace_path"] === "string" ? (body["workspace_path"] as string) : undefined,
     model: typeof body["model"] === "string" ? (body["model"] as string) : undefined,
     usage,
-    ...stripKeys(body, ["reply", "text", "flow_id", "trace_id", "flow_log", "task_id", "model", "usage"]),
+    ...stripKeys(body, [
+      "reply",
+      "text",
+      "flow_id",
+      "trace_id",
+      "flow_log",
+      "task_id",
+      "workspace_lease_id",
+      "workspace_path",
+      "model",
+      "usage",
+    ]),
   };
 }
 
@@ -111,6 +129,10 @@ function parseStreamMessage(msg: EventSourceMessage): StreamChunk | null {
     flowId: typeof o["flow_id"] === "string" ? (o["flow_id"] as string) : undefined,
     traceId: typeof o["trace_id"] === "string" ? (o["trace_id"] as string) : undefined,
     flowLog: typeof o["flow_log"] === "string" ? (o["flow_log"] as string) : undefined,
+    taskId: typeof o["task_id"] === "string" ? (o["task_id"] as string) : undefined,
+    workspaceLeaseId:
+      typeof o["workspace_lease_id"] === "string" ? (o["workspace_lease_id"] as string) : undefined,
+    workspacePath: typeof o["workspace_path"] === "string" ? (o["workspace_path"] as string) : undefined,
   };
 }
 
@@ -394,6 +416,9 @@ export class RelixClient {
       if (input.agent) {
         body.agent = input.agent;
       }
+      if (input.workspaceLeaseId) {
+        body.workspace_lease_id = input.workspaceLeaseId;
+      }
       const data = await doJsonRequest(this, "POST", "/chat", body);
       return parseChatResponse(data);
     });
@@ -416,6 +441,9 @@ export class RelixClient {
     };
     if (input.agent) {
       reqBody.agent = input.agent;
+    }
+    if (input.workspaceLeaseId) {
+      reqBody.workspace_lease_id = input.workspaceLeaseId;
     }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);

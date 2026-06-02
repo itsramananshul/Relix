@@ -39,10 +39,16 @@ describe("RelixClient.chat", () => {
         trace_id: "t1",
         flow_log: "/tmp/log",
         task_id: "task-1",
+        workspace_lease_id: "lease-1",
+        workspace_path: "/work/acme",
       }),
     );
     const client = makeClient(mock);
-    const res = await client.chat({ sessionId: "u1", message: "hello" });
+    const res = await client.chat({
+      sessionId: "u1",
+      message: "hello",
+      workspaceLeaseId: "lease-1",
+    });
     if (!res.ok) {
       throw new Error(`expected ok=true: ${res.error.message}`);
     }
@@ -50,6 +56,9 @@ describe("RelixClient.chat", () => {
     expect(res.data.flowId).toBe("f1");
     expect(res.data.traceId).toBe("t1");
     expect(res.data.taskId).toBe("task-1");
+    expect(res.data.workspaceLeaseId).toBe("lease-1");
+    expect(res.data.workspacePath).toBe("/work/acme");
+    expect(JSON.parse(mock.lastCall().body as string).workspace_lease_id).toBe("lease-1");
   });
 
   it("sends X-Relix-Tenant and Authorization headers", async () => {
@@ -137,6 +146,9 @@ describe("RelixClient.chatStream", () => {
     expect(done).toHaveLength(1);
     expect(done[0]?.flowId).toBe("f1");
     expect(done[0]?.traceId).toBe("t1");
+    expect(done[0]?.taskId).toBe("task-1");
+    expect(done[0]?.workspaceLeaseId).toBe("lease-1");
+    expect(done[0]?.workspacePath).toBe("/work/acme");
   });
 
   it("throws RelixAuthError when the stream endpoint returns 401", async () => {

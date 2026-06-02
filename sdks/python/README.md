@@ -48,8 +48,14 @@ Sync, async, and streaming variants share the same `session_id` / `message` shap
 
 ```python
 # One-shot
-resp = client.chat(session_id="user-123", message="hi", agent="coordinator")
-print(resp.text, resp.flow_id, resp.trace_id)
+resp = client.chat(
+    session_id="user-123",
+    message="hi",
+    agent="coordinator",
+    workspace_lease_id="wsl_123",  # optional execution workspace binding
+)
+print(resp.text, resp.flow_id, resp.trace_id, resp.task_id)
+print(resp.workspace_lease_id, resp.workspace_path)
 
 # Async
 resp = await client.achat(session_id="user-123", message="hi")
@@ -65,7 +71,7 @@ async for chunk in client.achat_stream(session_id="user-123", message="hello"):
         print(chunk.text, end="", flush=True)
 ```
 
-The terminal frame on every stream has `chunk.done == True` and carries `flow_id` / `trace_id` / `flow_log` for the finalised call.
+The terminal frame on every stream has `chunk.done == True` and carries `flow_id` / `trace_id` / `flow_log` plus the final `task_id`, `workspace_lease_id`, and `workspace_path` when the bridge created or resolved those bindings.
 
 ## Memory
 

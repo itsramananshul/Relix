@@ -33,7 +33,9 @@ const reply = await client.chat({
   sessionId: "user-123",
   message: "What do you know about me?",
 });
-console.log(reply.text);
+if (reply.ok) {
+  console.log(reply.data.text, reply.data.taskId);
+}
 ```
 
 ## Chat
@@ -44,8 +46,12 @@ const resp = await client.chat({
   sessionId: "user-123",
   message: "hi",
   agent: "coordinator",
+  workspaceLeaseId: "wsl_123", // optional execution workspace binding
 });
-console.log(resp.text, resp.flowId, resp.traceId);
+if (resp.ok) {
+  console.log(resp.data.text, resp.data.flowId, resp.data.traceId);
+  console.log(resp.data.taskId, resp.data.workspaceLeaseId, resp.data.workspacePath);
+}
 
 // Streaming
 for await (const chunk of client.chatStream({
@@ -58,7 +64,7 @@ for await (const chunk of client.chatStream({
 }
 ```
 
-The terminal frame has `chunk.done === true` and carries `flowId` / `traceId` / `flowLog`.
+The terminal frame has `chunk.done === true` and carries `flowId` / `traceId` / `flowLog` plus `taskId`, `workspaceLeaseId`, and `workspacePath` when the bridge created or resolved those bindings.
 
 ## Memory
 

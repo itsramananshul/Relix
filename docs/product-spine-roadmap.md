@@ -156,6 +156,9 @@ Current progress:
   accepts optional `task_id`/`run_id`, stamps `task_id` into the mesh dispatch
   envelope, records durable activity, appends best-effort task events for bound
   calls, and returns scope metadata for object responses
+- Rust/Python/TypeScript SDK chat responses surface task and workspace binding
+  fields; Python/TypeScript callers can also pass workspace lease ids into chat
+  and streaming chat so SDK users can bind work to the same execution context
 - standalone CLI flow runs remain unbound unless the caller explicitly grows a
   task binding path
 
@@ -168,7 +171,6 @@ Remaining launch work:
 - attach run ids to the same execution context; bridge chat/OpenAI/WS paths
   now accept a workspace lease id and stamp the resolved workspace path into
   dispatch envelopes
-- expose the binding clearly in dashboard and SDK responses
 
 ## Phase 3: Scoped Approvals
 

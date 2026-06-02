@@ -124,6 +124,8 @@ export interface ChatInput {
   message: string;
   /** Optional agent alias forwarded as a hint to the bridge flow. */
   agent?: string;
+  /** Existing execution workspace lease to bind this chat/run to. */
+  workspaceLeaseId?: string;
 }
 
 /** Token + cost accounting returned by the bridge when available. */
@@ -143,6 +145,8 @@ export interface ChatResponse {
   traceId: string;
   flowLog: string;
   taskId?: string;
+  workspaceLeaseId?: string;
+  workspacePath?: string;
   model?: string;
   usage?: ChatUsage;
   /** Forward-compat: extra keys returned by the bridge land here. */
@@ -158,6 +162,9 @@ export interface StreamChunk {
   flowId?: string;
   traceId?: string;
   flowLog?: string;
+  taskId?: string;
+  workspaceLeaseId?: string;
+  workspacePath?: string;
 }
 
 // ---------------------------------------------------------------------
