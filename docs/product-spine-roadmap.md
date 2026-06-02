@@ -349,10 +349,37 @@ Tenant context must be mandatory for tenant-owned data. No handler should
 silently fall back to `None` for memory, agents, tasks, approvals, credentials,
 budget, or audit data in multi-tenant mode.
 
+The bridge resolves every request's tenant from the authenticated
+principal in `tenant_middleware`, which already fails closed in
+multi-tenant mode: a credential with no `[auth.tenant_bindings]` entry
+(or no credential at all) is rejected with HTTP 401 before any handler
+runs. Inside a handler `current_tenant()` is therefore always the
+caller's verified tenant in multi-tenant mode, so the activity-attribution
+`unwrap_or(DEFAULT_TENANT)` fallbacks only ever apply in single-tenant
+mode. The remaining invariant work is the class of handler that reads or
+writes tenant-owned data using a caller-supplied tenant value instead of
+the verified one.
+
 Current progress:
 
 - standing approval list now resolves through the verified invocation tenant
   instead of returning same-agent rows across every tenant
+- the durable activity ledger read (`GET /v1/activity/recent`) now forces
+  its tenant filter to the verified per-request tenant and discards any
+  caller-supplied `tenant_id`, closing the cross-tenant audit read where
+  `?tenant_id=<victim>` (or an omitted filter) exposed another tenant's
+  ledger
+- identity-token issue (`POST /v1/identity/tokens`) reconciles the optional
+  body `tenant_id` override against the verified tenant: in multi-tenant
+  mode the verified tenant is forced and a disagreeing claim is rejected
+  with HTTP 403, so a caller cannot mint a session token bound to another
+  tenant; single-tenant mode still allows the override for seeding
+
+Known out-of-scope for the silent-fallback invariant: the administrative
+enumeration surfaces (`GET /v1/audit/tenants/:tenant_id` and
+`GET /v1/policy/tenants/:tenant_id`) are intentionally cross-tenant
+operator-console proxies. They need an admin/trusted-origin access gate
+rather than per-tenant scoping; that is a separate auth-model change.
 
 ## Phase 8: Setup That Does Not Waste The User's Life
 
