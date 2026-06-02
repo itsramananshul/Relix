@@ -112,6 +112,7 @@ mod confidence;
 mod confidence_mini_mesh_test;
 mod config;
 mod config_api;
+mod control_plane;
 mod credentials;
 mod cron;
 mod dashboard;
@@ -198,6 +199,7 @@ mod validate;
 mod workflows;
 #[cfg(test)]
 mod workflows_mini_mesh_test;
+mod workspaces;
 mod ws;
 mod yaml_validate;
 
@@ -448,6 +450,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/models", get(openai::models))
         .route("/v1/info", get(openai::info))
         .route("/v1/schema", get(schema::schema))
+        .route("/v1/control-plane/spine", get(control_plane::spine))
+        .route("/v1/workspaces", get(workspaces::list))
+        .route("/v1/workspaces", post(workspaces::create))
+        .route("/v1/workspaces/{lease_id}", get(workspaces::get))
+        .route(
+            "/v1/workspaces/{lease_id}/release",
+            post(workspaces::release),
+        )
         .route("/v1/sessions/export", get(export::export))
         .route("/v1/chat/completions", post(openai::chat_completions))
         // Task-native read API (Track 2). Bridge stays translation-only:

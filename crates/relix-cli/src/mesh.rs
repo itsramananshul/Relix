@@ -498,6 +498,13 @@ fn apply_config_env(cmd: &mut Command, cfg: &crate::config::RelixConfig) {
     {
         cmd.env(var, &cfg.provider.api_key);
     }
+    // AI model selection (RELA-45). mesh-up reads RELIX_AI_MODEL and
+    // writes it as the active provider's `default_model`. An empty
+    // value leaves the provider's baked-in default in place, so the
+    // OpenRouter free-model fallback still applies to a fresh setup.
+    if !cfg.provider.model.is_empty() {
+        cmd.env("RELIX_AI_MODEL", &cfg.provider.model);
+    }
     // Channel secrets. mesh-up only emits the channel TOML when the
     // matching `RELIX_*` flag is set (handled in build_boot_command);
     // here we just supply the tokens it will reference.
@@ -657,5 +664,34 @@ mod tests {
         assert_eq!(human_bytes(2_500_000), "2.4 MB");
         assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GB");
         assert_eq!(human_bytes(2_500_000_000), "2.3 GB");
+    }
+
+    #[test]
+    fn apply_config_env_forwards_model_as_relix_ai_model() {
+        use std::ffi::OsStr;
+        let mut cfg = crate::config::RelixConfig::default();
+        cfg.provider.model = "openai/gpt-oss-120b:free".to_string();
+        let mut cmd = Command::new("noop");
+        apply_config_env(&mut cmd, &cfg);
+        let found = cmd.get_envs().any(|(k, v)| {
+            k == OsStr::new("RELIX_AI_MODEL") && v == Some(OsStr::new("openai/gpt-oss-120b:free"))
+        });
+        assert!(found, "expected RELIX_AI_MODEL to be forwarded to mesh-up");
+    }
+
+    #[test]
+    fn apply_config_env_omits_model_when_empty() {
+        use std::ffi::OsStr;
+        let cfg = crate::config::RelixConfig::default();
+        let mut cmd = Command::new("noop");
+        apply_config_env(&mut cmd, &cfg);
+        let present = cmd
+            .get_envs()
+            .any(|(k, _)| k == OsStr::new("RELIX_AI_MODEL"));
+        assert!(
+            !present,
+            "RELIX_AI_MODEL must stay unset when no model is configured \
+             so the provider's baked-in default (free for OpenRouter) wins"
+        );
     }
 }

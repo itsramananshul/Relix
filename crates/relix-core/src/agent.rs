@@ -9,10 +9,10 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
-use serde::{Deserialize, Serialize};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -195,8 +195,7 @@ pub trait AgentRegistry: Send + Sync {
     /// Register a new agent; returns the newly created [`AgentRecord`].
     ///
     /// Fails with [`AgentError::AlreadyExists`] if the id is already taken.
-    fn create(&self, agent_id: AgentId, name: &str, role: &str)
-        -> Result<AgentRecord, AgentError>;
+    fn create(&self, agent_id: AgentId, name: &str, role: &str) -> Result<AgentRecord, AgentError>;
 
     /// Look up an agent by id.
     ///
@@ -307,9 +306,7 @@ impl TokenIssuer for HmacTokenIssuer {
             return Err(AgentError::InvalidToken);
         }
 
-        let expires_at: i64 = raw_expires
-            .parse()
-            .map_err(|_| AgentError::InvalidToken)?;
+        let expires_at: i64 = raw_expires.parse().map_err(|_| AgentError::InvalidToken)?;
 
         // Verify HMAC in constant time *before* returning any structural error
         // that would distinguish a bad-sig from a well-formed-but-stale token.
@@ -358,10 +355,7 @@ mod tests {
 
     #[test]
     fn agent_id_rejects_empty() {
-        assert!(matches!(
-            AgentId::new(""),
-            Err(AgentError::InvalidId(_))
-        ));
+        assert!(matches!(AgentId::new(""), Err(AgentError::InvalidId(_))));
     }
 
     #[test]
@@ -405,7 +399,10 @@ mod tests {
             updated_at: 0,
         };
         assert!(rec.is_active());
-        let rec2 = AgentRecord { status: AgentStatus::Revoked, ..rec };
+        let rec2 = AgentRecord {
+            status: AgentStatus::Revoked,
+            ..rec
+        };
         assert!(!rec2.is_active());
     }
 
@@ -511,7 +508,9 @@ mod tests {
 
     #[test]
     fn non_numeric_expiry_rejected() {
-        let err = issuer().verify("agt_abc|not-a-number|deadbeef").unwrap_err();
+        let err = issuer()
+            .verify("agt_abc|not-a-number|deadbeef")
+            .unwrap_err();
         assert!(matches!(err, AgentError::InvalidToken));
     }
 }

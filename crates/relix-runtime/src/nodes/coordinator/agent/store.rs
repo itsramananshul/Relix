@@ -236,10 +236,43 @@ pub struct StandingApproval {
     pub agent_id: String,
     pub match_category: String,
     pub match_path_glob: Option<String>,
+    pub scope_kind: String,
+    pub task_id: Option<String>,
+    pub session_id: Option<String>,
+    pub method_prefix: Option<String>,
+    pub workspace_path_glob: Option<String>,
     pub expires_at: i64,
     pub granted_by: String,
     pub note: String,
     pub created_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandingApprovalCreate<'a> {
+    pub agent_id: &'a str,
+    pub match_category: &'a str,
+    pub match_path_glob: Option<&'a str>,
+    pub scope_kind: Option<&'a str>,
+    pub task_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub method_prefix: Option<&'a str>,
+    pub workspace_path_glob: Option<&'a str>,
+    pub expires_at: i64,
+    pub granted_by: &'a str,
+    pub note: &'a str,
+    pub tenant_id: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandingApprovalMatch<'a> {
+    pub agent_id: &'a str,
+    pub category: &'a str,
+    pub method: &'a str,
+    pub task_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub workspace_path: Option<&'a str>,
+    pub tenant_id: Option<&'a str>,
+    pub now: i64,
 }
 
 /// NOT-DONE 2: one row in the `startup_tasks` ledger. Tracks
@@ -1245,15 +1278,43 @@ impl AgentStore {
         // GROUP 6: caller's VERIFIED tenant (from InvocationCtx).
         tenant_id: &str,
     ) -> Result<String, AgentStoreError> {
-        if agent_id.trim().is_empty() || match_category.trim().is_empty() {
+        self.create_scoped_standing(StandingApprovalCreate {
+            agent_id,
+            match_category,
+            match_path_glob,
+            scope_kind: None,
+            task_id: None,
+            session_id: None,
+            method_prefix: None,
+            workspace_path_glob: None,
+            expires_at,
+            granted_by,
+            note,
+            tenant_id,
+        })
+    }
+
+    pub fn create_scoped_standing(
+        &self,
+        input: StandingApprovalCreate<'_>,
+    ) -> Result<String, AgentStoreError> {
+        if input.agent_id.trim().is_empty() || input.match_category.trim().is_empty() {
             return Err(AgentStoreError::BadInput(
                 "agent_id and match_category required".into(),
             ));
         }
-        let tenant = if tenant_id.trim().is_empty() {
+        let scope_kind = normalize_standing_scope(input.scope_kind);
+        validate_standing_scope(
+            &scope_kind,
+            input.task_id,
+            input.session_id,
+            input.method_prefix,
+            input.match_path_glob.or(input.workspace_path_glob),
+        )?;
+        let tenant = if input.tenant_id.trim().is_empty() {
             "default"
         } else {
-            tenant_id
+            input.tenant_id
         };
         let now = unix_now();
         let standing_id = new_standing_id();
@@ -1261,16 +1322,22 @@ impl AgentStore {
         conn.execute(
             "INSERT INTO standing_approvals (
                  standing_id, agent_id, match_category, match_path_glob,
+                 scope_kind, task_id, session_id, method_prefix, workspace_path_glob,
                  expires_at, granted_by, note, created_at, tenant_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 standing_id,
-                agent_id,
-                match_category,
-                match_path_glob,
-                expires_at,
-                granted_by,
-                note,
+                input.agent_id,
+                input.match_category,
+                input.match_path_glob,
+                scope_kind,
+                input.task_id.and_then(non_empty_opt),
+                input.session_id.and_then(non_empty_opt),
+                input.method_prefix.and_then(non_empty_opt),
+                input.workspace_path_glob.and_then(non_empty_opt),
+                input.expires_at,
+                input.granted_by,
+                input.note,
                 now,
                 tenant,
             ],
@@ -1298,6 +1365,7 @@ impl AgentStore {
         let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
         let mut stmt = conn.prepare(
             "SELECT standing_id, agent_id, match_category, match_path_glob,
+                    scope_kind, task_id, session_id, method_prefix, workspace_path_glob,
                     expires_at, granted_by, note, created_at
              FROM standing_approvals WHERE agent_id = ?1
              ORDER BY created_at DESC",
@@ -1309,10 +1377,15 @@ impl AgentStore {
                     agent_id: r.get(1)?,
                     match_category: r.get(2)?,
                     match_path_glob: r.get(3)?,
-                    expires_at: r.get(4)?,
-                    granted_by: r.get(5)?,
-                    note: r.get(6)?,
-                    created_at: r.get(7)?,
+                    scope_kind: r.get(4)?,
+                    task_id: r.get(5)?,
+                    session_id: r.get(6)?,
+                    method_prefix: r.get(7)?,
+                    workspace_path_glob: r.get(8)?,
+                    expires_at: r.get(9)?,
+                    granted_by: r.get(10)?,
+                    note: r.get(11)?,
+                    created_at: r.get(12)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1328,14 +1401,69 @@ impl AgentStore {
         category: &str,
         now: i64,
     ) -> Result<bool, AgentStoreError> {
+        self.has_active_standing_for(StandingApprovalMatch {
+            agent_id,
+            category,
+            method: "",
+            task_id: None,
+            session_id: None,
+            workspace_path: None,
+            tenant_id: None,
+            now,
+        })
+    }
+
+    pub fn has_active_standing_for(
+        &self,
+        input: StandingApprovalMatch<'_>,
+    ) -> Result<bool, AgentStoreError> {
         let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM standing_approvals
-             WHERE agent_id = ?1 AND match_category = ?2 AND expires_at > ?3",
-            params![agent_id, category, now],
-            |r| r.get(0),
+        let tenant = input.tenant_id.and_then(non_empty_opt).unwrap_or("default");
+        let mut stmt = conn.prepare(
+            "SELECT standing_id, match_path_glob, scope_kind, task_id, session_id,
+                    method_prefix, workspace_path_glob
+             FROM standing_approvals
+             WHERE tenant_id = ?1 AND agent_id = ?2 AND match_category = ?3 AND expires_at > ?4",
         )?;
-        Ok(n > 0)
+        let rows = stmt
+            .query_map(
+                params![tenant, input.agent_id, input.category, input.now],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().any(
+            |(
+                _,
+                path_glob,
+                scope_kind,
+                task_id,
+                session_id,
+                method_prefix,
+                workspace_path_glob,
+            )| {
+                standing_scope_matches(
+                    &scope_kind,
+                    StandingScopeRow {
+                        path_glob: path_glob.as_deref(),
+                        task_id: task_id.as_deref(),
+                        session_id: session_id.as_deref(),
+                        method_prefix: method_prefix.as_deref(),
+                        workspace_path_glob: workspace_path_glob.as_deref(),
+                    },
+                    &input,
+                )
+            },
+        ))
     }
 
     pub fn revoke_standing(&self, standing_id: &str) -> Result<(), AgentStoreError> {
@@ -1426,6 +1554,11 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              agent_id        TEXT NOT NULL,
              match_category  TEXT NOT NULL,
              match_path_glob TEXT,
+             scope_kind      TEXT NOT NULL DEFAULT 'agent_category',
+             task_id         TEXT,
+             session_id      TEXT,
+             method_prefix   TEXT,
+             workspace_path_glob TEXT,
              expires_at      INTEGER NOT NULL,
              granted_by      TEXT NOT NULL,
              note            TEXT NOT NULL DEFAULT '',
@@ -1497,10 +1630,21 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     for tbl in ["agent_profiles", "approval_requests", "standing_approvals"] {
         ensure_column(conn, tbl, "tenant_id", "TEXT NOT NULL DEFAULT 'default'")?;
     }
+    ensure_column(
+        conn,
+        "standing_approvals",
+        "scope_kind",
+        "TEXT NOT NULL DEFAULT 'agent_category'",
+    )?;
+    ensure_column(conn, "standing_approvals", "task_id", "TEXT")?;
+    ensure_column(conn, "standing_approvals", "session_id", "TEXT")?;
+    ensure_column(conn, "standing_approvals", "method_prefix", "TEXT")?;
+    ensure_column(conn, "standing_approvals", "workspace_path_glob", "TEXT")?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS agent_profiles_tenant ON agent_profiles(tenant_id);\
          CREATE INDEX IF NOT EXISTS approval_requests_tenant ON approval_requests(tenant_id);\
-         CREATE INDEX IF NOT EXISTS standing_approvals_tenant ON standing_approvals(tenant_id);",
+         CREATE INDEX IF NOT EXISTS standing_approvals_tenant ON standing_approvals(tenant_id);\
+         CREATE INDEX IF NOT EXISTS standing_approvals_scope ON standing_approvals(tenant_id, agent_id, match_category, scope_kind, expires_at);",
     )?;
     Ok(())
 }
@@ -1576,6 +1720,107 @@ fn ensure_column(
     let sql_alter = format!("ALTER TABLE {table} ADD COLUMN {column} {column_decl}");
     conn.execute(&sql_alter, [])?;
     Ok(())
+}
+
+fn non_empty_opt(s: &str) -> Option<&str> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn normalize_standing_scope(scope_kind: Option<&str>) -> String {
+    match scope_kind.and_then(non_empty_opt) {
+        Some("task") => "task".into(),
+        Some("session") => "session".into(),
+        Some("method_prefix") | Some("capability_family") => "method_prefix".into(),
+        Some("workspace_path") => "workspace_path".into(),
+        Some("agent_category") | None => "agent_category".into(),
+        Some(other) => other.to_string(),
+    }
+}
+
+fn validate_standing_scope(
+    scope_kind: &str,
+    task_id: Option<&str>,
+    session_id: Option<&str>,
+    method_prefix: Option<&str>,
+    path_glob: Option<&str>,
+) -> Result<(), AgentStoreError> {
+    match scope_kind {
+        "agent_category" => Ok(()),
+        "task" if task_id.and_then(non_empty_opt).is_some() => Ok(()),
+        "session" if session_id.and_then(non_empty_opt).is_some() => Ok(()),
+        "method_prefix" if method_prefix.and_then(non_empty_opt).is_some() => Ok(()),
+        "workspace_path" if path_glob.and_then(non_empty_opt).is_some() => Ok(()),
+        "task" => Err(AgentStoreError::BadInput(
+            "task scoped standing approval requires task_id".into(),
+        )),
+        "session" => Err(AgentStoreError::BadInput(
+            "session scoped standing approval requires session_id".into(),
+        )),
+        "method_prefix" => Err(AgentStoreError::BadInput(
+            "method_prefix scoped standing approval requires method_prefix".into(),
+        )),
+        "workspace_path" => Err(AgentStoreError::BadInput(
+            "workspace_path scoped standing approval requires path_glob or workspace_path_glob"
+                .into(),
+        )),
+        other => Err(AgentStoreError::BadInput(format!(
+            "unsupported standing approval scope_kind: {other}"
+        ))),
+    }
+}
+
+struct StandingScopeRow<'a> {
+    path_glob: Option<&'a str>,
+    task_id: Option<&'a str>,
+    session_id: Option<&'a str>,
+    method_prefix: Option<&'a str>,
+    workspace_path_glob: Option<&'a str>,
+}
+
+fn standing_scope_matches(
+    scope_kind: &str,
+    row: StandingScopeRow<'_>,
+    input: &StandingApprovalMatch<'_>,
+) -> bool {
+    match scope_kind {
+        "agent_category" => workspace_matches(row.path_glob, input.workspace_path),
+        "task" => {
+            row.task_id == input.task_id && workspace_matches(row.path_glob, input.workspace_path)
+        }
+        "session" => {
+            row.session_id == input.session_id
+                && workspace_matches(row.path_glob, input.workspace_path)
+        }
+        "method_prefix" => {
+            row.method_prefix
+                .is_some_and(|prefix| input.method.starts_with(prefix))
+                && workspace_matches(row.path_glob, input.workspace_path)
+        }
+        "workspace_path" => workspace_matches(
+            row.workspace_path_glob.or(row.path_glob),
+            input.workspace_path,
+        ),
+        _ => false,
+    }
+}
+
+fn workspace_matches(pattern: Option<&str>, workspace_path: Option<&str>) -> bool {
+    let Some(pattern) = pattern.and_then(non_empty_opt) else {
+        return true;
+    };
+    let Some(path) = workspace_path.and_then(non_empty_opt) else {
+        return false;
+    };
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        path.starts_with(prefix)
+    } else {
+        path == pattern
+    }
 }
 
 fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
@@ -2394,5 +2639,99 @@ mod tests {
         .unwrap();
         let v = s.list_standing("agt-1").unwrap();
         assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn task_scoped_standing_only_matches_the_bound_task() {
+        let s = store();
+        s.create_scoped_standing(StandingApprovalCreate {
+            agent_id: "agt-1",
+            match_category: "fs",
+            match_path_glob: None,
+            scope_kind: Some("task"),
+            task_id: Some("task-123"),
+            session_id: None,
+            method_prefix: None,
+            workspace_path_glob: None,
+            expires_at: unix_now() + 60,
+            granted_by: "alice",
+            note: "single task",
+            tenant_id: "default",
+        })
+        .unwrap();
+
+        assert!(
+            s.has_active_standing_for(StandingApprovalMatch {
+                agent_id: "agt-1",
+                category: "fs",
+                method: "tool.fs.read",
+                task_id: Some("task-123"),
+                session_id: None,
+                workspace_path: None,
+                tenant_id: Some("default"),
+                now: unix_now(),
+            })
+            .unwrap()
+        );
+        assert!(
+            !s.has_active_standing_for(StandingApprovalMatch {
+                agent_id: "agt-1",
+                category: "fs",
+                method: "tool.fs.read",
+                task_id: Some("task-999"),
+                session_id: None,
+                workspace_path: None,
+                tenant_id: Some("default"),
+                now: unix_now(),
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn method_prefix_scoped_standing_is_not_a_category_wide_bypass() {
+        let s = store();
+        s.create_scoped_standing(StandingApprovalCreate {
+            agent_id: "agt-1",
+            match_category: "browser",
+            match_path_glob: None,
+            scope_kind: Some("method_prefix"),
+            task_id: None,
+            session_id: None,
+            method_prefix: Some("tool.web_read"),
+            workspace_path_glob: None,
+            expires_at: unix_now() + 60,
+            granted_by: "alice",
+            note: "read-only browsing",
+            tenant_id: "default",
+        })
+        .unwrap();
+
+        assert!(
+            s.has_active_standing_for(StandingApprovalMatch {
+                agent_id: "agt-1",
+                category: "browser",
+                method: "tool.web_read",
+                task_id: None,
+                session_id: None,
+                workspace_path: None,
+                tenant_id: Some("default"),
+                now: unix_now(),
+            })
+            .unwrap()
+        );
+        assert!(
+            !s.has_active_standing_for(StandingApprovalMatch {
+                agent_id: "agt-1",
+                category: "browser",
+                method: "tool.web_submit_form",
+                task_id: None,
+                session_id: None,
+                workspace_path: None,
+                tenant_id: Some("default"),
+                now: unix_now(),
+            })
+            .unwrap()
+        );
     }
 }

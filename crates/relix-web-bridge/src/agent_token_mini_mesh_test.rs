@@ -172,7 +172,10 @@ fn register_caps(dispatch: &mut DispatchBridge) {
     dispatch.register(
         "agent.get",
         Arc::new(FnHandler(|ctx: InvocationCtx| async move {
-            let id = std::str::from_utf8(&ctx.args).unwrap_or("").trim().to_string();
+            let id = std::str::from_utf8(&ctx.args)
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if id == FAKE_AGENT_ID {
                 let body = format!(
                     "agent_id={}|name={}|role=research|title=Junior|department=rd|team=ops\
@@ -212,11 +215,7 @@ fn register_caps(dispatch: &mut DispatchBridge) {
 }
 
 /// Build an `AppState` + `MeshClient` pointed at the fake coordinator.
-async fn build_state(
-    org_root: &SigningKey,
-    addr: Multiaddr,
-    tmpdir: &TempDir,
-) -> AppState {
+async fn build_state(org_root: &SigningKey, addr: Multiaddr, tmpdir: &TempDir) -> AppState {
     let bundle_bytes = mint_bridge_bundle_bytes(org_root, "agent-token-test-bridge");
     let bundle_path = tmpdir.path().join("bridge.bundle");
     std::fs::write(&bundle_path, &bundle_bytes).unwrap();
@@ -435,11 +434,7 @@ async fn post_agents_id_tokens_returns_404_for_unknown_agent() {
     .unwrap()
     .unwrap();
 
-    assert_eq!(
-        resp.status().as_u16(),
-        404,
-        "unknown agent must yield 404"
-    );
+    assert_eq!(resp.status().as_u16(), 404, "unknown agent must yield 404");
     let body: Value = resp.json().await.unwrap();
     assert!(
         body.get("error")

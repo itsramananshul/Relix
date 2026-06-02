@@ -8,10 +8,12 @@
 use std::sync::Arc;
 
 use relix_core::types::{ErrorEnvelope, error_kinds};
+use serde::Deserialize;
 
 use crate::dispatch::{HandlerOutcome, InvocationCtx};
 use crate::nodes::coordinator::agent::store::{
-    AgentStore, AgentStoreError, ApprovalStatus, default_approval_categories,
+    AgentStore, AgentStoreError, ApprovalStatus, StandingApprovalCreate,
+    default_approval_categories,
 };
 
 // ── agent.create ─────────────────────────────────────────
@@ -565,12 +567,70 @@ pub fn handle_approval_decide(
 
 // ── standing approval handlers ──────────────────────────
 
+#[derive(Debug, Deserialize)]
+struct StandingCreateJson {
+    agent_id: String,
+    #[serde(alias = "category")]
+    match_category: String,
+    expires_at: i64,
+    #[serde(default)]
+    granted_by: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default, alias = "path_glob")]
+    match_path_glob: Option<String>,
+    #[serde(default)]
+    scope_kind: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    method_prefix: Option<String>,
+    #[serde(default)]
+    workspace_path_glob: Option<String>,
+}
+
+/// Legacy wire arg:
 /// `agent_id|category|expires_at|granted_by|note|path_glob?`
+///
+/// Scoped wire arg:
+/// JSON object containing `agent_id`, `category`/`match_category`,
+/// `expires_at`, plus optional `scope_kind`, `task_id`,
+/// `session_id`, `method_prefix`, and `workspace_path_glob`.
 pub fn handle_standing_create(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
         Err(e) => return invalid(format!("agent.standing_approval.create utf8: {e}")),
     };
+    if s.trim_start().starts_with('{') {
+        let req: StandingCreateJson = match serde_json::from_str(s) {
+            Ok(req) => req,
+            Err(e) => {
+                return invalid(format!("agent.standing_approval.create json: {e}"));
+            }
+        };
+        let granted_by = req.granted_by.as_deref().unwrap_or("operator");
+        let note = req.note.as_deref().unwrap_or("");
+        return match store.create_scoped_standing(StandingApprovalCreate {
+            agent_id: &req.agent_id,
+            match_category: &req.match_category,
+            match_path_glob: req.match_path_glob.as_deref(),
+            scope_kind: req.scope_kind.as_deref(),
+            task_id: req.task_id.as_deref(),
+            session_id: req.session_id.as_deref(),
+            method_prefix: req.method_prefix.as_deref(),
+            workspace_path_glob: req.workspace_path_glob.as_deref(),
+            expires_at: req.expires_at,
+            granted_by,
+            note,
+            tenant_id: ctx.tenant_id_or_default(),
+        }) {
+            Ok(id) => HandlerOutcome::Ok(format!("{id}\n").into_bytes()),
+            Err(AgentStoreError::BadInput(m)) => invalid(m),
+            Err(e) => internal(format!("agent.standing_approval.create: {e}")),
+        };
+    }
     let parts: Vec<&str> = s.splitn(6, '|').collect();
     if parts.len() < 5 {
         return invalid(
@@ -623,13 +683,18 @@ pub fn handle_standing_list(store: &AgentStore, ctx: &InvocationCtx) -> HandlerO
             let mut out = String::new();
             for r in &rows {
                 out.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                     r.standing_id,
                     r.match_category,
                     r.match_path_glob.as_deref().unwrap_or(""),
+                    r.scope_kind,
+                    r.task_id.as_deref().unwrap_or(""),
+                    r.session_id.as_deref().unwrap_or(""),
+                    r.method_prefix.as_deref().unwrap_or(""),
+                    r.workspace_path_glob.as_deref().unwrap_or(""),
                     r.expires_at,
                     r.granted_by,
-                    sanitize(&r.note),
+                    sanitize(&r.note)
                 ));
             }
             out.push_str(&format!("count={}\n", rows.len()));

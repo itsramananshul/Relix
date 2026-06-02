@@ -29,7 +29,9 @@ use relix_core::capability::CapabilityDescriptor;
 use relix_core::identity::VerifiedIdentity;
 
 use crate::approval::{ApprovalKeySet, ApprovalToken, TokenError};
-use crate::nodes::coordinator::agent::store::{AgentGateView, AgentStore, ApprovalStatus};
+use crate::nodes::coordinator::agent::store::{
+    AgentGateView, AgentStore, ApprovalStatus, StandingApprovalMatch,
+};
 use crate::transport::envelope::RequestEnvelope;
 
 /// What the gate decides about one inbound call.
@@ -507,7 +509,16 @@ fn evaluate_against_view(
                 .cloned()
                 .unwrap_or_default();
             let standing = store
-                .has_active_standing(&view.agent_id, &matched_category, inputs.now)
+                .has_active_standing_for(StandingApprovalMatch {
+                    agent_id: &view.agent_id,
+                    category: &matched_category,
+                    method: &inputs.envelope.method,
+                    task_id: inputs.envelope.task_id.as_deref().and_then(non_empty_str),
+                    session_id: None,
+                    workspace_path: None,
+                    tenant_id: inputs.envelope.tenant_id.as_deref(),
+                    now: inputs.now,
+                })
                 .unwrap_or(false);
             if standing {
                 return GateDecision::Allow(GateAllow {
@@ -591,10 +602,20 @@ fn risk_within_ceiling(level: &str, ceiling: &str) -> bool {
     }
 }
 
+fn non_empty_str(s: &str) -> Option<&str> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::approval::ApprovalSigner;
+    use crate::nodes::coordinator::agent::store::StandingApprovalCreate;
     use relix_core::capability::RiskLevel;
     use relix_core::identity::VerifiedIdentity;
     use relix_core::types::{NodeId, RequestId, Timestamp, TraceId};
@@ -1080,6 +1101,42 @@ mod tests {
     }
 
     // ── SEC PART A — structured approval token ──────────
+
+    #[test]
+    fn task_scoped_standing_approval_does_not_admit_another_task() {
+        let (s, id) = setup_with_profile("high", "active", &[], &[], &["payments"]);
+        let agent_id = s.list_agents(None).unwrap()[0].agent_id.clone();
+        s.create_scoped_standing(StandingApprovalCreate {
+            agent_id: &agent_id,
+            match_category: "payments",
+            match_path_glob: None,
+            scope_kind: Some("task"),
+            task_id: Some("task-approved"),
+            session_id: None,
+            method_prefix: None,
+            workspace_path_glob: None,
+            expires_at: 9_999_999_999,
+            granted_by: "alice",
+            note: "",
+            tenant_id: "default",
+        })
+        .unwrap();
+        let c = cap(&["payments"], &[], RiskLevel::Low);
+
+        let mut approved = env("tool.payments.refund", None);
+        approved.task_id = Some("task-approved".into());
+        assert!(matches!(
+            run(&s, &id, &approved, Some(&c)),
+            GateDecision::Allow(_)
+        ));
+
+        let mut other = env("tool.payments.refund", None);
+        other.task_id = Some("task-other".into());
+        assert!(matches!(
+            run(&s, &id, &other, Some(&c)),
+            GateDecision::RequireApproval(_)
+        ));
+    }
 
     /// Test helper: mint an approved approval + return its
     /// freshly-signed wire token + subject_id bytes used to

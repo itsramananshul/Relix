@@ -46,8 +46,7 @@ pub struct SqliteAgentRegistry {
 impl SqliteAgentRegistry {
     /// Open (or create) a SQLite database at `path` and initialise the schema.
     pub fn open(path: &Path) -> Result<Self, AgentError> {
-        let conn = Connection::open(path)
-            .map_err(|e| AgentError::Storage(e.to_string()))?;
+        let conn = Connection::open(path).map_err(|e| AgentError::Storage(e.to_string()))?;
         let reg = SqliteAgentRegistry {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -57,8 +56,7 @@ impl SqliteAgentRegistry {
 
     /// Open an in-memory database; useful for tests and ephemeral sessions.
     pub fn open_in_memory() -> Result<Self, AgentError> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| AgentError::Storage(e.to_string()))?;
+        let conn = Connection::open_in_memory().map_err(|e| AgentError::Storage(e.to_string()))?;
         let reg = SqliteAgentRegistry {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -114,12 +112,7 @@ fn row_to_record(
 }
 
 impl AgentRegistry for SqliteAgentRegistry {
-    fn create(
-        &self,
-        agent_id: AgentId,
-        name: &str,
-        role: &str,
-    ) -> Result<AgentRecord, AgentError> {
+    fn create(&self, agent_id: AgentId, name: &str, role: &str) -> Result<AgentRecord, AgentError> {
         let now = now_secs()?;
         let conn = self
             .conn
@@ -215,7 +208,9 @@ impl AgentRegistry for SqliteAgentRegistry {
         for row in rows {
             let (id, name, role, status, created_at, updated_at) =
                 row.map_err(|e| AgentError::Storage(e.to_string()))?;
-            records.push(row_to_record(id, name, role, status, created_at, updated_at)?);
+            records.push(row_to_record(
+                id, name, role, status, created_at, updated_at,
+            )?);
         }
         Ok(records)
     }

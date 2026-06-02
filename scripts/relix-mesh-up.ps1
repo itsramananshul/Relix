@@ -360,54 +360,67 @@ rag_min_score      = 0.70
 $providerTail = switch ($Provider) {
     'openai' {
         $b = if ($BaseUrl) { $BaseUrl } else { 'https://api.openai.com/v1' }
+        # RELIX_AI_MODEL (set from config by `relix boot`, or exported
+        # by hand) picks the model; otherwise the provider default stands.
+        $model = if ($env:RELIX_AI_MODEL) { $env:RELIX_AI_MODEL } else { 'gpt-4o-mini' }
 @"
 
 [ai.providers.openai]
 base_url      = "$b"
 api_key_env   = "OPENAI_API_KEY"
-default_model = "gpt-4o-mini"
+default_model = "$model"
 "@
     }
     'openrouter' {
         $b = if ($BaseUrl) { $BaseUrl } else { 'https://openrouter.ai/api/v1' }
+        # Default to a `$0 free model so chat works out of the box without
+        # burning credits; RELIX_AI_MODEL overrides it. See RELA-45.
+        $model = if ($env:RELIX_AI_MODEL) { $env:RELIX_AI_MODEL } else { 'openai/gpt-oss-120b:free' }
 @"
 
 [ai.providers.openrouter]
 base_url      = "$b"
 api_key_env   = "OPENROUTER_API_KEY"
-default_model = "openai/gpt-4o-mini"
+default_model = "$model"
 "@
     }
     'xai' {
         $b = if ($BaseUrl) { $BaseUrl } else { 'https://api.x.ai/v1' }
+        $modelLine = if ($env:RELIX_AI_MODEL) { "default_model = `"$($env:RELIX_AI_MODEL)`"" } else { '' }
 @"
 
 [ai.providers.xai]
 base_url      = "$b"
 api_key_env   = "XAI_API_KEY"
+$modelLine
 "@
     }
     'local' {
         $b = if ($BaseUrl) { $BaseUrl } else { 'http://localhost:11434/v1' }
+        $modelLine = if ($env:RELIX_AI_MODEL) { "default_model = `"$($env:RELIX_AI_MODEL)`"" } else { '' }
 @"
 
 [ai.providers.local]
 base_url      = "$b"
+$modelLine
 "@
     }
     'anthropic' {
+        $model = if ($env:RELIX_AI_MODEL) { $env:RELIX_AI_MODEL } else { 'claude-3-5-sonnet-latest' }
 @"
 
 [ai.providers.anthropic]
 api_key_env   = "ANTHROPIC_API_KEY"
-default_model = "claude-3-5-sonnet-latest"
+default_model = "$model"
 "@
     }
     'gemini' {
+        $modelLine = if ($env:RELIX_AI_MODEL) { "default_model = `"$($env:RELIX_AI_MODEL)`"" } else { '' }
 @"
 
 [ai.providers.gemini]
 api_key_env   = "GEMINI_API_KEY"
+$modelLine
 "@
     }
     default { '' }

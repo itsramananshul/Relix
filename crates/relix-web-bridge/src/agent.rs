@@ -227,20 +227,14 @@ pub async fn issue_agent_token(
             error: format!("agent.get returned an unparseable body: {detail_body:?}"),
         }),
     ))?;
-    let token = try_issue_agent_token(
-        &state,
-        &agent_id,
-        &detail.name,
-        &req.scopes,
-        req.ttl_secs,
-    )
-    .await
-    .ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(ApiError {
-            error: "identity.issue_token capability is not available on this deployment".into(),
-        }),
-    ))?;
+    let token = try_issue_agent_token(&state, &agent_id, &detail.name, &req.scopes, req.ttl_secs)
+        .await
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError {
+                error: "identity.issue_token capability is not available on this deployment".into(),
+            }),
+        ))?;
     Ok(Json(AgentTokenResponse { agent_id, token }))
 }
 
@@ -420,6 +414,11 @@ pub struct StandingRow {
     pub standing_id: String,
     pub match_category: String,
     pub match_path_glob: Option<String>,
+    pub scope_kind: String,
+    pub task_id: Option<String>,
+    pub session_id: Option<String>,
+    pub method_prefix: Option<String>,
+    pub workspace_path_glob: Option<String>,
     pub expires_at: i64,
     pub granted_by: String,
     pub note: String,
@@ -441,6 +440,37 @@ pub struct StandingCreateRequest {
     pub note: Option<String>,
     #[serde(default)]
     pub path_glob: Option<String>,
+    #[serde(default)]
+    pub scope_kind: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub method_prefix: Option<String>,
+    #[serde(default)]
+    pub workspace_path_glob: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct StandingCreateForward<'a> {
+    agent_id: &'a str,
+    category: &'a str,
+    expires_at: i64,
+    granted_by: &'a str,
+    note: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path_glob: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method_prefix: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_path_glob: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -477,18 +507,29 @@ pub async fn create_standing(
     }
     let granted_by = req.granted_by.unwrap_or_else(|| "operator".to_string());
     let note = req.note.unwrap_or_default();
-    let path_glob = req.path_glob.unwrap_or_default();
-    let arg = format!(
-        "{agent_id}|{}|{}|{granted_by}|{note}|{path_glob}",
-        req.category, req.expires_at
-    );
-    let body = call_peer_string(
-        &state,
-        DEFAULT_PEER,
-        "agent.standing_approval.create",
-        arg.as_bytes(),
-    )
-    .await?;
+    let forward = StandingCreateForward {
+        agent_id: &agent_id,
+        category: &req.category,
+        expires_at: req.expires_at,
+        granted_by: &granted_by,
+        note: &note,
+        path_glob: req.path_glob.as_deref(),
+        scope_kind: req.scope_kind.as_deref(),
+        task_id: req.task_id.as_deref(),
+        session_id: req.session_id.as_deref(),
+        method_prefix: req.method_prefix.as_deref(),
+        workspace_path_glob: req.workspace_path_glob.as_deref(),
+    };
+    let arg = serde_json::to_vec(&forward).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("standing approval encode failed: {e}"),
+            }),
+        )
+    })?;
+    let body =
+        call_peer_string(&state, DEFAULT_PEER, "agent.standing_approval.create", &arg).await?;
     Ok(Json(StandingCreateResponse {
         standing_id: body.trim().to_string(),
     }))
@@ -606,24 +647,44 @@ pub fn parse_standing_body(body: &str) -> Vec<StandingRow> {
     body.lines()
         .filter(|line| !line.starts_with("count=") && !line.trim().is_empty())
         .filter_map(|line| {
-            let cols: Vec<&str> = line.splitn(6, '\t').collect();
-            if cols.len() != 6 {
+            let cols: Vec<&str> = line.splitn(11, '\t').collect();
+            if cols.len() == 6 {
+                return Some(StandingRow {
+                    standing_id: cols[0].into(),
+                    match_category: cols[1].into(),
+                    match_path_glob: opt_string(cols[2]),
+                    scope_kind: "agent_category".into(),
+                    task_id: None,
+                    session_id: None,
+                    method_prefix: None,
+                    workspace_path_glob: None,
+                    expires_at: cols[3].parse().ok()?,
+                    granted_by: cols[4].into(),
+                    note: cols[5].into(),
+                });
+            }
+            if cols.len() != 11 {
                 return None;
             }
             Some(StandingRow {
                 standing_id: cols[0].into(),
                 match_category: cols[1].into(),
-                match_path_glob: if cols[2].is_empty() {
-                    None
-                } else {
-                    Some(cols[2].into())
-                },
-                expires_at: cols[3].parse().ok()?,
-                granted_by: cols[4].into(),
-                note: cols[5].into(),
+                match_path_glob: opt_string(cols[2]),
+                scope_kind: cols[3].into(),
+                task_id: opt_string(cols[4]),
+                session_id: opt_string(cols[5]),
+                method_prefix: opt_string(cols[6]),
+                workspace_path_glob: opt_string(cols[7]),
+                expires_at: cols[8].parse().ok()?,
+                granted_by: cols[9].into(),
+                note: cols[10].into(),
             })
         })
         .collect()
+}
+
+fn opt_string(s: &str) -> Option<String> {
+    if s.is_empty() { None } else { Some(s.into()) }
 }
 
 fn parse_csv(s: &str) -> Vec<String> {
@@ -747,9 +808,14 @@ async fn try_issue_agent_token(
     if let Some(ttl) = ttl_secs {
         body.insert("ttl_secs".into(), Value::from(ttl));
     }
-    let resp = call_peer_json(state, DEFAULT_PEER, "identity.issue_token", &Value::Object(body))
-        .await
-        .ok()?;
+    let resp = call_peer_json(
+        state,
+        DEFAULT_PEER,
+        "identity.issue_token",
+        &Value::Object(body),
+    )
+    .await
+    .ok()?;
     resp.get("wire")
         .and_then(Value::as_str)
         .map(|s| s.to_string())
@@ -897,6 +963,16 @@ mod tests {
     // ── CreateAgentResponse serialisation ───────────────────
 
     #[test]
+    fn parse_scoped_standing_returns_scope_fields() {
+        let body = "std-1\tbrowser\t\tmethod_prefix\t\t\ttool.web_read\t\t9999\talice\tread-only\ncount=1\n";
+        let v = parse_standing_body(body);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].scope_kind, "method_prefix");
+        assert_eq!(v[0].method_prefix.as_deref(), Some("tool.web_read"));
+        assert_eq!(v[0].expires_at, 9999);
+    }
+
+    #[test]
     fn create_agent_response_omits_token_when_none() {
         let resp = CreateAgentResponse {
             agent_id: "agt_x_123".into(),
@@ -904,7 +980,10 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"agent_id\":\"agt_x_123\""));
-        assert!(!json.contains("token"), "token field must be absent when None");
+        assert!(
+            !json.contains("token"),
+            "token field must be absent when None"
+        );
     }
 
     #[test]

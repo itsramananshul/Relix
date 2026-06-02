@@ -101,6 +101,7 @@ struct Check {
 
 pub async fn run(args: DoctorArgs) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!("{}/v1/health", args.bridge.trim_end_matches('/'));
+    let mut local_checks = evaluate_local_readiness();
     // Resolve the bridge bearer once. `/v1/health` is auth-gated, so
     // without it an auth-enabled bridge answers 401 and every check
     // below would read as a broken mesh.
@@ -111,7 +112,12 @@ pub async fn run(args: DoctorArgs) -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => {
             // Probe failed — single FAIL row, exit 1. The error text
             // already names the token locations on a 401/403.
-            eprintln!("FAIL  bridge.reachable  {url}: {e}");
+            local_checks.push(Check {
+                label: "bridge.reachable".into(),
+                verdict: Verdict::Fail,
+                detail: format!("{url}: {e}"),
+            });
+            render_offline(&args.bridge, &local_checks);
             std::process::exit(1);
         }
     };
@@ -124,7 +130,8 @@ pub async fn run(args: DoctorArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     let resp: HealthResponse = serde_json::from_str(&body)
         .map_err(|e| format!("decode /v1/health body: {e} (body={body})"))?;
-    let mut checks = evaluate(&resp);
+    let mut checks = local_checks;
+    checks.extend(evaluate(&resp));
     let perm_checks = evaluate_perms();
     checks.extend(perm_checks);
     render(&args.bridge, &resp, &checks);
@@ -193,6 +200,91 @@ fn evaluate_perms() -> Vec<Check> {
         };
         out.push(row);
     }
+    out
+}
+
+fn evaluate_local_readiness() -> Vec<Check> {
+    let mut out = Vec::new();
+    let config_path = crate::config::RelixConfig::default_path();
+    match crate::config::RelixConfig::load_from(&config_path) {
+        Ok(Some(cfg)) => {
+            let errs = cfg.validate();
+            if errs.is_empty() {
+                out.push(Check {
+                    label: "setup.config".into(),
+                    verdict: Verdict::Pass,
+                    detail: format!("{} is valid", config_path.display()),
+                });
+            } else {
+                out.push(Check {
+                    label: "setup.config".into(),
+                    verdict: Verdict::Fail,
+                    detail: format!(
+                        "{} has {} problem(s): {}",
+                        config_path.display(),
+                        errs.len(),
+                        errs.join("; ")
+                    ),
+                });
+            }
+            out.push(if cfg.mesh.data_dir.trim().is_empty() {
+                Check {
+                    label: "setup.data_dir".into(),
+                    verdict: Verdict::Fail,
+                    detail: "mesh.data_dir is empty; set it in ~/.relix/config.toml".into(),
+                }
+            } else {
+                Check {
+                    label: "setup.data_dir".into(),
+                    verdict: Verdict::Pass,
+                    detail: format!("mesh.data_dir={}", cfg.mesh.data_dir),
+                }
+            });
+        }
+        Ok(None) => out.push(Check {
+            label: "setup.config".into(),
+            verdict: Verdict::Warn,
+            detail: format!(
+                "{} missing; run `relix setup` before `relix boot`",
+                config_path.display()
+            ),
+        }),
+        Err(e) => out.push(Check {
+            label: "setup.config".into(),
+            verdict: Verdict::Fail,
+            detail: format!("{} cannot be read: {e}", config_path.display()),
+        }),
+    }
+
+    out.push(if script_exists("relix-mesh-up") {
+        Check {
+            label: "setup.boot_script".into(),
+            verdict: Verdict::Pass,
+            detail: "relix-mesh-up script found".into(),
+        }
+    } else {
+        Check {
+            label: "setup.boot_script".into(),
+            verdict: Verdict::Fail,
+            detail: "relix-mesh-up script missing; re-run the installer or run from the repo root"
+                .into(),
+        }
+    });
+
+    out.push(if crate::bridge_token::resolve(None).is_some() {
+        Check {
+            label: "setup.bridge_token".into(),
+            verdict: Verdict::Pass,
+            detail: "bridge token resolved".into(),
+        }
+    } else {
+        Check {
+            label: "setup.bridge_token".into(),
+            verdict: Verdict::Warn,
+            detail: crate::bridge_token::missing_token_hint(),
+        }
+    });
+
     out
 }
 
@@ -298,6 +390,46 @@ fn render(bridge: &str, h: &HealthResponse, checks: &[Check]) {
     let n_pass = checks.iter().filter(|c| c.verdict == Verdict::Pass).count();
     println!();
     println!("{n_pass} pass, {n_warn} warn, {n_fail} fail");
+}
+
+fn render_offline(bridge: &str, checks: &[Check]) {
+    println!("relix-cli doctor — bridge={bridge}");
+    println!("bridge health: unreachable");
+    println!();
+    for c in checks {
+        println!("{:<5} {:<24}  {}", c.verdict.tag(), c.label, c.detail);
+    }
+    let n_fail = checks.iter().filter(|c| c.verdict == Verdict::Fail).count();
+    let n_warn = checks.iter().filter(|c| c.verdict == Verdict::Warn).count();
+    let n_pass = checks.iter().filter(|c| c.verdict == Verdict::Pass).count();
+    println!();
+    println!("{n_pass} pass, {n_warn} warn, {n_fail} fail");
+}
+
+fn script_exists(stem: &str) -> bool {
+    script_candidates(stem).iter().any(|p| p.is_file())
+}
+
+fn script_candidates(stem: &str) -> Vec<PathBuf> {
+    let (ps_name, sh_name) = (format!("{stem}.ps1"), format!("{stem}.sh"));
+    let want_ps = cfg!(windows);
+    let leaf = if want_ps { &ps_name } else { &sh_name };
+    let mut out = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        for ancestor in cwd.ancestors().take(6) {
+            out.push(ancestor.join("scripts").join(leaf));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        out.push(dir.join("scripts").join(leaf));
+    }
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    if let Some(home) = std::env::var_os(home_var).map(PathBuf::from) {
+        out.push(home.join(".local").join("scripts").join(leaf));
+    }
+    out
 }
 
 async fn http_get(url: &str, bearer: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {

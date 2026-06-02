@@ -112,9 +112,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // user secret and is never a hardcoded default.
     if final_cfg.credentials.enabled && !final_cfg.credentials.master_key.is_empty() {
         println!();
-        println!("Credential vault ENABLED. Master key (save this — required to decrypt the vault):");
+        println!(
+            "Credential vault ENABLED. Master key (save this — required to decrypt the vault):"
+        );
         println!("    {}", final_cfg.credentials.master_key);
-        println!("  Stored in {} and forwarded to the coordinator on `relix boot`.", path.display());
+        println!(
+            "  Stored in {} and forwarded to the coordinator on `relix boot`.",
+            path.display()
+        );
     }
     if final_cfg.approvals.enabled {
         println!();
@@ -193,6 +198,11 @@ struct WizardState {
     /// The current API key. Starts as the prior key on a reconfigure
     /// (so "Enter to keep" works), or empty on a fresh install.
     api_key: String,
+    /// Selected AI model id. Carried through unchanged until the model
+    /// page lands (RELA-45 frontend follow-up); preserving it here
+    /// keeps a dashboard-set or hand-edited model from being wiped on
+    /// a wizard re-run. Empty means "use the provider default".
+    model: String,
     /// Per-channel toggles for the multi-select page.
     channels_sel: [bool; 3],
     /// Full channels block including tokens — kept across toggles so
@@ -239,6 +249,7 @@ impl WizardState {
         Self {
             provider_idx,
             api_key: p.provider.api_key.clone(),
+            model: p.provider.model.clone(),
             channels_sel: [p.channels.telegram, p.channels.discord, p.channels.slack],
             channels: p.channels.clone(),
             mesh: p.mesh.clone(),
@@ -268,6 +279,7 @@ impl WizardState {
             provider: ProviderConfig {
                 name: self.provider_name().to_string(),
                 api_key: self.api_key.clone(),
+                model: self.model.clone(),
             },
             channels: ch,
             mesh: self.mesh.clone(),
@@ -840,7 +852,10 @@ fn pick_subsystems(
         queue!(out, Print("Optional subsystems"))?;
         queue!(out, ResetColor)?;
         queue!(out, cursor::MoveTo(2, 2))?;
-        queue!(out, Print("Up/Down to move, Space to toggle, Enter to continue"))?;
+        queue!(
+            out,
+            Print("Up/Down to move, Space to toggle, Enter to continue")
+        )?;
 
         let vmark = if vault_on { 'x' } else { ' ' };
         let amark = if approvals_on { 'x' } else { ' ' };
@@ -855,17 +870,32 @@ fn pick_subsystems(
 
         queue!(out, cursor::MoveTo(2, 7))?;
         queue!(out, SetForegroundColor(Color::DarkGrey))?;
-        queue!(out, Print("Vault: encrypted store for agent credentials. Needs a"))?;
+        queue!(
+            out,
+            Print("Vault: encrypted store for agent credentials. Needs a")
+        )?;
         queue!(out, cursor::MoveTo(2, 8))?;
-        queue!(out, Print("master key — generated for you when enabled and shown"))?;
+        queue!(
+            out,
+            Print("master key — generated for you when enabled and shown")
+        )?;
         queue!(out, cursor::MoveTo(2, 9))?;
-        queue!(out, Print("once at the end to save (never recoverable later)."))?;
+        queue!(
+            out,
+            Print("once at the end to save (never recoverable later).")
+        )?;
         queue!(out, cursor::MoveTo(2, 10))?;
-        queue!(out, Print("Approvals: in-process dashboard delivery (no secret)."))?;
+        queue!(
+            out,
+            Print("Approvals: in-process dashboard delivery (no secret).")
+        )?;
         if vault_on && !master_key.is_empty() {
             queue!(out, cursor::MoveTo(2, 12))?;
             queue!(out, SetForegroundColor(Color::Green))?;
-            queue!(out, Print("Vault master key generated — shown after you save."))?;
+            queue!(
+                out,
+                Print("Vault master key generated — shown after you save.")
+            )?;
             queue!(out, ResetColor)?;
         }
         queue!(out, ResetColor)?;
@@ -893,7 +923,11 @@ fn pick_subsystems(
             Key::Enter => {
                 let creds = CredentialsBlock {
                     enabled: vault_on,
-                    master_key: if vault_on { master_key.clone() } else { String::new() },
+                    master_key: if vault_on {
+                        master_key.clone()
+                    } else {
+                        String::new()
+                    },
                 };
                 let approvals = ApprovalsBlock {
                     enabled: approvals_on,

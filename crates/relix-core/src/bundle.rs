@@ -414,8 +414,10 @@ mod tests {
     #[test]
     fn default_lifetime_is_one_year() {
         // Guards against an accidental regression back to a short lifetime.
-        assert_eq!(DEFAULT_IDENTITY_LIFETIME_SECS, 365 * 24 * 60 * 60);
-        assert!(DEFAULT_RENEWAL_WINDOW_SECS < DEFAULT_IDENTITY_LIFETIME_SECS);
+        let lifetime = DEFAULT_IDENTITY_LIFETIME_SECS;
+        let renewal_window = DEFAULT_RENEWAL_WINDOW_SECS;
+        assert_eq!(lifetime, 365 * 24 * 60 * 60);
+        assert!(renewal_window < lifetime);
     }
 
     #[test]

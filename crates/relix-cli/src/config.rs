@@ -200,6 +200,14 @@ pub struct ProviderConfig {
     pub name: String,
     #[serde(default)]
     pub api_key: String,
+    /// Optional model id (for example `openai/gpt-oss-120b:free`).
+    /// Empty leaves the provider's baked-in `default_model` in place.
+    /// On boot a non-empty value is forwarded as `RELIX_AI_MODEL`,
+    /// which the mesh-up script writes as the provider's
+    /// `default_model`. Lets a user pick a model (including a free one)
+    /// without editing the AI-node TOML by hand.
+    #[serde(default)]
+    pub model: String,
 }
 
 impl Default for ProviderConfig {
@@ -207,6 +215,7 @@ impl Default for ProviderConfig {
         Self {
             name: default_provider_name(),
             api_key: String::new(),
+            model: String::new(),
         }
     }
 }
@@ -571,6 +580,7 @@ mod tests {
             provider: ProviderConfig {
                 name: "openai".into(),
                 api_key: String::new(),
+                model: String::new(),
             },
             ..Default::default()
         };
