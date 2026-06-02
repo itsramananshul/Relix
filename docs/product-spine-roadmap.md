@@ -70,6 +70,12 @@ Current progress:
 - `/v1/plugins/:id/reload` and `/v1/plugins/:id/disable` accept optional
   `task_id`/`run_id`, stamp `task_id` into the mesh dispatch envelope, record
   durable activity, and return scope metadata in mutation responses
+- memory write proxies (`/v1/memory/ingest`, `/v1/memory/ingest_image`,
+  `/v1/memory/context_flush`, quarantine decisions, record edits/freezes, and
+  model refresh requests) accept optional `task_id`/`run_id`, strip that bridge
+  metadata before forwarding, stamp `task_id` into the mesh dispatch envelope,
+  record durable activity without copying document/image payloads, and add scope
+  metadata to object responses
 - standalone CLI flow runs remain unbound unless the caller explicitly grows a
   task binding path
 
@@ -158,6 +164,8 @@ Unify scattered rings/logs/provenance into one durable activity ledger:
 - approval id: implemented for REST/dashboard and channel approval decisions
 - policy result: implemented for recent policy-denial rows with idempotent
   activity ids
+- memory writes: implemented for the GAP 5 bridge memory-write proxies without
+  logging raw document/image payloads
 - timestamp: implemented
 
 The operator question "what happened?" should not require scraping five
@@ -187,6 +195,7 @@ Current producers:
 - browser capture reads from `/v1/browser/captures/:filename`
 - plugin management mutations from `/v1/plugins/:id/reload` and
   `/v1/plugins/:id/disable`
+- memory writes from GAP 5 bridge proxies
 - outbound email sends from `/v1/email/send` and `/v1/email/send_template`
 - agent-message sends from `/v1/messages`
 
