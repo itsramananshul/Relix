@@ -56,14 +56,14 @@ Relix accepts that the libp2p ecosystem brings a long tail of transitives. Polic
 - Direct dependencies are reviewed and listed in `docs/security-critical-deps.md`.
 - Transitive dependencies are not enumerated, but are subject to:
   - License check via cargo-deny (see allowlist in `deny.toml`).
-  - Advisory check via cargo-audit (nightly hard gate; heavy-ci visibility).
+  - Advisory check via cargo-deny on every PR plus cargo-audit nightly hard gate.
 - A transitive advisory that proves reachable in Relix code becomes a release blocker. A transitive advisory that is documented as unreachable goes into `docs/security-advisories.md` with rationale + review condition, and a matching `deny.toml [advisories] ignore` entry.
 
 ## Security review process
 
 Three trigger points:
 
-1. **Per-PR (automatic):** fast-ci runs `cargo check` + tests + secret-scan. Heavy-ci (label `heavy` or manual dispatch) adds clippy + cargo-deny licenses/bans/sources + audit visibility.
+1. **Per-PR (automatic):** `ci.yml` runs `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on the ubuntu + macOS + windows matrix, `cargo deny check` (all categories), and the secret/AI-tag scan. All are required gates.
 2. **Per-milestone (manual):** before pushing a milestone commit, run the full `cargo deny check` and `cargo audit` locally.
 3. **Nightly (automated):** `nightly-security.yml` runs `cargo deny check` (all categories, hard gates) and `cargo audit` (hard gate) against `main`. New advisories surface within 24 hours.
 
@@ -85,11 +85,11 @@ The pin moves only when a deliberate need arises (new language feature, stable a
 
 ## CI policy at a glance
 
-`fast-ci.yml` (every push/PR) — must pass; cheap. Does NOT run cargo-deny or cargo-audit.
+`ci.yml` (every push/PR, required) runs fmt, clippy `-D warnings` and test on the ubuntu + macOS + windows matrix, `cargo deny check` (all categories), and the secret/AI-tag scan.
 
-`heavy-ci.yml` (manual or `heavy` label) — must pass before milestone merges; runs clippy, cargo-deny (licenses/bans/sources), cargo-audit (visibility, non-fatal), end-to-end demo.
+`heavy-ci.yml` (manual or `heavy` label) runs the end-to-end mesh demo. It is not a required gate and does not duplicate the per-push hygiene checks.
 
-`nightly-security.yml` (daily 06:00 UTC + manual) — hard gates for cargo-deny (all categories) and cargo-audit. Failures here open tracking issues.
+`nightly-security.yml` (daily 06:00 UTC + manual) is the backstop hard gate for cargo-deny (all categories) and cargo-audit. Failures here open tracking issues.
 
 See `docs/ci-strategy.md` for the full breakdown.
 

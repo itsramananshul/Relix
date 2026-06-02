@@ -1,118 +1,118 @@
 # CI Strategy
 
-Relix uses layered CI: a fast lane for every push, a strict lane for milestone gates, and a nightly security pass. The goal is to keep iteration cheap without surrendering hygiene.
+Relix runs one required gate on every push and pull request, plus an
+on-demand end-to-end lane and a nightly security pass. The required gate is
+deliberately thorough so no regression can land green; the other two lanes
+carry only the work that is too slow or too noisy to run on every push.
 
-## Layer 1 — `fast-ci.yml` (every push / PR)
+## Layer 1: `ci.yml` (required, every push / PR)
 
-Runs unconditionally on every push to `main` and every pull request.
+Runs unconditionally on every push to `main` and every pull request. This is
+the gate that must be green before a change reaches `main`.
 
-| Job          | Purpose                                              | Target runtime |
-|--------------|------------------------------------------------------|----------------|
-| `fmt`        | `cargo fmt --all -- --check`                         | ~30 s          |
-| `check`      | `cargo check --workspace --all-targets`              | ~2 min (warm)  |
-| `test`       | `cargo test --workspace` (unit + offline integration) | ~3 min (warm)  |
-| `secret-scan`| Grep for committed API keys + AI-coauthor tags       | ~10 s          |
+| Job          | Purpose                                                  | Runs on |
+|--------------|----------------------------------------------------------|---------|
+| `fmt`        | `cargo fmt --all -- --check`                             | ubuntu  |
+| `build-test` | `cargo clippy --workspace --all-targets -- -D warnings` then `cargo test --workspace` | ubuntu + macOS + windows |
+| `deny`       | `cargo deny check` (licenses, bans, sources, advisories) | ubuntu  |
+| `secret-scan`| Grep for committed API keys and AI-coauthor tags         | ubuntu  |
 
-**Total budget:** under 5 minutes with a warm `Swatinem/rust-cache` shared key. The cache is saved only on `main` (per the action's recommendation) to avoid PR cache thrash.
+`build-test` runs the full ubuntu + macOS + windows matrix on purpose.
+OS-gated code (`#[cfg(unix)]`, `#[cfg(target_os = "...")]`, path handling,
+line endings) only compiles and lints on its own host, so a Linux-only run
+would let an OS-specific regression land green. `fmt` and `deny` read
+host-independent inputs (source text and the lockfile), so they run once on
+Linux.
 
-**What fast CI deliberately does NOT run:**
+`build-test` uses a per-OS `Swatinem/rust-cache` shared key. The cache is
+saved only on `main` (per the action's recommendation) to avoid pull-request
+cache thrash, and cache failures are `continue-on-error` because the cache is
+a speed optimisation, not a correctness gate.
 
-- `cargo clippy --all-targets` (slow first build; lints flap on minor refactors).
-- `cargo deny check` (licenses are reviewed at heavy CI; not every push needs the audit-db pull).
-- `cargo audit` (advisory database changes daily; nightly catches drift).
-- End-to-end multi-process integration scripts (real libp2p ports + processes are heavy and flaky in shared CI).
+## Layer 2: `heavy-ci.yml` (on-demand end-to-end)
 
-These belong in `heavy-ci.yml` and `nightly-security.yml`.
-
-## Layer 2 — `heavy-ci.yml` (manual or `heavy`-labeled PR)
+The required hygiene gates now live in `ci.yml`, so `heavy-ci.yml` carries
+only the heavy multi-process mesh bring-up, which is too slow and port-bound
+to run on every push.
 
 Triggers:
 
-- `workflow_dispatch` — operator runs it manually before milestone push.
-- Pull request labeled `heavy` — applied when the PR touches the substrate (transport, dispatch, identity, policy, eventlog, codec) or when the author wants a strict lane.
+- `workflow_dispatch`: operator runs it before a milestone push.
+- Pull request labeled `heavy`: runs the end-to-end demo against the PR.
 
-| Job           | Purpose                                                  |
-|---------------|----------------------------------------------------------|
-| `clippy`      | `cargo clippy --workspace --all-targets -- -D warnings`  |
-| `deny`        | `cargo deny check licenses bans sources`                 |
-| `audit`       | `cargo audit` — advisory **visibility** (continue-on-error; nightly is the hard gate) |
-| `integration` | `bash scripts/alpha-bringup-m5.sh` end-to-end demo       |
+| Job           | Purpose                                            |
+|---------------|----------------------------------------------------|
+| `filter`      | gate the run on dispatch or the `heavy` label      |
+| `integration` | `bash scripts/alpha-bringup-m5.sh` end-to-end demo |
 
-Workflow permissions:
+This lane is not a required gate. It adds end-to-end coverage on request; it
+does not duplicate the per-push hygiene checks.
 
-```yaml
-permissions:
-  contents: read
-  checks: write              # rustsec/audit-check publishes check-runs
-  security-events: write     # advisories appear in the Security tab
-```
-
-The `checks: write` block fixes the historical `Resource not accessible by integration` error from `rustsec/audit-check@v2.0.0`. The `audit` job is intentionally `continue-on-error: true` here — its purpose in the heavy lane is to surface new advisories to reviewers, not to block iteration. Hard enforcement is in the nightly lane.
-
-## Layer 3 — `nightly-security.yml` (scheduled + manual)
+## Layer 3: `nightly-security.yml` (scheduled + manual)
 
 Triggers:
 
 - Daily cron (`0 6 * * *` UTC).
 - `workflow_dispatch`.
 
-| Job           | Purpose                                          |
-|---------------|--------------------------------------------------|
-| `deny-strict` | `cargo deny check` (all categories incl. advisories) — hard gate |
-| `audit-strict`| `cargo audit` as a hard gate                     |
-| `full-tests`  | `cargo test --workspace --release`               |
+| Job           | Purpose                                                       |
+|---------------|---------------------------------------------------------------|
+| `deny-strict` | `cargo deny check` (all categories incl. advisories) hard gate |
+| `audit-strict`| `cargo audit` as a hard gate                                  |
+| `full-tests`  | `cargo test --workspace --release`                            |
 
-`issues: write` permission allows future automation to open tracking issues on new advisories.
+`issues: write` permission lets the lane open a tracking issue when a newly
+published advisory breaks the strict pass. `ci.yml` already runs `cargo deny
+check` on every PR, so most advisory drift is caught there first; nightly is
+the backstop that catches advisories published after a change has merged.
 
 ## Per-advisory exceptions
 
-If `audit-strict` or `deny-strict` flags an advisory that we have evaluated and decided to accept (transitive, unreachable, or no fix available), the exception is recorded in two coordinated places:
+If `audit-strict` or `deny-strict` flags an advisory that we have evaluated
+and decided to accept (transitive, unreachable, or no fix available), the
+exception is recorded in two coordinated places:
 
-1. **`docs/security-advisories.md`** — human review notes: advisory ID, direct/transitive, reachability assessment, severity in context, mitigation plan, review condition.
-2. **`deny.toml`** `[advisories] ignore = [...]` — machine-readable, with an inline comment naming the advisory ID and pointing at the docs entry.
+1. **`docs/security-advisories.md`**: human review notes, including the
+   advisory ID, direct or transitive status, reachability assessment,
+   severity in context, mitigation plan, and review condition.
+2. **`deny.toml`** `[advisories] ignore = [...]`: machine-readable, with an
+   inline comment naming the advisory ID and pointing at the docs entry.
 
-No silent suppressions. Every entry has a removal condition (e.g., "remove after libp2p ≥ 0.55").
+No silent suppressions. Every entry has a removal condition (for example,
+"remove after libp2p reaches 0.55").
 
 ## Local-first workflow
 
-The CI lanes mirror the recommended local-dev pre-push order:
+The required gate mirrors the recommended local pre-push order:
 
 ```
-# Fast — before every push:
 cargo fmt --all
-cargo check --workspace --all-targets
-cargo test --workspace
-
-# Heavy — before a milestone push (~5–10 min):
 cargo clippy --workspace --all-targets -- -D warnings
-cargo deny check licenses bans sources
-
-# Security review — periodically, or before security-impacting PRs:
+cargo test --workspace
 cargo deny check
-cargo audit
 ```
 
-Engineers running these locally catch issues before they consume Actions minutes.
+Running these locally catches issues before they consume Actions minutes.
+`scripts/ci-local.ps1` runs the same set on a Windows dev box.
 
 ## Toolchain
 
-`rust-toolchain.toml` pins **Rust 1.95** with `rustfmt` + `clippy`. Every workflow uses `dtolnay/rust-toolchain@stable` plus `Swatinem/rust-cache@v2` for layered caching of the registry, git database, and target directory. Cache keys are per-lane (`fast-ci`, `heavy-ci`, `nightly`) to avoid cross-lane invalidation.
+`rust-toolchain.toml` pins **Rust 1.95** with `rustfmt` and `clippy`. Every
+workflow uses `dtolnay/rust-toolchain@stable` plus `Swatinem/rust-cache@v2`
+for layered caching of the registry, git database, and target directory.
+Cache keys are per-lane and, for the matrix, per-OS, to avoid cross-lane and
+cross-OS invalidation.
 
 MSRV is documented in `README.md`.
 
-## Actions-minute budget
-
-| Lane    | Trigger              | Typical run  | Approx minutes / push |
-|---------|----------------------|--------------|------------------------|
-| Fast    | push + PR            | 3–5 min      | 4 (4 jobs ~1 min)     |
-| Heavy   | manual + `heavy` PR  | 10–20 min    | 0 most pushes         |
-| Nightly | daily 06:00 UTC      | 10–25 min    | ~50 min/week          |
-
-Estimated baseline: under **10 minutes of Actions time per typical push**, vs the prior all-in-one workflow that burned 20+ minutes per push regardless of change scope.
-
 ## Discipline rules
 
-- Do NOT add expensive jobs to `fast-ci.yml`. The cost of fast CI matters because it runs on every push.
-- Do NOT skip heavy CI before a milestone push to `main`. The `heavy` label or a manual dispatch is mandatory before any PR that touches substrate paths is merged.
-- Do NOT add `cargo deny check advisories` to `fast-ci.yml`. The advisory database changes daily; that lane belongs to nightly.
-- Do NOT remove `secret-scan` from `fast-ci.yml`. It is cheap and catches the most expensive class of mistake.
+- Keep `ci.yml` as the single required gate. Do not move a required check
+  (fmt, clippy, test, deny) to a dispatch-only or label-only lane, because
+  that lets the check be skipped on an ordinary PR.
+- Keep the `build-test` matrix on all three operating systems. Dropping an OS
+  reopens the gap where OS-gated regressions land green.
+- Do NOT remove `secret-scan` from `ci.yml`. It is cheap and catches the most
+  expensive class of mistake.
+- Keep the heavy end-to-end demo off the per-push path. It is slow and
+  port-bound; run it on dispatch or with the `heavy` label.

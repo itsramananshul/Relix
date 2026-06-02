@@ -81,6 +81,8 @@ re-uploaded with `--clobber`.
 
 ## CI
 
-CI (`ci.yml`) does **not** run on every commit — it is manual-only
-(`workflow_dispatch`). Run the full gate locally with
-`scripts/ci-local.ps1` before tagging a release.
+CI (`ci.yml`) is the required gate. It runs on every push to `main` and
+every pull request: `cargo fmt --check`, `cargo clippy -D warnings` and
+`cargo test` on the ubuntu + macOS + windows matrix, `cargo deny check`, and
+the secret/AI-tag scan. Run the same set locally with `scripts/ci-local.ps1`
+before tagging a release.
