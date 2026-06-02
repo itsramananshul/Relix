@@ -211,12 +211,13 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
             status: SpineStatus::Partial,
             purpose: "Answers what happened, who did it, and why the system allowed or denied it.",
             routes: &[
+                "/v1/activity/recent",
                 "/v1/intervention/recent",
                 "/v1/policy/denials",
                 "/v1/logs/stream",
                 "/v1/provenance/recent",
             ],
-            gap: "Activity is split across rings, logs, provenance, and audit; it needs one durable activity ledger.",
+            gap: "Durable activity JSONL now captures workspace and operator-intervention events; policy, cost, model, memory, and dispatch producers still need to write into the same ledger.",
         },
         SpineSurface {
             id: "memory",

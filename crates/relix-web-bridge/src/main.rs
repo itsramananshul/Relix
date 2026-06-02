@@ -84,6 +84,7 @@ async fn route_latency_log(req: Request, next: Next) -> Response {
     resp
 }
 
+mod activity;
 mod agent;
 mod agent_memory;
 mod agent_metrics;
@@ -451,6 +452,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/info", get(openai::info))
         .route("/v1/schema", get(schema::schema))
         .route("/v1/control-plane/spine", get(control_plane::spine))
+        .route("/v1/activity/recent", get(activity::recent))
         .route("/v1/workspaces", get(workspaces::list))
         .route("/v1/workspaces", post(workspaces::create))
         .route("/v1/workspaces/{lease_id}", get(workspaces::get))

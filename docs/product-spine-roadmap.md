@@ -93,21 +93,35 @@ POST /v1/workspaces/{lease_id}/release
 
 ## Phase 5: Durable Activity Ledger
 
+Status: started.
+
 Unify scattered rings/logs/provenance into one durable activity ledger:
 
-- actor
-- tenant
-- task
-- run
-- method/action
-- decision
-- cost
-- approval id
-- policy result
-- timestamp
+- actor: implemented for workspace and intervention events
+- tenant: implemented for workspace events; intervention events currently default
+- task: implemented when a workspace or intervention target carries a task id
+- run: implemented for workspace events
+- method/action: implemented as `action`; method remains optional
+- decision: implemented
+- cost: schema field exists, producers missing
+- approval id: schema field exists, producers missing
+- policy result: schema field exists, producers missing
+- timestamp: implemented
 
 The operator question "what happened?" should not require scraping five
 different surfaces.
+
+Current endpoint:
+
+```text
+GET /v1/activity/recent
+```
+
+Current durable source:
+
+```text
+<data_dir>/bridge-activity.jsonl
+```
 
 ## Phase 6: Dashboard Decomposition
 

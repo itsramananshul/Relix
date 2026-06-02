@@ -214,9 +214,17 @@ pub async fn create(
     Json(req): Json<CreateWorkspaceLeaseRequest>,
 ) -> Result<Json<WorkspaceLease>, ErrorReply> {
     let tenant_id = tenant_id();
-    with_store(&state, |store| store.create(&tenant_id, req))
-        .map(Json)
-        .map_err(bad)
+    let lease = with_store(&state, |store| store.create(&tenant_id, req)).map_err(bad)?;
+    if let Err(e) = crate::activity::append_workspace_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        &lease,
+        "workspace.create",
+        "ok",
+        "workspace lease created",
+    ) {
+        tracing::warn!(error = %e, lease_id = %lease.lease_id, "activity ledger: workspace create append failed");
+    }
+    Ok(Json(lease))
 }
 
 pub async fn get(
@@ -239,17 +247,34 @@ pub async fn release(
     Json(req): Json<ReleaseWorkspaceLeaseRequest>,
 ) -> Result<Json<WorkspaceLease>, ErrorReply> {
     let tenant_id = tenant_id();
-    with_store(&state, |store| {
+    let lease = with_store(&state, |store| {
         store.release(&tenant_id, &lease_id, req.failure_reason)
     })
-    .map(Json)
     .map_err(|e| {
         if e.contains("not found") {
             not_found(e)
         } else {
             bad(e)
         }
-    })
+    })?;
+    let decision = match lease.cleanup_status {
+        WorkspaceLeaseStatus::CleanupFailed => "cleanup_failed",
+        WorkspaceLeaseStatus::Released => "ok",
+        WorkspaceLeaseStatus::Active => "active",
+    };
+    if let Err(e) = crate::activity::append_workspace_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        &lease,
+        "workspace.release",
+        decision,
+        lease
+            .failure_reason
+            .clone()
+            .unwrap_or_else(|| "workspace lease released".into()),
+    ) {
+        tracing::warn!(error = %e, lease_id = %lease.lease_id, "activity ledger: workspace release append failed");
+    }
+    Ok(Json(lease))
 }
 
 fn with_store<T>(
