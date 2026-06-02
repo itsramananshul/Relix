@@ -682,11 +682,8 @@ fn ensure(
                         // self-healed rather than left to break boot.
                         let root_key = read_secret_key(root_key_path)?;
                         let now = now_unix_secs();
-                        match bundle.validate(
-                            &root_key.verifying_key(),
-                            BundleType::Identity,
-                            now,
-                        ) {
+                        match bundle.validate(&root_key.verifying_key(), BundleType::Identity, now)
+                        {
                             Ok(()) => {
                                 if bundle.header.needs_renewal(now, window_secs) {
                                     let days = bundle.header.seconds_until_expiry(now) / 86_400;

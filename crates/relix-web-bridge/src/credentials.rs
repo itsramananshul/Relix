@@ -93,7 +93,15 @@ pub async fn store(
     if let Some(r) = req.rotation_interval_secs {
         body.insert("rotation_interval_secs".into(), Value::from(r));
     }
-    match call_peer_json(&state, &peer, "credentials.store", &Value::Object(body), false).await {
+    match call_peer_json(
+        &state,
+        &peer,
+        "credentials.store",
+        &Value::Object(body),
+        false,
+    )
+    .await
+    {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -109,7 +117,15 @@ pub async fn list(
     if let Some(o) = q.owner_agent {
         body.insert("owner_agent".into(), Value::from(o));
     }
-    match call_peer_json(&state, &peer, "credentials.list", &Value::Object(body), true).await {
+    match call_peer_json(
+        &state,
+        &peer,
+        "credentials.list",
+        &Value::Object(body),
+        true,
+    )
+    .await
+    {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -164,7 +180,15 @@ pub async fn revoke(
     if let Some(r) = req.reason {
         body.insert("reason".into(), Value::from(r));
     }
-    match call_peer_json(&state, &peer, "credentials.revoke", &Value::Object(body), false).await {
+    match call_peer_json(
+        &state,
+        &peer,
+        "credentials.revoke",
+        &Value::Object(body),
+        false,
+    )
+    .await
+    {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -185,7 +209,15 @@ pub async fn audit(
     if let Some(l) = q.limit {
         body.insert("limit".into(), Value::from(l as u64));
     }
-    match call_peer_json(&state, &peer, "credentials.audit", &Value::Object(body), true).await {
+    match call_peer_json(
+        &state,
+        &peer,
+        "credentials.audit",
+        &Value::Object(body),
+        true,
+    )
+    .await
+    {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -302,8 +334,7 @@ async fn call_peer_json(
             // clean "unavailable" marker (HTTP 200) so the panel shows
             // an empty vault instead of a 502. Mutating calls keep the
             // hard error. Admission is unchanged.
-            if graceful_unknown_method
-                && env.kind == relix_core::types::error_kinds::UNKNOWN_METHOD
+            if graceful_unknown_method && env.kind == relix_core::types::error_kinds::UNKNOWN_METHOD
             {
                 return Ok(unavailable(method));
             }

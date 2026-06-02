@@ -710,7 +710,9 @@ pub async fn status_for_setup() -> SetupPreflight {
         // (a) WITH memory.
         if !docker_daemon_running().await {
             println!();
-            println!("Docker is not running. Start Docker Desktop, then re-run `relix setup` to enable memory.");
+            println!(
+                "Docker is not running. Start Docker Desktop, then re-run `relix setup` to enable memory."
+            );
             return SetupPreflight::ExitStartDocker;
         }
         match install_qdrant_via_docker().await {

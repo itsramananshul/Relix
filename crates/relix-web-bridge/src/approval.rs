@@ -233,8 +233,14 @@ pub async fn get_approval(
     // The coordinator cap takes raw `approval_id` bytes (not
     // JSON), so we call the binary helper instead of the JSON
     // helper for this method.
-    match call_peer_raw_to_json(&state, &peer, "coord.approval.get", approval_id.as_bytes(), true)
-        .await
+    match call_peer_raw_to_json(
+        &state,
+        &peer,
+        "coord.approval.get",
+        approval_id.as_bytes(),
+        true,
+    )
+    .await
     {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
@@ -324,8 +330,7 @@ async fn call_peer_raw_to_json(
             // read-only dashboard surface, return a clean "unavailable"
             // marker (HTTP 200) so the panel renders empty instead of a
             // 502. Admission is unchanged — the responder still refused.
-            if graceful_unknown_method
-                && env.kind == relix_core::types::error_kinds::UNKNOWN_METHOD
+            if graceful_unknown_method && env.kind == relix_core::types::error_kinds::UNKNOWN_METHOD
             {
                 return Ok(unavailable(method));
             }
@@ -443,8 +448,7 @@ async fn call_peer_json(
             })
         }
         ResponseResult::Err(env) => {
-            if graceful_unknown_method
-                && env.kind == relix_core::types::error_kinds::UNKNOWN_METHOD
+            if graceful_unknown_method && env.kind == relix_core::types::error_kinds::UNKNOWN_METHOD
             {
                 return Ok(unavailable(method));
             }
