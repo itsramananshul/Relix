@@ -161,7 +161,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/tasks/:id/summary",
                 "/v1/tasks/:id/todos",
             ],
-            gap: "Chat, MCP invoke, and screen-capture paths can attach to a task; plugin and remaining direct utility invocations still need forced task or explicit ad-hoc run binding.",
+            gap: "Chat, MCP invoke, screen-capture, and outbound email paths can attach to a task; plugin and remaining direct utility invocations still need forced task or explicit ad-hoc run binding.",
         },
         SpineSurface {
             id: "runs",
@@ -240,7 +240,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/logs/stream",
                 "/v1/provenance/recent",
             ],
-            gap: "Durable activity JSONL now captures workspace, intervention, approval, policy-denial, and cost-observation events; model, memory, and dispatch producers still need the same ledger path.",
+            gap: "Durable activity JSONL now captures workspace, intervention, approval, policy-denial, cost-observation, MCP, screen, and outbound email events; model, memory, and dispatch producers still need the same ledger path.",
         },
         SpineSurface {
             id: "memory",
