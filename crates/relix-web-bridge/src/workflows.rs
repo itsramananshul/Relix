@@ -19,7 +19,7 @@
 use axum::body::Body;
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -30,7 +30,9 @@ use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 use relix_runtime::transport::stream::{StreamFrame, StreamReader, write_request_envelope};
 
+use crate::activity::{ToolInvocationActivity, append_tool_invocation_activity};
 use crate::config::AppState;
+use crate::tenant::{DEFAULT_TENANT, current_subject};
 
 const DEFAULT_PEER: &str = "coordinator";
 
@@ -46,6 +48,10 @@ pub struct RunRequest {
     pub input: String,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,13 +59,27 @@ pub struct ValidateRequest {
     pub source: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct ReloadQuery {
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+
 /// `POST /v1/workflows/run` — execute a workflow.
 pub async fn run(State(state): State<AppState>, Json(req): Json<RunRequest>) -> Response {
     if req.name.trim().is_empty() {
         return bad_json(StatusCode::BAD_REQUEST, "name is required");
     }
+    let task_id = match clean_optional_id(req.task_id.as_deref(), "task_id") {
+        Ok(task_id) => task_id,
+        Err(resp) => return json_error(resp),
+    };
+    let run_id = clean_optional(req.run_id.as_deref());
+    let detail = run_detail(&req.name, req.input.len(), req.stream);
     if req.stream {
-        return run_stream(&state, &req).await;
+        return run_stream(&state, &req, task_id.as_deref(), run_id.as_deref(), &detail).await;
     }
     let coord_args = serde_json::json!({
         "name": req.name,
@@ -69,15 +89,48 @@ pub async fn run(State(state): State<AppState>, Json(req): Json<RunRequest>) -> 
         Ok(b) => b,
         Err(e) => return bad_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("encode: {e}")),
     };
-    match call_peer_json(&state, DEFAULT_PEER, "workflow.run", &coord_arg_bytes).await {
-        Ok(body) => json_response(StatusCode::OK, body),
-        Err(resp) => resp,
+    match call_peer_json(
+        &state,
+        DEFAULT_PEER,
+        "workflow.run",
+        &coord_arg_bytes,
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(mut body) => {
+            attach_scope(&mut body, task_id.as_deref(), run_id.as_deref());
+            record_workflow_activity(
+                &state,
+                WorkflowActivity {
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "workflow.run",
+                    decision: "ok",
+                    detail: &detail,
+                },
+            );
+            json_response(StatusCode::OK, body)
+        }
+        Err(resp) => {
+            record_workflow_activity(
+                &state,
+                WorkflowActivity {
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "workflow.run",
+                    decision: "err",
+                    detail: &detail,
+                },
+            );
+            resp
+        }
     }
 }
 
 /// `GET /v1/workflows` — list every workflow in the catalog.
 pub async fn list(State(state): State<AppState>) -> Response {
-    match call_peer_json(&state, DEFAULT_PEER, "workflow.list", b"").await {
+    match call_peer_json(&state, DEFAULT_PEER, "workflow.list", b"", None).await {
         Ok(body) => json_response(StatusCode::OK, body),
         Err(resp) => resp,
     }
@@ -91,7 +144,8 @@ pub async fn status(State(state): State<AppState>, Path(execution_id): Path<Stri
         Ok(b) => b,
         Err(e) => return bad_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("encode: {e}")),
     };
-    let body = match call_peer_json(&state, DEFAULT_PEER, "workflow.status", &arg_bytes).await {
+    let body = match call_peer_json(&state, DEFAULT_PEER, "workflow.status", &arg_bytes, None).await
+    {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -111,10 +165,11 @@ pub async fn validate(State(state): State<AppState>, Json(req): Json<ValidateReq
         Ok(b) => b,
         Err(e) => return bad_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("encode: {e}")),
     };
-    let body = match call_peer_json(&state, DEFAULT_PEER, "workflow.validate", &arg_bytes).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let body =
+        match call_peer_json(&state, DEFAULT_PEER, "workflow.validate", &arg_bytes, None).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
     let ok = body.get("ok").and_then(Value::as_bool).unwrap_or(false);
     let status = if ok {
         StatusCode::OK
@@ -127,16 +182,61 @@ pub async fn validate(State(state): State<AppState>, Json(req): Json<ValidateReq
 /// `POST /v1/workflows/reload` — drop the workflow file
 /// cache on the coordinator so the next list / run picks up
 /// any in-place edits without a coordinator restart.
-pub async fn reload(State(state): State<AppState>) -> Response {
-    match call_peer_json(&state, DEFAULT_PEER, "workflow.reload", b"").await {
-        Ok(body) => json_response(StatusCode::OK, body),
-        Err(resp) => resp,
+pub async fn reload(State(state): State<AppState>, Query(q): Query<ReloadQuery>) -> Response {
+    let task_id = match clean_optional_id(q.task_id.as_deref(), "task_id") {
+        Ok(task_id) => task_id,
+        Err(resp) => return json_error(resp),
+    };
+    let run_id = clean_optional(q.run_id.as_deref());
+    let detail = "method=workflow.reload".to_string();
+    match call_peer_json(
+        &state,
+        DEFAULT_PEER,
+        "workflow.reload",
+        b"",
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(mut body) => {
+            attach_scope(&mut body, task_id.as_deref(), run_id.as_deref());
+            record_workflow_activity(
+                &state,
+                WorkflowActivity {
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "workflow.reload",
+                    decision: "ok",
+                    detail: &detail,
+                },
+            );
+            json_response(StatusCode::OK, body)
+        }
+        Err(resp) => {
+            record_workflow_activity(
+                &state,
+                WorkflowActivity {
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "workflow.reload",
+                    decision: "err",
+                    detail: &detail,
+                },
+            );
+            resp
+        }
     }
 }
 
 // ── streaming ────────────────────────────────────────────
 
-async fn run_stream(state: &AppState, req: &RunRequest) -> Response {
+async fn run_stream(
+    state: &AppState,
+    req: &RunRequest,
+    task_id: Option<&str>,
+    run_id: Option<&str>,
+    detail: &str,
+) -> Response {
     let Some(mesh) = state.mesh_client.as_ref().cloned() else {
         return bad_json(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -165,7 +265,7 @@ async fn run_stream(state: &AppState, req: &RunRequest) -> Response {
         deadline_secs,
         None,
         None,
-        None,
+        task_id.map(str::to_string),
         crate::tenant::current_tenant_or_none(),
     );
 
@@ -179,11 +279,31 @@ async fn run_stream(state: &AppState, req: &RunRequest) -> Response {
         }
     };
     if let Err(e) = write_request_envelope(&mut raw_stream, &envelope).await {
+        record_workflow_activity(
+            state,
+            WorkflowActivity {
+                task_id,
+                run_id,
+                method: "workflow.run.stream",
+                decision: "err",
+                detail,
+            },
+        );
         return bad_json(
             StatusCode::BAD_GATEWAY,
             &format!("write workflow.run.stream request: {e}"),
         );
     }
+    record_workflow_activity(
+        state,
+        WorkflowActivity {
+            task_id,
+            run_id,
+            method: "workflow.run.stream",
+            decision: "started",
+            detail,
+        },
+    );
     let reader = StreamReader::new(raw_stream);
 
     let sse_body = async_stream::stream! {
@@ -240,6 +360,16 @@ async fn run_stream(state: &AppState, req: &RunRequest) -> Response {
         HeaderValue::from_static("text/event-stream"),
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    if let Some(task_id) = task_id
+        && let Ok(value) = HeaderValue::from_str(task_id)
+    {
+        headers.insert("X-Relix-Task-Id", value);
+    }
+    if let Some(run_id) = run_id
+        && let Ok(value) = HeaderValue::from_str(run_id)
+    {
+        headers.insert("X-Relix-Run-Id", value);
+    }
     (StatusCode::OK, headers, body).into_response()
 }
 
@@ -278,11 +408,105 @@ fn json_response(status: StatusCode, body: Value) -> Response {
     (status, headers, bytes).into_response()
 }
 
+fn json_error((status, Json(err)): (StatusCode, Json<ApiError>)) -> Response {
+    bad_json(status, &err.error)
+}
+
+fn clean_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn clean_optional_id(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<String>, (StatusCode, Json<ApiError>)> {
+    let Some(clean) = clean_optional(value) else {
+        return Ok(None);
+    };
+    if clean.len() == 32 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(Some(clean))
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: format!("{field} must be 32 hex chars"),
+            }),
+        ))
+    }
+}
+
+fn attach_scope(value: &mut Value, task_id: Option<&str>, run_id: Option<&str>) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(task_id) = task_id {
+        obj.insert("task_id".into(), Value::String(task_id.to_string()));
+    }
+    if let Some(run_id) = run_id {
+        obj.insert("run_id".into(), Value::String(run_id.to_string()));
+    }
+}
+
+fn run_detail(name: &str, input_len: usize, stream: bool) -> String {
+    format!("method=workflow.run; name={name}; input_len={input_len}; stream={stream}")
+}
+
+struct WorkflowActivity<'a> {
+    task_id: Option<&'a str>,
+    run_id: Option<&'a str>,
+    method: &'a str,
+    decision: &'a str,
+    detail: &'a str,
+}
+
+fn record_workflow_activity(state: &AppState, activity: WorkflowActivity<'_>) {
+    let tenant_id = crate::tenant::current_tenant_or_none()
+        .as_deref()
+        .unwrap_or(DEFAULT_TENANT)
+        .to_string();
+    let actor = current_subject().unwrap_or_else(|| activity.method.to_string());
+    if let Err(e) = append_tool_invocation_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        ToolInvocationActivity {
+            tenant_id: &tenant_id,
+            actor: &actor,
+            peer: DEFAULT_PEER,
+            method: activity.method,
+            task_id: activity.task_id,
+            run_id: activity.run_id,
+            decision: activity.decision,
+            detail: activity.detail,
+        },
+    ) {
+        tracing::warn!(
+            error = %e,
+            method = activity.method,
+            "failed to append workflow activity"
+        );
+    }
+    if let (Some(rec), Some(task_id)) = (state.task_recorder.as_ref(), activity.task_id) {
+        let payload = format!(
+            "peer={DEFAULT_PEER} outcome={} {}",
+            activity.decision, activity.detail
+        );
+        let rec = rec.clone();
+        let task_id = task_id.to_string();
+        let event_type = activity.method.to_string();
+        tokio::spawn(async move {
+            rec.event(&task_id, &event_type, &payload).await;
+        });
+    }
+}
+
 async fn call_peer_json(
     state: &AppState,
     alias: &str,
     method: &str,
     arg: &[u8],
+    task_id: Option<&str>,
 ) -> Result<Value, Response> {
     let mesh = state.mesh_client.as_ref().ok_or_else(|| {
         bad_json(
@@ -298,7 +522,7 @@ async fn call_peer_json(
         deadline_secs,
         None,
         None,
-        None,
+        task_id.map(str::to_string),
         crate::tenant::current_tenant_or_none(),
     );
     let timeout = std::time::Duration::from_secs(deadline_secs as u64 + 5);
@@ -366,5 +590,66 @@ mod tests {
     fn falls_back_when_payload_has_no_event_field() {
         assert!(parse_event_name(r#"{"agent":"a"}"#).is_none());
         assert!(parse_event_name("not even json").is_none());
+    }
+
+    #[test]
+    fn run_request_accepts_task_and_run_context() {
+        let req: RunRequest = serde_json::from_value(serde_json::json!({
+            "name": "daily",
+            "input": "hello",
+            "stream": true,
+            "task_id": "0123456789abcdef0123456789abcdef",
+            "run_id": "run-1"
+        }))
+        .unwrap();
+        assert_eq!(
+            req.task_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(req.run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn clean_optional_id_rejects_invalid_task_id() {
+        assert!(clean_optional_id(None, "task_id").unwrap().is_none());
+        assert_eq!(
+            clean_optional_id(Some(" 0123456789abcdef0123456789abcdef "), "task_id")
+                .unwrap()
+                .as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        let err = clean_optional_id(Some("bad"), "task_id").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1.0.error, "task_id must be 32 hex chars");
+    }
+
+    #[test]
+    fn attach_scope_only_mutates_object_responses() {
+        let mut obj = serde_json::json!({"execution_id": "wf-1"});
+        attach_scope(
+            &mut obj,
+            Some("0123456789abcdef0123456789abcdef"),
+            Some("run-1"),
+        );
+        assert_eq!(obj["task_id"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(obj["run_id"], "run-1");
+
+        let mut scalar = Value::String("ok".into());
+        attach_scope(
+            &mut scalar,
+            Some("0123456789abcdef0123456789abcdef"),
+            Some("run-1"),
+        );
+        assert_eq!(scalar.as_str(), Some("ok"));
+    }
+
+    #[test]
+    fn run_detail_does_not_copy_workflow_input() {
+        let secret = "do not leak this workflow input";
+        let detail = run_detail("nightly", secret.len(), false);
+        assert!(detail.contains("name=nightly"));
+        assert!(detail.contains("input_len=31"));
+        assert!(detail.contains("stream=false"));
+        assert!(!detail.contains(secret));
     }
 }

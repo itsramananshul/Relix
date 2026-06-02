@@ -88,6 +88,11 @@ Current progress:
   optional `task_id`/`run_id`, stamp `task_id` into the mesh dispatch envelope,
   record durable activity without copying secret values or revoke reasons, and
   return scope metadata
+- workflow execution and cache reload (`POST /v1/workflows/run` and
+  `POST /v1/workflows/reload`) accept optional `task_id`/`run_id`, stamp
+  `task_id` into unary and streaming mesh dispatch envelopes, record durable
+  activity without copying workflow input, and return scope metadata through
+  JSON fields or SSE response headers
 - standalone CLI flow runs remain unbound unless the caller explicitly grows a
   task binding path
 
@@ -176,10 +181,10 @@ Unify scattered rings/logs/provenance into one durable activity ledger:
 - approval id: implemented for REST/dashboard and channel approval decisions
 - policy result: implemented for recent policy-denial rows with idempotent
   activity ids
-- memory, skill-store, and credential operations: implemented for the GAP 5
-  bridge memory-write proxies, standalone embedding writes, skill-store
-  mutations, and credential vault reads/mutations without logging raw
-  document/image/text/skill/secret payloads
+- memory, skill-store, credential, and workflow operations: implemented for the
+  GAP 5 bridge memory-write proxies, standalone embedding writes, skill-store
+  mutations, credential vault reads/mutations, and workflow run/reload calls
+  without logging raw document/image/text/skill/secret/workflow-input payloads
 - timestamp: implemented
 
 The operator question "what happened?" should not require scraping five
@@ -213,6 +218,7 @@ Current producers:
 - memory embedding writes from `/v1/memory/embed` and `/v1/memory/embed_all`
 - skill-store mutations from `/v1/skills`
 - credential vault reads and mutations from `/v1/credentials`
+- workflow execution and reload calls from `/v1/workflows`
 - outbound email sends from `/v1/email/send` and `/v1/email/send_template`
 - agent-message sends from `/v1/messages`
 
