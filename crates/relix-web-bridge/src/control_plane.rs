@@ -161,7 +161,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/tasks/:id/summary",
                 "/v1/tasks/:id/todos",
             ],
-            gap: "Chat, planning mutations, identity token/research mutations, belief reset, execution rollback, memory-write proxies, MCP invoke, screen-capture, browser-capture, plugin management mutations, standing approval mutations, outbound email, and agent-message send paths can attach to a task; remaining direct utility invocations still need forced task or explicit ad-hoc run binding.",
+            gap: "Chat, planning mutations, identity token/research mutations, belief reset, execution rollback, memory-write proxies, knowledge transfer mutations, MCP invoke, screen-capture, browser-capture, plugin management mutations, standing approval mutations, outbound email, and agent-message send paths can attach to a task; remaining direct utility invocations still need forced task or explicit ad-hoc run binding.",
         },
         SpineSurface {
             id: "runs",
@@ -240,7 +240,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/logs/stream",
                 "/v1/provenance/recent",
             ],
-            gap: "Durable activity JSONL now captures workspace, intervention, approval, standing-approval, budget-reset, identity-token/research, belief-reset, policy-denial, cost-observation, planning, execution rollback, memory-write/manual-curation, MCP, screen, browser-capture, plugin management, outbound email, and agent-message events; model and dispatch producers still need the same ledger path.",
+            gap: "Durable activity JSONL now captures workspace, intervention, approval, standing-approval, budget-reset, identity-token/research, belief-reset, policy-denial, cost-observation, planning, execution rollback, memory-write/manual-curation, knowledge-transfer, MCP, screen, browser-capture, plugin management, outbound email, and agent-message events; model and dispatch producers still need the same ledger path.",
         },
         SpineSurface {
             id: "memory",
@@ -252,9 +252,11 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/memory/records",
                 "/v1/memory/stats",
                 "/v1/knowledge/share",
+                "/v1/knowledge/broadcast",
+                "/v1/knowledge/revoke",
                 "/v1/knowledge/recall",
             ],
-            gap: "Bridge memory-write proxies and manual curator runs can carry task/run provenance; default binding still needs to expand into every background memory producer.",
+            gap: "Bridge memory-write proxies, knowledge transfer mutations, and manual curator runs can carry task/run provenance; default binding still needs to expand into every background memory producer.",
         },
         SpineSurface {
             id: "extensions",

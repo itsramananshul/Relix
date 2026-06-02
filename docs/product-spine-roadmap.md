@@ -84,6 +84,12 @@ Current progress:
   `/v1/memory/embed_all`) accept optional `task_id`/`run_id`, stamp `task_id`
   into the mesh dispatch envelope, record durable activity without copying raw
   text payloads, and return scope metadata
+- knowledge transfer mutations (`/v1/knowledge/share`,
+  `/v1/knowledge/broadcast`, `/v1/knowledge/revoke`, and
+  `/v1/knowledge/recall`) accept optional `task_id`/`run_id`, stamp `task_id`
+  into the mesh dispatch envelope, record durable activity without copying
+  shared messages or recalled context, and return scope metadata for object
+  responses
 - skill-store mutations (`POST /v1/skills`, `PATCH /v1/skills/{id}`, and
   `POST /v1/skills/{id}/deprecate`) accept optional `task_id`/`run_id`, stamp
   `task_id` into the mesh dispatch envelope, record durable activity without
@@ -223,13 +229,14 @@ Unify scattered rings/logs/provenance into one durable activity ledger:
   activity
 - policy result: implemented for recent policy-denial rows with idempotent
   activity ids
-- planning, execution rollback, memory, skill-store, credential, workflow,
-  delegation, and cron operations:
+- planning, execution rollback, memory, knowledge-transfer, skill-store,
+  credential, workflow, delegation, and cron operations:
   implemented for the GAP 5 bridge memory-write proxies, standalone embedding
-  writes, skill-store mutations, credential vault reads/mutations, workflow
-  run/reload calls, delegation spawn/cancel calls, scheduler mutations,
-  planning create/approve/reject calls, and execution rollback calls without
-  logging raw document/image/text/skill/secret/workflow-input/delegation/
+  writes, knowledge share/broadcast/revoke/recall calls, skill-store mutations,
+  credential vault reads/mutations, workflow run/reload calls, delegation
+  spawn/cancel calls, scheduler mutations, planning create/approve/reject
+  calls, and execution rollback calls without logging raw
+  document/image/text/knowledge-message/skill/secret/workflow-input/delegation/
   cron-prompt/spec/note payloads
 - timestamp: implemented
 - budget reset: implemented as task-aware governance activity
@@ -268,6 +275,7 @@ Current producers:
 - memory writes from GAP 5 bridge proxies
 - manual memory curation from `/v1/memory/curate`
 - memory embedding writes from `/v1/memory/embed` and `/v1/memory/embed_all`
+- knowledge share/broadcast/revoke/recall calls from `/v1/knowledge`
 - skill-store mutations from `/v1/skills`
 - credential vault reads and mutations from `/v1/credentials`
 - workflow execution and reload calls from `/v1/workflows`
