@@ -126,6 +126,14 @@ pub struct FlowOutcome {
     /// `task.create` call succeeded. `None` when the coordinator is
     /// absent or the call failed (fail-soft).
     pub task_id: Option<String>,
+    /// Durable workspace lease used for this run, when the caller
+    /// supplied `workspace_lease_id` and it resolved for the current
+    /// tenant.
+    pub workspace_lease_id: Option<String>,
+    /// Resolved workspace path from the durable lease. This is what
+    /// gets stamped onto dispatch envelopes for workspace-scoped
+    /// standing approvals.
+    pub workspace_path: Option<String>,
 }
 
 /// Categorised failure so handlers can pick the right HTTP status.
@@ -147,8 +155,10 @@ pub async fn execute_chat_flow(
     state: &AppState,
     session_id: &str,
     message: &str,
+    workspace_lease_id: Option<&str>,
 ) -> Result<FlowOutcome, FlowExecError> {
     validate_input(session_id, message).map_err(FlowExecError::InvalidInput)?;
+    let workspace = resolve_workspace_binding(state, workspace_lease_id)?;
 
     // B1.2: best-effort task creation. None when coordinator is absent
     // or the call failed (TaskRecorder logs the warning).
@@ -218,7 +228,7 @@ pub async fn execute_chat_flow(
         trace_id: Some(trace_id),
         task_id: task_id.clone(),
         session_id: Some(session_id.to_string()),
-        workspace_path: None,
+        workspace_path: workspace.workspace_path.clone(),
         chunk_observer: None,
         cancel_signal: None,
         last_confidence_cell: Some(relix_runtime::confidence::LastConfidenceCell::new()),
@@ -229,6 +239,7 @@ pub async fn execute_chat_flow(
         state.task_recorder.as_ref(),
         task_id,
         Some(session_id.to_string()),
+        workspace,
     )
     .await
 }
@@ -243,6 +254,7 @@ async fn finalize_flow_run(
     recorder: Option<&TaskRecorder>,
     task_id: Option<String>,
     session_id_for_turn: Option<String>,
+    workspace: WorkspaceBinding,
 ) -> Result<FlowOutcome, FlowExecError> {
     match res {
         Ok(result) => {
@@ -300,6 +312,8 @@ async fn finalize_flow_run(
                 trace_id,
                 flow_log_path,
                 task_id,
+                workspace_lease_id: workspace.workspace_lease_id,
+                workspace_path: workspace.workspace_path,
             })
         }
         Err(FlowRunnerError::Transport(m)) => {
@@ -346,6 +360,7 @@ pub async fn execute_chat_with_tool_flow(
     session_id: &str,
     message: &str,
     url: &str,
+    workspace_lease_id: Option<&str>,
 ) -> Result<FlowOutcome, FlowExecError> {
     let Some(tool_template) = state.tool_template.as_ref() else {
         return Err(FlowExecError::InvalidInput(
@@ -354,6 +369,7 @@ pub async fn execute_chat_with_tool_flow(
     };
     validate_input(session_id, message).map_err(FlowExecError::InvalidInput)?;
     validate_url(url).map_err(FlowExecError::InvalidInput)?;
+    let workspace = resolve_workspace_binding(state, workspace_lease_id)?;
 
     let task_id = create_task_fail_soft(
         state.task_recorder.as_ref(),
@@ -446,7 +462,7 @@ pub async fn execute_chat_with_tool_flow(
         trace_id: Some(trace_id),
         task_id: task_id.clone(),
         session_id: Some(session_id.to_string()),
-        workspace_path: None,
+        workspace_path: workspace.workspace_path.clone(),
         chunk_observer: None,
         cancel_signal: None,
         last_confidence_cell: Some(relix_runtime::confidence::LastConfidenceCell::new()),
@@ -457,6 +473,7 @@ pub async fn execute_chat_with_tool_flow(
         state.task_recorder.as_ref(),
         task_id,
         Some(session_id.to_string()),
+        workspace,
     )
     .await
 }
@@ -566,11 +583,13 @@ pub async fn execute_chat_flow_streaming(
     state: &AppState,
     session_id: &str,
     message: &str,
+    workspace_lease_id: Option<&str>,
     streaming_template: &str,
     on_chunk: relix_runtime::flow_runner::ChunkObserver,
     cancel_signal: relix_runtime::flow_runner::CancelSignal,
 ) -> Result<FlowOutcome, FlowExecError> {
     validate_input(session_id, message).map_err(FlowExecError::InvalidInput)?;
+    let workspace = resolve_workspace_binding(state, workspace_lease_id)?;
 
     let task_id = create_task_fail_soft(
         state.task_recorder.as_ref(),
@@ -631,7 +650,7 @@ pub async fn execute_chat_flow_streaming(
         trace_id: Some(trace_id),
         task_id: task_id.clone(),
         session_id: Some(session_id.to_string()),
-        workspace_path: None,
+        workspace_path: workspace.workspace_path.clone(),
         chunk_observer: Some(on_chunk),
         cancel_signal: Some(cancel_signal),
         last_confidence_cell: Some(relix_runtime::confidence::LastConfidenceCell::new()),
@@ -642,8 +661,30 @@ pub async fn execute_chat_flow_streaming(
         state.task_recorder.as_ref(),
         task_id,
         Some(session_id.to_string()),
+        workspace,
     )
     .await
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorkspaceBinding {
+    workspace_lease_id: Option<String>,
+    workspace_path: Option<String>,
+}
+
+fn resolve_workspace_binding(
+    state: &AppState,
+    workspace_lease_id: Option<&str>,
+) -> Result<WorkspaceBinding, FlowExecError> {
+    let Some(lease_id) = workspace_lease_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(WorkspaceBinding::default());
+    };
+    let lease = crate::workspaces::resolve_active_lease_for_current_tenant(state, lease_id)
+        .map_err(FlowExecError::InvalidInput)?;
+    Ok(WorkspaceBinding {
+        workspace_lease_id: Some(lease.lease_id),
+        workspace_path: Some(lease.workspace_path),
+    })
 }
 
 /// Truncate a string at `n` characters (not bytes), appending an

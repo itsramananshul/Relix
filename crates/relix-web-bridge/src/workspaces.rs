@@ -126,6 +126,16 @@ impl WorkspaceLeaseStore {
             .cloned()
     }
 
+    pub fn get_active(&self, tenant_id: &str, lease_id: &str) -> Result<WorkspaceLease, String> {
+        let lease = self
+            .get(tenant_id, lease_id)
+            .ok_or_else(|| format!("workspace lease not found: {lease_id}"))?;
+        if lease.cleanup_status != WorkspaceLeaseStatus::Active {
+            return Err(format!("workspace lease is not active: {lease_id}"));
+        }
+        Ok(lease)
+    }
+
     pub fn create(
         &mut self,
         tenant_id: &str,
@@ -239,6 +249,19 @@ pub async fn get(
     })
     .map(Json)
     .map_err(not_found)
+}
+
+/// Resolve a workspace lease for the tenant currently attached to
+/// the request scope. Execution paths use this instead of trusting a
+/// caller-supplied workspace path; workspace-scoped approvals must be
+/// tied to a durable lease the tenant actually owns.
+pub fn resolve_active_lease_for_current_tenant(
+    state: &AppState,
+    lease_id: &str,
+) -> Result<WorkspaceLease, String> {
+    let lease_id = clean_required(lease_id, "workspace_lease_id")?;
+    let tenant_id = tenant_id();
+    with_store(state, |store| store.get_active(&tenant_id, &lease_id))
 }
 
 pub async fn release(
@@ -452,5 +475,32 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, "workspace_path required");
+    }
+
+    #[test]
+    fn inactive_lease_is_not_execution_bindable() {
+        let mut store = WorkspaceLeaseStore::new(None).unwrap();
+        let lease = store
+            .create(
+                "default",
+                CreateWorkspaceLeaseRequest {
+                    workspace_path: "/tmp/repo".into(),
+                    owner_agent: "agt-1".into(),
+                    git_branch: None,
+                    sandbox_id: None,
+                    task_id: None,
+                    run_id: None,
+                    provision_command: None,
+                    teardown_command: None,
+                },
+            )
+            .unwrap();
+        let released = store.release("default", &lease.lease_id, None).unwrap();
+        assert_eq!(released.cleanup_status, WorkspaceLeaseStatus::Released);
+        let err = store.get_active("default", &lease.lease_id).unwrap_err();
+        assert_eq!(
+            err,
+            format!("workspace lease is not active: {}", lease.lease_id)
+        );
     }
 }

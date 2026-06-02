@@ -58,7 +58,9 @@ Remaining launch work:
 
 - make task creation fail-closed for production modes instead of fail-soft
 - bind plugin/MCP/direct bridge utility calls to tasks or explicit ad-hoc runs
-- attach workspace/run ids to the same execution context
+- attach run ids to the same execution context; bridge chat/OpenAI/WS paths
+  now accept a workspace lease id and stamp the resolved workspace path into
+  dispatch envelopes
 - expose the binding clearly in dashboard and SDK responses
 
 ## Phase 3: Scoped Approvals
@@ -77,7 +79,9 @@ Approval scopes:
 - one task: implemented via `scope_kind = "task"` and `task_id`
 - one session: implemented in the store/API and wired through bridge flow dispatch via `session_id`
 - one agent plus capability family: implemented via `scope_kind = "method_prefix"`
-- one workspace path: implemented in the store/API; dispatch has a `workspace_path` envelope field, but bridge workspace leases still need to populate it
+- one workspace path: implemented in the store/API; bridge chat/OpenAI/WS
+  paths resolve active workspace leases and stamp the resolved `workspace_path`
+  into dispatch envelopes
 - until a time limit: implemented through `expires_at`
 - until a budget limit: still missing
 
@@ -95,6 +99,8 @@ Relix needs first-class workspace leases:
 - teardown command: implemented as lease metadata, execution still missing
 - owner agent: implemented
 - active run: implemented as optional `run_id`, but not automatically bound yet
+- chat/OpenAI/WS execution binding: implemented through `workspace_lease_id`
+  request metadata resolved against active tenant-owned leases
 - cleanup status: implemented
 - failure reason: implemented
 

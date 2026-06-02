@@ -65,6 +65,11 @@ pub struct ChatCompletionRequest {
     #[allow(dead_code)]
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// Relix extension: durable workspace lease for this chat turn.
+    /// The bridge resolves this to a tenant-owned active lease before
+    /// stamping the workspace path onto dispatch envelopes.
+    #[serde(default)]
+    pub workspace_lease_id: Option<String>,
     /// Catch-all for unsupported fields (top_p, n, presence_penalty, …) so
     /// validation never rejects an OpenAI client over an inert parameter.
     #[serde(flatten)]
@@ -156,6 +161,10 @@ pub struct RelixExtension {
     /// stay clean.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_lease_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -319,14 +328,23 @@ pub async fn chat_completions(
     }
 
     let outcome = match tool_url.as_deref() {
-        Some(url) => {
-            execute_chat_with_tool_flow(&state, &translated.session_id, &translated.prompt, url)
-                .await
-                .map_err(exec_error_to_http)?
-        }
-        None => execute_chat_flow(&state, &translated.session_id, &translated.prompt)
-            .await
-            .map_err(exec_error_to_http)?,
+        Some(url) => execute_chat_with_tool_flow(
+            &state,
+            &translated.session_id,
+            &translated.prompt,
+            url,
+            req.workspace_lease_id.as_deref(),
+        )
+        .await
+        .map_err(exec_error_to_http)?,
+        None => execute_chat_flow(
+            &state,
+            &translated.session_id,
+            &translated.prompt,
+            req.workspace_lease_id.as_deref(),
+        )
+        .await
+        .map_err(exec_error_to_http)?,
     };
 
     // W8: derive the SHA-256 of the system prompt (empty
@@ -384,6 +402,8 @@ pub async fn chat_completions(
             outcome.trace_id.clone(),
             outcome.flow_log_path.clone(),
             outcome.task_id.clone(),
+            outcome.workspace_lease_id.clone(),
+            outcome.workspace_path.clone(),
             state.cfg.sse.chunk_bytes,
             Duration::from_millis(state.cfg.sse.chunk_delay_ms),
         );
@@ -420,6 +440,8 @@ pub async fn chat_completions(
                 flow_log: outcome.flow_log_path,
                 session_id: translated.session_id,
                 task_id: outcome.task_id,
+                workspace_lease_id: outcome.workspace_lease_id,
+                workspace_path: outcome.workspace_path,
             },
         };
         let mut http = Json(resp).into_response();
@@ -482,11 +504,13 @@ async fn chat_completions_streaming(
     let state_for_flow = state.clone();
     let session_id = translated.session_id.clone();
     let prompt = translated.prompt.clone();
+    let workspace_lease_id = req.workspace_lease_id.clone();
     let flow_handle = tokio::spawn(async move {
         let outcome = execute_chat_flow_streaming(
             &state_for_flow,
             &session_id,
             &prompt,
+            workspace_lease_id.as_deref(),
             &streaming_template,
             on_chunk,
             cancel_for_flow,
@@ -583,14 +607,23 @@ async fn chat_completions_streaming(
             Err(_) => None,
         };
 
-        let (real_flow_id, real_trace_id, real_flow_log, real_task_id) = match &outcome {
+        let (
+            real_flow_id,
+            real_trace_id,
+            real_flow_log,
+            real_task_id,
+            real_workspace_lease_id,
+            real_workspace_path,
+        ) = match &outcome {
             Some(o) => (
                 o.flow_id.clone(),
                 o.trace_id.clone(),
                 o.flow_log_path.clone(),
                 o.task_id.clone(),
+                o.workspace_lease_id.clone(),
+                o.workspace_path.clone(),
             ),
-            None => (String::new(), String::new(), String::new(), None),
+            None => (String::new(), String::new(), String::new(), None, None, None),
         };
 
         // Final finish frame + relix metadata.
@@ -604,6 +637,8 @@ async fn chat_completions_streaming(
             &real_flow_log,
             &session_for_stream,
             real_task_id.as_deref(),
+            real_workspace_lease_id.as_deref(),
+            real_workspace_path.as_deref(),
         )));
 
         // Two-sink observability + provenance — same shape as
@@ -706,6 +741,8 @@ pub(crate) fn streaming_finish_chunk_json(
     flow_log: &str,
     session_id: &str,
     task_id: Option<&str>,
+    workspace_lease_id: Option<&str>,
+    workspace_path: Option<&str>,
 ) -> String {
     serde_json::json!({
         "id": id,
@@ -723,6 +760,8 @@ pub(crate) fn streaming_finish_chunk_json(
             "flow_log": flow_log,
             "session_id": session_id,
             "task_id": task_id,
+            "workspace_lease_id": workspace_lease_id,
+            "workspace_path": workspace_path,
         },
     })
     .to_string()
@@ -1119,6 +1158,8 @@ fn build_openai_sse(
     trace_id: String,
     flow_log: String,
     task_id: Option<String>,
+    workspace_lease_id: Option<String>,
+    workspace_path: Option<String>,
     chunk_bytes: usize,
     chunk_delay: Duration,
 ) -> impl Stream<Item = Result<Event, Infallible>> + Send + 'static {
@@ -1176,6 +1217,8 @@ fn build_openai_sse(
                 "flow_log": flow_log,
                 "session_id": session_id,
                 "task_id": task_id,
+                "workspace_lease_id": workspace_lease_id,
+                "workspace_path": workspace_path,
             },
         });
         yield Ok(Event::default().data(relix_chunk.to_string()));
@@ -1437,6 +1480,7 @@ mod tests {
                 "model":"x",
                 "stream":false,
                 "messages":[{"role":"user","content":"hi"}],
+                "workspace_lease_id":"wsl_abc",
                 "presence_penalty":0.1,
                 "tool_choice":"auto",
                 "logprobs":true
@@ -1444,6 +1488,7 @@ mod tests {
         );
         let t = translate_request(&r).expect("ok");
         assert_eq!(t.prompt, "hi");
+        assert_eq!(r.workspace_lease_id.as_deref(), Some("wsl_abc"));
     }
 
     #[test]
@@ -1596,6 +1641,8 @@ mod tests {
             "/tmp/flow.log",
             "session-foo",
             Some("task-bar"),
+            Some("wsl-1"),
+            Some("/repo"),
         );
         let v = parse_chunk(&body);
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
@@ -1609,6 +1656,8 @@ mod tests {
         assert_eq!(relix["flow_log"], "/tmp/flow.log");
         assert_eq!(relix["session_id"], "session-foo");
         assert_eq!(relix["task_id"], "task-bar");
+        assert_eq!(relix["workspace_lease_id"], "wsl-1");
+        assert_eq!(relix["workspace_path"], "/repo");
     }
 
     #[test]
@@ -1621,6 +1670,8 @@ mod tests {
             "trace-id-hex",
             "/tmp/flow.log",
             "session-foo",
+            None,
+            None,
             None,
         );
         let v = parse_chunk(&body);
@@ -1664,6 +1715,8 @@ mod tests {
             "t1",
             "/tmp/f.log",
             "s1",
+            None,
+            None,
             None,
         ));
         // Decode every JSON frame (asserts shape) +
@@ -1713,6 +1766,8 @@ mod tests {
                 flow_log: "/tmp/f.log".to_string(),
                 session_id: "s1".to_string(),
                 task_id: None,
+                workspace_lease_id: None,
+                workspace_path: None,
             },
         }
     }
