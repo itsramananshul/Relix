@@ -347,9 +347,16 @@ GET /v1/control-plane/dashboard
 ```
 
 The current dashboard now consumes the dashboard manifest and annotates sidebar
-surfaces with spine ids/status. The remaining work is the real split: move each
-surface into maintainable modules without losing the strict single-page CSP and
-auth bootstrap guarantees.
+surfaces with spine ids/status, and renders a visible per-section spine-status
+badge (ready / partial / missing) driven by the manifest — so navigation
+reflects the real control-plane contract at a glance instead of only a hover
+tooltip. Internally each product surface is already a self-contained render
+module in the `Loaders` registry, dispatched by `navigate -> loadSection`, with
+the `SECTIONS` array as the nav registry; the badge rendering uses the safe
+`el()` DOM builder so the strict single-page CSP and no-`innerHTML` guarantees
+hold. The remaining work is the cosmetic file-level split (extracting each
+`Loaders.*` module to its own source unit) without losing the single inline
+artifact — a maintainability refactor, not a contract change.
 
 ## Phase 7: Tenant as a Hard Invariant
 

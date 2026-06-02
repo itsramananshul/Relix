@@ -57,6 +57,10 @@ input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); ou
 .nav-item.active { background: var(--row-hover); border-left-color: var(--accent); color: var(--text-strong); font-weight: 600; }
 .nav-item .nav-icon { width: 18px; text-align: center; opacity: 0.85; font-size: 13px; }
 .nav-item .nav-num { width: 22px; text-align: right; color: var(--text-dim); font-variant-numeric: tabular-nums; font-size: 11px; }
+.nav-item .nav-spine-badge { margin-left: auto; font-size: 9px; line-height: 1; padding: 2px 5px; border-radius: 6px; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; color: #fff; opacity: 0.9; }
+.nav-item .nav-spine-badge.ok { background: var(--ok, #2e7d32); }
+.nav-item .nav-spine-badge.warn { background: var(--warn, #b26a00); }
+.nav-item .nav-spine-badge.err { background: var(--err, #c62828); }
 .sidebar-footer { padding: 10px 16px; border-top: 1px solid var(--border); font-size: 11px; color: var(--text-dim); }
 .hamburger { display: none; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; }
 main { padding: 24px; min-width: 0; }
@@ -744,7 +748,41 @@ function applyDashboardManifest(manifest) {
     item.setAttribute('data-spine-status', statuses);
     item.setAttribute('data-spine-source', manifest.source || 'control-plane-spine');
     item.setAttribute('title', title);
+    // Make the product contract VISIBLE, not just a hover tooltip: a
+    // small badge on the nav item shows the worst spine status across
+    // the surfaces backing that section (ready / partial / missing).
+    // This is what makes navigation reflect the real control-plane
+    // contract instead of hard-coded guesses.
+    var worst = surfaces.reduce(function (acc, s) {
+      var rank = spineBadgeRank(s.status);
+      return rank > acc.rank ? { rank: rank, status: s.status } : acc;
+    }, { rank: 0, status: null });
+    setNavSpineBadge(item, worst.status, worst.rank);
   }
+}
+
+// Map a spine status string to a severity rank (higher = worse) so a
+// section backed by several surfaces surfaces its weakest one.
+function spineBadgeRank(status) {
+  var s = String(status || '').toLowerCase();
+  if (/missing|absent|planned|todo|none|unimplemented/.test(s)) return 3;
+  if (/partial|started|progress|degraded|beta|wip/.test(s)) return 2;
+  return 1; // implemented / ready / ok / done / stable
+}
+
+function spineBadgeClass(rank) {
+  return rank >= 3 ? 'err' : (rank >= 2 ? 'warn' : 'ok');
+}
+
+// Idempotently set (or refresh) the visible spine-status badge on a
+// nav item. Uses the safe el() DOM builder — never innerHTML.
+function setNavSpineBadge(item, status, rank) {
+  var existing = item.querySelector('.nav-spine-badge');
+  if (existing) item.removeChild(existing);
+  if (!status) return;
+  item.appendChild(el('span', {
+    class: 'nav-spine-badge ' + spineBadgeClass(rank || spineBadgeRank(status))
+  }, spineStatusLabel(status)));
 }
 
 function loadControlPlane() {

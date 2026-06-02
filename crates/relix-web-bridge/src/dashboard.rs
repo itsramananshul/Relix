@@ -430,6 +430,44 @@ mod tests {
         );
     }
 
+    /// Phase 6 — the manifest must drive a VISIBLE spine-status badge
+    /// on each nav item, not just a hover tooltip, so navigation
+    /// reflects the real product contract. Assert the rendering hook,
+    /// the severity mapping, and the badge CSS are all present.
+    #[tokio::test]
+    async fn page_renders_visible_spine_status_badge_from_manifest() {
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("function setNavSpineBadge("),
+            "missing visible nav badge renderer"
+        );
+        assert!(
+            body.contains("function spineBadgeRank("),
+            "missing spine status severity mapping"
+        );
+        // The renderer is actually invoked from manifest application.
+        assert!(
+            body.contains("setNavSpineBadge(item"),
+            "applyDashboardManifest does not render the visible badge"
+        );
+        // The badge has styling for all three severities.
+        for cls in [
+            ".nav-spine-badge.ok",
+            ".nav-spine-badge.warn",
+            ".nav-spine-badge.err",
+        ] {
+            assert!(body.contains(cls), "missing badge style {cls}");
+        }
+        // Built via the safe DOM builder, never innerHTML (covered by
+        // page_javascript_has_no_innerhtml_assignment too).
+        assert!(
+            body.contains("class: 'nav-spine-badge '"),
+            "badge is not built with the safe el() builder"
+        );
+    }
+
     /// P4 test: "Dashboard with no token shows the auth error
     /// screen and makes no further requests." We assert the
     /// shape of the bootstrap path: when /v1/auth/token returns
