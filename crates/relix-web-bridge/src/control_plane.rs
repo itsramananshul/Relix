@@ -147,7 +147,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/agents/:agent_id/token",
                 "/v1/agents/:agent_id/standing-approvals",
             ],
-            gap: "Agent records need budget, workspace, and default runtime binding in one canonical shape.",
+            gap: "Agent records and identity token mutations can carry task/run provenance; budget, workspace, and default runtime binding still need one canonical agent shape.",
         },
         SpineSurface {
             id: "tasks",
@@ -161,7 +161,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/tasks/:id/summary",
                 "/v1/tasks/:id/todos",
             ],
-            gap: "Chat, planning mutations, execution rollback, memory-write proxies, MCP invoke, screen-capture, browser-capture, plugin management mutations, standing approval mutations, outbound email, and agent-message send paths can attach to a task; remaining direct utility invocations still need forced task or explicit ad-hoc run binding.",
+            gap: "Chat, planning mutations, identity token/research mutations, execution rollback, memory-write proxies, MCP invoke, screen-capture, browser-capture, plugin management mutations, standing approval mutations, outbound email, and agent-message send paths can attach to a task; remaining direct utility invocations still need forced task or explicit ad-hoc run binding.",
         },
         SpineSurface {
             id: "runs",
@@ -240,7 +240,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/logs/stream",
                 "/v1/provenance/recent",
             ],
-            gap: "Durable activity JSONL now captures workspace, intervention, approval, standing-approval, budget-reset, policy-denial, cost-observation, planning, execution rollback, memory-write, MCP, screen, browser-capture, plugin management, outbound email, and agent-message events; model and dispatch producers still need the same ledger path.",
+            gap: "Durable activity JSONL now captures workspace, intervention, approval, standing-approval, budget-reset, identity-token/research, policy-denial, cost-observation, planning, execution rollback, memory-write, MCP, screen, browser-capture, plugin management, outbound email, and agent-message events; model and dispatch producers still need the same ledger path.",
         },
         SpineSurface {
             id: "memory",
