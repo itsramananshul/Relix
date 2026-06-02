@@ -221,6 +221,38 @@ impl WorkspaceLeaseStore {
         Ok(out)
     }
 
+    /// Phase 4 — bind the active durable task (and optional run) onto
+    /// a lease so the workspace reflects which work is currently using
+    /// it. Only mutates an active lease and bumps `updated_at_ms`;
+    /// re-binding the same task is idempotent in effect.
+    pub fn bind_active_run(
+        &mut self,
+        tenant_id: &str,
+        lease_id: &str,
+        task_id: &str,
+        run_id: Option<&str>,
+    ) -> Result<WorkspaceLease, String> {
+        let tenant_id = clean_required(tenant_id, "tenant_id")?;
+        let task_id = clean_required(task_id, "task_id")?;
+        let now = now_ms();
+        let lease = self
+            .leases
+            .get_mut(lease_id)
+            .filter(|lease| lease.tenant_id == tenant_id)
+            .ok_or_else(|| format!("workspace lease not found: {lease_id}"))?;
+        if lease.cleanup_status != WorkspaceLeaseStatus::Active {
+            return Err(format!("workspace lease is not active: {lease_id}"));
+        }
+        lease.task_id = Some(task_id);
+        if let Some(run) = run_id.map(str::trim).filter(|s| !s.is_empty()) {
+            lease.run_id = Some(run.to_string());
+        }
+        lease.updated_at_ms = now;
+        let out = lease.clone();
+        self.persist()?;
+        Ok(out)
+    }
+
     fn persist(&self) -> Result<(), String> {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
@@ -318,6 +350,36 @@ pub fn resolve_active_lease_for_current_tenant(
     let lease_id = clean_required(lease_id, "workspace_lease_id")?;
     let tenant_id = tenant_id();
     with_store(state, |store| store.get_active(&tenant_id, &lease_id))
+}
+
+/// Phase 4 — bind a created task (and optional run) onto a workspace
+/// lease the current tenant owns, recording a durable activity row.
+///
+/// Execution paths call this AFTER `task.create` so the workspace's
+/// "active run" reflects the work currently using it. The lease is
+/// resolved against the verified per-request tenant, so a caller can
+/// only bind tasks onto their own leases.
+pub fn bind_active_run_for_current_tenant(
+    state: &AppState,
+    lease_id: &str,
+    task_id: &str,
+    run_id: Option<&str>,
+) -> Result<WorkspaceLease, String> {
+    let lease_id = clean_required(lease_id, "workspace_lease_id")?;
+    let tenant_id = tenant_id();
+    let lease = with_store(state, |store| {
+        store.bind_active_run(&tenant_id, &lease_id, task_id, run_id)
+    })?;
+    if let Err(e) = crate::activity::append_workspace_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        &lease,
+        "workspace.bind_run",
+        "ok",
+        format!("task_id={task_id}"),
+    ) {
+        tracing::warn!(error = %e, lease_id = %lease.lease_id, "activity ledger: workspace bind_run append failed");
+    }
+    Ok(lease)
 }
 
 pub async fn release(
@@ -617,6 +679,49 @@ mod tests {
             .expect("release");
         assert_eq!(released.cleanup_status, WorkspaceLeaseStatus::Released);
         assert!(released.released_at_ms.is_some());
+    }
+
+    #[test]
+    fn bind_active_run_stamps_task_onto_active_lease() {
+        let mut store = WorkspaceLeaseStore::new(None).unwrap();
+        let lease = store
+            .create(
+                "tenant-a",
+                CreateWorkspaceLeaseRequest {
+                    workspace_path: "/tmp/repo".into(),
+                    owner_agent: "agt-1".into(),
+                    git_branch: None,
+                    sandbox_id: None,
+                    task_id: None,
+                    run_id: None,
+                    provision_command: None,
+                    teardown_command: None,
+                },
+            )
+            .unwrap();
+        assert!(lease.task_id.is_none());
+
+        let bound = store
+            .bind_active_run("tenant-a", &lease.lease_id, "task-9", Some("run-9"))
+            .expect("bind");
+        assert_eq!(bound.task_id.as_deref(), Some("task-9"));
+        assert_eq!(bound.run_id.as_deref(), Some("run-9"));
+        assert!(bound.updated_at_ms >= lease.updated_at_ms);
+
+        // Cross-tenant bind is rejected: the lease belongs to tenant-a.
+        assert!(
+            store
+                .bind_active_run("tenant-b", &lease.lease_id, "task-x", None)
+                .is_err()
+        );
+
+        // Released leases can no longer be bound.
+        store.release("tenant-a", &lease.lease_id, None).unwrap();
+        assert!(
+            store
+                .bind_active_run("tenant-a", &lease.lease_id, "task-10", None)
+                .is_err()
+        );
     }
 
     #[test]

@@ -210,7 +210,10 @@ Relix needs first-class workspace leases:
 - teardown command: implemented and executed before lease release; failures
   mark the lease `cleanup_failed`
 - owner agent: implemented
-- active run: implemented as optional `run_id`, but not automatically bound yet
+- active run: implemented as optional `run_id`; chat/OpenAI/WS flows now
+  automatically bind the created coordinator task onto the resolved
+  workspace lease (`workspace.bind_run` activity), so a lease's
+  `task_id`/`run_id` reflect the work currently using it
 - chat/OpenAI/WS execution binding: implemented through `workspace_lease_id`
   request metadata resolved against active tenant-owned leases
 - cleanup status: implemented

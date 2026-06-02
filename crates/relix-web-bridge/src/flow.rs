@@ -191,6 +191,9 @@ pub async fn execute_chat_flow(
         rec.event(tid, "capability.invoked", "method=ai.chat peer=ai")
             .await;
     }
+    // Phase 4: bind the created task to the workspace lease (if any)
+    // so the lease's active-run fields reflect the work using it.
+    bind_workspace_active_run(state, &workspace, task_id.as_deref());
     // W5: record the user turn in the chronicle so
     // task.session_export can reconstruct the transcript.
     record_chat_turn(
@@ -417,6 +420,8 @@ pub async fn execute_chat_with_tool_flow(
         rec.event(tid, "capability.invoked", "method=ai.chat peer=ai")
             .await;
     }
+    // Phase 4: bind the created task to the workspace lease (if any).
+    bind_workspace_active_run(state, &workspace, task_id.as_deref());
     // W5: record the user turn for the tool-augmented flow too.
     record_chat_turn(
         state.task_recorder.as_ref(),
@@ -640,6 +645,8 @@ pub async fn execute_chat_flow_streaming(
         rec.event(tid, "capability.invoked", "method=ai.chat.stream peer=ai")
             .await;
     }
+    // Phase 4: bind the created task to the workspace lease (if any).
+    bind_workspace_active_run(state, &workspace, task_id.as_deref());
     record_chat_turn(
         state.task_recorder.as_ref(),
         task_id.as_ref(),
@@ -703,6 +710,25 @@ pub async fn execute_chat_flow_streaming(
 struct WorkspaceBinding {
     workspace_lease_id: Option<String>,
     workspace_path: Option<String>,
+}
+
+/// Phase 4 — when a chat created a durable task AND bound a workspace
+/// lease, stamp the task onto the lease so the workspace's "active
+/// run" reflects the work currently using it. Best-effort: a binding
+/// failure is logged and never fails the chat itself.
+fn bind_workspace_active_run(
+    state: &AppState,
+    workspace: &WorkspaceBinding,
+    task_id: Option<&str>,
+) {
+    let (Some(lease_id), Some(tid)) = (workspace.workspace_lease_id.as_deref(), task_id) else {
+        return;
+    };
+    if let Err(e) =
+        crate::workspaces::bind_active_run_for_current_tenant(state, lease_id, tid, None)
+    {
+        tracing::warn!(error = %e, lease_id, task_id = tid, "workspace active-run bind failed");
+    }
 }
 
 fn resolve_workspace_binding(
