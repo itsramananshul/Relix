@@ -128,6 +128,10 @@ Current progress:
   optional `task_id`/`run_id`, stamp `task_id` into mesh dispatch envelopes,
   record durable activity without logging issued token values or research
   subject/context text, and return scope metadata for object responses
+- belief reset (`POST /v1/belief/{session_id}` with `{"action":"reset"}`)
+  accepts optional `task_id`/`run_id`, stamps `task_id` into the mesh dispatch
+  envelope, records durable activity, appends best-effort task events for bound
+  calls, and returns scope metadata for object responses
 - standalone CLI flow runs remain unbound unless the caller explicitly grows a
   task binding path
 
@@ -253,6 +257,7 @@ Current producers:
 - budget reset calls from `/v1/budget/reset`
 - identity token issue/revoke and research-backed identity calls from
   `/v1/identity`
+- belief reset calls from `/v1/belief/{session_id}`
 - policy denials discovered through `/v1/policy/denials`
 - cost aggregate observations from `/v1/metrics/cost`
 - MCP invocations from `/v1/mcp/invoke`
