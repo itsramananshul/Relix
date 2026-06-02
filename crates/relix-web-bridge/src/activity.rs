@@ -19,7 +19,12 @@ use axum::{
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 
-use crate::{config::AppState, intervention_audit::InterventionEntry, workspaces::WorkspaceLease};
+use crate::{
+    config::AppState,
+    intervention_audit::InterventionEntry,
+    tenant::{DEFAULT_TENANT, current_tenant},
+    workspaces::WorkspaceLease,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActivityEntry {
@@ -138,8 +143,20 @@ type ErrorReply = (StatusCode, Json<ApiError>);
 
 pub async fn recent(
     State(state): State<AppState>,
-    Query(q): Query<ActivityQuery>,
+    Query(mut q): Query<ActivityQuery>,
 ) -> Result<Json<ActivityRecentResponse>, ErrorReply> {
+    // Phase 7 — tenant as a hard invariant. The activity ledger is
+    // tenant-owned audit data, so a caller may only ever read their
+    // OWN tenant's rows. We deliberately IGNORE any caller-supplied
+    // `tenant_id` query filter and force the verified per-request
+    // tenant the middleware resolved. In multi-tenant mode the
+    // middleware already rejected unbound credentials with 401, so
+    // `current_tenant()` is the caller's real, verified tenant; in
+    // single-tenant mode it is the `default` sentinel and every row
+    // is scoped to it. This closes the cross-tenant audit read where
+    // `?tenant_id=<victim>` (or an omitted filter) would otherwise
+    // expose another tenant's "what happened?" ledger.
+    enforce_read_tenant(&mut q);
     let Some(path) = activity_path_for_state(&state) else {
         return Ok(Json(ActivityRecentResponse {
             items: Vec::new(),
@@ -403,6 +420,15 @@ pub fn append_task_control_activity(
 
 pub fn activity_path_from_intervention_path(path: &Path) -> PathBuf {
     path.with_file_name("bridge-activity.jsonl")
+}
+
+/// Phase 7 — force the activity-read tenant filter to the verified
+/// per-request tenant, discarding any caller-supplied `tenant_id`.
+/// Extracted so the security property (a caller can never widen the
+/// read past their own tenant) is unit-testable without standing up
+/// a full `AppState`.
+fn enforce_read_tenant(q: &mut ActivityQuery) {
+    q.tenant_id = Some(current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string()));
 }
 
 fn activity_path_for_state(state: &AppState) -> Option<PathBuf> {
@@ -934,5 +960,43 @@ mod tests {
         assert_eq!(items[0].run_id.as_deref(), Some("run-1"));
         assert_eq!(items[0].method.as_deref(), Some("task.pause"));
         assert!(items[0].detail.contains("flow_still_running=true"));
+    }
+
+    // Phase 7 — tenant as a hard invariant for the activity ledger.
+    // A caller may never read past their own tenant: the handler
+    // forces the read filter to the verified per-request tenant and
+    // discards any caller-supplied `tenant_id`.
+    #[tokio::test]
+    async fn read_tenant_is_forced_to_verified_tenant_not_caller_supplied() {
+        // Caller is verified as tenant-a but asks for tenant-b's rows.
+        let mut q = ActivityQuery {
+            limit: None,
+            tenant_id: Some("tenant-b".into()),
+            source: None,
+            task_id: None,
+        };
+        crate::tenant::CURRENT_TENANT
+            .scope("tenant-a".to_string(), async {
+                enforce_read_tenant(&mut q);
+            })
+            .await;
+        // The spoofed tenant-b filter was overwritten with the
+        // verified tenant-a, so the read can only ever see tenant-a.
+        assert_eq!(q.tenant_id.as_deref(), Some("tenant-a"));
+    }
+
+    #[tokio::test]
+    async fn read_tenant_falls_back_to_default_outside_middleware_scope() {
+        // No middleware scope bound (single-tenant / direct call):
+        // the filter is pinned to the `default` sentinel, never left
+        // open to read every tenant's rows.
+        let mut q = ActivityQuery {
+            limit: None,
+            tenant_id: None,
+            source: None,
+            task_id: None,
+        };
+        enforce_read_tenant(&mut q);
+        assert_eq!(q.tenant_id.as_deref(), Some(DEFAULT_TENANT));
     }
 }
