@@ -59,6 +59,7 @@ pub async fn run(
         capability_cache: None,
         mesh_client: None,
         trace_id: None,
+        task_id: None,
         chunk_observer: None,
         cancel_signal: None,
         last_confidence_cell: None,

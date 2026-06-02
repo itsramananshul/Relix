@@ -776,6 +776,7 @@ async fn real_dispatcher_remote_call_stream_honours_cancel_signal() {
         capability_cache: None,
         mesh_client: None,
         trace_id: Some(TraceId::new()),
+        task_id: None,
         chunk_observer: None,
         cancel_signal: Some(cancel_signal),
         last_confidence_cell: None,

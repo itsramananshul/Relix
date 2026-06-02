@@ -29,6 +29,8 @@ exist, which are partial, and which are missing.
 
 ## Phase 2: Task-Bound Execution
 
+Status: started.
+
 Every high-risk execution path must carry task/run context:
 
 - `ai.chat`
@@ -41,6 +43,23 @@ Every high-risk execution path must carry task/run context:
 
 Anonymous capability execution should become an explicit ad-hoc run, not a
 silent side path.
+
+Current progress:
+
+- bridge chat / tool-chat / OpenAI shim flows create a coordinator task when
+  the recorder is wired
+- flow-issued unary and streaming `remote_call` envelopes now carry that
+  `task_id`, so responder-side approval gates can bind risky calls back to the
+  durable task
+- standalone CLI flow runs remain unbound unless the caller explicitly grows a
+  task binding path
+
+Remaining launch work:
+
+- make task creation fail-closed for production modes instead of fail-soft
+- bind plugin/MCP/direct bridge utility calls to tasks or explicit ad-hoc runs
+- attach workspace/run ids to the same execution context
+- expose the binding clearly in dashboard and SDK responses
 
 ## Phase 3: Scoped Approvals
 
