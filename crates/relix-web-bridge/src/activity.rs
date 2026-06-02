@@ -117,6 +117,18 @@ pub struct ToolInvocationActivity<'a> {
     pub detail: &'a str,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TaskControlActivity<'a> {
+    pub tenant_id: &'a str,
+    pub actor: &'a str,
+    pub action: &'a str,
+    pub task_id: Option<&'a str>,
+    pub run_id: Option<&'a str>,
+    pub target: &'a str,
+    pub decision: &'a str,
+    pub detail: &'a str,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ApiError {
     pub error: String,
@@ -356,6 +368,35 @@ pub fn append_tool_invocation_activity(
             policy_result: None,
             cost_micros: None,
             detail: format!("peer={}; {}", invocation.peer, invocation.detail),
+        },
+    )
+}
+
+pub fn append_task_control_activity(
+    data_dir: Option<&Path>,
+    activity: TaskControlActivity<'_>,
+) -> Result<(), String> {
+    let Some(path) = data_dir.map(activity_path_for_data_dir) else {
+        return Ok(());
+    };
+    append_entry(
+        &path,
+        &ActivityEntry {
+            activity_id: new_activity_id(),
+            ts_ms: now_ms(),
+            source: "task".into(),
+            actor: activity.actor.into(),
+            tenant_id: activity.tenant_id.into(),
+            task_id: activity.task_id.map(str::to_string),
+            run_id: activity.run_id.map(str::to_string),
+            action: activity.action.into(),
+            target: activity.target.into(),
+            decision: activity.decision.into(),
+            method: Some(activity.action.into()),
+            approval_id: None,
+            policy_result: None,
+            cost_micros: None,
+            detail: activity.detail.into(),
         },
     )
 }
@@ -860,5 +901,38 @@ mod tests {
         assert_eq!(items[0].run_id.as_deref(), Some("run-1"));
         assert_eq!(items[0].method.as_deref(), Some("tool.screen"));
         assert!(items[0].detail.contains("region=full"));
+    }
+
+    #[test]
+    fn task_control_activity_keeps_tenant_task_and_run_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        append_task_control_activity(
+            Some(tmp.path()),
+            TaskControlActivity {
+                tenant_id: "tenant-a",
+                actor: "operator-1",
+                action: "task.pause",
+                task_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                run_id: Some("run-1"),
+                target: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                decision: "ok",
+                detail: "prior_status=running; flow_still_running=true",
+            },
+        )
+        .unwrap();
+
+        let q = ActivityQuery {
+            limit: None,
+            tenant_id: Some("tenant-a".into()),
+            source: Some("task".into()),
+            task_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+        };
+        let items = read_recent(&activity_path_for_data_dir(tmp.path()), &q, 10).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].action, "task.pause");
+        assert_eq!(items[0].target, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(items[0].run_id.as_deref(), Some("run-1"));
+        assert_eq!(items[0].method.as_deref(), Some("task.pause"));
+        assert!(items[0].detail.contains("flow_still_running=true"));
     }
 }

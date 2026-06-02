@@ -44,8 +44,10 @@ use axum::{
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
+use crate::activity::{TaskControlActivity, append_task_control_activity};
 use crate::config::AppState;
 use crate::intervention_audit::new_correlation_id;
+use crate::tenant::{DEFAULT_TENANT, current_subject, current_tenant};
 
 /// Compact task line returned by `GET /v1/tasks`.
 #[derive(Debug, Serialize)]
@@ -365,6 +367,14 @@ pub async fn recover(
             "no coordinator configured",
             corr,
         );
+        record_task_control_activity(
+            &state,
+            "task.recover",
+            None,
+            "all",
+            "error",
+            "no coordinator configured",
+        );
         return Err(no_coordinator());
     };
     let body = match rec.recover().await {
@@ -377,6 +387,14 @@ pub async fn recover(
                 "error",
                 format!("coord call failed: {e}"),
                 corr,
+            );
+            record_task_control_activity(
+                &state,
+                "task.recover",
+                None,
+                "all",
+                "error",
+                "coordinator call failed",
             );
             return Err((StatusCode::BAD_GATEWAY, Json(ApiError { error: e })));
         }
@@ -398,6 +416,14 @@ pub async fn recover(
     state
         .intervention_audit
         .record_with_id("anon", "recover", "all", "ok", detail, corr);
+    record_task_control_activity(
+        &state,
+        "task.recover",
+        None,
+        "all",
+        "ok",
+        format!("recovered_count={count}"),
+    );
     Ok(Json(RecoverResponse {
         recovered: ids,
         count,
@@ -524,6 +550,14 @@ pub async fn cancel(
             format!("coord cancel failed: {e}"),
             corr,
         );
+        record_task_control_activity(
+            &state,
+            "task.cancel",
+            Some(&id),
+            &id,
+            "error",
+            "coordinator task.cancel failed",
+        );
         return Err((gateway_status_for(&e), Json(ApiError { error: e })));
     }
     let flow_still_running = matches!(prior_status.as_str(), "running" | "retrying");
@@ -543,6 +577,17 @@ pub async fn cancel(
     state
         .intervention_audit
         .record_with_id("anon", "cancel", &id, "ok", detail, corr);
+    record_task_control_activity(
+        &state,
+        "task.cancel",
+        Some(&id),
+        &id,
+        "ok",
+        format!(
+            "prior_status={prior_status}; new_status=cancelled; reason_len={}; flow_still_running={flow_still_running}",
+            reason.len()
+        ),
+    );
     Ok(Json(CancelResp {
         task_id: id,
         prior_status,
@@ -593,6 +638,14 @@ pub async fn retry(
                 format!("non-retryable failure_class={c}"),
                 corr,
             );
+            record_task_control_activity(
+                &state,
+                "task.retry",
+                Some(&id),
+                &id,
+                "refused",
+                format!("failure_class={c}; force=false"),
+            );
             return Ok(Json(RetryResponse {
                 outcome: "refused".to_string(),
                 detail: format!(
@@ -616,6 +669,14 @@ pub async fn retry(
                 format!("coord retry failed: {e}"),
                 corr,
             );
+            record_task_control_activity(
+                &state,
+                "task.retry",
+                Some(&id),
+                &id,
+                "error",
+                format!("coordinator task.retry failed; force={force}"),
+            );
             return Err((gateway_status_for(&e), Json(ApiError { error: e })));
         }
     };
@@ -633,6 +694,25 @@ pub async fn retry(
         outcome_label,
         format!("{}{}", parsed.detail, force_suffix),
         corr,
+    );
+    record_task_control_activity(
+        &state,
+        "task.retry",
+        Some(&id),
+        &id,
+        outcome_label,
+        format!(
+            "outcome={}; force={force}; attempt={}; of_budget={}",
+            parsed.outcome,
+            parsed
+                .attempt
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
+            parsed
+                .of_budget
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into())
+        ),
     );
     Ok(Json(parsed))
 }
@@ -704,11 +784,27 @@ pub async fn replay(
                 format!("coord replay failed: {e}"),
                 corr,
             );
+            record_task_control_activity(
+                &state,
+                "task.replay",
+                Some(&id),
+                &id,
+                "error",
+                "coordinator task.replay failed",
+            );
             return Err((gateway_status_for(&e), Json(ApiError { error: e })));
         }
     };
     let new_task_id = body.trim().to_string();
     if new_task_id.is_empty() {
+        record_task_control_activity(
+            &state,
+            "task.replay",
+            Some(&id),
+            &id,
+            "error",
+            "coordinator returned empty replay task id",
+        );
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ApiError {
@@ -723,6 +819,14 @@ pub async fn replay(
         "ok",
         format!("new_task_id={new_task_id}"),
         corr,
+    );
+    record_task_control_activity(
+        &state,
+        "task.replay",
+        Some(&id),
+        &id,
+        "ok",
+        format!("new_task_id={new_task_id}"),
     );
     Ok(Json(ReplayResponse {
         original_task_id: id,
@@ -2564,6 +2668,39 @@ fn no_coordinator() -> (StatusCode, Json<ApiError>) {
             error: "coordinator not configured ([coordinator] alias missing)".into(),
         }),
     )
+}
+
+fn record_task_control_activity(
+    state: &AppState,
+    action: &str,
+    task_id: Option<&str>,
+    target: &str,
+    decision: &str,
+    detail: impl Into<String>,
+) {
+    let tenant = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    let actor = current_subject().unwrap_or_else(|| "anon".to_string());
+    let detail = detail.into();
+    if let Err(e) = append_task_control_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        TaskControlActivity {
+            tenant_id: &tenant,
+            actor: &actor,
+            action,
+            task_id,
+            run_id: None,
+            target,
+            decision,
+            detail: &detail,
+        },
+    ) {
+        tracing::warn!(
+            action,
+            target,
+            error = %e,
+            "task control activity append failed"
+        );
+    }
 }
 
 /// Distinguish "not found" from generic gateway errors when the
