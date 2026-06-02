@@ -1,5 +1,17 @@
 # Dashboard redesign
 
+> **Historical design contract (superseded 2026-06-02).** This is the
+> design doc written before the console was built. The shipped result
+> diverged from it: the dashboard
+> (`crates/relix-web-bridge/src/dashboard.html`) is a twenty-two-panel
+> single-page app selected from a sidebar, with no `#/...` hash
+> routing and no `#/tasks`, `#/overview`, or `#/topology` routes. A
+> Tasks panel exists, but the `#/...` routes, the
+> activity rail, and the peer drawer described below were not shipped
+> in that form. For the panels that actually exist, see
+> [operator-guide.md](operator-guide.md) and the `SECTIONS` array in
+> `dashboard.html`. Kept for design history only.
+
 Design contract for the Relix operator console.
 
 The current `/dashboard` is a single page that lists tasks plus

@@ -154,12 +154,14 @@ cron.create  arg: name|schedule|flow_template|prompt|subject_id
 
 ## Triggering manually
 
-`relix-cli ops cron trigger --job-id <id>` (or the dashboard's
-**Trigger now** button) creates the coordinator task immediately
-and spawns the AI dispatch. Returns the new `task_id`.
+`relix-cli ops cron trigger --job-id <id>` creates the coordinator
+task immediately and spawns the AI dispatch. Returns the new
+`task_id`. The dashboard's Scheduled Jobs panel offers the same
+per-job trigger (and a New Job form), backed by
+`POST /v1/cron/jobs/:job_id/trigger`.
 
-The dashboard auto-navigates to the new task's detail page so you
-can watch the chronicle land in real time.
+Watch the chronicle land with `relix-cli task watch <task_id>` (or
+`GET /v1/tasks/<task_id>/events/stream`).
 
 ## Hardening
 
@@ -186,9 +188,9 @@ Two chronicle events land on the task:
   `ok=0|cause=<reason>` on failure.
 
 The task's `latest_result` column holds an 800-char preview of the
-full AI reply for the dashboard's task detail view. Telegram-side
-delivery is a follow-up — for now, results land in the task
-chronicle accessible via `#/tasks/<id>`.
+full AI reply. Telegram-side delivery is a follow-up; for now,
+results land in the task chronicle, readable via
+`relix-cli task get <id>` or `GET /v1/tasks/<id>`.
 
 ## Capability surface
 

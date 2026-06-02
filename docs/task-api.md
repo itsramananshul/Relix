@@ -430,10 +430,12 @@ planner-foundations contract these endpoints satisfy.
 
 ## Dashboard config
 
-These endpoints back the dashboard's settings pages
-(`#/providers`, `#/telegram`, `#/config`). Local/dev only —
-no auth at the HTTP layer; production deployments must put
-a reverse proxy with auth in front before exposing the
+These endpoints back the read-only Configuration panel
+(`config-providers` / routing / effective config in
+`dashboard.html`) and the `relix setup` wizard. They are
+local/dev only: no auth at the HTTP layer; production
+deployments must put a reverse proxy with auth in front
+before exposing the
 bridge beyond loopback. See
 [`dashboard-redesign.md`](dashboard-redesign.md) for the
 full security model.
@@ -580,8 +582,9 @@ Freshness buckets (aligned with the 60s refresh period):
 CLI parity: `relix-cli topology show [--bridge URL] [--json]
 [--warn-after-secs N]`.
 
-Dashboard surface: the "Mesh topology" widget at the top of
-`/dashboard`.
+Dashboard surface: the Overview panel's "System Health" card
+rolls peer count and node-type breakdown up from `/v1/topology`
+(`crates/relix-web-bridge/src/dashboard.html`).
 
 ### `GET /v1/topology/events?since=<ts>&limit=N`
 
@@ -613,8 +616,10 @@ Response:
 
 `kind` values: `joined` / `freshness_changed` / `dropped`.
 
-Dashboard surface: "Recent transitions" card on the
-`#/topology` page.
+Dashboard surface: there is no dedicated topology page in the
+current console; the Overview panel's "System Health" card shows
+current peer state from `/v1/topology`, and this transition ring
+is available over HTTP at `/v1/topology/events`.
 
 ### `GET /v1/routing`
 

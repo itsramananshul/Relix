@@ -174,8 +174,10 @@ is rebuilt on each start.
 
 - **In-flight HTTP requests.** Any chat that was mid-flow is
   cancelled; the operator sees a connection reset.
-- **SSE streams.** The dashboard's per-task chronicle streams
-  drop. EventSource auto-reconnect kicks in with the
+- **SSE streams.** Per-task chronicle SSE streams
+  (`GET /v1/tasks/:id/events/stream`, consumed by `relix task
+  watch` and API clients) drop. EventSource auto-reconnect
+  kicks in with the
   `?since=<lastEventId>` semantics from the prefix-extract
   cursor advancement (see `extract_event_id_prefix` in
   `crates/relix-web-bridge/src/tasks.rs`).

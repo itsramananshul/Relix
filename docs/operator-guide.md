@@ -417,19 +417,57 @@ re-run it). This is a documented limitation
 ## Operator dashboard
 
 Open `http://127.0.0.1:19791/dashboard` for the operator
-console. Six routes, all shareable as URLs:
+console. The sidebar lists twenty-two panels (selected by
+click; there is no `#/...` hash routing). Source of truth:
+the `SECTIONS` array in `crates/relix-web-bridge/src/dashboard.html`.
 
-| Hash | What it shows |
+| Panel | What it shows |
 |---|---|
-| `#/overview` | Mesh KPIs + live activity rail. The first stop for triage. |
-| `#/tasks` | Task list, detail panel, chronicle, export, recover. |
-| `#/tasks?status=failed` | Bookmarkable filter. `q=` for free-text. `task=` to auto-open. |
-| `#/topology` | Mesh peer graph + table. Click any node for a detail drawer. |
-| `#/providers` | AI provider keys + Test connection per provider. |
-| `#/telegram` | Bot token + mode + Test connection. |
-| `#/config` | Effective bridge config snapshot. |
+| Overview | KPI grid (24h requests/cost, pending approvals, recent sessions), a System Health card grid that rolls up `/v1/topology` peer counts + per-agent scores, and a Recent Activity table. The first stop for triage. |
+| Tasks | Task-ledger summary + a table with status filter, search, and Spawn Task. Backed by `/v1/tasks` (with `/v1/tasks/:id/*` for detail and actions). |
+| Scheduled Jobs | Cron job table with subject filter, New Job, and trigger. Backed by `/v1/cron/jobs` and `/v1/cron/jobs/:job_id/trigger`. |
+| Chat | Send a message through a configured provider and read the reply + stats. |
+| Memory | Search, ingest, inspector, and dialectic tabs over the memory store. |
+| Approvals | Pending / history / failed-delivery / channels tabs. |
+| Skills | Skill catalogue + statistics; create/deprecate. |
+| Sessions | Recent sessions + content search. |
+| Reasoning | Smart routing, self-consistency, belief state, judge verdicts. |
+| Credentials | Vault, rotation schedule, per-credential audit log. |
+| Identity | Active session tokens + research identity. |
+| Cost & Metrics | Cost by provider/agent, 24h trend, baselines, alerts, spend caps. |
+| Observability | OTel/sink status, per-agent health, session debugger, provenance, alert history. |
+| Policy Denials | Recent admission denials with a peer filter. Backed by `/v1/policy/denials`. |
+| Multi-Tenant | Tenant list + per-tenant detail. |
+| Planning | Create/inspect plans (planner + critic). |
+| Workflows | Active + registered workflows; reload from disk. |
+| Email | SMTP/IMAP status + recent inbound messages. |
+| Plugins | Installed subprocess plugins. |
+| MCP Servers | Registered MCP servers with a peer filter, tool listing, and invoke. Backed by `/v1/mcp/servers`, `/v1/mcp/tools`, `/v1/mcp/invoke`. |
+| Configuration | Providers, routing tiers, effective (redacted) config. |
+| Logs | Live `/v1/logs/stream` tail with level/text/target filters. |
+
+There is no standalone Audit-log panel; audit data is reachable
+through the Credentials, MCP, and Multi-Tenant panels and the
+hash-chained `audit.log` files (read with `relix-flow-inspect`).
+The `#/tasks` task-detail "causality surfaces" described later in
+this guide are a separate, pre-v0.3.0 hash-routed design and do not
+match the current Tasks panel; the underlying data is on
+`/v1/tasks/:id/*` and `relix task`.
 
 ### Configuring providers (dashboard-first)
+
+> **Stale (2026-06-02).** The shipped Configuration panel is
+> read-only: it lists each provider with its default model and
+> `configured` / `enabled` / `is_default` flags
+> (`config-providers` in `dashboard.html`). There is no
+> provider card, no key-entry field, no per-provider "Test
+> connection", and no "Test all configured" matrix; the only
+> live connection test is Telegram (`/v1/config/telegram/test`).
+> Set provider keys with `relix setup` (the wizard) or in
+> `~/.relix/config.toml`; see the README "Quick start" and
+> [configuration.md](configuration.md). The section below
+> describes a pre-v0.3.0 dashboard and is kept for history;
+> RELA-25 tracks rewriting it.
 
 You **do not** need to hardcode keys, export env vars, or
 edit TOML. Open `#/providers`, pick a card, paste the
@@ -470,6 +508,14 @@ you investigate.
 
 ### Configuring Telegram
 
+> **Stale (2026-06-02).** The shipped console has no Telegram
+> page or form; the Configuration panel is read-only. Set the
+> Telegram bot token and mode with `relix setup` or in
+> `~/.relix/config.toml`. A connection test is available over
+> HTTP at `POST /v1/config/telegram/test` (calls Telegram
+> `getMe`). The walkthrough below describes a pre-v0.3.0
+> dashboard; RELA-25 tracks rewriting it.
+
 `#/telegram` ships a copy-paste @BotFather walkthrough
 and a single form: paste the token, pick `polling` mode,
 click Save. **Test connection** calls Telegram's
@@ -488,24 +534,21 @@ polling regardless of the saved mode.
 
 ### Live runtime feel
 
-The dashboard polls `/v1/health` + `/v1/topology` +
-`/v1/tasks/cursor` in the background every 5s. The
-overview's Activity rail diffs against the prior
-snapshot and surfaces:
+When the Overview panel is open it polls
+`/v1/observability/health`, `/v1/topology`,
+`/v1/metrics/cost`, `/v1/approval/pending`, `/v1/sessions`,
+`/v1/observability/alerts`, and `/v1/intervention/recent`,
+and re-runs the active panel on a 30s auto-refresh
+(`AUTOREFRESH_MS` in `dashboard.html`; approvals refresh on a
+separate 10s timer). The Recent Activity table merges recent
+intervention-log entries and active cost alerts, newest first
+(subsystem, kind, description, relative time).
 
-- Task status transitions (running → completed / failed
-  / interrupted).
-- Peer freshness transitions (fresh → stale → expired
-  and recoveries).
-- Peer joins + drops from the manifest cache.
-- Reconnect attempts (`MeshClient::reconnect_counters`
-  delta) — separated as "recovered" or "in progress".
-- Coordinator presence flips (configured ↔ unavailable).
-
-Activity items are clickable: a task entry takes you to
-that task's detail panel; a peer entry opens the peer
-drawer. The topbar status dot polls every 10s
-independently as a cross-page "is the mesh up?" indicator.
+The earlier draft of this guide described a diffing "activity
+rail" with clickable task/peer navigation and a peer drawer.
+That design predates the v0.3.0 console rebuild and is not in
+the shipped dashboard; the current Recent Activity table is
+read-only.
 
 The overview also surfaces a **Top retried tasks (15 min)**
 card that groups recent `retried_from` edges by task_id
@@ -522,6 +565,16 @@ The flag persists into the URL as `?stuck=1` so the
 filter survives reloads + sharing.
 
 ### Per-task causality surfaces
+
+> **Stale (2026-06-02).** The console does have a Tasks panel
+> (a ledger table with status filter, search, and Spawn Task), but
+> it has no `#/tasks` hash route and does not render the
+> specific causality surfaces described below; those are a separate
+> pre-v0.3.0 design. The underlying data is on the task HTTP API
+> (`/v1/tasks/:id`, `.../lineage`, `.../attempts`, `.../edges`,
+> `.../events/stream`, `.../export`) and the `relix task` CLI
+> (`get`, `watch`, `lineage`, `export`). RELA-25 tracks rewriting
+> this section against the shipped Tasks panel and those surfaces.
 
 Open any task on `#/tasks` to see four causality
 surfaces stacked above the chronicle:
@@ -841,9 +894,8 @@ relix-cli task export --peer ... --identity ... --client-key ... \
     --task-id <hex> --out -
 ```
 
-Browser equivalent: the dashboard's per-task **Export** button
-hits `GET /v1/tasks/:id/export` with
-`Content-Disposition: attachment`.
+HTTP equivalent: `GET /v1/tasks/:id/export` returns the same
+single-JSON archive with `Content-Disposition: attachment`.
 
 **Plan a retention policy without deleting:**
 

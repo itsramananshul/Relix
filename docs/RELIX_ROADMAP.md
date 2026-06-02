@@ -420,6 +420,8 @@ Bridge work that landed alongside the UI:
 
 Tests: 14 dashboard tests + 4 log-ring tests pass; the full bridge test suite (537+ tests) is green; cargo clippy `-D warnings` clean.
 
+**Follow-on (RELA-31, HEAD `d5260a3`):** the dashboard was later extended from 18 to 22 sections, adding Tasks, Scheduled Jobs (cron), Policy Denials, and MCP Servers, backed by `/v1/tasks`, `/v1/cron/jobs`, `/v1/policy/denials`, and `/v1/mcp/servers`. The `SECTIONS` array in `dashboard.html` is the current source of truth.
+
 ---
 
 ## Part 5 — Infrastructure (Wave 5)

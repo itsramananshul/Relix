@@ -261,9 +261,16 @@ signed audit record**. No bypass switch.
   lowers to SOL. [docs/sol.md](docs/sol.md).
 - **MCP support.** Register external MCP servers as proxied
   capabilities via `tool.mcp.*`.
-- **Dashboard.** Topology, tasks, cron jobs, audit log,
-  policy denials, plugins, per-channel status — all at
-  `/dashboard` with no extra config.
+- **Operator console.** The `/dashboard` single-page app ships
+  twenty-two panels: Overview, Tasks, Scheduled Jobs, Chat,
+  Memory, Approvals, Skills, Sessions, Reasoning, Credentials,
+  Identity, Cost & Metrics, Observability, Policy Denials,
+  Multi-Tenant, Planning, Workflows, Email, Plugins, MCP Servers,
+  Configuration, and Logs. No extra config. Mesh topology, health,
+  cost, pending approvals, and recent activity roll up into the
+  Overview panel; the task ledger, cron jobs, policy denials, and
+  MCP servers each have their own panel, backed by `/v1/tasks`,
+  `/v1/cron/jobs`, `/v1/policy/denials`, and `/v1/mcp/servers`.
 
 ## Security model
 
