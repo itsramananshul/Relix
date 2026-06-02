@@ -103,11 +103,18 @@ pub async fn issue(
     };
     let run_id = clean_optional(req.run_id.as_deref());
     let detail = issue_detail(&req);
+    // Phase 7 — the token's tenant binding must come from the verified
+    // principal, not the request body, so a caller can't mint a token
+    // for another tenant.
+    let tenant_id = match reconcile_issue_tenant(req.tenant_id.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return forbidden(&e),
+    };
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let mut body = serde_json::Map::new();
     body.insert("session_id".into(), Value::from(req.session_id));
     body.insert("agent_name".into(), Value::from(req.agent_name));
-    if let Some(t) = req.tenant_id {
+    if let Some(t) = tenant_id {
         body.insert("tenant_id".into(), Value::from(t));
     }
     body.insert("scopes".into(), Value::from(req.scopes));
@@ -314,6 +321,48 @@ fn bad_request(msg: &str) -> axum::response::Response {
         }),
     )
         .into_response()
+}
+
+fn forbidden(msg: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::FORBIDDEN,
+        Json(ApiError {
+            error: msg.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+/// Phase 7 — reconcile a caller-supplied `tenant_id` override on an
+/// identity-token issue against the verified per-request tenant.
+///
+/// The issued token's tenant binding is a tenant-owned privilege, so a
+/// caller must never mint a token for another tenant by setting
+/// `tenant_id` in the request body. In multi-tenant mode the middleware
+/// resolved a real verified tenant, so:
+///   - a body claim that DISAGREES with it is a cross-tenant
+///     escalation attempt → `Err` (surfaced as HTTP 403)
+///   - the verified tenant is forced regardless of an omitted or
+///     matching body claim
+///
+/// In single-tenant mode (no verified tenant binding) the body value
+/// passes through unchanged so operators can still seed named tenants.
+fn reconcile_issue_tenant(body_claim: Option<&str>) -> Result<Option<String>, String> {
+    let claim = clean_optional(body_claim);
+    match crate::tenant::current_tenant_or_none() {
+        Some(verified) => {
+            if let Some(c) = claim.as_deref()
+                && c != verified
+            {
+                return Err(format!(
+                    "tenant_id override {c:?} does not match the authenticated tenant"
+                ));
+            }
+            Ok(Some(verified))
+        }
+        None => Ok(claim),
+    }
 }
 
 /// Clean "feature not enabled" body (HTTP 200) when the responder
@@ -611,5 +660,53 @@ mod tests {
         );
         assert!(clean_optional_id(Some("bad"), "task_id").is_err());
         assert_eq!(clean_optional_id(Some(" "), "task_id").unwrap(), None);
+    }
+
+    // Phase 7 — the issued token's tenant binding must come from the
+    // verified principal, never the request body.
+    #[tokio::test]
+    async fn issue_tenant_forces_verified_and_rejects_mismatch() {
+        // Multi-tenant: verified tenant-a, body omits → forced to a.
+        let forced = crate::tenant::CURRENT_TENANT
+            .scope("tenant-a".to_string(), async {
+                reconcile_issue_tenant(None)
+            })
+            .await;
+        assert_eq!(forced, Ok(Some("tenant-a".to_string())));
+
+        // Multi-tenant: verified tenant-a, body agrees → ok.
+        let agree = crate::tenant::CURRENT_TENANT
+            .scope("tenant-a".to_string(), async {
+                reconcile_issue_tenant(Some("tenant-a"))
+            })
+            .await;
+        assert_eq!(agree, Ok(Some("tenant-a".to_string())));
+
+        // Multi-tenant: verified tenant-a, body claims tenant-b → reject.
+        let spoof = crate::tenant::CURRENT_TENANT
+            .scope("tenant-a".to_string(), async {
+                reconcile_issue_tenant(Some("tenant-b"))
+            })
+            .await;
+        assert!(spoof.is_err());
+    }
+
+    #[tokio::test]
+    async fn issue_tenant_single_tenant_mode_passes_body_through() {
+        // Single-tenant sentinel → current_tenant_or_none() is None,
+        // so the body override (if any) passes through for seeding.
+        let passthrough = crate::tenant::CURRENT_TENANT
+            .scope(DEFAULT_TENANT.to_string(), async {
+                reconcile_issue_tenant(Some("seed-tenant"))
+            })
+            .await;
+        assert_eq!(passthrough, Ok(Some("seed-tenant".to_string())));
+
+        let none = crate::tenant::CURRENT_TENANT
+            .scope(DEFAULT_TENANT.to_string(), async {
+                reconcile_issue_tenant(None)
+            })
+            .await;
+        assert_eq!(none, Ok(None));
     }
 }
