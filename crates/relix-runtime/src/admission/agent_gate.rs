@@ -514,8 +514,16 @@ fn evaluate_against_view(
                     category: &matched_category,
                     method: &inputs.envelope.method,
                     task_id: inputs.envelope.task_id.as_deref().and_then(non_empty_str),
-                    session_id: None,
-                    workspace_path: None,
+                    session_id: inputs
+                        .envelope
+                        .session_id
+                        .as_deref()
+                        .and_then(non_empty_str),
+                    workspace_path: inputs
+                        .envelope
+                        .workspace_path
+                        .as_deref()
+                        .and_then(non_empty_str),
                     tenant_id: inputs.envelope.tenant_id.as_deref(),
                     now: inputs.now,
                 })
@@ -670,6 +678,8 @@ mod tests {
             surface: surface.map(|s| s.to_string()),
             approval_token: None,
             task_id: None,
+            session_id: None,
+            workspace_path: None,
             tenant_id: None,
             session_token: None,
         }
@@ -1132,6 +1142,42 @@ mod tests {
 
         let mut other = env("tool.payments.refund", None);
         other.task_id = Some("task-other".into());
+        assert!(matches!(
+            run(&s, &id, &other, Some(&c)),
+            GateDecision::RequireApproval(_)
+        ));
+    }
+
+    #[test]
+    fn session_scoped_standing_approval_matches_envelope_session_id() {
+        let (s, id) = setup_with_profile("high", "active", &[], &[], &["payments"]);
+        let agent_id = s.list_agents(None).unwrap()[0].agent_id.clone();
+        s.create_scoped_standing(StandingApprovalCreate {
+            agent_id: &agent_id,
+            match_category: "payments",
+            match_path_glob: None,
+            scope_kind: Some("session"),
+            task_id: None,
+            session_id: Some("sess-approved"),
+            method_prefix: None,
+            workspace_path_glob: None,
+            expires_at: 9_999_999_999,
+            granted_by: "alice",
+            note: "",
+            tenant_id: "default",
+        })
+        .unwrap();
+        let c = cap(&["payments"], &[], RiskLevel::Low);
+
+        let mut approved = env("tool.payments.refund", None);
+        approved.session_id = Some("sess-approved".into());
+        assert!(matches!(
+            run(&s, &id, &approved, Some(&c)),
+            GateDecision::Allow(_)
+        ));
+
+        let mut other = env("tool.payments.refund", None);
+        other.session_id = Some("sess-other".into());
         assert!(matches!(
             run(&s, &id, &other, Some(&c)),
             GateDecision::RequireApproval(_)

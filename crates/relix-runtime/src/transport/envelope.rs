@@ -67,6 +67,19 @@ pub struct RequestEnvelope {
     /// poll/decide, just without auto-pausing a calling task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// Optional logical session id the caller is acting inside.
+    /// Standing approvals can bind to this so an operator can
+    /// approve a session window rather than one call at a time.
+    /// Additive: older clients omit it and session-scoped
+    /// approvals simply do not match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Optional workspace path for the execution context. This
+    /// lets workspace/path-scoped standing approvals match the
+    /// actual run location instead of trusting a capability's raw
+    /// argument string. Additive: older clients omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
     /// GAP 23: per-request tenant identifier. Operator-asserted
     /// (not cryptographically proven). The bridge stamps it
     /// from the `X-Relix-Tenant` header before issuing a mesh

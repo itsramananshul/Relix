@@ -75,9 +75,9 @@ Approval scopes:
 
 - one call
 - one task: implemented via `scope_kind = "task"` and `task_id`
-- one session: implemented in the store/API; dispatch needs a first-class session id
+- one session: implemented in the store/API and wired through bridge flow dispatch via `session_id`
 - one agent plus capability family: implemented via `scope_kind = "method_prefix"`
-- one workspace path: implemented in the store/API; dispatch needs workspace context
+- one workspace path: implemented in the store/API; dispatch has a `workspace_path` envelope field, but bridge workspace leases still need to populate it
 - until a time limit: implemented through `expires_at`
 - until a budget limit: still missing
 

@@ -134,6 +134,14 @@ pub struct FlowRunOptions {
     /// audits, and task-pausing logic can bind risky capability calls
     /// back to the durable work item.
     pub task_id: Option<String>,
+    /// Optional session id this flow is executing under. Bridge chat
+    /// and OpenAI-shim flows set this so session-scoped standing
+    /// approvals can cover every tool/AI call inside the turn.
+    pub session_id: Option<String>,
+    /// Optional workspace path this flow is executing inside. Future
+    /// workspace leases can set this so workspace-scoped standing
+    /// approvals match the concrete run location.
+    pub workspace_path: Option<String>,
     /// RELIX-2 step 5: optional chunk observer. Wired by the
     /// web bridge when serving a `stream: true` chat request.
     /// Each chunk yielded by a `remote_call_stream` opcode
@@ -276,6 +284,8 @@ impl FlowRunner {
             deadline_secs: opts.deadline_secs,
             capability_cache: opts.capability_cache.clone(),
             task_id: opts.task_id.clone(),
+            session_id: opts.session_id.clone(),
+            workspace_path: opts.workspace_path.clone(),
             mesh: opts.mesh_client.clone(),
             cancel_signal: opts.cancel_signal.clone(),
             last_confidence_cell: opts.last_confidence_cell.clone(),
@@ -528,6 +538,8 @@ struct RealDispatcher {
     deadline_secs: i64,
     capability_cache: Option<Arc<ManifestCache>>,
     task_id: Option<String>,
+    session_id: Option<String>,
+    workspace_path: Option<String>,
     /// When present, calls go through [`MeshClient::call`] which adds
     /// reconnect-on-transport-failure behaviour. When absent (the
     /// `relix-cli flow-run` path), we keep the original direct
@@ -602,6 +614,8 @@ fn build_flow_remote_request(
     identity: Bundle,
     deadline_secs: i64,
     task_id: Option<&str>,
+    session_id: Option<&str>,
+    workspace_path: Option<&str>,
 ) -> Vec<u8> {
     build_request_with_surface(
         method.to_string(),
@@ -611,6 +625,8 @@ fn build_flow_remote_request(
         None,
         None,
         task_id.map(str::to_string),
+        session_id.map(str::to_string),
+        workspace_path.map(str::to_string),
     )
 }
 
@@ -664,6 +680,8 @@ impl RemoteCallDispatcher for RealDispatcher {
             self.identity.clone(),
             self.deadline_secs,
             self.task_id.as_deref(),
+            self.session_id.as_deref(),
+            self.workspace_path.as_deref(),
         );
         let request_id = peek_request_id(&envelope_bytes);
 
@@ -805,6 +823,8 @@ impl RemoteCallDispatcher for RealDispatcher {
             self.identity.clone(),
             self.deadline_secs,
             self.task_id.as_deref(),
+            self.session_id.as_deref(),
+            self.workspace_path.as_deref(),
         );
         let request_id = peek_request_id(&envelope_bytes);
 
@@ -1214,12 +1234,21 @@ mod tests {
     #[test]
     fn flow_remote_request_stamps_task_id_when_flow_is_task_bound() {
         let bundle = mock_bundle();
-        let bytes =
-            build_flow_remote_request("tool.web_fetch", b"{}", bundle, 30, Some("task-123"));
+        let bytes = build_flow_remote_request(
+            "tool.web_fetch",
+            b"{}",
+            bundle,
+            30,
+            Some("task-123"),
+            Some("sess-123"),
+            Some("D:/work/relix"),
+        );
         let req: crate::transport::envelope::RequestEnvelope =
             relix_core::codec::decode(&bytes).expect("request decodes");
         assert_eq!(req.method, "tool.web_fetch");
         assert_eq!(req.task_id.as_deref(), Some("task-123"));
+        assert_eq!(req.session_id.as_deref(), Some("sess-123"));
+        assert_eq!(req.workspace_path.as_deref(), Some("D:/work/relix"));
         assert!(req.surface.is_none());
         assert!(req.approval_token.is_none());
     }
@@ -1227,11 +1256,13 @@ mod tests {
     #[test]
     fn flow_remote_request_leaves_task_id_absent_for_standalone_runs() {
         let bundle = mock_bundle();
-        let bytes = build_flow_remote_request("ai.chat", b"hello", bundle, 30, None);
+        let bytes = build_flow_remote_request("ai.chat", b"hello", bundle, 30, None, None, None);
         let req: crate::transport::envelope::RequestEnvelope =
             relix_core::codec::decode(&bytes).expect("request decodes");
         assert_eq!(req.method, "ai.chat");
         assert!(req.task_id.is_none());
+        assert!(req.session_id.is_none());
+        assert!(req.workspace_path.is_none());
     }
 
     fn mock_bundle() -> Bundle {
