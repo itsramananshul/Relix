@@ -93,6 +93,10 @@ Current progress:
   `task_id` into unary and streaming mesh dispatch envelopes, record durable
   activity without copying workflow input, and return scope metadata through
   JSON fields or SSE response headers
+- delegation mutations (`POST /v1/delegate/spawn` and
+  `POST /v1/delegate/cancel/{child_id}`) stamp the parent/child task id into
+  mesh dispatch envelopes, record durable activity without copying delegated
+  goal/context/reason text, and return scope metadata for mutation responses
 - standalone CLI flow runs remain unbound unless the caller explicitly grows a
   task binding path
 
@@ -181,10 +185,11 @@ Unify scattered rings/logs/provenance into one durable activity ledger:
 - approval id: implemented for REST/dashboard and channel approval decisions
 - policy result: implemented for recent policy-denial rows with idempotent
   activity ids
-- memory, skill-store, credential, and workflow operations: implemented for the
-  GAP 5 bridge memory-write proxies, standalone embedding writes, skill-store
-  mutations, credential vault reads/mutations, and workflow run/reload calls
-  without logging raw document/image/text/skill/secret/workflow-input payloads
+- memory, skill-store, credential, workflow, and delegation operations:
+  implemented for the GAP 5 bridge memory-write proxies, standalone embedding
+  writes, skill-store mutations, credential vault reads/mutations, workflow
+  run/reload calls, and delegation spawn/cancel calls without logging raw
+  document/image/text/skill/secret/workflow-input/delegation payloads
 - timestamp: implemented
 
 The operator question "what happened?" should not require scraping five
@@ -219,6 +224,7 @@ Current producers:
 - skill-store mutations from `/v1/skills`
 - credential vault reads and mutations from `/v1/credentials`
 - workflow execution and reload calls from `/v1/workflows`
+- delegation spawn/cancel calls from `/v1/delegate`
 - outbound email sends from `/v1/email/send` and `/v1/email/send_template`
 - agent-message sends from `/v1/messages`
 
