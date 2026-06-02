@@ -80,6 +80,10 @@ Current progress:
   `/v1/memory/embed_all`) accept optional `task_id`/`run_id`, stamp `task_id`
   into the mesh dispatch envelope, record durable activity without copying raw
   text payloads, and return scope metadata
+- skill-store mutations (`POST /v1/skills`, `PATCH /v1/skills/{id}`, and
+  `POST /v1/skills/{id}/deprecate`) accept optional `task_id`/`run_id`, stamp
+  `task_id` into the mesh dispatch envelope, record durable activity without
+  copying skill bodies or deprecation reasons, and return scope metadata
 - standalone CLI flow runs remain unbound unless the caller explicitly grows a
   task binding path
 
@@ -168,8 +172,9 @@ Unify scattered rings/logs/provenance into one durable activity ledger:
 - approval id: implemented for REST/dashboard and channel approval decisions
 - policy result: implemented for recent policy-denial rows with idempotent
   activity ids
-- memory writes: implemented for the GAP 5 bridge memory-write proxies and
-  standalone embedding writes without logging raw document/image/text payloads
+- memory and skill-store writes: implemented for the GAP 5 bridge memory-write
+  proxies, standalone embedding writes, and skill-store mutations without
+  logging raw document/image/text/skill payloads
 - timestamp: implemented
 
 The operator question "what happened?" should not require scraping five
@@ -201,6 +206,7 @@ Current producers:
   `/v1/plugins/:id/disable`
 - memory writes from GAP 5 bridge proxies
 - memory embedding writes from `/v1/memory/embed` and `/v1/memory/embed_all`
+- skill-store mutations from `/v1/skills`
 - outbound email sends from `/v1/email/send` and `/v1/email/send_template`
 - agent-message sends from `/v1/messages`
 
