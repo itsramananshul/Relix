@@ -1,13 +1,14 @@
 //! HTTP proxies for the agent employee permission model.
 //!
 //! Endpoints (all forward to the coordinator's `agent.*` /
-//! `coord.approval.*` capabilities):
+//! `coord.approval.*` / `identity.*` capabilities):
 //!
 //! - `GET    /v1/agents                                  ` — list.
-//! - `POST   /v1/agents                                  ` — create.
+//! - `POST   /v1/agents                                  ` — create; returns AgentId + issued token.
 //! - `GET    /v1/agents/:agent_id                        ` — detail.
 //! - `PATCH  /v1/agents/:agent_id                        ` — update one field.
-//! - `DELETE /v1/agents/:agent_id                        ` — soft delete.
+//! - `DELETE /v1/agents/:agent_id                        ` — soft delete (revoke).
+//! - `POST   /v1/agents/:agent_id/tokens                 ` — issue a fresh token for an agent.
 //! - `GET    /v1/approvals                               ` — pending approvals.
 //! - `POST   /v1/approvals/:approval_id/decide           ` — approve / reject.
 //! - `GET    /v1/agents/:agent_id/standing-approvals     ` — list standing.
@@ -20,6 +21,7 @@ use axum::{
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
@@ -79,6 +81,28 @@ pub struct CreateAgentRequest {
 #[derive(Debug, Serialize)]
 pub struct CreateAgentResponse {
     pub agent_id: String,
+    /// Session-identity token issued at registration time.
+    /// `None` when the coordinator does not have the
+    /// `identity.issue_token` capability registered — callers
+    /// can still use `POST /v1/agents/:id/tokens` later.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+// ── Token issuance ────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+pub struct IssueAgentTokenRequest {
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentTokenResponse {
+    pub agent_id: String,
+    pub token: String,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -185,9 +209,39 @@ pub async fn create_agent(
         "{name}|{role}|{title}|{department}|{team}|{created_by}|{subject_id}|{risk_ceiling}"
     );
     let body = call_peer_string(&state, DEFAULT_PEER, "agent.create", arg.as_bytes()).await?;
-    Ok(Json(CreateAgentResponse {
-        agent_id: body.trim().to_string(),
-    }))
+    let agent_id = body.trim().to_string();
+    let token = try_issue_agent_token(&state, &agent_id, &name, &[], None).await;
+    Ok(Json(CreateAgentResponse { agent_id, token }))
+}
+
+pub async fn issue_agent_token(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(req): Json<IssueAgentTokenRequest>,
+) -> Result<Json<AgentTokenResponse>, (StatusCode, Json<ApiError>)> {
+    let detail_body =
+        call_peer_string(&state, DEFAULT_PEER, "agent.get", agent_id.as_bytes()).await?;
+    let detail = parse_agent_detail(&detail_body).ok_or((
+        StatusCode::BAD_GATEWAY,
+        Json(ApiError {
+            error: format!("agent.get returned an unparseable body: {detail_body:?}"),
+        }),
+    ))?;
+    let token = try_issue_agent_token(
+        &state,
+        &agent_id,
+        &detail.name,
+        &req.scopes,
+        req.ttl_secs,
+    )
+    .await
+    .ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError {
+            error: "identity.issue_token capability is not available on this deployment".into(),
+        }),
+    ))?;
+    Ok(Json(AgentTokenResponse { agent_id, token }))
 }
 
 pub async fn get_agent(
@@ -672,6 +726,127 @@ async fn call_peer_string(
     }
 }
 
+/// Attempt to issue a session-identity token for `agent_id` /
+/// `agent_name` by calling the coordinator's
+/// `identity.issue_token` cap. Returns `None` when the cap is
+/// not registered on the coordinator (clean degradation) — the
+/// agent profile is still created; the caller can retry via
+/// `POST /v1/agents/:id/tokens` once the identity service is
+/// enabled.
+async fn try_issue_agent_token(
+    state: &AppState,
+    agent_id: &str,
+    agent_name: &str,
+    scopes: &[String],
+    ttl_secs: Option<u64>,
+) -> Option<String> {
+    let mut body = serde_json::Map::new();
+    body.insert("session_id".into(), Value::from(agent_id));
+    body.insert("agent_name".into(), Value::from(agent_name));
+    body.insert("scopes".into(), Value::from(scopes.to_vec()));
+    if let Some(ttl) = ttl_secs {
+        body.insert("ttl_secs".into(), Value::from(ttl));
+    }
+    let resp = call_peer_json(state, DEFAULT_PEER, "identity.issue_token", &Value::Object(body))
+        .await
+        .ok()?;
+    resp.get("wire")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+}
+
+async fn call_peer_json(
+    state: &AppState,
+    alias: &str,
+    method: &str,
+    args: &Value,
+) -> Result<Value, (StatusCode, Json<ApiError>)> {
+    let mesh = state.mesh_client.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError {
+            error: "bridge mesh client not initialized".into(),
+        }),
+    ))?;
+    let deadline_secs = state.cfg.transport.deadline_secs.clamp(5, 60);
+    let arg_bytes = serde_json::to_vec(args).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("encode args: {e}"),
+            }),
+        )
+    })?;
+    let envelope = build_request_with_tenant(
+        method,
+        arg_bytes,
+        state.identity_bundle.clone(),
+        deadline_secs,
+        None,
+        None,
+        None,
+        crate::tenant::current_tenant_or_none(),
+    );
+    let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
+        let msg = e.to_string();
+        let lower = msg.to_ascii_lowercase();
+        let status = if lower.contains("unknown alias") || lower.contains("no peer") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        (status, Json(ApiError { error: msg }))
+    })?;
+    let resp = decode_response(&resp_bytes).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(ApiError {
+                error: format!("decode response: {e}"),
+            }),
+        )
+    })?;
+    match resp.res {
+        ResponseResult::Ok(body) => {
+            let text = String::from_utf8(body.to_vec()).map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ApiError {
+                        error: format!("response body utf8: {e}"),
+                    }),
+                )
+            })?;
+            serde_json::from_str::<Value>(&text).map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ApiError {
+                        error: format!("response body not JSON: {e}"),
+                    }),
+                )
+            })
+        }
+        ResponseResult::Err(env) => {
+            let status = if env.kind == relix_core::types::error_kinds::INVALID_ARGS {
+                StatusCode::BAD_REQUEST
+            } else if env.kind == relix_core::types::error_kinds::SECURITY_DENIED {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            Err((
+                status,
+                Json(ApiError {
+                    error: format!("responder err kind={} cause={}", env.kind, env.cause),
+                }),
+            ))
+        }
+        ResponseResult::StreamHandle(_) => Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ApiError {
+                error: "unexpected stream response".into(),
+            }),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,5 +892,54 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].match_path_glob.as_deref(), Some("/inbox/**"));
         assert_eq!(v[1].match_path_glob, None);
+    }
+
+    // ── CreateAgentResponse serialisation ───────────────────
+
+    #[test]
+    fn create_agent_response_omits_token_when_none() {
+        let resp = CreateAgentResponse {
+            agent_id: "agt_x_123".into(),
+            token: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"agent_id\":\"agt_x_123\""));
+        assert!(!json.contains("token"), "token field must be absent when None");
+    }
+
+    #[test]
+    fn create_agent_response_includes_token_when_some() {
+        let resp = CreateAgentResponse {
+            agent_id: "agt_x_456".into(),
+            token: Some("tok_abc".into()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"token\":\"tok_abc\""));
+    }
+
+    #[test]
+    fn agent_token_response_serialises_agent_id_and_token() {
+        let resp = AgentTokenResponse {
+            agent_id: "agt_y_789".into(),
+            token: "wire_token_xyz".into(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"agent_id\":\"agt_y_789\""));
+        assert!(json.contains("\"token\":\"wire_token_xyz\""));
+    }
+
+    #[test]
+    fn issue_agent_token_request_defaults_to_empty_scopes() {
+        let req: IssueAgentTokenRequest = serde_json::from_str("{}").unwrap();
+        assert!(req.scopes.is_empty());
+        assert!(req.ttl_secs.is_none());
+    }
+
+    #[test]
+    fn issue_agent_token_request_accepts_scopes_and_ttl() {
+        let req: IssueAgentTokenRequest =
+            serde_json::from_str(r#"{"scopes":["read","write"],"ttl_secs":3600}"#).unwrap();
+        assert_eq!(req.scopes, vec!["read", "write"]);
+        assert_eq!(req.ttl_secs, Some(3600));
     }
 }

@@ -89,6 +89,8 @@ mod agent_memory;
 mod agent_metrics;
 #[cfg(test)]
 mod agent_metrics_mini_mesh_test;
+#[cfg(test)]
+mod agent_token_mini_mesh_test;
 mod agents_access;
 #[cfg(test)]
 mod alert_dispatch_mini_mesh_test;
@@ -951,13 +953,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/delegate/result/:child_task_id", get(delegate::result))
         .route("/v1/delegate/cancel/:child_task_id", post(delegate::cancel))
         .route("/v1/delegate/list/:parent_task_id", get(delegate::list))
-        // PH-AGENT-BRIDGE: agent employee permission model.
-        // CRUD + approval-decide + standing-approvals proxies
-        // onto the coordinator's `agent.*` / `coord.approval.*`
-        // / `agent.standing_approval.*` capabilities.
+        // PH-AGENT-BRIDGE / REL-20: agent identity REST API.
+        // CRUD + token-issuance + approval-decide + standing-approvals
+        // proxies onto the coordinator's `agent.*` / `coord.approval.*`
+        // / `identity.*` / `agent.standing_approval.*` capabilities.
+        //
+        // Token-issuance route registered before the `:agent_id`
+        // catch-all so axum's static matcher prefers it.
         .route(
             "/v1/agents",
             get(agent::list_agents).post(agent::create_agent),
+        )
+        .route(
+            "/v1/agents/:agent_id/tokens",
+            post(agent::issue_agent_token),
         )
         .route(
             "/v1/agents/:agent_id",
