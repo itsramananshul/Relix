@@ -102,6 +102,10 @@ Current progress:
   scope task ids into mesh dispatch envelopes, record durable activity without
   copying recurring prompts, and keep trigger-launched task ids separate from
   request scope ids
+- standing approval mutations (`POST /v1/agents/{id}/standing-approvals` and
+  `DELETE /v1/standing-approvals/{id}`) stamp available task scope into mesh
+  dispatch envelopes, record durable activity without copying operator notes,
+  and return scope metadata for create/revoke responses
 - standalone CLI flow runs remain unbound unless the caller explicitly grows a
   task binding path
 
@@ -188,7 +192,9 @@ Unify scattered rings/logs/provenance into one durable activity ledger:
 - decision: implemented
 - cost: implemented for idempotent `/v1/metrics/cost` aggregate
   observations; per-run/per-call spend producers are still missing
-- approval id: implemented for REST/dashboard and channel approval decisions
+- approval id: implemented for REST/dashboard and channel approval decisions;
+  standing approval grants/revocations are recorded as approval-control tool
+  activity
 - policy result: implemented for recent policy-denial rows with idempotent
   activity ids
 - memory, skill-store, credential, workflow, delegation, and cron operations:
@@ -233,6 +239,7 @@ Current producers:
 - workflow execution and reload calls from `/v1/workflows`
 - delegation spawn/cancel calls from `/v1/delegate`
 - cron scheduler mutations from `/v1/cron/jobs`
+- standing approval create/revoke calls from `/v1/agents`
 - outbound email sends from `/v1/email/send` and `/v1/email/send_template`
 - agent-message sends from `/v1/messages`
 

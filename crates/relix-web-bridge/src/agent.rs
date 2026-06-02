@@ -26,7 +26,9 @@ use serde_json::Value;
 use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
+use crate::activity::{ToolInvocationActivity, append_tool_invocation_activity};
 use crate::config::AppState;
+use crate::tenant::{DEFAULT_TENANT, current_subject};
 
 const DEFAULT_PEER: &str = "coordinator";
 
@@ -161,6 +163,10 @@ pub struct UpdateAgentRequest {
 #[derive(Debug, Serialize)]
 pub struct OkResponse {
     pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 pub async fn list_agents(
@@ -321,7 +327,11 @@ pub async fn update_agent(
         applied = true;
     }
     let _ = applied;
-    Ok(Json(OkResponse { ok: true }))
+    Ok(Json(OkResponse {
+        ok: true,
+        task_id: None,
+        run_id: None,
+    }))
 }
 
 pub async fn delete_agent(
@@ -329,7 +339,11 @@ pub async fn delete_agent(
     Path(agent_id): Path<String>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<ApiError>)> {
     let _ = call_peer_string(&state, DEFAULT_PEER, "agent.delete", agent_id.as_bytes()).await?;
-    Ok(Json(OkResponse { ok: true }))
+    Ok(Json(OkResponse {
+        ok: true,
+        task_id: None,
+        run_id: None,
+    }))
 }
 
 // ── Approvals ────────────────────────────────────────────
@@ -458,6 +472,8 @@ pub struct StandingCreateRequest {
     pub max_calls: Option<i64>,
     #[serde(default)]
     pub max_cost_micros: Option<i64>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -488,6 +504,10 @@ struct StandingCreateForward<'a> {
 #[derive(Debug, Serialize)]
 pub struct StandingCreateResponse {
     pub standing_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 pub async fn list_standing(
@@ -523,8 +543,18 @@ pub async fn create_standing(
     if req.max_cost_micros.is_some_and(|n| n <= 0) {
         return Err(bad("max_cost_micros must be positive when provided".into()));
     }
-    let granted_by = req.granted_by.unwrap_or_else(|| "operator".to_string());
-    let note = req.note.unwrap_or_default();
+    let task_id = clean_optional(req.task_id.as_deref());
+    let run_id = clean_optional(req.run_id.as_deref());
+    let detail = standing_create_detail(
+        &agent_id,
+        &req,
+        req.note.as_ref().map(|s| s.len()).unwrap_or_default(),
+    );
+    let granted_by = req
+        .granted_by
+        .clone()
+        .unwrap_or_else(|| "operator".to_string());
+    let note = req.note.clone().unwrap_or_default();
     let forward = StandingCreateForward {
         agent_id: &agent_id,
         category: &req.category,
@@ -548,25 +578,110 @@ pub async fn create_standing(
             }),
         )
     })?;
-    let body =
-        call_peer_string(&state, DEFAULT_PEER, "agent.standing_approval.create", &arg).await?;
+    let body = match call_peer_string_scoped(
+        &state,
+        DEFAULT_PEER,
+        "agent.standing_approval.create",
+        &arg,
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(body) => {
+            record_standing_activity(
+                &state,
+                StandingActivity {
+                    actor: &granted_by,
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "agent.standing_approval.create",
+                    decision: "ok",
+                    detail: &detail,
+                },
+            );
+            body
+        }
+        Err(err) => {
+            record_standing_activity(
+                &state,
+                StandingActivity {
+                    actor: &granted_by,
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "agent.standing_approval.create",
+                    decision: "err",
+                    detail: &detail,
+                },
+            );
+            return Err(err);
+        }
+    };
     Ok(Json(StandingCreateResponse {
         standing_id: body.trim().to_string(),
+        task_id,
+        run_id,
     }))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ScopeQuery {
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 pub async fn revoke_standing(
     State(state): State<AppState>,
     Path(standing_id): Path<String>,
+    Query(q): Query<ScopeQuery>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<ApiError>)> {
-    let _ = call_peer_string(
+    let task_id = clean_optional(q.task_id.as_deref());
+    let run_id = clean_optional(q.run_id.as_deref());
+    let detail = standing_revoke_detail(&standing_id);
+    let actor = current_subject().unwrap_or_else(|| "operator".to_string());
+    match call_peer_string_scoped(
         &state,
         DEFAULT_PEER,
         "agent.standing_approval.revoke",
         standing_id.as_bytes(),
+        task_id.as_deref(),
     )
-    .await?;
-    Ok(Json(OkResponse { ok: true }))
+    .await
+    {
+        Ok(_) => {
+            record_standing_activity(
+                &state,
+                StandingActivity {
+                    actor: &actor,
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "agent.standing_approval.revoke",
+                    decision: "ok",
+                    detail: &detail,
+                },
+            );
+            Ok(Json(OkResponse {
+                ok: true,
+                task_id,
+                run_id,
+            }))
+        }
+        Err(err) => {
+            record_standing_activity(
+                &state,
+                StandingActivity {
+                    actor: &actor,
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "agent.standing_approval.revoke",
+                    decision: "err",
+                    detail: &detail,
+                },
+            );
+            Err(err)
+        }
+    }
 }
 
 // ── Parsers ──────────────────────────────────────────────
@@ -777,11 +892,82 @@ fn bad(msg: String) -> (StatusCode, Json<ApiError>) {
     (StatusCode::BAD_REQUEST, Json(ApiError { error: msg }))
 }
 
+fn clean_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn standing_create_detail(agent_id: &str, req: &StandingCreateRequest, note_len: usize) -> String {
+    format!(
+        "agent_id={agent_id}; category={}; scope_kind={}; expires_at={}; max_calls={}; max_cost_micros={}; note_len={note_len}",
+        req.category,
+        req.scope_kind.as_deref().unwrap_or("agent_category"),
+        req.expires_at,
+        req.max_calls
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into()),
+        req.max_cost_micros
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into())
+    )
+}
+
+fn standing_revoke_detail(standing_id: &str) -> String {
+    format!("standing_id={standing_id}")
+}
+
+struct StandingActivity<'a> {
+    actor: &'a str,
+    task_id: Option<&'a str>,
+    run_id: Option<&'a str>,
+    method: &'a str,
+    decision: &'a str,
+    detail: &'a str,
+}
+
+fn record_standing_activity(state: &AppState, activity: StandingActivity<'_>) {
+    let tenant_id = crate::tenant::current_tenant_or_none()
+        .as_deref()
+        .unwrap_or(DEFAULT_TENANT)
+        .to_string();
+    if let Err(e) = append_tool_invocation_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        ToolInvocationActivity {
+            tenant_id: &tenant_id,
+            actor: activity.actor,
+            peer: DEFAULT_PEER,
+            method: activity.method,
+            task_id: activity.task_id,
+            run_id: activity.run_id,
+            decision: activity.decision,
+            detail: activity.detail,
+        },
+    ) {
+        tracing::warn!(
+            error = %e,
+            method = activity.method,
+            "failed to append standing approval activity"
+        );
+    }
+}
+
 async fn call_peer_string(
     state: &AppState,
     alias: &str,
     method: &str,
     arg: &[u8],
+) -> Result<String, (StatusCode, Json<ApiError>)> {
+    call_peer_string_scoped(state, alias, method, arg, None).await
+}
+
+async fn call_peer_string_scoped(
+    state: &AppState,
+    alias: &str,
+    method: &str,
+    arg: &[u8],
+    task_id: Option<&str>,
 ) -> Result<String, (StatusCode, Json<ApiError>)> {
     let mesh = state.mesh_client.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -797,7 +983,7 @@ async fn call_peer_string(
         deadline_secs,
         None,
         None,
-        None,
+        task_id.map(str::to_string),
         crate::tenant::current_tenant_or_none(),
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
@@ -1048,6 +1234,46 @@ mod tests {
         assert_eq!(v[0].max_cost_micros, Some(20_000));
         assert_eq!(v[0].cost_used_micros, 10_000);
         assert_eq!(v[0].note, "one paid call");
+    }
+
+    #[test]
+    fn standing_create_detail_does_not_copy_operator_note() {
+        let req = StandingCreateRequest {
+            category: "payments".into(),
+            expires_at: 9999,
+            granted_by: Some("alice".into()),
+            note: Some("sensitive operator reason".into()),
+            path_glob: None,
+            scope_kind: Some("task".into()),
+            task_id: Some("0123456789abcdef0123456789abcdef".into()),
+            session_id: None,
+            method_prefix: None,
+            workspace_path_glob: None,
+            max_calls: Some(2),
+            max_cost_micros: Some(20_000),
+            run_id: Some("run-1".into()),
+        };
+        let detail = standing_create_detail("agt-1", &req, req.note.as_ref().unwrap().len());
+        assert!(detail.contains("agent_id=agt-1"));
+        assert!(detail.contains("category=payments"));
+        assert!(detail.contains("scope_kind=task"));
+        assert!(detail.contains("max_calls=2"));
+        assert!(detail.contains("max_cost_micros=20000"));
+        assert!(detail.contains("note_len=25"));
+        assert!(!detail.contains("sensitive operator reason"));
+    }
+
+    #[test]
+    fn standing_create_response_can_echo_scope_context() {
+        let value = serde_json::to_value(StandingCreateResponse {
+            standing_id: "std_1".into(),
+            task_id: Some("0123456789abcdef0123456789abcdef".into()),
+            run_id: Some("run-1".into()),
+        })
+        .unwrap();
+        assert_eq!(value["standing_id"], "std_1");
+        assert_eq!(value["task_id"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(value["run_id"], "run-1");
     }
 
     #[test]
