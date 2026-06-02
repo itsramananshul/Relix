@@ -30,13 +30,19 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
+use std::path::Path as FsPath;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
-use crate::config::AppState;
+use crate::{
+    activity::{CostReportActivity, append_cost_report_activity},
+    config::AppState,
+    tenant::{DEFAULT_TENANT, current_subject, current_tenant},
+};
 
 const DEFAULT_PEER: &str = "coordinator";
 
@@ -304,14 +310,82 @@ pub async fn cost(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
-    let body = serde_json::json!({ "hours": q.hours.unwrap_or(24) });
+    let hours = q.hours.unwrap_or(24);
+    let body = serde_json::json!({ "hours": hours });
     match call_peer_json(&state, &peer, "metrics.cost_report", &body).await {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Ok(v) => {
+            let tenant_id = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+            let actor = current_subject().unwrap_or_else(|| "metrics.cost_report".into());
+            if let Err(e) = record_cost_report_activity(
+                state.cfg.transport.data_dir.as_deref(),
+                &tenant_id,
+                &actor,
+                &peer,
+                hours,
+                &v,
+            ) {
+                tracing::warn!(error = %e, "failed to append cost report activity");
+            }
+            (StatusCode::OK, Json(v)).into_response()
+        }
         Err(resp) => resp,
     }
 }
 
 // ── mesh helpers ─────────────────────────────────────────
+
+fn record_cost_report_activity(
+    data_dir: Option<&FsPath>,
+    tenant_id: &str,
+    actor: &str,
+    peer: &str,
+    hours: u32,
+    report: &Value,
+) -> Result<usize, String> {
+    let Some(rows) = report.as_array() else {
+        return Ok(0);
+    };
+    let mut appended = 0_usize;
+    for row in rows {
+        let Some(agent) = row.get("agent").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(method) = row.get("method").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(total_cost_micros) = value_as_i64(row.get("total_cost_micros")) else {
+            continue;
+        };
+        let total_tokens = row.get("total_tokens").and_then(Value::as_u64).unwrap_or(0);
+        let invocations = row.get("invocations").and_then(Value::as_u64).unwrap_or(0);
+        if append_cost_report_activity(
+            data_dir,
+            CostReportActivity {
+                tenant_id,
+                actor,
+                peer,
+                hours,
+                agent,
+                method,
+                total_cost_micros,
+                total_tokens,
+                invocations,
+            },
+        )? {
+            appended = appended.saturating_add(1);
+        }
+    }
+    Ok(appended)
+}
+
+fn value_as_i64(value: Option<&Value>) -> Option<i64> {
+    value.and_then(|v| {
+        v.as_i64().or_else(|| {
+            let n = v.as_u64()?;
+            i64::try_from(n).ok()
+        })
+    })
+}
 
 fn bad_request(msg: &str) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -481,5 +555,80 @@ mod tests {
             parsed.get("error").and_then(serde_json::Value::as_str),
             Some("agent is required")
         );
+    }
+
+    #[test]
+    fn record_cost_report_activity_appends_paid_rows_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report = serde_json::json!([
+            {
+                "agent": "alice",
+                "method": "ai.chat",
+                "total_cost_micros": 18_000,
+                "total_tokens": 12_000,
+                "invocations": 100
+            },
+            {
+                "agent": "alice",
+                "method": "tool.fs.read",
+                "total_cost_micros": 0,
+                "total_tokens": 0,
+                "invocations": 5
+            }
+        ]);
+
+        let first = record_cost_report_activity(
+            Some(tmp.path()),
+            "tenant-a",
+            "operator-1",
+            "coordinator",
+            24,
+            &report,
+        )
+        .unwrap();
+        let second = record_cost_report_activity(
+            Some(tmp.path()),
+            "tenant-a",
+            "operator-1",
+            "coordinator",
+            24,
+            &report,
+        )
+        .unwrap();
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 0);
+        let body = std::fs::read_to_string(tmp.path().join("bridge-activity.jsonl")).unwrap();
+        let lines: Vec<_> = body.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let entry: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(entry["source"], "cost");
+        assert_eq!(entry["actor"], "operator-1");
+        assert_eq!(entry["tenant_id"], "tenant-a");
+        assert_eq!(entry["action"], "metrics.cost_report.observed");
+        assert_eq!(entry["target"], "alice/ai.chat");
+        assert_eq!(entry["cost_micros"], 18_000);
+    }
+
+    #[test]
+    fn record_cost_report_activity_ignores_unavailable_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report = serde_json::json!({
+            "available": false,
+            "reason": "metrics disabled"
+        });
+
+        let count = record_cost_report_activity(
+            Some(tmp.path()),
+            "tenant-a",
+            "operator-1",
+            "coordinator",
+            24,
+            &report,
+        )
+        .unwrap();
+
+        assert_eq!(count, 0);
+        assert!(!tmp.path().join("bridge-activity.jsonl").exists());
     }
 }

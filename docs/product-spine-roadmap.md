@@ -134,7 +134,8 @@ Unify scattered rings/logs/provenance into one durable activity ledger:
 - run: implemented for workspace events
 - method/action: implemented as `action`; method remains optional
 - decision: implemented
-- cost: schema field exists, producers missing
+- cost: implemented for idempotent `/v1/metrics/cost` aggregate
+  observations; per-run/per-call spend producers are still missing
 - approval id: implemented for REST/dashboard and channel approval decisions
 - policy result: implemented for recent policy-denial rows with idempotent
   activity ids
@@ -161,6 +162,7 @@ Current producers:
 - operator intervention audit rows
 - approval decisions from the dashboard/API and channel callbacks
 - policy denials discovered through `/v1/policy/denials`
+- cost aggregate observations from `/v1/metrics/cost`
 
 ## Phase 6: Dashboard Decomposition
 

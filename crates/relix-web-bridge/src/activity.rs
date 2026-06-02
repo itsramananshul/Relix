@@ -77,6 +77,19 @@ pub struct PolicyDenialActivity<'a> {
     pub reason: &'a str,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CostReportActivity<'a> {
+    pub tenant_id: &'a str,
+    pub actor: &'a str,
+    pub peer: &'a str,
+    pub hours: u32,
+    pub agent: &'a str,
+    pub method: &'a str,
+    pub total_cost_micros: i64,
+    pub total_tokens: u64,
+    pub invocations: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ApiError {
     pub error: String,
@@ -216,6 +229,41 @@ pub fn append_policy_denial_activity(
             detail: format!(
                 "peer={}; subject={}; reason={}",
                 denial.peer, denial.caller_subject_id, denial.reason
+            ),
+        },
+    )
+}
+
+pub fn append_cost_report_activity(
+    data_dir: Option<&Path>,
+    cost: CostReportActivity<'_>,
+) -> Result<bool, String> {
+    let Some(path) = data_dir.map(activity_path_for_data_dir) else {
+        return Ok(false);
+    };
+    if cost.total_cost_micros <= 0 {
+        return Ok(false);
+    }
+    append_entry_once(
+        &path,
+        &ActivityEntry {
+            activity_id: cost_report_activity_id(&cost),
+            ts_ms: now_ms(),
+            source: "cost".into(),
+            actor: cost.actor.into(),
+            tenant_id: cost.tenant_id.into(),
+            task_id: None,
+            run_id: None,
+            action: "metrics.cost_report.observed".into(),
+            target: format!("{}/{}", cost.agent, cost.method),
+            decision: "observed".into(),
+            method: Some(cost.method.into()),
+            approval_id: None,
+            policy_result: None,
+            cost_micros: Some(cost.total_cost_micros),
+            detail: format!(
+                "peer={}; hours={}; tokens={}; invocations={}",
+                cost.peer, cost.hours, cost.total_tokens, cost.invocations
             ),
         },
     )
@@ -391,6 +439,22 @@ fn policy_denial_activity_id(
     let material = format!("{tenant_id}\n{at_ms}\n{method}\n{caller_subject_id}\n{rule}\n{reason}");
     let digest = blake3::hash(material.as_bytes());
     format!("act_policy_{}", &digest.to_hex().as_str()[..24])
+}
+
+fn cost_report_activity_id(cost: &CostReportActivity<'_>) -> String {
+    let material = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        cost.tenant_id,
+        cost.peer,
+        cost.hours,
+        cost.agent,
+        cost.method,
+        cost.total_cost_micros,
+        cost.total_tokens,
+        cost.invocations
+    );
+    let digest = blake3::hash(material.as_bytes());
+    format!("act_cost_{}", &digest.to_hex().as_str()[..24])
 }
 
 fn internal(error: impl Into<String>) -> ErrorReply {
@@ -578,5 +642,64 @@ mod tests {
         assert_eq!(items[0].method.as_deref(), Some("tool.web_fetch"));
         assert_eq!(items[0].policy_result.as_deref(), Some("default_deny"));
         assert_eq!(items[0].decision, "denied");
+    }
+
+    #[test]
+    fn cost_report_activity_is_idempotent_and_queryable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cost = CostReportActivity {
+            tenant_id: "tenant-a",
+            actor: "operator-1",
+            peer: "coordinator",
+            hours: 24,
+            agent: "alice",
+            method: "ai.chat",
+            total_cost_micros: 18_000,
+            total_tokens: 12_000,
+            invocations: 100,
+        };
+
+        assert!(append_cost_report_activity(Some(tmp.path()), cost).unwrap());
+        assert!(!append_cost_report_activity(Some(tmp.path()), cost).unwrap());
+
+        let q = ActivityQuery {
+            limit: None,
+            tenant_id: Some("tenant-a".into()),
+            source: Some("cost".into()),
+            task_id: None,
+        };
+        let items = read_recent(&activity_path_for_data_dir(tmp.path()), &q, 10).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].action, "metrics.cost_report.observed");
+        assert_eq!(items[0].actor, "operator-1");
+        assert_eq!(items[0].target, "alice/ai.chat");
+        assert_eq!(items[0].method.as_deref(), Some("ai.chat"));
+        assert_eq!(items[0].cost_micros, Some(18_000));
+        assert!(items[0].detail.contains("hours=24"));
+    }
+
+    #[test]
+    fn zero_cost_report_activity_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cost = CostReportActivity {
+            tenant_id: "tenant-a",
+            actor: "operator-1",
+            peer: "coordinator",
+            hours: 24,
+            agent: "alice",
+            method: "tool.fs.read",
+            total_cost_micros: 0,
+            total_tokens: 0,
+            invocations: 5,
+        };
+
+        assert!(!append_cost_report_activity(Some(tmp.path()), cost).unwrap());
+        let items = read_recent(
+            &activity_path_for_data_dir(tmp.path()),
+            &ActivityQuery::default(),
+            10,
+        )
+        .unwrap();
+        assert!(items.is_empty());
     }
 }
