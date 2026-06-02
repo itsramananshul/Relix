@@ -15,6 +15,7 @@
 
 mod approval;
 mod belief;
+mod bridge_token;
 mod browser;
 mod build;
 mod capability;

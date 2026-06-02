@@ -30,6 +30,13 @@ pub struct DoctorArgs {
     /// jq-parse the response.
     #[arg(long, default_value_t = false)]
     pub json: bool,
+    /// Bridge bearer token for the auth-gated `/v1/health` probe.
+    /// Precedence when omitted: `RELIX_BRIDGE_TOKEN` env, then
+    /// `~/.relix/bridge-token`. Without a token an auth-enabled
+    /// bridge answers 401 and doctor reports a healthy mesh as
+    /// broken.
+    #[arg(long)]
+    pub token: Option<String>,
 }
 
 /// Mirror of the bridge's `topology::HealthResponse`. We
@@ -94,11 +101,17 @@ struct Check {
 
 pub async fn run(args: DoctorArgs) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!("{}/v1/health", args.bridge.trim_end_matches('/'));
-    let body = match http_get(&url).await {
+    // Resolve the bridge bearer once. `/v1/health` is auth-gated, so
+    // without it an auth-enabled bridge answers 401 and every check
+    // below would read as a broken mesh.
+    let token = crate::bridge_token::resolve(args.token.as_deref());
+    let bearer = token.as_ref().map(|(t, _)| t.as_str());
+    let body = match http_get(&url, bearer).await {
         Ok(b) => b,
         Err(e) => {
-            // Bridge unreachable — single FAIL row, exit 1.
-            eprintln!("FAIL  bridge.reachable  could not reach {url}: {e}");
+            // Probe failed — single FAIL row, exit 1. The error text
+            // already names the token locations on a 401/403.
+            eprintln!("FAIL  bridge.reachable  {url}: {e}");
             std::process::exit(1);
         }
     };
@@ -115,6 +128,9 @@ pub async fn run(args: DoctorArgs) -> Result<(), Box<dyn std::error::Error>> {
     let perm_checks = evaluate_perms();
     checks.extend(perm_checks);
     render(&args.bridge, &resp, &checks);
+    if let Some((_, src)) = &token {
+        println!("token: {}", src.label());
+    }
     let any_fail = checks.iter().any(|c| c.verdict == Verdict::Fail);
     if any_fail {
         std::process::exit(1);
@@ -284,13 +300,27 @@ fn render(bridge: &str, h: &HealthResponse, checks: &[Check]) {
     println!("{n_pass} pass, {n_warn} warn, {n_fail} fail");
 }
 
-async fn http_get(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+async fn http_get(url: &str, bearer: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
-    let resp = client.get(url).send().await?;
+    let mut req = client.get(url);
+    if let Some(t) = bearer {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = req.send().await?;
     let status = resp.status();
     let body = resp.text().await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        // Don't dump a raw 401 — name the token locations so the
+        // operator knows the mesh may be healthy and the probe just
+        // lacked credentials.
+        return Err(format!(
+            "bridge returned HTTP {status}. {}",
+            crate::bridge_token::missing_token_hint()
+        )
+        .into());
+    }
     if !status.is_success() {
         return Err(format!("bridge returned HTTP {status}: {body}").into());
     }
@@ -391,6 +421,83 @@ mod tests {
         let checks = evaluate(&h);
         let row = checks.iter().find(|c| c.label == "bridge.status").unwrap();
         assert_eq!(row.verdict, Verdict::Fail);
+    }
+
+    /// Minimal mock bridge: records every request's headers and
+    /// answers `/v1/health` with a healthy body. Lets a test assert
+    /// the probe carries `Authorization: Bearer <token>`.
+    async fn spawn_mock_bridge() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen = seen2.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        let Ok(n) = sock.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf);
+                    let mut headers = std::collections::HashMap::new();
+                    for l in text.split("\r\n").skip(1) {
+                        if l.is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = l.split_once(':') {
+                            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                        }
+                    }
+                    seen.lock().unwrap().push(headers);
+                    let body = r#"{"status":"ok","peer_count":1,"peers_fresh":1,"coordinator_configured":true}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    #[tokio::test]
+    async fn health_probe_attaches_bearer_token() {
+        // AC: the auth-gated `/v1/health` probe must carry
+        // `Authorization: Bearer <token>` so a healthy auth-enabled
+        // mesh is not reported as broken.
+        let (addr, seen) = spawn_mock_bridge().await;
+        let url = format!("{addr}/v1/health");
+        let body = http_get(&url, Some("smoke-tok")).await.unwrap();
+        assert!(body.contains("\"status\":\"ok\""));
+        let reqs = seen.lock().unwrap();
+        assert!(
+            reqs.iter().any(|h| h
+                .get("authorization")
+                .map(|v| v.eq_ignore_ascii_case("Bearer smoke-tok"))
+                .unwrap_or(false)),
+            "doctor /v1/health probe must send Authorization: Bearer"
+        );
     }
 
     #[test]

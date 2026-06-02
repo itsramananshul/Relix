@@ -88,6 +88,13 @@ pub enum Cmd {
         /// regardless of provider configuration.
         #[arg(long, default_value = "relix-mock")]
         provider: String,
+        /// Bridge bearer token for the auth-gated `/v1/*` steps.
+        /// Precedence when omitted: `RELIX_BRIDGE_TOKEN` env, then
+        /// `~/.relix/bridge-token`. Without it an auth-enabled
+        /// bridge answers 401 on steps 2-5 and smoke reports a
+        /// healthy mesh as broken.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// W2-007b mirror: ask a peer's PolicyEngine "would this
     /// caller (with these groups) calling this method be
@@ -920,7 +927,11 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             limit,
             json,
         } => session_search(&bridge, &query, &subject_id, limit, json).await,
-        Cmd::Smoke { bridge, provider } => smoke(&bridge, &provider).await,
+        Cmd::Smoke {
+            bridge,
+            provider,
+            token,
+        } => smoke(&bridge, &provider, token.as_deref()).await,
         Cmd::Tail {
             bridge,
             filter,
@@ -2023,9 +2034,20 @@ async fn tail(
 
 // W2-008b CLI mirror: end-to-end mesh smoke test.
 
-async fn smoke(bridge: &str, provider: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn smoke(
+    bridge: &str,
+    provider: &str,
+    token: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let base = bridge.trim_end_matches('/');
+    // Steps 2-5 hit auth-gated `/v1/*`. Resolve the bearer once so a
+    // healthy auth-enabled mesh passes instead of reporting 401s.
+    let resolved = crate::bridge_token::resolve(token);
+    let bearer = resolved.as_ref().map(|(t, _)| t.as_str());
     println!("Relix smoke (bridge={base})");
+    if let Some((_, src)) = &resolved {
+        println!("  token: {}", src.label());
+    }
     let mut step = 0usize;
     let mut fails = 0usize;
     let mut run = |desc: &str, res: Result<String, Box<dyn std::error::Error>>| {
@@ -2041,13 +2063,13 @@ async fn smoke(bridge: &str, provider: &str) -> Result<(), Box<dyn std::error::E
         res.ok()
     };
 
-    // 1. liveness
+    // 1. liveness — public, no token required.
     let _ = run("GET /health", http_get(&format!("{base}/health")).await);
 
     // 2. topology — count peers when we got a body back
     let topo_body = run(
         "GET /v1/topology",
-        http_get(&format!("{base}/v1/topology")).await,
+        http_get_auth(&format!("{base}/v1/topology"), bearer).await,
     );
     if let Some(body) = topo_body {
         let peer_count = body.matches("\"alias\":").count();
@@ -2060,19 +2082,23 @@ async fn smoke(bridge: &str, provider: &str) -> Result<(), Box<dyn std::error::E
     );
     let _ = run(
         &format!("POST /v1/chat/completions (model={provider})"),
-        http_post_json(&format!("{base}/v1/chat/completions"), &chat_body).await,
+        http_post_json_auth(&format!("{base}/v1/chat/completions"), &chat_body, bearer).await,
     );
 
     // 4. dispatch stats — observability
     let _ = run(
         "GET /v1/dispatch/stats?peer=tool (W2-006c)",
-        http_get(&format!("{base}/v1/dispatch/stats?peer=tool")).await,
+        http_get_auth(&format!("{base}/v1/dispatch/stats?peer=tool"), bearer).await,
     );
 
     // 5. policy denials — yellow-flag a non-empty ring
     let denials_body = run(
         "GET /v1/policy/denials?peer=tool (W2-007e)",
-        http_get(&format!("{base}/v1/policy/denials?peer=tool&max=10")).await,
+        http_get_auth(
+            &format!("{base}/v1/policy/denials?peer=tool&max=10"),
+            bearer,
+        )
+        .await,
     );
     if let Some(body) = denials_body {
         // Loose-parse just the count field — keeps the smoke
@@ -2292,18 +2318,34 @@ async fn events(
     Ok(())
 }
 
-async fn http_post_json(url: &str, body: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Auth-aware POST. Attaches `Authorization: Bearer <token>` when a
+/// token is supplied and turns a 401/403 into an actionable hint that
+/// names the token locations instead of a raw status dump.
+async fn http_post_json_auth(
+    url: &str,
+    body: &str,
+    bearer: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
-    let resp = client
+    let mut req = client
         .post(url)
         .header("content-type", "application/json")
-        .body(body.to_string())
-        .send()
-        .await?;
+        .body(body.to_string());
+    if let Some(t) = bearer {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = req.send().await?;
     let status = resp.status();
     let body = resp.text().await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(format!(
+            "bridge returned HTTP {status}. {}",
+            crate::bridge_token::missing_token_hint()
+        )
+        .into());
+    }
     if !status.is_success() {
         return Err(format!("bridge returned HTTP {status}: {body}").into());
     }
@@ -2394,12 +2436,33 @@ struct TopologyPeer {
 }
 
 async fn http_get(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    http_get_auth(url, None).await
+}
+
+/// Auth-aware GET. Attaches `Authorization: Bearer <token>` when a
+/// token is supplied and turns a 401/403 into an actionable hint that
+/// names the token locations instead of a raw status dump.
+async fn http_get_auth(
+    url: &str,
+    bearer: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
-    let resp = client.get(url).send().await?;
+    let mut req = client.get(url);
+    if let Some(t) = bearer {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = req.send().await?;
     let status = resp.status();
     let body = resp.text().await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(format!(
+            "bridge returned HTTP {status}. {}",
+            crate::bridge_token::missing_token_hint()
+        )
+        .into());
+    }
     if !status.is_success() {
         return Err(format!("bridge returned HTTP {status}: {body}").into());
     }
@@ -3955,6 +4018,104 @@ mod tests {
         // Sentinel for "no timestamp".
         assert_eq!(format_unix_ts(0), "—");
         assert_eq!(format_unix_ts(-1), "—");
+    }
+
+    /// Minimal mock bridge: records request headers, answers any
+    /// path with 200. Lets a test assert the auth-gated probe carries
+    /// `Authorization: Bearer <token>`.
+    async fn spawn_header_recorder() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen = seen2.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        let Ok(n) = sock.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf);
+                    let mut headers = std::collections::HashMap::new();
+                    for l in text.split("\r\n").skip(1) {
+                        if l.is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = l.split_once(':') {
+                            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                        }
+                    }
+                    seen.lock().unwrap().push(headers);
+                    let body = "{}";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    #[tokio::test]
+    async fn smoke_helpers_attach_bearer_token() {
+        // AC: auth-gated smoke steps must carry
+        // `Authorization: Bearer <token>`. Pins both the GET and POST
+        // helpers smoke uses.
+        let (addr, seen) = spawn_header_recorder().await;
+        http_get_auth(&format!("{addr}/v1/topology"), Some("smoke-tok"))
+            .await
+            .unwrap();
+        http_post_json_auth(
+            &format!("{addr}/v1/chat/completions"),
+            "{}",
+            Some("smoke-tok"),
+        )
+        .await
+        .unwrap();
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 2, "expected one GET and one POST");
+        assert!(
+            reqs.iter().all(|h| h
+                .get("authorization")
+                .map(|v| v.eq_ignore_ascii_case("Bearer smoke-tok"))
+                .unwrap_or(false)),
+            "every auth-gated smoke step must send Authorization: Bearer"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_get_without_token_omits_authorization_header() {
+        // Public steps (and auth-disabled meshes) must not invent a
+        // header. None in -> no Authorization out.
+        let (addr, seen) = spawn_header_recorder().await;
+        http_get(&format!("{addr}/health")).await.unwrap();
+        let reqs = seen.lock().unwrap();
+        assert!(
+            reqs.iter().all(|h| !h.contains_key("authorization")),
+            "no token resolved must mean no Authorization header"
+        );
     }
 
     #[test]
