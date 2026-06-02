@@ -67,6 +67,9 @@ Current progress:
 - `/v1/messages` send accepts optional `task_id`/`run_id`, stamps `task_id`
   into the mesh dispatch envelope, records durable activity without leaking
   message body/subject content, and returns scope metadata in the send response
+- `/v1/plugins/:id/reload` and `/v1/plugins/:id/disable` accept optional
+  `task_id`/`run_id`, stamp `task_id` into the mesh dispatch envelope, record
+  durable activity, and return scope metadata in mutation responses
 - standalone CLI flow runs remain unbound unless the caller explicitly grows a
   task binding path
 
@@ -75,7 +78,7 @@ Remaining launch work:
 - make task creation fail-closed for production modes: implemented through
   `[coordinator] required = true`, which refuses startup when the coordinator
   alias is unavailable and refuses chat dispatch when `task.create` fails
-- bind plugin/direct bridge utility calls to tasks or explicit ad-hoc runs
+- bind remaining direct bridge utility calls to tasks or explicit ad-hoc runs
 - attach run ids to the same execution context; bridge chat/OpenAI/WS paths
   now accept a workspace lease id and stamp the resolved workspace path into
   dispatch envelopes
@@ -182,6 +185,8 @@ Current producers:
 - MCP invocations from `/v1/mcp/invoke`
 - screen captures from `/v1/tools/screen`
 - browser capture reads from `/v1/browser/captures/:filename`
+- plugin management mutations from `/v1/plugins/:id/reload` and
+  `/v1/plugins/:id/disable`
 - outbound email sends from `/v1/email/send` and `/v1/email/send_template`
 - agent-message sends from `/v1/messages`
 
