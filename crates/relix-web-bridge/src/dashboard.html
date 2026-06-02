@@ -182,6 +182,39 @@ input[type="text"], input[type="number"], input[type="password"], select { width
     <div class="panel"><h2 class="panel-title">Recent Activity</h2><div id="overview-activity"></div></div>
   </section>
 
+  <section id="section-tasks" class="section" data-section="tasks">
+    <div class="section-head"><h1 class="section-title">Tasks</h1><div class="section-meta" id="tasks-meta"></div></div>
+    <div class="panel"><h2 class="panel-title">Summary</h2><div class="grid grid-4" id="tasks-summary"></div></div>
+    <div class="panel">
+      <h2 class="panel-title">Task Ledger<button class="btn primary" id="task-spawn-open">+ Spawn Task</button></h2>
+      <div class="form-row"><label for="task-status-filter">Status</label>
+        <select id="task-status-filter">
+          <option value="">All statuses</option>
+          <option value="pending">pending</option>
+          <option value="running">running</option>
+          <option value="retrying">retrying</option>
+          <option value="awaiting_input">awaiting_input</option>
+          <option value="paused">paused</option>
+          <option value="frozen">frozen</option>
+          <option value="interrupted">interrupted</option>
+          <option value="completed">completed</option>
+          <option value="failed">failed</option>
+          <option value="cancelled">cancelled</option>
+        </select></div>
+      <div class="form-row"><label for="task-search">Search</label><input id="task-search" type="text" placeholder="task id / title substring"></div>
+      <div id="tasks-table"></div>
+    </div>
+  </section>
+
+  <section id="section-cron" class="section" data-section="cron">
+    <div class="section-head"><h1 class="section-title">Scheduled Jobs</h1><div class="section-meta" id="cron-meta"></div></div>
+    <div class="panel">
+      <h2 class="panel-title">Cron Jobs<button class="btn primary" id="cron-create-open">+ New Job</button></h2>
+      <div class="form-row"><label for="cron-subject">Subject filter</label><input id="cron-subject" type="text" placeholder="subject_id (optional)"></div>
+      <div id="cron-table"></div>
+    </div>
+  </section>
+
   <section id="section-chat" class="section" data-section="chat">
     <div class="section-head"><h1 class="section-title">Chat</h1><div class="section-meta"></div></div>
     <div class="panel">
@@ -341,6 +374,15 @@ input[type="text"], input[type="number"], input[type="password"], select { width
     </div>
   </section>
 
+  <section id="section-denials" class="section" data-section="denials">
+    <div class="section-head"><h1 class="section-title">Policy Denials</h1><div class="section-meta" id="denials-meta"></div></div>
+    <div class="panel">
+      <h2 class="panel-title">Recent Denials<span class="panel-meta" id="denials-count"></span></h2>
+      <div class="form-row"><label for="denials-peer">Peer</label><input id="denials-peer" type="text" placeholder="tool (default)"></div>
+      <div id="denials-table"></div>
+    </div>
+  </section>
+
   <section id="section-tenant" class="section" data-section="tenant">
     <div class="section-head"><h1 class="section-title">Multi-Tenant</h1><div class="section-meta" id="tenant-meta"></div></div>
     <div class="panel"><h2 class="panel-title">Tenants</h2><div id="tenant-list"></div></div>
@@ -379,6 +421,16 @@ input[type="text"], input[type="number"], input[type="password"], select { width
     <div class="panel"><h2 class="panel-title">Installed Plugins</h2><div id="plugins-table"></div></div>
   </section>
 
+  <section id="section-mcp" class="section" data-section="mcp">
+    <div class="section-head"><h1 class="section-title">MCP Servers</h1><div class="section-meta" id="mcp-meta"></div></div>
+    <div class="panel">
+      <h2 class="panel-title">Servers<span class="panel-meta" id="mcp-peer-label"></span></h2>
+      <div class="form-row"><label for="mcp-peer">Peer</label><input id="mcp-peer" type="text" placeholder="tool (default)"></div>
+      <div id="mcp-servers"></div>
+    </div>
+    <div class="panel"><h2 class="panel-title">Invocation Audit<span class="panel-meta" id="mcp-audit-count"></span></h2><div id="mcp-audit"></div></div>
+  </section>
+
   <section id="section-config" class="section" data-section="config">
     <div class="section-head"><h1 class="section-title">Configuration</h1><div class="section-meta" id="config-meta"></div></div>
     <div class="panel"><h2 class="panel-title">Providers</h2><div id="config-providers"></div></div>
@@ -409,6 +461,8 @@ input[type="text"], input[type="number"], input[type="password"], select { width
 
 var SECTIONS = [
   { id: 'overview',      label: 'Overview',        icon: '◆' },
+  { id: 'tasks',         label: 'Tasks',           icon: '▤' },
+  { id: 'cron',          label: 'Scheduled Jobs',  icon: '◴' },
   { id: 'chat',          label: 'Chat',            icon: '✎' },
   { id: 'memory',        label: 'Memory',          icon: '☷' },
   { id: 'approvals',     label: 'Approvals',       icon: '✓' },
@@ -419,11 +473,13 @@ var SECTIONS = [
   { id: 'identity',      label: 'Identity',        icon: '◐' },
   { id: 'cost',          label: 'Cost & Metrics',  icon: '$' },
   { id: 'observability', label: 'Observability',   icon: '⚭' },
+  { id: 'denials',       label: 'Policy Denials',  icon: '⊘' },
   { id: 'tenant',        label: 'Multi-Tenant',    icon: '⌑' },
   { id: 'planning',      label: 'Planning',        icon: '◳' },
   { id: 'workflows',     label: 'Workflows',       icon: '⇄' },
   { id: 'email',         label: 'Email',           icon: '✉' },
   { id: 'plugins',       label: 'Plugins',         icon: '⚇' },
+  { id: 'mcp',           label: 'MCP Servers',     icon: '⧉' },
   { id: 'config',        label: 'Configuration',   icon: '⚙' },
   { id: 'logs',          label: 'Logs',            icon: '☰' }
 ];
@@ -599,7 +655,9 @@ var Bridge = {
     });
   },
   get: function (path) { return this.req('GET', path); },
-  post: function (path, body) { return this.req('POST', path, body || {}); }
+  post: function (path, body) { return this.req('POST', path, body || {}); },
+  patch: function (path, body) { return this.req('PATCH', path, body || {}); },
+  del: function (path) { return this.req('DELETE', path); }
 };
 
 var State = {
@@ -2263,6 +2321,497 @@ Loaders.plugins = function () {
   });
 };
 
+// Normalize a coordinator timestamp to milliseconds. Some
+// surfaces emit unix seconds, others milliseconds. Anything
+// below 1e12 is treated as seconds and scaled up; 0 / null
+// pass through so fmtDate / fmtRelative render their own
+// empty marker.
+function toMs(v) {
+  if (!v) return 0;
+  return v < 1e12 ? v * 1000 : v;
+}
+
+// A panel's backing data can be absent for several honest
+// reasons on a given deployment: the node or feature is not
+// running (404 unknown alias), the responder does not
+// implement the method (admission:unknown_method), or the
+// console identity is not admitted to the method by policy.
+// None of these are dashboard faults, so render a calm muted
+// state rather than a red error box. This never fabricates
+// data and never weakens admission; it only presents an
+// honest "not available here" message.
+function panelDataAbsent(err) {
+  if (isFeatureAbsent(err)) return true;
+  var m = ((err && err.message) || '') + ' ' + ((err && err.body) || '');
+  return /unknown_method|unknown method|admission:|default_deny|no allow rule|not admitted|not permitted|deny:/i.test(m);
+}
+function calmPanel(container, label) {
+  setKids(container, el('div', { class: 'muted' },
+    label + ' is not available on this deployment.'));
+}
+
+// ── Tasks ────────────────────────────────────────────────
+function taskStatusCls(status) {
+  switch (status) {
+    case 'completed': return 'ok';
+    case 'running': case 'retrying': return 'info';
+    case 'failed': return 'err';
+    case 'cancelled': case 'interrupted': return 'warn';
+    case 'paused': case 'frozen': case 'awaiting_input': return 'muted';
+    default: return 'muted';
+  }
+}
+
+Loaders.tasks = function () {
+  var box = document.getElementById('tasks-table');
+  spinnerInto(box);
+  var status = (document.getElementById('task-status-filter').value || '').trim();
+  var path = '/v1/tasks?limit=200' + (status ? '&status=' + encodeURIComponent(status) : '');
+  Promise.all([
+    Bridge.get(path),
+    Bridge.get('/v1/tasks/count' + (status ? '?status=' + encodeURIComponent(status) : '')).catch(function () { return null; })
+  ]).then(function (vals) {
+    var rows = rowsOf(vals[0]);
+    var total = (vals[1] && typeof vals[1].count === 'number') ? vals[1].count : rows.length;
+    var search = (document.getElementById('task-search').value || '').toLowerCase();
+    var filtered = search ? rows.filter(function (r) {
+      return ((r.task_id || '') + ' ' + (r.title || '')).toLowerCase().indexOf(search) !== -1;
+    }) : rows;
+    var running = rows.filter(function (r) { return r.status === 'running' || r.status === 'retrying'; }).length;
+    var failed = rows.filter(function (r) { return r.status === 'failed'; }).length;
+    setKids(document.getElementById('tasks-summary'),
+      kpi('Total' + (status ? ' (' + status + ')' : ''), String(total)),
+      kpi('Running', String(running), 'in this page'),
+      kpi('Failed', String(failed), 'in this page'),
+      kpi('Loaded at', fmtDate(Date.now())));
+    if (!filtered.length) setKids(box, el('div', { class: 'muted' }, 'No tasks match.'));
+    else {
+      var t = el('table', {}, el('thead', {}, el('tr', {},
+        el('th', {}, 'Task ID'), el('th', {}, 'Status'), el('th', {}, 'Title'),
+        el('th', {}, 'Updated'), el('th', {}, 'Flags'))));
+      var tb = el('tbody', {});
+      filtered.slice(0, 200).forEach(function (r) {
+        var id = r.task_id || '';
+        tb.appendChild(el('tr', { onclick: function () { openTaskDetail(id); } },
+          el('td', { class: 'mono' }, trunc(id, 18)),
+          el('td', {}, el('span', { class: 'badge ' + taskStatusCls(r.status) }, r.status || '')),
+          el('td', {}, trunc(r.title || '', 70)),
+          el('td', { class: 'mono' }, fmtRelative(toMs(r.updated_at))),
+          el('td', {}, r.investigation_marked_at ? el('span', { class: 'badge warn' }, 'investigating') : '')));
+      });
+      t.appendChild(tb); setKids(box, t);
+    }
+    setMeta('tasks', true);
+  }).catch(function (e) {
+    if (panelDataAbsent(e)) { calmPanel(box, 'Task ledger'); setMeta('tasks', true); }
+    else { errorPanel(box, e, Loaders.tasks); setMeta('tasks', false); }
+  });
+};
+
+function openTaskDetail(id) {
+  Promise.all([
+    Bridge.get('/v1/tasks/' + encodeURIComponent(id)),
+    Bridge.get('/v1/tasks/' + encodeURIComponent(id) + '/summary').catch(function () { return null; }),
+    Bridge.get('/v1/tasks/' + encodeURIComponent(id) + '/attempts').catch(function () { return null; })
+  ]).then(function (vals) {
+    var detail = vals[0] || {};
+    var summary = vals[1];
+    var attempts = rowsOf(vals[2], 'attempts');
+    var header = detail.header || {};
+    var events = rowsOf(detail, 'events');
+    var status = (summary && summary.status) || header.status || '';
+    var body = el('div', {});
+
+    // Header facts.
+    var headerItems = [['Task ID', id], ['Status', status]];
+    if (summary) {
+      if (summary.retries) headerItems.push(['Retries', summary.retries]);
+      if (summary.retry_policy) headerItems.push(['Retry policy', summary.retry_policy]);
+      if (summary.duration_secs != null) headerItems.push(['Duration', summary.duration_secs + 's']);
+      if (summary.last_failure_class) headerItems.push(['Last failure', summary.last_failure_class]);
+      if (summary.last_failure_reason) headerItems.push(['Reason', summary.last_failure_reason]);
+    }
+    Object.keys(header).forEach(function (k) {
+      if (k === 'status') return;
+      headerItems.push([k, header[k]]);
+    });
+    body.appendChild(kvList(headerItems));
+
+    // Operator actions wired to the real lifecycle endpoints.
+    function act(label, cls, action, payload) {
+      return el('button', { class: 'btn ' + (cls || ''), onclick: function () {
+        Bridge.post('/v1/tasks/' + encodeURIComponent(id) + '/' + action, payload || {})
+          .then(function () { closeModal(); openTaskDetail(id); Loaders.tasks(); })
+          .catch(function (e) { alert(action + ' failed: ' + e.message); });
+      } }, label);
+    }
+    var marked = !!header.investigation_marked_at || (summary && summary.investigation_marked_at);
+    body.appendChild(el('div', { class: 'btn-row', style: { marginTop: '12px' } },
+      act('Retry', '', 'retry'),
+      act('Replay', '', 'replay'),
+      act('Cancel', 'err', 'cancel', { reason: 'operator-cancelled from dashboard' }),
+      act('Pause', '', 'pause'),
+      act('Resume', '', 'resume'),
+      act('Freeze', '', 'freeze'),
+      act('Unfreeze', '', 'unfreeze'),
+      el('button', { class: 'btn', onclick: function () {
+        Bridge.post('/v1/tasks/' + encodeURIComponent(id) + '/investigation', { marked: !marked })
+          .then(function () { closeModal(); openTaskDetail(id); Loaders.tasks(); })
+          .catch(function (e) { alert('investigation failed: ' + e.message); });
+      } }, marked ? 'Clear investigation' : 'Mark investigation')));
+
+    // Add-note control.
+    var noteInput = el('input', { type: 'text', placeholder: 'Add an operator note', style: { flex: '1' } });
+    body.appendChild(el('div', { class: 'btn-row', style: { marginTop: '8px', alignItems: 'center' } },
+      noteInput,
+      el('button', { class: 'btn', onclick: function () {
+        var v = (noteInput.value || '').trim();
+        if (!v) { alert('Note text is required.'); return; }
+        Bridge.post('/v1/tasks/' + encodeURIComponent(id) + '/note', { note: v })
+          .then(function () { closeModal(); openTaskDetail(id); })
+          .catch(function (e) { alert('note failed: ' + e.message); });
+      } }, 'Add Note')));
+
+    // Attempts.
+    if (attempts.length) {
+      body.appendChild(el('h3', { style: { fontSize: '13px', marginTop: '16px' } }, 'Attempts'));
+      var at = el('table', {}, el('thead', {}, el('tr', {},
+        el('th', {}, '#'), el('th', {}, 'Status'), el('th', {}, 'Started'),
+        el('th', {}, 'Finished'), el('th', {}, 'Failure'))));
+      var atb = el('tbody', {});
+      attempts.forEach(function (a) {
+        atb.appendChild(el('tr', {},
+          el('td', { class: 'mono' }, String(a.attempt_num)),
+          el('td', {}, el('span', { class: 'badge ' + taskStatusCls(a.status) }, a.status || '')),
+          el('td', { class: 'mono' }, fmtRelative(toMs(a.started_at))),
+          el('td', { class: 'mono' }, a.finished_at ? fmtRelative(toMs(a.finished_at)) : ''),
+          el('td', {}, a.failure_class || '')));
+      });
+      at.appendChild(atb); body.appendChild(at);
+    }
+
+    // Chronicle events.
+    body.appendChild(el('h3', { style: { fontSize: '13px', marginTop: '16px' } }, 'Chronicle'));
+    if (!events.length) body.appendChild(el('div', { class: 'muted' }, 'No events recorded.'));
+    else {
+      var list = el('div', {});
+      events.forEach(function (ev) {
+        list.appendChild(el('div', { style: { padding: '6px 0', borderBottom: '1px solid var(--border)' } },
+          el('div', {}, el('span', { class: 'badge muted' }, ev.event_type || ''),
+            el('span', { class: 'mono', style: { marginLeft: '8px', color: 'var(--text-dim)' } }, fmtDate(toMs(ev.ts)))),
+          el('div', { class: 'code', style: { marginTop: '4px' } }, trunc(ev.payload || '', 600))));
+      });
+      body.appendChild(list);
+    }
+    openModal('Task ' + trunc(id, 16), body);
+  }).catch(function (e) { alert('Failed to load task: ' + e.message); });
+}
+
+function openSpawnTaskModal() {
+  var body = el('div', {},
+    el('div', { class: 'form-row' }, el('label', {}, 'Parent task ID'), el('input', { id: 'spawn-parent', type: 'text', placeholder: '32 hex chars' })),
+    el('div', { class: 'form-row' }, el('label', {}, 'Goal'), el('input', { id: 'spawn-goal', type: 'text' })),
+    el('div', { class: 'form-row' }, el('label', {}, 'Context'), el('textarea', { id: 'spawn-context', rows: '3' })),
+    el('div', { class: 'form-row' }, el('label', {}, 'Target subject'), el('input', { id: 'spawn-subject', type: 'text', placeholder: 'optional' })),
+    el('div', { class: 'form-row' }, el('label', {}, 'Depth'), el('input', { id: 'spawn-depth', type: 'number', min: '0', value: '0' })),
+    el('div', { class: 'muted', style: { marginTop: '4px' } },
+      'Spawns a child task under an existing parent through the delegation surface.'),
+    el('div', { style: { textAlign: 'right', marginTop: '12px' } },
+      el('button', { class: 'btn primary', onclick: spawnTaskSubmit }, 'Spawn')));
+  openModal('Spawn Task', body);
+}
+function spawnTaskSubmit() {
+  var parent = (document.getElementById('spawn-parent').value || '').trim();
+  var goal = (document.getElementById('spawn-goal').value || '').trim();
+  if (!parent || !goal) { alert('Parent task ID and goal are required.'); return; }
+  var payload = { parent_task_id: parent, goal: goal };
+  var ctx = (document.getElementById('spawn-context').value || '').trim();
+  if (ctx) payload.context = ctx;
+  var subj = (document.getElementById('spawn-subject').value || '').trim();
+  if (subj) payload.target_subject_id = subj;
+  var depth = document.getElementById('spawn-depth').value;
+  if (depth !== '') payload.depth = parseInt(depth, 10);
+  Bridge.post('/v1/delegate/spawn', payload).then(function (j) {
+    closeModal();
+    Loaders.tasks();
+    if (j && j.child_task_id) openTaskDetail(j.child_task_id);
+  }).catch(function (e) { alert('Spawn failed: ' + e.message); });
+}
+
+// ── Scheduled Jobs (cron) ────────────────────────────────
+Loaders.cron = function () {
+  var box = document.getElementById('cron-table');
+  spinnerInto(box);
+  var subject = (document.getElementById('cron-subject').value || '').trim();
+  var path = '/v1/cron/jobs' + (subject ? '?subject_id=' + encodeURIComponent(subject) : '');
+  Bridge.get(path).then(function (j) {
+    var rows = rowsOf(j, 'jobs');
+    if (!rows.length) setKids(box, el('div', { class: 'muted' }, 'No scheduled jobs.'));
+    else {
+      var t = el('table', {}, el('thead', {}, el('tr', {},
+        el('th', {}, 'Name'), el('th', {}, 'Schedule'), el('th', {}, 'Enabled'),
+        el('th', {}, 'Next run'), el('th', {}, 'Last run'), el('th', {}, 'Runs'),
+        el('th', {}, 'Actions'))));
+      var tb = el('tbody', {});
+      rows.forEach(function (r) {
+        tb.appendChild(el('tr', {},
+          el('td', { onclick: function () { openCronDetail(r.job_id); }, style: { cursor: 'pointer' } }, r.name || ''),
+          el('td', { class: 'mono' }, r.schedule || ''),
+          el('td', {}, el('span', { class: 'badge ' + (r.enabled ? 'ok' : 'muted') }, r.enabled ? 'enabled' : 'disabled')),
+          el('td', { class: 'mono' }, fmtDate(toMs(r.next_run_at))),
+          el('td', { class: 'mono' }, fmtRelative(toMs(r.last_run_at))),
+          el('td', { class: 'mono' }, String(r.run_count || 0)),
+          el('td', { class: 'btn-row' },
+            el('button', { class: 'btn', onclick: function () {
+              Bridge.post('/v1/cron/jobs/' + encodeURIComponent(r.job_id) + '/trigger')
+                .then(function (res) { alert('Triggered. Task: ' + (res && res.task_id ? res.task_id : 'unknown')); Loaders.cron(); })
+                .catch(function (e) { alert('Trigger failed: ' + e.message); });
+            } }, 'Trigger'),
+            el('button', { class: 'btn', onclick: function () {
+              Bridge.patch('/v1/cron/jobs/' + encodeURIComponent(r.job_id), { enabled: !r.enabled })
+                .then(Loaders.cron).catch(function (e) { alert('Update failed: ' + e.message); });
+            } }, r.enabled ? 'Disable' : 'Enable'),
+            el('button', { class: 'btn', onclick: function () { openEditCronModal(r.job_id); } }, 'Edit'),
+            el('button', { class: 'btn err', onclick: function () {
+              if (!confirm('Delete job ' + (r.name || r.job_id) + '?')) return;
+              Bridge.del('/v1/cron/jobs/' + encodeURIComponent(r.job_id))
+                .then(Loaders.cron).catch(function (e) { alert('Delete failed: ' + e.message); });
+            } }, 'Delete'))));
+      });
+      t.appendChild(tb); setKids(box, t);
+    }
+    setMeta('cron', true);
+  }).catch(function (e) {
+    if (panelDataAbsent(e)) { calmPanel(box, 'Cron scheduler'); setMeta('cron', true); }
+    else { errorPanel(box, e, Loaders.cron); setMeta('cron', false); }
+  });
+};
+
+function openCronDetail(jobId) {
+  Bridge.get('/v1/cron/jobs/' + encodeURIComponent(jobId)).then(function (j) {
+    var body = el('div', {}, kvList([
+      ['Job ID', j.job_id || ''],
+      ['Name', j.name || ''],
+      ['Schedule', j.schedule || ''],
+      ['Enabled', j.enabled ? 'yes' : 'no'],
+      ['Flow template', j.flow_template || ''],
+      ['Subject', j.subject_id || ''],
+      ['Created', fmtDate(toMs(j.created_at))],
+      ['Updated', fmtDate(toMs(j.updated_at))],
+      ['Next run', fmtDate(toMs(j.next_run_at))],
+      ['Last run', fmtRelative(toMs(j.last_run_at))],
+      ['Run count', String(j.run_count || 0)],
+      ['Last task', j.last_task_id || ''],
+      ['Last status', j.last_status || '']
+    ]));
+    if (j.prompt) {
+      body.appendChild(el('h3', { style: { fontSize: '13px', marginTop: '12px' } }, 'Prompt'));
+      body.appendChild(el('div', { class: 'code' }, j.prompt));
+    }
+    openModal('Job ' + trunc(j.name || jobId, 24), body);
+  }).catch(function (e) { alert('Failed to load job: ' + e.message); });
+}
+
+function openCreateCronModal() {
+  var body = el('div', {},
+    el('div', { class: 'form-row' }, el('label', {}, 'Name'), el('input', { id: 'cron-name', type: 'text' })),
+    el('div', { class: 'form-row' }, el('label', {}, 'Schedule'), el('input', { id: 'cron-sched', type: 'text', placeholder: 'e.g. 1h, 1d, cron expr' })),
+    el('div', { class: 'form-row' }, el('label', {}, 'Flow template'), el('input', { id: 'cron-flow', type: 'text', value: 'flows/chat_template.sol' })),
+    el('div', { class: 'form-row' }, el('label', {}, 'Subject'), el('input', { id: 'cron-subj', type: 'text' })),
+    el('div', { class: 'form-row' }, el('label', {}, 'Prompt'), el('textarea', { id: 'cron-prompt', rows: '4' })),
+    el('div', { style: { textAlign: 'right', marginTop: '12px' } },
+      el('button', { class: 'btn primary', onclick: createCronSubmit }, 'Create')));
+  openModal('New Scheduled Job', body);
+}
+function createCronSubmit() {
+  var payload = {
+    name: (document.getElementById('cron-name').value || '').trim(),
+    schedule: (document.getElementById('cron-sched').value || '').trim(),
+    flow_template: (document.getElementById('cron-flow').value || '').trim(),
+    subject_id: (document.getElementById('cron-subj').value || '').trim(),
+    prompt: document.getElementById('cron-prompt').value || ''
+  };
+  if (!payload.name || !payload.schedule || !payload.subject_id) {
+    alert('Name, schedule, and subject are required.'); return;
+  }
+  Bridge.post('/v1/cron/jobs', payload).then(function () { closeModal(); Loaders.cron(); })
+    .catch(function (e) { alert('Create failed: ' + e.message); });
+}
+
+function openEditCronModal(jobId) {
+  Bridge.get('/v1/cron/jobs/' + encodeURIComponent(jobId)).then(function (j) {
+    var body = el('div', {},
+      el('div', { class: 'form-row' }, el('label', {}, 'Enabled'),
+        el('input', { id: 'cron-edit-enabled', type: 'checkbox', checked: !!j.enabled })),
+      el('div', { class: 'form-row' }, el('label', {}, 'Schedule'),
+        el('input', { id: 'cron-edit-sched', type: 'text', value: j.schedule || '' })),
+      el('div', { class: 'form-row' }, el('label', {}, 'Prompt'),
+        el('textarea', { id: 'cron-edit-prompt', rows: '4' }, j.prompt || '')),
+      el('div', { style: { textAlign: 'right', marginTop: '12px' } },
+        el('button', { class: 'btn primary', onclick: function () { editCronSubmit(jobId, j); } }, 'Save')));
+    openModal('Edit Job', body);
+  }).catch(function (e) { alert('Failed to load job: ' + e.message); });
+}
+function editCronSubmit(jobId, original) {
+  var payload = {};
+  var enabled = document.getElementById('cron-edit-enabled').checked;
+  if (enabled !== !!original.enabled) payload.enabled = enabled;
+  var sched = (document.getElementById('cron-edit-sched').value || '').trim();
+  if (sched !== (original.schedule || '')) payload.schedule = sched;
+  var prompt = document.getElementById('cron-edit-prompt').value || '';
+  if (prompt !== (original.prompt || '')) payload.prompt = prompt;
+  if (!Object.keys(payload).length) { closeModal(); return; }
+  Bridge.patch('/v1/cron/jobs/' + encodeURIComponent(jobId), payload)
+    .then(function () { closeModal(); Loaders.cron(); })
+    .catch(function (e) { alert('Save failed: ' + e.message); });
+}
+
+// ── Policy Denials (read-only) ───────────────────────────
+Loaders.denials = function () {
+  var box = document.getElementById('denials-table');
+  spinnerInto(box);
+  var peer = (document.getElementById('denials-peer').value || '').trim();
+  var path = '/v1/policy/denials?max=200' + (peer ? '&peer=' + encodeURIComponent(peer) : '');
+  Bridge.get(path).then(function (j) {
+    var rows = rowsOf(j, 'denials');
+    var label = document.getElementById('denials-count');
+    setKids(label, (j && j.peer ? 'peer ' + j.peer + ' · ' : '') + rows.length + ' shown');
+    if (!rows.length) setKids(box, el('div', { class: 'muted' }, 'No policy denials recorded.'));
+    else {
+      var t = el('table', {}, el('thead', {}, el('tr', {},
+        el('th', {}, 'When'), el('th', {}, 'Method'), el('th', {}, 'Caller'),
+        el('th', {}, 'Rule'), el('th', {}, 'Reason'))));
+      var tb = el('tbody', {});
+      rows.forEach(function (r) {
+        tb.appendChild(el('tr', { onclick: function () { openDenialDetail(r); }, style: { cursor: 'pointer' } },
+          el('td', { class: 'mono' }, fmtDate(toMs(r.at))),
+          el('td', { class: 'mono' }, r.method || ''),
+          el('td', {}, r.caller_name || trunc(r.caller_subject_id || '', 16)),
+          el('td', {}, el('span', { class: 'badge warn' }, r.rule || '')),
+          el('td', {}, trunc(r.reason || '', 80))));
+      });
+      t.appendChild(tb); setKids(box, t);
+    }
+    setMeta('denials', true);
+  }).catch(function (e) {
+    if (panelDataAbsent(e)) { calmPanel(box, 'Policy denial ring'); setMeta('denials', true); }
+    else { errorPanel(box, e, Loaders.denials); setMeta('denials', false); }
+  });
+};
+function openDenialDetail(r) {
+  openModal('Policy Denial', el('div', {}, kvList([
+    ['When', fmtDate(toMs(r.at))],
+    ['Method', r.method || ''],
+    ['Caller name', r.caller_name || ''],
+    ['Caller subject', r.caller_subject_id || ''],
+    ['Rule', r.rule || ''],
+    ['Reason', r.reason || '']
+  ])));
+}
+
+// ── MCP Servers / Tools ──────────────────────────────────
+Loaders.mcp = function () {
+  var box = document.getElementById('mcp-servers');
+  spinnerInto(box);
+  var peer = (document.getElementById('mcp-peer').value || '').trim();
+  var qp = peer ? '?peer=' + encodeURIComponent(peer) : '';
+  Bridge.get('/v1/mcp/servers' + qp).then(function (j) {
+    var servers = rowsOf(j, 'servers');
+    var usedPeer = (j && j.peer) || peer || 'tool';
+    setKids(document.getElementById('mcp-peer-label'), 'peer ' + usedPeer);
+    if (!servers.length) setKids(box, el('div', { class: 'muted' }, 'No MCP servers registered on this peer.'));
+    else {
+      var t = el('table', {}, el('thead', {}, el('tr', {},
+        el('th', {}, 'Server'), el('th', {}, 'Transport'), el('th', {}, 'Endpoint'),
+        el('th', {}, 'Tools'), el('th', {}, 'Status'), el('th', {}, 'Actions'))));
+      var tb = el('tbody', {});
+      servers.forEach(function (s) {
+        var st = (s.status || '').toLowerCase();
+        var cls = st === 'configured' || st === 'connected' || st === 'ok' ? 'ok' : (st === 'error' ? 'err' : 'muted');
+        tb.appendChild(el('tr', {},
+          el('td', { class: 'mono' }, s.id || ''),
+          el('td', {}, s.transport || ''),
+          el('td', { class: 'mono' }, trunc(s.endpoint || '', 40)),
+          el('td', { class: 'mono' }, String(s.declared_tool_count || 0)),
+          el('td', {}, el('span', { class: 'badge ' + cls }, s.status || '')),
+          el('td', { class: 'btn-row' },
+            el('button', { class: 'btn', onclick: function () { openMcpTools(s.id, usedPeer); } }, 'Tools'),
+            el('button', { class: 'btn', onclick: function () { openMcpInvoke(s.id, usedPeer); } }, 'Invoke'))));
+      });
+      t.appendChild(tb); setKids(box, t);
+    }
+    setMeta('mcp', true);
+  }).catch(function (e) {
+    if (panelDataAbsent(e)) { calmPanel(box, 'MCP registry'); setMeta('mcp', true); }
+    else { errorPanel(box, e, Loaders.mcp); setMeta('mcp', false); }
+  });
+  loadMcpAudit();
+};
+function loadMcpAudit() {
+  var box = document.getElementById('mcp-audit');
+  Bridge.get('/v1/mcp/audit?max=100').then(function (j) {
+    var rows = rowsOf(j, 'entries');
+    setKids(document.getElementById('mcp-audit-count'), (j && typeof j.count === 'number') ? j.count + ' total' : '');
+    if (!rows.length) { setKids(box, el('div', { class: 'muted' }, 'No invocations recorded yet.')); return; }
+    var t = el('table', {}, el('thead', {}, el('tr', {},
+      el('th', {}, 'When'), el('th', {}, 'Peer'), el('th', {}, 'Server'),
+      el('th', {}, 'Tool'), el('th', {}, 'Outcome'), el('th', {}, 'Duration'))));
+    var tb = el('tbody', {});
+    rows.forEach(function (e) {
+      tb.appendChild(el('tr', {},
+        el('td', { class: 'mono' }, fmtDate(toMs(e.ts_secs))),
+        el('td', {}, e.peer_alias || ''),
+        el('td', { class: 'mono' }, e.server_id || ''),
+        el('td', { class: 'mono' }, e.tool_name || ''),
+        el('td', {}, el('span', { class: 'badge ' + (e.outcome === 'ok' ? 'ok' : 'err') },
+          (e.outcome || '') + (e.error_kind ? ' (' + e.error_kind + ')' : ''))),
+        el('td', { class: 'mono' }, (e.duration_ms != null ? e.duration_ms + 'ms' : ''))));
+    });
+    t.appendChild(tb); setKids(box, t);
+  }).catch(function () { setKids(box, el('div', { class: 'muted' }, 'Invocation audit unavailable.')); });
+}
+function openMcpTools(serverId, peer) {
+  Bridge.get('/v1/mcp/tools?server_id=' + encodeURIComponent(serverId) + '&peer=' + encodeURIComponent(peer)).then(function (j) {
+    var tools = rowsOf(j, 'tools');
+    var body = el('div', {});
+    if (!tools.length) body.appendChild(el('div', { class: 'muted' }, 'No tools declared by this server.'));
+    else tools.forEach(function (name) { body.appendChild(el('div', { class: 'chip mono' }, name)); });
+    openModal('Tools on ' + serverId, body);
+  }).catch(function (e) { alert('Failed to load tools: ' + e.message); });
+}
+function openMcpInvoke(serverId, peer) {
+  var result = el('div', { style: { marginTop: '12px' } });
+  var body = el('div', {},
+    el('div', { class: 'form-row' }, el('label', {}, 'Server'), el('input', { id: 'mcp-inv-server', type: 'text', value: serverId })),
+    el('div', { class: 'form-row' }, el('label', {}, 'Tool name'), el('input', { id: 'mcp-inv-tool', type: 'text' })),
+    el('div', { class: 'form-row' }, el('label', {}, 'Args (JSON)'), el('textarea', { id: 'mcp-inv-args', rows: '4', placeholder: '{}' })),
+    el('div', { style: { textAlign: 'right' } },
+      el('button', { class: 'btn primary', onclick: function () { mcpInvokeSubmit(peer, result); } }, 'Invoke')),
+    result);
+  openModal('Invoke MCP Tool', body);
+}
+function mcpInvokeSubmit(peer, result) {
+  var payload = {
+    peer: peer,
+    server_id: (document.getElementById('mcp-inv-server').value || '').trim(),
+    tool_name: (document.getElementById('mcp-inv-tool').value || '').trim(),
+    args: document.getElementById('mcp-inv-args').value || ''
+  };
+  if (!payload.server_id || !payload.tool_name) { alert('Server and tool name are required.'); return; }
+  setKids(result, el('div', { class: 'loading-state' }, el('span', { class: 'spinner' }), ' Invoking…'));
+  Bridge.post('/v1/mcp/invoke', payload).then(function (j) {
+    setKids(result, el('div', { class: 'panel-title' }, 'Result'),
+      el('div', { class: 'code' }, (j && j.result != null) ? String(j.result) : JSON.stringify(j || {}, null, 2)));
+    loadMcpAudit();
+  }).catch(function (e) {
+    // The stdio runtime is not connected yet (D-009): the bridge
+    // surfaces RuntimeNotConnected as an HTTP error. Show it
+    // plainly rather than as a red failure of the dashboard.
+    setKids(result, el('div', { class: 'error-state' }, e && e.message ? e.message : String(e)));
+    loadMcpAudit();
+  });
+}
+
 Loaders.config = function () {
   Promise.all([
     Bridge.get('/v1/config').catch(function () { return null; }),
@@ -2651,6 +3200,23 @@ function initApp() {
       document.getElementById('plan-submit').addEventListener('click', planSubmit);
       document.getElementById('workflows-reload-btn').addEventListener('click', function () {
         Bridge.post('/v1/workflows/reload').then(Loaders.workflows).catch(function (e) { alert(e.message); });
+      });
+      document.getElementById('task-spawn-open').addEventListener('click', openSpawnTaskModal);
+      document.getElementById('task-status-filter').addEventListener('change', function () {
+        if (State.active === 'tasks') Loaders.tasks();
+      });
+      document.getElementById('task-search').addEventListener('input', function () {
+        if (State.active === 'tasks') Loaders.tasks();
+      });
+      document.getElementById('cron-create-open').addEventListener('click', openCreateCronModal);
+      document.getElementById('cron-subject').addEventListener('change', function () {
+        if (State.active === 'cron') Loaders.cron();
+      });
+      document.getElementById('denials-peer').addEventListener('change', function () {
+        if (State.active === 'denials') Loaders.denials();
+      });
+      document.getElementById('mcp-peer').addEventListener('change', function () {
+        if (State.active === 'mcp') Loaders.mcp();
       });
       wireLogControls();
     } catch (e) {
