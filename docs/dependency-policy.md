@@ -63,7 +63,7 @@ Relix accepts that the libp2p ecosystem brings a long tail of transitives. Polic
 
 Three trigger points:
 
-1. **Per-PR (automatic):** `ci.yml` runs `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on the ubuntu + macOS + windows matrix, `cargo deny check` (all categories), and the secret/AI-tag scan. All are required gates.
+1. **Per-PR (automatic):** `ci.yml` runs `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on the ubuntu + macOS + windows matrix, plus `cargo deny check` (all categories). All are required gates.
 2. **Per-milestone (manual):** before pushing a milestone commit, run the full `cargo deny check` and `cargo audit` locally.
 3. **Nightly (automated):** `nightly-security.yml` runs `cargo deny check` (all categories, hard gates) and `cargo audit` (hard gate) against `main`. New advisories surface within 24 hours.
 
@@ -85,7 +85,7 @@ The pin moves only when a deliberate need arises (new language feature, stable a
 
 ## CI policy at a glance
 
-`ci.yml` (every push/PR, required) runs fmt, clippy `-D warnings` and test on the ubuntu + macOS + windows matrix, `cargo deny check` (all categories), and the secret/AI-tag scan.
+`ci.yml` (every push/PR, required) runs fmt, clippy `-D warnings` and test on the ubuntu + macOS + windows matrix, plus `cargo deny check` (all categories).
 
 `heavy-ci.yml` (manual or `heavy` label) runs the end-to-end mesh demo. It is not a required gate and does not duplicate the per-push hygiene checks.
 

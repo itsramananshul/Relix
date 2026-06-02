@@ -83,6 +83,6 @@ re-uploaded with `--clobber`.
 
 CI (`ci.yml`) is the required gate. It runs on every push to `main` and
 every pull request: `cargo fmt --check`, `cargo clippy -D warnings` and
-`cargo test` on the ubuntu + macOS + windows matrix, `cargo deny check`, and
-the secret/AI-tag scan. Run the same set locally with `scripts/ci-local.ps1`
-before tagging a release.
+`cargo test` on the ubuntu + macOS + windows matrix, plus `cargo deny check`.
+Run the same set locally with `scripts/ci-local.ps1` before tagging a
+release.
