@@ -71,9 +71,8 @@ Status: started.
 
 Single-call approvals are not enough for autonomous work. Relix now supports
 standing approvals scoped by task, session, capability/method prefix, workspace
-path, category, and expiry time. The remaining launch-critical work is making
-that scope obvious in the dashboard/CLI and adding hard budget/call-count
-limits.
+path, category, expiry time, and call count. The remaining launch-critical work
+is making that scope obvious in the dashboard/CLI and adding hard budget limits.
 
 Approval scopes:
 
@@ -85,9 +84,12 @@ Approval scopes:
   paths resolve active workspace leases and stamp the resolved `workspace_path`
   into dispatch envelopes
 - until a time limit: implemented through `expires_at`
+- until a call-count limit: implemented through `max_calls` and atomic
+  `calls_used` consumption in the admission gate
 - until a budget limit: still missing
 
-Approval decisions must write durable activity events and must be revocable.
+Approval decisions write durable activity events; standing approvals are
+revocable.
 
 ## Phase 4: Execution Workspaces
 
@@ -192,6 +194,11 @@ auth bootstrap guarantees.
 Tenant context must be mandatory for tenant-owned data. No handler should
 silently fall back to `None` for memory, agents, tasks, approvals, credentials,
 budget, or audit data in multi-tenant mode.
+
+Current progress:
+
+- standing approval list now resolves through the verified invocation tenant
+  instead of returning same-agent rows across every tenant
 
 ## Phase 8: Setup That Does Not Waste The User's Life
 

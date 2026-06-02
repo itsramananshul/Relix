@@ -421,6 +421,8 @@ pub struct StandingRow {
     pub workspace_path_glob: Option<String>,
     pub expires_at: i64,
     pub granted_by: String,
+    pub max_calls: Option<i64>,
+    pub calls_used: i64,
     pub note: String,
 }
 
@@ -450,6 +452,8 @@ pub struct StandingCreateRequest {
     pub method_prefix: Option<String>,
     #[serde(default)]
     pub workspace_path_glob: Option<String>,
+    #[serde(default)]
+    pub max_calls: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -471,6 +475,8 @@ struct StandingCreateForward<'a> {
     method_prefix: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace_path_glob: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_calls: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -505,6 +511,9 @@ pub async fn create_standing(
     if req.expires_at <= 0 {
         return Err(bad("expires_at must be a positive unix timestamp".into()));
     }
+    if req.max_calls.is_some_and(|n| n <= 0) {
+        return Err(bad("max_calls must be positive when provided".into()));
+    }
     let granted_by = req.granted_by.unwrap_or_else(|| "operator".to_string());
     let note = req.note.unwrap_or_default();
     let forward = StandingCreateForward {
@@ -519,6 +528,7 @@ pub async fn create_standing(
         session_id: req.session_id.as_deref(),
         method_prefix: req.method_prefix.as_deref(),
         workspace_path_glob: req.workspace_path_glob.as_deref(),
+        max_calls: req.max_calls,
     };
     let arg = serde_json::to_vec(&forward).map_err(|e| {
         (
@@ -647,7 +657,7 @@ pub fn parse_standing_body(body: &str) -> Vec<StandingRow> {
     body.lines()
         .filter(|line| !line.starts_with("count=") && !line.trim().is_empty())
         .filter_map(|line| {
-            let cols: Vec<&str> = line.splitn(11, '\t').collect();
+            let cols: Vec<&str> = line.splitn(13, '\t').collect();
             if cols.len() == 6 {
                 return Some(StandingRow {
                     standing_id: cols[0].into(),
@@ -660,10 +670,29 @@ pub fn parse_standing_body(body: &str) -> Vec<StandingRow> {
                     workspace_path_glob: None,
                     expires_at: cols[3].parse().ok()?,
                     granted_by: cols[4].into(),
+                    max_calls: None,
+                    calls_used: 0,
                     note: cols[5].into(),
                 });
             }
-            if cols.len() != 11 {
+            if cols.len() == 11 {
+                return Some(StandingRow {
+                    standing_id: cols[0].into(),
+                    match_category: cols[1].into(),
+                    match_path_glob: opt_string(cols[2]),
+                    scope_kind: cols[3].into(),
+                    task_id: opt_string(cols[4]),
+                    session_id: opt_string(cols[5]),
+                    method_prefix: opt_string(cols[6]),
+                    workspace_path_glob: opt_string(cols[7]),
+                    expires_at: cols[8].parse().ok()?,
+                    granted_by: cols[9].into(),
+                    max_calls: None,
+                    calls_used: 0,
+                    note: cols[10].into(),
+                });
+            }
+            if cols.len() != 13 {
                 return None;
             }
             Some(StandingRow {
@@ -677,7 +706,9 @@ pub fn parse_standing_body(body: &str) -> Vec<StandingRow> {
                 workspace_path_glob: opt_string(cols[7]),
                 expires_at: cols[8].parse().ok()?,
                 granted_by: cols[9].into(),
-                note: cols[10].into(),
+                max_calls: cols[10].parse().ok(),
+                calls_used: cols[11].parse().ok()?,
+                note: cols[12].into(),
             })
         })
         .collect()
@@ -970,6 +1001,16 @@ mod tests {
         assert_eq!(v[0].scope_kind, "method_prefix");
         assert_eq!(v[0].method_prefix.as_deref(), Some("tool.web_read"));
         assert_eq!(v[0].expires_at, 9999);
+    }
+
+    #[test]
+    fn parse_bounded_standing_returns_call_limits() {
+        let body = "std-1\tbrowser\t\tmethod_prefix\t\t\ttool.web_read\t\t9999\talice\t5\t2\tread-only\ncount=1\n";
+        let v = parse_standing_body(body);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].max_calls, Some(5));
+        assert_eq!(v[0].calls_used, 2);
+        assert_eq!(v[0].note, "read-only");
     }
 
     #[test]

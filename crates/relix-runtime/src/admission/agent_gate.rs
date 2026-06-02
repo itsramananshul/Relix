@@ -508,8 +508,8 @@ fn evaluate_against_view(
                 .find(|c| view.approval_required_categories.iter().any(|r| r == *c))
                 .cloned()
                 .unwrap_or_default();
-            let standing = store
-                .has_active_standing_for(StandingApprovalMatch {
+            let standing_id = store
+                .consume_active_standing_for(StandingApprovalMatch {
                     agent_id: &view.agent_id,
                     category: &matched_category,
                     method: &inputs.envelope.method,
@@ -527,10 +527,10 @@ fn evaluate_against_view(
                     tenant_id: inputs.envelope.tenant_id.as_deref(),
                     now: inputs.now,
                 })
-                .unwrap_or(false);
-            if standing {
+                .unwrap_or(None);
+            if let Some(standing_id) = standing_id {
                 return GateDecision::Allow(GateAllow {
-                    matched_rule: format!("standing_approval:{matched_category}"),
+                    matched_rule: format!("standing_approval:{matched_category}:{standing_id}"),
                     consumed_approval_id: None,
                 });
             }
@@ -1127,6 +1127,7 @@ mod tests {
             workspace_path_glob: None,
             expires_at: 9_999_999_999,
             granted_by: "alice",
+            max_calls: None,
             note: "",
             tenant_id: "default",
         })
@@ -1163,6 +1164,7 @@ mod tests {
             workspace_path_glob: None,
             expires_at: 9_999_999_999,
             granted_by: "alice",
+            max_calls: None,
             note: "",
             tenant_id: "default",
         })
@@ -1180,6 +1182,36 @@ mod tests {
         other.session_id = Some("sess-other".into());
         assert!(matches!(
             run(&s, &id, &other, Some(&c)),
+            GateDecision::RequireApproval(_)
+        ));
+    }
+
+    #[test]
+    fn bounded_standing_approval_stops_admitting_after_max_calls() {
+        let (s, id) = setup_with_profile("high", "active", &[], &[], &["payments"]);
+        let agent_id = s.list_agents(None).unwrap()[0].agent_id.clone();
+        s.create_scoped_standing(StandingApprovalCreate {
+            agent_id: &agent_id,
+            match_category: "payments",
+            match_path_glob: None,
+            scope_kind: Some("agent_category"),
+            task_id: None,
+            session_id: None,
+            method_prefix: None,
+            workspace_path_glob: None,
+            expires_at: 9_999_999_999,
+            granted_by: "alice",
+            max_calls: Some(1),
+            note: "one call only",
+            tenant_id: "default",
+        })
+        .unwrap();
+        let c = cap(&["payments"], &[], RiskLevel::Low);
+        let e = env("tool.payments.refund", None);
+
+        assert!(matches!(run(&s, &id, &e, Some(&c)), GateDecision::Allow(_)));
+        assert!(matches!(
+            run(&s, &id, &e, Some(&c)),
             GateDecision::RequireApproval(_)
         ));
     }

@@ -94,7 +94,7 @@ pub fn build_spine(state: &AppState) -> ControlPlaneSpine {
             tenant_model: "tenant header + policy/audit partitioning; still being forced into every route",
             work_model: "task ledger is the canonical work object; chat/capability calls still need tighter task binding",
             execution_model: "attempts/events exist; cooperative cancellation and run ownership are still partial",
-            approval_model: "single-call and scoped standing approvals exist; budget-bound approval windows remain the next mandatory upgrade",
+            approval_model: "single-call and scoped standing approvals exist; call-count limits are enforced, budget-bound approval windows remain missing",
             dashboard_model: "single embedded operator console; useful, but still too monolithic for long-term product work",
         },
         runtime: RuntimeReadiness {

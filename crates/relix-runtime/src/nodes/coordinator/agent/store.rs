@@ -243,6 +243,8 @@ pub struct StandingApproval {
     pub workspace_path_glob: Option<String>,
     pub expires_at: i64,
     pub granted_by: String,
+    pub max_calls: Option<i64>,
+    pub calls_used: i64,
     pub note: String,
     pub created_at: i64,
 }
@@ -259,6 +261,7 @@ pub struct StandingApprovalCreate<'a> {
     pub workspace_path_glob: Option<&'a str>,
     pub expires_at: i64,
     pub granted_by: &'a str,
+    pub max_calls: Option<i64>,
     pub note: &'a str,
     pub tenant_id: &'a str,
 }
@@ -1289,6 +1292,7 @@ impl AgentStore {
             workspace_path_glob: None,
             expires_at,
             granted_by,
+            max_calls: None,
             note,
             tenant_id,
         })
@@ -1311,6 +1315,11 @@ impl AgentStore {
             input.method_prefix,
             input.match_path_glob.or(input.workspace_path_glob),
         )?;
+        if input.max_calls.is_some_and(|n| n <= 0) {
+            return Err(AgentStoreError::BadInput(
+                "standing approval max_calls must be positive".into(),
+            ));
+        }
         let tenant = if input.tenant_id.trim().is_empty() {
             "default"
         } else {
@@ -1323,8 +1332,8 @@ impl AgentStore {
             "INSERT INTO standing_approvals (
                  standing_id, agent_id, match_category, match_path_glob,
                  scope_kind, task_id, session_id, method_prefix, workspace_path_glob,
-                 expires_at, granted_by, note, created_at, tenant_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 expires_at, granted_by, max_calls, calls_used, note, created_at, tenant_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13, ?14, ?15)",
             params![
                 standing_id,
                 input.agent_id,
@@ -1337,6 +1346,7 @@ impl AgentStore {
                 input.workspace_path_glob.and_then(non_empty_opt),
                 input.expires_at,
                 input.granted_by,
+                input.max_calls,
                 input.note,
                 now,
                 tenant,
@@ -1362,16 +1372,25 @@ impl AgentStore {
     }
 
     pub fn list_standing(&self, agent_id: &str) -> Result<Vec<StandingApproval>, AgentStoreError> {
+        self.list_standing_for_tenant(agent_id, "default")
+    }
+
+    pub fn list_standing_for_tenant(
+        &self,
+        agent_id: &str,
+        tenant_id: &str,
+    ) -> Result<Vec<StandingApproval>, AgentStoreError> {
         let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let tenant = non_empty_opt(tenant_id).unwrap_or("default");
         let mut stmt = conn.prepare(
             "SELECT standing_id, agent_id, match_category, match_path_glob,
                     scope_kind, task_id, session_id, method_prefix, workspace_path_glob,
-                    expires_at, granted_by, note, created_at
-             FROM standing_approvals WHERE agent_id = ?1
+                    expires_at, granted_by, max_calls, calls_used, note, created_at
+             FROM standing_approvals WHERE tenant_id = ?1 AND agent_id = ?2
              ORDER BY created_at DESC",
         )?;
         let rows = stmt
-            .query_map(params![agent_id], |r| {
+            .query_map(params![tenant, agent_id], |r| {
                 Ok(StandingApproval {
                     standing_id: r.get(0)?,
                     agent_id: r.get(1)?,
@@ -1384,8 +1403,10 @@ impl AgentStore {
                     workspace_path_glob: r.get(8)?,
                     expires_at: r.get(9)?,
                     granted_by: r.get(10)?,
-                    note: r.get(11)?,
-                    created_at: r.get(12)?,
+                    max_calls: r.get(11)?,
+                    calls_used: r.get(12)?,
+                    note: r.get(13)?,
+                    created_at: r.get(14)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1423,7 +1444,8 @@ impl AgentStore {
             "SELECT standing_id, match_path_glob, scope_kind, task_id, session_id,
                     method_prefix, workspace_path_glob
              FROM standing_approvals
-             WHERE tenant_id = ?1 AND agent_id = ?2 AND match_category = ?3 AND expires_at > ?4",
+             WHERE tenant_id = ?1 AND agent_id = ?2 AND match_category = ?3 AND expires_at > ?4
+               AND (max_calls IS NULL OR calls_used < max_calls)",
         )?;
         let rows = stmt
             .query_map(
@@ -1464,6 +1486,78 @@ impl AgentStore {
                 )
             },
         ))
+    }
+
+    pub fn consume_active_standing_for(
+        &self,
+        input: StandingApprovalMatch<'_>,
+    ) -> Result<Option<String>, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let tenant = input.tenant_id.and_then(non_empty_opt).unwrap_or("default");
+        let candidates = {
+            let mut stmt = conn.prepare(
+                "SELECT standing_id, match_path_glob, scope_kind, task_id, session_id,
+                        method_prefix, workspace_path_glob, max_calls
+                 FROM standing_approvals
+                 WHERE tenant_id = ?1 AND agent_id = ?2 AND match_category = ?3 AND expires_at > ?4
+                   AND (max_calls IS NULL OR calls_used < max_calls)
+                 ORDER BY created_at ASC, standing_id ASC",
+            )?;
+            stmt.query_map(
+                params![tenant, input.agent_id, input.category, input.now],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                        r.get::<_, Option<i64>>(7)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (
+            standing_id,
+            path_glob,
+            scope_kind,
+            task_id,
+            session_id,
+            method_prefix,
+            workspace_path_glob,
+            max_calls,
+        ) in candidates
+        {
+            if !standing_scope_matches(
+                &scope_kind,
+                StandingScopeRow {
+                    path_glob: path_glob.as_deref(),
+                    task_id: task_id.as_deref(),
+                    session_id: session_id.as_deref(),
+                    method_prefix: method_prefix.as_deref(),
+                    workspace_path_glob: workspace_path_glob.as_deref(),
+                },
+                &input,
+            ) {
+                continue;
+            }
+            if max_calls.is_none() {
+                return Ok(Some(standing_id));
+            }
+            let changed = conn.execute(
+                "UPDATE standing_approvals
+                 SET calls_used = calls_used + 1
+                 WHERE standing_id = ?1 AND calls_used < max_calls",
+                params![standing_id],
+            )?;
+            if changed > 0 {
+                return Ok(Some(standing_id));
+            }
+        }
+        Ok(None)
     }
 
     pub fn revoke_standing(&self, standing_id: &str) -> Result<(), AgentStoreError> {
@@ -1561,6 +1655,8 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              workspace_path_glob TEXT,
              expires_at      INTEGER NOT NULL,
              granted_by      TEXT NOT NULL,
+             max_calls       INTEGER,
+             calls_used      INTEGER NOT NULL DEFAULT 0,
              note            TEXT NOT NULL DEFAULT '',
              created_at      INTEGER NOT NULL
          );
@@ -1640,6 +1736,13 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     ensure_column(conn, "standing_approvals", "session_id", "TEXT")?;
     ensure_column(conn, "standing_approvals", "method_prefix", "TEXT")?;
     ensure_column(conn, "standing_approvals", "workspace_path_glob", "TEXT")?;
+    ensure_column(conn, "standing_approvals", "max_calls", "INTEGER")?;
+    ensure_column(
+        conn,
+        "standing_approvals",
+        "calls_used",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS agent_profiles_tenant ON agent_profiles(tenant_id);\
          CREATE INDEX IF NOT EXISTS approval_requests_tenant ON approval_requests(tenant_id);\
@@ -2642,6 +2745,38 @@ mod tests {
     }
 
     #[test]
+    fn list_standing_for_tenant_does_not_cross_tenant_boundary() {
+        let s = store();
+        s.create_standing(
+            "agt-1",
+            "fs",
+            None,
+            unix_now() + 60,
+            "alice",
+            "tenant-a-row",
+            "tenant-a",
+        )
+        .unwrap();
+        s.create_standing(
+            "agt-1",
+            "browser",
+            None,
+            unix_now() + 60,
+            "bob",
+            "tenant-b-row",
+            "tenant-b",
+        )
+        .unwrap();
+
+        let a = s.list_standing_for_tenant("agt-1", "tenant-a").unwrap();
+        let b = s.list_standing_for_tenant("agt-1", "tenant-b").unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].note, "tenant-a-row");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].note, "tenant-b-row");
+    }
+
+    #[test]
     fn task_scoped_standing_only_matches_the_bound_task() {
         let s = store();
         s.create_scoped_standing(StandingApprovalCreate {
@@ -2655,6 +2790,7 @@ mod tests {
             workspace_path_glob: None,
             expires_at: unix_now() + 60,
             granted_by: "alice",
+            max_calls: None,
             note: "single task",
             tenant_id: "default",
         })
@@ -2702,6 +2838,7 @@ mod tests {
             workspace_path_glob: None,
             expires_at: unix_now() + 60,
             granted_by: "alice",
+            max_calls: None,
             note: "read-only browsing",
             tenant_id: "default",
         })
@@ -2733,5 +2870,52 @@ mod tests {
             })
             .unwrap()
         );
+    }
+
+    #[test]
+    fn bounded_standing_approval_is_consumed_until_exhausted() {
+        let s = store();
+        let id = s
+            .create_scoped_standing(StandingApprovalCreate {
+                agent_id: "agt-1",
+                match_category: "fs",
+                match_path_glob: None,
+                scope_kind: Some("agent_category"),
+                task_id: None,
+                session_id: None,
+                method_prefix: None,
+                workspace_path_glob: None,
+                expires_at: unix_now() + 60,
+                granted_by: "alice",
+                max_calls: Some(2),
+                note: "two calls",
+                tenant_id: "default",
+            })
+            .unwrap();
+        let input = || StandingApprovalMatch {
+            agent_id: "agt-1",
+            category: "fs",
+            method: "tool.fs.read",
+            task_id: None,
+            session_id: None,
+            workspace_path: None,
+            tenant_id: Some("default"),
+            now: unix_now(),
+        };
+
+        assert_eq!(
+            s.consume_active_standing_for(input()).unwrap().as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(
+            s.consume_active_standing_for(input()).unwrap().as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(s.consume_active_standing_for(input()).unwrap(), None);
+        assert!(!s.has_active_standing_for(input()).unwrap());
+
+        let rows = s.list_standing("agt-1").unwrap();
+        assert_eq!(rows[0].max_calls, Some(2));
+        assert_eq!(rows[0].calls_used, 2);
     }
 }

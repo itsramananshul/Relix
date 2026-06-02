@@ -589,6 +589,8 @@ struct StandingCreateJson {
     method_prefix: Option<String>,
     #[serde(default)]
     workspace_path_glob: Option<String>,
+    #[serde(default)]
+    max_calls: Option<i64>,
 }
 
 /// Legacy wire arg:
@@ -623,6 +625,7 @@ pub fn handle_standing_create(store: &AgentStore, ctx: &InvocationCtx) -> Handle
             workspace_path_glob: req.workspace_path_glob.as_deref(),
             expires_at: req.expires_at,
             granted_by,
+            max_calls: req.max_calls,
             note,
             tenant_id: ctx.tenant_id_or_default(),
         }) {
@@ -678,12 +681,12 @@ pub fn handle_standing_list(store: &AgentStore, ctx: &InvocationCtx) -> HandlerO
     if agent_id.is_empty() {
         return invalid("agent.standing_approval.list: agent_id required".into());
     }
-    match store.list_standing(agent_id) {
+    match store.list_standing_for_tenant(agent_id, ctx.tenant_id_or_default()) {
         Ok(rows) => {
             let mut out = String::new();
             for r in &rows {
                 out.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                     r.standing_id,
                     r.match_category,
                     r.match_path_glob.as_deref().unwrap_or(""),
@@ -694,6 +697,8 @@ pub fn handle_standing_list(store: &AgentStore, ctx: &InvocationCtx) -> HandlerO
                     r.workspace_path_glob.as_deref().unwrap_or(""),
                     r.expires_at,
                     r.granted_by,
+                    r.max_calls.map(|n| n.to_string()).unwrap_or_default(),
+                    r.calls_used,
                     sanitize(&r.note)
                 ));
             }
