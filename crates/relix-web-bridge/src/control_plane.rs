@@ -254,7 +254,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/knowledge/share",
                 "/v1/knowledge/recall",
             ],
-            gap: "Memory writes still need stronger task/run provenance by default.",
+            gap: "Bridge memory-write proxies can carry task/run provenance; default binding still needs to expand into every background memory producer.",
         },
         SpineSurface {
             id: "extensions",
@@ -268,7 +268,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/mcp/servers",
                 "/v1/mcp/tools",
             ],
-            gap: "Plugin/tool execution must inherit task, tenant, budget, and approval context without optional fallthrough.",
+            gap: "MCP, plugin management, and selected tool utilities can carry task context; arbitrary plugin/tool execution still needs mandatory inherited task, tenant, budget, and approval context.",
         },
     ]
 }
