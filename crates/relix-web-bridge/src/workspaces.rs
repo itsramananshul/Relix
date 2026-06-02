@@ -9,8 +9,9 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{Mutex, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -34,9 +35,12 @@ pub struct ApiError {
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceLeaseStatus {
     Active,
+    ProvisionFailed,
     Released,
     CleanupFailed,
 }
+
+const WORKSPACE_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceLease {
@@ -196,6 +200,27 @@ impl WorkspaceLeaseStore {
         Ok(out)
     }
 
+    pub fn mark_provision_failed(
+        &mut self,
+        tenant_id: &str,
+        lease_id: &str,
+        failure_reason: String,
+    ) -> Result<WorkspaceLease, String> {
+        let tenant_id = clean_required(tenant_id, "tenant_id")?;
+        let now = now_ms();
+        let lease = self
+            .leases
+            .get_mut(lease_id)
+            .filter(|lease| lease.tenant_id == tenant_id)
+            .ok_or_else(|| format!("workspace lease not found: {lease_id}"))?;
+        lease.cleanup_status = WorkspaceLeaseStatus::ProvisionFailed;
+        lease.failure_reason = Some(failure_reason);
+        lease.updated_at_ms = now;
+        let out = lease.clone();
+        self.persist()?;
+        Ok(out)
+    }
+
     fn persist(&self) -> Result<(), String> {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
@@ -234,6 +259,37 @@ pub async fn create(
     ) {
         tracing::warn!(error = %e, lease_id = %lease.lease_id, "activity ledger: workspace create append failed");
     }
+    if let Some(command) = lease.provision_command.clone() {
+        match run_workspace_command(&lease, &command) {
+            Ok(detail) => {
+                if let Err(e) = crate::activity::append_workspace_activity(
+                    state.cfg.transport.data_dir.as_deref(),
+                    &lease,
+                    "workspace.provision",
+                    "ok",
+                    detail,
+                ) {
+                    tracing::warn!(error = %e, lease_id = %lease.lease_id, "activity ledger: workspace provision append failed");
+                }
+            }
+            Err(e) => {
+                let failed = with_store(&state, |store| {
+                    store.mark_provision_failed(&tenant_id, &lease.lease_id, e.clone())
+                })
+                .map_err(internal)?;
+                if let Err(activity_err) = crate::activity::append_workspace_activity(
+                    state.cfg.transport.data_dir.as_deref(),
+                    &failed,
+                    "workspace.provision",
+                    "failed",
+                    e.clone(),
+                ) {
+                    tracing::warn!(error = %activity_err, lease_id = %failed.lease_id, "activity ledger: workspace provision failure append failed");
+                }
+                return Err(bad(format!("workspace provision failed: {e}")));
+            }
+        }
+    }
     Ok(Json(lease))
 }
 
@@ -270,8 +326,49 @@ pub async fn release(
     Json(req): Json<ReleaseWorkspaceLeaseRequest>,
 ) -> Result<Json<WorkspaceLease>, ErrorReply> {
     let tenant_id = tenant_id();
+    let active =
+        with_store(&state, |store| store.get_active(&tenant_id, &lease_id)).map_err(|e| {
+            if e.contains("not found") {
+                not_found(e)
+            } else {
+                bad(e)
+            }
+        })?;
+    let mut failure_reason = req.failure_reason;
+    if let Some(command) = active.teardown_command.clone() {
+        match run_workspace_command(&active, &command) {
+            Ok(detail) => {
+                if let Err(e) = crate::activity::append_workspace_activity(
+                    state.cfg.transport.data_dir.as_deref(),
+                    &active,
+                    "workspace.teardown",
+                    "ok",
+                    detail,
+                ) {
+                    tracing::warn!(error = %e, lease_id = %active.lease_id, "activity ledger: workspace teardown append failed");
+                }
+            }
+            Err(e) => {
+                if let Err(activity_err) = crate::activity::append_workspace_activity(
+                    state.cfg.transport.data_dir.as_deref(),
+                    &active,
+                    "workspace.teardown",
+                    "failed",
+                    e.clone(),
+                ) {
+                    tracing::warn!(error = %activity_err, lease_id = %active.lease_id, "activity ledger: workspace teardown failure append failed");
+                }
+                failure_reason = Some(match failure_reason {
+                    Some(existing) if !existing.trim().is_empty() => {
+                        format!("{}; teardown command failed: {e}", existing.trim())
+                    }
+                    _ => format!("teardown command failed: {e}"),
+                });
+            }
+        }
+    }
     let lease = with_store(&state, |store| {
-        store.release(&tenant_id, &lease_id, req.failure_reason)
+        store.release(&tenant_id, &lease_id, failure_reason)
     })
     .map_err(|e| {
         if e.contains("not found") {
@@ -281,6 +378,7 @@ pub async fn release(
         }
     })?;
     let decision = match lease.cleanup_status {
+        WorkspaceLeaseStatus::ProvisionFailed => "provision_failed",
         WorkspaceLeaseStatus::CleanupFailed => "cleanup_failed",
         WorkspaceLeaseStatus::Released => "ok",
         WorkspaceLeaseStatus::Active => "active",
@@ -369,6 +467,96 @@ fn clean_optional(value: Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn run_workspace_command(lease: &WorkspaceLease, command: &str) -> Result<String, String> {
+    let command = command.trim();
+    if command.is_empty() {
+        return Ok("workspace command empty; skipped".into());
+    }
+    let cwd = command_cwd(&lease.workspace_path)?;
+    let mut cmd = shell_command(command);
+    cmd.current_dir(&cwd)
+        .env("RELIX_WORKSPACE_PATH", &lease.workspace_path)
+        .env("RELIX_WORKSPACE_LEASE_ID", &lease.lease_id)
+        .env("RELIX_TENANT_ID", &lease.tenant_id)
+        .env("RELIX_OWNER_AGENT", &lease.owner_agent)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn workspace command in {}: {e}", cwd.display()))?;
+    let deadline = Instant::now() + WORKSPACE_COMMAND_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "command timed out after {}s",
+                    WORKSPACE_COMMAND_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => return Err(format!("wait workspace command: {e}")),
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("collect workspace command output: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = truncate_detail(format!(
+        "exit={}; cwd={}; stdout={}; stderr={}",
+        output.status.code().unwrap_or(-1),
+        cwd.display(),
+        stdout.trim(),
+        stderr.trim()
+    ));
+    if output.status.success() {
+        Ok(detail)
+    } else {
+        Err(detail)
+    }
+}
+
+fn shell_command(command: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", command]);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", command]);
+        cmd
+    }
+}
+
+fn command_cwd(workspace_path: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(workspace_path);
+    if path.is_dir() {
+        return Ok(path);
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create workspace parent: {e}"))?;
+        return Ok(parent.to_path_buf());
+    }
+    std::env::current_dir().map_err(|e| format!("resolve current dir: {e}"))
+}
+
+fn truncate_detail(mut value: String) -> String {
+    const MAX: usize = 2048;
+    if value.len() > MAX {
+        value.truncate(MAX);
+        value.push_str("...");
+    }
+    value
+}
+
 fn tenant_id() -> String {
     crate::tenant::current_tenant_or_none().unwrap_or_else(|| "default".into())
 }
@@ -454,6 +642,61 @@ mod tests {
             .unwrap();
         assert_eq!(failed.cleanup_status, WorkspaceLeaseStatus::CleanupFailed);
         assert_eq!(failed.failure_reason.as_deref(), Some("teardown exited 1"));
+    }
+
+    #[test]
+    fn mark_provision_failed_makes_lease_inactive() {
+        let mut store = WorkspaceLeaseStore::new(None).unwrap();
+        let lease = store
+            .create(
+                "default",
+                CreateWorkspaceLeaseRequest {
+                    workspace_path: "/tmp/repo".into(),
+                    owner_agent: "agt-1".into(),
+                    git_branch: None,
+                    sandbox_id: None,
+                    task_id: None,
+                    run_id: None,
+                    provision_command: None,
+                    teardown_command: None,
+                },
+            )
+            .unwrap();
+        let failed = store
+            .mark_provision_failed("default", &lease.lease_id, "provision exited 7".into())
+            .unwrap();
+        assert_eq!(failed.cleanup_status, WorkspaceLeaseStatus::ProvisionFailed);
+        assert_eq!(failed.failure_reason.as_deref(), Some("provision exited 7"));
+        assert!(store.get_active("default", &lease.lease_id).is_err());
+    }
+
+    #[test]
+    fn workspace_command_reports_success_and_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lease = WorkspaceLease {
+            lease_id: "wsl_test".into(),
+            tenant_id: "default".into(),
+            workspace_path: tmp.path().join("repo").display().to_string(),
+            git_branch: None,
+            sandbox_id: None,
+            task_id: None,
+            run_id: None,
+            owner_agent: "agt-1".into(),
+            provision_command: None,
+            teardown_command: None,
+            cleanup_status: WorkspaceLeaseStatus::Active,
+            failure_reason: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            released_at_ms: None,
+        };
+
+        let ok = run_workspace_command(&lease, "echo relix-workspace").unwrap();
+        assert!(ok.contains("exit=0"));
+        assert!(ok.contains("relix-workspace"));
+
+        let err = run_workspace_command(&lease, "exit 7").unwrap_err();
+        assert!(err.contains("exit=7"));
     }
 
     #[test]

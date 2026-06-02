@@ -99,8 +99,10 @@ Relix needs first-class workspace leases:
 
 - local path or sandbox id: implemented as a persisted lease field
 - git branch/worktree: implemented as lease metadata
-- provision command: implemented as lease metadata, execution still missing
-- teardown command: implemented as lease metadata, execution still missing
+- provision command: implemented and executed on lease creation with
+  `RELIX_WORKSPACE_*` environment binding
+- teardown command: implemented and executed before lease release; failures
+  mark the lease `cleanup_failed`
 - owner agent: implemented
 - active run: implemented as optional `run_id`, but not automatically bound yet
 - chat/OpenAI/WS execution binding: implemented through `workspace_lease_id`

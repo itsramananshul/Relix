@@ -188,7 +188,7 @@ pub fn spine_surfaces() -> Vec<SpineSurface> {
                 "/v1/workspaces/:lease_id",
                 "/v1/workspaces/:lease_id/release",
             ],
-            gap: "Workspace leases now persist ownership and cleanup state; provisioning, teardown execution, run attachment, and sandbox isolation still need runtime enforcement.",
+            gap: "Workspace leases persist ownership, run binding, and command-backed provision/teardown state; sandbox isolation still needs runtime enforcement.",
         },
         SpineSurface {
             id: "schedules",
