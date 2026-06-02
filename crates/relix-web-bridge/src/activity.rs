@@ -105,6 +105,18 @@ pub struct McpInvocationActivity<'a> {
     pub error_kind: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ToolInvocationActivity<'a> {
+    pub tenant_id: &'a str,
+    pub actor: &'a str,
+    pub peer: &'a str,
+    pub method: &'a str,
+    pub task_id: Option<&'a str>,
+    pub run_id: Option<&'a str>,
+    pub decision: &'a str,
+    pub detail: &'a str,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ApiError {
     pub error: String,
@@ -315,6 +327,35 @@ pub fn append_mcp_invocation_activity(
                 invocation.duration_ms,
                 invocation.error_kind.unwrap_or("")
             ),
+        },
+    )
+}
+
+pub fn append_tool_invocation_activity(
+    data_dir: Option<&Path>,
+    invocation: ToolInvocationActivity<'_>,
+) -> Result<(), String> {
+    let Some(path) = data_dir.map(activity_path_for_data_dir) else {
+        return Ok(());
+    };
+    append_entry(
+        &path,
+        &ActivityEntry {
+            activity_id: new_activity_id(),
+            ts_ms: now_ms(),
+            source: "tool".into(),
+            actor: invocation.actor.into(),
+            tenant_id: invocation.tenant_id.into(),
+            task_id: invocation.task_id.map(str::to_string),
+            run_id: invocation.run_id.map(str::to_string),
+            action: invocation.method.into(),
+            target: invocation.method.into(),
+            decision: invocation.decision.into(),
+            method: Some(invocation.method.into()),
+            approval_id: None,
+            policy_result: None,
+            cost_micros: None,
+            detail: format!("peer={}; {}", invocation.peer, invocation.detail),
         },
     )
 }
@@ -787,5 +828,37 @@ mod tests {
         assert_eq!(items[0].run_id.as_deref(), Some("run-1"));
         assert_eq!(items[0].method.as_deref(), Some("tool.mcp.invoke"));
         assert!(items[0].detail.contains("args_len=42"));
+    }
+
+    #[test]
+    fn tool_invocation_activity_keeps_task_and_run_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        append_tool_invocation_activity(
+            Some(tmp.path()),
+            ToolInvocationActivity {
+                tenant_id: "tenant-a",
+                actor: "operator-1",
+                peer: "tool",
+                method: "tool.screen",
+                task_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                run_id: Some("run-1"),
+                decision: "ok",
+                detail: "region=full",
+            },
+        )
+        .unwrap();
+
+        let q = ActivityQuery {
+            limit: None,
+            tenant_id: Some("tenant-a".into()),
+            source: Some("tool".into()),
+            task_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+        };
+        let items = read_recent(&activity_path_for_data_dir(tmp.path()), &q, 10).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].action, "tool.screen");
+        assert_eq!(items[0].run_id.as_deref(), Some("run-1"));
+        assert_eq!(items[0].method.as_deref(), Some("tool.screen"));
+        assert!(items[0].detail.contains("region=full"));
     }
 }

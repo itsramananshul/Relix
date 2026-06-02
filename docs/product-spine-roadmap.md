@@ -54,6 +54,9 @@ Current progress:
 - `/v1/mcp/invoke` accepts optional `task_id`/`run_id`, stamps `task_id` into
   the mesh dispatch envelope, and records durable activity plus best-effort task
   events for bound calls
+- `/v1/tools/screen` accepts optional `task_id`/`run_id`, stamps `task_id` into
+  the mesh dispatch envelope, records durable activity, and adds scope metadata
+  to object responses
 - standalone CLI flow runs remain unbound unless the caller explicitly grows a
   task binding path
 
@@ -167,6 +170,7 @@ Current producers:
 - policy denials discovered through `/v1/policy/denials`
 - cost aggregate observations from `/v1/metrics/cost`
 - MCP invocations from `/v1/mcp/invoke`
+- screen captures from `/v1/tools/screen`
 
 ## Phase 6: Dashboard Decomposition
 
