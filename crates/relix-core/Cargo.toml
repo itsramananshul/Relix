@@ -42,6 +42,11 @@ hex.workspace = true
 toml.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
+# REL-18: HMAC-SHA256 for HmacTokenIssuer in agent.rs
+hmac.workspace = true
+sha2.workspace = true
+# Constant-time signature comparison in agent token verification.
+subtle.workspace = true
 # Shared per-channel proactive rate-limit tracker
 # (`channel_rate_limit.rs`) uses `tokio::time::sleep` inside
 # the `acquire` await. Time + macros only; the rest of

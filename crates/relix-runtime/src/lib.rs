@@ -12,6 +12,7 @@
 //! crate.
 //!
 //! Module layout:
+//! - [`agent_registry`] — SQLite-backed [`relix_core::agent::AgentRegistry`] (REL-18).
 //! - [`transport`] — libp2p wrapper inherited from OpenPrem INFRA (RELIX-1 transport).
 //! - [`sol`] — SOL VM with cross-node `remote_call` extension (RELIX-7 alpha).
 //! - [`dispatch`] — inbound RPC → SOL session OR native handler (RELIX-1 §1.13).
@@ -33,6 +34,7 @@
 #![deny(unsafe_code)]
 
 pub mod admission;
+pub mod agent_registry;
 pub mod approval;
 pub mod audit_partition;
 pub mod confidence;

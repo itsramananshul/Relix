@@ -3,6 +3,7 @@
 //! Shared substrate primitives for Relix. Every other crate depends on this one.
 //!
 //! Module layout mirrors the substrate specs:
+//! - [`agent`] — AgentId, AgentRecord, AgentToken, AgentRegistry + TokenIssuer traits, HmacTokenIssuer (REL-18).
 //! - [`codec`] — deterministic CBOR encoding/decoding (RELIX-4 §4.8).
 //! - [`types`] — shared wire types (NodeId, RequestId, TraceId, ErrorEnvelope).
 //! - [`bundle`] — Ed25519-signed CBOR bundle envelope (RELIX-4).
@@ -37,6 +38,7 @@
 #![cfg_attr(not(test), warn(clippy::unwrap_used))]
 #![cfg_attr(not(test), warn(clippy::expect_used))]
 
+pub mod agent;
 pub mod approval;
 pub mod audit;
 pub mod bundle;
