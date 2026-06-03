@@ -77,6 +77,50 @@ pub fn curate_default(meta: &KnackMeta, now: i64) -> KnackState {
     )
 }
 
+/// Default: a run that made this many tool calls is "hard enough"
+/// to be worth reviewing for a new Knack.
+pub const DEFAULT_KNACK_REVIEW_TOOL_THRESHOLD: u32 = 6;
+
+/// Should a finished run trigger a background skill-creation review?
+///
+/// Tool-iteration intensity is the proxy for difficulty — a long
+/// tool chain is exactly the multi-step work worth distilling into a
+/// Knack. Fires only on a *successful* run (a failure has nothing
+/// reusable to capture).
+pub fn should_review_for_knack(tool_calls: u32, succeeded: bool, threshold: u32) -> bool {
+    succeeded && tool_calls >= threshold
+}
+
+/// A counter-based **nudge** clock. The post-response Tradecraft /
+/// memory review fires every `every` responses, so self-improvement
+/// always runs *after* the reply and never competes with the task.
+/// [`NudgeClock::tick`] returns `true` on the firing response.
+#[derive(Clone, Debug)]
+pub struct NudgeClock {
+    every: u32,
+    count: u32,
+}
+
+impl NudgeClock {
+    pub fn new(every: u32) -> Self {
+        Self {
+            every: every.max(1),
+            count: 0,
+        }
+    }
+
+    /// Advance one response; returns `true` when the nudge fires.
+    pub fn tick(&mut self) -> bool {
+        self.count += 1;
+        if self.count >= self.every {
+            self.count = 0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +186,33 @@ mod tests {
         };
         assert!(!is_auto_managed(&meta));
         assert_eq!(curate_default(&meta, now), KnackState::Active);
+    }
+
+    #[test]
+    fn knack_review_fires_on_hard_successful_runs_only() {
+        let t = DEFAULT_KNACK_REVIEW_TOOL_THRESHOLD;
+        // Hard + success → review.
+        assert!(should_review_for_knack(t, true, t));
+        assert!(should_review_for_knack(t + 5, true, t));
+        // Below threshold → no review.
+        assert!(!should_review_for_knack(t - 1, true, t));
+        // Hard but failed → nothing to capture.
+        assert!(!should_review_for_knack(t + 5, false, t));
+    }
+
+    #[test]
+    fn nudge_clock_fires_every_n_responses() {
+        let mut clock = NudgeClock::new(3);
+        assert!(!clock.tick()); // 1
+        assert!(!clock.tick()); // 2
+        assert!(clock.tick()); // 3 → fire
+        assert!(!clock.tick()); // 4
+        assert!(!clock.tick()); // 5
+        assert!(clock.tick()); // 6 → fire
+
+        // every=0 is clamped to 1 (fires every response).
+        let mut each = NudgeClock::new(0);
+        assert!(each.tick());
+        assert!(each.tick());
     }
 }
