@@ -48,6 +48,8 @@ pub enum CompanionAction {
     CreateBrief { title: String },
     CreateMandate { title: String },
     Move { id: String, status: String },
+    Assign { id: String, agent: String },
+    Pin { id: String, on: bool },
     Overdue,
     Board,
     Search { query: String },
@@ -113,6 +115,28 @@ pub fn parse_command(message: &str) -> CompanionAction {
             return CompanionAction::Search { query: q };
         }
     }
+    // "pin <id>" / "unpin <id>"
+    if let Some(id) = after("unpin ")
+        && !id.is_empty()
+    {
+        return CompanionAction::Pin { id, on: false };
+    }
+    if let Some(id) = after("pin ")
+        && !id.is_empty()
+    {
+        return CompanionAction::Pin { id, on: true };
+    }
+    // "assign <id> to <agent>"
+    if let Some(rest) = after("assign ") {
+        let rl = rest.to_ascii_lowercase();
+        if let Some(idx) = rl.find(" to ") {
+            let id = rest[..idx].trim().to_string();
+            let agent = rest[idx + 4..].trim().to_string();
+            if !id.is_empty() && !agent.is_empty() {
+                return CompanionAction::Assign { id, agent };
+            }
+        }
+    }
     // "move <id> to <status>"
     if let Some(rest) = after("move ") {
         let rl = rest.to_ascii_lowercase();
@@ -176,6 +200,27 @@ pub async fn handle(
             Ok(Json(CompanionResponse {
                 action: "move".into(),
                 reply: format!("Moved {id} → {status}."),
+                result: None,
+            }))
+        }
+        CompanionAction::Assign { id, agent } => {
+            if agent.contains('|') {
+                return Err(bad("agent must not contain `|`"));
+            }
+            let arg = format!("{id}|assignee|{agent}");
+            call_peer(&state, "brief.set", arg.as_bytes()).await?;
+            Ok(Json(CompanionResponse {
+                action: "assign".into(),
+                reply: format!("Assigned {id} → {agent}."),
+                result: None,
+            }))
+        }
+        CompanionAction::Pin { id, on } => {
+            let arg = format!("{id}|{}", i32::from(on));
+            call_peer(&state, "brief.pin", arg.as_bytes()).await?;
+            Ok(Json(CompanionResponse {
+                action: "pin".into(),
+                reply: format!("{} {id}.", if on { "Pinned" } else { "Unpinned" }),
                 result: None,
             }))
         }
@@ -329,6 +374,30 @@ mod tests {
         assert_eq!(
             parse_command("move xyz to nowhere"),
             CompanionAction::Unknown
+        );
+    }
+
+    #[test]
+    fn parses_assign_and_pin() {
+        assert_eq!(
+            parse_command("assign abc to agt_eng"),
+            CompanionAction::Assign {
+                id: "abc".into(),
+                agent: "agt_eng".into()
+            }
+        );
+        assert_eq!(
+            parse_command("pin abc"),
+            CompanionAction::Pin { id: "abc".into(), on: true }
+        );
+        assert_eq!(
+            parse_command("unpin abc"),
+            CompanionAction::Pin { id: "abc".into(), on: false }
+        );
+        // "move" must NOT be swallowed by the pin/assign rules.
+        assert_eq!(
+            parse_command("move abc to done"),
+            CompanionAction::Move { id: "abc".into(), status: "done".into() }
         );
     }
 
