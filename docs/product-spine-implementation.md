@@ -17,6 +17,8 @@
 | `bench/` | The **Bench**: serverless sleep/wake workspace lifecycle (hibernate to ~$0, wake with snapshot); `idle_active_benches` + `hibernate_idle` auto-sleep tick. |
 | `controller_runtime.rs` | Wiring: spine handlers, the shared Rig registry + `rig.list`/`rig.describe` (+ `RELIX_DEFAULT_RIG`), and the opt-in live heartbeat loop (`RELIX_HEARTBEAT_ENABLED`) with rich prompt composition, failure-parking, and per-tick token sweep. |
 | `relix-cli` `call.rs` | `relix call --method <name> --arg <pipe-delimited>` — generic capability invocation, the operator escape hatch reaching the whole spine surface from the CLI. |
+| `relix-web-bridge` `spine.rs` | The dashboard HTTP surface — `GET /v1/spine/{guild,board,board/:col,roster,mandates,mandates/search,mandates/:id/{tree,briefs},briefs/search,briefs/:id,desk/:agent,overdue}` + write `POST /v1/spine/{briefs,briefs/:id/{move,pin,comment,due},mandates}`, all proxying to the coordinator through the mesh admission pipeline. |
+| `relix-web-bridge` `spine_dashboard.html` | **Phase 6** — the served `/spine` board page (self-contained inline HTML/JS/CSS, B&W): Board (kanban + detail panel + move/pin/comment/create), Mandates (goal tree), and Roster tabs, driven by `/v1/spine/*`. |
 
 ## Capabilities (live on the mesh, in our language)
 
