@@ -409,6 +409,37 @@ impl SpineStore {
         Ok(rows)
     }
 
+    /// PHASE 5 (companion): Mandates whose title contains `query`
+    /// (case-insensitive substring, LIKE wildcards escaped),
+    /// tenant-scoped, newest first. Empty `query` → empty result.
+    pub fn search_mandates(
+        &self,
+        tenant: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<Mandate>, SpineStoreError> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tenant = normalize_tenant(tenant);
+        let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let lim = limit.clamp(1, 1000) as i64;
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT mandate_id, tenant_id, title, description, owner_agent_id,
+                    status, parent_mandate_id, created_at, updated_at
+             FROM mandates
+             WHERE tenant_id = ?1 AND title LIKE ?2 ESCAPE '\\'
+             ORDER BY created_at DESC LIMIT ?3",
+        )?;
+        let rows: Vec<Mandate> = stmt
+            .query_map(params![tenant, pattern, lim], row_to_mandate)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// PHASE 1 (spine tree): a Mandate's direct child Mandates
     /// (sub-Mandates), newest first. Tenant-scoped — the drill-down
     /// for a nested-Mandate tree in the dashboard.
@@ -970,6 +1001,32 @@ mod tests {
         let g = s.get_guild("fresh").unwrap().unwrap();
         assert_eq!(g.display_name, "fresh");
         assert_eq!(g.monthly_allowance_cents, Some(100));
+    }
+
+    #[test]
+    fn search_mandates_matches_title_substring_per_tenant() {
+        let s = store();
+        let auth = s
+            .create_mandate("acme", "Ship auth rewrite", "", None, None)
+            .unwrap();
+        let login = s
+            .create_mandate("acme", "Fix auth login bug", "", None, None)
+            .unwrap();
+        s.create_mandate("acme", "Billing revamp", "", None, None)
+            .unwrap();
+        // Another tenant's matching mandate must not appear.
+        s.create_mandate("other", "Auth for other co", "", None, None)
+            .unwrap();
+
+        let ids: std::collections::HashSet<String> = s
+            .search_mandates("acme", "auth", 50)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.mandate_id)
+            .collect();
+        assert!(ids.contains(&auth) && ids.contains(&login));
+        assert_eq!(ids.len(), 2);
+        assert!(s.search_mandates("acme", "  ", 50).unwrap().is_empty());
     }
 
     #[test]

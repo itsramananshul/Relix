@@ -43,6 +43,7 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<SpineStore>) {
     cap!("mandate.list", handle_mandate_list);
     cap!("mandate.children", handle_mandate_children);
     cap!("mandate.tree", handle_mandate_tree);
+    cap!("mandate.search", handle_mandate_search);
     cap!("mandate.update", handle_mandate_update);
     cap!("campaign.create", handle_campaign_create);
     cap!("campaign.get", handle_campaign_get);
@@ -254,6 +255,35 @@ fn handle_mandate_list(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcom
             Err(e) => internal(format!("mandate.list encode: {e}")),
         },
         Err(e) => internal(format!("mandate.list: {e}")),
+    }
+}
+
+/// `mandate.search` — args `query|limit` (limit default 50).
+/// Tenant-scoped. Returns a JSON array of Mandates whose title
+/// contains the query (literal substring), newest first.
+fn handle_mandate_search(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("mandate.search utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    let query = parts.first().copied().unwrap_or("").trim();
+    if query.is_empty() {
+        return invalid("mandate.search: query required".to_string());
+    }
+    let limit: usize = parts
+        .get(1)
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    match store.search_mandates(ctx.tenant_id_or_default(), query, limit) {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("mandate.search encode: {e}")),
+        },
+        Err(e) => internal(format!("mandate.search: {e}")),
     }
 }
 
