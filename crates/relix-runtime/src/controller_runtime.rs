@@ -8627,6 +8627,75 @@ fn register_node_type_handlers(
                 }
             }
         }
+        // PHASE 3 (heartbeat loop): the live dispatch tick. Opt-in
+        // via RELIX_HEARTBEAT_ENABLED (off by default so it never
+        // surprises an operator). When on, a timer polls the ready
+        // Briefs and runs each on its Operative's Rig via
+        // `heartbeat::dispatch_batch`. An Operative with no Rig
+        // configured (or an unknown one) resolves to None — the
+        // Brief is left untouched (the Desk surfaces it) — so the
+        // loop is inert until real Rigs are registered + chosen.
+        if std::env::var("RELIX_HEARTBEAT_ENABLED")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+        {
+            let interval_secs = std::env::var("RELIX_HEARTBEAT_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(10);
+            let batch = std::env::var("RELIX_HEARTBEAT_BATCH")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(16);
+            let lease_secs: i64 = 300;
+            let task_store = store.clone();
+            let ag_store = agent_store.clone();
+            let registry = std::sync::Arc::new(crate::rig::RigRegistry::with_builtins());
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                loop {
+                    ticker.tick().await;
+                    let ts = task_store.clone();
+                    let ags = ag_store.clone();
+                    let reg = registry.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        crate::nodes::coordinator::heartbeat::dispatch_batch(
+                            &ts,
+                            batch,
+                            lease_secs,
+                            |card| {
+                                let assignee = card.assignee_agent_id.as_deref()?;
+                                let rig_name = ags.get_agent(assignee).ok().flatten()?.rig?;
+                                reg.get(&rig_name)
+                            },
+                            |card| card.title.clone(),
+                        )
+                    })
+                    .await;
+                    match outcome {
+                        Ok(Ok(records)) if !records.is_empty() => tracing::debug!(
+                            count = records.len(),
+                            "heartbeat: dispatch tick processed Briefs"
+                        ),
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "heartbeat: dispatch tick failed")
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "heartbeat: dispatch task join error")
+                        }
+                    }
+                }
+            });
+            tracing::info!(
+                interval_secs,
+                batch,
+                "coordinator startup: heartbeat dispatch loop spawned (RELIX_HEARTBEAT_ENABLED)"
+            );
+        }
         // NOT-DONE 2: spawn the legacy-token orphaned-task fail
         // pass in the BACKGROUND so it does not block the
         // controller from accepting requests. The pass:
