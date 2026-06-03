@@ -53,7 +53,45 @@ impl MacroSpec {
         self.max_output_bytes = n;
         self
     }
+
+    /// Is this Macro's interpreter on `allow`? Matched on the final
+    /// path component — so an absolute path (`/usr/bin/python3`,
+    /// `C:\Python\python3.exe`) still matches `python3` —
+    /// case-insensitively, ignoring a trailing `.exe`. An empty
+    /// allowlist denies everything (deny-by-default).
+    pub fn interpreter_allowed(&self, allow: &[&str]) -> bool {
+        let base = Self::base_name(&self.interpreter);
+        allow.iter().any(|a| Self::base_name(a) == base)
+    }
+
+    fn base_name(s: &str) -> String {
+        let last = s.rsplit(['/', '\\']).next().unwrap_or(s);
+        let last = last
+            .strip_suffix(".exe")
+            .or_else(|| last.strip_suffix(".EXE"))
+            .unwrap_or(last);
+        last.to_ascii_lowercase()
+    }
 }
+
+/// A Macro was refused *before* running — its interpreter isn't on
+/// the allowlist. Carries the offending interpreter for the error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MacroDenied {
+    pub interpreter: String,
+}
+
+impl std::fmt::Display for MacroDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "interpreter '{}' is not on the Macro allowlist",
+            self.interpreter
+        )
+    }
+}
+
+impl std::error::Error for MacroDenied {}
 
 /// The result of a Macro run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +171,20 @@ pub fn run_macro(spec: &MacroSpec) -> MacroResult {
     }
 }
 
+/// Run a Macro only if its interpreter is on `allow` (see
+/// [`MacroSpec::interpreter_allowed`]); otherwise refuse *before*
+/// spawning anything. This is the execute_code safety gate — the
+/// caller decides which interpreters a Cell may run, and an
+/// off-list interpreter never reaches `Command::spawn`.
+pub fn run_macro_guarded(spec: &MacroSpec, allow: &[&str]) -> Result<MacroResult, MacroDenied> {
+    if !spec.interpreter_allowed(allow) {
+        return Err(MacroDenied {
+            interpreter: spec.interpreter.clone(),
+        });
+    }
+    Ok(run_macro(spec))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +234,41 @@ mod tests {
         assert!(!r.success);
         assert!(r.exit_code.is_none());
         assert!(r.stderr.contains("spawn"));
+    }
+
+    #[test]
+    fn interpreter_allowlist_matches_basename_path_and_exe() {
+        let allow = ["python3", "bash"];
+        assert!(MacroSpec::new("python3", "").interpreter_allowed(&allow));
+        // Absolute path still matches on the basename.
+        assert!(MacroSpec::new("/usr/bin/python3", "").interpreter_allowed(&allow));
+        assert!(MacroSpec::new("C:\\tools\\bash.exe", "").interpreter_allowed(&allow));
+        // Case-insensitive.
+        assert!(MacroSpec::new("BASH", "").interpreter_allowed(&allow));
+        // Not on the list.
+        assert!(!MacroSpec::new("ruby", "").interpreter_allowed(&allow));
+        // Empty allowlist denies everything.
+        assert!(!MacroSpec::new("python3", "").interpreter_allowed(&[]));
+    }
+
+    #[test]
+    fn guarded_refuses_offlist_interpreter_without_spawning() {
+        // A bogus binary that WOULD fail to spawn — but the guard
+        // must reject it first, so we get MacroDenied, not a spawn
+        // error.
+        let spec = MacroSpec::new("nonexistent-interpreter-xyzzy", "whatever");
+        let err = run_macro_guarded(&spec, &["python3"]).unwrap_err();
+        assert_eq!(err.interpreter, "nonexistent-interpreter-xyzzy");
+        assert!(err.to_string().contains("allowlist"));
+    }
+
+    #[test]
+    fn guarded_runs_an_allowlisted_interpreter() {
+        let spec = cmd_spec(if cfg!(windows) { "echo ok" } else { "echo ok" }, 64);
+        let allow = if cfg!(windows) { "cmd" } else { "sh" };
+        let r = run_macro_guarded(&spec, &[allow]).expect("allowed");
+        assert!(r.success, "stderr: {}", r.stderr);
+        assert!(r.stdout.contains("ok"));
     }
 
     #[test]
