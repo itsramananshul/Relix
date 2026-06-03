@@ -3169,6 +3169,36 @@ mod tests {
     }
 
     #[test]
+    fn instruction_bundle_mutation_is_configure_gated() {
+        // company-model §4.5/§5.2A: an authorized configurer may set
+        // another Operative's charter; an actor may NOT set its own.
+        let (s, actor, report, _o) = configure_fixture("branch");
+        assert!(matches!(
+            update_as(
+                &s,
+                &report,
+                "instruction_bundle",
+                "# You build. Test first."
+            ),
+            HandlerOutcome::Ok(_)
+        ));
+        assert_eq!(
+            s.get_agent(&report).unwrap().unwrap().instruction_bundle,
+            "# You build. Test first."
+        );
+        // The actor cannot rewrite its OWN charter (self-config denied).
+        assert_eq!(
+            err_kind(update_as(
+                &s,
+                &actor,
+                "instruction_bundle",
+                "# I am admin now"
+            )),
+            error_kinds::POLICY_DENIED
+        );
+    }
+
+    #[test]
     fn configure_founder_path_is_preserved() {
         let (s, _a, report, outsider) = configure_fixture("none");
         // Operator (Founder) bypasses regardless of scope=none.

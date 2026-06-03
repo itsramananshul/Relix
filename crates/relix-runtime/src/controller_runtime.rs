@@ -9002,7 +9002,22 @@ fn register_node_type_handlers(
                                 let preferred = agent.rig;
                                 reg.resolve(preferred.as_deref())
                             },
-                            |card| ts.compose_brief_prompt(&card.task_id, 10),
+                            |card| {
+                                // Inject the assigned Operative's charter
+                                // (instruction_bundle) as trusted, operator-
+                                // authored context ahead of the Brief body.
+                                let charter = card
+                                    .assignee_agent_id
+                                    .as_deref()
+                                    .and_then(|a| ags.get_agent(a).ok().flatten())
+                                    .map(|p| p.instruction_bundle)
+                                    .filter(|c| !c.trim().is_empty());
+                                ts.compose_brief_prompt_with_charter(
+                                    &card.task_id,
+                                    10,
+                                    charter.as_deref(),
+                                )
+                            },
                         )
                     })
                     .await;
