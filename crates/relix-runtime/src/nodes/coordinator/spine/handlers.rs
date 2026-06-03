@@ -47,6 +47,7 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<SpineStore>) {
     cap!("campaign.list", handle_campaign_list);
     cap!("campaign.update", handle_campaign_update);
     cap!("guild.get", handle_guild_get);
+    cap!("guild.counts", handle_guild_counts);
     cap!("guild.set", handle_guild_set);
     cap!("guild.set_allowance", handle_guild_set_allowance);
     cap!("mandate.propose_strategy", handle_mandate_propose_strategy);
@@ -137,6 +138,19 @@ fn handle_guild_get(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
         },
         Ok(None) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => internal(format!("guild.get: {e}")),
+    }
+}
+
+/// `guild.counts` — the Guild's spine at a glance (Mandate &
+/// Campaign totals + in-flight subset) as JSON. No args. Tenant
+/// from ctx.
+fn handle_guild_counts(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    match store.guild_counts(ctx.tenant_id_or_default()) {
+        Ok(counts) => match serde_json::to_vec(&counts) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("guild.counts encode: {e}")),
+        },
+        Err(e) => internal(format!("guild.counts: {e}")),
     }
 }
 

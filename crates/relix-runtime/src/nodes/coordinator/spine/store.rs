@@ -83,6 +83,19 @@ pub struct Guild {
     pub updated_at: i64,
 }
 
+/// The Guild's spine at a glance — Mandate & Campaign totals plus
+/// the in-flight subset, in one tenant-scoped read. The companion /
+/// dashboard pairs this with the Roster + board summaries.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpineCounts {
+    pub mandates_total: i64,
+    /// Mandates with status `active`.
+    pub mandates_active: i64,
+    pub campaigns_total: i64,
+    /// Campaigns with status `in_progress`.
+    pub campaigns_active: i64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SpineStoreError {
     #[error("spine store: {0}")]
@@ -385,6 +398,32 @@ impl SpineStore {
                 .collect::<rusqlite::Result<_>>()?
         };
         Ok(rows)
+    }
+
+    /// PHASE 5 (companion): the Guild's spine counts in one
+    /// tenant-scoped read — Mandate & Campaign totals plus the
+    /// in-flight subset.
+    pub fn guild_counts(&self, tenant: &str) -> Result<SpineCounts, SpineStoreError> {
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let tenant = normalize_tenant(tenant);
+        let one = |sql: &str, status: Option<&str>| -> rusqlite::Result<i64> {
+            match status {
+                Some(s) => conn.query_row(sql, params![tenant, s], |r| r.get(0)),
+                None => conn.query_row(sql, params![tenant], |r| r.get(0)),
+            }
+        };
+        Ok(SpineCounts {
+            mandates_total: one("SELECT COUNT(*) FROM mandates WHERE tenant_id = ?1", None)?,
+            mandates_active: one(
+                "SELECT COUNT(*) FROM mandates WHERE tenant_id = ?1 AND status = ?2",
+                Some("active"),
+            )?,
+            campaigns_total: one("SELECT COUNT(*) FROM campaigns WHERE tenant_id = ?1", None)?,
+            campaigns_active: one(
+                "SELECT COUNT(*) FROM campaigns WHERE tenant_id = ?1 AND status = ?2",
+                Some("in_progress"),
+            )?,
+        })
     }
 
     /// Update one writable mandate field. Writable: `status`,
@@ -881,6 +920,33 @@ mod tests {
         let g = s.get_guild("fresh").unwrap().unwrap();
         assert_eq!(g.display_name, "fresh");
         assert_eq!(g.monthly_allowance_cents, Some(100));
+    }
+
+    #[test]
+    fn guild_counts_summarize_the_spine_per_tenant() {
+        let s = store();
+        let m1 = s.create_mandate("acme", "Ship v1", "", None, None).unwrap();
+        let _m2 = s.create_mandate("acme", "Grow", "", None, None).unwrap();
+        s.update_mandate_field(&m1, "status", "active").unwrap();
+        let c1 = s
+            .create_campaign("acme", "Auth", Some(&m1), None, None)
+            .unwrap();
+        let _c2 = s
+            .create_campaign("acme", "Billing", Some(&m1), None, None)
+            .unwrap();
+        s.update_campaign_field(&c1, "status", "in_progress").unwrap();
+        // A different Guild's spine is counted separately.
+        s.create_mandate("other", "X", "", None, None).unwrap();
+
+        let c = s.guild_counts("acme").unwrap();
+        assert_eq!(c.mandates_total, 2);
+        assert_eq!(c.mandates_active, 1);
+        assert_eq!(c.campaigns_total, 2);
+        assert_eq!(c.campaigns_active, 1);
+
+        let o = s.guild_counts("other").unwrap();
+        assert_eq!(o.mandates_total, 1);
+        assert_eq!(o.campaigns_total, 0);
     }
 
     #[test]
