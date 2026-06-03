@@ -901,6 +901,65 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// PHASE 2 (Desk): Briefs that are blocked right now — in a live
+    /// column with at least one unresolved Snag (a blocker not yet
+    /// `done`). The "blocked work" the Desk surfaces. Newest first.
+    pub fn list_blocked_briefs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT t.task_id, t.title, t.board_status, t.priority,
+                        t.assignee_agent_id, t.mandate_id, t.campaign_id
+                 FROM tasks t
+                 JOIN task_edges e ON e.task_id = t.task_id AND e.edge_type = 'blocked_on'
+                 JOIN tasks b ON b.task_id = e.related_task_id
+                 WHERE b.board_status != 'done'
+                   AND t.board_status NOT IN ('done', 'cancelled')
+                 ORDER BY t.updated_at DESC LIMIT ?1",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
+    /// PHASE 2 (Desk): Briefs that look stale — in an active column
+    /// (todo / in_progress / in_review) with no update for at least
+    /// `idle_secs`. Most-stale first. The "stuck work" the Desk
+    /// surfaces so nothing sits unmoved with nobody on it.
+    pub fn list_stale_briefs(
+        &self,
+        idle_secs: i64,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let cutoff = unix_secs().saturating_sub(idle_secs.max(0));
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, title, board_status, priority,
+                        assignee_agent_id, mandate_id, campaign_id
+                 FROM tasks
+                 WHERE board_status IN ('todo', 'in_progress', 'in_review')
+                   AND updated_at < ?1
+                 ORDER BY updated_at ASC LIMIT ?2",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![cutoff, lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// Insert a new Task. Returns the freshly-minted `task_id`
     /// (32 hex chars). Optional retry / timeout metadata defaults to
     /// "no retry, no timeout" for backwards compatibility with pre-C1
@@ -4910,6 +4969,27 @@ pub fn register(
             })),
         );
     }
+    // PHASE 2 (Desk): blocked + stale work surfaces.
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.blocked_list",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_blocked_list(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.stale_list",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_stale_list(&s, &ctx) }
+            })),
+        );
+    }
     {
         let s = store.clone();
         bridge.register(
@@ -5804,6 +5884,59 @@ fn handle_brief_board(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome 
             Err(e) => internal(format!("brief.board encode: {e}")),
         },
         Err(e) => map_edge_err("brief.board", e),
+    }
+}
+
+/// `brief.blocked_list` — Briefs currently blocked by an unresolved
+/// Snag (the Desk's blocked work). Arg `limit` (optional, default 50).
+fn handle_brief_blocked_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("brief.blocked_list utf8: {e}")),
+    };
+    let limit: usize = if raw.is_empty() {
+        50
+    } else {
+        raw.parse().unwrap_or(50)
+    };
+    match store.list_blocked_briefs(limit) {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.blocked_list encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.blocked_list", e),
+    }
+}
+
+/// `brief.stale_list` — Briefs in an active column idle for at least
+/// `idle_secs` (the Desk's stuck work). Arg `idle_secs|limit`
+/// (idle_secs default 86400 = 1 day; limit default 50).
+fn handle_brief_stale_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("brief.stale_list utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    let idle: i64 = parts
+        .first()
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(86_400);
+    let limit: usize = parts
+        .get(1)
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    match store.list_stale_briefs(idle, limit) {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.stale_list encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.stale_list", e),
     }
 }
 
@@ -7477,6 +7610,21 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
     Ok(())
 }
 
+/// Map a row of the BriefCard column set into a `brief::BriefCard`.
+/// Column order: task_id, title, board_status, priority,
+/// assignee_agent_id, mandate_id, campaign_id.
+fn brief_card_from_row(r: &rusqlite::Row) -> rusqlite::Result<brief::BriefCard> {
+    Ok(brief::BriefCard {
+        task_id: r.get(0)?,
+        title: r.get(1)?,
+        board_status: r.get(2)?,
+        priority: r.get(3)?,
+        assignee_agent_id: r.get(4)?,
+        mandate_id: r.get(5)?,
+        campaign_id: r.get(6)?,
+    })
+}
+
 /// PHASE 1 (Brief): does a Brief row exist? Helper for the
 /// relation-edge validators. Takes an already-locked connection.
 fn task_row_exists(conn: &Connection, task_id: &str) -> Result<bool, CoordinatorError> {
@@ -8676,6 +8824,52 @@ mod tests {
         let inprog = s.list_briefs_by_board(Some("in_progress"), 50).unwrap();
         assert_eq!(inprog[0].priority, "high");
         assert_eq!(inprog[0].assignee_agent_id.as_deref(), Some("agt_x"));
+    }
+
+    #[test]
+    fn phase2_desk_surfaces_blocked_and_stale_briefs() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+
+        // Blocked: a live Brief with an unresolved Snag.
+        let blocked = mk("blocked");
+        let blocker = mk("blocker");
+        s.set_board_status(&blocked, "todo").unwrap();
+        s.add_snag(&blocked, &blocker).unwrap();
+        let bl = s.list_blocked_briefs(50).unwrap();
+        assert_eq!(bl.len(), 1);
+        assert_eq!(bl[0].task_id, blocked);
+        // Resolving the blocker drops it off.
+        for st in ["todo", "in_progress", "in_review", "done"] {
+            s.set_board_status(&blocker, st).unwrap();
+        }
+        assert!(s.list_blocked_briefs(50).unwrap().is_empty());
+
+        // Stale: an active Brief backdated past the idle window.
+        let stale = mk("stale");
+        s.set_board_status(&stale, "in_progress").unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE tasks SET updated_at = 100 WHERE task_id = ?1",
+                params![stale],
+            )
+            .unwrap();
+        }
+        let st = s.list_stale_briefs(0, 50).unwrap();
+        assert!(st.iter().any(|c| c.task_id == stale));
+        // A fresh active Brief is not stale.
+        let fresh = mk("fresh");
+        s.set_board_status(&fresh, "in_progress").unwrap();
+        assert!(
+            !s.list_stale_briefs(0, 50)
+                .unwrap()
+                .iter()
+                .any(|c| c.task_id == fresh)
+        );
     }
 
     /// File-backed open helper for the DB-hardening tests. We
