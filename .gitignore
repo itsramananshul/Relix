@@ -10,6 +10,11 @@ fuzz/corpus/*
 !fuzz/corpus/seed/
 fuzz/artifacts
 
+# Reference codebases — large external repos cloned into references/ for study
+# (Paperclip + Hermes). Not part of Relix; never tracked.
+/references/paperclip/
+/references/hermes-agent/
+
 # Local secrets / keys (no secrets are ever committed; this is belt-and-braces)
 *.key
 *.pem
