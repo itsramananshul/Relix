@@ -52,6 +52,7 @@ pub mod nodes;
 pub mod observability;
 pub mod planning;
 pub mod plugin;
+pub mod rig;
 pub mod sflow;
 pub mod sol;
 pub mod training;

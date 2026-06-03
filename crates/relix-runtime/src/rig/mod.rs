@@ -1,0 +1,257 @@
+//! The **Rig** layer — Relix's universal agent-backend contract
+//! (the "plug in any agent" foundation; see
+//! `docs/relix-agent-adapters.md`).
+//!
+//! A **Rig** is *what powers an Operative* — the swappable backend
+//! that actually runs a Brief. The rest of Relix (the Brief ledger,
+//! the heartbeat loop, governance) never cares *which* Rig an
+//! Operative uses: it hands the Rig a [`RigRunRequest`] and gets a
+//! [`RigOutcome`] back. Adding support for a new agent product —
+//! an embedded Hermes, a Claude / Codex CLI on a subscription, a
+//! remote API agent — is implementing this one trait and
+//! registering it.
+//!
+//! **Governance scales with the Rig, the sandbox is always the
+//! floor.** A *rich* Rig (a plugged-in Hermes, ACP) lets Relix gate
+//! each tool call from inside; a *thin* Rig (a headless CLI, a
+//! generic process) can only be governed at the box wall plus the
+//! bridge-back token. Each Rig declares which it is via
+//! [`Rig::governance`] so the dispatcher can size the sandbox
+//! accordingly.
+//!
+//! This module is the contract + registry + a built-in reference
+//! adapter (`echo`). Real Rigs live behind the same trait.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+/// A request to run a Brief on a Rig — what the dispatcher hands an
+/// agent backend when it wakes an Operative.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RigRunRequest {
+    /// The Brief (coordinator task id) being worked.
+    pub brief_id: String,
+    /// The Operative (agent id) assigned to it.
+    pub agent_id: String,
+    /// The Guild (tenant) the work belongs to.
+    pub tenant_id: String,
+    /// The work to do — the Brief's description / instruction
+    /// bundle, assembled by the dispatcher.
+    pub prompt: String,
+    /// Opaque additional context (goal ancestry, prior-run summary,
+    /// linked Dossiers, …). The Rig passes it through to the agent.
+    pub context: String,
+}
+
+impl RigRunRequest {
+    pub fn new(
+        brief_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        tenant_id: impl Into<String>,
+        prompt: impl Into<String>,
+    ) -> Self {
+        Self {
+            brief_id: brief_id.into(),
+            agent_id: agent_id.into(),
+            tenant_id: tenant_id.into(),
+            prompt: prompt.into(),
+            context: String::new(),
+        }
+    }
+
+    /// Attach opaque context (builder style).
+    pub fn with_context(mut self, context: impl Into<String>) -> Self {
+        self.context = context.into();
+        self
+    }
+}
+
+/// The outcome of a Rig run, reported back to the dispatcher.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RigOutcome {
+    /// The run finished and produced a result summary. The
+    /// dispatcher records the Shift and may move the Brief toward
+    /// `in_review` / `done`.
+    Done { summary: String },
+    /// The run did useful work but the Brief needs another Shift
+    /// later (a durable yield / continuation). The dispatcher
+    /// releases the Claim and the Brief stays workable.
+    Continue { note: String },
+    /// The run failed. `retryable` lets the dispatcher distinguish a
+    /// transient failure (retry next tick) from a hard one (escalate
+    /// to the Desk).
+    Failed { reason: String, retryable: bool },
+}
+
+/// How much Relix can govern *inside* a Rig. Rich Rigs expose every
+/// tool call for gating; thin Rigs can only be bounded by their
+/// sandbox + the scoped bridge-back token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RigGovernance {
+    /// Per-tool-call gating available inside the Rig (Hermes, ACP).
+    PerToolCall,
+    /// Only box-level (sandbox) governance — the floor (headless
+    /// CLIs, generic processes). The dispatcher gives these tighter
+    /// sandboxes.
+    BoxLevel,
+}
+
+/// A **Rig** — a pluggable agent backend. The uniform contract
+/// behind every Operative's "what powers it."
+pub trait Rig: Send + Sync {
+    /// The Rig's stable type name (e.g. `echo`, `hermes`, `claude`,
+    /// `codex`). Used as its registry key.
+    fn name(&self) -> &str;
+
+    /// A human label for the Rig. Defaults to [`Rig::name`].
+    fn display_name(&self) -> &str {
+        self.name()
+    }
+
+    /// How deeply Relix can govern inside this Rig. Defaults to the
+    /// conservative `BoxLevel` (thin) — a Rig opts *up* to
+    /// `PerToolCall` only when it genuinely exposes its tools.
+    fn governance(&self) -> RigGovernance {
+        RigGovernance::BoxLevel
+    }
+
+    /// Run one Brief and report the outcome. Synchronous by
+    /// contract; async backends (process spawn, HTTP) run their I/O
+    /// and block the worker thread (the dispatcher calls this off
+    /// the async runtime).
+    fn run(&self, req: &RigRunRequest) -> RigOutcome;
+}
+
+/// A registry of Rigs, keyed by [`Rig::name`]. Built-ins are
+/// registered at startup; operator / third-party Rigs register the
+/// same way, so "plug in any agent" is open-ended. Last writer wins
+/// (an operator Rig may override a built-in of the same name).
+#[derive(Clone, Default)]
+pub struct RigRegistry {
+    rigs: BTreeMap<String, Arc<dyn Rig>>,
+}
+
+impl RigRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A registry pre-loaded with the built-in Rigs.
+    pub fn with_builtins() -> Self {
+        let mut r = Self::new();
+        r.register(Arc::new(EchoRig));
+        r
+    }
+
+    /// Register a Rig under its [`Rig::name`]. Overrides any
+    /// existing Rig of the same name.
+    pub fn register(&mut self, rig: Arc<dyn Rig>) {
+        self.rigs.insert(rig.name().to_string(), rig);
+    }
+
+    /// Look up a Rig by name.
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Rig>> {
+        self.rigs.get(name).cloned()
+    }
+
+    /// All registered Rig names, sorted.
+    pub fn names(&self) -> Vec<String> {
+        self.rigs.keys().cloned().collect()
+    }
+
+    /// How many Rigs are registered.
+    pub fn len(&self) -> usize {
+        self.rigs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rigs.is_empty()
+    }
+}
+
+/// The built-in **`echo`** Rig — the contract's canonical minimal
+/// adapter. It "runs" a Brief by echoing the prompt back as the
+/// result. Used in tests and as the reference any real Rig (Hermes,
+/// Claude, Codex, remote) is modelled on. Thin by governance: it
+/// does no tool calls, so there is nothing inside to gate.
+pub struct EchoRig;
+
+impl Rig for EchoRig {
+    fn name(&self) -> &str {
+        "echo"
+    }
+
+    fn display_name(&self) -> &str {
+        "Echo (built-in reference)"
+    }
+
+    fn run(&self, req: &RigRunRequest) -> RigOutcome {
+        if req.prompt.trim().is_empty() {
+            RigOutcome::Failed {
+                reason: "empty prompt".to_string(),
+                retryable: false,
+            }
+        } else {
+            RigOutcome::Done {
+                summary: format!("echo: {}", req.prompt.trim()),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn echo_rig_runs_and_reports_done() {
+        let rig = EchoRig;
+        assert_eq!(rig.name(), "echo");
+        assert_eq!(rig.governance(), RigGovernance::BoxLevel);
+        let req = RigRunRequest::new("brief_1", "agt_a", "guild_x", "write the readme")
+            .with_context("goal: ship v1");
+        match rig.run(&req) {
+            RigOutcome::Done { summary } => assert_eq!(summary, "echo: write the readme"),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn echo_rig_fails_on_empty_prompt() {
+        let rig = EchoRig;
+        let req = RigRunRequest::new("b", "a", "g", "   ");
+        assert!(matches!(
+            rig.run(&req),
+            RigOutcome::Failed { retryable: false, .. }
+        ));
+    }
+
+    #[test]
+    fn registry_registers_looks_up_and_overrides() {
+        let reg = RigRegistry::with_builtins();
+        assert_eq!(reg.names(), vec!["echo".to_string()]);
+        assert!(reg.get("echo").is_some());
+        assert!(reg.get("nope").is_none());
+        assert_eq!(reg.get("echo").unwrap().name(), "echo");
+
+        // A custom Rig registers the same way; same name overrides.
+        struct CustomEcho;
+        impl Rig for CustomEcho {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn governance(&self) -> RigGovernance {
+                RigGovernance::PerToolCall
+            }
+            fn run(&self, _req: &RigRunRequest) -> RigOutcome {
+                RigOutcome::Continue {
+                    note: "custom".to_string(),
+                }
+            }
+        }
+        let mut reg = reg;
+        reg.register(Arc::new(CustomEcho));
+        assert_eq!(reg.len(), 1, "override keeps a single 'echo' entry");
+        assert_eq!(reg.get("echo").unwrap().governance(), RigGovernance::PerToolCall);
+    }
+}
