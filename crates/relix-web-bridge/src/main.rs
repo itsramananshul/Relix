@@ -176,6 +176,7 @@ mod sessions_obs;
 mod skills;
 mod slack;
 mod sol_validate;
+mod spine;
 mod sse;
 #[cfg(test)]
 mod streaming_mini_mesh_test;
@@ -486,6 +487,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/chat/completions", post(openai::chat_completions))
         // Task-native read API (Track 2). Bridge stays translation-only:
         // each route is a thin forwarder to a Coordinator capability.
+        // Product-spine dashboard read surface.
+        .route("/v1/spine/guild", get(spine::guild_counts))
+        .route("/v1/spine/board", get(spine::board_summary))
+        .route("/v1/spine/board/:column", get(spine::board_column))
+        .route("/v1/spine/roster", get(spine::roster_summary))
+        .route("/v1/spine/mandates", get(spine::mandates))
+        .route("/v1/spine/mandates/search", get(spine::mandate_search))
+        .route("/v1/spine/briefs/search", get(spine::brief_search))
+        .route("/v1/spine/briefs/:id", get(spine::brief_detail))
+        .route("/v1/spine/desk/:agent", get(spine::desk))
+        .route("/v1/spine/overdue", get(spine::overdue))
         .route("/v1/tasks", get(tasks::list))
         .route("/v1/tasks/count", get(tasks::count))
         .route("/v1/tasks/cursor", get(tasks::list_cursor))
