@@ -332,8 +332,13 @@ async function renderCosts(host) {
     ];
     renderListLike(host, ["Item","Value"], rows);
     if (cap != null && remaining < 0) {
-      host.append(node("div",{className:"event err",textContent:"Committed Operative allowance exceeds the Guild cap. Relix stores the cap, but hard spend stop is still a roadmap gap."}));
+      host.append(node("div",{className:"event err",textContent:"Over-cap: committed Operative allowance exceeds the Guild cap."}));
     }
+    // Allowance enforcement state at Brief dispatch (company-model §3.6/§5.2D).
+    host.append(node("div",{className:"muted",style:"margin-top:8px;font-size:12px;line-height:1.5"},[
+      node("div",{textContent:"Operative Allowance — ENFORCED at dispatch: allowance = 0 hard-stops the Operative; a positive cap stops dispatch once trailing-30-day recorded AI spend reaches it (best-effort: only priced AI calls attributed to the Operative count)."}),
+      node("div",{textContent:"Guild Allowance — visibility / commitment only. No Guild-level spend hard-stop yet."}),
+    ]));
   } catch(e) {
     host.innerHTML = "";
     host.append(node("div",{className:"err",textContent:e.message}));

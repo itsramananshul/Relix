@@ -88,6 +88,55 @@ pub struct DispatchRecord {
     pub outcome: RigOutcome,
 }
 
+/// Verdict of the per-Brief Allowance / budget admission gate
+/// (relix-company-model §3.6 "Budgets" + §5.2D autonomy/budget): the
+/// company operating system must not keep dispatching work when the
+/// assigned Operative is over its hard budget.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BudgetAdmission {
+    /// The Operative may run this Brief.
+    Allow,
+    /// The Operative is over budget / hard-stopped. `reason` is the
+    /// operator-facing explanation chronicled on the Brief.
+    Refuse { reason: String },
+}
+
+/// One US cent expressed in micro-USD (the metrics cost unit).
+pub const MICROS_PER_CENT: u64 = 10_000;
+
+/// Pure per-Operative monthly Allowance verdict.
+///
+/// - `allowance_cents`: the Operative's configured monthly cap
+///   (`AgentProfile.monthly_allowance_cents`); `None` = no per-agent
+///   Allowance, so this gate allows.
+/// - `spend_micros`: the Operative's spend over the window, in
+///   micro-USD (from the metrics ledger).
+///
+/// A cap of `0` (or negative) is an explicit **hard-stop** — the
+/// Operative is budgeted to nothing and must not run. A positive cap
+/// refuses once spend reaches it. (1 cent = [`MICROS_PER_CENT`]
+/// micro-USD.)
+pub fn allowance_admits(allowance_cents: Option<i64>, spend_micros: u64) -> BudgetAdmission {
+    match allowance_cents {
+        None => BudgetAdmission::Allow,
+        Some(c) if c <= 0 => BudgetAdmission::Refuse {
+            reason: "allowance=0 (hard-stopped)".to_string(),
+        },
+        Some(c) => {
+            let cap_micros = (c as u64).saturating_mul(MICROS_PER_CENT);
+            if spend_micros >= cap_micros {
+                BudgetAdmission::Refuse {
+                    reason: format!(
+                        "over monthly allowance (used {spend_micros}u >= cap {cap_micros}u)"
+                    ),
+                }
+            } else {
+                BudgetAdmission::Allow
+            }
+        }
+    }
+}
+
 /// Run one full dispatch tick: claim the ready Briefs, run each on
 /// its Rig, advance the board, and release the Claim.
 ///
@@ -130,6 +179,8 @@ where
         bridge_tokens,
         |_| true,
         |_| 20,
+        // No budget gate for the simple wrapper (tests / old callers).
+        |_| BudgetAdmission::Allow,
         resolve_rig,
         build_prompt,
     )
@@ -139,13 +190,15 @@ where
 /// default [`dispatch_batch`] keeps tests and old callers simple;
 /// this variant lets production wiring enforce per-agent runtime
 /// Keys before queueing timer wakes and before claiming queued runs.
-pub fn dispatch_batch_with_policy<R, P, A, C>(
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_batch_with_policy<R, P, A, C, B>(
     store: &TaskStore,
     batch: usize,
     lease_secs: i64,
     bridge_tokens: Option<&BridgeTokenStore>,
     allow_timer_wakeup: A,
     max_running_for_agent: C,
+    admit_budget: B,
     resolve_rig: R,
     build_prompt: P,
 ) -> Result<Vec<DispatchRecord>, CoordinatorError>
@@ -154,6 +207,7 @@ where
     P: Fn(&brief::BriefCard) -> String,
     A: Fn(&brief::BriefCard) -> bool,
     C: FnMut(&str) -> i64,
+    B: Fn(&brief::BriefCard) -> BudgetAdmission,
 {
     let ready = store.list_ready_briefs(batch)?;
     for card in &ready {
@@ -170,6 +224,34 @@ where
     for claimed_wake in claimed {
         let card = claimed_wake.card;
         let wakeup_id = claimed_wake.wakeup.wakeup_id;
+        // PHASE 4 (Allowance hard-stop, relix-company-model §3.6/§5.2D):
+        // before running the Brief, check the assigned Operative is
+        // within budget. If over budget / hard-stopped, do NOT run it
+        // and do NOT silently skip — park it in `blocked` (visible to
+        // the operator), chronicle WHY, finish the wakeup, and release
+        // the Claim so the lease is not leaked.
+        if let BudgetAdmission::Refuse { reason } = admit_budget(&card) {
+            // `todo -> blocked` is illegal; mirror the dispatch path's
+            // `todo -> in_progress -> blocked` so the park is valid.
+            if card.board_status == "todo" {
+                store.set_board_status(&card.task_id, "in_progress")?;
+            }
+            store.set_board_status(&card.task_id, "blocked")?;
+            let _ = store.append_event(&card.task_id, "brief.budget_refused", &reason);
+            let _ = store.finish_wakeup(&wakeup_id, "failed", Some(&reason));
+            if let Some(assignee) = card.assignee_agent_id.as_deref() {
+                store.release_claim(&card.task_id, assignee)?;
+            }
+            records.push(DispatchRecord {
+                brief_id: card.task_id.clone(),
+                rig: String::new(),
+                outcome: RigOutcome::Failed {
+                    reason,
+                    retryable: false,
+                },
+            });
+            continue;
+        }
         let record = match resolve_rig(&card) {
             Some(rig) => {
                 // Work starts: todo → in_progress.
@@ -485,6 +567,7 @@ mod tests {
             None,
             |_| false,
             |_| 20,
+            |_| BudgetAdmission::Allow,
             |_: &brief::BriefCard| reg.get("echo"),
             |c: &brief::BriefCard| c.title.clone(),
         )
@@ -510,6 +593,7 @@ mod tests {
             None,
             |_| true,
             |agent| if agent == "agt_a" { 1 } else { 20 },
+            |_| BudgetAdmission::Allow,
             |_: &brief::BriefCard| reg.get("echo"),
             |c: &brief::BriefCard| c.title.clone(),
         )
@@ -525,6 +609,111 @@ mod tests {
         let queued_rows = s.list_brief_wakeups(&queued_id, 10).unwrap();
         assert_eq!(queued_rows.len(), 1);
         assert_eq!(queued_rows[0].status, "queued");
+    }
+
+    // ── Allowance / budget hard-stop (company-model §3.6/§5.2D) ──
+
+    #[test]
+    fn allowance_admits_pure_verdicts() {
+        // No per-agent Allowance configured → always allowed.
+        assert_eq!(allowance_admits(None, 999_999_999), BudgetAdmission::Allow);
+        // Explicit zero (or negative) Allowance → hard-stop regardless
+        // of spend (even with zero recorded spend).
+        assert!(matches!(
+            allowance_admits(Some(0), 0),
+            BudgetAdmission::Refuse { .. }
+        ));
+        assert!(matches!(
+            allowance_admits(Some(-5), 0),
+            BudgetAdmission::Refuse { .. }
+        ));
+        // Positive cap: 100 cents = 1_000_000 micro-USD.
+        // Under the cap → allowed.
+        assert_eq!(allowance_admits(Some(100), 999_999), BudgetAdmission::Allow);
+        // At/over the cap → refused.
+        assert!(matches!(
+            allowance_admits(Some(100), 1_000_000),
+            BudgetAdmission::Refuse { .. }
+        ));
+        assert!(matches!(
+            allowance_admits(Some(100), 5_000_000),
+            BudgetAdmission::Refuse { .. }
+        ));
+    }
+
+    #[test]
+    fn over_budget_operative_is_refused_parked_and_chronicled() {
+        use crate::rig::RigRegistry;
+        let s = store();
+        let reg = RigRegistry::with_builtins();
+        let refused = ready_brief(&s, "refused work", "agt_broke");
+        let allowed = ready_brief(&s, "allowed work", "agt_ok");
+
+        let records = dispatch_batch_with_policy(
+            &s,
+            50,
+            300,
+            None,
+            |_| true,
+            |_| 20,
+            // Refuse only the over-budget Operative; mirror the live
+            // closure's payload shape.
+            |card: &brief::BriefCard| {
+                if card.assignee_agent_id.as_deref() == Some("agt_broke") {
+                    BudgetAdmission::Refuse {
+                        reason: "budget_refused: agent_id=agt_broke allowance=0c used=0u \
+                                 reason=allowance=0 (hard-stopped)"
+                            .to_string(),
+                    }
+                } else {
+                    BudgetAdmission::Allow
+                }
+            },
+            |_: &brief::BriefCard| reg.get("echo"),
+            |c: &brief::BriefCard| c.title.clone(),
+        )
+        .unwrap();
+
+        // The refused Brief did NOT run: it's parked in `blocked`
+        // (visible to the operator), never reaching `in_review`.
+        assert_eq!(
+            s.board_status(&refused).unwrap().as_deref(),
+            Some("blocked")
+        );
+        // It was NOT silently skipped — a chronicle event explains why.
+        let refusal = s
+            .query_events(
+                &refused,
+                0,
+                50,
+                Some("brief.budget_refused"),
+                crate::nodes::coordinator::EventOrder::Desc,
+            )
+            .unwrap();
+        assert_eq!(refusal.len(), 1);
+        assert!(
+            refusal[0].payload.contains("budget_refused")
+                && refusal[0].payload.contains("agt_broke"),
+            "got {:?}",
+            refusal[0].payload
+        );
+        // The Claim lease is released (not leaked) and the wakeup
+        // closed as failed.
+        assert!(s.claim_holder(&refused).unwrap().is_none());
+        assert!(records.iter().any(|r| r.brief_id == refused
+            && matches!(
+                r.outcome,
+                RigOutcome::Failed {
+                    retryable: false,
+                    ..
+                }
+            )));
+
+        // The under-budget Operative still dispatches normally.
+        assert_eq!(
+            s.board_status(&allowed).unwrap().as_deref(),
+            Some("in_review")
+        );
     }
 
     #[test]

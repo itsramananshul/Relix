@@ -8822,6 +8822,11 @@ fn register_node_type_handlers(
             let task_store = store.clone();
             let ag_store = agent_store.clone();
             let registry = rig_registry.clone();
+            // Live spend ledger for the Allowance hard-stop gate
+            // (relix-company-model §3.6/§5.2D). `None` when metrics are
+            // disabled, in which case only an explicit zero Allowance
+            // hard-stops (a positive cap can't be spend-checked).
+            let metrics_query = metrics.map(|m| m.query.clone());
             // Per-run bridge-back tokens the dispatch loop mints +
             // injects so a running agent can call Relix's API back.
             let bridge_tokens = crate::rig::bridge::BridgeTokenStore::global();
@@ -8834,9 +8839,11 @@ fn register_node_type_handlers(
                     let ags = ag_store.clone();
                     let reg = registry.clone();
                     let bt = bridge_tokens.clone();
+                    let mq = metrics_query.clone();
                     let outcome = tokio::task::spawn_blocking(move || {
                         let ags_for_timer = ags.clone();
                         let ags_for_caps = ags.clone();
+                        let ags_for_budget = ags.clone();
                         crate::nodes::coordinator::heartbeat::dispatch_batch_with_policy(
                             &ts,
                             batch,
@@ -8886,6 +8893,49 @@ fn register_node_type_handlers(
                                     .filter(|a| a.status == "active")
                                     .map(|a| a.max_concurrent_runs)
                                     .unwrap_or(0)
+                            },
+                            // Allowance hard-stop gate
+                            // (relix-company-model §3.6/§5.2D): refuse to
+                            // dispatch a Brief whose Operative is over its
+                            // monthly Allowance or explicitly hard-stopped
+                            // (allowance = 0). Spend is the Operative's
+                            // trailing-30-day cost from the metrics ledger.
+                            move |card| {
+                                use crate::nodes::coordinator::heartbeat::{
+                                    allowance_admits, BudgetAdmission,
+                                };
+                                let Some(assignee) = card.assignee_agent_id.as_deref() else {
+                                    return BudgetAdmission::Allow;
+                                };
+                                let Some(agent) =
+                                    ags_for_budget.get_agent(assignee).ok().flatten()
+                                else {
+                                    return BudgetAdmission::Allow;
+                                };
+                                let cap = agent.monthly_allowance_cents;
+                                if cap.is_none() {
+                                    return BudgetAdmission::Allow;
+                                }
+                                let since_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as i64)
+                                    .unwrap_or(0)
+                                    - 30 * 86_400 * 1000;
+                                let spend = mq
+                                    .as_ref()
+                                    .and_then(|q| q.cost_since(Some(assignee), since_ms).ok())
+                                    .unwrap_or(0);
+                                match allowance_admits(cap, spend) {
+                                    BudgetAdmission::Allow => BudgetAdmission::Allow,
+                                    BudgetAdmission::Refuse { reason } => {
+                                        BudgetAdmission::Refuse {
+                                            reason: format!(
+                                                "budget_refused: agent_id={assignee} allowance={}c used={spend}u reason={reason}",
+                                                cap.unwrap_or(0)
+                                            ),
+                                        }
+                                    }
+                                }
                             },
                             |card| {
                                 let assignee = card.assignee_agent_id.as_deref()?;
