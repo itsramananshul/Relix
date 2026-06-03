@@ -1008,6 +1008,77 @@ impl AgentStore {
         self.update_agent_field(agent_id, "status", "disabled")
     }
 
+    // ── PHASE 4: hire flow ────────────────────────────────
+
+    /// Request a hire: mint a new Operative in `pending` status. A
+    /// pending Operative appears in the Roster but is **inert** —
+    /// the fail-closed agent gate denies any non-`active` caller —
+    /// so a CEO-spawned hire can't act until the Founder approves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_hire(
+        &self,
+        name: &str,
+        role: &str,
+        title: &str,
+        department: &str,
+        team: &str,
+        created_by: &str,
+        subject_id: &str,
+        risk_ceiling: &str,
+        tenant_id: &str,
+    ) -> Result<String, AgentStoreError> {
+        let agent_id = self.create_agent(
+            name,
+            role,
+            title,
+            department,
+            team,
+            created_by,
+            subject_id,
+            risk_ceiling,
+            tenant_id,
+        )?;
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        conn.execute(
+            "UPDATE agent_profiles SET status='pending', updated_at=?1 WHERE agent_id=?2",
+            params![now, agent_id],
+        )?;
+        Ok(agent_id)
+    }
+
+    /// Approve a pending hire (pending → active). Errors if the
+    /// Operative isn't pending (so an already-active agent can't be
+    /// "approved" into existence).
+    pub fn approve_hire(&self, agent_id: &str) -> Result<(), AgentStoreError> {
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let changed = conn.execute(
+            "UPDATE agent_profiles SET status='active', updated_at=?1
+             WHERE agent_id=?2 AND status='pending'",
+            params![now, agent_id],
+        )?;
+        if changed == 0 {
+            return Err(AgentStoreError::NotFound(agent_id.into()));
+        }
+        Ok(())
+    }
+
+    /// Reject a pending hire (pending → disabled, terminal).
+    pub fn reject_hire(&self, agent_id: &str) -> Result<(), AgentStoreError> {
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let changed = conn.execute(
+            "UPDATE agent_profiles SET status='disabled', updated_at=?1
+             WHERE agent_id=?2 AND status='pending'",
+            params![now, agent_id],
+        )?;
+        if changed == 0 {
+            return Err(AgentStoreError::NotFound(agent_id.into()));
+        }
+        Ok(())
+    }
+
     // ── approval_requests ─────────────────────────────────
 
     /// Insert a new pending approval. Returns the approval_id.
@@ -2428,6 +2499,37 @@ mod tests {
         );
         // The apex escalates to nobody.
         assert!(s.chain_of_command(&ceo).unwrap().is_empty());
+    }
+
+    // ── PHASE 4: hire flow ───────────────────────────────
+
+    #[test]
+    fn hire_flow_is_pending_until_approved() {
+        let s = store();
+        let id = s
+            .request_hire(
+                "Eng", "engineer", "E", "eng", "eng", "ceo", "subj-hire", "low", "default",
+            )
+            .unwrap();
+        // A fresh hire is pending (inert — gate denies non-active).
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().status, "pending");
+
+        // Approve → active.
+        s.approve_hire(&id).unwrap();
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().status, "active");
+        // Can't "approve" again — it's no longer pending.
+        assert!(s.approve_hire(&id).is_err());
+
+        // Reject a fresh pending hire → disabled (terminal).
+        let id2 = s
+            .request_hire(
+                "X", "r", "t", "d", "t", "ceo", "subj-h2", "low", "default",
+            )
+            .unwrap();
+        s.reject_hire(&id2).unwrap();
+        assert_eq!(s.get_agent(&id2).unwrap().unwrap().status, "disabled");
+        // Rejecting a non-pending agent errors.
+        assert!(s.reject_hire(&id).is_err());
     }
 
     // ── PILLAR 2: Rig (agent backend) ────────────────────
