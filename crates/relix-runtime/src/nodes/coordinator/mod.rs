@@ -993,6 +993,65 @@ impl TaskStore {
         Ok(())
     }
 
+    /// PHASE 5 (Brief): replace a Brief's free-form labels. Each is
+    /// trimmed; empties and any containing the `,` separator are
+    /// dropped; duplicates are removed (first wins, order preserved).
+    /// An empty result clears the column. The Brief must exist.
+    pub fn set_brief_labels(
+        &self,
+        task_id: &str,
+        labels: &[&str],
+    ) -> Result<(), CoordinatorError> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut norm: Vec<String> = Vec::new();
+        for l in labels {
+            let t = l.trim();
+            if t.is_empty() || t.contains(',') {
+                continue;
+            }
+            if seen.insert(t.to_string()) {
+                norm.push(t.to_string());
+            }
+        }
+        let joined = norm.join(",");
+        let stored: Option<String> = if joined.is_empty() { None } else { Some(joined) };
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let changed = conn
+            .execute(
+                "UPDATE tasks SET labels = ?1, updated_at = ?2 WHERE task_id = ?3",
+                params![stored, unix_secs(), task_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+        if changed == 0 {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// PHASE 5 (Brief): a Brief's labels (empty when unset).
+    /// `NotFound` when the Brief doesn't exist.
+    pub fn brief_labels(&self, task_id: &str) -> Result<Vec<String>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let raw: Option<Option<String>> = conn
+            .query_row(
+                "SELECT labels FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        match raw {
+            None => Err(CoordinatorError::NotFound(task_id.to_string())),
+            Some(None) => Ok(Vec::new()),
+            Some(Some(s)) => Ok(s
+                .split(',')
+                .map(str::trim)
+                .filter(|x| !x.is_empty())
+                .map(str::to_string)
+                .collect()),
+        }
+    }
+
     /// PHASE 5 (dispatch): compose the prompt handed to a Rig for a
     /// Brief — its title, its Dossier headers (the plan/spec
     /// artifacts), and the most recent comments (oldest→newest).
@@ -5614,6 +5673,26 @@ pub fn register(
     {
         let s = store.clone();
         bridge.register(
+            "brief.set_labels",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_set_labels(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.labels",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_labels(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
             "brief.detail",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -6734,6 +6813,44 @@ fn handle_brief_create(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome
     match store.create_brief(title, &owner, opt(1), opt(2), opt(3), opt(4)) {
         Ok(id) => HandlerOutcome::Ok(id.into_bytes()),
         Err(e) => map_edge_err("brief.create", e),
+    }
+}
+
+/// `brief.set_labels` — replace a Brief's labels. Arg
+/// `task|label1,label2,...` (comma-separated; empty list clears).
+fn handle_brief_set_labels(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.set_labels utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    let task = parts.first().copied().unwrap_or("").trim();
+    if task.is_empty() {
+        return invalid("brief.set_labels: task required (arg shape: task|csv)".to_string());
+    }
+    let labels: Vec<&str> = parts
+        .get(1)
+        .copied()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    match store.set_brief_labels(task, &labels) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.set_labels", e),
+    }
+}
+
+/// `brief.labels` — a Brief's labels, one per line. Arg `task`.
+fn handle_brief_labels(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task = match single_id(ctx, "brief.labels") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    match store.brief_labels(task) {
+        Ok(labels) => HandlerOutcome::Ok(labels.join("\n").into_bytes()),
+        Err(e) => map_edge_err("brief.labels", e),
     }
 }
 
@@ -9019,6 +9136,10 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         // nullable, so existing rows are simply unclaimed.
         "ALTER TABLE tasks ADD COLUMN claimed_by TEXT",
         "ALTER TABLE tasks ADD COLUMN claim_expires_at INTEGER",
+        // PHASE 5 (Brief): free-form labels — a normalized,
+        // comma-joined tag set (bug / feature / customer-x …) for
+        // organising the board. NULL = no labels. Additive.
+        "ALTER TABLE tasks ADD COLUMN labels TEXT",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the
@@ -10095,6 +10216,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload, "todo -> in_progress");
+    }
+
+    #[test]
+    fn brief_labels_normalize_dedupe_and_clear() {
+        let s = store();
+        let id = s
+            .create("b", "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .unwrap();
+        // Empty initially.
+        assert!(s.brief_labels(&id).unwrap().is_empty());
+
+        // Set with dupes, whitespace, and a comma-bearing entry (dropped).
+        s.set_brief_labels(&id, &["bug", " bug ", "urgent", "a,b", ""])
+            .unwrap();
+        assert_eq!(
+            s.brief_labels(&id).unwrap(),
+            vec!["bug".to_string(), "urgent".to_string()]
+        );
+
+        // Replace wholesale.
+        s.set_brief_labels(&id, &["feature"]).unwrap();
+        assert_eq!(s.brief_labels(&id).unwrap(), vec!["feature".to_string()]);
+
+        // Clear with an empty set.
+        s.set_brief_labels(&id, &[]).unwrap();
+        assert!(s.brief_labels(&id).unwrap().is_empty());
+
+        // Unknown Brief → NotFound on both paths.
+        assert!(matches!(
+            s.brief_labels("nope"),
+            Err(CoordinatorError::NotFound(_))
+        ));
+        assert!(matches!(
+            s.set_brief_labels("nope", &["x"]),
+            Err(CoordinatorError::NotFound(_))
+        ));
     }
 
     #[test]
