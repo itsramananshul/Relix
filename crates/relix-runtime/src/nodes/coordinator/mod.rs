@@ -1003,32 +1003,29 @@ impl TaskStore {
         let mut out = String::new();
         // Title — the headline instruction. Scoped so the lock is
         // dropped before the sub-reads below re-lock.
-        if let Ok(conn) = self.conn.lock() {
-            if let Ok(title) = conn.query_row(
+        if let Ok(conn) = self.conn.lock()
+            && let Ok(title) = conn.query_row(
                 "SELECT title FROM tasks WHERE task_id=?1",
                 params![task_id],
                 |r| r.get::<_, String>(0),
             ) {
                 out.push_str(&title);
             }
-        }
         // Dossiers — the durable artifacts (plan/spec/notes).
-        if let Ok(docs) = self.list_dossiers(task_id) {
-            if !docs.is_empty() {
+        if let Ok(docs) = self.list_dossiers(task_id)
+            && !docs.is_empty() {
                 out.push_str("\n\nDossiers:");
                 for d in docs {
                     out.push_str(&format!("\n- [{}] {}", d.kind, d.title));
                 }
             }
-        }
         // The current plan body in full — the agent needs the actual
         // instructions, not just the plan's title.
-        if let Ok(Some(plan)) = self.latest_dossier(task_id, "plan") {
-            if !plan.body.trim().is_empty() {
+        if let Ok(Some(plan)) = self.latest_dossier(task_id, "plan")
+            && !plan.body.trim().is_empty() {
                 out.push_str("\n\nCurrent plan:\n");
                 out.push_str(plan.body.trim());
             }
-        }
         // Recent comments — the conversation thread, oldest→newest.
         if let Ok(mut comments) = self.query_events(
             task_id,
@@ -1036,15 +1033,14 @@ impl TaskStore {
             max_comments.max(1),
             Some("brief.comment"),
             EventOrder::Desc,
-        ) {
-            if !comments.is_empty() {
+        )
+            && !comments.is_empty() {
                 comments.reverse();
                 out.push_str("\n\nRecent comments:");
                 for c in comments {
                     out.push_str(&format!("\n- {}", c.payload));
                 }
             }
-        }
         out
     }
 
@@ -1162,13 +1158,12 @@ impl TaskStore {
         board: Option<&str>,
         limit: usize,
     ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
-        if let Some(b) = board {
-            if !brief::is_board_status(b) {
+        if let Some(b) = board
+            && !brief::is_board_status(b) {
                 return Err(CoordinatorError::Invalid(format!(
                     "unknown board status '{b}'"
                 )));
             }
-        }
         let lim = limit.clamp(1, self.max_list) as i64;
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let map = |r: &rusqlite::Row| {

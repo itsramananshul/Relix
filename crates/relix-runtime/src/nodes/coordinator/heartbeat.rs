@@ -129,11 +129,10 @@ where
                 .with_bridge_token(&token)
                 .with_context(brief_context(&card));
                 let outcome = rig.run(&req);
-                if let Some(bt) = bridge_tokens {
-                    if !token.is_empty() {
+                if let Some(bt) = bridge_tokens
+                    && !token.is_empty() {
                         bt.revoke(&token);
                     }
-                }
                 // Advance the board by outcome. The Brief is now
                 // `in_progress` (we either moved it or it already
                 // was), so both transitions below are legal.

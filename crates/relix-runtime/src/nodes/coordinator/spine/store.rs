@@ -4,11 +4,11 @@
 //!
 //! Two tables live in their own coordinator-side database:
 //!
-//! - `mandates`    — Phase 1. The high-level outcomes a company
-//!                cares about; may nest (a mandate can have a
-//!                parent mandate) to form a mandate hierarchy.
+//! - `mandates` — Phase 1. The high-level outcomes a company cares
+//!   about; may nest (a mandate can have a parent mandate) to form a
+//!   mandate hierarchy.
 //! - `campaigns` — Phase 1. A workstream under a mandate; the unit
-//!                an Issue links up to.
+//!   an Issue links up to.
 //!
 //! Both objects are **tenant-scoped** (a Company is the
 //! product-facing name for a tenant), and every read offers a
@@ -221,11 +221,10 @@ impl SpineStore {
         tenant_id: &str,
         cents: Option<i64>,
     ) -> Result<(), SpineStoreError> {
-        if let Some(c) = cents {
-            if c < 0 {
+        if let Some(c) = cents
+            && c < 0 {
                 return Err(SpineStoreError::BadInput("allowance must be >= 0".into()));
             }
-        }
         let tenant = normalize_tenant(tenant_id);
         let now = unix_now();
         let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;

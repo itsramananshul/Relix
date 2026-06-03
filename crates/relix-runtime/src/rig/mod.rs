@@ -215,11 +215,10 @@ impl RigRegistry {
     /// resolves — the Brief is left for the Desk. This is the
     /// dispatcher's single resolution point.
     pub fn resolve(&self, preferred: Option<&str>) -> Option<Arc<dyn Rig>> {
-        if let Some(name) = preferred.filter(|s| !s.is_empty()) {
-            if let Some(rig) = self.get(name) {
+        if let Some(name) = preferred.filter(|s| !s.is_empty())
+            && let Some(rig) = self.get(name) {
                 return Some(rig);
             }
-        }
         self.default_name.as_deref().and_then(|d| self.get(d))
     }
 
