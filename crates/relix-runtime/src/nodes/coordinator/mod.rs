@@ -873,6 +873,15 @@ impl TaskStore {
         if changed == 0 {
             return Err(CoordinatorError::NotFound(task_id.to_string()));
         }
+        // Reassigning (or unassigning) drops any stale Claim so the
+        // new assignee can pick the Brief up immediately instead of
+        // waiting out the previous holder's lease.
+        if field == "assignee" {
+            let _ = conn.execute(
+                "UPDATE tasks SET claimed_by=NULL, claim_expires_at=NULL WHERE task_id=?1",
+                params![task_id],
+            );
+        }
         // Chronicle an assignment (skip clears).
         if field == "assignee" && !value.trim().is_empty() {
             let _ = conn.execute(
@@ -9526,6 +9535,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload, "todo -> in_progress");
+    }
+
+    #[test]
+    fn reassigning_a_brief_drops_the_previous_holders_claim() {
+        let s = store();
+        let id = s
+            .create("b", "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .unwrap();
+        s.set_brief_field(&id, "assignee", "agt_a").unwrap();
+        s.set_board_status(&id, "todo").unwrap();
+        // agt_a claims it.
+        assert!(s.claim_brief(&id, "agt_a", 300).unwrap());
+        assert_eq!(s.claim_holder(&id).unwrap().unwrap().0, "agt_a");
+        // Not ready while held.
+        assert!(s.list_ready_briefs(50).unwrap().is_empty());
+
+        // Reassign to agt_b → stale Claim cleared, ready again.
+        s.set_brief_field(&id, "assignee", "agt_b").unwrap();
+        assert!(s.claim_holder(&id).unwrap().is_none());
+        let ready: Vec<String> = s
+            .list_ready_briefs(50)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.task_id)
+            .collect();
+        assert!(ready.contains(&id));
     }
 
     #[test]
