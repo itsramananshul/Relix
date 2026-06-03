@@ -782,6 +782,40 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// PHASE 5 (companion): post a comment to a Brief's Chronicle.
+    /// Records a `brief.comment` event (payload `author: text`) so a
+    /// human, the companion, and the assigned Operative share one
+    /// conversation thread on the Brief — read back via `task.events`
+    /// (type filter `brief.comment`, order `desc`). The Brief must
+    /// exist; author and text are required.
+    pub fn comment_on_brief(
+        &self,
+        task_id: &str,
+        author: &str,
+        text: &str,
+    ) -> Result<(), CoordinatorError> {
+        let author = author.trim();
+        let text = text.trim();
+        if author.is_empty() {
+            return Err(CoordinatorError::Invalid("comment author required".to_string()));
+        }
+        if text.is_empty() {
+            return Err(CoordinatorError::Invalid("comment text required".to_string()));
+        }
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, task_id)? {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let now = unix_secs();
+        conn.execute(
+            "INSERT INTO task_events (task_id, ts, event_type, payload)
+             VALUES (?1, ?2, 'brief.comment', ?3)",
+            params![task_id, now, format!("{author}: {text}")],
+        )
+        .map_err(CoordinatorError::Db)?;
+        Ok(())
+    }
+
     /// PHASE 1 (Brief): set one of the Brief's spine fields —
     /// `assignee` / `priority` / `mandate` / `campaign`. Empty
     /// value clears assignee/mandate/campaign (NULL); `priority`
@@ -5219,6 +5253,17 @@ pub fn register(
             })),
         );
     }
+    // PHASE 5 (companion): comment thread on a Brief.
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.comment",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_comment(&s, &ctx) }
+            })),
+        );
+    }
     // PHASE 1 (Brief): Dossiers — durable artifacts on a Brief.
     {
         let s = store.clone();
@@ -6201,6 +6246,24 @@ fn handle_brief_blocked(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcom
     match store.is_blocked(task) {
         Ok(b) => HandlerOutcome::Ok(if b { b"true".to_vec() } else { b"false".to_vec() }),
         Err(e) => map_edge_err("brief.blocked", e),
+    }
+}
+
+/// `brief.comment` — post a comment to a Brief's Chronicle. Arg
+/// `task_id|author|text` (text may contain pipes). Read back via
+/// `task.events` with type filter `brief.comment`.
+fn handle_brief_comment(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.comment utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(3, '|').collect();
+    if parts.len() < 3 {
+        return invalid("brief.comment: expected `task_id|author|text`".to_string());
+    }
+    match store.comment_on_brief(parts[0].trim(), parts[1].trim(), parts[2]) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.comment", e),
     }
 }
 
@@ -9336,6 +9399,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload, "todo -> in_progress");
+    }
+
+    #[test]
+    fn brief_comment_appends_to_the_chronicle() {
+        let s = store();
+        let id = s
+            .create("b", "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .unwrap();
+        s.comment_on_brief(&id, "founder", "ship it by friday").unwrap();
+        s.comment_on_brief(&id, "agt_eng", "on it").unwrap();
+
+        // Empty author / text rejected; unknown Brief → NotFound.
+        assert!(matches!(
+            s.comment_on_brief(&id, "  ", "x"),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        assert!(matches!(
+            s.comment_on_brief(&id, "a", "   "),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        assert!(matches!(
+            s.comment_on_brief("nope", "a", "b"),
+            Err(CoordinatorError::NotFound(_))
+        ));
+
+        let conn = s.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_events
+                 WHERE task_id = ?1 AND event_type = 'brief.comment'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+        let last: String = conn
+            .query_row(
+                "SELECT payload FROM task_events
+                 WHERE task_id = ?1 AND event_type = 'brief.comment'
+                 ORDER BY event_id DESC LIMIT 1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(last, "agt_eng: on it");
     }
 
     #[test]
