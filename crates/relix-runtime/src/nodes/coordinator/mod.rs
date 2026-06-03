@@ -1262,6 +1262,10 @@ impl TaskStore {
                     out.push_str(&format!("\n- [{}] {}", d.kind, d.title));
                 }
             }
+        // Deadline, if one is set — so the agent can prioritise.
+        if let Ok(Some(due)) = self.brief_due(task_id) {
+            out.push_str(&format!("\n\nDue (unix secs): {due}"));
+        }
         // The current plan body in full — the agent needs the actual
         // instructions, not just the plan's title.
         if let Ok(Some(plan)) = self.latest_dossier(task_id, "plan")
@@ -10897,10 +10901,12 @@ mod tests {
             .unwrap();
         s.comment_on_brief(&id, "founder", "use passkeys").unwrap();
         s.comment_on_brief(&id, "agt_eng", "starting now").unwrap();
+        s.set_brief_due(&id, Some(1_777_000_000)).unwrap();
 
         let prompt = s.compose_brief_prompt(&id, 10);
         assert!(prompt.starts_with("Ship the auth rewrite"));
         assert!(prompt.contains("[spec] Auth Spec"));
+        assert!(prompt.contains("Due (unix secs): 1777000000"));
         // The plan body is inlined for the agent.
         assert!(prompt.contains("Current plan:"));
         assert!(prompt.contains("step 1: design the token flow"));
