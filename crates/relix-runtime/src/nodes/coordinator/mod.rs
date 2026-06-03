@@ -605,6 +605,34 @@ impl TaskStore {
         Ok(())
     }
 
+    /// PHASE 3 (supervisory): a parent Brief's decomposition
+    /// progress — its Sub-briefs counted by board column. The signal
+    /// a planner reads to see how much of its breakdown is done. The
+    /// counts sum to the number of Sub-briefs.
+    pub fn subbrief_progress(
+        &self,
+        parent: &str,
+    ) -> Result<Vec<(String, i64)>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.board_status, COUNT(*)
+                 FROM task_edges e
+                 JOIN tasks c ON c.task_id = e.related_task_id
+                 WHERE e.task_id = ?1 AND e.edge_type = 'spawned'
+                 GROUP BY c.board_status ORDER BY c.board_status",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![parent], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// PHASE 1 (Brief): record that `task` is blocked by `blocker`
     /// — a **Snag** (a `task_edges` 'blocked_on' edge). Both must
     /// exist; no self-block; idempotent.
@@ -5565,6 +5593,16 @@ pub fn register(
     {
         let s = store.clone();
         bridge.register(
+            "brief.subbrief_progress",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_subbrief_progress(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
             "brief.blocking",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -6673,6 +6711,20 @@ fn handle_brief_detail(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome
         },
         Ok(None) => invalid(format!("brief.detail: not found: {task}")),
         Err(e) => map_edge_err("brief.detail", e),
+    }
+}
+
+/// `brief.subbrief_progress` — a parent's Sub-briefs counted by
+/// board column (+ `total`). Arg `parent`. The planner's
+/// decomposition-progress view.
+fn handle_brief_subbrief_progress(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let parent = match single_id(ctx, "brief.subbrief_progress") {
+        Ok(p) => p,
+        Err(o) => return o,
+    };
+    match store.subbrief_progress(parent) {
+        Ok(counts) => counts_to_json(counts),
+        Err(e) => map_edge_err("brief.subbrief_progress", e),
     }
 }
 
@@ -10097,6 +10149,40 @@ mod tests {
 
         // Unknown Brief → None.
         assert!(s.brief_detail("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn subbrief_progress_counts_children_by_column() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        let parent = mk("parent");
+        // Two children done, one in_progress.
+        for t in ["c1", "c2"] {
+            let c = mk(t);
+            s.link_subbrief(&parent, &c).unwrap();
+            s.set_board_status(&c, "todo").unwrap();
+            s.set_board_status(&c, "in_progress").unwrap();
+            s.set_board_status(&c, "in_review").unwrap();
+            s.set_board_status(&c, "done").unwrap();
+        }
+        let c3 = mk("c3");
+        s.link_subbrief(&parent, &c3).unwrap();
+        s.set_board_status(&c3, "todo").unwrap();
+        s.set_board_status(&c3, "in_progress").unwrap();
+
+        let map: std::collections::HashMap<String, i64> = s
+            .subbrief_progress(&parent)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(map.get("done"), Some(&2));
+        assert_eq!(map.get("in_progress"), Some(&1));
+        assert_eq!(map.values().sum::<i64>(), 3);
+        // A childless Brief has no progress rows.
+        assert!(s.subbrief_progress(&c3).unwrap().is_empty());
     }
 
     #[test]
