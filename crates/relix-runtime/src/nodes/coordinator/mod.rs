@@ -6764,11 +6764,13 @@ pub fn register(
         // state machine. Distinct from `task.update` (execution
         // status) — this is the operator-board column.
         let s = store.clone();
+        let a = agent_store.clone();
         bridge.register(
             "brief.move",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
-                async move { handle_brief_move(&s, &ctx) }
+                let a = a.clone();
+                async move { handle_brief_move(&s, a.as_deref(), &ctx) }
             })),
         );
     }
@@ -6789,11 +6791,13 @@ pub fn register(
     }
     {
         let s = store.clone();
+        let a = agent_store.clone();
         bridge.register(
             "brief.create",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
-                async move { handle_brief_create(&s, &ctx) }
+                let a = a.clone();
+                async move { handle_brief_create(&s, a.as_deref(), &ctx) }
             })),
         );
     }
@@ -7976,7 +7980,11 @@ fn handle_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
 
 /// `brief.move` — move a Brief's board status. Arg: `task_id|board_status`.
 /// Enforces the board state machine; returns `from -> to` as the body.
-fn handle_brief_move(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+fn handle_brief_move(
+    store: &TaskStore,
+    agent_store: Option<&agent::AgentStore>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
     let raw = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
         Err(e) => return invalid(format!("brief.move utf8: {e}")),
@@ -7989,6 +7997,19 @@ fn handle_brief_move(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let to = parts[1].trim();
     if task_id.is_empty() {
         return invalid("brief.move: task_id required".to_string());
+    }
+    // Assignment gate (company-model §5.2B): moving a Brief into an
+    // active-execution column (`in_progress`/`in_review`) activates the
+    // assignment, so a non-operator actor must be allowed to assign the
+    // Brief's current assignee. (`enforce_assign_key` bypasses the
+    // Founder/Board and the assignee-is-the-actor self-progress case.)
+    if matches!(to, "in_progress" | "in_review")
+        && let Some(astore) = agent_store
+        && let Ok(Some(f)) = store.brief_fields(task_id)
+        && let Some(assignee) = f.assignee_agent_id.as_deref()
+        && let Err(out) = agent::handlers::enforce_assign_key(astore, ctx, assignee)
+    {
+        return out;
     }
     match store.set_board_status(task_id, to) {
         Ok((from, to)) => HandlerOutcome::Ok(format!("{from} -> {to}").into_bytes()),
@@ -8058,7 +8079,11 @@ fn handle_brief_unsubbrief(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOut
 /// Arg `title|assignee|mandate|campaign|priority` (only `title`
 /// required; the rest optional, empty = skip). Owner subject comes
 /// from the caller. Returns the new task_id.
-fn handle_brief_create(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+fn handle_brief_create(
+    store: &TaskStore,
+    agent_store: Option<&agent::AgentStore>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
     let raw = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
         Err(e) => return invalid(format!("brief.create utf8: {e}")),
@@ -8078,6 +8103,14 @@ fn handle_brief_create(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome
             .map(str::trim)
             .filter(|s| !s.is_empty())
     };
+    // Assignment gate (company-model §5.2B): an initial assignee is a
+    // grant of work, so it runs the same governance as `brief.set`.
+    if let Some(assignee) = opt(1)
+        && let Some(astore) = agent_store
+        && let Err(out) = agent::handlers::enforce_assign_key(astore, ctx, assignee)
+    {
+        return out;
+    }
     let owner = ctx.caller.subject_id.to_string();
     match store.create_brief(
         ctx.tenant_id_or_default(),
@@ -12488,6 +12521,33 @@ mod tests {
                 "default",
             )
             .unwrap();
+        // Two real, active assignees: one in the allowlist, one not.
+        let agt_allowed = agents
+            .create_agent(
+                "Allowed",
+                "engineer",
+                "W",
+                "eng",
+                "eng",
+                "prime",
+                "subj-allowed",
+                "medium",
+                "default",
+            )
+            .unwrap();
+        let agt_blocked = agents
+            .create_agent(
+                "Blocked",
+                "engineer",
+                "W",
+                "eng",
+                "eng",
+                "prime",
+                "subj-blocked",
+                "medium",
+                "default",
+            )
+            .unwrap();
         agents
             .update_agent_field(&mgr, "can_assign_work", "true")
             .unwrap();
@@ -12495,7 +12555,7 @@ mod tests {
             .update_agent_field(&mgr, "assign_scope", "specific")
             .unwrap();
         agents
-            .update_agent_field(&mgr, "assign_allowed_agents", "agt_allowed")
+            .update_agent_field(&mgr, "assign_allowed_agents", &agt_allowed)
             .unwrap();
         let brief = tasks
             .create_brief(
@@ -12509,12 +12569,12 @@ mod tests {
             )
             .unwrap();
 
-        // Out-of-allowlist assignee → denied (the agent actor has
-        // role "" via the ctx helper, so it is not the Founder path).
+        // Out-of-allowlist (but real + active) assignee → denied by
+        // scope (the agent actor has role "" so it is not the Founder).
         let deny = handle_brief_set(
             &tasks,
             Some(&agents),
-            &ctx(format!("{brief}|assignee|agt_blocked").as_bytes()),
+            &ctx(format!("{brief}|assignee|{agt_blocked}").as_bytes()),
         );
         assert!(
             matches!(deny, HandlerOutcome::Err(e) if e.kind == error_kinds::POLICY_DENIED),
@@ -12524,7 +12584,7 @@ mod tests {
         let ok = handle_brief_set(
             &tasks,
             Some(&agents),
-            &ctx(format!("{brief}|assignee|agt_allowed").as_bytes()),
+            &ctx(format!("{brief}|assignee|{agt_allowed}").as_bytes()),
         );
         assert!(matches!(ok, HandlerOutcome::Ok(_)));
         assert_eq!(
@@ -12534,7 +12594,7 @@ mod tests {
                 .unwrap()
                 .assignee_agent_id
                 .as_deref(),
-            Some("agt_allowed")
+            Some(agt_allowed.as_str())
         );
     }
 
@@ -12559,6 +12619,252 @@ mod tests {
                 .assignee_agent_id
                 .as_deref(),
             Some("agt_any")
+        );
+    }
+
+    /// Set up a manager actor (keyed to the `ctx()` subject) that can
+    /// assign within its Branch, plus an active worker reporting to it.
+    /// Returns (agents, manager_id, worker_id).
+    #[cfg(test)]
+    fn assign_fixture() -> (agent::AgentStore, String, String) {
+        let agents = agent::AgentStore::in_memory().unwrap();
+        let mgr_subject = relix_core::types::NodeId::from_pubkey(b"x").to_string();
+        let mgr = agents
+            .create_agent(
+                "Mgr",
+                "planner",
+                "Lead",
+                "ops",
+                "ops",
+                "prime",
+                &mgr_subject,
+                "medium",
+                "default",
+            )
+            .unwrap();
+        agents
+            .update_agent_field(&mgr, "can_assign_work", "true")
+            .unwrap();
+        agents
+            .update_agent_field(&mgr, "assign_scope", "branch")
+            .unwrap();
+        let worker = agents
+            .create_agent(
+                "W", "engineer", "W", "eng", "eng", "mgr", "subj-w", "medium", "default",
+            )
+            .unwrap();
+        agents
+            .update_agent_field(&worker, "reports_to", &mgr)
+            .unwrap();
+        (agents, mgr, worker)
+    }
+
+    #[test]
+    fn brief_create_rejects_unauthorized_assignee() {
+        // An out-of-Branch (but real, active) assignee → denied.
+        let tasks = store();
+        let (agents, _mgr, _worker) = assign_fixture();
+        let outsider = agents
+            .create_agent(
+                "O", "engineer", "O", "eng", "eng", "x", "subj-o", "medium", "default",
+            )
+            .unwrap();
+        let out = handle_brief_create(
+            &tasks,
+            Some(&agents),
+            &ctx(format!("Build it|{outsider}").as_bytes()),
+        );
+        assert!(
+            matches!(out, HandlerOutcome::Err(e) if e.kind == error_kinds::POLICY_DENIED),
+            "brief.create must reject an out-of-scope assignee"
+        );
+    }
+
+    #[test]
+    fn brief_create_accepts_authorized_assignee() {
+        let tasks = store();
+        let (agents, _mgr, worker) = assign_fixture();
+        let out = handle_brief_create(
+            &tasks,
+            Some(&agents),
+            &ctx(format!("Build it|{worker}").as_bytes()),
+        );
+        let id = match out {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok: {} {}", e.kind, e.cause),
+        };
+        assert_eq!(
+            tasks
+                .brief_fields(id.trim())
+                .unwrap()
+                .unwrap()
+                .assignee_agent_id
+                .as_deref(),
+            Some(worker.as_str())
+        );
+    }
+
+    #[test]
+    fn brief_create_rejects_wrong_tenant_assignee() {
+        // A real, active agent that lives in another Guild must not be
+        // assignable from this Guild's caller.
+        let tasks = store();
+        let (agents, _mgr, _worker) = assign_fixture();
+        let other = agents
+            .create_agent(
+                "Other",
+                "engineer",
+                "O",
+                "eng",
+                "eng",
+                "x",
+                "subj-other",
+                "medium",
+                "tenant-b",
+            )
+            .unwrap();
+        // ctx() defaults to the `default` tenant.
+        let out = handle_brief_create(&tasks, Some(&agents), &ctx(format!("X|{other}").as_bytes()));
+        assert!(
+            matches!(out, HandlerOutcome::Err(e) if e.kind == error_kinds::POLICY_DENIED),
+            "a cross-tenant assignee must be rejected"
+        );
+    }
+
+    #[test]
+    fn brief_create_rejects_disabled_or_pending_assignee() {
+        let tasks = store();
+        let (agents, mgr, worker) = assign_fixture();
+        // Put the (in-Branch, allowed) worker into a non-active state.
+        agents.soft_delete_agent(&worker).unwrap(); // → disabled
+        let out = handle_brief_create(
+            &tasks,
+            Some(&agents),
+            &ctx(format!("X|{worker}").as_bytes()),
+        );
+        assert!(
+            matches!(out, HandlerOutcome::Err(e) if e.kind == error_kinds::POLICY_DENIED),
+            "a disabled assignee must be rejected"
+        );
+        // A pending hire is likewise not assignable.
+        let pending = agents
+            .request_hire(
+                "P", "engineer", "P", "eng", "eng", &mgr, "subj-p", "medium", "default",
+            )
+            .unwrap();
+        agents
+            .update_agent_field(&pending, "reports_to", &mgr)
+            .unwrap();
+        let out = handle_brief_create(
+            &tasks,
+            Some(&agents),
+            &ctx(format!("X|{pending}").as_bytes()),
+        );
+        assert!(
+            matches!(out, HandlerOutcome::Err(e) if e.kind == error_kinds::POLICY_DENIED),
+            "a pending assignee must be rejected"
+        );
+    }
+
+    #[test]
+    fn brief_move_into_execution_cannot_bypass_assignment_gate() {
+        // A Brief assigned (by the Founder) to an out-of-scope worker
+        // cannot be pushed into `in_progress` by an unauthorized agent.
+        let tasks = store();
+        let (agents, _mgr, _worker) = assign_fixture();
+        let outsider = agents
+            .create_agent(
+                "O", "engineer", "O", "eng", "eng", "x", "subj-o", "medium", "default",
+            )
+            .unwrap();
+        // Founder creates the Brief already assigned + in todo.
+        let brief = tasks
+            .create_brief(
+                "default",
+                "T",
+                "subj-founder",
+                Some(&outsider),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        // The non-operator manager (not managing `outsider`) tries to
+        // move it into execution → denied.
+        let out = handle_brief_move(
+            &tasks,
+            Some(&agents),
+            &ctx(format!("{brief}|in_progress").as_bytes()),
+        );
+        assert!(
+            matches!(out, HandlerOutcome::Err(e) if e.kind == error_kinds::POLICY_DENIED),
+            "brief.move into in_progress must run the assignment gate"
+        );
+    }
+
+    #[test]
+    fn brief_move_founder_path_is_allowed() {
+        // The Founder/Board (operator role) is sovereign — it may move
+        // any Brief into execution regardless of the assignee.
+        let tasks = store();
+        let (agents, _mgr, _worker) = assign_fixture();
+        let outsider = agents
+            .create_agent(
+                "O", "engineer", "O", "eng", "eng", "x", "subj-o", "medium", "default",
+            )
+            .unwrap();
+        let brief = tasks
+            .create_brief(
+                "default",
+                "T",
+                "subj-founder",
+                Some(&outsider),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let mut c = ctx(format!("{brief}|in_progress").as_bytes());
+        c.caller.role = "operator".into();
+        let out = handle_brief_move(&tasks, Some(&agents), &c);
+        assert!(
+            matches!(out, HandlerOutcome::Ok(_)),
+            "Founder move must pass"
+        );
+    }
+
+    #[test]
+    fn brief_move_self_progress_is_allowed() {
+        // An Operative progressing its OWN assigned Brief is not
+        // delegation — it passes even without an assign Key.
+        let tasks = store();
+        let agents = agent::AgentStore::in_memory().unwrap();
+        // The actor is keyed to the ctx() subject and has NO assign Key.
+        let me_subject = relix_core::types::NodeId::from_pubkey(b"x").to_string();
+        let me = agents
+            .create_agent(
+                "Me",
+                "engineer",
+                "W",
+                "eng",
+                "eng",
+                "prime",
+                &me_subject,
+                "medium",
+                "default",
+            )
+            .unwrap();
+        let brief = tasks
+            .create_brief("default", "T", "subj-founder", Some(&me), None, None, None)
+            .unwrap();
+        let out = handle_brief_move(
+            &tasks,
+            Some(&agents),
+            &ctx(format!("{brief}|in_progress").as_bytes()),
+        );
+        assert!(
+            matches!(out, HandlerOutcome::Ok(_)),
+            "an Operative must be able to progress its own Brief"
         );
     }
 

@@ -1168,17 +1168,27 @@ fn finalize_spawn(
     HandlerOutcome::Ok(body.into_bytes())
 }
 
-/// Enforce the **assign Key** (company-model §5.2B / §5.3) for an
-/// agent-originated Brief assignment to `assignee_id`. Returns:
+/// Enforce assignment governance (company-model §5.2B / §5.3) for an
+/// agent-originated Brief assignment to `assignee_id`. This is the
+/// single chokepoint used by `brief.create` (initial assignee),
+/// `brief.set` (assignee), and `brief.move` (into an execution state).
+/// Returns:
 ///
-/// - `Ok(())` — allowed, or bypassed (Founder/Board path, or the
-///   assignee value is empty i.e. the assignment is being *cleared*).
-/// - `Err(outcome)` — denied (no Key / wrong scope / no actor
-///   profile); the caller returns it verbatim.
+/// - `Ok(())` — allowed, or bypassed (Founder/Board path; the assignee
+///   value is empty i.e. the assignment is being *cleared*; or the
+///   assignee is the actor itself i.e. claiming/working its own work).
+/// - `Err(outcome)` — denied; the caller returns it verbatim.
 ///
-/// Branch membership is resolved from the live org tree
-/// (`AgentStore::manages`), so `assign_scope = branch` reflects the
-/// real Branch at decision time.
+/// Three layers, all tenant-scoped:
+/// 1. **Actor identity** — a non-operator caller must have an
+///    Operative profile in this Guild (else `SECURITY_DENIED`).
+/// 2. **Assignee validity** — the assignee must exist in THIS Guild
+///    and be `active`. This blocks cross-tenant / unknown ids and
+///    disabled/pending/suspended hires from receiving executable work
+///    (`POLICY_DENIED`).
+/// 3. **Assign Key** — the actor's `can_assign_work` + `assign_scope`
+///    must admit the assignee; Branch membership is resolved live from
+///    the org tree (tenant-scoped).
 pub(crate) fn enforce_assign_key(
     store: &AgentStore,
     ctx: &InvocationCtx,
@@ -1190,10 +1200,12 @@ pub(crate) fn enforce_assign_key(
         return Ok(());
     }
     if caller_is_operator(ctx) {
+        // Founder/Board is sovereign over assignment authority.
         return Ok(());
     }
+    let tenant = ctx.tenant_id_or_default();
     let subject = ctx.caller.subject_id.to_string();
-    let actor = match store.get_by_subject_for_tenant(&subject, ctx.tenant_id_or_default()) {
+    let actor = match store.get_by_subject_for_tenant(&subject, tenant) {
         Ok(Some(p)) => p,
         Ok(None) => {
             return Err(security_denied(format!(
@@ -1202,8 +1214,28 @@ pub(crate) fn enforce_assign_key(
         }
         Err(e) => return Err(internal(format!("assign key lookup: {e}"))),
     };
+    // Claiming / progressing your own work is not delegation.
+    if assignee == actor.agent_id {
+        return Ok(());
+    }
+    // Assignee validity: must exist in this Guild and be active.
+    let target = match store.get_agent_for_tenant(assignee, tenant) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Err(policy_denied(format!(
+                "assign denied: `{assignee}` is not an Operative in this Guild"
+            )));
+        }
+        Err(e) => return Err(internal(format!("assignee lookup: {e}"))),
+    };
+    if target.status != "active" {
+        return Err(policy_denied(format!(
+            "assign denied: `{assignee}` is {} (not active) — cannot receive executable work",
+            target.status
+        )));
+    }
     let in_branch = store
-        .manages_for_tenant(&actor.agent_id, assignee, ctx.tenant_id_or_default())
+        .manages_for_tenant(&actor.agent_id, assignee, tenant)
         .unwrap_or(false);
     match assign_verdict(
         actor.can_assign_work,
