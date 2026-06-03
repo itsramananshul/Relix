@@ -578,6 +578,33 @@ impl TaskStore {
         self.list_brief_edges(parent, "spawned")
     }
 
+    /// PHASE 1 (Brief): detach a **Sub-brief** — remove the `parent`
+    /// → `child` 'spawned' edge (a mis-decomposed plan). Chronicles
+    /// `brief.subbrief_removed` when an edge is removed. Idempotent;
+    /// `parent` must exist. The child Brief itself is untouched.
+    pub fn unlink_subbrief(&self, parent: &str, child: &str) -> Result<(), CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, parent)? {
+            return Err(CoordinatorError::NotFound(parent.to_string()));
+        }
+        let removed = conn
+            .execute(
+                "DELETE FROM task_edges
+                 WHERE task_id = ?1 AND edge_type = 'spawned' AND related_task_id = ?2",
+                params![parent, child],
+            )
+            .map_err(CoordinatorError::Db)?;
+        if removed > 0 {
+            let now = unix_secs();
+            let _ = conn.execute(
+                "INSERT INTO task_events (task_id, ts, event_type, payload)
+                 VALUES (?1, ?2, 'brief.subbrief_removed', ?3)",
+                params![parent, now, child],
+            );
+        }
+        Ok(())
+    }
+
     /// PHASE 1 (Brief): record that `task` is blocked by `blocker`
     /// — a **Snag** (a `task_edges` 'blocked_on' edge). Both must
     /// exist; no self-block; idempotent.
@@ -5305,6 +5332,19 @@ pub fn register(
     {
         let s = store.clone();
         bridge.register(
+            "brief.unsubbrief",
+            Arc::new(FnHandler({
+                let s = s.clone();
+                move |ctx: InvocationCtx| {
+                    let s = s.clone();
+                    async move { handle_brief_unsubbrief(&s, &ctx) }
+                }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
             "brief.subbrief",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -6327,6 +6367,19 @@ fn handle_brief_subbrief(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutco
     match store.link_subbrief(parent, child) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.subbrief", e),
+    }
+}
+
+/// `brief.unsubbrief` — detach a Sub-brief from `parent` (a
+/// mis-decomposed plan). Arg `parent|child`. Idempotent.
+fn handle_brief_unsubbrief(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let (parent, child) = match parse_pair(ctx, "brief.unsubbrief") {
+        Ok(p) => p,
+        Err(o) => return o,
+    };
+    match store.unlink_subbrief(parent, child) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.unsubbrief", e),
     }
 }
 
@@ -9586,6 +9639,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload, "todo -> in_progress");
+    }
+
+    #[test]
+    fn unlink_subbrief_detaches_and_chronicles() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        let parent = mk("parent");
+        let child = mk("child");
+        s.link_subbrief(&parent, &child).unwrap();
+        assert_eq!(s.list_subbriefs(&parent).unwrap(), vec![child.clone()]);
+
+        s.unlink_subbrief(&parent, &child).unwrap();
+        assert!(s.list_subbriefs(&parent).unwrap().is_empty());
+        // The child Brief itself still exists (only the edge went).
+        assert!(s.brief_fields(&child).unwrap().is_some());
+        // Idempotent; unknown parent → NotFound.
+        s.unlink_subbrief(&parent, &child).unwrap();
+        assert!(matches!(
+            s.unlink_subbrief("nope", &child),
+            Err(CoordinatorError::NotFound(_))
+        ));
+
+        let conn = s.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_events
+                 WHERE task_id = ?1 AND event_type = 'brief.subbrief_removed'",
+                params![parent],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]
