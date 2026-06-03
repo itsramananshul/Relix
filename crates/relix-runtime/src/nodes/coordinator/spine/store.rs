@@ -245,9 +245,18 @@ impl SpineStore {
     /// `proposed` and stores the plan `doc`. The enforced gate: a
     /// CEO can't build a team for the Mandate until the strategy is
     /// `approved`.
-    pub fn propose_strategy(&self, mandate_id: &str, doc: &str) -> Result<(), SpineStoreError> {
+    /// Propose a strategy for a Mandate. Tenant-guarded: the Mandate
+    /// must belong to `tenant` (a Guild can't touch another's).
+    pub fn propose_strategy(
+        &self,
+        tenant: &str,
+        mandate_id: &str,
+        doc: &str,
+    ) -> Result<(), SpineStoreError> {
         let now = unix_now();
+        let tenant = normalize_tenant(tenant);
         let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        require_mandate_in_tenant(&conn, mandate_id, tenant)?;
         conn.execute(
             "INSERT INTO mandate_strategy (mandate_id, status, doc, updated_at)
              VALUES (?1, 'proposed', ?2, ?3)
@@ -258,19 +267,26 @@ impl SpineStore {
         Ok(())
     }
 
-    /// Approve a proposed strategy (proposed → approved).
-    pub fn approve_strategy(&self, mandate_id: &str) -> Result<(), SpineStoreError> {
-        self.decide_strategy(mandate_id, "approved")
+    /// Approve a proposed strategy (proposed → approved). Tenant-guarded.
+    pub fn approve_strategy(&self, tenant: &str, mandate_id: &str) -> Result<(), SpineStoreError> {
+        self.decide_strategy(tenant, mandate_id, "approved")
     }
 
-    /// Reject a proposed strategy (proposed → rejected).
-    pub fn reject_strategy(&self, mandate_id: &str) -> Result<(), SpineStoreError> {
-        self.decide_strategy(mandate_id, "rejected")
+    /// Reject a proposed strategy (proposed → rejected). Tenant-guarded.
+    pub fn reject_strategy(&self, tenant: &str, mandate_id: &str) -> Result<(), SpineStoreError> {
+        self.decide_strategy(tenant, mandate_id, "rejected")
     }
 
-    fn decide_strategy(&self, mandate_id: &str, to: &str) -> Result<(), SpineStoreError> {
+    fn decide_strategy(
+        &self,
+        tenant: &str,
+        mandate_id: &str,
+        to: &str,
+    ) -> Result<(), SpineStoreError> {
         let now = unix_now();
+        let tenant = normalize_tenant(tenant);
         let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        require_mandate_in_tenant(&conn, mandate_id, tenant)?;
         let changed = conn.execute(
             "UPDATE mandate_strategy SET status=?1, updated_at=?2
              WHERE mandate_id=?3 AND status='proposed'",
@@ -285,9 +301,15 @@ impl SpineStore {
     }
 
     /// The Mandate's strategy status (`proposed`/`approved`/`rejected`),
-    /// or `None` if none was proposed.
-    pub fn strategy_status(&self, mandate_id: &str) -> Result<Option<String>, SpineStoreError> {
+    /// or `None` if none was proposed. Tenant-guarded.
+    pub fn strategy_status(
+        &self,
+        tenant: &str,
+        mandate_id: &str,
+    ) -> Result<Option<String>, SpineStoreError> {
+        let tenant = normalize_tenant(tenant);
         let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        require_mandate_in_tenant(&conn, mandate_id, tenant)?;
         let row = conn
             .query_row(
                 "SELECT status FROM mandate_strategy WHERE mandate_id = ?1",
@@ -298,10 +320,14 @@ impl SpineStore {
         Ok(row)
     }
 
-    /// Is the Mandate's strategy approved? The gate a CEO flow checks
-    /// before spawning a team.
-    pub fn strategy_approved(&self, mandate_id: &str) -> Result<bool, SpineStoreError> {
-        Ok(self.strategy_status(mandate_id)?.as_deref() == Some("approved"))
+    /// Is the Mandate's strategy approved? The gate the CEO/hire flow
+    /// checks before spawning a team. Tenant-guarded.
+    pub fn strategy_approved(
+        &self,
+        tenant: &str,
+        mandate_id: &str,
+    ) -> Result<bool, SpineStoreError> {
+        Ok(self.strategy_status(tenant, mandate_id)?.as_deref() == Some("approved"))
     }
 
     // ── mandates ─────────────────────────────────────────────
@@ -1166,26 +1192,55 @@ mod tests {
         let s = store();
         let m = s.create_mandate("t", "Ship v1", "", None, None).unwrap();
         // No strategy → not approved.
-        assert_eq!(s.strategy_status(&m).unwrap(), None);
-        assert!(!s.strategy_approved(&m).unwrap());
+        assert_eq!(s.strategy_status("t", &m).unwrap(), None);
+        assert!(!s.strategy_approved("t", &m).unwrap());
 
         // Propose → proposed, still not approved.
-        s.propose_strategy(&m, "1. hire 2. build").unwrap();
-        assert_eq!(s.strategy_status(&m).unwrap().as_deref(), Some("proposed"));
-        assert!(!s.strategy_approved(&m).unwrap());
+        s.propose_strategy("t", &m, "1. hire 2. build").unwrap();
+        assert_eq!(s.strategy_status("t", &m).unwrap().as_deref(), Some("proposed"));
+        assert!(!s.strategy_approved("t", &m).unwrap());
 
         // Approve → the gate opens.
-        s.approve_strategy(&m).unwrap();
-        assert!(s.strategy_approved(&m).unwrap());
+        s.approve_strategy("t", &m).unwrap();
+        assert!(s.strategy_approved("t", &m).unwrap());
         // Can't approve again (no longer proposed).
-        assert!(s.approve_strategy(&m).is_err());
+        assert!(s.approve_strategy("t", &m).is_err());
 
         // Reject path.
         let m2 = s.create_mandate("t", "Other", "", None, None).unwrap();
-        s.propose_strategy(&m2, "plan").unwrap();
-        s.reject_strategy(&m2).unwrap();
-        assert_eq!(s.strategy_status(&m2).unwrap().as_deref(), Some("rejected"));
-        assert!(!s.strategy_approved(&m2).unwrap());
+        s.propose_strategy("t", &m2, "plan").unwrap();
+        s.reject_strategy("t", &m2).unwrap();
+        assert_eq!(s.strategy_status("t", &m2).unwrap().as_deref(), Some("rejected"));
+        assert!(!s.strategy_approved("t", &m2).unwrap());
+    }
+
+    #[test]
+    fn strategy_actions_are_tenant_guarded() {
+        let s = store();
+        let m = s.create_mandate("acme", "Ship v1", "", None, None).unwrap();
+        // Another Guild cannot propose / approve / reject / read the
+        // strategy of acme's Mandate.
+        assert!(matches!(
+            s.propose_strategy("other", &m, "steal"),
+            Err(SpineStoreError::BadInput(_))
+        ));
+        // acme proposes legitimately.
+        s.propose_strategy("acme", &m, "plan").unwrap();
+        assert!(matches!(
+            s.approve_strategy("other", &m),
+            Err(SpineStoreError::BadInput(_))
+        ));
+        assert!(matches!(
+            s.reject_strategy("other", &m),
+            Err(SpineStoreError::BadInput(_))
+        ));
+        assert!(matches!(
+            s.strategy_status("other", &m),
+            Err(SpineStoreError::BadInput(_))
+        ));
+        // Still only acme can act.
+        s.approve_strategy("acme", &m).unwrap();
+        assert!(s.strategy_approved("acme", &m).unwrap());
     }
 
     #[test]

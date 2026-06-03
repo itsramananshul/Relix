@@ -84,48 +84,52 @@ fn handle_mandate_propose_strategy(store: &SpineStore, ctx: &InvocationCtx) -> H
         return invalid("mandate.propose_strategy: expected `mandate_id|doc`".to_string());
     }
     let doc = parts.get(1).copied().unwrap_or("");
-    match store.propose_strategy(parts[0].trim(), doc) {
+    match store.propose_strategy(ctx.tenant_id_or_default(), parts[0].trim(), doc) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(SpineStoreError::BadInput(m)) => invalid(format!("mandate.propose_strategy: {m}")),
         Err(e) => internal(format!("mandate.propose_strategy: {e}")),
     }
 }
 
-/// `mandate.approve_strategy` — approve. Arg `mandate_id`.
+/// `mandate.approve_strategy` — approve. Arg `mandate_id`. Tenant-guarded.
 fn handle_mandate_approve_strategy(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let id = match one_id(ctx, "mandate.approve_strategy") {
         Ok(i) => i,
         Err(o) => return o,
     };
-    match store.approve_strategy(id) {
+    match store.approve_strategy(ctx.tenant_id_or_default(), id) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(SpineStoreError::NotFound(m)) => invalid(format!("mandate.approve_strategy: {m}")),
+        Err(SpineStoreError::BadInput(m)) => invalid(format!("mandate.approve_strategy: {m}")),
         Err(e) => internal(format!("mandate.approve_strategy: {e}")),
     }
 }
 
-/// `mandate.reject_strategy` — reject. Arg `mandate_id`.
+/// `mandate.reject_strategy` — reject. Arg `mandate_id`. Tenant-guarded.
 fn handle_mandate_reject_strategy(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let id = match one_id(ctx, "mandate.reject_strategy") {
         Ok(i) => i,
         Err(o) => return o,
     };
-    match store.reject_strategy(id) {
+    match store.reject_strategy(ctx.tenant_id_or_default(), id) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(SpineStoreError::NotFound(m)) => invalid(format!("mandate.reject_strategy: {m}")),
+        Err(SpineStoreError::BadInput(m)) => invalid(format!("mandate.reject_strategy: {m}")),
         Err(e) => internal(format!("mandate.reject_strategy: {e}")),
     }
 }
 
 /// `mandate.strategy` — the strategy status word, or empty if none.
-/// Arg `mandate_id`.
+/// Arg `mandate_id`. Tenant-guarded.
 fn handle_mandate_strategy(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let id = match one_id(ctx, "mandate.strategy") {
         Ok(i) => i,
         Err(o) => return o,
     };
-    match store.strategy_status(id) {
+    match store.strategy_status(ctx.tenant_id_or_default(), id) {
         Ok(Some(s)) => HandlerOutcome::Ok(s.into_bytes()),
         Ok(None) => HandlerOutcome::Ok(Vec::new()),
+        Err(SpineStoreError::BadInput(m)) => invalid(format!("mandate.strategy: {m}")),
         Err(e) => internal(format!("mandate.strategy: {e}")),
     }
 }
