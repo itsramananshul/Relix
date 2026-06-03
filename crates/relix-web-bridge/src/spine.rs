@@ -130,6 +130,25 @@ pub async fn mandate_search(
     json_passthrough(call_peer(&state, "mandate.search", arg.as_bytes()).await?)
 }
 
+/// `GET /v1/spine/mandates/:id/tree` — a Mandate with its direct
+/// sub-Mandates and Campaigns.
+pub async fn mandate_tree(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "mandate.tree", id.as_bytes()).await?)
+}
+
+/// `GET /v1/spine/mandates/:id/briefs` — the Briefs under a Mandate.
+pub async fn mandate_briefs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ListQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let arg = format!("{}|{}", id, q.limit.unwrap_or(100));
+    json_passthrough(call_peer(&state, "mandate.briefs", arg.as_bytes()).await?)
+}
+
 /// `GET /v1/spine/briefs/:id` — the full Brief detail view.
 pub async fn brief_detail(
     State(state): State<AppState>,
@@ -510,6 +529,7 @@ mod tests {
         assert!(SPINE_HTML.contains("/v1/spine/board"));
         assert!(SPINE_HTML.contains("/v1/spine/briefs"));
         assert!(SPINE_HTML.contains("/v1/spine/guild"));
+        assert!(SPINE_HTML.contains("/v1/spine/mandates"));
     }
 
     /// Build the full spine route table in isolation: matchit panics
@@ -530,6 +550,8 @@ mod tests {
                 get(mandates).post(create_mandate),
             )
             .route("/v1/spine/mandates/search", get(mandate_search))
+            .route("/v1/spine/mandates/:id/tree", get(mandate_tree))
+            .route("/v1/spine/mandates/:id/briefs", get(mandate_briefs))
             .route("/v1/spine/briefs/search", get(brief_search))
             .route("/v1/spine/briefs/:id", get(brief_detail))
             .route("/v1/spine/desk/:agent", get(desk))

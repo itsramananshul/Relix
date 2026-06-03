@@ -498,6 +498,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(spine::mandates).post(spine::create_mandate),
         )
         .route("/v1/spine/mandates/search", get(spine::mandate_search))
+        .route("/v1/spine/mandates/:id/tree", get(spine::mandate_tree))
+        .route("/v1/spine/mandates/:id/briefs", get(spine::mandate_briefs))
         .route("/v1/spine/briefs/search", get(spine::brief_search))
         .route("/v1/spine/briefs/:id", get(spine::brief_detail))
         .route("/v1/spine/desk/:agent", get(spine::desk))

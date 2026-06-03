@@ -10,6 +10,13 @@
   body { margin:0; font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:var(--fg); background:var(--bg); }
   header { display:flex; align-items:baseline; gap:18px; padding:16px 22px; border-bottom:1px solid var(--line); }
   header h1 { font-size:16px; font-weight:600; letter-spacing:.02em; margin:0; }
+  nav { display:flex; gap:4px; }
+  .tab { background:none; color:var(--mut); border:none; padding:5px 10px; border-radius:6px; }
+  .tab.on { color:var(--fg); background:var(--chip); font-weight:600; }
+  .mandate { border:1px solid var(--line); border-radius:8px; padding:12px 14px; margin-bottom:10px; }
+  .mandate h4 { margin:0 0 2px; font-size:14px; }
+  .mandate .sub { margin-top:8px; padding-left:14px; border-left:2px solid var(--line); }
+  .mandate .camp { font-size:12px; color:var(--mut); margin:3px 0; }
   .counts { display:flex; gap:14px; color:var(--mut); font-size:12px; }
   .counts b { color:var(--fg); font-weight:600; }
   main { padding:18px 22px; }
@@ -45,16 +52,29 @@
 <body>
 <header>
   <h1>RELIX · Spine</h1>
+  <nav id="nav">
+    <button class="tab on" data-view="board">Board</button>
+    <button class="tab" data-view="mandates">Mandates</button>
+  </nav>
   <div class="counts" id="counts"><span class="muted">loading…</span></div>
 </header>
 <main>
-  <div class="toolbar">
-    <button id="newBrief">+ Brief</button>
-    <button class="ghost" id="refresh">Refresh</button>
-    <input id="search" placeholder="Search briefs…" />
-    <button class="ghost" id="overdueBtn">Overdue</button>
-  </div>
-  <div class="board" id="board"></div>
+  <section id="boardView">
+    <div class="toolbar">
+      <button id="newBrief">+ Brief</button>
+      <button class="ghost" id="refresh">Refresh</button>
+      <input id="search" placeholder="Search briefs…" />
+      <button class="ghost" id="overdueBtn">Overdue</button>
+    </div>
+    <div class="board" id="board"></div>
+  </section>
+  <section id="mandatesView" hidden>
+    <div class="toolbar">
+      <button id="newMandate">+ Mandate</button>
+      <button class="ghost" id="refreshMandates">Refresh</button>
+    </div>
+    <div id="mandates"></div>
+  </section>
 </main>
 
 <aside id="panel"><button class="close" id="panelClose">×</button><div id="panelBody"></div></aside>
@@ -183,6 +203,49 @@ async function showList(title, rows) {
   if(!rows||!rows.length){ body.append(el("div",{className:"muted",textContent:"none"})); return; }
   for(const b of rows){ const c=card(b); body.append(c); }
 }
+
+async function loadMandates() {
+  const host = $("#mandates"); host.innerHTML = '<div class="muted">loading…</div>';
+  try {
+    const list = await api("/v1/spine/mandates") || [];
+    host.innerHTML = "";
+    if (!list.length) { host.append(el("div",{className:"muted",textContent:"No mandates yet."})); return; }
+    for (const m of list) {
+      const box = el("div",{className:"mandate"});
+      box.append(el("h4",{textContent:m.title}));
+      box.append(el("div",{className:"muted",textContent:m.status+" · "+m.mandate_id}));
+      const sub = el("div",{className:"sub"});
+      box.append(sub);
+      box.append(el("button",{className:"ghost",textContent:"Expand",style:"margin-top:8px;font-size:12px;padding:4px 9px", onclick:async(ev)=>{
+        ev.target.disabled = true;
+        try {
+          const tree = await api("/v1/spine/mandates/"+m.mandate_id+"/tree");
+          sub.innerHTML = "";
+          for (const c of (tree.campaigns||[])) sub.append(el("div",{className:"camp",textContent:"▸ "+c.title+" ("+c.status+")"}));
+          for (const cm of (tree.child_mandates||[])) sub.append(el("div",{className:"camp",textContent:"↳ "+cm.title}));
+          if (!(tree.campaigns||[]).length && !(tree.child_mandates||[]).length) sub.append(el("div",{className:"muted",textContent:"no campaigns / sub-mandates"}));
+        } catch(e){ sub.append(el("div",{className:"err",textContent:e.message})); }
+      }}));
+      host.append(box);
+    }
+  } catch(e){ host.innerHTML = '<div class="err">'+e.message+'</div>'; }
+}
+
+function switchView(name) {
+  for (const t of document.querySelectorAll(".tab")) t.classList.toggle("on", t.dataset.view===name);
+  $("#boardView").hidden = name!=="board";
+  $("#mandatesView").hidden = name!=="mandates";
+  if (name==="mandates") loadMandates();
+}
+for (const t of document.querySelectorAll(".tab")) t.onclick = ()=>switchView(t.dataset.view);
+
+$("#refreshMandates").onclick = loadMandates;
+$("#newMandate").onclick = async ()=>{
+  const title = prompt("Mandate title");
+  if (!title || !title.trim()) return;
+  try { await api("/v1/spine/mandates",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({title})}); loadCounts(); loadMandates(); }
+  catch(e){ alert(e.message); }
+};
 
 $("#refresh").onclick = ()=>{ loadCounts(); loadBoard(); };
 $("#panelClose").onclick = ()=>$("#panel").classList.remove("open");
