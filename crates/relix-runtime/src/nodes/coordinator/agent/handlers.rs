@@ -81,9 +81,10 @@ pub fn handle_request_hire(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOu
     }
     // Spawn-Key gate (company-model §5.2A): an agent actor needs
     // `can_spawn_agents`. The Founder/Board bypasses; a denied actor
-    // never mints a hire. A `Clearance` note is surfaced on success.
-    let clearance = match enforce_spawn_key(store, ctx) {
-        Ok(c) => c,
+    // never mints a hire. On lead/founder route a typed spawn
+    // Clearance is created that must be greenlit to activate the hire.
+    let gate = match enforce_spawn_key(store, ctx) {
+        Ok(g) => g,
         Err(out) => return out,
     };
     match store.request_hire(
@@ -97,13 +98,8 @@ pub fn handle_request_hire(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOu
         parts[7],
         ctx.tenant_id_or_default(),
     ) {
-        Ok(id) => {
-            let mut body = format!("{id}\n");
-            if let Some(reason) = clearance {
-                body.push_str(&format!("clearance: {reason}\n"));
-            }
-            HandlerOutcome::Ok(body.into_bytes())
-        }
+        // parts[6] is the hire's subject_id.
+        Ok(id) => finalize_spawn(store, ctx, &id, parts[6], gate),
         Err(AgentStoreError::BadInput(m)) => invalid(m),
         Err(e) => internal(format!("agent.request_hire: {e}")),
     }
@@ -154,9 +150,11 @@ pub fn handle_request_hire_for_mandate(
         Err(e) => return internal(format!("agent.request_hire_for_mandate: {e}")),
     }
     // Strategy is approved; now the actor still needs the spawn Key
-    // (company-model §5.2A) — the two gates are independent.
-    let clearance = match enforce_spawn_key(agent_store, ctx) {
-        Ok(c) => c,
+    // (company-model §5.2A) — the two gates are independent. The
+    // strategy gate above always runs first, so a spawn Clearance is
+    // only ever minted for a strategy-approved Mandate.
+    let gate = match enforce_spawn_key(agent_store, ctx) {
+        Ok(g) => g,
         Err(out) => return out,
     };
     match agent_store.request_hire(
@@ -170,13 +168,8 @@ pub fn handle_request_hire_for_mandate(
         parts[8],
         ctx.tenant_id_or_default(),
     ) {
-        Ok(id) => {
-            let mut body = format!("{id}\n");
-            if let Some(reason) = clearance {
-                body.push_str(&format!("clearance: {reason}\n"));
-            }
-            HandlerOutcome::Ok(body.into_bytes())
-        }
+        // parts[7] is the hire's subject_id (mandate_id is parts[0]).
+        Ok(id) => finalize_spawn(agent_store, ctx, &id, parts[7], gate),
         Err(AgentStoreError::BadInput(m)) => invalid(m),
         Err(e) => internal(format!("agent.request_hire_for_mandate: {e}")),
     }
@@ -887,24 +880,36 @@ fn security_denied(cause: String) -> HandlerOutcome {
     })
 }
 
+/// Outcome of the spawn-Key gate (company-model §5.2A).
+pub(crate) enum SpawnGate {
+    /// Founder/Board path, or an actor with `spawn_route=direct`: mint
+    /// the pending-inert hire with no Clearance.
+    Proceed,
+    /// `spawn_route=lead|founder`: mint the pending-inert hire AND a
+    /// typed spawn Clearance that must be greenlit to activate it.
+    /// `approver_subjects` is the Lead's subject (route=lead) so that
+    /// Lead may also decide; empty (route=founder) → operator/admin.
+    Clearance {
+        reason: String,
+        approver_subjects: Vec<String>,
+    },
+}
+
 /// Enforce the **spawn Key** (company-model §5.2A) for a hire that an
-/// Operative actor originates. Returns:
-///
-/// - `Ok(None)` — Founder/Board path, or the actor may spawn directly:
-///   the caller proceeds to mint a pending-inert hire with no note.
-/// - `Ok(Some(reason))` — permitted but routed up (Clearance): the
-///   caller still mints a pending-inert hire and surfaces `reason`.
-/// - `Err(outcome)` — denied (no Key, or the caller has no Operative
-///   profile in this Guild); the handler returns it verbatim.
+/// Operative actor originates. The Founder/Board bypasses; a denied
+/// actor's outcome is returned verbatim. On `lead`/`founder` route the
+/// caller must, after minting the pending hire, create the typed spawn
+/// Clearance — see [`AgentStore::create_spawn_clearance`].
 pub(crate) fn enforce_spawn_key(
     store: &AgentStore,
     ctx: &InvocationCtx,
-) -> Result<Option<String>, HandlerOutcome> {
+) -> Result<SpawnGate, HandlerOutcome> {
     if caller_is_operator(ctx) {
-        return Ok(None);
+        return Ok(SpawnGate::Proceed);
     }
+    let tenant = ctx.tenant_id_or_default();
     let subject = ctx.caller.subject_id.to_string();
-    let actor = match store.get_by_subject_for_tenant(&subject, ctx.tenant_id_or_default()) {
+    let actor = match store.get_by_subject_for_tenant(&subject, tenant) {
         Ok(Some(p)) => p,
         Ok(None) => {
             return Err(security_denied(format!(
@@ -914,10 +919,58 @@ pub(crate) fn enforce_spawn_key(
         Err(e) => return Err(internal(format!("spawn key lookup: {e}"))),
     };
     match spawn_verdict(actor.can_spawn_agents, &actor.spawn_route) {
-        KeyVerdict::Allow => Ok(None),
-        KeyVerdict::Clearance { reason } => Ok(Some(reason)),
+        KeyVerdict::Allow => Ok(SpawnGate::Proceed),
+        KeyVerdict::Clearance { reason } => {
+            // route=lead → the actor's Lead may decide (add its subject
+            // to the approver allowlist); route=founder → leave empty so
+            // only operator/admin decides. operator/admin is always
+            // allowed regardless, so this only *widens* to the Lead.
+            let mut approver_subjects = Vec::new();
+            if super::keys::normalize_spawn_route(&actor.spawn_route) == "lead"
+                && let Some(lead_id) = actor.reports_to.as_deref()
+                && let Ok(Some(lead)) = store.get_agent_for_tenant(lead_id, tenant)
+            {
+                approver_subjects.push(lead.subject_id);
+            }
+            Ok(SpawnGate::Clearance {
+                reason,
+                approver_subjects,
+            })
+        }
         KeyVerdict::Deny { reason } => Err(policy_denied(format!("spawn denied: {reason}"))),
     }
+}
+
+/// After a pending hire is minted, finalise the spawn-Key outcome:
+/// `Proceed` returns just the id; `Clearance` mints the **typed spawn
+/// Clearance** linked to the pending hire (so approving it activates
+/// the hire — see [`handle_approval_decide`]) and appends a
+/// `clearance:` line carrying the new `clearance_id`.
+fn finalize_spawn(
+    store: &AgentStore,
+    ctx: &InvocationCtx,
+    hire_id: &str,
+    hire_subject: &str,
+    gate: SpawnGate,
+) -> HandlerOutcome {
+    let mut body = format!("{hire_id}\n");
+    if let SpawnGate::Clearance {
+        reason,
+        approver_subjects,
+    } = gate
+    {
+        match store.create_spawn_clearance(
+            hire_id,
+            hire_subject,
+            &reason,
+            &approver_subjects,
+            ctx.tenant_id_or_default(),
+        ) {
+            Ok(cid) => body.push_str(&format!("clearance: {reason} (clearance_id={cid})\n")),
+            Err(e) => return internal(format!("agent.request_hire spawn clearance: {e}")),
+        }
+    }
+    HandlerOutcome::Ok(body.into_bytes())
 }
 
 /// Enforce the **assign Key** (company-model §5.2B / §5.3) for an
@@ -1168,6 +1221,27 @@ pub fn handle_approval_decide(
         };
         if let Err(e) = r {
             tracing::warn!(task_id = %tid, error = %e, "coord.approval.decide: task hop failed");
+        }
+    }
+    // Spawn-Clearance hop (company-model §5.2A): when this approval is
+    // the typed spawn Clearance for a pending hire, approving it
+    // *activates* the hire (pending → active) and rejecting it disables
+    // it. The hire stays inert until this fires. `record.agent_id` is
+    // the pending hire; the row already passed the tenant + approver
+    // checks above, so acting by agent_id is safe.
+    if record.method == crate::nodes::coordinator::agent::store::SPAWN_CLEARANCE_METHOD {
+        let hire_id = record.agent_id.as_str();
+        let r = match decision {
+            ApprovalStatus::Approved => store.approve_hire(hire_id),
+            ApprovalStatus::Rejected => store.reject_hire(hire_id),
+            _ => Ok(()),
+        };
+        if let Err(e) = r {
+            tracing::warn!(
+                agent_id = %hire_id,
+                error = %e,
+                "coord.approval.decide: spawn-clearance hire hop failed (already decided?)"
+            );
         }
     }
     // P1: mint the Ed25519-signed token when the approval was
@@ -1548,6 +1622,65 @@ mod tests {
         assert_eq!(hire.name, "Planner");
     }
 
+    #[test]
+    fn mandate_founder_route_mints_spawn_clearance_only_after_strategy_approval() {
+        use crate::nodes::coordinator::agent::store::SPAWN_CLEARANCE_METHOD;
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let mandate = spine
+            .create_mandate("default", "Ship v1", "real product", None, None)
+            .unwrap();
+        // An agent actor with can_spawn + founder route.
+        let actor = agents
+            .create_agent(
+                "Prime",
+                "prime",
+                "Lead",
+                "ops",
+                "ops",
+                "founder",
+                &subject_of(b"planner-seed"),
+                "medium",
+                "default",
+            )
+            .unwrap();
+        agents
+            .update_agent_field(&actor, "can_spawn_agents", "true")
+            .unwrap();
+        let arg = format!("{mandate}|Worker|engineer|W|eng|eng|prime|subj-w|medium");
+        // Strategy NOT approved → refused, no hire, no Clearance.
+        let out = handle_request_hire_for_mandate(
+            &agents,
+            &spine,
+            &fake_ctx_with_role(arg.as_bytes(), "prime", b"planner-seed"),
+        );
+        assert_eq!(err_kind(out), error_kinds::POLICY_DENIED);
+        assert!(agents.list_pending_approvals(100).unwrap().is_empty());
+        // Approve strategy → now the hire + spawn Clearance are minted.
+        spine
+            .propose_strategy("default", &mandate, "hire a worker")
+            .unwrap();
+        spine.approve_strategy("default", &mandate).unwrap();
+        let body = ok_body(handle_request_hire_for_mandate(
+            &agents,
+            &spine,
+            &fake_ctx_with_role(arg.as_bytes(), "prime", b"planner-seed"),
+        ));
+        let hire_id = body.lines().next().unwrap().trim();
+        assert_eq!(
+            agents.get_agent(hire_id).unwrap().unwrap().status,
+            "pending"
+        );
+        assert!(
+            agents
+                .list_pending_approvals(100)
+                .unwrap()
+                .iter()
+                .any(|r| r.method == SPAWN_CLEARANCE_METHOD && r.agent_id == hire_id),
+            "strategy-approved founder-route mandate hire must mint a spawn Clearance"
+        );
+    }
+
     // ── Spawn-Key enforcement (company-model §5.2A) ──────────
 
     /// The hex subject_id a `fake_ctx_with_role(_, _, seed)` actor
@@ -1635,6 +1768,179 @@ mod tests {
         assert!(
             body.contains("clearance:"),
             "founder route must surface a clearance note: {body}"
+        );
+    }
+
+    // ── Route-differentiated spawn Clearance (company-model §5.2A) ──
+
+    /// Build a `can_spawn_agents` actor with the given route, keyed to
+    /// the `planner-seed` ctx, and return its agent_id.
+    fn spawn_actor(s: &AgentStore, route: &str) -> String {
+        let actor = s
+            .create_agent(
+                "Planner",
+                "planner",
+                "Lead",
+                "ops",
+                "ops",
+                "prime",
+                &subject_of(b"planner-seed"),
+                "medium",
+                "default",
+            )
+            .unwrap();
+        s.update_agent_field(&actor, "can_spawn_agents", "true")
+            .unwrap();
+        s.update_agent_field(&actor, "spawn_route", route).unwrap();
+        actor
+    }
+
+    /// Find the pending spawn Clearance minted for `hire_id`, if any.
+    fn spawn_clearance_for(s: &AgentStore, hire_id: &str) -> Option<String> {
+        use crate::nodes::coordinator::agent::store::SPAWN_CLEARANCE_METHOD;
+        s.list_pending_approvals(100)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method == SPAWN_CLEARANCE_METHOD && r.agent_id == hire_id)
+            .map(|r| r.approval_id)
+    }
+
+    fn decide(s: &AgentStore, approval_id: &str, decision: &str) -> HandlerOutcome {
+        let resume: TaskResumeFn = Arc::new(|_| Ok(()));
+        let fail: TaskResumeFn = Arc::new(|_| Ok(()));
+        let arg = format!("{approval_id}|{decision}|operator|ok");
+        handle_approval_decide(
+            s,
+            &fake_ctx(arg.as_bytes()),
+            &resume,
+            &fail,
+            None,
+            APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+            &relix_core::clock::SystemClock,
+        )
+    }
+
+    #[test]
+    fn spawn_route_founder_creates_pending_hire_and_pending_clearance() {
+        let s = store();
+        spawn_actor(&s, "founder");
+        let body = ok_body(handle_request_hire(
+            &s,
+            &fake_ctx_with_role(
+                b"Worker|engineer|Worker|eng|eng|planner|subj-worker|medium",
+                "planner",
+                b"planner-seed",
+            ),
+        ));
+        let hire_id = body.lines().next().unwrap().trim();
+        // The hire is pending-inert ...
+        assert_eq!(s.get_agent(hire_id).unwrap().unwrap().status, "pending");
+        // ... and a real typed spawn Clearance exists for it.
+        assert!(
+            spawn_clearance_for(&s, hire_id).is_some(),
+            "founder route must mint a typed spawn Clearance: {body}"
+        );
+    }
+
+    #[test]
+    fn approving_spawn_clearance_activates_the_hire() {
+        let s = store();
+        spawn_actor(&s, "founder");
+        let body = ok_body(handle_request_hire(
+            &s,
+            &fake_ctx_with_role(
+                b"Worker|engineer|Worker|eng|eng|planner|subj-worker|medium",
+                "planner",
+                b"planner-seed",
+            ),
+        ));
+        let hire_id = body.lines().next().unwrap().trim().to_string();
+        let cid = spawn_clearance_for(&s, &hire_id).expect("clearance exists");
+        // Still pending before the decision.
+        assert_eq!(s.get_agent(&hire_id).unwrap().unwrap().status, "pending");
+        // Approving the Clearance activates the hire.
+        assert!(matches!(
+            decide(&s, &cid, "approved"),
+            HandlerOutcome::Ok(_)
+        ));
+        assert_eq!(s.get_agent(&hire_id).unwrap().unwrap().status, "active");
+    }
+
+    #[test]
+    fn rejecting_spawn_clearance_does_not_activate_the_hire() {
+        let s = store();
+        spawn_actor(&s, "founder");
+        let body = ok_body(handle_request_hire(
+            &s,
+            &fake_ctx_with_role(
+                b"Worker|engineer|Worker|eng|eng|planner|subj-worker|medium",
+                "planner",
+                b"planner-seed",
+            ),
+        ));
+        let hire_id = body.lines().next().unwrap().trim().to_string();
+        let cid = spawn_clearance_for(&s, &hire_id).expect("clearance exists");
+        assert!(matches!(
+            decide(&s, &cid, "rejected"),
+            HandlerOutcome::Ok(_)
+        ));
+        // Never activated (the existing hire flow disables a rejected hire).
+        assert_ne!(s.get_agent(&hire_id).unwrap().unwrap().status, "active");
+    }
+
+    #[test]
+    fn direct_route_mints_no_spawn_clearance() {
+        let s = store();
+        spawn_actor(&s, "direct");
+        let body = ok_body(handle_request_hire(
+            &s,
+            &fake_ctx_with_role(
+                b"Worker|engineer|Worker|eng|eng|planner|subj-worker|medium",
+                "planner",
+                b"planner-seed",
+            ),
+        ));
+        let hire_id = body.lines().next().unwrap().trim();
+        assert!(
+            spawn_clearance_for(&s, hire_id).is_none(),
+            "direct route must NOT mint a spawn Clearance"
+        );
+    }
+
+    #[test]
+    fn denied_spawn_creates_neither_hire_nor_clearance() {
+        let s = store();
+        // can_spawn defaults false → denied.
+        s.create_agent(
+            "Planner",
+            "planner",
+            "Lead",
+            "ops",
+            "ops",
+            "prime",
+            &subject_of(b"planner-seed"),
+            "medium",
+            "default",
+        )
+        .unwrap();
+        let before = s.list_pending_approvals(100).unwrap().len();
+        let out = handle_request_hire(
+            &s,
+            &fake_ctx_with_role(
+                b"Worker|engineer|Worker|eng|eng|planner|subj-worker|medium",
+                "planner",
+                b"planner-seed",
+            ),
+        );
+        assert_eq!(err_kind(out), error_kinds::POLICY_DENIED);
+        // No new pending approval, and no Operative named "Worker".
+        assert_eq!(s.list_pending_approvals(100).unwrap().len(), before);
+        assert!(
+            !s.list_agents(None)
+                .unwrap()
+                .iter()
+                .any(|a| a.name == "Worker"),
+            "a denied spawn must mint no hire"
         );
     }
 

@@ -19,6 +19,20 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+/// Marker `method` on an `approval_requests` row meaning "activate the
+/// pending hire named by this row's `agent_id` when approved" — the
+/// route-differentiated spawn Clearance (company-model §5.2A). The
+/// decide hop in the handlers matches on this exact string.
+pub const SPAWN_CLEARANCE_METHOD: &str = "agent.activate_hire";
+
+/// Capability category recorded on a spawn Clearance row.
+pub const SPAWN_CLEARANCE_CATEGORY: &str = "agents:create";
+
+/// Lifetime of a spawn Clearance before it auto-expires (7 days). A
+/// hire awaiting greenlight can reasonably wait days, unlike a
+/// mid-Shift action Clearance.
+pub const SPAWN_CLEARANCE_TTL_SECS: i64 = 7 * 86_400;
+
 // ── Public record types ───────────────────────────────────
 
 /// Full agent profile row. Returned by `agent.get` and the
@@ -1684,6 +1698,37 @@ impl AgentStore {
             ],
         )?;
         Ok(approval_id)
+    }
+
+    /// Create a **typed spawn Clearance** linked to a pending hire
+    /// (company-model §5.2A, route=lead/founder). The row's
+    /// `method = SPAWN_CLEARANCE_METHOD` and `agent_id = hire_agent_id`
+    /// are the marker [`crate::nodes::coordinator::agent::handlers`]'
+    /// decide hop reads to *activate* the hire on approve (or disable
+    /// it on reject). `approver_subjects` widens the decider set to the
+    /// actor's Lead (route=lead); operator/admin can always decide.
+    pub fn create_spawn_clearance(
+        &self,
+        hire_agent_id: &str,
+        hire_subject_id: &str,
+        reason: &str,
+        approver_subjects: &[String],
+        tenant: &str,
+    ) -> Result<String, AgentStoreError> {
+        let expires_at = unix_now() + SPAWN_CLEARANCE_TTL_SECS;
+        self.create_approval(
+            hire_agent_id,
+            hire_subject_id,
+            SPAWN_CLEARANCE_METHOD,
+            SPAWN_CLEARANCE_CATEGORY,
+            "spawn",
+            reason,
+            &[],
+            None,
+            expires_at,
+            approver_subjects,
+            tenant,
+        )
     }
 
     /// GROUP 6: tenant-scoped approval lookup — returns the row
