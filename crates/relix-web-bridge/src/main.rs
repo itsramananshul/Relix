@@ -507,6 +507,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/desk/:agent", get(spine::desk))
         .route("/v1/spine/by-label", get(spine::by_label))
         .route("/v1/spine/overdue", get(spine::overdue))
+        .route("/v1/spine/blocked", get(spine::blocked))
+        .route("/v1/spine/stale", get(spine::stale))
+        .route("/v1/spine/unblocked", get(spine::unblocked))
         // Product-spine dashboard write actions.
         .route("/v1/spine/briefs", post(spine::create_brief))
         .route("/v1/spine/briefs/:id/move", post(spine::move_brief))

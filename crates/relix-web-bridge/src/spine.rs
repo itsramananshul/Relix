@@ -199,6 +199,34 @@ pub async fn overdue(
     json_passthrough(call_peer(&state, "brief.overdue", arg.as_bytes()).await?)
 }
 
+/// `GET /v1/spine/blocked?limit=` — Briefs blocked by an unresolved Snag.
+pub async fn blocked(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let arg = q.limit.unwrap_or(50).to_string();
+    json_passthrough(call_peer(&state, "brief.blocked_list", arg.as_bytes()).await?)
+}
+
+/// `GET /v1/spine/stale?idle_secs=&limit=` — Briefs idle in an active column.
+pub async fn stale(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    // brief.stale_list arg is `idle_secs|limit`; default 1 day.
+    let arg = format!("86400|{}", q.limit.unwrap_or(50));
+    json_passthrough(call_peer(&state, "brief.stale_list", arg.as_bytes()).await?)
+}
+
+/// `GET /v1/spine/unblocked?limit=` — the blockers-resolved wake list.
+pub async fn unblocked(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let arg = q.limit.unwrap_or(50).to_string();
+    json_passthrough(call_peer(&state, "brief.unblocked", arg.as_bytes()).await?)
+}
+
 /// `GET /v1/spine/briefs/search?q=&limit=` — Brief title search.
 pub async fn brief_search(
     State(state): State<AppState>,
@@ -634,6 +662,9 @@ mod tests {
             .route("/v1/spine/desk/:agent", get(desk))
             .route("/v1/spine/by-label", get(by_label))
             .route("/v1/spine/overdue", get(overdue))
+            .route("/v1/spine/blocked", get(blocked))
+            .route("/v1/spine/stale", get(stale))
+            .route("/v1/spine/unblocked", get(unblocked))
             .route("/v1/spine/briefs", post(create_brief))
             .route("/v1/spine/briefs/:id/move", post(move_brief))
             .route("/v1/spine/briefs/:id/pin", post(pin_brief))

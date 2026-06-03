@@ -57,6 +57,7 @@
 <header>
   <h1>RELIX · Spine</h1>
   <nav id="nav">
+    <button class="tab" data-view="inbox">Inbox</button>
     <button class="tab on" data-view="board">Board</button>
     <button class="tab" data-view="mandates">Mandates</button>
     <button class="tab" data-view="roster">Roster</button>
@@ -69,6 +70,10 @@
   </div>
 </header>
 <main>
+  <section id="inboxView" hidden>
+    <div class="toolbar"><button class="ghost" id="refreshInbox">Refresh</button></div>
+    <div id="inbox"></div>
+  </section>
   <section id="boardView">
     <div class="toolbar">
       <button id="newBrief">+ Brief</button>
@@ -317,14 +322,38 @@ function setAutoActivity(on) {
   if (on) actTimer = setInterval(loadActivity, 3000);
 }
 
+async function loadInbox() {
+  const host = $("#inbox"); host.innerHTML = '<div class="muted">loading…</div>';
+  const sections = [
+    ["⚠ Blocked", "/v1/spine/blocked"],
+    ["⏰ Overdue", "/v1/spine/overdue"],
+    ["✓ Unblocked (ready to resume)", "/v1/spine/unblocked"],
+    ["🕔 Stale (idle > 1d)", "/v1/spine/stale"],
+  ];
+  host.innerHTML = "";
+  for (const [label, url] of sections) {
+    const box = el("div",{className:"mandate"});
+    const h = el("h4",{textContent:label}); box.append(h);
+    host.append(box);
+    api(url).then(rows=>{
+      rows = rows||[];
+      h.textContent = label + "  (" + rows.length + ")";
+      if (!rows.length) { box.append(el("div",{className:"muted",textContent:"nothing"})); return; }
+      for (const b of rows) box.append(card(b));
+    }).catch(e=>box.append(el("div",{className:"err",textContent:e.message})));
+  }
+}
+
 function switchView(name) {
   for (const t of document.querySelectorAll(".tab")) t.classList.toggle("on", t.dataset.view===name);
+  $("#inboxView").hidden = name!=="inbox";
   $("#boardView").hidden = name!=="board";
   $("#mandatesView").hidden = name!=="mandates";
   $("#rosterView").hidden = name!=="roster";
   $("#activityView").hidden = name!=="activity";
   if (name!=="activity") setAutoActivity(false); // stop polling when away
   setAutoBoard(name==="board" && $("#autoBoard").checked);
+  if (name==="inbox") loadInbox();
   if (name==="mandates") loadMandates();
   if (name==="roster") loadRoster();
   if (name==="activity") { loadActivity(); setAutoActivity($("#autoAct").checked); }
@@ -333,6 +362,7 @@ for (const t of document.querySelectorAll(".tab")) t.onclick = ()=>switchView(t.
 
 $("#refreshMandates").onclick = loadMandates;
 $("#refreshRoster").onclick = loadRoster;
+$("#refreshInbox").onclick = loadInbox;
 $("#refreshActivity").onclick = loadActivity;
 $("#autoAct").addEventListener("change", e=>setAutoActivity(e.target.checked));
 $("#newMandate").onclick = async ()=>{
