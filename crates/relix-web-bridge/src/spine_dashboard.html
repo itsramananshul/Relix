@@ -106,7 +106,7 @@
   <form method="dialog" class="grid" id="newForm">
     <strong>New Brief</strong>
     <label>Title <input name="title" required /></label>
-    <label>Assignee <input name="assignee" placeholder="agent id (optional)" /></label>
+    <label>Assignee <input name="assignee" placeholder="operative id (optional)" /></label>
     <label>Mandate <input name="mandate" placeholder="mandate id (optional)" /></label>
     <label>Priority
       <select name="priority">
@@ -205,7 +205,7 @@ async function openBrief(id) {
     const setField = async (field, value)=>{ try { await api("/v1/spine/briefs/"+id+"/set",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({field,value})}); openBrief(id); loadBoard(); } catch(e){ alert(e.message); } };
     const af = el("div",{className:"row"});
     af.append(el("div",{className:"lbl",textContent:"Assignee"}));
-    const ain = el("input",{value:f.assignee_agent_id||"", placeholder:"agent id", style:"width:70%"});
+    const ain = el("input",{value:f.assignee_agent_id||"", placeholder:"operative id", style:"width:70%"});
     af.append(ain, " ", el("button",{className:"ghost",textContent:"Set",onclick:()=>setField("assignee", ain.value.trim())})); body.append(af);
     const pf = el("div",{className:"row"});
     pf.append(el("div",{className:"lbl",textContent:"Priority"}));
