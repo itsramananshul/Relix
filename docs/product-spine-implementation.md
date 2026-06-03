@@ -15,7 +15,7 @@
 | `macros/` | The **Macro** (native execute_code): `run_macro` (capped) + `run_macro_guarded` (interpreter allowlist) + `run_macro_rpc` (split `@relix-call` tool requests from residual); `cwd` + scoped `env` for the Cell. |
 | `tradecraft/` | The **Keeper**: usage-clock Knack aging + provenance gate; the creation trigger + post-response nudge. |
 | `bench/` | The **Bench**: serverless sleep/wake workspace lifecycle (hibernate to ~$0, wake with snapshot); `idle_active_benches` + `hibernate_idle` auto-sleep tick. |
-| `controller_runtime.rs` | Wiring: spine handlers, the shared Rig registry + `rig.list`/`rig.describe` (+ `RELIX_DEFAULT_RIG`), and the opt-in live heartbeat loop (`RELIX_HEARTBEAT_ENABLED`) with rich prompt composition, failure-parking, and per-tick token sweep. |
+| `src/controller_runtime.rs` (crate root, not under `nodes/coordinator/`) | Wiring: spine handlers, the shared Rig registry + `rig.list`/`rig.describe` (+ `RELIX_DEFAULT_RIG`), and the opt-in live heartbeat loop (`RELIX_HEARTBEAT_ENABLED`) with rich prompt composition, failure-parking, and per-tick token sweep. |
 | `relix-cli` `call.rs` | `relix call --method <name> --arg <pipe-delimited>` — generic capability invocation, the operator escape hatch reaching the whole spine surface from the CLI. |
 | `relix-web-bridge` `spine.rs` | The dashboard HTTP surface — `GET /v1/spine/{guild,board,board/:col,roster,mandates,mandates/search,mandates/:id/{tree,briefs},briefs/search,briefs/:id,desk/:agent,overdue}` + write `POST /v1/spine/{briefs,briefs/:id/{move,pin,comment,due},mandates}`, all proxying to the coordinator through the mesh admission pipeline. |
 | `relix-web-bridge` `spine_dashboard.html` | **Phase 6** — the served `/spine` board page (self-contained inline HTML/JS/CSS, B&W): Board (kanban + detail panel: move/pin/comment/assign/priority/snag/subbrief + create + search + label filter), Mandates (goal tree + create), Roster, and Activity (live chronicle) tabs, plus the companion command bar — all driven by `/v1/spine/*`. |
@@ -38,7 +38,7 @@
 - Mesh tools lent to a Rig route through the admission pipeline; the **box is the boundary** for thin Rigs; the **bridge-back token** is scoped per Shift (Brief + Operative) **and optionally per-method** (`mint_scoped`/`authorize_method`), revoked when the Shift ends.
 - The **Macro** (execute_code) runs only **allowlisted interpreters** (`run_macro_guarded`); a `ProcessRig`'s stdout is **capped** so a runaway CLI can't flood context.
 - An unrecoverable dispatch **Failed** parks the Brief in `blocked` (with the reason chronicled) instead of re-dispatching forever.
-- The enforced **strategy gate** (`strategy_approved`) — a CEO can't build a team until the plan is approved.
+- The **strategy gate** is a *tenant-guarded, queryable* predicate (`strategy_approved`) with the proposed→approved/rejected state machine. ⚠️ It is **not yet enforced** — no hire/team-build path blocks on it (company-model §10.3 wants enforcement; that coupling is follow-up). Do not describe it as enforced until wired.
 
 ## Shipped this roadmap
 - **Phase 6 dashboard** — served at `/spine`, fully functional (Board/Mandates/Roster/Activity + command bar) over the `/v1/spine/*` API.

@@ -242,11 +242,18 @@ impl SpineStore {
     // ── mandate strategy gate (Phase 4) ──────────────────
 
     /// Propose (or re-propose) a strategy for a Mandate — sets it
-    /// `proposed` and stores the plan `doc`. The enforced gate: a
-    /// CEO can't build a team for the Mandate until the strategy is
-    /// `approved`.
-    /// Propose a strategy for a Mandate. Tenant-guarded: the Mandate
-    /// must belong to `tenant` (a Guild can't touch another's).
+    /// `proposed` and stores the plan `doc`.
+    ///
+    /// NOTE: this is the *queryable* half of the gate
+    /// (`strategy_approved` is the predicate a hire / team-build path
+    /// must check). Wiring it as a hard pre-condition on hiring (the
+    /// company-model §10.3 enforcement) requires the hire→Mandate
+    /// coupling and is tracked as follow-up — today nothing in the
+    /// runtime blocks a hire on this predicate, so do NOT describe it
+    /// as "enforced" until that wiring lands.
+    ///
+    /// Tenant-guarded: the Mandate must belong to `tenant` (a Guild
+    /// can't touch another's).
     pub fn propose_strategy(
         &self,
         tenant: &str,
