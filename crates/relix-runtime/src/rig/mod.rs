@@ -467,6 +467,18 @@ pub fn gemini_rig() -> ProcessRig {
     ProcessRig::new("gemini", "gemini", Vec::new())
 }
 
+/// An installed **Hermes** agent, plugged in as a Rig (Pillar 2 —
+/// the deepest "plug in any agent" target). Spawns the `hermes`
+/// binary with the prompt on stdin. Declared `PerToolCall`:
+/// Hermes is a rich agent that surfaces its tool calls, so Relix
+/// governs it more deeply than a black-box CLI — the dispatcher can
+/// give it a looser sandbox and lean on per-tool gating + the
+/// scoped bridge-back token.
+pub fn hermes_rig() -> ProcessRig {
+    ProcessRig::new("hermes", "hermes", vec!["run".to_string(), "-".to_string()])
+        .with_governance(RigGovernance::PerToolCall)
+}
+
 /// Register the standard CLI subscription Rigs into `registry`.
 /// They spawn external binaries, so a Rig whose CLI isn't installed
 /// simply fails gracefully at run time (a retryable `Failed`) — the
@@ -475,6 +487,7 @@ pub fn register_cli_rigs(registry: &mut RigRegistry) {
     registry.register(Arc::new(claude_rig()));
     registry.register(Arc::new(codex_rig()));
     registry.register(Arc::new(gemini_rig()));
+    registry.register(Arc::new(hermes_rig()));
 }
 
 #[cfg(test)]
@@ -617,13 +630,19 @@ mod tests {
         assert!(x.args().iter().any(|a| a == "exec"));
 
         assert_eq!(gemini_rig().name(), "gemini");
+
+        // Hermes is the deep adapter — rich governance.
+        let h = hermes_rig();
+        assert_eq!(h.name(), "hermes");
+        assert_eq!(h.program(), "hermes");
+        assert_eq!(h.governance(), RigGovernance::PerToolCall);
     }
 
     #[test]
     fn register_cli_rigs_adds_them_alongside_builtins() {
         let mut reg = RigRegistry::with_builtins();
         register_cli_rigs(&mut reg);
-        for name in ["echo", "claude", "codex", "gemini"] {
+        for name in ["echo", "claude", "codex", "gemini", "hermes"] {
             assert!(reg.get(name).is_some(), "{name} should be registered");
         }
     }
