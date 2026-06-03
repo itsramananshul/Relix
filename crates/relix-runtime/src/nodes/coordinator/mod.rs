@@ -839,6 +839,42 @@ impl TaskStore {
         Ok(doc_id)
     }
 
+    /// PHASE 5 (Brief): the most recent Dossier of `kind` on a Brief
+    /// (full body). Dossiers are append-only/versioned, so this is
+    /// "the current plan/spec" — the latest one wins. `None` when the
+    /// Brief has no Dossier of that kind.
+    pub fn latest_dossier(
+        &self,
+        task_id: &str,
+        kind: &str,
+    ) -> Result<Option<brief::Dossier>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        match conn.query_row(
+            // `rowid` is the monotonic insert order — a reliable
+            // tiebreak when several Dossiers share a created_at second
+            // (doc_id is random, so it can't order by recency).
+            "SELECT doc_id, task_id, kind, title, body, created_at, updated_at
+             FROM task_documents WHERE task_id = ?1 AND kind = ?2
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![task_id, kind],
+            |r| {
+                Ok(brief::Dossier {
+                    doc_id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    title: r.get(3)?,
+                    body: r.get(4)?,
+                    created_at: r.get(5)?,
+                    updated_at: r.get(6)?,
+                })
+            },
+        ) {
+            Ok(d) => Ok(Some(d)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(CoordinatorError::Db(e)),
+        }
+    }
+
     /// PHASE 1 (Brief): read a Dossier by id (full body). `None`
     /// when absent.
     pub fn get_dossier(&self, doc_id: &str) -> Result<Option<brief::Dossier>, CoordinatorError> {
@@ -5640,6 +5676,16 @@ pub fn register(
             })),
         );
     }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.dossier_latest",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_dossier_latest(&s, &ctx) }
+            })),
+        );
+    }
     // PHASE 1 (Brief): spine-field set + read (assignee, priority,
     // mandate/campaign links).
     {
@@ -6759,6 +6805,29 @@ fn handle_brief_dossiers(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutco
             Err(e) => internal(format!("brief.dossiers encode: {e}")),
         },
         Err(e) => map_edge_err("brief.dossiers", e),
+    }
+}
+
+/// `brief.dossier_latest` — the most recent Dossier of a kind on a
+/// Brief (full JSON), or empty body when none. Arg `task_id|kind`.
+fn handle_brief_dossier_latest(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("brief.dossier_latest utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    let task = parts.first().copied().map(str::trim).unwrap_or("");
+    let kind = parts.get(1).copied().map(str::trim).unwrap_or("");
+    if task.is_empty() || kind.is_empty() {
+        return invalid("brief.dossier_latest: expected `task_id|kind`".to_string());
+    }
+    match store.latest_dossier(task, kind) {
+        Ok(Some(d)) => match serde_json::to_vec(&d) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.dossier_latest encode: {e}")),
+        },
+        Ok(None) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.dossier_latest", e),
     }
 }
 
@@ -9904,6 +9973,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload, "todo -> in_progress");
+    }
+
+    #[test]
+    fn latest_dossier_returns_the_newest_of_a_kind() {
+        let s = store();
+        let id = s
+            .create("b", "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .unwrap();
+        s.add_dossier(&id, "plan", "Plan v1", "first").unwrap();
+        s.add_dossier(&id, "spec", "Spec", "specbody").unwrap();
+        let v2 = s.add_dossier(&id, "plan", "Plan v2", "second").unwrap();
+
+        let latest = s.latest_dossier(&id, "plan").unwrap().unwrap();
+        assert_eq!(latest.doc_id, v2);
+        assert_eq!(latest.title, "Plan v2");
+        assert_eq!(latest.body, "second");
+        // A kind with no Dossier → None.
+        assert!(s.latest_dossier(&id, "design").unwrap().is_none());
     }
 
     #[test]
