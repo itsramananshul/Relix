@@ -84,6 +84,8 @@ pub struct BriefDetail {
     pub dossiers: Vec<DossierMeta>,
     /// The Brief's free-form labels.
     pub labels: Vec<String>,
+    /// Pinned to the top of its board column.
+    pub pinned: bool,
     /// True when at least one Snag's blocker isn't `done`.
     pub blocked: bool,
 }

@@ -827,6 +827,7 @@ impl TaskStore {
             parents: self.parent_briefs(task)?,
             dossiers: self.list_dossiers(task)?,
             labels: self.brief_labels(task)?,
+            pinned: self.brief_pinned(task)?,
             blocked: self.is_blocked(task)?,
         }))
     }
@@ -10715,6 +10716,7 @@ mod tests {
         assert!(d.parents.is_empty());
         assert_eq!(d.dossiers.len(), 1);
         assert_eq!(d.labels, vec!["bug".to_string(), "urgent".to_string()]);
+        assert!(!d.pinned);
         assert!(d.blocked, "blocker isn't done → task is blocked");
 
         // Unknown Brief → None.
