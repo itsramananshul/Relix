@@ -217,6 +217,71 @@ impl SpineStore {
         Ok(())
     }
 
+    // ── mandate strategy gate (Phase 4) ──────────────────
+
+    /// Propose (or re-propose) a strategy for a Mandate — sets it
+    /// `proposed` and stores the plan `doc`. The enforced gate: a
+    /// CEO can't build a team for the Mandate until the strategy is
+    /// `approved`.
+    pub fn propose_strategy(&self, mandate_id: &str, doc: &str) -> Result<(), SpineStoreError> {
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        conn.execute(
+            "INSERT INTO mandate_strategy (mandate_id, status, doc, updated_at)
+             VALUES (?1, 'proposed', ?2, ?3)
+             ON CONFLICT(mandate_id)
+                 DO UPDATE SET status='proposed', doc=?2, updated_at=?3",
+            params![mandate_id, doc, now],
+        )?;
+        Ok(())
+    }
+
+    /// Approve a proposed strategy (proposed → approved).
+    pub fn approve_strategy(&self, mandate_id: &str) -> Result<(), SpineStoreError> {
+        self.decide_strategy(mandate_id, "approved")
+    }
+
+    /// Reject a proposed strategy (proposed → rejected).
+    pub fn reject_strategy(&self, mandate_id: &str) -> Result<(), SpineStoreError> {
+        self.decide_strategy(mandate_id, "rejected")
+    }
+
+    fn decide_strategy(&self, mandate_id: &str, to: &str) -> Result<(), SpineStoreError> {
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let changed = conn.execute(
+            "UPDATE mandate_strategy SET status=?1, updated_at=?2
+             WHERE mandate_id=?3 AND status='proposed'",
+            params![to, now, mandate_id],
+        )?;
+        if changed == 0 {
+            return Err(SpineStoreError::NotFound(format!(
+                "no proposed strategy for {mandate_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The Mandate's strategy status (`proposed`/`approved`/`rejected`),
+    /// or `None` if none was proposed.
+    pub fn strategy_status(&self, mandate_id: &str) -> Result<Option<String>, SpineStoreError> {
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT status FROM mandate_strategy WHERE mandate_id = ?1",
+                params![mandate_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Is the Mandate's strategy approved? The gate a CEO flow checks
+    /// before spawning a team.
+    pub fn strategy_approved(&self, mandate_id: &str) -> Result<bool, SpineStoreError> {
+        Ok(self.strategy_status(mandate_id)?.as_deref() == Some("approved"))
+    }
+
     // ── mandates ─────────────────────────────────────────────
 
     /// Create a Mandate. Returns the freshly-allocated `mandate_id`.
@@ -636,6 +701,13 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              display_name TEXT NOT NULL,
              created_at   INTEGER NOT NULL,
              updated_at   INTEGER NOT NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS mandate_strategy (
+             mandate_id TEXT PRIMARY KEY,
+             status     TEXT NOT NULL DEFAULT 'proposed',
+             doc        TEXT NOT NULL DEFAULT '',
+             updated_at INTEGER NOT NULL
          );",
     )?;
     // Defensive additive column: a Guild's monthly Allowance (cents).
@@ -809,6 +881,33 @@ mod tests {
         let g = s.get_guild("fresh").unwrap().unwrap();
         assert_eq!(g.display_name, "fresh");
         assert_eq!(g.monthly_allowance_cents, Some(100));
+    }
+
+    #[test]
+    fn strategy_gate_enforces_approval() {
+        let s = store();
+        let m = s.create_mandate("t", "Ship v1", "", None, None).unwrap();
+        // No strategy → not approved.
+        assert_eq!(s.strategy_status(&m).unwrap(), None);
+        assert!(!s.strategy_approved(&m).unwrap());
+
+        // Propose → proposed, still not approved.
+        s.propose_strategy(&m, "1. hire 2. build").unwrap();
+        assert_eq!(s.strategy_status(&m).unwrap().as_deref(), Some("proposed"));
+        assert!(!s.strategy_approved(&m).unwrap());
+
+        // Approve → the gate opens.
+        s.approve_strategy(&m).unwrap();
+        assert!(s.strategy_approved(&m).unwrap());
+        // Can't approve again (no longer proposed).
+        assert!(s.approve_strategy(&m).is_err());
+
+        // Reject path.
+        let m2 = s.create_mandate("t", "Other", "", None, None).unwrap();
+        s.propose_strategy(&m2, "plan").unwrap();
+        s.reject_strategy(&m2).unwrap();
+        assert_eq!(s.strategy_status(&m2).unwrap().as_deref(), Some("rejected"));
+        assert!(!s.strategy_approved(&m2).unwrap());
     }
 
     #[test]

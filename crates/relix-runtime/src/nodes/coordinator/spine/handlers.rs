@@ -49,6 +49,80 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<SpineStore>) {
     cap!("guild.get", handle_guild_get);
     cap!("guild.set", handle_guild_set);
     cap!("guild.set_allowance", handle_guild_set_allowance);
+    cap!("mandate.propose_strategy", handle_mandate_propose_strategy);
+    cap!("mandate.approve_strategy", handle_mandate_approve_strategy);
+    cap!("mandate.reject_strategy", handle_mandate_reject_strategy);
+    cap!("mandate.strategy", handle_mandate_strategy);
+}
+
+// ── mandate strategy gate (Phase 4) ──────────────────────
+
+/// A single trimmed id arg, or an INVALID_ARGS outcome.
+fn one_id<'a>(ctx: &'a InvocationCtx, method: &str) -> Result<&'a str, HandlerOutcome> {
+    let raw = std::str::from_utf8(&ctx.args)
+        .map_err(|e| invalid(format!("{method} utf8: {e}")))?
+        .trim();
+    if raw.is_empty() {
+        return Err(invalid(format!("{method}: id required")));
+    }
+    Ok(raw)
+}
+
+/// `mandate.propose_strategy` — propose a strategy. Arg `mandate_id|doc`.
+fn handle_mandate_propose_strategy(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("mandate.propose_strategy utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    if parts.is_empty() || parts[0].trim().is_empty() {
+        return invalid("mandate.propose_strategy: expected `mandate_id|doc`".to_string());
+    }
+    let doc = parts.get(1).copied().unwrap_or("");
+    match store.propose_strategy(parts[0].trim(), doc) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => internal(format!("mandate.propose_strategy: {e}")),
+    }
+}
+
+/// `mandate.approve_strategy` — approve. Arg `mandate_id`.
+fn handle_mandate_approve_strategy(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match one_id(ctx, "mandate.approve_strategy") {
+        Ok(i) => i,
+        Err(o) => return o,
+    };
+    match store.approve_strategy(id) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(SpineStoreError::NotFound(m)) => invalid(format!("mandate.approve_strategy: {m}")),
+        Err(e) => internal(format!("mandate.approve_strategy: {e}")),
+    }
+}
+
+/// `mandate.reject_strategy` — reject. Arg `mandate_id`.
+fn handle_mandate_reject_strategy(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match one_id(ctx, "mandate.reject_strategy") {
+        Ok(i) => i,
+        Err(o) => return o,
+    };
+    match store.reject_strategy(id) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(SpineStoreError::NotFound(m)) => invalid(format!("mandate.reject_strategy: {m}")),
+        Err(e) => internal(format!("mandate.reject_strategy: {e}")),
+    }
+}
+
+/// `mandate.strategy` — the strategy status word, or empty if none.
+/// Arg `mandate_id`.
+fn handle_mandate_strategy(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match one_id(ctx, "mandate.strategy") {
+        Ok(i) => i,
+        Err(o) => return o,
+    };
+    match store.strategy_status(id) {
+        Ok(Some(s)) => HandlerOutcome::Ok(s.into_bytes()),
+        Ok(None) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => internal(format!("mandate.strategy: {e}")),
+    }
 }
 
 // ── guild.* ───────────────────────────────────────────────
