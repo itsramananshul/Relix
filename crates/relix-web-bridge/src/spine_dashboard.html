@@ -17,6 +17,10 @@
   .mandate h4 { margin:0 0 2px; font-size:14px; }
   .mandate .sub { margin-top:8px; padding-left:14px; border-left:2px solid var(--line); }
   .mandate .camp { font-size:12px; color:var(--mut); margin:3px 0; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); }
+  th { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); }
+  td.st-active { color:#0a0; } td.st-suspended,td.st-disabled { color:#b00; } td.st-pending { color:var(--mut); }
   .counts { display:flex; gap:14px; color:var(--mut); font-size:12px; }
   .counts b { color:var(--fg); font-weight:600; }
   main { padding:18px 22px; }
@@ -55,6 +59,7 @@
   <nav id="nav">
     <button class="tab on" data-view="board">Board</button>
     <button class="tab" data-view="mandates">Mandates</button>
+    <button class="tab" data-view="roster">Roster</button>
   </nav>
   <div class="counts" id="counts"><span class="muted">loading…</span></div>
 </header>
@@ -74,6 +79,10 @@
       <button class="ghost" id="refreshMandates">Refresh</button>
     </div>
     <div id="mandates"></div>
+  </section>
+  <section id="rosterView" hidden>
+    <div class="toolbar"><button class="ghost" id="refreshRoster">Refresh</button></div>
+    <table id="roster"><thead><tr><th>Name</th><th>Role</th><th>Status</th><th>ID</th></tr></thead><tbody></tbody></table>
   </section>
 </main>
 
@@ -231,15 +240,36 @@ async function loadMandates() {
   } catch(e){ host.innerHTML = '<div class="err">'+e.message+'</div>'; }
 }
 
+async function loadRoster() {
+  const tb = $("#roster tbody"); tb.innerHTML = '<tr><td colspan="4" class="muted">loading…</td></tr>';
+  try {
+    const res = await api("/v1/agents");
+    const rows = (res && res.agents) || [];
+    tb.innerHTML = "";
+    if (!rows.length) { tb.append(el("tr",{},[el("td",{colSpan:4,className:"muted",textContent:"No operatives yet."})])); return; }
+    for (const a of rows) {
+      tb.append(el("tr",{},[
+        el("td",{textContent:a.name||""}),
+        el("td",{textContent:a.role||""}),
+        el("td",{className:"st-"+(a.status||""), textContent:a.status||""}),
+        el("td",{className:"muted",textContent:(a.agent_id||"").slice(0,12)}),
+      ]));
+    }
+  } catch(e){ tb.innerHTML = '<tr><td colspan="4" class="err">'+e.message+'</td></tr>'; }
+}
+
 function switchView(name) {
   for (const t of document.querySelectorAll(".tab")) t.classList.toggle("on", t.dataset.view===name);
   $("#boardView").hidden = name!=="board";
   $("#mandatesView").hidden = name!=="mandates";
+  $("#rosterView").hidden = name!=="roster";
   if (name==="mandates") loadMandates();
+  if (name==="roster") loadRoster();
 }
 for (const t of document.querySelectorAll(".tab")) t.onclick = ()=>switchView(t.dataset.view);
 
 $("#refreshMandates").onclick = loadMandates;
+$("#refreshRoster").onclick = loadRoster;
 $("#newMandate").onclick = async ()=>{
   const title = prompt("Mandate title");
   if (!title || !title.trim()) return;
