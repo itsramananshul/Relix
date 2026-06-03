@@ -76,6 +76,7 @@
       <input id="search" placeholder="Search briefs…" />
       <input id="labelFilter" placeholder="label…" style="width:110px" />
       <button class="ghost" id="overdueBtn">Overdue</button>
+      <label class="muted" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="autoBoard" /> live</label>
     </div>
     <div class="board" id="board"></div>
   </section>
@@ -323,6 +324,7 @@ function switchView(name) {
   $("#rosterView").hidden = name!=="roster";
   $("#activityView").hidden = name!=="activity";
   if (name!=="activity") setAutoActivity(false); // stop polling when away
+  setAutoBoard(name==="board" && $("#autoBoard").checked);
   if (name==="mandates") loadMandates();
   if (name==="roster") loadRoster();
   if (name==="activity") { loadActivity(); setAutoActivity($("#autoAct").checked); }
@@ -339,6 +341,13 @@ $("#newMandate").onclick = async ()=>{
   try { await api("/v1/spine/mandates",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({title})}); loadCounts(); loadMandates(); }
   catch(e){ alert(e.message); }
 };
+
+let boardTimer = null;
+function setAutoBoard(on) {
+  if (boardTimer) { clearInterval(boardTimer); boardTimer = null; }
+  if (on) boardTimer = setInterval(()=>{ loadCounts(); loadBoard(); }, 5000);
+}
+$("#autoBoard").addEventListener("change", e=>setAutoBoard(e.target.checked));
 
 $("#refresh").onclick = ()=>{ loadCounts(); loadBoard(); };
 $("#panelClose").onclick = ()=>$("#panel").classList.remove("open");
