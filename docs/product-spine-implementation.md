@@ -11,11 +11,12 @@
 | `coordinator/brief.rs` | Brief board state machine (`board_transition_allowed`), priorities, the `BriefCard` / `Dossier` / `BriefFields` types. |
 | `coordinator/mod.rs` (TaskStore) | The Brief ledger: board-status moves, Claim (lease/heartbeat/release), Sub-briefs/Snags, Dossiers, spine-fields, board/ready/children-done/blocked/stale queries, progress rollups, link listings, chronicle events. |
 | `coordinator/heartbeat.rs` | The dispatch loop: `claim_ready_batch`, `dispatch_batch` (claim → run-on-Rig → advance board → release), bridge-token mint/revoke per Shift. |
-| `rig/` | The universal agent-backend contract (`Rig` trait), registry with Guild-default `resolve`, `EchoRig`, `ProcessRig` (stdout-capped), the Claude/Codex/Gemini subscription adapters, and the bridge-back token store (per-method scope). |
+| `rig/` | The universal agent-backend contract (`Rig` trait), registry with Guild-default `resolve`, `EchoRig`, `ProcessRig` (stdout-capped, configurable governance), the Claude/Codex/Gemini subscription adapters + the **Hermes** deep adapter (`hermes_rig`, PerToolCall), and the bridge-back token store (per-method scope). |
 | `macros/` | The **Macro** (native execute_code): `run_macro` (capped) + `run_macro_guarded` (interpreter allowlist) + `run_macro_rpc` (split `@relix-call` tool requests from residual); `cwd` + scoped `env` for the Cell. |
 | `tradecraft/` | The **Keeper**: usage-clock Knack aging + provenance gate; the creation trigger + post-response nudge. |
 | `bench/` | The **Bench**: serverless sleep/wake workspace lifecycle (hibernate to ~$0, wake with snapshot); `idle_active_benches` + `hibernate_idle` auto-sleep tick. |
-| `controller_runtime.rs` | Wiring: spine handlers, the shared Rig registry + `rig.list`, and the opt-in live heartbeat loop (`RELIX_HEARTBEAT_ENABLED`). |
+| `controller_runtime.rs` | Wiring: spine handlers, the shared Rig registry + `rig.list`/`rig.describe` (+ `RELIX_DEFAULT_RIG`), and the opt-in live heartbeat loop (`RELIX_HEARTBEAT_ENABLED`) with rich prompt composition, failure-parking, and per-tick token sweep. |
+| `relix-cli` `call.rs` | `relix call --method <name> --arg <pipe-delimited>` — generic capability invocation, the operator escape hatch reaching the whole spine surface from the CLI. |
 
 ## Capabilities (live on the mesh, in our language)
 
