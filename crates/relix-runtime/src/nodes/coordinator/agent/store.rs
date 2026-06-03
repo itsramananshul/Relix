@@ -811,6 +811,18 @@ impl AgentStore {
         Ok(chain)
     }
 
+    /// PHASE 2/3 authority: may `manager` act on `target`? True when
+    /// `target` is in `manager`'s Branch (subtree) — the delegated-
+    /// authority scope ("a planner may only assign to agents under
+    /// it"). A manager does not manage itself.
+    pub fn manages(&self, manager_id: &str, target_id: &str) -> Result<bool, AgentStoreError> {
+        if manager_id == target_id {
+            return Ok(false);
+        }
+        let subtree = self.manager_subtree(manager_id)?;
+        Ok(subtree.iter().any(|id| id == target_id))
+    }
+
     /// Update one field. The set of writable fields is curated;
     /// silent-allow on agent_id / created_at is intentional —
     /// they're never operator-mutable.
@@ -2499,6 +2511,34 @@ mod tests {
         );
         // The apex escalates to nobody.
         assert!(s.chain_of_command(&ceo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn manages_reflects_the_branch_subtree() {
+        let s = store();
+        let ceo = s
+            .create_agent("CEO", "ceo", "C", "x", "x", "op", "subj-mc", "high", "default")
+            .unwrap();
+        let planner = s
+            .create_agent(
+                "P", "planner", "P", "e", "e", "op", "subj-mp", "medium", "default",
+            )
+            .unwrap();
+        let worker = s
+            .create_agent("W", "worker", "W", "e", "e", "op", "subj-mw", "low", "default")
+            .unwrap();
+        let outsider = s
+            .create_agent("O", "worker", "O", "e", "e", "op", "subj-mo", "low", "default")
+            .unwrap();
+        s.update_agent_field(&planner, "reports_to", &ceo).unwrap();
+        s.update_agent_field(&worker, "reports_to", &planner).unwrap();
+
+        assert!(s.manages(&ceo, &planner).unwrap());
+        assert!(s.manages(&ceo, &worker).unwrap());
+        assert!(s.manages(&planner, &worker).unwrap());
+        assert!(!s.manages(&planner, &ceo).unwrap());
+        assert!(!s.manages(&ceo, &outsider).unwrap());
+        assert!(!s.manages(&ceo, &ceo).unwrap());
     }
 
     // ── PHASE 4: hire flow ───────────────────────────────

@@ -240,6 +240,24 @@ pub fn handle_keys(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
     }
 }
 
+/// `agent.manages` — does `manager` manage `target` (target in
+/// manager's Branch / subtree)? Arg `manager_id|target_id`. Returns
+/// `true` / `false`. The delegated-authority check.
+pub fn handle_manages(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("agent.manages utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    if parts.len() < 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+        return invalid("agent.manages: expected `manager_id|target_id`".into());
+    }
+    match store.manages(parts[0].trim(), parts[1].trim()) {
+        Ok(b) => HandlerOutcome::Ok(if b { b"true".to_vec() } else { b"false".to_vec() }),
+        Err(e) => internal(format!("agent.manages: {e}")),
+    }
+}
+
 // ── agent.effective_capabilities ─────────────────────────
 
 /// Wire arg: `agent_id|peer_alias`. The handler reaches into the

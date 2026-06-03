@@ -3184,6 +3184,17 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // PHASE 2/3: delegated-authority check (Branch / subtree).
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.manages",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_manages(&s, &ctx) }
+            })),
+        );
+    }
     {
         let s = agent_store.clone();
         bridge.register(
@@ -8816,6 +8827,11 @@ fn register_node_type_handlers(
             (
                 "agent.keys",
                 "The full Operative profile as JSON (identity + the Keys permission surface + the Lead). Structured read for the per-agent Keys panel. Arg: agent_id.",
+                &["agent", "read"],
+            ),
+            (
+                "agent.manages",
+                "Delegated-authority check: does a manager manage a target (target in the manager's Branch/subtree)? Arg: manager_id|target_id. Returns true/false.",
                 &["agent", "read"],
             ),
             (
