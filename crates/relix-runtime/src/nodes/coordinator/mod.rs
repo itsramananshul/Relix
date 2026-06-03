@@ -828,6 +828,7 @@ impl TaskStore {
             dossiers: self.list_dossiers(task)?,
             labels: self.brief_labels(task)?,
             pinned: self.brief_pinned(task)?,
+            due_at: self.brief_due(task)?,
             blocked: self.is_blocked(task)?,
         }))
     }
@@ -10939,6 +10940,7 @@ mod tests {
         assert_eq!(d.dossiers.len(), 1);
         assert_eq!(d.labels, vec!["bug".to_string(), "urgent".to_string()]);
         assert!(!d.pinned);
+        assert_eq!(d.due_at, None);
         assert!(d.blocked, "blocker isn't done → task is blocked");
 
         // Unknown Brief → None.

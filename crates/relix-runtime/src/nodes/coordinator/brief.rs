@@ -86,6 +86,8 @@ pub struct BriefDetail {
     pub labels: Vec<String>,
     /// Pinned to the top of its board column.
     pub pinned: bool,
+    /// Optional due date (unix secs); `None` when unset.
+    pub due_at: Option<i64>,
     /// True when at least one Snag's blocker isn't `done`.
     pub blocked: bool,
 }
