@@ -240,13 +240,26 @@ function clearanceSection(host, rows) {
   sec.append(node("div",{className:"toolbar",style:"margin-bottom:8px"},[
     node("strong",{textContent:"Clearances"}),
     node("span",{className:"badge",textContent:String(rows.length)}),
-    node("span",{className:"muted",style:"font-size:12px",textContent:"Pending greenlights. Decide via the operator CLI (no inline approve yet)."}),
+    node("span",{className:"muted",style:"font-size:12px",textContent:"Pending greenlights. Approve or reject inline."}),
   ]));
-  rows.forEach(c => sec.append(node("div",{className:"event"},[
-    node("strong",{textContent:c.method || "approval"}),
-    node("div",{textContent:c.reason || ""}),
-    node("div",{className:"mono muted",textContent:(c.agent_id || "")+"  "+(c.approval_id || "")}),
-  ])));
+  rows.forEach(c => {
+    const err = node("div",{className:"err",style:"font-size:12px"});
+    const decide = async (decision) => {
+      err.textContent = "";
+      try { await post("/v1/spine/clearances/"+encodeURIComponent(c.approval_id)+"/decide", {decision}); await render(); }
+      catch(e) { err.textContent = e.message; }
+    };
+    sec.append(node("div",{className:"event"},[
+      node("strong",{textContent:c.method || "approval"}),
+      node("div",{textContent:c.reason || ""}),
+      node("div",{className:"mono muted",textContent:(c.agent_id || "")+"  "+(c.approval_id || "")}),
+      node("div",{style:"display:flex;gap:8px;margin-top:6px"},[
+        node("button",{textContent:"Approve",onclick:()=>decide("approve")}),
+        node("button",{className:"ghost",textContent:"Reject",onclick:()=>decide("reject")}),
+      ]),
+      err,
+    ]));
+  });
   host.append(sec);
 }
 function inboxSection(host, title, rows, hint) {

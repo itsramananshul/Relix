@@ -522,6 +522,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/keys/:agent", get(spine::keys))
         .route("/v1/spine/assign_check", get(spine::assign_check))
         .route("/v1/spine/clearances", get(spine::clearances))
+        .route(
+            "/v1/spine/clearances/:approval_id/decide",
+            post(spine::decide_clearance),
+        )
         // Composite Desk/Inbox + Brief live-thread payloads.
         .route("/v1/spine/inbox", get(spine::inbox))
         .route("/v1/spine/briefs/:id/events", get(spine::brief_events))

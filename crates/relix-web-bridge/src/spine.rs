@@ -337,6 +337,84 @@ pub async fn clearances(
     json_value(parse_clearance_lines(&raw))
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct ClearanceDecision {
+    /// `approve` / `reject` (also accepts `approved` / `rejected`).
+    #[serde(default)]
+    pub decision: String,
+    /// Optional operator note recorded on the decision.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Accepted for API symmetry but NOT forwarded: the minted token's
+    /// TTL is controller-configured (`[approval] approval_token_ttl_secs`),
+    /// not settable per-decision by `coord.approval.decide`.
+    #[serde(default)]
+    pub ttl_secs: Option<i64>,
+}
+
+/// `POST /v1/spine/clearances/:approval_id/decide` — greenlight or
+/// refuse a pending Clearance inline from the Desk. Body:
+/// `{ "decision": "approve"|"reject", "note": "...", "ttl_secs"?: n }`.
+///
+/// The bridge forwards to `coord.approval.decide` **as its own
+/// verified identity** — exactly like the existing
+/// `/v1/approvals/:id/decide` route. The runtime cap enforces the
+/// real authorisation (`authorized_approvers` ∪ operator/admin role),
+/// so this never fabricates approval: an unauthorised bridge identity
+/// is refused by the cap, not waved through here. Tenant scoping
+/// (chunk 1) means the approval must belong to the caller's Guild.
+pub async fn decide_clearance(
+    State(state): State<AppState>,
+    Path(approval_id): Path<String>,
+    Json(req): Json<ClearanceDecision>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if approval_id.trim().is_empty() {
+        return Err(bad("approval_id required"));
+    }
+    let decision = match normalize_clearance_decision(&req.decision) {
+        Some(d) => d,
+        None => {
+            return Err(bad(&format!(
+                "decision must be approve|reject, got `{}`",
+                req.decision
+            )));
+        }
+    };
+    // coord.approval.decide arg: approval_id|decision|decided_by|note?
+    let note = req.note.unwrap_or_default();
+    let arg = format!("{}|{decision}|operator|{note}", approval_id.trim());
+    let raw = call_peer(&state, "coord.approval.decide", arg.as_bytes()).await?;
+    // Response is `ok\n` or `ok|<token>\n`.
+    let text = String::from_utf8_lossy(&raw);
+    let token = text
+        .trim()
+        .strip_prefix("ok|")
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+    json_value(serde_json::json!({
+        "ok": true,
+        "approval_id": approval_id.trim(),
+        "decision": decision,
+        "approval_token": token,
+        // Echoed for transparency: a per-decision TTL is NOT applied —
+        // the minted token uses the controller-configured TTL. Surfaced
+        // so a caller that sent ttl_secs knows it was not honoured.
+        "ttl_secs_ignored": req.ttl_secs,
+    }))
+}
+
+/// Normalise a Clearance decision into the wire value
+/// `coord.approval.decide` expects. Accepts the product verbs
+/// (`approve`/`reject`) and the raw runtime values
+/// (`approved`/`rejected`); anything else is `None` → a 400.
+fn normalize_clearance_decision(decision: &str) -> Option<&'static str> {
+    match decision.trim() {
+        "approve" | "approved" => Some("approved"),
+        "reject" | "rejected" => Some("rejected"),
+        _ => None,
+    }
+}
+
 /// `GET /v1/spine/briefs/:id/events?limit=` — a single Brief's
 /// Chronicle (newest first), as a JSON array. Bounded by `limit`.
 pub async fn brief_events(
@@ -860,6 +938,17 @@ mod tests {
     }
 
     #[test]
+    fn normalize_clearance_decision_accepts_verbs_and_rejects_garbage() {
+        assert_eq!(normalize_clearance_decision("approve"), Some("approved"));
+        assert_eq!(normalize_clearance_decision("approved"), Some("approved"));
+        assert_eq!(normalize_clearance_decision(" reject "), Some("rejected"));
+        assert_eq!(normalize_clearance_decision("rejected"), Some("rejected"));
+        // Anything else maps to None → the route returns 400.
+        assert_eq!(normalize_clearance_decision("maybe"), None);
+        assert_eq!(normalize_clearance_decision(""), None);
+    }
+
+    #[test]
     fn parse_clearance_lines_parses_tsv_and_drops_count() {
         let body = b"ap_1\tagt_x\tbrief.clearance_request\tneeds prod deploy\t1700\nap_2\tagt_y\tpayments\tspend $50\t1800\ncount=2\n";
         let got = parse_clearance_lines(body);
@@ -922,9 +1011,10 @@ mod tests {
         assert!(SPINE_HTML.contains("/v1/spine/inbox"));
         assert!(SPINE_HTML.contains("/thread"));
         assert!(SPINE_HTML.contains("/v1/spine/desk/"));
-        // Keys panel + pending Clearances on the Desk.
+        // Keys panel + pending Clearances on the Desk + inline decide.
         assert!(SPINE_HTML.contains("/v1/spine/keys/"));
         assert!(SPINE_HTML.contains("/v1/spine/clearances"));
+        assert!(SPINE_HTML.contains("/decide"));
     }
 
     /// Build the full spine route table in isolation: matchit panics
@@ -959,6 +1049,10 @@ mod tests {
             .route("/v1/spine/keys/:agent", get(keys))
             .route("/v1/spine/assign_check", get(assign_check))
             .route("/v1/spine/clearances", get(clearances))
+            .route(
+                "/v1/spine/clearances/:approval_id/decide",
+                post(decide_clearance),
+            )
             .route("/v1/spine/inbox", get(inbox))
             .route("/v1/spine/briefs/:id/events", get(brief_events))
             .route("/v1/spine/briefs/:id/thread", get(brief_thread))
