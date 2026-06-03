@@ -8638,6 +8638,30 @@ fn register_node_type_handlers(
                 }
             }
         }
+        // Shared Rig registry (builtins + CLI subscription Rigs).
+        // Available regardless of the heartbeat loop so `rig.list`
+        // can tell the Keys / agent-config UI which backends exist.
+        let rig_registry = std::sync::Arc::new({
+            let mut r = crate::rig::RigRegistry::with_builtins();
+            crate::rig::register_cli_rigs(&mut r);
+            r
+        });
+        {
+            let reg = rig_registry.clone();
+            bridge.register(
+                "rig.list",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |_ctx: crate::dispatch::InvocationCtx| {
+                        let reg = reg.clone();
+                        async move {
+                            crate::dispatch::HandlerOutcome::Ok(
+                                reg.names().join("\n").into_bytes(),
+                            )
+                        }
+                    },
+                )),
+            );
+        }
         // PHASE 3 (heartbeat loop): the live dispatch tick. Opt-in
         // via RELIX_HEARTBEAT_ENABLED (off by default so it never
         // surprises an operator). When on, a timer polls the ready
@@ -8663,14 +8687,7 @@ fn register_node_type_handlers(
             let lease_secs: i64 = 300;
             let task_store = store.clone();
             let ag_store = agent_store.clone();
-            let registry = std::sync::Arc::new({
-                let mut r = crate::rig::RigRegistry::with_builtins();
-                // CLI subscription Rigs (claude / codex / gemini). They
-                // fail gracefully if the binary isn't installed, so
-                // registering them unconditionally is safe.
-                crate::rig::register_cli_rigs(&mut r);
-                r
-            });
+            let registry = rig_registry.clone();
             // Per-run bridge-back tokens the dispatch loop mints +
             // injects so a running agent can call Relix's API back.
             let bridge_tokens = crate::rig::bridge::BridgeTokenStore::new();
