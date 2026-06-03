@@ -779,6 +779,29 @@ impl TaskStore {
         self.list_reverse_edges(task, "spawned")
     }
 
+    /// PHASE 1 (Brief): the full detail view of a Brief in one read —
+    /// spine fields + both directions of the relation graph +
+    /// Dossiers + blocked flag. `None` when the Brief doesn't exist.
+    /// Each sub-read locks independently (no nested lock), so this is
+    /// a convenience composite, not a single transaction.
+    pub fn brief_detail(
+        &self,
+        task: &str,
+    ) -> Result<Option<brief::BriefDetail>, CoordinatorError> {
+        let Some(fields) = self.brief_fields(task)? else {
+            return Ok(None);
+        };
+        Ok(Some(brief::BriefDetail {
+            fields,
+            subbriefs: self.list_subbriefs(task)?,
+            snags: self.list_snags(task)?,
+            blocking: self.list_blocking(task)?,
+            parents: self.parent_briefs(task)?,
+            dossiers: self.list_dossiers(task)?,
+            blocked: self.is_blocked(task)?,
+        }))
+    }
+
     /// PHASE 1 (Brief): attach a **Dossier** (durable artifact) to
     /// a Brief. Append-only; returns the new `doc_id`. `kind` and
     /// `title` are required; the Brief must exist.
@@ -5380,6 +5403,16 @@ pub fn register(
     {
         let s = store.clone();
         bridge.register(
+            "brief.detail",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_detail(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
             "brief.blocking",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -6435,6 +6468,24 @@ fn handle_brief_unsubbrief(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOut
     match store.unlink_subbrief(parent, child) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.unsubbrief", e),
+    }
+}
+
+/// `brief.detail` — the full Brief detail view (fields + relations
+/// both ways + dossiers + blocked flag) as one JSON object. Arg
+/// `task`. `not found` when the Brief doesn't exist.
+fn handle_brief_detail(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task = match single_id(ctx, "brief.detail") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    match store.brief_detail(task) {
+        Ok(Some(d)) => match serde_json::to_vec(&d) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.detail encode: {e}")),
+        },
+        Ok(None) => invalid(format!("brief.detail: not found: {task}")),
+        Err(e) => map_edge_err("brief.detail", e),
     }
 }
 
@@ -9720,6 +9771,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload, "todo -> in_progress");
+    }
+
+    #[test]
+    fn brief_detail_assembles_the_full_view() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        let task = mk("task");
+        let child = mk("child");
+        let blocker = mk("blocker");
+        let waiter = mk("waiter");
+        s.set_brief_field(&task, "assignee", "agt_a").unwrap();
+        s.link_subbrief(&task, &child).unwrap();
+        s.add_snag(&task, &blocker).unwrap(); // task blocked by blocker
+        s.add_snag(&waiter, &task).unwrap(); // waiter blocked by task
+        s.add_dossier(&task, "plan", "The Plan", "body").unwrap();
+
+        let d = s.brief_detail(&task).unwrap().unwrap();
+        assert_eq!(d.fields.assignee_agent_id.as_deref(), Some("agt_a"));
+        assert_eq!(d.subbriefs, vec![child]);
+        assert_eq!(d.snags, vec![blocker]);
+        assert_eq!(d.blocking, vec![waiter]);
+        assert!(d.parents.is_empty());
+        assert_eq!(d.dossiers.len(), 1);
+        assert!(d.blocked, "blocker isn't done → task is blocked");
+
+        // Unknown Brief → None.
+        assert!(s.brief_detail("nope").unwrap().is_none());
     }
 
     #[test]

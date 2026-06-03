@@ -66,6 +66,26 @@ pub struct BriefCard {
     pub campaign_id: Option<String>,
 }
 
+/// The full detail view of a Brief, assembled in one read: its
+/// spine fields, both directions of its relation graph, its
+/// Dossiers, and whether it's currently blocked. Saves the detail
+/// pane a fan-out of separate calls.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BriefDetail {
+    pub fields: BriefFields,
+    /// Downstream: the Sub-briefs spawned from this Brief.
+    pub subbriefs: Vec<String>,
+    /// Downstream: the Snags (blockers) on this Brief.
+    pub snags: Vec<String>,
+    /// Upstream: the Briefs this Brief blocks (who waits on it).
+    pub blocking: Vec<String>,
+    /// Upstream: the parent Briefs that spawned this as a Sub-brief.
+    pub parents: Vec<String>,
+    pub dossiers: Vec<DossierMeta>,
+    /// True when at least one Snag's blocker isn't `done`.
+    pub blocked: bool,
+}
+
 /// The board columns a Brief can sit in.
 ///
 /// `backlog → todo → in_progress → in_review → done` is the happy
