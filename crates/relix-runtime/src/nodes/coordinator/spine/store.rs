@@ -175,6 +175,68 @@ pub struct TeamPlanRecord<'a> {
     pub status: &'a str,
 }
 
+/// A persisted **Mandate Orchestration run** — the durable record of
+/// one `mandate.orchestrate` call (company-model §4.6). List fields are
+/// stored as JSON text; [`OrchestrationRun::to_json`] reconstructs the
+/// operator-facing object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrchestrationRun {
+    pub run_id: String,
+    pub tenant_id: String,
+    pub mandate_id: String,
+    pub mode: String,
+    pub dry_run: bool,
+    pub input_signature: String,
+    /// `blocked` / `planned` / `created` / `assigned`.
+    pub status: String,
+    /// JSON array of created Brief task_ids.
+    pub created_brief_ids: String,
+    /// JSON array of assigned Brief task_ids.
+    pub assigned_brief_ids: String,
+    /// JSON array of blocker objects.
+    pub blockers: String,
+    /// JSON array of next-action strings.
+    pub next_actions: String,
+    pub created_at: i64,
+}
+
+impl OrchestrationRun {
+    pub fn to_json(&self) -> serde_json::Value {
+        let arr = |s: &str| -> serde_json::Value {
+            serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+        };
+        serde_json::json!({
+            "run_id": self.run_id,
+            "tenant_id": self.tenant_id,
+            "mandate_id": self.mandate_id,
+            "mode": self.mode,
+            "dry_run": self.dry_run,
+            "input_signature": self.input_signature,
+            "status": self.status,
+            "created_brief_ids": arr(&self.created_brief_ids),
+            "assigned_brief_ids": arr(&self.assigned_brief_ids),
+            "blockers": arr(&self.blockers),
+            "next_actions": arr(&self.next_actions),
+            "created_at": self.created_at,
+        })
+    }
+}
+
+/// Inputs for [`SpineStore::record_orchestration_run`]. List fields are
+/// pre-serialized JSON strings.
+pub struct OrchestrationRunRecord<'a> {
+    pub tenant_id: &'a str,
+    pub mandate_id: &'a str,
+    pub mode: &'a str,
+    pub dry_run: bool,
+    pub input_signature: &'a str,
+    pub status: &'a str,
+    pub created_brief_ids_json: &'a str,
+    pub assigned_brief_ids_json: &'a str,
+    pub blockers_json: &'a str,
+    pub next_actions_json: &'a str,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SpineStoreError {
     #[error("spine store: {0}")]
@@ -467,6 +529,96 @@ impl SpineStore {
             )
             .optional()?;
         Ok(row)
+    }
+
+    // ── mandate orchestration runs ───────────────────────────
+
+    /// Persist one orchestration run. The Mandate must exist in
+    /// `tenant`. Returns the new `run_id`. Each call appends a row;
+    /// `latest_orchestration_run` reads the newest.
+    pub fn record_orchestration_run(
+        &self,
+        rec: &OrchestrationRunRecord,
+    ) -> Result<String, SpineStoreError> {
+        let tenant = normalize_tenant(rec.tenant_id);
+        let now = unix_now();
+        let run_id = new_run_id();
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        require_mandate_in_tenant(&conn, rec.mandate_id, tenant)?;
+        conn.execute(
+            "INSERT INTO mandate_orchestration_runs (
+                 run_id, tenant_id, mandate_id, mode, dry_run, input_signature,
+                 status, created_brief_ids, assigned_brief_ids, blockers,
+                 next_actions, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                run_id,
+                tenant,
+                rec.mandate_id,
+                rec.mode,
+                if rec.dry_run { 1 } else { 0 },
+                rec.input_signature,
+                rec.status,
+                rec.created_brief_ids_json,
+                rec.assigned_brief_ids_json,
+                rec.blockers_json,
+                rec.next_actions_json,
+                now,
+            ],
+        )?;
+        Ok(run_id)
+    }
+
+    /// The most recent orchestration run for a Mandate, scoped to
+    /// `tenant` (`None` if never orchestrated; cross-Guild reads as
+    /// `None`).
+    pub fn latest_orchestration_run(
+        &self,
+        tenant: &str,
+        mandate_id: &str,
+    ) -> Result<Option<OrchestrationRun>, SpineStoreError> {
+        let tenant = normalize_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT run_id, tenant_id, mandate_id, mode, dry_run, input_signature,
+                        status, created_brief_ids, assigned_brief_ids, blockers,
+                        next_actions, created_at
+                 FROM mandate_orchestration_runs
+                 WHERE tenant_id = ?1 AND mandate_id = ?2
+                 ORDER BY created_at DESC, rowid DESC
+                 LIMIT 1",
+                params![tenant, mandate_id],
+                row_to_orchestration_run,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Recent orchestration runs for a Mandate (newest first), scoped
+    /// to `tenant`.
+    pub fn list_orchestration_runs(
+        &self,
+        tenant: &str,
+        mandate_id: &str,
+        limit: usize,
+    ) -> Result<Vec<OrchestrationRun>, SpineStoreError> {
+        let tenant = normalize_tenant(tenant);
+        let cap = limit.clamp(1, 200) as i64;
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, tenant_id, mandate_id, mode, dry_run, input_signature,
+                    status, created_brief_ids, assigned_brief_ids, blockers,
+                    next_actions, created_at
+             FROM mandate_orchestration_runs
+             WHERE tenant_id = ?1 AND mandate_id = ?2
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![tenant, mandate_id, cap], row_to_orchestration_run)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     // ── mandates ─────────────────────────────────────────────
@@ -1048,7 +1200,24 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              updated_at     INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS mandate_team_plans_latest
-             ON mandate_team_plans(tenant_id, mandate_id, created_at);",
+             ON mandate_team_plans(tenant_id, mandate_id, created_at);
+
+         CREATE TABLE IF NOT EXISTS mandate_orchestration_runs (
+             run_id            TEXT PRIMARY KEY,
+             tenant_id         TEXT NOT NULL DEFAULT 'default',
+             mandate_id        TEXT NOT NULL,
+             mode              TEXT NOT NULL DEFAULT 'plan_only',
+             dry_run           INTEGER NOT NULL DEFAULT 0,
+             input_signature   TEXT NOT NULL DEFAULT '',
+             status            TEXT NOT NULL DEFAULT 'planned',
+             created_brief_ids TEXT NOT NULL DEFAULT '[]',
+             assigned_brief_ids TEXT NOT NULL DEFAULT '[]',
+             blockers          TEXT NOT NULL DEFAULT '[]',
+             next_actions      TEXT NOT NULL DEFAULT '[]',
+             created_at        INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS mandate_orchestration_runs_latest
+             ON mandate_orchestration_runs(tenant_id, mandate_id, created_at);",
     )?;
     // Defensive additive column: a Guild's monthly Allowance (cents).
     // Tolerates a guilds table created before this column existed.
@@ -1185,6 +1354,30 @@ fn new_plan_id() -> String {
     let mut bytes = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut bytes);
     format!("plan_{}", hex::encode(bytes))
+}
+
+fn new_run_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    format!("orun_{}", hex::encode(bytes))
+}
+
+fn row_to_orchestration_run(r: &rusqlite::Row) -> rusqlite::Result<OrchestrationRun> {
+    Ok(OrchestrationRun {
+        run_id: r.get(0)?,
+        tenant_id: r.get(1)?,
+        mandate_id: r.get(2)?,
+        mode: r.get(3)?,
+        dry_run: r.get::<_, i64>(4)? != 0,
+        input_signature: r.get(5)?,
+        status: r.get(6)?,
+        created_brief_ids: r.get(7)?,
+        assigned_brief_ids: r.get(8)?,
+        blockers: r.get(9)?,
+        next_actions: r.get(10)?,
+        created_at: r.get(11)?,
+    })
 }
 
 fn new_campaign_id() -> String {
@@ -1621,6 +1814,67 @@ mod tests {
                 next_steps_json: "[]",
                 status: "planned",
             }),
+            Err(SpineStoreError::BadInput(_))
+        ));
+    }
+
+    fn orun(mandate_id: &str, tenant: &str, status: &str) -> OrchestrationRunRecord<'static> {
+        // leak the borrowed ids into 'static for the test's brevity
+        let mandate = Box::leak(mandate_id.to_string().into_boxed_str());
+        let tenant = Box::leak(tenant.to_string().into_boxed_str());
+        let status = Box::leak(status.to_string().into_boxed_str());
+        OrchestrationRunRecord {
+            tenant_id: tenant,
+            mandate_id: mandate,
+            mode: "assign_ready",
+            dry_run: false,
+            input_signature: "sig-1",
+            status,
+            created_brief_ids_json: "[\"t1\",\"t2\"]",
+            assigned_brief_ids_json: "[\"t2\"]",
+            blockers_json: "[]",
+            next_actions_json: "[\"review\"]",
+        }
+    }
+
+    #[test]
+    fn orchestration_run_latest_list_and_tenant_isolation() {
+        let s = store();
+        let m = s.create_mandate("a", "Ship", "", None, None).unwrap();
+        // None until any run.
+        assert!(s.latest_orchestration_run("a", &m).unwrap().is_none());
+        assert!(s.list_orchestration_runs("a", &m, 10).unwrap().is_empty());
+        // Persist + read back.
+        let run_id = s
+            .record_orchestration_run(&orun(&m, "a", "created"))
+            .unwrap();
+        let latest = s.latest_orchestration_run("a", &m).unwrap().unwrap();
+        assert_eq!(latest.run_id, run_id);
+        assert_eq!(latest.status, "created");
+        assert_eq!(latest.mode, "assign_ready");
+        assert_eq!(
+            latest.to_json()["created_brief_ids"],
+            serde_json::json!(["t1", "t2"])
+        );
+        assert_eq!(
+            latest.to_json()["assigned_brief_ids"],
+            serde_json::json!(["t2"])
+        );
+        // Tenant B cannot read tenant A's run.
+        assert!(s.latest_orchestration_run("b", &m).unwrap().is_none());
+        assert!(s.list_orchestration_runs("b", &m, 10).unwrap().is_empty());
+        // A second run supersedes the latest; the list keeps both.
+        let r2 = s
+            .record_orchestration_run(&orun(&m, "a", "assigned"))
+            .unwrap();
+        assert_eq!(
+            s.latest_orchestration_run("a", &m).unwrap().unwrap().run_id,
+            r2
+        );
+        assert_eq!(s.list_orchestration_runs("a", &m, 10).unwrap().len(), 2);
+        // Recording against another tenant's mandate is rejected.
+        assert!(matches!(
+            s.record_orchestration_run(&orun(&m, "b", "created")),
             Err(SpineStoreError::BadInput(_))
         ));
     }
