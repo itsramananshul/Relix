@@ -1272,6 +1272,39 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// PHASE 5 (org load): aggregate in-flight Brief counts across a
+    /// SET of Operatives — a manager's whole Branch, say. Counts
+    /// briefs in todo/in_progress/in_review/blocked by column across
+    /// all `assignees`. Empty input → empty result.
+    pub fn aggregate_board_counts(
+        &self,
+        assignees: &[&str],
+    ) -> Result<Vec<(String, i64)>, CoordinatorError> {
+        if assignees.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let placeholders = (1..=assignees.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT board_status, COUNT(*) FROM tasks
+             WHERE assignee_agent_id IN ({placeholders})
+               AND board_status IN ('todo','in_progress','in_review','blocked')
+             GROUP BY board_status ORDER BY board_status"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(assignees.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// PHASE 2 (Desk): Briefs that are blocked right now — in a live
     /// column with at least one unresolved Snag (a blocker not yet
     /// `done`). The "blocked work" the Desk surfaces. Newest first.
@@ -5832,6 +5865,16 @@ pub fn register(
     {
         let s = store.clone();
         bridge.register(
+            "brief.team_workload",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_team_workload(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
             "brief.stale_list",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -6989,6 +7032,27 @@ fn handle_brief_blocked_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerO
             Err(e) => internal(format!("brief.blocked_list encode: {e}")),
         },
         Err(e) => map_edge_err("brief.blocked_list", e),
+    }
+}
+
+/// `brief.team_workload` — aggregate in-flight Brief counts across
+/// a SET of Operatives (a manager's Branch). Arg: pipe-separated
+/// assignee ids `a1|a2|a3`. Returns counts by column (+ `total`).
+fn handle_brief_team_workload(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("brief.team_workload utf8: {e}")),
+    };
+    if raw.is_empty() {
+        return invalid("brief.team_workload: at least one assignee required".to_string());
+    }
+    let ids: Vec<&str> = raw.split('|').map(str::trim).filter(|s| !s.is_empty()).collect();
+    if ids.is_empty() {
+        return invalid("brief.team_workload: at least one assignee required".to_string());
+    }
+    match store.aggregate_board_counts(&ids) {
+        Ok(counts) => counts_to_json(counts),
+        Err(e) => map_edge_err("brief.team_workload", e),
     }
 }
 
@@ -10311,6 +10375,42 @@ mod tests {
             .map(|c| c.task_id)
             .collect();
         assert!(ready.contains(&id));
+    }
+
+    #[test]
+    fn aggregate_board_counts_sum_across_a_team() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        let place = |id: &str, who: &str, status: &str| {
+            s.set_brief_field(id, "assignee", who).unwrap();
+            s.set_board_status(id, "todo").unwrap();
+            if status != "todo" {
+                s.set_board_status(id, "in_progress").unwrap();
+            }
+        };
+        let a1 = mk("a1");
+        place(&a1, "agt_a", "in_progress");
+        let a2 = mk("a2");
+        place(&a2, "agt_a", "todo");
+        let b1 = mk("b1");
+        place(&b1, "agt_b", "in_progress");
+        // agt_c is outside the team and must not be counted.
+        let c1 = mk("c1");
+        place(&c1, "agt_c", "in_progress");
+
+        let map: std::collections::HashMap<String, i64> = s
+            .aggregate_board_counts(&["agt_a", "agt_b"])
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(map.get("in_progress"), Some(&2)); // a1 + b1
+        assert_eq!(map.get("todo"), Some(&1)); // a2
+        assert_eq!(map.values().sum::<i64>(), 3); // c1 excluded
+        // Empty team → empty result.
+        assert!(s.aggregate_board_counts(&[]).unwrap().is_empty());
     }
 
     #[test]
