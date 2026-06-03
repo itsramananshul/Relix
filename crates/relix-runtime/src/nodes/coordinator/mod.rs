@@ -839,6 +839,14 @@ impl TaskStore {
         if changed == 0 {
             return Err(CoordinatorError::NotFound(task_id.to_string()));
         }
+        // Chronicle an assignment (skip clears).
+        if field == "assignee" && !value.trim().is_empty() {
+            let _ = conn.execute(
+                "INSERT INTO task_events (task_id, ts, event_type, payload)
+                 VALUES (?1, ?2, 'brief.assigned', ?3)",
+                params![task_id, now, value.trim()],
+            );
+        }
         Ok(())
     }
 
@@ -9400,6 +9408,18 @@ mod tests {
             s.set_brief_field("missing", "priority", "high"),
             Err(CoordinatorError::NotFound(_))
         ));
+
+        // The one non-empty assignment was chronicled (clears aren't).
+        let conn = s.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_events
+                 WHERE task_id=?1 AND event_type='brief.assigned'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]
