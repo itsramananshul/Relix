@@ -233,6 +233,16 @@ impl ProcessRig {
             args,
         }
     }
+
+    /// The program this Rig spawns.
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    /// The arguments passed to the program.
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
 }
 
 impl Rig for ProcessRig {
@@ -292,6 +302,43 @@ impl Rig for ProcessRig {
             }
         }
     }
+}
+
+// ── CLI subscription Rigs ─────────────────────────────────
+//
+// The standard CLI Rigs, as ProcessRigs. Each spawns the operator's
+// installed CLI, which authenticates with ITS OWN subscription
+// login — **no inference key is injected**. This is the
+// subscription model from `docs/relix-agent-adapters.md`: run heavy
+// agents on a flat-rate Claude Max / ChatGPT (Codex) / Gemini
+// subscription instead of metered API. The flags here are the
+// starting shape; future refinements add availability / login
+// probing and structured-output parsing.
+
+/// Claude Code on a Claude subscription. Prompt piped to stdin.
+pub fn claude_rig() -> ProcessRig {
+    ProcessRig::new("claude", "claude", vec!["--print".to_string()])
+}
+
+/// Codex on a ChatGPT / Codex subscription. Prompt piped via the
+/// trailing `-` (read from stdin).
+pub fn codex_rig() -> ProcessRig {
+    ProcessRig::new("codex", "codex", vec!["exec".to_string(), "-".to_string()])
+}
+
+/// Gemini CLI on a Google subscription. Prompt piped to stdin.
+pub fn gemini_rig() -> ProcessRig {
+    ProcessRig::new("gemini", "gemini", Vec::new())
+}
+
+/// Register the standard CLI subscription Rigs into `registry`.
+/// They spawn external binaries, so a Rig whose CLI isn't installed
+/// simply fails gracefully at run time (a retryable `Failed`) — the
+/// operator opts an Operative onto one by setting its `rig`.
+pub fn register_cli_rigs(registry: &mut RigRegistry) {
+    registry.register(Arc::new(claude_rig()));
+    registry.register(Arc::new(codex_rig()));
+    registry.register(Arc::new(gemini_rig()));
 }
 
 #[cfg(test)]
@@ -398,5 +445,29 @@ mod tests {
             rig.run(&req),
             RigOutcome::Failed { retryable: true, .. }
         ));
+    }
+
+    #[test]
+    fn cli_rig_factories_configure_the_right_commands() {
+        let c = claude_rig();
+        assert_eq!(c.name(), "claude");
+        assert_eq!(c.program(), "claude");
+        assert!(c.args().iter().any(|a| a == "--print"));
+
+        let x = codex_rig();
+        assert_eq!(x.name(), "codex");
+        assert_eq!(x.program(), "codex");
+        assert!(x.args().iter().any(|a| a == "exec"));
+
+        assert_eq!(gemini_rig().name(), "gemini");
+    }
+
+    #[test]
+    fn register_cli_rigs_adds_them_alongside_builtins() {
+        let mut reg = RigRegistry::with_builtins();
+        register_cli_rigs(&mut reg);
+        for name in ["echo", "claude", "codex", "gemini"] {
+            assert!(reg.get(name).is_some(), "{name} should be registered");
+        }
     }
 }

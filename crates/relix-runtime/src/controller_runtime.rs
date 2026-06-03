@@ -8652,7 +8652,14 @@ fn register_node_type_handlers(
             let lease_secs: i64 = 300;
             let task_store = store.clone();
             let ag_store = agent_store.clone();
-            let registry = std::sync::Arc::new(crate::rig::RigRegistry::with_builtins());
+            let registry = std::sync::Arc::new({
+                let mut r = crate::rig::RigRegistry::with_builtins();
+                // CLI subscription Rigs (claude / codex / gemini). They
+                // fail gracefully if the binary isn't installed, so
+                // registering them unconditionally is safe.
+                crate::rig::register_cli_rigs(&mut r);
+                r
+            });
             tokio::spawn(async move {
                 let mut ticker =
                     tokio::time::interval(std::time::Duration::from_secs(interval_secs));
