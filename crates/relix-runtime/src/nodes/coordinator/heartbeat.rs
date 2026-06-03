@@ -125,7 +125,8 @@ where
                     String::new(),
                     build_prompt(&card),
                 )
-                .with_bridge_token(&token);
+                .with_bridge_token(&token)
+                .with_context(brief_context(&card));
                 let outcome = rig.run(&req);
                 if let Some(bt) = bridge_tokens {
                     if !token.is_empty() {
@@ -178,6 +179,21 @@ where
         records.push(record);
     }
     Ok(records)
+}
+
+/// Build the opaque `context` string handed to the Rig: where the
+/// Brief sits on the spine (priority + Mandate/Campaign links), so
+/// the agent backend knows the work's place in the company without
+/// a separate lookup.
+fn brief_context(card: &brief::BriefCard) -> String {
+    let mut parts = vec![format!("priority={}", card.priority)];
+    if let Some(m) = &card.mandate_id {
+        parts.push(format!("mandate={m}"));
+    }
+    if let Some(c) = &card.campaign_id {
+        parts.push(format!("campaign={c}"));
+    }
+    parts.join("; ")
 }
 
 #[cfg(test)]
@@ -415,6 +431,47 @@ mod tests {
         .unwrap();
         // Retryable → stays in_progress so the next tick retries it.
         assert_eq!(s.board_status(&a).unwrap().as_deref(), Some("in_progress"));
+    }
+
+    #[test]
+    fn dispatch_batch_hands_the_rig_the_brief_spine_context() {
+        use std::sync::{Arc, Mutex};
+
+        struct CtxRig(Arc<Mutex<String>>);
+        impl Rig for CtxRig {
+            fn name(&self) -> &str {
+                "ctx"
+            }
+            fn run(&self, req: &RigRunRequest) -> RigOutcome {
+                *self.0.lock().unwrap() = req.context.clone();
+                RigOutcome::Done {
+                    summary: "ok".to_string(),
+                }
+            }
+        }
+
+        let s = store();
+        let a = ready_brief(&s, "a", "agt_a");
+        s.set_brief_field(&a, "priority", "high").unwrap();
+        s.set_brief_field(&a, "mandate", "mandate_x").unwrap();
+        s.set_brief_field(&a, "campaign", "camp_y").unwrap();
+
+        let seen = Arc::new(Mutex::new(String::new()));
+        let rig: Arc<dyn Rig> = Arc::new(CtxRig(seen.clone()));
+        dispatch_batch(
+            &s,
+            50,
+            300,
+            None,
+            |_: &brief::BriefCard| Some(rig.clone()),
+            |c: &brief::BriefCard| c.title.clone(),
+        )
+        .unwrap();
+
+        let ctx = seen.lock().unwrap().clone();
+        assert!(ctx.contains("priority=high"), "ctx: {ctx}");
+        assert!(ctx.contains("mandate=mandate_x"), "ctx: {ctx}");
+        assert!(ctx.contains("campaign=camp_y"), "ctx: {ctx}");
     }
 
     #[test]
