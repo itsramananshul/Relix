@@ -69,6 +69,17 @@ pub struct Campaign {
     pub updated_at: i64,
 }
 
+/// A **Guild** — the product face of a tenant (the company). Holds
+/// its display name; branding / budget can extend this later.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Guild {
+    /// The tenant id this Guild *is*.
+    pub tenant_id: String,
+    pub display_name: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SpineStoreError {
     #[error("spine store: {0}")]
@@ -125,6 +136,52 @@ impl SpineStore {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    // ── guilds (the Company face of a tenant) ────────────
+
+    /// Set (upsert) a Guild's display name for `tenant_id`.
+    pub fn set_guild_name(
+        &self,
+        tenant_id: &str,
+        display_name: &str,
+    ) -> Result<(), SpineStoreError> {
+        if display_name.trim().is_empty() {
+            return Err(SpineStoreError::BadInput(
+                "guild display_name required".into(),
+            ));
+        }
+        let tenant = normalize_tenant(tenant_id);
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        conn.execute(
+            "INSERT INTO guilds (tenant_id, display_name, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(tenant_id) DO UPDATE SET display_name = ?2, updated_at = ?3",
+            params![tenant, display_name.trim(), now],
+        )?;
+        Ok(())
+    }
+
+    /// Read a Guild by tenant id. `None` until a name is set.
+    pub fn get_guild(&self, tenant_id: &str) -> Result<Option<Guild>, SpineStoreError> {
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT tenant_id, display_name, created_at, updated_at
+                 FROM guilds WHERE tenant_id = ?1",
+                params![normalize_tenant(tenant_id)],
+                |r| {
+                    Ok(Guild {
+                        tenant_id: r.get(0)?,
+                        display_name: r.get(1)?,
+                        created_at: r.get(2)?,
+                        updated_at: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
     // ── mandates ─────────────────────────────────────────────
@@ -539,7 +596,14 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              updated_at     INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS campaigns_tenant ON campaigns(tenant_id);
-         CREATE INDEX IF NOT EXISTS campaigns_mandate ON campaigns(mandate_id);",
+         CREATE INDEX IF NOT EXISTS campaigns_mandate ON campaigns(mandate_id);
+
+         CREATE TABLE IF NOT EXISTS guilds (
+             tenant_id    TEXT PRIMARY KEY,
+             display_name TEXT NOT NULL,
+             created_at   INTEGER NOT NULL,
+             updated_at   INTEGER NOT NULL
+         );",
     )
 }
 
@@ -666,6 +730,27 @@ mod tests {
 
     fn store() -> SpineStore {
         SpineStore::in_memory().unwrap()
+    }
+
+    #[test]
+    fn guild_name_upserts_and_reads_per_tenant() {
+        let s = store();
+        assert!(s.get_guild("acme").unwrap().is_none());
+        s.set_guild_name("acme", "Acme Inc").unwrap();
+        assert_eq!(
+            s.get_guild("acme").unwrap().unwrap().display_name,
+            "Acme Inc"
+        );
+        // Upsert updates in place.
+        s.set_guild_name("acme", "Acme Corp").unwrap();
+        assert_eq!(
+            s.get_guild("acme").unwrap().unwrap().display_name,
+            "Acme Corp"
+        );
+        // Empty name rejected.
+        assert!(s.set_guild_name("acme", "  ").is_err());
+        // A different tenant is a different Guild.
+        assert!(s.get_guild("other").unwrap().is_none());
     }
 
     #[test]

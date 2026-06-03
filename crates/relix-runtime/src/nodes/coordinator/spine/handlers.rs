@@ -46,6 +46,36 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<SpineStore>) {
     cap!("campaign.get", handle_campaign_get);
     cap!("campaign.list", handle_campaign_list);
     cap!("campaign.update", handle_campaign_update);
+    cap!("guild.get", handle_guild_get);
+    cap!("guild.set", handle_guild_set);
+}
+
+// ── guild.* ───────────────────────────────────────────────
+
+/// `guild.get` — read the caller's Guild (display name) as JSON, or
+/// empty body when unnamed. Tenant from ctx.
+fn handle_guild_get(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    match store.get_guild(ctx.tenant_id_or_default()) {
+        Ok(Some(g)) => match serde_json::to_vec(&g) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("guild.get encode: {e}")),
+        },
+        Ok(None) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => internal(format!("guild.get: {e}")),
+    }
+}
+
+/// `guild.set` — set the caller's Guild display name. Arg `display_name`.
+fn handle_guild_set(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let name = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("guild.set utf8: {e}")),
+    };
+    match store.set_guild_name(ctx.tenant_id_or_default(), name) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(SpineStoreError::BadInput(m)) => invalid(format!("guild.set: {m}")),
+        Err(e) => internal(format!("guild.set: {e}")),
+    }
 }
 
 // ── mandate.* ─────────────────────────────────────────────
