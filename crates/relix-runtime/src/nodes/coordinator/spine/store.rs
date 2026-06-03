@@ -1,0 +1,761 @@
+//! SQLite-backed storage for the company **work-object spine**
+//! above the Issue: **Mandates** (the durable "why") and
+//! **Campaigns** (workstreams grouping issues under a mandate).
+//!
+//! Two tables live in their own coordinator-side database:
+//!
+//! - `mandates`    — Phase 1. The high-level outcomes a company
+//!                cares about; may nest (a mandate can have a
+//!                parent mandate) to form a mandate hierarchy.
+//! - `campaigns` — Phase 1. A workstream under a mandate; the unit
+//!                an Issue links up to.
+//!
+//! Both objects are **tenant-scoped** (a Company is the
+//! product-facing name for a tenant), and every read offers a
+//! tenant-scoped variant so a caller scoped to tenant A can
+//! never read tenant B's spine — mirroring the agent store's
+//! GROUP-6 isolation.
+//!
+//! This module is deliberately self-contained (its own store,
+//! its own schema, its own tests) so it adds the spine objects
+//! without touching the existing coordinator Task ledger. The
+//! Issue itself remains the evolved Task; Mandates/Campaigns are the
+//! durable objects it links up to.
+
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+
+// ── Public record types ───────────────────────────────────
+
+/// A Mandate / Initiative — the durable "why." Belongs to a
+/// Company (tenant); may nest under a parent mandate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mandate {
+    pub mandate_id: String,
+    pub tenant_id: String,
+    pub title: String,
+    pub description: String,
+    /// The agent that owns this mandate (usually the CEO or a
+    /// senior agent). `None` until assigned.
+    pub owner_agent_id: Option<String>,
+    /// `planned` / `active` / `achieved` / `cancelled`.
+    pub status: String,
+    /// Parent mandate, for a mandate hierarchy. `None` at the top.
+    pub parent_mandate_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// A Campaign — a workstream grouping issues under a mandate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Campaign {
+    pub campaign_id: String,
+    pub tenant_id: String,
+    pub title: String,
+    /// The mandate this workstream serves. `None` if unlinked.
+    pub mandate_id: Option<String>,
+    /// The lead agent for the campaign. `None` until assigned.
+    pub lead_agent_id: Option<String>,
+    /// `backlog` / `planned` / `in_progress` / `completed` /
+    /// `cancelled`.
+    pub status: String,
+    /// Optional shared workspace/environment the campaign's work
+    /// runs in (a cwd, a worktree, or — later — a sandbox id).
+    pub workspace: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SpineStoreError {
+    #[error("spine store: {0}")]
+    Io(String),
+    #[error("spine store: db: {0}")]
+    Db(#[from] rusqlite::Error),
+    #[error("spine store: not found: {0}")]
+    NotFound(String),
+    #[error("spine store: bad input: {0}")]
+    BadInput(String),
+    #[error("spine store: poisoned mutex")]
+    Lock,
+}
+
+// ── Status vocabularies ───────────────────────────────────
+
+fn is_mandate_status(s: &str) -> bool {
+    matches!(s, "planned" | "active" | "achieved" | "cancelled")
+}
+
+fn is_campaign_status(s: &str) -> bool {
+    matches!(
+        s,
+        "backlog" | "planned" | "in_progress" | "completed" | "cancelled"
+    )
+}
+
+// ── Store ─────────────────────────────────────────────────
+
+pub struct SpineStore {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl SpineStore {
+    pub fn open(path: &Path) -> Result<Self, SpineStoreError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| SpineStoreError::Io(e.to_string()))?;
+        }
+        let conn = Connection::open(path)?;
+        crate::db::apply_pragmas(&conn)?;
+        crate::db::log_integrity_warning(&conn, "spine_store");
+        crate::db::ensure_migration_table(&conn)?;
+        init_schema(&conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    pub fn in_memory() -> Result<Self, SpineStoreError> {
+        let conn = Connection::open_in_memory()?;
+        crate::db::apply_pragmas(&conn)?;
+        crate::db::ensure_migration_table(&conn)?;
+        init_schema(&conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    // ── mandates ─────────────────────────────────────────────
+
+    /// Create a Mandate. Returns the freshly-allocated `mandate_id`.
+    /// `parent_mandate_id`, when set, must reference an existing
+    /// mandate in the same tenant.
+    pub fn create_mandate(
+        &self,
+        tenant_id: &str,
+        title: &str,
+        description: &str,
+        owner_agent_id: Option<&str>,
+        parent_mandate_id: Option<&str>,
+    ) -> Result<String, SpineStoreError> {
+        if title.trim().is_empty() {
+            return Err(SpineStoreError::BadInput("title required".into()));
+        }
+        let tenant = normalize_tenant(tenant_id);
+        let now = unix_now();
+        let mandate_id = new_mandate_id();
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        if let Some(parent) = parent_mandate_id.and_then(non_empty) {
+            require_mandate_in_tenant(&conn, parent, tenant)?;
+        }
+        conn.execute(
+            "INSERT INTO mandates (
+                 mandate_id, tenant_id, title, description, owner_agent_id,
+                 status, parent_mandate_id, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'planned', ?6, ?7, ?7)",
+            params![
+                mandate_id,
+                tenant,
+                title.trim(),
+                description.trim(),
+                owner_agent_id.and_then(non_empty),
+                parent_mandate_id.and_then(non_empty),
+                now,
+            ],
+        )?;
+        Ok(mandate_id)
+    }
+
+    pub fn get_mandate(&self, mandate_id: &str) -> Result<Option<Mandate>, SpineStoreError> {
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let row = conn
+            .query_row(SELECT_MANDATE, params![mandate_id], row_to_mandate)
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Tenant-scoped mandate read — returns the mandate ONLY when it
+    /// belongs to `tenant`, so tenant A cannot read tenant B's
+    /// mandate by id.
+    pub fn get_mandate_for_tenant(
+        &self,
+        mandate_id: &str,
+        tenant: &str,
+    ) -> Result<Option<Mandate>, SpineStoreError> {
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT mandate_id, tenant_id, title, description, owner_agent_id,
+                        status, parent_mandate_id, created_at, updated_at
+                 FROM mandates WHERE mandate_id = ?1 AND tenant_id = ?2",
+                params![mandate_id, normalize_tenant(tenant)],
+                row_to_mandate,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// List a tenant's mandates, newest first. `status_filter`
+    /// narrows to one status when set.
+    pub fn list_mandates(
+        &self,
+        tenant: &str,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<Mandate>, SpineStoreError> {
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let tenant = normalize_tenant(tenant);
+        let (sql, with_status) = match status_filter.and_then(non_empty) {
+            Some(_) => (
+                "SELECT mandate_id, tenant_id, title, description, owner_agent_id,
+                        status, parent_mandate_id, created_at, updated_at
+                 FROM mandates WHERE tenant_id = ?1 AND status = ?2
+                 ORDER BY created_at DESC",
+                true,
+            ),
+            None => (
+                "SELECT mandate_id, tenant_id, title, description, owner_agent_id,
+                        status, parent_mandate_id, created_at, updated_at
+                 FROM mandates WHERE tenant_id = ?1 ORDER BY created_at DESC",
+                false,
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows: Vec<Mandate> = if with_status {
+            stmt.query_map(params![tenant, status_filter.unwrap()], row_to_mandate)?
+                .collect::<rusqlite::Result<_>>()?
+        } else {
+            stmt.query_map(params![tenant], row_to_mandate)?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        Ok(rows)
+    }
+
+    /// Update one writable mandate field. Writable: `status`,
+    /// `title`, `description`, `owner_agent_id`,
+    /// `parent_mandate_id`. A `parent_mandate_id` change is validated
+    /// (must exist in-tenant, no self-parent, no cycle).
+    pub fn update_mandate_field(
+        &self,
+        mandate_id: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<(), SpineStoreError> {
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let changed = match field {
+            "status" => {
+                if !is_mandate_status(value) {
+                    return Err(SpineStoreError::BadInput(format!(
+                        "mandate status '{value}' not in planned/active/achieved/cancelled"
+                    )));
+                }
+                conn.execute(
+                    "UPDATE mandates SET status=?1, updated_at=?2 WHERE mandate_id=?3",
+                    params![value, now, mandate_id],
+                )?
+            }
+            "title" => {
+                if value.trim().is_empty() {
+                    return Err(SpineStoreError::BadInput("title required".into()));
+                }
+                conn.execute(
+                    "UPDATE mandates SET title=?1, updated_at=?2 WHERE mandate_id=?3",
+                    params![value.trim(), now, mandate_id],
+                )?
+            }
+            "description" => conn.execute(
+                "UPDATE mandates SET description=?1, updated_at=?2 WHERE mandate_id=?3",
+                params![value.trim(), now, mandate_id],
+            )?,
+            "owner_agent_id" => conn.execute(
+                "UPDATE mandates SET owner_agent_id=?1, updated_at=?2 WHERE mandate_id=?3",
+                params![non_empty(value), now, mandate_id],
+            )?,
+            "parent_mandate_id" => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    conn.execute(
+                        "UPDATE mandates SET parent_mandate_id=NULL, updated_at=?1 WHERE mandate_id=?2",
+                        params![now, mandate_id],
+                    )?
+                } else {
+                    if trimmed == mandate_id {
+                        return Err(SpineStoreError::BadInput(
+                            "a mandate cannot be its own parent".into(),
+                        ));
+                    }
+                    // Parent must exist in the same tenant.
+                    let tenant: Option<String> = conn
+                        .query_row(
+                            "SELECT tenant_id FROM mandates WHERE mandate_id=?1",
+                            params![mandate_id],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let Some(tenant) = tenant else {
+                        return Err(SpineStoreError::NotFound(mandate_id.into()));
+                    };
+                    require_mandate_in_tenant(&conn, trimmed, &tenant)?;
+                    if creates_mandate_cycle(&conn, mandate_id, trimmed)? {
+                        return Err(SpineStoreError::BadInput(
+                            "parent change would create a mandate cycle".into(),
+                        ));
+                    }
+                    conn.execute(
+                        "UPDATE mandates SET parent_mandate_id=?1, updated_at=?2 WHERE mandate_id=?3",
+                        params![trimmed, now, mandate_id],
+                    )?
+                }
+            }
+            other => {
+                return Err(SpineStoreError::BadInput(format!(
+                    "unknown mandate field '{other}'"
+                )));
+            }
+        };
+        if changed == 0 {
+            return Err(SpineStoreError::NotFound(mandate_id.into()));
+        }
+        Ok(())
+    }
+
+    // ── campaigns ──────────────────────────────────────────
+
+    /// Create a Campaign. `mandate_id`, when set, must reference an
+    /// existing mandate in the same tenant.
+    pub fn create_campaign(
+        &self,
+        tenant_id: &str,
+        title: &str,
+        mandate_id: Option<&str>,
+        lead_agent_id: Option<&str>,
+        workspace: Option<&str>,
+    ) -> Result<String, SpineStoreError> {
+        if title.trim().is_empty() {
+            return Err(SpineStoreError::BadInput("title required".into()));
+        }
+        let tenant = normalize_tenant(tenant_id);
+        let now = unix_now();
+        let campaign_id = new_campaign_id();
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        if let Some(mandate) = mandate_id.and_then(non_empty) {
+            require_mandate_in_tenant(&conn, mandate, tenant)?;
+        }
+        conn.execute(
+            "INSERT INTO campaigns (
+                 campaign_id, tenant_id, title, mandate_id, lead_agent_id,
+                 status, workspace, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'backlog', ?6, ?7, ?7)",
+            params![
+                campaign_id,
+                tenant,
+                title.trim(),
+                mandate_id.and_then(non_empty),
+                lead_agent_id.and_then(non_empty),
+                workspace.and_then(non_empty),
+                now,
+            ],
+        )?;
+        Ok(campaign_id)
+    }
+
+    pub fn get_campaign(&self, campaign_id: &str) -> Result<Option<Campaign>, SpineStoreError> {
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let row = conn
+            .query_row(SELECT_CAMPAIGN, params![campaign_id], row_to_campaign)
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Tenant-scoped campaign read.
+    pub fn get_campaign_for_tenant(
+        &self,
+        campaign_id: &str,
+        tenant: &str,
+    ) -> Result<Option<Campaign>, SpineStoreError> {
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT campaign_id, tenant_id, title, mandate_id, lead_agent_id,
+                        status, workspace, created_at, updated_at
+                 FROM campaigns WHERE campaign_id = ?1 AND tenant_id = ?2",
+                params![campaign_id, normalize_tenant(tenant)],
+                row_to_campaign,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// List a tenant's campaigns, newest first. `mandate_filter`
+    /// narrows to one mandate's workstreams when set.
+    pub fn list_campaigns(
+        &self,
+        tenant: &str,
+        mandate_filter: Option<&str>,
+    ) -> Result<Vec<Campaign>, SpineStoreError> {
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let tenant = normalize_tenant(tenant);
+        let (sql, with_mandate) = match mandate_filter.and_then(non_empty) {
+            Some(_) => (
+                "SELECT campaign_id, tenant_id, title, mandate_id, lead_agent_id,
+                        status, workspace, created_at, updated_at
+                 FROM campaigns WHERE tenant_id = ?1 AND mandate_id = ?2
+                 ORDER BY created_at DESC",
+                true,
+            ),
+            None => (
+                "SELECT campaign_id, tenant_id, title, mandate_id, lead_agent_id,
+                        status, workspace, created_at, updated_at
+                 FROM campaigns WHERE tenant_id = ?1 ORDER BY created_at DESC",
+                false,
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows: Vec<Campaign> = if with_mandate {
+            stmt.query_map(params![tenant, mandate_filter.unwrap()], row_to_campaign)?
+                .collect::<rusqlite::Result<_>>()?
+        } else {
+            stmt.query_map(params![tenant], row_to_campaign)?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        Ok(rows)
+    }
+
+    /// Update one writable campaign field. Writable: `status`,
+    /// `title`, `mandate_id`, `lead_agent_id`, `workspace`.
+    pub fn update_campaign_field(
+        &self,
+        campaign_id: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<(), SpineStoreError> {
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let changed = match field {
+            "status" => {
+                if !is_campaign_status(value) {
+                    return Err(SpineStoreError::BadInput(format!(
+                        "campaign status '{value}' not in \
+                         backlog/planned/in_progress/completed/cancelled"
+                    )));
+                }
+                conn.execute(
+                    "UPDATE campaigns SET status=?1, updated_at=?2 WHERE campaign_id=?3",
+                    params![value, now, campaign_id],
+                )?
+            }
+            "title" => {
+                if value.trim().is_empty() {
+                    return Err(SpineStoreError::BadInput("title required".into()));
+                }
+                conn.execute(
+                    "UPDATE campaigns SET title=?1, updated_at=?2 WHERE campaign_id=?3",
+                    params![value.trim(), now, campaign_id],
+                )?
+            }
+            "mandate_id" => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    conn.execute(
+                        "UPDATE campaigns SET mandate_id=NULL, updated_at=?1 WHERE campaign_id=?2",
+                        params![now, campaign_id],
+                    )?
+                } else {
+                    let tenant: Option<String> = conn
+                        .query_row(
+                            "SELECT tenant_id FROM campaigns WHERE campaign_id=?1",
+                            params![campaign_id],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let Some(tenant) = tenant else {
+                        return Err(SpineStoreError::NotFound(campaign_id.into()));
+                    };
+                    require_mandate_in_tenant(&conn, trimmed, &tenant)?;
+                    conn.execute(
+                        "UPDATE campaigns SET mandate_id=?1, updated_at=?2 WHERE campaign_id=?3",
+                        params![trimmed, now, campaign_id],
+                    )?
+                }
+            }
+            "lead_agent_id" => conn.execute(
+                "UPDATE campaigns SET lead_agent_id=?1, updated_at=?2 WHERE campaign_id=?3",
+                params![non_empty(value), now, campaign_id],
+            )?,
+            "workspace" => conn.execute(
+                "UPDATE campaigns SET workspace=?1, updated_at=?2 WHERE campaign_id=?3",
+                params![non_empty(value), now, campaign_id],
+            )?,
+            other => {
+                return Err(SpineStoreError::BadInput(format!(
+                    "unknown campaign field '{other}'"
+                )));
+            }
+        };
+        if changed == 0 {
+            return Err(SpineStoreError::NotFound(campaign_id.into()));
+        }
+        Ok(())
+    }
+}
+
+// ── schema + helpers ──────────────────────────────────────
+
+const SELECT_MANDATE: &str = "SELECT mandate_id, tenant_id, title, description, owner_agent_id,
+        status, parent_mandate_id, created_at, updated_at
+ FROM mandates WHERE mandate_id = ?1";
+
+const SELECT_CAMPAIGN: &str = "SELECT campaign_id, tenant_id, title, mandate_id, lead_agent_id,
+        status, workspace, created_at, updated_at
+ FROM campaigns WHERE campaign_id = ?1";
+
+fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS mandates (
+             mandate_id        TEXT PRIMARY KEY,
+             tenant_id      TEXT NOT NULL DEFAULT 'default',
+             title          TEXT NOT NULL,
+             description    TEXT NOT NULL DEFAULT '',
+             owner_agent_id TEXT,
+             status         TEXT NOT NULL DEFAULT 'planned',
+             parent_mandate_id TEXT,
+             created_at     INTEGER NOT NULL,
+             updated_at     INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS mandates_tenant ON mandates(tenant_id);
+         CREATE INDEX IF NOT EXISTS mandates_parent ON mandates(parent_mandate_id);
+
+         CREATE TABLE IF NOT EXISTS campaigns (
+             campaign_id     TEXT PRIMARY KEY,
+             tenant_id      TEXT NOT NULL DEFAULT 'default',
+             title          TEXT NOT NULL,
+             mandate_id        TEXT,
+             lead_agent_id  TEXT,
+             status         TEXT NOT NULL DEFAULT 'backlog',
+             workspace      TEXT,
+             created_at     INTEGER NOT NULL,
+             updated_at     INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS campaigns_tenant ON campaigns(tenant_id);
+         CREATE INDEX IF NOT EXISTS campaigns_mandate ON campaigns(mandate_id);",
+    )
+}
+
+/// Confirm `mandate_id` exists and belongs to `tenant`, else a
+/// `BadInput` so a cross-tenant or dangling link is rejected.
+fn require_mandate_in_tenant(
+    conn: &Connection,
+    mandate_id: &str,
+    tenant: &str,
+) -> Result<(), SpineStoreError> {
+    let ok = conn
+        .query_row(
+            "SELECT 1 FROM mandates WHERE mandate_id = ?1 AND tenant_id = ?2",
+            params![mandate_id, tenant],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if ok {
+        Ok(())
+    } else {
+        Err(SpineStoreError::BadInput(format!(
+            "mandate '{mandate_id}' is not a known mandate in this company"
+        )))
+    }
+}
+
+/// Would setting `mandate_id`'s parent to `new_parent` create a
+/// cycle? True if `mandate_id` is an ancestor of `new_parent`
+/// (walking up from `new_parent` reaches `mandate_id`). Depth-capped.
+fn creates_mandate_cycle(
+    conn: &Connection,
+    mandate_id: &str,
+    new_parent: &str,
+) -> Result<bool, SpineStoreError> {
+    const MAX_DEPTH: usize = 1024;
+    let mut current = new_parent.to_string();
+    for _ in 0..MAX_DEPTH {
+        if current == mandate_id {
+            return Ok(true);
+        }
+        let parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_mandate_id FROM mandates WHERE mandate_id = ?1",
+                params![current],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        match parent {
+            Some(p) => current = p,
+            None => return Ok(false),
+        }
+    }
+    // Hit the depth cap → treat as a cycle, conservatively.
+    Ok(true)
+}
+
+fn row_to_mandate(r: &rusqlite::Row) -> rusqlite::Result<Mandate> {
+    Ok(Mandate {
+        mandate_id: r.get(0)?,
+        tenant_id: r.get(1)?,
+        title: r.get(2)?,
+        description: r.get(3)?,
+        owner_agent_id: r.get(4)?,
+        status: r.get(5)?,
+        parent_mandate_id: r.get(6)?,
+        created_at: r.get(7)?,
+        updated_at: r.get(8)?,
+    })
+}
+
+fn row_to_campaign(r: &rusqlite::Row) -> rusqlite::Result<Campaign> {
+    Ok(Campaign {
+        campaign_id: r.get(0)?,
+        tenant_id: r.get(1)?,
+        title: r.get(2)?,
+        mandate_id: r.get(3)?,
+        lead_agent_id: r.get(4)?,
+        status: r.get(5)?,
+        workspace: r.get(6)?,
+        created_at: r.get(7)?,
+        updated_at: r.get(8)?,
+    })
+}
+
+fn normalize_tenant(tenant_id: &str) -> &str {
+    if tenant_id.trim().is_empty() {
+        "default"
+    } else {
+        tenant_id
+    }
+}
+
+fn non_empty(s: &str) -> Option<&str> {
+    let t = s.trim();
+    if t.is_empty() { None } else { Some(t) }
+}
+
+fn new_mandate_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    format!("mandate_{}", hex::encode(bytes))
+}
+
+fn new_campaign_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    format!("camp_{}", hex::encode(bytes))
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> SpineStore {
+        SpineStore::in_memory().unwrap()
+    }
+
+    #[test]
+    fn mandate_create_get_round_trips() {
+        let s = store();
+        let id = s
+            .create_mandate("acme", "Ship v1", "the big one", Some("agt_ceo"), None)
+            .unwrap();
+        let g = s.get_mandate(&id).unwrap().unwrap();
+        assert_eq!(g.title, "Ship v1");
+        assert_eq!(g.description, "the big one");
+        assert_eq!(g.owner_agent_id.as_deref(), Some("agt_ceo"));
+        assert_eq!(g.status, "planned");
+        assert_eq!(g.parent_mandate_id, None);
+        assert_eq!(g.tenant_id, "acme");
+    }
+
+    #[test]
+    fn mandate_status_is_validated() {
+        let s = store();
+        let id = s.create_mandate("t", "G", "", None, None).unwrap();
+        assert!(s.update_mandate_field(&id, "status", "active").is_ok());
+        assert_eq!(s.get_mandate(&id).unwrap().unwrap().status, "active");
+        assert!(s.update_mandate_field(&id, "status", "bogus").is_err());
+    }
+
+    #[test]
+    fn mandate_nesting_validates_parent_and_rejects_cycles() {
+        let s = store();
+        let parent = s.create_mandate("t", "Parent", "", None, None).unwrap();
+        let child = s
+            .create_mandate("t", "Child", "", None, Some(&parent))
+            .unwrap();
+        assert_eq!(
+            s.get_mandate(&child).unwrap().unwrap().parent_mandate_id.as_deref(),
+            Some(parent.as_str())
+        );
+        // A mandate cannot parent itself.
+        assert!(s.update_mandate_field(&child, "parent_mandate_id", &child).is_err());
+        // Making the parent report to the child = a cycle → rejected.
+        assert!(s.update_mandate_field(&parent, "parent_mandate_id", &child).is_err());
+        // Unknown parent → rejected.
+        assert!(s.create_mandate("t", "X", "", None, Some("nope")).is_err());
+        // Cross-tenant parent → rejected.
+        assert!(s.create_mandate("other", "Y", "", None, Some(&parent)).is_err());
+    }
+
+    #[test]
+    fn campaign_links_to_mandate_in_same_tenant_only() {
+        let s = store();
+        let mandate = s.create_mandate("acme", "G", "", None, None).unwrap();
+        let proj = s
+            .create_campaign("acme", "Auth rewrite", Some(&mandate), Some("agt_lead"), None)
+            .unwrap();
+        let p = s.get_campaign(&proj).unwrap().unwrap();
+        assert_eq!(p.title, "Auth rewrite");
+        assert_eq!(p.mandate_id.as_deref(), Some(mandate.as_str()));
+        assert_eq!(p.lead_agent_id.as_deref(), Some("agt_lead"));
+        assert_eq!(p.status, "backlog");
+        // A campaign in another tenant cannot link this mandate.
+        assert!(s.create_campaign("other", "P", Some(&mandate), None, None).is_err());
+    }
+
+    #[test]
+    fn lists_are_tenant_scoped_and_filterable() {
+        let s = store();
+        let g_a = s.create_mandate("a", "GA", "", None, None).unwrap();
+        s.update_mandate_field(&g_a, "status", "active").unwrap();
+        s.create_mandate("a", "GA2", "", None, None).unwrap();
+        s.create_mandate("b", "GB", "", None, None).unwrap();
+
+        // Tenant isolation on lists.
+        assert_eq!(s.list_mandates("a", None).unwrap().len(), 2);
+        assert_eq!(s.list_mandates("b", None).unwrap().len(), 1);
+        // Status filter.
+        let active = s.list_mandates("a", Some("active")).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].mandate_id, g_a);
+
+        // Cross-tenant reads are blocked.
+        assert!(s.get_mandate_for_tenant(&g_a, "b").unwrap().is_none());
+        assert!(s.get_mandate_for_tenant(&g_a, "a").unwrap().is_some());
+
+        // Campaign mandate-filter.
+        let mandate = s.create_mandate("a", "GP", "", None, None).unwrap();
+        let p1 = s.create_campaign("a", "P1", Some(&mandate), None, None).unwrap();
+        s.create_campaign("a", "P2", None, None, None).unwrap();
+        let under_mandate = s.list_campaigns("a", Some(&mandate)).unwrap();
+        assert_eq!(under_mandate.len(), 1);
+        assert_eq!(under_mandate[0].campaign_id, p1);
+        assert_eq!(s.list_campaigns("a", None).unwrap().len(), 2);
+    }
+}

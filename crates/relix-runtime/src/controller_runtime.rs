@@ -7242,6 +7242,28 @@ fn register_node_type_handlers(
             drift_cfg.clone(),
             drift_embedder_cell,
         );
+        // PHASE 1 (spine): the Mandate + Campaign objects live in
+        // the coordinator DB alongside the Brief (task) ledger.
+        // Open the SpineStore and register the `mandate.*` /
+        // `campaign.*` capabilities. Non-fatal: a spine-open
+        // failure logs and leaves the caps unregistered rather
+        // than aborting coordinator boot (the Brief ledger, which
+        // already opened the same path above, keeps working).
+        match crate::nodes::coordinator::spine::SpineStore::open(&coord_cfg.db_path) {
+            Ok(spine_store) => {
+                crate::nodes::coordinator::spine::handlers::register(
+                    bridge,
+                    std::sync::Arc::new(spine_store),
+                );
+                tracing::info!(
+                    "coordinator startup: spine (mandate/campaign) capabilities registered"
+                );
+            }
+            Err(e) => tracing::error!(
+                error = %e,
+                "coordinator startup: SpineStore open failed; mandate/campaign caps NOT registered"
+            ),
+        }
         // RELIX-7.30 PART 1: out-of-band approval delivery
         // matrix. Wired when `[approval.delivery]` is present;
         // absent keeps the bridge on the pre-7.30 admission

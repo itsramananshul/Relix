@@ -144,11 +144,13 @@ use relix_core::types::{ErrorEnvelope, error_kinds};
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
 pub mod agent;
+pub mod brief;
 pub mod cron;
 pub mod delegate;
 pub mod event_summary;
 pub mod messaging;
 pub mod routing;
+pub mod spine;
 pub use event_summary::{summarize_event, summarize_event_parts};
 
 /// H4: number of consecutive failures sharing the same
@@ -6660,6 +6662,27 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         // `caller` field still captures *who* authorized it;
         // this captures *which surface* dispatched it).
         "ALTER TABLE tasks ADD COLUMN origin_surface TEXT",
+        // PHASE 1 (Task → Brief): the product-spine lifecycle
+        // columns that turn a coordinator Task into a **Brief**
+        // (see docs/relix-lexicon.md). All additive + nullable
+        // or defaulted, so existing rows keep flowing.
+        //   assignee_agent_id — the single Operative this Brief
+        //     is assigned to (distinct from `owner_subject_id`,
+        //     which is the creator). NULL = unassigned.
+        "ALTER TABLE tasks ADD COLUMN assignee_agent_id TEXT",
+        //   board_status — the Brief's board column, separate
+        //     from the execution `status`. One of: backlog /
+        //     todo / in_progress / in_review / done / blocked /
+        //     cancelled. Defaults to 'backlog'.
+        "ALTER TABLE tasks ADD COLUMN board_status TEXT NOT NULL DEFAULT 'backlog'",
+        //   priority — low / normal / high / urgent.
+        "ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'",
+        //   mandate_id / campaign_id — the spine links a Brief
+        //     points *up* to (the "why" and the workstream).
+        //     NULL = unlinked. Validated against the spine store
+        //     at write time once the handlers are wired.
+        "ALTER TABLE tasks ADD COLUMN mandate_id TEXT",
+        "ALTER TABLE tasks ADD COLUMN campaign_id TEXT",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the
