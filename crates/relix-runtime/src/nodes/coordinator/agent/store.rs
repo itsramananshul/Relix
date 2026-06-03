@@ -751,6 +751,23 @@ impl AgentStore {
         Ok(rows)
     }
 
+    /// PHASE 5 (staffing): the **active** Operatives whose `role`
+    /// matches — the companion's "who can I assign this to" lookup.
+    /// Returns agent_ids, creation order. Suspended/disabled/pending
+    /// Operatives are excluded (only assignable ones).
+    pub fn list_by_role(&self, role: &str) -> Result<Vec<String>, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT agent_id FROM agent_profiles
+             WHERE role = ?1 AND status = 'active'
+             ORDER BY created_at ASC",
+        )?;
+        let rows: Vec<String> = stmt
+            .query_map(params![role], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// PHASE 2 (org tree): an Operative's **peers** — the other
     /// Operatives reporting to the same Lead (excludes the agent
     /// itself). Empty for an apex with no Lead set. The "my team"
@@ -2599,6 +2616,29 @@ mod tests {
         );
         // The apex escalates to nobody.
         assert!(s.chain_of_command(&ceo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_by_role_returns_active_matches_only() {
+        let s = store();
+        let e1 = s
+            .create_agent("E1", "engineer", "E", "e", "e", "op", "subj-br1", "low", "default")
+            .unwrap();
+        let e2 = s
+            .create_agent("E2", "engineer", "E", "e", "e", "op", "subj-br2", "low", "default")
+            .unwrap();
+        let _d = s
+            .create_agent("D", "designer", "D", "e", "e", "op", "subj-br3", "low", "default")
+            .unwrap();
+        // A pending engineer is not assignable.
+        s.request_hire("E3", "engineer", "E", "e", "e", "op", "subj-br4", "low", "default")
+            .unwrap();
+        // A suspended engineer is excluded.
+        s.update_agent_field(&e2, "status", "suspended").unwrap();
+
+        let engineers = s.list_by_role("engineer").unwrap();
+        assert_eq!(engineers, vec![e1]);
+        assert!(s.list_by_role("manager").unwrap().is_empty());
     }
 
     #[test]

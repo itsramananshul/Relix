@@ -179,6 +179,23 @@ pub fn handle_reports(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome
     }
 }
 
+/// `agent.by_role` — the active Operatives with a given role (the
+/// assignable staff for that role). Arg: role. One agent_id per
+/// line.
+pub fn handle_by_role(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let role = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("agent.by_role utf8: {e}")),
+    };
+    if role.is_empty() {
+        return invalid("agent.by_role: role required".into());
+    }
+    match store.list_by_role(role) {
+        Ok(rows) => HandlerOutcome::Ok(rows.join("\n").into_bytes()),
+        Err(e) => internal(format!("agent.by_role: {e}")),
+    }
+}
+
 /// `agent.peers` — the Operatives reporting to the same Lead as
 /// `agent_id` (excludes the agent itself). Arg: agent_id. One
 /// agent_id per line; empty for an apex with no Lead.
