@@ -106,6 +106,75 @@ pub struct MandateTree {
     pub campaigns: Vec<Campaign>,
 }
 
+/// A persisted **Mandate Team Plan** (company-model §4.2/§4.5) — the
+/// durable artifact produced by `mandate.team_plan`. The list fields
+/// are stored as JSON text exactly as the planning handler built them;
+/// [`TeamPlan::to_json`] reconstructs the operator-facing object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeamPlan {
+    pub plan_id: String,
+    pub tenant_id: String,
+    pub mandate_id: String,
+    pub actor_id: String,
+    pub description: String,
+    /// JSON array of role strings.
+    pub proposed_roles: String,
+    /// JSON array of `{role, agent_id, subject_id}` objects.
+    pub pending_hires: String,
+    /// JSON array of clearance id strings.
+    pub clearance_ids: String,
+    /// JSON array of `{role, reason}` objects.
+    pub denials: String,
+    /// JSON array of next-step strings.
+    pub next_steps: String,
+    /// `planned` / `staffing` / `awaiting_clearance`.
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl TeamPlan {
+    /// Reconstruct the operator-facing JSON object, parsing the stored
+    /// JSON-text list fields back into arrays (malformed text degrades
+    /// to an empty array rather than poisoning the read).
+    pub fn to_json(&self) -> serde_json::Value {
+        let arr = |s: &str| -> serde_json::Value {
+            serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+        };
+        serde_json::json!({
+            "plan_id": self.plan_id,
+            "tenant_id": self.tenant_id,
+            "mandate_id": self.mandate_id,
+            "actor_id": self.actor_id,
+            "description": self.description,
+            "proposed_roles": arr(&self.proposed_roles),
+            "pending_hires": arr(&self.pending_hires),
+            "clearance_ids": arr(&self.clearance_ids),
+            "denials": arr(&self.denials),
+            "next_steps": arr(&self.next_steps),
+            "status": self.status,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        })
+    }
+}
+
+/// Inputs for [`SpineStore::record_team_plan`]. The list fields are
+/// pre-serialized JSON strings (the planning handler already builds
+/// them as `serde_json` values).
+pub struct TeamPlanRecord<'a> {
+    pub tenant_id: &'a str,
+    pub mandate_id: &'a str,
+    pub actor_id: &'a str,
+    pub description: &'a str,
+    pub proposed_roles_json: &'a str,
+    pub pending_hires_json: &'a str,
+    pub clearance_ids_json: &'a str,
+    pub denials_json: &'a str,
+    pub next_steps_json: &'a str,
+    pub status: &'a str,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SpineStoreError {
     #[error("spine store: {0}")]
@@ -336,6 +405,68 @@ impl SpineStore {
         mandate_id: &str,
     ) -> Result<bool, SpineStoreError> {
         Ok(self.strategy_status(tenant, mandate_id)?.as_deref() == Some("approved"))
+    }
+
+    // ── mandate team plans (Prime team-build) ────────────────
+
+    /// Persist a Team Plan for a Mandate (`mandate.team_plan`). The
+    /// Mandate must exist in `tenant`. Returns the new `plan_id`. Each
+    /// call appends a new row; `latest_team_plan` reads the newest.
+    pub fn record_team_plan(&self, rec: &TeamPlanRecord) -> Result<String, SpineStoreError> {
+        let tenant = normalize_tenant(rec.tenant_id);
+        let now = unix_now();
+        let plan_id = new_plan_id();
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        require_mandate_in_tenant(&conn, rec.mandate_id, tenant)?;
+        conn.execute(
+            "INSERT INTO mandate_team_plans (
+                 plan_id, tenant_id, mandate_id, actor_id, description,
+                 proposed_roles, pending_hires, clearance_ids, denials,
+                 next_steps, status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+            params![
+                plan_id,
+                tenant,
+                rec.mandate_id,
+                rec.actor_id,
+                rec.description,
+                rec.proposed_roles_json,
+                rec.pending_hires_json,
+                rec.clearance_ids_json,
+                rec.denials_json,
+                rec.next_steps_json,
+                rec.status,
+                now,
+            ],
+        )?;
+        Ok(plan_id)
+    }
+
+    /// The most recent Team Plan for a Mandate, scoped to `tenant` —
+    /// `None` if the Mandate has never been planned. A known `plan` /
+    /// `mandate_id` from another Guild reads as `None` (tenant
+    /// isolation).
+    pub fn latest_team_plan(
+        &self,
+        tenant: &str,
+        mandate_id: &str,
+    ) -> Result<Option<TeamPlan>, SpineStoreError> {
+        let tenant = normalize_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT plan_id, tenant_id, mandate_id, actor_id, description,
+                        proposed_roles, pending_hires, clearance_ids, denials,
+                        next_steps, status, created_at, updated_at
+                 FROM mandate_team_plans
+                 WHERE tenant_id = ?1 AND mandate_id = ?2
+                 ORDER BY created_at DESC, rowid DESC
+                 LIMIT 1",
+                params![tenant, mandate_id],
+                row_to_team_plan,
+            )
+            .optional()?;
+        Ok(row)
     }
 
     // ── mandates ─────────────────────────────────────────────
@@ -899,7 +1030,25 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              status     TEXT NOT NULL DEFAULT 'proposed',
              doc        TEXT NOT NULL DEFAULT '',
              updated_at INTEGER NOT NULL
-         );",
+         );
+
+         CREATE TABLE IF NOT EXISTS mandate_team_plans (
+             plan_id        TEXT PRIMARY KEY,
+             tenant_id      TEXT NOT NULL DEFAULT 'default',
+             mandate_id     TEXT NOT NULL,
+             actor_id       TEXT NOT NULL DEFAULT '',
+             description    TEXT NOT NULL DEFAULT '',
+             proposed_roles TEXT NOT NULL DEFAULT '[]',
+             pending_hires  TEXT NOT NULL DEFAULT '[]',
+             clearance_ids  TEXT NOT NULL DEFAULT '[]',
+             denials        TEXT NOT NULL DEFAULT '[]',
+             next_steps     TEXT NOT NULL DEFAULT '[]',
+             status         TEXT NOT NULL DEFAULT 'planned',
+             created_at     INTEGER NOT NULL,
+             updated_at     INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS mandate_team_plans_latest
+             ON mandate_team_plans(tenant_id, mandate_id, created_at);",
     )?;
     // Defensive additive column: a Guild's monthly Allowance (cents).
     // Tolerates a guilds table created before this column existed.
@@ -1006,11 +1155,36 @@ fn non_empty(s: &str) -> Option<&str> {
     if t.is_empty() { None } else { Some(t) }
 }
 
+fn row_to_team_plan(r: &rusqlite::Row) -> rusqlite::Result<TeamPlan> {
+    Ok(TeamPlan {
+        plan_id: r.get(0)?,
+        tenant_id: r.get(1)?,
+        mandate_id: r.get(2)?,
+        actor_id: r.get(3)?,
+        description: r.get(4)?,
+        proposed_roles: r.get(5)?,
+        pending_hires: r.get(6)?,
+        clearance_ids: r.get(7)?,
+        denials: r.get(8)?,
+        next_steps: r.get(9)?,
+        status: r.get(10)?,
+        created_at: r.get(11)?,
+        updated_at: r.get(12)?,
+    })
+}
+
 fn new_mandate_id() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut bytes);
     format!("mandate_{}", hex::encode(bytes))
+}
+
+fn new_plan_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    format!("plan_{}", hex::encode(bytes))
 }
 
 fn new_campaign_id() -> String {
@@ -1385,5 +1559,69 @@ mod tests {
         assert_eq!(under_mandate.len(), 1);
         assert_eq!(under_mandate[0].campaign_id, p1);
         assert_eq!(s.list_campaigns("a", None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn team_plan_persist_latest_and_tenant_isolation() {
+        let s = store();
+        let m = s.create_mandate("a", "Ship", "", None, None).unwrap();
+        // None until planned.
+        assert!(s.latest_team_plan("a", &m).unwrap().is_none());
+        let plan_id = s
+            .record_team_plan(&TeamPlanRecord {
+                tenant_id: "a",
+                mandate_id: &m,
+                actor_id: "operator",
+                description: "grow",
+                proposed_roles_json: "[\"planner\"]",
+                pending_hires_json: "[]",
+                clearance_ids_json: "[]",
+                denials_json: "[]",
+                next_steps_json: "[\"do x\"]",
+                status: "planned",
+            })
+            .unwrap();
+        // Latest reads it back, tenant A only.
+        let latest = s.latest_team_plan("a", &m).unwrap().unwrap();
+        assert_eq!(latest.plan_id, plan_id);
+        assert_eq!(latest.status, "planned");
+        assert_eq!(
+            latest.to_json()["proposed_roles"],
+            serde_json::json!(["planner"])
+        );
+        // Tenant B cannot read tenant A's plan.
+        assert!(s.latest_team_plan("b", &m).unwrap().is_none());
+        // A second plan supersedes (latest = newest).
+        let p2 = s
+            .record_team_plan(&TeamPlanRecord {
+                tenant_id: "a",
+                mandate_id: &m,
+                actor_id: "operator",
+                description: "grow again",
+                proposed_roles_json: "[]",
+                pending_hires_json: "[]",
+                clearance_ids_json: "[]",
+                denials_json: "[]",
+                next_steps_json: "[]",
+                status: "staffing",
+            })
+            .unwrap();
+        assert_eq!(s.latest_team_plan("a", &m).unwrap().unwrap().plan_id, p2);
+        // Recording against another tenant's mandate is rejected.
+        assert!(matches!(
+            s.record_team_plan(&TeamPlanRecord {
+                tenant_id: "b",
+                mandate_id: &m,
+                actor_id: "x",
+                description: "",
+                proposed_roles_json: "[]",
+                pending_hires_json: "[]",
+                clearance_ids_json: "[]",
+                denials_json: "[]",
+                next_steps_json: "[]",
+                status: "planned",
+            }),
+            Err(SpineStoreError::BadInput(_))
+        ));
     }
 }

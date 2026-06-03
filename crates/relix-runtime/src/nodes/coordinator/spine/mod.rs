@@ -13,4 +13,4 @@
 pub mod handlers;
 pub mod store;
 
-pub use store::{Campaign, Mandate, SpineStore, SpineStoreError};
+pub use store::{Campaign, Mandate, SpineStore, SpineStoreError, TeamPlan, TeamPlanRecord};

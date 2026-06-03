@@ -432,6 +432,26 @@ pub async fn team_plan(
     json_passthrough(call_peer(&state, "mandate.team_plan", arg.as_bytes()).await?)
 }
 
+/// `GET /v1/spine/mandates/:id/team_plan` — the latest persisted Team
+/// Plan for a Mandate as JSON (`null` if never planned). Proxies
+/// `mandate.team_plan.latest`. Tenant-scoped.
+pub async fn team_plan_latest(
+    State(state): State<AppState>,
+    Path(mandate_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if mandate_id.trim().is_empty() {
+        return Err(bad("mandate_id required"));
+    }
+    json_passthrough(
+        call_peer(
+            &state,
+            "mandate.team_plan.latest",
+            mandate_id.trim().as_bytes(),
+        )
+        .await?,
+    )
+}
+
 /// Normalise a Clearance decision into the wire value
 /// `coord.approval.decide` expects. Accepts the product verbs
 /// (`approve`/`reject`) and the raw runtime values
@@ -1067,7 +1087,10 @@ mod tests {
             .route("/v1/spine/mandates/search", get(mandate_search))
             .route("/v1/spine/mandates/:id/tree", get(mandate_tree))
             .route("/v1/spine/mandates/:id/briefs", get(mandate_briefs))
-            .route("/v1/spine/mandates/:id/team_plan", post(team_plan))
+            .route(
+                "/v1/spine/mandates/:id/team_plan",
+                get(team_plan_latest).post(team_plan),
+            )
             .route("/v1/spine/briefs/search", get(brief_search))
             .route("/v1/spine/briefs/:id", get(brief_detail))
             .route("/v1/spine/briefs/:id/wakeups", get(brief_wakeups))

@@ -3157,6 +3157,16 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // PRIME: read the latest persisted Team Plan for a Mandate.
+    if let Some(spine) = spine_store.clone() {
+        bridge.register(
+            "mandate.team_plan.latest",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let spine = spine.clone();
+                async move { handlers::handle_team_plan_latest(&spine, &ctx) }
+            })),
+        );
+    }
     {
         let s = agent_store.clone();
         bridge.register(
@@ -9095,8 +9105,13 @@ fn register_node_type_handlers(
             ),
             (
                 "mandate.team_plan",
-                "Prime team-build foundation (governed, not autonomous): mandate_id|description?|roles? where roles is a CSV of `role` or `role:subject_id`. Requires approved strategy + the actor's spawn Key. Mints pending hires (with spawn Clearances) for roles given an identity; returns a JSON plan {proposed_roles, pending_hires, clearances, denials, next_steps}.",
+                "Prime team-build foundation (governed, not autonomous): mandate_id|description?|roles? where roles is a CSV of `role` or `role:subject_id`. Requires approved strategy + the actor's spawn Key. Mints pending hires (with spawn Clearances) for roles given an identity; persists the plan and returns a JSON plan {plan_id, status, proposed_roles, pending_hires, clearances, clearance_ids, denials, next_steps}.",
                 &["agent", "persist", "governance"],
+            ),
+            (
+                "mandate.team_plan.latest",
+                "Read the latest persisted Team Plan for a Mandate as JSON (null if never planned). Arg: mandate_id. Tenant-scoped.",
+                &["mandate", "read"],
             ),
             (
                 "agent.approve_hire",

@@ -17,7 +17,7 @@ use crate::nodes::coordinator::agent::store::{
     default_approval_categories,
 };
 use crate::nodes::coordinator::spine::SpineStore;
-use crate::nodes::coordinator::spine::store::SpineStoreError;
+use crate::nodes::coordinator::spine::store::{SpineStoreError, TeamPlanRecord};
 use crate::nodes::coordinator::{CoordinatorError, TaskStore};
 
 // ── agent.create ─────────────────────────────────────────
@@ -353,20 +353,91 @@ pub fn handle_team_plan(
             .push("Create Briefs under this Mandate and assign them to the team.".to_string());
     }
 
+    // Coarse lifecycle status persisted on the plan row; the live
+    // `mandate.team_readiness` view recomputes actual readiness.
+    let clearance_ids: Vec<String> = clearances
+        .iter()
+        .filter_map(|c| c.get("clearance_id").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect();
+    let status = if !clearance_ids.is_empty() {
+        "awaiting_clearance"
+    } else if !pending_hires.is_empty() {
+        "staffing"
+    } else {
+        "planned"
+    };
+
+    // Persist the plan (durable artifact). Best-effort: the hires are
+    // already minted, so a persistence error must not lose that work —
+    // it is surfaced as `persisted: false` rather than failing the call.
+    let to_json_str =
+        |v: &serde_json::Value| serde_json::to_string(v).unwrap_or_else(|_| "[]".into());
+    let proposed_json = serde_json::to_string(&proposed_roles).unwrap_or_else(|_| "[]".into());
+    let pending_json = to_json_str(&serde_json::Value::Array(pending_hires.clone()));
+    let clearance_ids_json = serde_json::to_string(&clearance_ids).unwrap_or_else(|_| "[]".into());
+    let denials_json = to_json_str(&serde_json::Value::Array(denials.clone()));
+    let next_steps_json = serde_json::to_string(&next_steps).unwrap_or_else(|_| "[]".into());
+    let (plan_id, persisted) = match spine_store.record_team_plan(&TeamPlanRecord {
+        tenant_id: tenant,
+        mandate_id,
+        actor_id: &actor_label,
+        description: &description,
+        proposed_roles_json: &proposed_json,
+        pending_hires_json: &pending_json,
+        clearance_ids_json: &clearance_ids_json,
+        denials_json: &denials_json,
+        next_steps_json: &next_steps_json,
+        status,
+    }) {
+        Ok(id) => (Some(id), true),
+        Err(e) => {
+            tracing::warn!(mandate_id = %mandate_id, error = %e, "mandate.team_plan: persist failed");
+            (None, false)
+        }
+    };
+
     let plan = serde_json::json!({
         "mandate_id": mandate_id,
+        "plan_id": plan_id,
+        "persisted": persisted,
+        "status": status,
         "strategy_approved": true,
         "actor": actor_label,
         "description": description,
         "proposed_roles": proposed_roles,
         "pending_hires": pending_hires,
         "clearances": clearances,
+        "clearance_ids": clearance_ids,
         "denials": denials,
         "next_steps": next_steps,
     });
     match serde_json::to_vec(&plan) {
         Ok(b) => HandlerOutcome::Ok(b),
         Err(e) => internal(format!("mandate.team_plan encode: {e}")),
+    }
+}
+
+/// `mandate.team_plan.latest` — the most recent persisted Team Plan
+/// for a Mandate as JSON, or `{}`-ish `null` when none exists. Arg:
+/// `mandate_id`. Tenant-scoped: a Mandate/plan from another Guild
+/// reads as not-found.
+pub fn handle_team_plan_latest(spine_store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let mandate_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("mandate.team_plan.latest utf8: {e}")),
+    };
+    if mandate_id.is_empty() {
+        return invalid("mandate.team_plan.latest: mandate_id required".into());
+    }
+    match spine_store.latest_team_plan(ctx.tenant_id_or_default(), mandate_id) {
+        Ok(Some(plan)) => match serde_json::to_vec(&plan.to_json()) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("mandate.team_plan.latest encode: {e}")),
+        },
+        // No plan yet → JSON null (the dashboard renders an empty state).
+        Ok(None) => HandlerOutcome::Ok(b"null".to_vec()),
+        Err(e) => internal(format!("mandate.team_plan.latest: {e}")),
     }
 }
 
@@ -2038,6 +2109,68 @@ mod tests {
                 .iter()
                 .any(|r| r.method == SPAWN_CLEARANCE_METHOD && r.agent_id == hire_id)
         );
+    }
+
+    #[test]
+    fn team_plan_persists_and_latest_round_trips() {
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        let arg = format!("{m}|grow|planner,engineer:subj-eng");
+        let body = ok_body(handle_team_plan(&agents, &spine, &fake_ctx(arg.as_bytes())));
+        let v: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
+        assert_eq!(v["persisted"], true);
+        assert!(v["plan_id"].as_str().is_some());
+        // status reflects a pending hire with no clearance (operator path).
+        assert_eq!(v["status"], "staffing");
+
+        // The persisted latest plan round-trips the same content.
+        let latest = ok_body(handle_team_plan_latest(&spine, &fake_ctx(m.as_bytes())));
+        let lv: serde_json::Value = serde_json::from_slice(latest.as_bytes()).unwrap();
+        assert_eq!(lv["mandate_id"], m);
+        assert_eq!(lv["proposed_roles"], serde_json::json!(["planner"]));
+        assert_eq!(lv["pending_hires"][0]["role"], "engineer");
+        assert_eq!(lv["status"], "staffing");
+        assert_eq!(lv["plan_id"], v["plan_id"]);
+    }
+
+    #[test]
+    fn team_plan_latest_is_none_until_planned() {
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        let body = ok_body(handle_team_plan_latest(&spine, &fake_ctx(m.as_bytes())));
+        assert_eq!(body.trim(), "null");
+    }
+
+    #[test]
+    fn team_plan_latest_is_tenant_isolated() {
+        // Tenant A plans a team; tenant B must not read it.
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = spine
+            .create_mandate("tenant-a", "Ship", "real", None, None)
+            .unwrap();
+        spine.propose_strategy("tenant-a", &m, "plan").unwrap();
+        spine.approve_strategy("tenant-a", &m).unwrap();
+        let arg = format!("{m}|grow|planner");
+        // Plan as tenant A (operator).
+        let plan_ctx = fake_ctx_tenant(arg.as_bytes(), "tenant-a");
+        assert!(matches!(
+            handle_team_plan(&agents, &spine, &plan_ctx),
+            HandlerOutcome::Ok(_)
+        ));
+        // Tenant A reads its plan.
+        let a = ok_body(handle_team_plan_latest(
+            &spine,
+            &fake_ctx_tenant(m.as_bytes(), "tenant-a"),
+        ));
+        assert_ne!(a.trim(), "null", "tenant A must see its own plan");
+        // Tenant B reads null (cannot see tenant A's plan).
+        let b = ok_body(handle_team_plan_latest(
+            &spine,
+            &fake_ctx_tenant(m.as_bytes(), "tenant-b"),
+        ));
+        assert_eq!(b.trim(), "null", "tenant B must not read tenant A's plan");
     }
 
     // ── Spawn-Key enforcement (company-model §5.2A) ──────────
