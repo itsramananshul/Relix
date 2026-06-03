@@ -496,6 +496,66 @@ impl TaskStore {
         })
     }
 
+    /// PHASE 1 (Brief): move a Brief's **board status**, enforcing
+    /// the board state machine ([`brief::board_transition_allowed`]).
+    /// Board status is the column the Brief sits in on the operator
+    /// board — separate from the execution `status`. Returns the
+    /// `(from, to)` pair on success.
+    ///
+    /// Errors: `Invalid` if `to` is unknown or the move is illegal
+    /// (skipping columns, or leaving the terminal `cancelled`);
+    /// `NotFound` if the Brief doesn't exist.
+    pub fn set_board_status(
+        &self,
+        task_id: &str,
+        to: &str,
+    ) -> Result<(String, String), CoordinatorError> {
+        if !brief::is_board_status(to) {
+            return Err(CoordinatorError::Invalid(format!(
+                "unknown board status '{to}'"
+            )));
+        }
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let from: String = match conn.query_row(
+            "SELECT board_status FROM tasks WHERE task_id = ?1",
+            params![task_id],
+            |r| r.get(0),
+        ) {
+            Ok(s) => s,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(CoordinatorError::NotFound(task_id.to_string()));
+            }
+            Err(e) => return Err(CoordinatorError::Db(e)),
+        };
+        if !brief::board_transition_allowed(&from, to) {
+            return Err(CoordinatorError::Invalid(format!(
+                "illegal board move {from} -> {to}"
+            )));
+        }
+        let now = unix_secs();
+        conn.execute(
+            "UPDATE tasks SET board_status = ?1, updated_at = ?2 WHERE task_id = ?3",
+            params![to, now, task_id],
+        )
+        .map_err(CoordinatorError::Db)?;
+        Ok((from, to.to_string()))
+    }
+
+    /// PHASE 1 (Brief): read a Brief's current board status. `None`
+    /// when the Brief doesn't exist.
+    pub fn board_status(&self, task_id: &str) -> Result<Option<String>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        match conn.query_row(
+            "SELECT board_status FROM tasks WHERE task_id = ?1",
+            params![task_id],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(s) => Ok(Some(s)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(CoordinatorError::Db(e)),
+        }
+    }
+
     /// Insert a new Task. Returns the freshly-minted `task_id`
     /// (32 hex chars). Optional retry / timeout metadata defaults to
     /// "no retry, no timeout" for backwards compatibility with pre-C1
@@ -4377,6 +4437,19 @@ pub fn register(
         );
     }
     {
+        // PHASE 1 (Brief): board-status move, enforcing the board
+        // state machine. Distinct from `task.update` (execution
+        // status) — this is the operator-board column.
+        let s = store.clone();
+        bridge.register(
+            "brief.move",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_move(&s, &ctx) }
+            })),
+        );
+    }
+    {
         let s = store.clone();
         bridge.register(
             "task.recover",
@@ -5042,6 +5115,30 @@ fn handle_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
             HandlerOutcome::Ok(buf.into_bytes())
         }
         Err(e) => internal(format!("task.list: {e}")),
+    }
+}
+
+/// `brief.move` — move a Brief's board status. Arg: `task_id|board_status`.
+/// Enforces the board state machine; returns `from -> to` as the body.
+fn handle_brief_move(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.move utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    if parts.len() < 2 {
+        return invalid("brief.move: expected `task_id|board_status`".to_string());
+    }
+    let task_id = parts[0].trim();
+    let to = parts[1].trim();
+    if task_id.is_empty() {
+        return invalid("brief.move: task_id required".to_string());
+    }
+    match store.set_board_status(task_id, to) {
+        Ok((from, to)) => HandlerOutcome::Ok(format!("{from} -> {to}").into_bytes()),
+        Err(CoordinatorError::NotFound(id)) => invalid(format!("brief.move: not found: {id}")),
+        Err(CoordinatorError::Invalid(m)) => invalid(format!("brief.move: {m}")),
+        Err(e) => internal(format!("brief.move: {e}")),
     }
 }
 
@@ -7616,6 +7713,71 @@ mod tests {
 
     fn store() -> TaskStore {
         TaskStore::in_memory().expect("open")
+    }
+
+    #[test]
+    fn phase1_brief_board_move_enforces_the_state_machine() {
+        let s = store();
+        let id = s
+            .create(
+                "ship the landing page",
+                "flows/none.sol",
+                "{}",
+                "subject-1",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Fresh Briefs open in 'backlog'.
+        assert_eq!(s.board_status(&id).unwrap().as_deref(), Some("backlog"));
+
+        // Walk the happy path; the from→to pair is reported.
+        assert_eq!(
+            s.set_board_status(&id, "todo").unwrap(),
+            ("backlog".to_string(), "todo".to_string())
+        );
+        s.set_board_status(&id, "in_progress").unwrap();
+        s.set_board_status(&id, "in_review").unwrap();
+        s.set_board_status(&id, "done").unwrap();
+        assert_eq!(s.board_status(&id).unwrap().as_deref(), Some("done"));
+
+        // Illegal skips and unknown statuses are rejected.
+        let id2 = s
+            .create(
+                "x",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            s.set_board_status(&id2, "done"),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        assert!(matches!(
+            s.set_board_status(&id2, "bogus"),
+            Err(CoordinatorError::Invalid(_))
+        ));
+
+        // Cancel is terminal.
+        s.set_board_status(&id2, "cancelled").unwrap();
+        assert!(matches!(
+            s.set_board_status(&id2, "todo"),
+            Err(CoordinatorError::Invalid(_))
+        ));
+
+        // Unknown Brief → NotFound.
+        assert!(matches!(
+            s.set_board_status("nope", "todo"),
+            Err(CoordinatorError::NotFound(_))
+        ));
     }
 
     /// File-backed open helper for the DB-hardening tests. We
