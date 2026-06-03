@@ -591,6 +591,34 @@ impl TaskStore {
         self.list_brief_edges(task, "blocked_on")
     }
 
+    /// PHASE 1 (Brief): clear a **Snag** — remove the `task` →
+    /// `blocker` 'blocked_on' edge (the dependency was wrong, or has
+    /// been resolved out-of-band). Chronicles `brief.snag_cleared`
+    /// when an edge is actually removed. Idempotent: clearing a
+    /// non-existent Snag is a no-op success. `task` must exist.
+    pub fn remove_snag(&self, task: &str, blocker: &str) -> Result<(), CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, task)? {
+            return Err(CoordinatorError::NotFound(task.to_string()));
+        }
+        let removed = conn
+            .execute(
+                "DELETE FROM task_edges
+                 WHERE task_id = ?1 AND edge_type = 'blocked_on' AND related_task_id = ?2",
+                params![task, blocker],
+            )
+            .map_err(CoordinatorError::Db)?;
+        if removed > 0 {
+            let now = unix_secs();
+            let _ = conn.execute(
+                "INSERT INTO task_events (task_id, ts, event_type, payload)
+                 VALUES (?1, ?2, 'brief.snag_cleared', ?3)",
+                params![task, now, blocker],
+            );
+        }
+        Ok(())
+    }
+
     /// PHASE 1 (Brief): is `task` blocked? True when it has at
     /// least one Snag whose blocker has NOT reached board status
     /// `done`. Per the locked rule, only `done` resolves a Snag —
@@ -5307,6 +5335,16 @@ pub fn register(
     {
         let s = store.clone();
         bridge.register(
+            "brief.unsnag",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_unsnag(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
             "brief.snags",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -6314,6 +6352,19 @@ fn handle_brief_snag(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     match store.add_snag(task, blocker) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.snag", e),
+    }
+}
+
+/// `brief.unsnag` — clear the `task` → `blocker` Snag (a wrong /
+/// resolved dependency). Arg `task|blocker`. Idempotent.
+fn handle_brief_unsnag(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let (task, blocker) = match parse_pair(ctx, "brief.unsnag") {
+        Ok(p) => p,
+        Err(o) => return o,
+    };
+    match store.remove_snag(task, blocker) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.unsnag", e),
     }
 }
 
@@ -9535,6 +9586,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload, "todo -> in_progress");
+    }
+
+    #[test]
+    fn remove_snag_unblocks_and_chronicles() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        let task = mk("task");
+        let blocker = mk("blocker");
+        s.add_snag(&task, &blocker).unwrap();
+        assert!(s.is_blocked(&task).unwrap());
+
+        // Clear the (wrong) dependency → unblocked.
+        s.remove_snag(&task, &blocker).unwrap();
+        assert!(!s.is_blocked(&task).unwrap());
+        assert!(s.list_snags(&task).unwrap().is_empty());
+
+        // Idempotent: clearing again is a no-op success.
+        s.remove_snag(&task, &blocker).unwrap();
+        // Unknown task → NotFound.
+        assert!(matches!(
+            s.remove_snag("nope", &blocker),
+            Err(CoordinatorError::NotFound(_))
+        ));
+
+        // Exactly one snag_cleared event was chronicled.
+        let conn = s.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_events
+                 WHERE task_id = ?1 AND event_type = 'brief.snag_cleared'",
+                params![task],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]
