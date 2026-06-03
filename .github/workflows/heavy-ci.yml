@@ -1,11 +1,13 @@
 name: heavy-ci
 
-# Strict checks. Run manually before milestone completion or before merging
-# a substrate-touching PR. Not on every push.
-# - cargo clippy --workspace --all-targets -D warnings
-# - cargo deny check (licenses, bans, sources)
-# - cargo audit (advisories — visibility; failure handled per advisory policy)
-# - end-to-end integration scripts (where available)
+# On-demand end-to-end check. The required hygiene gates (fmt, clippy,
+# test matrix, cargo deny) now run on every push and PR in ci.yml, so this
+# workflow carries only the heavy multi-process mesh bring-up, which is too
+# slow and port-bound to run on every push.
+#
+# Triggers:
+#   workflow_dispatch           operator runs it before a milestone push.
+#   pull_request labeled heavy  run the end-to-end demo against a PR.
 #
 # See docs/ci-strategy.md.
 
@@ -13,17 +15,11 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [main]
-    # Only run on PRs labeled `heavy` to keep most PRs in fast-ci.
+    # Only run on PRs labeled `heavy` to keep most PRs on the fast ci.yml gate.
     types: [labeled, opened, synchronize, reopened]
 
 permissions:
   contents: read
-  # rustsec/audit-check needs `checks: write` to publish check-run output;
-  # without it the action errors out with "Resource not accessible by integration".
-  checks: write
-  # security-events write lets advisory results show up in the GitHub
-  # Security tab (Code Scanning); harmless when unused.
-  security-events: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,57 +42,8 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::heavy-ci skipped (label 'heavy' not present); fast-ci runs in parallel."
+            echo "::notice::heavy-ci skipped (label 'heavy' not present); ci.yml runs the required gates."
           fi
-
-  clippy:
-    name: cargo clippy --all-targets
-    needs: filter
-    if: needs.filter.outputs.run == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: heavy-ci
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-
-  deny:
-    name: cargo deny check
-    needs: filter
-    if: needs.filter.outputs.run == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      # Pin to a known-good action version; binaries cached internally.
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          # Run all categories — licenses/bans/sources are hard gates;
-          # advisories category is handled by the nightly workflow with
-          # per-advisory ignore rationale in docs/security-advisories.md.
-          command: check licenses bans sources
-
-  audit:
-    name: cargo audit (advisories — hard gate)
-    needs: filter
-    if: needs.filter.outputs.run == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Hard gate: a PR touching a transitive dep with a known CVE must
-    # fail this job. Per-advisory exceptions live in `deny.toml`
-    # `[advisories] ignore` (mirrored in docs/security-advisories.md)
-    # with documented rationale and review condition — no silent
-    # suppression here.
-    steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
   integration:
     name: end-to-end M5 demo

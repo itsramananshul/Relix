@@ -436,7 +436,9 @@ fn apply_sandbox(cmd: &mut Command, limits: &SandboxLimits) {
     // (setrlimit, raw libc::prctl, raw libc syscall(). No
     // heap allocation. Returns 0 on success to let exec
     // proceed.
-    use std::os::unix::process::CommandExt as _;
+    //
+    // `pre_exec` is the inherent tokio::process::Command method on unix, so
+    // no std CommandExt import is needed.
     unsafe {
         cmd.pre_exec(move || {
             use rlimit::{Resource, setrlimit};

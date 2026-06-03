@@ -635,11 +635,7 @@ mod tests {
         let still: Vec<_> = std::fs::read_dir(dir.path())
             .expect("readdir")
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains("quarantined-")
-            })
+            .filter(|e| e.file_name().to_string_lossy().contains("quarantined-"))
             .collect();
         assert!(still.is_empty(), "must not quarantine a current-key tamper");
     }
@@ -651,7 +647,8 @@ mod tests {
         let mut f = std::fs::File::create(path).expect("create");
         for rec in recs {
             let bytes = codec::encode(rec).expect("encode");
-            f.write_all(&(bytes.len() as u32).to_be_bytes()).expect("len");
+            f.write_all(&(bytes.len() as u32).to_be_bytes())
+                .expect("len");
             f.write_all(&bytes).expect("bytes");
         }
         f.sync_data().expect("sync");
