@@ -756,6 +756,94 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// PHASE 1 (Brief): set one of the Brief's spine fields —
+    /// `assignee` / `priority` / `mandate` / `campaign`. Empty
+    /// value clears assignee/mandate/campaign (NULL); `priority`
+    /// must be a valid level. The Brief must exist.
+    ///
+    /// NOTE: assignee/mandate/campaign are stored as soft links
+    /// (the Operative lives in the agent store, the Mandate /
+    /// Campaign in the spine store — both separate DBs), so
+    /// cross-object existence is the caller's responsibility for
+    /// now.
+    pub fn set_brief_field(
+        &self,
+        task_id: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<(), CoordinatorError> {
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, task_id)? {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let changed = match field {
+            "priority" => {
+                let v = value.trim();
+                if !brief::is_priority(v) {
+                    return Err(CoordinatorError::Invalid(format!(
+                        "priority '{v}' not in low/normal/high/urgent"
+                    )));
+                }
+                conn.execute(
+                    "UPDATE tasks SET priority=?1, updated_at=?2 WHERE task_id=?3",
+                    params![v, now, task_id],
+                )
+            }
+            "assignee" | "mandate" | "campaign" => {
+                let col = match field {
+                    "assignee" => "assignee_agent_id",
+                    "mandate" => "mandate_id",
+                    _ => "campaign_id",
+                };
+                let t = value.trim();
+                let stored: Option<&str> = if t.is_empty() { None } else { Some(t) };
+                // `col` is from the fixed match above, never user input.
+                let sql =
+                    format!("UPDATE tasks SET {col}=?1, updated_at=?2 WHERE task_id=?3");
+                conn.execute(&sql, params![stored, now, task_id])
+            }
+            other => {
+                return Err(CoordinatorError::Invalid(format!(
+                    "unknown brief field '{other}' (assignee/priority/mandate/campaign)"
+                )));
+            }
+        }
+        .map_err(CoordinatorError::Db)?;
+        if changed == 0 {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// PHASE 1 (Brief): read a Brief's spine fields. `None` when
+    /// the Brief doesn't exist.
+    pub fn brief_fields(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<brief::BriefFields>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        match conn.query_row(
+            "SELECT task_id, assignee_agent_id, board_status, priority, mandate_id, campaign_id
+             FROM tasks WHERE task_id = ?1",
+            params![task_id],
+            |r| {
+                Ok(brief::BriefFields {
+                    task_id: r.get(0)?,
+                    assignee_agent_id: r.get(1)?,
+                    board_status: r.get(2)?,
+                    priority: r.get(3)?,
+                    mandate_id: r.get(4)?,
+                    campaign_id: r.get(5)?,
+                })
+            },
+        ) {
+            Ok(f) => Ok(Some(f)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(CoordinatorError::Db(e)),
+        }
+    }
+
     /// Insert a new Task. Returns the freshly-minted `task_id`
     /// (32 hex chars). Optional retry / timeout metadata defaults to
     /// "no retry, no timeout" for backwards compatibility with pre-C1
@@ -4732,6 +4820,28 @@ pub fn register(
             })),
         );
     }
+    // PHASE 1 (Brief): spine-field set + read (assignee, priority,
+    // mandate/campaign links).
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.set",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_set(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.fields",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_fields(&s, &ctx) }
+            })),
+        );
+    }
     {
         let s = store.clone();
         bridge.register(
@@ -5562,6 +5672,40 @@ fn handle_brief_dossier_get(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOu
         },
         Ok(None) => invalid(format!("brief.dossier_get: not found: {doc_id}")),
         Err(e) => map_edge_err("brief.dossier_get", e),
+    }
+}
+
+/// `brief.set` — set a Brief spine field. Arg `task_id|field|value`
+/// (field = assignee/priority/mandate/campaign; empty value clears
+/// assignee/mandate/campaign).
+fn handle_brief_set(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.set utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(3, '|').collect();
+    if parts.len() < 3 {
+        return invalid("brief.set: expected `task_id|field|value`".to_string());
+    }
+    match store.set_brief_field(parts[0].trim(), parts[1].trim(), parts[2]) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.set", e),
+    }
+}
+
+/// `brief.fields` — read a Brief's spine fields (JSON). Arg `task_id`.
+fn handle_brief_fields(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task = match single_id(ctx, "brief.fields") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    match store.brief_fields(task) {
+        Ok(Some(f)) => match serde_json::to_vec(&f) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.fields encode: {e}")),
+        },
+        Ok(None) => invalid(format!("brief.fields: not found: {task}")),
+        Err(e) => map_edge_err("brief.fields", e),
     }
 }
 
@@ -8338,6 +8482,60 @@ mod tests {
             Err(CoordinatorError::NotFound(_))
         ));
         assert!(s.get_dossier("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn phase1_brief_spine_fields_set_and_read() {
+        let s = store();
+        let id = s
+            .create(
+                "b",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Defaults.
+        let f = s.brief_fields(&id).unwrap().unwrap();
+        assert_eq!(f.board_status, "backlog");
+        assert_eq!(f.priority, "normal");
+        assert_eq!(f.assignee_agent_id, None);
+        assert_eq!(f.mandate_id, None);
+        assert_eq!(f.campaign_id, None);
+
+        // Set each spine field.
+        s.set_brief_field(&id, "assignee", "agt_eng_1").unwrap();
+        s.set_brief_field(&id, "priority", "high").unwrap();
+        s.set_brief_field(&id, "mandate", "mandate_x").unwrap();
+        s.set_brief_field(&id, "campaign", "camp_y").unwrap();
+        let f = s.brief_fields(&id).unwrap().unwrap();
+        assert_eq!(f.assignee_agent_id.as_deref(), Some("agt_eng_1"));
+        assert_eq!(f.priority, "high");
+        assert_eq!(f.mandate_id.as_deref(), Some("mandate_x"));
+        assert_eq!(f.campaign_id.as_deref(), Some("camp_y"));
+
+        // Empty clears the soft links.
+        s.set_brief_field(&id, "assignee", "").unwrap();
+        assert_eq!(s.brief_fields(&id).unwrap().unwrap().assignee_agent_id, None);
+
+        // Validation.
+        assert!(matches!(
+            s.set_brief_field(&id, "priority", "bogus"),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        assert!(matches!(
+            s.set_brief_field(&id, "nope", "x"),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        assert!(matches!(
+            s.set_brief_field("missing", "priority", "high"),
+            Err(CoordinatorError::NotFound(_))
+        ));
     }
 
     /// File-backed open helper for the DB-hardening tests. We

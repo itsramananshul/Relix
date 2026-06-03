@@ -39,6 +39,19 @@ pub struct DossierMeta {
     pub updated_at: i64,
 }
 
+/// The product-spine fields of a Brief (the columns layered onto
+/// the Task ledger): who it's assigned to, where it sits on the
+/// board, its priority, and what it links *up* to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BriefFields {
+    pub task_id: String,
+    pub assignee_agent_id: Option<String>,
+    pub board_status: String,
+    pub priority: String,
+    pub mandate_id: Option<String>,
+    pub campaign_id: Option<String>,
+}
+
 /// The board columns a Brief can sit in.
 ///
 /// `backlog → todo → in_progress → in_review → done` is the happy
