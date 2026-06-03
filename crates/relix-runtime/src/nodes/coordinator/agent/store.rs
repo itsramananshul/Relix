@@ -76,6 +76,10 @@ pub struct AgentProfile {
     /// default Rig. Nullable; existing rows read NULL.
     #[serde(default)]
     pub rig: Option<String>,
+    /// PILLAR 2 / governance: this Operative's monthly **Allowance**
+    /// (budget) in cents. `None` = no per-agent cap. Nullable.
+    #[serde(default)]
+    pub monthly_allowance_cents: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -643,7 +647,7 @@ impl AgentStore {
                         allow_sensitivity_tags, deny_sensitivity_tags,
                         approval_required_categories, authorized_approvers,
                         approval_timeout_secs,
-                        created_at, updated_at, profile, reports_to, rig
+                        created_at, updated_at, profile, reports_to, rig, monthly_allowance_cents
                  FROM agent_profiles WHERE subject_id = ?1 AND tenant_id = ?2",
                 params![subject_id, tenant],
                 row_to_agent,
@@ -675,7 +679,7 @@ impl AgentStore {
                         allow_sensitivity_tags, deny_sensitivity_tags,
                         approval_required_categories, authorized_approvers,
                         approval_timeout_secs,
-                        created_at, updated_at, profile, reports_to, rig
+                        created_at, updated_at, profile, reports_to, rig, monthly_allowance_cents
                  FROM agent_profiles WHERE subject_id = ?1",
                 params![subject_id],
                 row_to_agent,
@@ -954,6 +958,34 @@ impl AgentStore {
                     if trimmed.is_empty() { None } else { Some(trimmed) };
                 conn.execute(
                     "UPDATE agent_profiles SET rig=?1, updated_at=?2 WHERE agent_id=?3",
+                    params![stored, now, agent_id],
+                )?
+            }
+            "allowance" => {
+                // Governance: this Operative's monthly Allowance in
+                // cents. Empty clears the cap; negative / non-integer
+                // are rejected.
+                let trimmed = value.trim();
+                let stored: Option<i64> = if trimmed.is_empty() {
+                    None
+                } else {
+                    match trimmed.parse::<i64>() {
+                        Ok(c) if c >= 0 => Some(c),
+                        Ok(_) => {
+                            return Err(AgentStoreError::BadInput(
+                                "allowance must be >= 0".into(),
+                            ));
+                        }
+                        Err(_) => {
+                            return Err(AgentStoreError::BadInput(format!(
+                                "allowance not an integer: {trimmed}"
+                            )));
+                        }
+                    }
+                };
+                conn.execute(
+                    "UPDATE agent_profiles SET monthly_allowance_cents=?1, updated_at=?2
+                     WHERE agent_id=?3",
                     params![stored, now, agent_id],
                 )?
             }
@@ -1772,7 +1804,7 @@ const SELECT_AGENT: &str = "SELECT agent_id, name, role, title, department, team
         allow_sensitivity_tags, deny_sensitivity_tags,
         approval_required_categories, authorized_approvers,
         approval_timeout_secs,
-        created_at, updated_at, profile, reports_to, rig
+        created_at, updated_at, profile, reports_to, rig, monthly_allowance_cents
  FROM agent_profiles WHERE agent_id = ?1";
 
 const SELECT_APPROVAL: &str =
@@ -1807,7 +1839,8 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              created_at      INTEGER NOT NULL,
              updated_at      INTEGER NOT NULL,
              reports_to      TEXT,
-             rig             TEXT
+             rig             TEXT,
+             monthly_allowance_cents INTEGER
          );
          CREATE UNIQUE INDEX IF NOT EXISTS agent_profiles_subject
              ON agent_profiles(subject_id);
@@ -1920,6 +1953,8 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     ensure_column(conn, "agent_profiles", "reports_to", "TEXT")?;
     // PILLAR 2 (Rig): the agent backend that powers an Operative.
     ensure_column(conn, "agent_profiles", "rig", "TEXT")?;
+    // Governance: per-Operative monthly Allowance (budget, cents).
+    ensure_column(conn, "agent_profiles", "monthly_allowance_cents", "INTEGER")?;
     // GROUP 6: tenant isolation. Add `tenant_id` to the per-caller
     // agent/approval tables. Idempotent (ensure_column probes
     // PRAGMA); existing rows default to the reserved 'default'
@@ -2174,6 +2209,7 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
         // so every existing positional index above is unchanged.
         reports_to: r.get::<_, Option<String>>(21)?,
         rig: r.get::<_, Option<String>>(22)?,
+        monthly_allowance_cents: r.get::<_, Option<i64>>(23)?,
     })
 }
 
@@ -2415,6 +2451,32 @@ mod tests {
         // Clear it back to the default.
         s.update_agent_field(&id, "rig", "").unwrap();
         assert_eq!(s.get_agent(&id).unwrap().unwrap().rig, None);
+    }
+
+    #[test]
+    fn agent_allowance_sets_clears_and_validates() {
+        let s = store();
+        let id = s
+            .create_agent(
+                "n", "r", "t", "d", "t", "op", "subj-allw", "low", "default",
+            )
+            .unwrap();
+        assert_eq!(
+            s.get_agent(&id).unwrap().unwrap().monthly_allowance_cents,
+            None
+        );
+        s.update_agent_field(&id, "allowance", "25000").unwrap();
+        assert_eq!(
+            s.get_agent(&id).unwrap().unwrap().monthly_allowance_cents,
+            Some(25000)
+        );
+        s.update_agent_field(&id, "allowance", "").unwrap();
+        assert_eq!(
+            s.get_agent(&id).unwrap().unwrap().monthly_allowance_cents,
+            None
+        );
+        assert!(s.update_agent_field(&id, "allowance", "-5").is_err());
+        assert!(s.update_agent_field(&id, "allowance", "abc").is_err());
     }
 
     // ── agent CRUD ───────────────────────────────────────
