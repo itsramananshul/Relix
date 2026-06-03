@@ -351,6 +351,45 @@ pub async fn set_due(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RelationRequest {
+    /// The other Brief's task id (a blocker, or a child Sub-brief).
+    pub other: String,
+}
+
+/// `POST /v1/spine/briefs/:id/snag` — record `id` blocked by `other`.
+pub async fn add_snag(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RelationRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let arg = format!("{id}|{}", req.other.trim());
+    call_peer(&state, "brief.snag", arg.as_bytes()).await?;
+    ok_json()
+}
+
+/// `POST /v1/spine/briefs/:id/unsnag` — clear the `id`→`other` Snag.
+pub async fn remove_snag(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RelationRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let arg = format!("{id}|{}", req.other.trim());
+    call_peer(&state, "brief.unsnag", arg.as_bytes()).await?;
+    ok_json()
+}
+
+/// `POST /v1/spine/briefs/:id/subbrief` — link `other` as a Sub-brief.
+pub async fn add_subbrief(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RelationRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let arg = format!("{id}|{}", req.other.trim());
+    call_peer(&state, "brief.subbrief", arg.as_bytes()).await?;
+    ok_json()
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CreateMandateRequest {
     pub title: String,
     #[serde(default)]
@@ -585,6 +624,9 @@ mod tests {
             .route("/v1/spine/briefs/:id/pin", post(pin_brief))
             .route("/v1/spine/briefs/:id/comment", post(comment_brief))
             .route("/v1/spine/briefs/:id/due", post(set_due))
-            .route("/v1/spine/briefs/:id/set", post(set_field));
+            .route("/v1/spine/briefs/:id/set", post(set_field))
+            .route("/v1/spine/briefs/:id/snag", post(add_snag))
+            .route("/v1/spine/briefs/:id/unsnag", post(remove_snag))
+            .route("/v1/spine/briefs/:id/subbrief", post(add_subbrief));
     }
 }

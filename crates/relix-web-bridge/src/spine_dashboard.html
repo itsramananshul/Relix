@@ -206,10 +206,20 @@ async function openBrief(id) {
     const psel = el("select"); for (const p of ["low","normal","high","urgent"]) psel.append(el("option",{value:p,textContent:p,selected:p===f.priority}));
     pf.append(psel, " ", el("button",{className:"ghost",textContent:"Set",onclick:()=>setField("priority", psel.value)})); body.append(pf);
     const sect = (label, items) => { if(!items||!items.length) return; const r=el("div",{className:"row"}); r.append(el("div",{className:"lbl",textContent:label})); const ul=el("ul"); for(const i of items) ul.append(el("li",{textContent:i})); r.append(ul); body.append(r); };
+    const rel = async (action, other)=>{ if(!other||!other.trim()) return; try { await api("/v1/spine/briefs/"+id+"/"+action,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({other:other.trim()})}); openBrief(id); loadBoard(); } catch(e){ alert(e.message); } };
     sect("Labels", d.labels);
     sect("Sub-briefs", d.subbriefs);
     sect("Snags (blocked by)", d.snags);
     sect("Blocking", d.blocking);
+    // Relation editing.
+    const relRow = el("div",{className:"row"});
+    relRow.append(el("div",{className:"lbl",textContent:"Link"}));
+    const rin = el("input",{placeholder:"other brief id", style:"width:55%"});
+    relRow.append(rin," ",
+      el("button",{className:"ghost",textContent:"+Snag",onclick:()=>rel("snag",rin.value)})," ",
+      el("button",{className:"ghost",textContent:"-Snag",onclick:()=>rel("unsnag",rin.value)})," ",
+      el("button",{className:"ghost",textContent:"+Sub",onclick:()=>rel("subbrief",rin.value)}));
+    body.append(relRow);
     if (d.dossiers && d.dossiers.length) sect("Dossiers", d.dossiers.map(x=>"["+x.kind+"] "+x.title));
     if (d.blocked) body.append(el("div",{className:"err",textContent:"⚠ blocked"}));
     const cr = el("div",{className:"row"});
