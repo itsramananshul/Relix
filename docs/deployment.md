@@ -272,17 +272,16 @@ tooling is in
 
 What ships today (Phase 1):
 
-- **Save before deleting** — `relix-cli task export
-  --task-id ID --out FILE` or the dashboard's per-task
-  **Export** button writes a single-JSON archival
-  artifact (header + every attempt + every chronicle
-  event). Pipe to `gzip` for long-term storage.
-- **Plan before any future deletion** — `relix-cli task
-  compact --max-age-secs N` or the dashboard's
-  **Chronicle retention** widget counts what *would*
-  be deleted under a max-age policy, broken down by
-  parent task status. Honours the R5 invariant
-  (terminal-state tasks only, never in-flight).
+- **Save before deleting.** `relix-cli task export
+  --task-id ID --out FILE` (HTTP: `GET /v1/tasks/:id/export`)
+  writes a single-JSON archival artifact (header + every
+  attempt + every chronicle event). Pipe to `gzip` for
+  long-term storage.
+- **Plan before any future deletion.** `relix-cli task
+  compact --max-age-secs N` counts what *would* be deleted
+  under a max-age policy, broken down by parent task status.
+  Honours the R5 invariant (terminal-state tasks only, never
+  in-flight).
 
 What does NOT ship today: destructive deletion of
 chronicle rows. The dry-run counter exists so operators

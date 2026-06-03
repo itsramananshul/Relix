@@ -15,6 +15,7 @@
 
 mod approval;
 mod belief;
+mod bridge_token;
 mod browser;
 mod build;
 mod capability;
@@ -459,9 +460,10 @@ enum Cmd {
     /// responses for scripting.
     Build(build::BuildArgs),
 
-    /// Stop every running `relix-controller` and `relix-web-bridge`
-    /// on this machine. Idempotent — exits 0 if nothing was running.
-    Stop,
+    /// Stop the local mesh by terminating only the PIDs `relix boot`
+    /// recorded in its pidfile. An unrelated mesh on the same machine
+    /// survives. Idempotent - exits 0 if nothing was running.
+    Stop(mesh::StopArgs),
 
     /// Print bridge health + topology snapshot. Exits 1 if the bridge
     /// is unreachable, so this is safe to use as a CI / shell gate.
@@ -604,7 +606,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Setup => setup::run().await,
         Cmd::Boot(args) => mesh::boot(args).await,
         Cmd::Build(args) => build::run(args).await,
-        Cmd::Stop => mesh::stop(),
+        Cmd::Stop(args) => mesh::stop(args),
         Cmd::Status(args) => mesh::status(args).await,
         Cmd::Update(args) => update::run(args).await,
         Cmd::Install(args) => install::run(args).await,

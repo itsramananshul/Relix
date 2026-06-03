@@ -343,18 +343,32 @@ note from the original audit no longer applies.
 
 ## 4. WHAT THE DASHBOARD SHOWS
 
-**0.4.1 update:** The operator dashboard was fully rebuilt as of May 31, 2026 into
-a single self-contained `dashboard.html` (CSS + JS inline, no external deps, no CDN)
-with **18 top-level sections** — expanded from the original 12. New sections in 0.4.1:
-Chat, Memory (inspector, dialectic, quarantine), Approvals, Skills, Sessions, Reasoning,
-Credentials, Identity, Multi-Tenant, Planning, Workflows, and a live Logs stream
-(`GET /v1/logs/stream` SSE). The subsection inventory below reflects the
-pre-rebuild structure and is annotated where sections have changed materially.
+**Update:** The operator dashboard was rebuilt in v0.3.0 into a single
+self-contained `dashboard.html` (CSS + JS inline, no external deps, no
+CDN). The current build carries **22 top-level sections**. The
+subsection inventory below reflects the pre-rebuild structure and is
+annotated where sections have changed materially.
 
 Served by `relix-web-bridge` at `GET /dashboard` as a single static
-HTML file with inline JS (no build step). Eighteen top-level sections, each
-addressable via `#/<route>` and `data-page="<route>"` in
-`crates/relix-web-bridge/src/dashboard.html`.
+HTML file with inline JS (no build step). Twenty-two top-level
+sections, each a `data-section="<id>"` panel selected from the sidebar
+`SECTIONS` array in `crates/relix-web-bridge/src/dashboard.html`. There
+is no `#/...` hash routing and no `data-page` attribute.
+
+> **Superseded subsections.** The current twenty-two panels are
+> Overview, Tasks, Scheduled Jobs, Chat, Memory, Approvals, Skills,
+> Sessions, Reasoning, Credentials, Identity, Cost & Metrics,
+> Observability, Policy Denials, Multi-Tenant, Planning, Workflows,
+> Email, Plugins, MCP Servers, Configuration, and Logs. The §4.1 to
+> §4.10 subsections below describe the pre-rebuild page set
+> (`#/tasks`, `#/topology`, `#/capabilities`, `#/mcp`, `#/fsaudit`,
+> `#/termaudit`, `#/browser`, `#/metrics`, `#/providers`) and use a
+> `#/...` hash routing that no longer exists. Tasks, Scheduled Jobs
+> (cron), Policy Denials, and MCP Servers are now real panels; there
+> is still no Topology, Capabilities, fsaudit, termaudit, browser,
+> Metrics, or Providers page, and that data lives on the HTTP API and
+> the `relix` CLI. See [operator-guide.md](operator-guide.md) for the
+> per-panel breakdown.
 
 ### 4.1 `#/overview`
 
@@ -1009,7 +1023,7 @@ multi-org boundaries — not actively in a slice.
 - `docs/replay-model.md` — still accurate: SOL VM is synchronous, pause-and-resume is still hard.
 - `docs/plugin-foundations.md` — **partially stale**: the subprocess plugin system ships as of 0.4.1 (§6.1d). The M1/M2/M3 constraints remain correct; WASM sandbox and marketplace are still future.
 - `docs/multi-node-bringup.md` — describes `relix-mesh-up.ps1` flow; still accurate.
-- `docs/dashboard-redesign.md` — the 18-section operator dashboard rebuild shipped (May 31, 2026). Some redesign refs are still useful for context.
+- `docs/dashboard-redesign.md`: the operator dashboard rebuild shipped (May 31, 2026) as 18 sections, later extended to 22 by RELA-31 (Tasks, Scheduled Jobs, Policy Denials, MCP Servers). Some redesign refs are still useful for context.
 - `docs/production-checklist.md` — operational gates for a hypothetical production deploy. Not a track.
 
 ### 7.5 Specs / SIMP entries deferred to Gate 2

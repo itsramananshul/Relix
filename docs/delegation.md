@@ -151,8 +151,8 @@ relix-cli ops delegate spawn \
   --target-subject-id <agent-b>
 ```
 
-Then either watch the dashboard's task detail page (the new
-**Delegations** panel) or:
+Then watch the child task via `relix-cli task watch <child>`
+(or `GET /v1/tasks/<child>`) or:
 
 ```
 relix-cli ops delegate result --child-task-id <child>
@@ -189,8 +189,8 @@ The bridge proxies all four as JSON at `/v1/delegate/*`:
 Two places to look:
 
 - **`latest_result` column** on the child task (first 800 chars of
-  the AI reply). Visible at `#/tasks/<child_id>` and via
-  `task.get`.
+  the AI reply). Visible via `task.get` /
+  `GET /v1/tasks/<child_id>`.
 - **Chronicle events** on both tasks:
   - On the child: `delegate.completed` (with `chars=N|preview=...`)
     or `delegate.failed` (with `cause=...`).

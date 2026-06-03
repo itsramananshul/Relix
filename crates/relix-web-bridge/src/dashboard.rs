@@ -237,6 +237,42 @@ mod tests {
         }
     }
 
+    /// RELA-31: the four endpoint-group panels (tasks, cron,
+    /// policy denials, mcp) must each register a `<section>` and
+    /// a sidebar nav entry so they are reachable from navigation
+    /// and not dead code. Asserts both the section landmark and
+    /// the `data-nav` routing marker the SECTIONS array emits.
+    #[tokio::test]
+    async fn page_body_contains_rela31_panel_section_and_nav_ids() {
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for sec in ["tasks", "cron", "denials", "mcp"] {
+            assert!(
+                body.contains(&format!("id=\"section-{sec}\"")),
+                "missing section id for new panel {sec}"
+            );
+            assert!(
+                body.contains(&format!("data-section=\"{sec}\"")),
+                "missing data-section marker for new panel {sec}"
+            );
+        }
+        // Each panel must reference its real backend endpoint
+        // group (the call path is built inline, so assert on the
+        // endpoint string rather than a specific call expression).
+        for needle in [
+            "/v1/tasks?limit=",
+            "/v1/cron/jobs",
+            "/v1/policy/denials",
+            "/v1/mcp/servers",
+        ] {
+            assert!(
+                body.contains(needle),
+                "new panel is not wired to its real endpoint: {needle}"
+            );
+        }
+    }
+
     /// The dashboard ships everything inline — there must be no
     /// `<script src=>` or `<link href=>` pointing at an external
     /// resource (the strict CSP would block any such load anyway,

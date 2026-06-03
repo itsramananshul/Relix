@@ -459,11 +459,13 @@ pub struct AppState {
     /// Backs the `/v1/agents/access` endpoint. See
     /// `crates/relix-runtime/src/nodes/execution/broker.rs`.
     pub access_broker: std::sync::Arc<relix_runtime::nodes::execution::broker::AgentAccessBroker>,
-    /// Discoverable tool registry. Empty by default — the
-    /// tool node publishes its capability descriptors at
-    /// startup and the bridge builds the registry from them.
-    /// Backs `/v1/tools` (list) and `/v1/tools/search`
-    /// (keyword). See
+    /// Discoverable tool registry. Built empty here and
+    /// reassigned in `main.rs` after the startup discovery pass
+    /// via `crate::tools::registry_from_manifest`, which reads
+    /// the tool node's advertised capability descriptors out of
+    /// the manifest cache. Stays empty when no tool peer was
+    /// discovered. Backs `/v1/tools` (list), `/v1/tools/search`
+    /// (keyword), and `/v1/tools/manifest` (signed). See
     /// `crates/relix-runtime/src/nodes/tool/registry.rs`.
     pub tool_registry: std::sync::Arc<relix_runtime::nodes::tool::registry::ToolRegistry>,
     /// Two-sink observability. Metadata events for every

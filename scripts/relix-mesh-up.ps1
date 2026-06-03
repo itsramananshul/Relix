@@ -208,6 +208,14 @@ New-Item -ItemType Directory -Force -Path 'dev-keys', $DataBase, 'configs/polici
 # panel lists zero workflows (200) instead of erroring it does not exist.
 New-Item -ItemType Directory -Force -Path "$DataBase/workflows" | Out-Null
 
+# Pidfile recording every process THIS run started. An out-of-band
+# shutdown (scripts/relix-mesh-down.ps1 or `relix stop`) reads it and
+# stops exactly these PIDs, never a name-based sweep, so an unrelated
+# mesh on the same box survives. Written once the mesh is up; removed by
+# the finally block on exit. Lives under DataBase so a per-run label
+# isolates it.
+$PidFile = "$DataBase/mesh.pids"
+
 # 1) Identities. The org root is the trust anchor: mint once, never re-mint
 #    (re-minting would change org_id and invalidate every leaf bundle).
 if (-not (Test-Path $OrgKey) -or -not (Test-Path $OrgPub)) {
@@ -1570,6 +1578,10 @@ try {
     }
     Start-Sleep -Milliseconds 400
 
+    # Record every PID we started so an out-of-band shutdown can stop
+    # exactly this mesh and nothing else. The finally block removes it.
+    ($started | ForEach-Object { $_.Id }) | Set-Content -Encoding ascii $PidFile
+
     Write-Host ""
     Write-Host "mesh is UP."
     Write-Host ""
@@ -1641,8 +1653,9 @@ try {
     #     every PID this script started.
     #
     #   * One of the spawned controllers (or the bridge) exits on its
-    #     own — typically because `relix stop` taskkill'd them from
-    #     another terminal. We break the loop so the outer `finally`
+    #     own - typically because `relix stop` signalled them by their
+    #     recorded PID from another terminal. We break the loop so the
+    #     outer `finally`
     #     tears down whatever's still running, then exit with code 1
     #     so `relix boot` returns to the prompt instead of hanging.
     #
@@ -1702,5 +1715,6 @@ finally {
             }
         }
     }
+    if ($PidFile) { Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue }
     Write-Host "mesh down."
 }

@@ -7,6 +7,32 @@ once a stable release is cut.
 
 ## [Unreleased]
 
+### Documentation
+
+- Recorded the operator-console redesign that shipped in **v0.3.0**
+  but was never logged here. The original single-page dashboard (task
+  ledger plus topology and chronicle-retention widgets) was rebuilt
+  into a multi-panel console; the current build carries twenty-two
+  panels: Overview, Tasks, Scheduled Jobs, Chat, Memory, Approvals,
+  Skills, Sessions, Reasoning, Credentials, Identity, Cost & Metrics,
+  Observability, Policy Denials, Multi-Tenant, Planning, Workflows,
+  Email, Plugins, MCP Servers, Configuration, and Logs. Source of
+  truth: the `SECTIONS` array in
+  `crates/relix-web-bridge/src/dashboard.html`.
+- Corrected README and the dashboard docs to the real panel
+  inventory and removed the false `#/...` hash-route claims; the
+  console has no hash routing. Each panel is backed by a real route
+  (for example `/v1/tasks`, `/v1/cron/jobs`, `/v1/policy/denials`,
+  `/v1/mcp/servers`). There is no standalone Audit-log panel; audit
+  data is reachable through the Credentials, MCP, and Multi-Tenant
+  panels and the hash-chained `audit.log` files (read with
+  `relix-flow-inspect`).
+- Marked `ADVERSARIAL_AUDIT.md` (2026-05-29) as superseded. Its top
+  findings were remediated across v0.3.0–v0.4.3-beta.1 (real approval
+  channel dispatch, Argon2id credential KDF, fail-closed agent
+  admission, intentional manual-only CI), so it overstates current
+  risk and is retained for history only.
+
 ## [0.4.3-beta.1] - 2026-06-01
 
 First build on the **beta** channel (GitHub pre-release; not "Latest").
@@ -362,8 +388,9 @@ First public alpha. Everything below is real and ships.
 
 - OpenAI-compatible `/v1/chat/completions` (including SSE
   streaming via `/chat/stream`) routed through the SOL chat flow.
-- Operator dashboard at `/dashboard` showing topology, tasks, cron
-  jobs, policy denials, audit ring, plugins, and per-channel status.
+- Operator dashboard at `/dashboard`: a single page with the task
+  ledger plus collapsible mesh-topology and chronicle-retention
+  dry-run widgets.
 - Direct HTTP surfaces for every operator workflow listed above —
   see `docs/configuration.md` and the route list in
   `crates/relix-web-bridge/src/main.rs`.

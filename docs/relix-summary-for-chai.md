@@ -120,8 +120,8 @@ Every node type has a `.toml` config. The `role` field in `[controller]` determi
 - **Operator blocklist**: `[tool] blocked_hosts` in config — runs before scheme/DNS and on every redirect.
 
 ### Wave 2 — IN PROGRESS (most items closed)
-- **Dispatch observability** (CLOSED): `node.dispatch.stats`, `GET /v1/dispatch/stats`, `#/metrics` dashboard, `relix-cli ops dispatch-stats` — per-capability latency (last/max/mean/samples) live in memory.
-- **Policy hardening** (CLOSED): `node.policy.simulate` (what-if check), `node.policy.recent_denials` (denial ring), both with bridge proxies and dashboard panels on `#/capabilities`.
+- **Dispatch observability** (CLOSED): `node.dispatch.stats`, `GET /v1/dispatch/stats`, `relix-cli ops dispatch-stats`. Per-capability latency (last/max/mean/samples) lives in memory. No dedicated dashboard page.
+- **Policy hardening** (CLOSED): `node.policy.simulate` (what-if check), `node.policy.recent_denials` (denial ring), both with bridge proxies and CLI (`relix ops`). The denial ring surfaces in the Policy Denials panel (`/v1/policy/denials`); simulate has no dedicated panel.
 - **Task replay** (substantively CLOSED): `task.replay` clones task with `retried_from` edge, `POST /v1/tasks/:id/replay`, Replay button on dashboard, per-step durations in timeline.
 - **Health-aware AI router**: `HealthAwareRouter` filters cooldown/quarantined providers and ranks by success_ratio. `NoopRouter` + `ProviderRouter` trait as the foundation. `POST /v1/providers/route_test` lets operators preview router decisions.
 - **Anthropic prompt caching + extended thinking**: `cache_control: ephemeral` on system block; opt-in `thinking_budget_tokens` on ChatInput.
@@ -219,22 +219,42 @@ Todo: `task.todo_set`, `task.todo_list`, `task.todo_update`
 
 ---
 
-## Dashboard Pages
+## Dashboard Panels
 
-| Page | What it shows |
+Since the v0.3.0 rebuild the console is a single-page app: a sidebar
+of panels, selected by click, with no `#/...` hash routes. The
+current build has twenty-two. The `SECTIONS` array in
+`crates/relix-web-bridge/src/dashboard.html` is the source of truth.
+
+| Panel | What it shows |
 |------|--------------|
-| `#/overview` | Mesh KPIs, ops-health badges, redaction counter, event histogram, stuck banner, firehose |
-| `#/tasks` | Ledger + per-task drill-in: timeline (per-step durations), retry chain, exec graph, lineage, todos, Replay button |
-| `#/topology` | Mesh + cross-task edges + lifecycle events |
-| `#/capabilities` | Capability explorer + "Policy What If" form + "Recent Denials" ring |
-| `#/metrics` | Dispatch latency per capability (mean/max/tail-ratio/errors) |
-| `#/providers` | AI provider CRUD + routing-trace + failover-reason + rate-limit + auto-cooldown |
-| `#/mcp` | MCP server table + expandable tools |
-| `#/fsaudit` | Filesystem mutation ring + host blocklist card |
-| `#/termaudit` | Terminal completion ring with status badges |
-| `#/browser` | Browser session table |
-| `#/telegram` | Telegram channel config |
-| `#/config` | Bridge config inspection |
+| Overview | KPI grid, System Health (rolls up `/v1/topology` + per-agent scores), Recent Activity |
+| Tasks | Task-ledger summary + table with status filter, search, and Spawn Task (`/v1/tasks`) |
+| Scheduled Jobs | Cron job table with subject filter, New Job, and trigger (`/v1/cron/jobs`) |
+| Chat | Send a message through a provider and read the reply + stats |
+| Memory | Search / ingest / inspector / dialectic over the memory store |
+| Approvals | Pending / history / failed-delivery / channels |
+| Skills | Skill catalogue + statistics |
+| Sessions | Recent sessions + content search |
+| Reasoning | Smart routing, self-consistency, belief state, judge verdicts |
+| Credentials | Vault, rotation schedule, per-credential audit log |
+| Identity | Active session tokens + research identity |
+| Cost & Metrics | Cost by provider/agent, 24h trend, baselines, alerts, spend caps |
+| Observability | OTel/sink status, per-agent health, session debugger, provenance, alerts |
+| Policy Denials | Recent admission denials with peer filter (`/v1/policy/denials`) |
+| Multi-Tenant | Tenant list + per-tenant detail |
+| Planning | Create/inspect plans (planner + critic) |
+| Workflows | Active + registered workflows |
+| Email | SMTP/IMAP status + recent inbound messages |
+| Plugins | Installed subprocess plugins |
+| MCP Servers | Registered MCP servers with peer filter, tool listing, and invoke (`/v1/mcp/servers`) |
+| Configuration | Providers, routing tiers, effective (redacted) config |
+| Logs | Live `/v1/logs/stream` tail with filters |
+
+There is no Topology, Capabilities, Metrics, fsaudit, termaudit,
+browser, or Telegram page. Capability, topology, filesystem-audit,
+terminal-audit, and browser-session data are on the HTTP API and the
+`relix` CLI; provider config is in the Configuration panel.
 
 ---
 

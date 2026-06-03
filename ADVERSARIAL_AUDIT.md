@@ -1,5 +1,26 @@
 # Relix Adversarial Audit — Full Damage Report
 
+> **SUPERSEDED as of 2026-06-02.** This is a point-in-time audit run
+> on 2026-05-29 against pre-v0.3.0 code. It overstates the current risk
+> posture: its top "production-lethal" findings have since been
+> remediated. Spot checks against the current tree:
+>
+> - Finding 1 (approval delivery was a `tracing::info!` stub) is fixed.
+>   `crates/relix-runtime/src/approval/delivery.rs` now dispatches over
+>   real channels (`SingleChannelDispatch`, webhook transport).
+> - Finding 4 (SHA-256 credential KDF) is fixed: Argon2id with a
+>   per-vault salt in `crates/relix-runtime/src/credentials/store.rs`.
+> - Finding 5 (default-allow agent admission) is fixed: fail-closed in
+>   `crates/relix-runtime/src/admission/agent_gate.rs` ("SEC PART 1").
+> - Finding 8 (CI not on push) is now intentional: CI is manual-only
+>   (`workflow_dispatch`) as of v0.4.2; see CHANGELOG.
+>
+> A bundle of production-lethal gaps was closed in commit `05416ac`
+> ("sec(P1-P6)") and identity expiry in v0.4.2. Treat the entries
+> below as historical, not as the present state. For the current
+> posture see `docs/security.md`, `SECURITY.md`, and `CHANGELOG.md`.
+> Re-audit before relying on any specific finding here.
+
 **Scope:** `D:\DATA\WORK\OpenPrem\Apps\Relix`
 **Date of audit:** 2026-05-29
 **Files audited:** ~1,050 source/config/doc files under `crates/`, `sdks/`, `configs/`, `scripts/`, `ops/`, `docs/`, `specs/`, `conformance/`, `examples/`, `flows/`, `workflows/`, `.github/`, plus root `install.{sh,ps1}`, `Dockerfile`, `Cargo.toml`, `deny.toml`, `CHANGELOG*`, `CONTRIBUTING.md`, `CODEOWNERS`, `SECURITY.md`, `README.md`. `reference/` and `.claude/worktrees/` excluded as out-of-scope.

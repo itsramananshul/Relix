@@ -115,7 +115,16 @@ pub struct ChatCompletionResponse {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChatCompletionChoice>,
-    pub usage: Usage,
+    /// Token usage. The web bridge only sees the model's reply
+    /// text over the mesh; the AI node routes its real token
+    /// counts out-of-band to the metrics sink, so they never
+    /// reach this layer (see RELA-23 / RELA-33). Rather than
+    /// emit a fabricated `0/0/0` that makes cost-tracking
+    /// clients compute a zero spend, the field is omitted
+    /// entirely when no real counts are available. `Some` is
+    /// reserved for the day usage travels the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
     /// Non-OpenAI Relix extension so curl users see provenance.
     pub relix: RelixExtension,
 }
@@ -401,11 +410,10 @@ pub async fn chat_completions(
                 },
                 finish_reason: "stop",
             }],
-            usage: Usage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-            },
+            // RELA-23: no real token counts are available at the
+            // bridge layer, so usage is omitted rather than
+            // reported as a misleading zero.
+            usage: None,
             relix: RelixExtension {
                 flow_id: outcome.flow_id,
                 trace_id: outcome.trace_id,
@@ -1681,5 +1689,68 @@ mod tests {
         // After the JSON frames the literal [DONE] sentinel
         // closes the stream.
         assert_eq!(STREAMING_DONE_SENTINEL, "[DONE]");
+    }
+
+    fn sample_response(usage: Option<Usage>) -> ChatCompletionResponse {
+        ChatCompletionResponse {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion",
+            created: 1_700_000_000,
+            model: "relix-mock".to_string(),
+            choices: vec![ChatCompletionChoice {
+                index: 0,
+                message: OpenAiMessage {
+                    role: "assistant".to_string(),
+                    content: "hello".to_string(),
+                    has_tool_calls: false,
+                },
+                finish_reason: "stop",
+            }],
+            usage,
+            relix: RelixExtension {
+                flow_id: "f1".to_string(),
+                trace_id: "t1".to_string(),
+                flow_log: "/tmp/f.log".to_string(),
+                session_id: "s1".to_string(),
+                task_id: None,
+            },
+        }
+    }
+
+    #[test]
+    fn usage_is_omitted_when_no_real_counts_available() {
+        // RELA-23 (Approach B, honest omission): the bridge has
+        // no real token counts at this layer, so the response
+        // must NOT carry a `usage` object at all. Emitting a
+        // zero-filled usage would make cost-tracking clients
+        // record a false zero spend; an absent field is the
+        // honest signal that usage was not measured here.
+        let resp = sample_response(None);
+        let v = serde_json::to_value(&resp).expect("serialize response");
+        assert!(
+            v.get("usage").is_none(),
+            "usage must be omitted when no real counts exist, got: {v}"
+        );
+    }
+
+    #[test]
+    fn usage_when_present_is_emitted_with_consistent_total() {
+        // The field stays a faithful pass-through for the day
+        // real counts travel the wire: when usage IS present it
+        // serializes in full and total == prompt + completion.
+        let resp = sample_response(Some(Usage {
+            prompt_tokens: 12,
+            completion_tokens: 8,
+            total_tokens: 20,
+        }));
+        let v = serde_json::to_value(&resp).expect("serialize response");
+        assert_eq!(v["usage"]["prompt_tokens"], 12);
+        assert_eq!(v["usage"]["completion_tokens"], 8);
+        assert_eq!(v["usage"]["total_tokens"], 20);
+        assert_eq!(
+            v["usage"]["total_tokens"].as_u64().unwrap(),
+            v["usage"]["prompt_tokens"].as_u64().unwrap()
+                + v["usage"]["completion_tokens"].as_u64().unwrap(),
+        );
     }
 }

@@ -559,15 +559,18 @@ The bridge translates HTTP → coord capabilities. Notable operator-facing endpo
 
 ## Operator UI (`crates/relix-web-bridge/src/dashboard.html`)
 
-| Page | Notes |
-|---|---|
-| `#/overview` | Mesh + runtime KPIs, ops-health badges (H11), redaction counter (PH-WAVE2C), event-type histogram (H13), stuck banner (H6), firehose with filter (H12) + row category accents (PH-WAVE2H) + click-to-expand payload (PH-DASH1) |
-| `#/tasks` | Ledger + per-task drill-in (timeline, retry chain, exec graph, lineage, todos widget) |
-| `#/topology` | Mesh + cross-task edges + lifecycle events |
-| `#/capabilities` (PH-DASH3) | Capability explorer with category chips + substring filter |
-| `#/providers` | AI provider CRUD + per-card routing-trace badge (M77) + failover-reason badge (H1) + rate-limit time-decay badge (PH-WAVE2G) + auto-cooldown banner (PH-WAVE2J) |
-| `#/telegram` | Telegram channel config |
-| `#/config` | Bridge config inspection |
+Since the v0.3.0 rebuild the console is a single-page app with a
+sidebar of panels and no `#/...` hash routes. The current build has
+twenty-two: Overview, Tasks, Scheduled Jobs, Chat, Memory, Approvals,
+Skills, Sessions, Reasoning, Credentials, Identity, Cost & Metrics,
+Observability, Policy Denials, Multi-Tenant, Planning, Workflows,
+Email, Plugins, MCP Servers, Configuration, and Logs. The `SECTIONS`
+array in `dashboard.html` is the source of truth; see
+[operator-guide.md](operator-guide.md) for a per-panel breakdown.
+Topology, health, and cost roll up into Overview. There is no
+Capabilities, Topology, Telegram, or Providers page; provider config
+lives under Configuration, and capability/topology data is on the
+HTTP API (`/v1/capabilities`, `/v1/topology`).
 
 ## CLI (`crates/relix-cli/`)
 

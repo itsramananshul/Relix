@@ -247,6 +247,13 @@ mkdir -p "$DATA_BASE" dev-keys "configs/policies"
 # directory does not exist.
 mkdir -p "$DATA_BASE/workflows"
 
+# Pidfile recording every process THIS run started. An out-of-band
+# shutdown (scripts/relix-mesh-down.sh or `relix stop`) reads it and
+# signals exactly these PIDs, never a name-based sweep, so an unrelated
+# mesh on the same box survives. Written once the mesh is up; removed by
+# cleanup() on exit. Lives under DATA_BASE so a per-run label isolates it.
+PID_FILE="$DATA_BASE/mesh.pids"
+
 ORG_KEY="dev-keys/$RUN-org-root.key"
 ORG_PUB="dev-keys/$RUN-org-root.pub"
 MEM_KEY="dev-keys/$RUN-memory.key"
@@ -1308,6 +1315,7 @@ cleanup() {
             kill -9 "$pid" 2>/dev/null
         fi
     done
+    rm -f "$PID_FILE" 2>/dev/null || true
     echo "mesh down."
 }
 trap cleanup EXIT INT TERM
@@ -1443,6 +1451,11 @@ until curl -fsS "http://127.0.0.1:$BRIDGE_PORT/health" >/dev/null 2>&1; do
     fi
 done
 echo "  bridge ready"
+
+# Record every PID we started so an out-of-band shutdown can terminate
+# exactly this mesh and nothing else. cleanup() removes it on exit.
+printf '%s\n' "${PIDS[@]}" > "$PID_FILE"
+
 echo
 echo "BRIDGE_UP"
 echo

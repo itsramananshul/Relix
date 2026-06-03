@@ -12,6 +12,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
+use relix_runtime::manifest::ManifestCache;
 use relix_runtime::nodes::tool::manifest::{SignedManifest, ToolManifest};
 use relix_runtime::nodes::tool::registry::{ToolDefinition, ToolRegistry};
 use serde::{Deserialize, Serialize};
@@ -133,11 +134,38 @@ fn unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Helper used by `AppState::try_new` to build the default
-/// registry. Keeps the in-test registry construction in one
-/// place; production registry contents will land once the
-/// tool-node side publishes its capability descriptors to
-/// the bridge.
+/// Build the discoverable tool registry from the bridge's
+/// post-discovery manifest cache. Every peer whose `node_type`
+/// is `"tool"` contributes the capability descriptors it
+/// advertised in its `node.manifest`; those map into
+/// `ToolDefinition`s via
+/// [`ToolRegistry::from_capability_descriptors`].
+///
+/// Returns a genuinely empty registry when no tool node was
+/// discovered (no tool peer configured, or none reachable at
+/// startup). Callers get the same `Arc<ToolRegistry>` shape as
+/// [`empty_registry`], so the `/v1/tools*` surface degrades to
+/// an honest empty list rather than a fabricated one.
+pub fn registry_from_manifest(cache: &ManifestCache) -> Arc<ToolRegistry> {
+    let caps: Vec<_> = cache
+        .entries()
+        .into_iter()
+        .filter(|cached| cached.manifest.node_type == "tool")
+        .flat_map(|cached| cached.manifest.capabilities)
+        // Drop the node operator builtins every node advertises
+        // (`node.health`, `node.manifest`, `node.dispatch.stats`,
+        // `node.policy.*`, ...). The tool surface is everything
+        // the tool node publishes that is not a `node.*` builtin,
+        // which matches `nodes::tool::advertised_capabilities`.
+        .filter(|cap| !cap.method_name.starts_with("node."))
+        .collect();
+    Arc::new(ToolRegistry::from_capability_descriptors(&caps))
+}
+
+/// Empty fallback registry. Used as the pre-discovery default
+/// in `AppState::try_new` (reassigned in `main.rs` once the
+/// discovery pass has pulled the tool node's manifest) and by
+/// the test fixtures below. Never carries fabricated entries.
 pub fn empty_registry() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::new(Vec::new()))
 }
@@ -145,7 +173,78 @@ pub fn empty_registry() -> Arc<ToolRegistry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use relix_core::capability::CapabilityDescriptor;
+    use relix_core::types::NodeId;
+    use relix_runtime::manifest::NodeManifest;
     use serde_json::Value;
+
+    fn manifest(seed: &[u8], node_type: &str, methods: &[&str]) -> NodeManifest {
+        NodeManifest {
+            node_id: NodeId::from_pubkey(seed),
+            node_name: node_type.into(),
+            node_type: node_type.into(),
+            manifest_version: 1,
+            org_id: NodeId::from_pubkey(b"org"),
+            endpoints: vec![],
+            capabilities: methods
+                .iter()
+                .map(|m| CapabilityDescriptor::unary(*m))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn registry_from_manifest_collects_only_tool_node_capabilities() {
+        let cache = ManifestCache::new();
+        cache.insert(
+            Some("tool".into()),
+            manifest(
+                b"t",
+                "tool",
+                // node.* operator builtins ride alongside the tool
+                // surface in every node's manifest; they must not
+                // land in the tool registry.
+                &[
+                    "tool.web_fetch",
+                    "tool.write_file",
+                    "node.health",
+                    "node.manifest",
+                ],
+            ),
+        );
+        // A non-tool peer must not leak into the tool registry.
+        cache.insert(Some("ai".into()), manifest(b"a", "ai", &["ai.chat"]));
+        let registry = registry_from_manifest(&cache);
+        assert_eq!(registry.len(), 2);
+        let names: Vec<&str> = registry.all().iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"tool.web_fetch"));
+        assert!(names.contains(&"tool.write_file"));
+        assert!(!names.contains(&"ai.chat"));
+        assert!(!names.contains(&"node.health"));
+        assert!(!names.contains(&"node.manifest"));
+        // Mutating verb in the name infers irreversibility.
+        let write = registry
+            .all()
+            .iter()
+            .find(|t| t.name == "tool.write_file")
+            .unwrap();
+        assert!(!write.reversible);
+    }
+
+    #[test]
+    fn registry_from_manifest_is_empty_when_no_tool_node_present() {
+        let cache = ManifestCache::new();
+        cache.insert(Some("ai".into()), manifest(b"a", "ai", &["ai.chat"]));
+        let registry = registry_from_manifest(&cache);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn registry_from_manifest_empty_cache_yields_empty_registry() {
+        let cache = ManifestCache::new();
+        let registry = registry_from_manifest(&cache);
+        assert!(registry.is_empty());
+    }
 
     fn tool(name: &str, description: &str, tags: &[&str]) -> ToolDefinition {
         ToolDefinition {
