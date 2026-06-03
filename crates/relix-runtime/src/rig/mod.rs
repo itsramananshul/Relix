@@ -43,6 +43,11 @@ pub struct RigRunRequest {
     /// Opaque additional context (goal ancestry, prior-run summary,
     /// linked Dossiers, …). The Rig passes it through to the agent.
     pub context: String,
+    /// PILLAR 2 (bridge-back): the scoped per-run token the agent
+    /// uses to call Relix's API back (comment, sub-brief, request a
+    /// Clearance). Empty when no bridge is configured. A Rig injects
+    /// it into the agent's environment at run time.
+    pub bridge_token: String,
 }
 
 impl RigRunRequest {
@@ -58,12 +63,19 @@ impl RigRunRequest {
             tenant_id: tenant_id.into(),
             prompt: prompt.into(),
             context: String::new(),
+            bridge_token: String::new(),
         }
     }
 
     /// Attach opaque context (builder style).
     pub fn with_context(mut self, context: impl Into<String>) -> Self {
         self.context = context.into();
+        self
+    }
+
+    /// Attach a bridge-back token (builder style).
+    pub fn with_bridge_token(mut self, token: impl Into<String>) -> Self {
+        self.bridge_token = token.into();
         self
     }
 }
@@ -256,13 +268,21 @@ impl Rig for ProcessRig {
         use std::io::Write;
         use std::process::{Command, Stdio};
 
-        let mut child = match Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .args(&self.args)
+            // The agent learns its own scope from the environment;
+            // the bridge token (when present) is how it calls Relix
+            // back, scoped to exactly this Brief + Operative.
+            .env("RELIX_BRIEF_ID", &req.brief_id)
+            .env("RELIX_AGENT_ID", &req.agent_id)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+            .stderr(Stdio::piped());
+        if !req.bridge_token.is_empty() {
+            command.env("RELIX_BRIDGE_TOKEN", &req.bridge_token);
+        }
+        let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) => {
                 return RigOutcome::Failed {
@@ -412,6 +432,27 @@ mod tests {
             ("cmd".into(), vec!["/C".into(), "exit".into(), "1".into()])
         } else {
             ("sh".into(), vec!["-c".into(), "exit 1".into()])
+        }
+    }
+    fn echo_env_cmd(var: &str) -> (String, Vec<String>) {
+        if cfg!(windows) {
+            ("cmd".into(), vec!["/C".into(), format!("echo %{var}%")])
+        } else {
+            ("sh".into(), vec!["-c".into(), format!("echo ${var}")])
+        }
+    }
+
+    #[test]
+    fn process_rig_injects_the_bridge_token_into_the_child_env() {
+        let (prog, args) = echo_env_cmd("RELIX_BRIDGE_TOKEN");
+        let rig = ProcessRig::new("test-env", prog, args);
+        let req = RigRunRequest::new("brief_1", "agt_a", "g", "ignored")
+            .with_bridge_token("brt_secret123");
+        match rig.run(&req) {
+            RigOutcome::Done { summary } => {
+                assert!(summary.contains("brt_secret123"), "got: {summary:?}")
+            }
+            other => panic!("expected Done, got {other:?}"),
         }
     }
 
