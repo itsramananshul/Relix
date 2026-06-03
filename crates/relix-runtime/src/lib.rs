@@ -46,6 +46,7 @@ pub mod dispatch;
 pub mod flow_runner;
 pub mod identity;
 pub mod knowledge;
+pub mod macros;
 pub mod manifest;
 pub mod metrics;
 pub mod nodes;
