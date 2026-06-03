@@ -698,6 +698,37 @@ impl SpineStore {
         Ok(rows)
     }
 
+    /// PHASE 5 (companion): Campaigns whose title contains `query`
+    /// (case-insensitive substring, LIKE wildcards escaped),
+    /// tenant-scoped, newest first. Empty `query` → empty result.
+    pub fn search_campaigns(
+        &self,
+        tenant: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<Campaign>, SpineStoreError> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tenant = normalize_tenant(tenant);
+        let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let lim = limit.clamp(1, 1000) as i64;
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT campaign_id, tenant_id, title, mandate_id, lead_agent_id,
+                    status, workspace, created_at, updated_at
+             FROM campaigns
+             WHERE tenant_id = ?1 AND title LIKE ?2 ESCAPE '\\'
+             ORDER BY created_at DESC LIMIT ?3",
+        )?;
+        let rows: Vec<Campaign> = stmt
+            .query_map(params![tenant, pattern, lim], row_to_campaign)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Update one writable campaign field. Writable: `status`,
     /// `title`, `mandate_id`, `lead_agent_id`, `workspace`.
     pub fn update_campaign_field(
@@ -1027,6 +1058,30 @@ mod tests {
         assert!(ids.contains(&auth) && ids.contains(&login));
         assert_eq!(ids.len(), 2);
         assert!(s.search_mandates("acme", "  ", 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_campaigns_matches_title_substring_per_tenant() {
+        let s = store();
+        let m = s.create_mandate("acme", "M", "", None, None).unwrap();
+        let a = s
+            .create_campaign("acme", "Auth rewrite", Some(&m), None, None)
+            .unwrap();
+        let b = s
+            .create_campaign("acme", "Auth hardening", Some(&m), None, None)
+            .unwrap();
+        s.create_campaign("acme", "Billing", Some(&m), None, None)
+            .unwrap();
+
+        let ids: std::collections::HashSet<String> = s
+            .search_campaigns("acme", "auth", 50)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.campaign_id)
+            .collect();
+        assert!(ids.contains(&a) && ids.contains(&b));
+        assert_eq!(ids.len(), 2);
+        assert!(s.search_campaigns("other", "auth", 50).unwrap().is_empty());
     }
 
     #[test]

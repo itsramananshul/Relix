@@ -48,6 +48,7 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<SpineStore>) {
     cap!("campaign.create", handle_campaign_create);
     cap!("campaign.get", handle_campaign_get);
     cap!("campaign.list", handle_campaign_list);
+    cap!("campaign.search", handle_campaign_search);
     cap!("campaign.update", handle_campaign_update);
     cap!("guild.get", handle_guild_get);
     cap!("guild.counts", handle_guild_counts);
@@ -412,6 +413,35 @@ fn handle_campaign_list(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutco
             Err(e) => internal(format!("campaign.list encode: {e}")),
         },
         Err(e) => internal(format!("campaign.list: {e}")),
+    }
+}
+
+/// `campaign.search` — args `query|limit` (limit default 50).
+/// Tenant-scoped. JSON array of Campaigns whose title contains the
+/// query (literal substring), newest first.
+fn handle_campaign_search(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("campaign.search utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    let query = parts.first().copied().unwrap_or("").trim();
+    if query.is_empty() {
+        return invalid("campaign.search: query required".to_string());
+    }
+    let limit: usize = parts
+        .get(1)
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    match store.search_campaigns(ctx.tenant_id_or_default(), query, limit) {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("campaign.search encode: {e}")),
+        },
+        Err(e) => internal(format!("campaign.search: {e}")),
     }
 }
 
