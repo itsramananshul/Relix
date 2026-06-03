@@ -3195,6 +3195,17 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // PHASE 5 (companion): Roster-at-a-glance status counts.
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.roster_summary",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_roster_summary(&s, &ctx) }
+            })),
+        );
+    }
     {
         let s = agent_store.clone();
         bridge.register(
@@ -8849,6 +8860,11 @@ fn register_node_type_handlers(
             (
                 "agent.manages",
                 "Delegated-authority check: does a manager manage a target (target in the manager's Branch/subtree)? Arg: manager_id|target_id. Returns true/false.",
+                &["agent", "read"],
+            ),
+            (
+                "agent.roster_summary",
+                "Operative counts by status (active/pending/suspended/disabled) + total, as JSON. No args. The Roster-at-a-glance.",
                 &["agent", "read"],
             ),
             (

@@ -258,6 +258,28 @@ pub fn handle_manages(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome
     }
 }
 
+/// `agent.roster_summary` — Operative counts by status (+ `total`)
+/// as JSON. No args. The Roster-at-a-glance for the companion /
+/// dashboard.
+pub fn handle_roster_summary(store: &AgentStore, _ctx: &InvocationCtx) -> HandlerOutcome {
+    match store.status_counts() {
+        Ok(counts) => {
+            let mut obj = serde_json::Map::new();
+            let mut total = 0i64;
+            for (status, n) in counts {
+                total += n;
+                obj.insert(status, serde_json::Value::from(n));
+            }
+            obj.insert("total".to_string(), serde_json::Value::from(total));
+            match serde_json::to_vec(&serde_json::Value::Object(obj)) {
+                Ok(b) => HandlerOutcome::Ok(b),
+                Err(e) => internal(format!("agent.roster_summary encode: {e}")),
+            }
+        }
+        Err(e) => internal(format!("agent.roster_summary: {e}")),
+    }
+}
+
 // ── agent.effective_capabilities ─────────────────────────
 
 /// Wire arg: `agent_id|peer_alias`. The handler reaches into the

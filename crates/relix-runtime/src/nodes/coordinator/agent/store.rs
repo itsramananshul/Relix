@@ -823,6 +823,20 @@ impl AgentStore {
         Ok(subtree.iter().any(|id| id == target_id))
     }
 
+    /// PHASE 5 (companion / Roster): Operative counts by status —
+    /// the Roster-at-a-glance (active / pending / suspended /
+    /// disabled).
+    pub fn status_counts(&self) -> Result<Vec<(String, i64)>, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT status, COUNT(*) FROM agent_profiles GROUP BY status ORDER BY status",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Update one field. The set of writable fields is curated;
     /// silent-allow on agent_id / created_at is intentional —
     /// they're never operator-mutable.
@@ -2539,6 +2553,23 @@ mod tests {
         assert!(!s.manages(&planner, &ceo).unwrap());
         assert!(!s.manages(&ceo, &outsider).unwrap());
         assert!(!s.manages(&ceo, &ceo).unwrap());
+    }
+
+    #[test]
+    fn status_counts_summarize_the_roster() {
+        let s = store();
+        s.create_agent("a", "r", "t", "d", "t", "op", "s1", "low", "default")
+            .unwrap();
+        s.create_agent("b", "r", "t", "d", "t", "op", "s2", "low", "default")
+            .unwrap();
+        s.request_hire("c", "r", "t", "d", "t", "op", "s3", "low", "default")
+            .unwrap();
+
+        let map: std::collections::HashMap<String, i64> =
+            s.status_counts().unwrap().into_iter().collect();
+        assert_eq!(map.get("active"), Some(&2));
+        assert_eq!(map.get("pending"), Some(&1));
+        assert_eq!(map.values().sum::<i64>(), 3);
     }
 
     // ── PHASE 4: hire flow ───────────────────────────────
