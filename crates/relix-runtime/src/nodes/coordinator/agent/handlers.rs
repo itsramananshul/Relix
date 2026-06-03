@@ -11,7 +11,9 @@ use relix_core::types::{ErrorEnvelope, error_kinds};
 use serde::Deserialize;
 
 use crate::dispatch::{HandlerOutcome, InvocationCtx};
-use crate::nodes::coordinator::agent::keys::{KeyVerdict, assign_verdict, spawn_verdict};
+use crate::nodes::coordinator::agent::keys::{
+    KeyVerdict, assign_verdict, manage_verdict, spawn_verdict,
+};
 use crate::nodes::coordinator::agent::store::{
     AgentStore, AgentStoreError, ApprovalStatus, StandingApprovalCreate,
     default_approval_categories,
@@ -1489,6 +1491,74 @@ pub(crate) fn enforce_assign_key(
         KeyVerdict::Allow => Ok(()),
         KeyVerdict::Clearance { reason } | KeyVerdict::Deny { reason } => {
             Err(policy_denied(format!("assign denied: {reason}")))
+        }
+    }
+}
+
+/// Enforce the **manage Key** (company-model §5.2A) for an
+/// agent-originated mutation of a Brief **owned by another Operative**
+/// (move / override fields / due / pin / snag). `owner` is the Brief's
+/// current assignee. Returns `Ok(())` — bypassed — for: no owner (an
+/// unowned Brief is not "another agent's work"), the Founder/Board
+/// (operator/admin), and `owner == actor` (progressing one's own work
+/// is normal execution, not management). Otherwise the actor needs
+/// `can_manage_work` and a `manage_scope` that admits the owner. All
+/// tenant-scoped; a disabled/pending/cross-tenant owner fails closed.
+pub(crate) fn enforce_manage_key(
+    store: &AgentStore,
+    ctx: &InvocationCtx,
+    owner: Option<&str>,
+) -> Result<(), HandlerOutcome> {
+    let Some(owner) = owner.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    if caller_is_operator(ctx) {
+        return Ok(());
+    }
+    let tenant = ctx.tenant_id_or_default();
+    let subject = ctx.caller.subject_id.to_string();
+    let actor = match store.get_by_subject_for_tenant(&subject, tenant) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Err(security_denied(format!(
+                "manage denied: caller `{subject}` has no Operative profile in this Guild"
+            )));
+        }
+        Err(e) => return Err(internal(format!("manage key lookup: {e}"))),
+    };
+    // Progressing your own assigned work is not management.
+    if owner == actor.agent_id {
+        return Ok(());
+    }
+    // The owner must be a real, active Operative in this Guild.
+    let target = match store.get_agent_for_tenant(owner, tenant) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Err(policy_denied(format!(
+                "manage denied: owner `{owner}` is not an Operative in this Guild"
+            )));
+        }
+        Err(e) => return Err(internal(format!("manage owner lookup: {e}"))),
+    };
+    if target.status != "active" {
+        return Err(policy_denied(format!(
+            "manage denied: owner `{owner}` is {} (not active)",
+            target.status
+        )));
+    }
+    let in_branch = store
+        .manages_for_tenant(&actor.agent_id, owner, tenant)
+        .unwrap_or(false);
+    match manage_verdict(
+        actor.can_manage_work,
+        &actor.manage_scope,
+        &actor.manage_allowed_agents,
+        owner,
+        in_branch,
+    ) {
+        KeyVerdict::Allow => Ok(()),
+        KeyVerdict::Clearance { reason } | KeyVerdict::Deny { reason } => {
+            Err(policy_denied(format!("manage denied: {reason}")))
         }
     }
 }

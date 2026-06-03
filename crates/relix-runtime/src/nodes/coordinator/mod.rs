@@ -6823,21 +6823,25 @@ pub fn register(
     }
     {
         let s = store.clone();
+        let a = agent_store.clone();
         bridge.register(
             "brief.pin",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
-                async move { handle_brief_pin(&s, &ctx) }
+                let a = a.clone();
+                async move { handle_brief_pin(&s, a.as_deref(), &ctx) }
             })),
         );
     }
     {
         let s = store.clone();
+        let a = agent_store.clone();
         bridge.register(
             "brief.set_due",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
-                async move { handle_brief_set_due(&s, &ctx) }
+                let a = a.clone();
+                async move { handle_brief_set_due(&s, a.as_deref(), &ctx) }
             })),
         );
     }
@@ -6943,21 +6947,25 @@ pub fn register(
     }
     {
         let s = store.clone();
+        let a = agent_store.clone();
         bridge.register(
             "brief.snag",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
-                async move { handle_brief_snag(&s, &ctx) }
+                let a = a.clone();
+                async move { handle_brief_snag(&s, a.as_deref(), &ctx) }
             })),
         );
     }
     {
         let s = store.clone();
+        let a = agent_store.clone();
         bridge.register(
             "brief.unsnag",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
-                async move { handle_brief_unsnag(&s, &ctx) }
+                let a = a.clone();
+                async move { handle_brief_unsnag(&s, a.as_deref(), &ctx) }
             })),
         );
     }
@@ -7980,6 +7988,26 @@ fn handle_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
 
 /// `brief.move` — move a Brief's board status. Arg: `task_id|board_status`.
 /// Enforces the board state machine; returns `from -> to` as the body.
+/// Read a Brief's current owner (assignee) and run the manage-Key gate
+/// against it. Used by every Brief-management mutation (move / set
+/// non-assignee field / due / pin / snag). Skipped when no agent store
+/// is wired (documented gap, same as the assign gate).
+fn manage_gate(
+    store: &TaskStore,
+    agent_store: Option<&agent::AgentStore>,
+    ctx: &InvocationCtx,
+    task_id: &str,
+) -> Result<(), HandlerOutcome> {
+    let Some(astore) = agent_store else {
+        return Ok(());
+    };
+    let owner = match store.brief_fields(task_id) {
+        Ok(Some(f)) => f.assignee_agent_id,
+        _ => None,
+    };
+    agent::handlers::enforce_manage_key(astore, ctx, owner.as_deref())
+}
+
 fn handle_brief_move(
     store: &TaskStore,
     agent_store: Option<&agent::AgentStore>,
@@ -7998,17 +8026,12 @@ fn handle_brief_move(
     if task_id.is_empty() {
         return invalid("brief.move: task_id required".to_string());
     }
-    // Assignment gate (company-model §5.2B): moving a Brief into an
-    // active-execution column (`in_progress`/`in_review`) activates the
-    // assignment, so a non-operator actor must be allowed to assign the
-    // Brief's current assignee. (`enforce_assign_key` bypasses the
-    // Founder/Board and the assignee-is-the-actor self-progress case.)
-    if matches!(to, "in_progress" | "in_review")
-        && let Some(astore) = agent_store
-        && let Ok(Some(f)) = store.brief_fields(task_id)
-        && let Some(assignee) = f.assignee_agent_id.as_deref()
-        && let Err(out) = agent::handlers::enforce_assign_key(astore, ctx, assignee)
-    {
+    // Manage gate (company-model §5.2A): moving a Brief owned by ANOTHER
+    // Operative is controlling that agent's work, so a non-operator
+    // actor needs `can_manage_work` + a `manage_scope` admitting the
+    // owner. Bypassed for the Founder/Board, an unowned Brief, and the
+    // owner progressing its own work.
+    if let Err(out) = manage_gate(store, agent_store, ctx, task_id) {
         return out;
     }
     match store.set_board_status(task_id, to) {
@@ -8211,7 +8234,11 @@ fn handle_brief_by_label(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutco
 
 /// `brief.set_due` — set/clear a Brief's due date. Arg `task|epoch`
 /// (empty epoch clears).
-fn handle_brief_set_due(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+fn handle_brief_set_due(
+    store: &TaskStore,
+    agent_store: Option<&agent::AgentStore>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
     let raw = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
         Err(e) => return invalid(format!("brief.set_due utf8: {e}")),
@@ -8220,6 +8247,10 @@ fn handle_brief_set_due(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcom
     let task = parts.first().copied().unwrap_or("").trim();
     if task.is_empty() {
         return invalid("brief.set_due: task required (arg shape: task|epoch)".to_string());
+    }
+    // Manage gate: setting a due date controls another agent's work.
+    if let Err(out) = manage_gate(store, agent_store, ctx, task) {
+        return out;
     }
     let due_raw = parts.get(1).copied().map(str::trim).unwrap_or("");
     let due_at: Option<i64> = if due_raw.is_empty() {
@@ -8283,7 +8314,11 @@ fn handle_brief_overdue(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcom
 
 /// `brief.pin` — pin/unpin a Brief (pinned sorts to the top of its
 /// column). Arg `task|1` to pin, `task|0` to unpin (default pin).
-fn handle_brief_pin(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+fn handle_brief_pin(
+    store: &TaskStore,
+    agent_store: Option<&agent::AgentStore>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
     let raw = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
         Err(e) => return invalid(format!("brief.pin utf8: {e}")),
@@ -8292,6 +8327,10 @@ fn handle_brief_pin(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let task = parts.first().copied().unwrap_or("").trim();
     if task.is_empty() {
         return invalid("brief.pin: task required (arg shape: task|0|1)".to_string());
+    }
+    // Manage gate: pinning/unpinning controls another agent's work.
+    if let Err(out) = manage_gate(store, agent_store, ctx, task) {
+        return out;
     }
     let pinned = match parts.get(1).copied().map(str::trim) {
         Some("0") | Some("false") => false,
@@ -8387,11 +8426,19 @@ fn handle_brief_subbriefs(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutc
 }
 
 /// `brief.snag` — record that `task` is blocked by `blocker`. Arg `task|blocker`.
-fn handle_brief_snag(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+fn handle_brief_snag(
+    store: &TaskStore,
+    agent_store: Option<&agent::AgentStore>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
     let (task, blocker) = match parse_pair(ctx, "brief.snag") {
         Ok(p) => p,
         Err(o) => return o,
     };
+    // Manage gate: blocking another agent's Brief controls its work.
+    if let Err(out) = manage_gate(store, agent_store, ctx, task) {
+        return out;
+    }
     match store.add_snag(task, blocker) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.snag", e),
@@ -8400,11 +8447,19 @@ fn handle_brief_snag(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
 
 /// `brief.unsnag` — clear the `task` → `blocker` Snag (a wrong /
 /// resolved dependency). Arg `task|blocker`. Idempotent.
-fn handle_brief_unsnag(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+fn handle_brief_unsnag(
+    store: &TaskStore,
+    agent_store: Option<&agent::AgentStore>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
     let (task, blocker) = match parse_pair(ctx, "brief.unsnag") {
         Ok(p) => p,
         Err(o) => return o,
     };
+    // Manage gate: unblocking another agent's Brief controls its work.
+    if let Err(out) = manage_gate(store, agent_store, ctx, task) {
+        return out;
+    }
     match store.remove_snag(task, blocker) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.unsnag", e),
@@ -8575,17 +8630,25 @@ fn handle_brief_set(
         return invalid("brief.set: expected `task_id|field|value`".to_string());
     }
     let field = parts[1].trim();
-    // Assign-Key gate (company-model §5.2B / §5.3): an agent actor may
-    // only assign a Brief within its `assign_scope`. The Founder/Board
-    // path bypasses; when no agent store is wired the check is skipped
-    // (documented gap). Other fields are unaffected.
-    if field == "assignee"
-        && let Some(astore) = agent_store
-        && let Err(out) = agent::handlers::enforce_assign_key(astore, ctx, parts[2].trim())
-    {
-        return out;
+    let task_id = parts[0].trim();
+    if field == "assignee" {
+        // Assign-Key gate (company-model §5.2B / §5.3): setting the
+        // assignee is a grant of work — only within the actor's
+        // `assign_scope`.
+        if let Some(astore) = agent_store
+            && let Err(out) = agent::handlers::enforce_assign_key(astore, ctx, parts[2].trim())
+        {
+            return out;
+        }
+    } else {
+        // Manage-Key gate: changing any OTHER field of a Brief owned by
+        // another Operative (priority, reviewer, mandate/campaign link,
+        // labels, …) is controlling that agent's work.
+        if let Err(out) = manage_gate(store, agent_store, ctx, task_id) {
+            return out;
+        }
     }
-    match store.set_brief_field(parts[0].trim(), field, parts[2]) {
+    match store.set_brief_field(task_id, field, parts[2]) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.set", e),
     }
@@ -12866,6 +12929,163 @@ mod tests {
             matches!(out, HandlerOutcome::Ok(_)),
             "an Operative must be able to progress its own Brief"
         );
+    }
+
+    // ── Manage-Key enforcement (company-model §5.2A) ─────────
+
+    #[test]
+    fn brief_move_without_manage_key_is_denied() {
+        // The fixture manager has assign rights but NOT can_manage_work,
+        // so it cannot move another Operative's (the worker's) Brief.
+        let tasks = store();
+        let (agents, _mgr, worker) = assign_fixture();
+        let brief = tasks
+            .create_brief(
+                "default",
+                "T",
+                "subj-founder",
+                Some(&worker),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let out = handle_brief_move(
+            &tasks,
+            Some(&agents),
+            &ctx(format!("{brief}|done").as_bytes()),
+        );
+        assert!(
+            matches!(out, HandlerOutcome::Err(e) if e.kind == error_kinds::POLICY_DENIED),
+            "moving another agent's Brief without can_manage_work must be denied"
+        );
+    }
+
+    #[test]
+    fn brief_manage_branch_scope_allows_report_denies_out_of_branch() {
+        let tasks = store();
+        let (agents, mgr, worker) = assign_fixture();
+        agents
+            .update_agent_field(&mgr, "can_manage_work", "true")
+            .unwrap();
+        agents
+            .update_agent_field(&mgr, "manage_scope", "branch")
+            .unwrap();
+        // A report's Brief → the manager may move it.
+        let report_brief = tasks
+            .create_brief("default", "T", "subj-f", Some(&worker), None, None, None)
+            .unwrap();
+        assert!(matches!(
+            handle_brief_move(
+                &tasks,
+                Some(&agents),
+                &ctx(format!("{report_brief}|in_progress").as_bytes())
+            ),
+            HandlerOutcome::Ok(_)
+        ));
+        // An out-of-Branch Operative's Brief → denied.
+        let outsider = agents
+            .create_agent(
+                "O", "engineer", "O", "eng", "eng", "x", "subj-o", "medium", "default",
+            )
+            .unwrap();
+        let other_brief = tasks
+            .create_brief("default", "T", "subj-f", Some(&outsider), None, None, None)
+            .unwrap();
+        assert!(
+            matches!(
+                handle_brief_move(&tasks, Some(&agents), &ctx(format!("{other_brief}|done").as_bytes())),
+                HandlerOutcome::Err(e) if e.kind == error_kinds::POLICY_DENIED
+            ),
+            "branch manage scope must not reach an out-of-Branch owner"
+        );
+    }
+
+    #[test]
+    fn brief_manage_specific_scope_honours_allowlist() {
+        let tasks = store();
+        let (agents, mgr, _worker) = assign_fixture();
+        let listed = agents
+            .create_agent(
+                "L", "engineer", "L", "eng", "eng", "x", "subj-l", "medium", "default",
+            )
+            .unwrap();
+        let unlisted = agents
+            .create_agent(
+                "U", "engineer", "U", "eng", "eng", "x", "subj-u", "medium", "default",
+            )
+            .unwrap();
+        agents
+            .update_agent_field(&mgr, "can_manage_work", "true")
+            .unwrap();
+        agents
+            .update_agent_field(&mgr, "manage_scope", "specific")
+            .unwrap();
+        agents
+            .update_agent_field(&mgr, "manage_allowed_agents", &listed)
+            .unwrap();
+        // set_due on the listed owner's Brief → allowed.
+        let ok_brief = tasks
+            .create_brief("default", "T", "subj-f", Some(&listed), None, None, None)
+            .unwrap();
+        assert!(matches!(
+            handle_brief_set_due(
+                &tasks,
+                Some(&agents),
+                &ctx(format!("{ok_brief}|0").as_bytes())
+            ),
+            HandlerOutcome::Ok(_)
+        ));
+        // ... on the unlisted owner's Brief → denied.
+        let no_brief = tasks
+            .create_brief("default", "T", "subj-f", Some(&unlisted), None, None, None)
+            .unwrap();
+        assert!(matches!(
+            handle_brief_set_due(&tasks, Some(&agents), &ctx(format!("{no_brief}|0").as_bytes())),
+            HandlerOutcome::Err(e) if e.kind == error_kinds::POLICY_DENIED
+        ));
+    }
+
+    #[test]
+    fn brief_manage_wrong_tenant_owner_is_denied() {
+        // The Brief's owner is an Operative in another Guild; even an
+        // any-scope manager in this Guild cannot reach it.
+        let tasks = store();
+        let (agents, mgr, _worker) = assign_fixture();
+        agents
+            .update_agent_field(&mgr, "can_manage_work", "true")
+            .unwrap();
+        agents
+            .update_agent_field(&mgr, "manage_scope", "any")
+            .unwrap();
+        let other = agents
+            .create_agent(
+                "Other", "engineer", "O", "eng", "eng", "x", "subj-ot", "medium", "tenant-b",
+            )
+            .unwrap();
+        // Brief in the default tenant assigned to a tenant-b owner id.
+        let brief = tasks
+            .create_brief("default", "T", "subj-f", Some(&other), None, None, None)
+            .unwrap();
+        assert!(matches!(
+            handle_brief_pin(&tasks, Some(&agents), &ctx(format!("{brief}|1").as_bytes())),
+            HandlerOutcome::Err(e) if e.kind == error_kinds::POLICY_DENIED
+        ));
+    }
+
+    #[test]
+    fn brief_manage_founder_path_bypasses() {
+        let tasks = store();
+        let (agents, _mgr, worker) = assign_fixture();
+        let brief = tasks
+            .create_brief("default", "T", "subj-f", Some(&worker), None, None, None)
+            .unwrap();
+        let mut c = ctx(format!("{brief}|in_progress").as_bytes());
+        c.caller.role = "operator".into();
+        assert!(matches!(
+            handle_brief_move(&tasks, Some(&agents), &c),
+            HandlerOutcome::Ok(_)
+        ));
     }
 
     #[test]
