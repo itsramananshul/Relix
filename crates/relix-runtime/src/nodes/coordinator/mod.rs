@@ -1028,6 +1028,47 @@ impl TaskStore {
         Ok(())
     }
 
+    /// PHASE 5 (board): the Briefs carrying `label` (CSV-column
+    /// membership), newest first. Empty `label` → empty result.
+    /// (Labels with SQL `LIKE` wildcards aren't expected; set_labels
+    /// keeps them comma-free but not wildcard-free.)
+    pub fn list_briefs_by_label(
+        &self,
+        label: &str,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let label = label.trim();
+        if label.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, title, board_status, priority,
+                        assignee_agent_id, mandate_id, campaign_id
+                 FROM tasks
+                 WHERE labels = ?1 OR labels LIKE ?2 OR labels LIKE ?3 OR labels LIKE ?4
+                 ORDER BY updated_at DESC LIMIT ?5",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    label,
+                    format!("{label},%"),
+                    format!("%,{label}"),
+                    format!("%,{label},%"),
+                    lim
+                ],
+                brief_card_from_row,
+            )
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// PHASE 5 (Brief): a Brief's labels (empty when unset).
     /// `NotFound` when the Brief doesn't exist.
     pub fn brief_labels(&self, task_id: &str) -> Result<Vec<String>, CoordinatorError> {
@@ -5693,6 +5734,16 @@ pub fn register(
     {
         let s = store.clone();
         bridge.register(
+            "brief.by_label",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_by_label(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
             "brief.detail",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -6839,6 +6890,34 @@ fn handle_brief_set_labels(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOut
     match store.set_brief_labels(task, &labels) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.set_labels", e),
+    }
+}
+
+/// `brief.by_label` — the Briefs carrying a label (JSON cards). Arg
+/// `label|limit` (limit default 50).
+fn handle_brief_by_label(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("brief.by_label utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    let label = parts.first().copied().map(str::trim).unwrap_or("");
+    if label.is_empty() {
+        return invalid("brief.by_label: label required".to_string());
+    }
+    let limit: usize = parts
+        .get(1)
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    match store.list_briefs_by_label(label, limit) {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.by_label encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.by_label", e),
     }
 }
 
@@ -10242,6 +10321,28 @@ mod tests {
         // Clear with an empty set.
         s.set_brief_labels(&id, &[]).unwrap();
         assert!(s.brief_labels(&id).unwrap().is_empty());
+
+        // Filter by label across briefs (CSV-membership).
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        let a = mk("a");
+        let b = mk("b");
+        let c = mk("c");
+        s.set_brief_labels(&a, &["bug", "urgent"]).unwrap(); // exact-in-middle
+        s.set_brief_labels(&b, &["urgent"]).unwrap(); // exact-only
+        s.set_brief_labels(&c, &["feature"]).unwrap();
+        let urgent: std::collections::HashSet<String> = s
+            .list_briefs_by_label("urgent", 50)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.task_id)
+            .collect();
+        assert!(urgent.contains(&a) && urgent.contains(&b));
+        assert!(!urgent.contains(&c));
+        assert_eq!(urgent.len(), 2);
+        assert!(s.list_briefs_by_label("", 50).unwrap().is_empty());
 
         // Unknown Brief → NotFound on both paths.
         assert!(matches!(
