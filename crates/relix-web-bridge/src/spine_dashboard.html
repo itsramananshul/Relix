@@ -210,10 +210,16 @@ function render() {
 }
 async function renderInbox(host) {
   host.append(node("div",{className:"muted",textContent:"Loading desk..."}));
-  let inbox;
-  try { inbox = await api("/v1/spine/inbox?limit=25"); }
+  let inbox, clearances;
+  try {
+    [inbox, clearances] = await Promise.all([
+      api("/v1/spine/inbox?limit=25"),
+      api("/v1/spine/clearances?limit=25").catch(()=>[]),
+    ]);
+  }
   catch(e) { host.innerHTML = ""; return host.append(node("div",{className:"err",textContent:e.message})); }
   host.innerHTML = "";
+  clearances = clearances || [];
   const sections = [
     ["Blocked", inbox.blocked, "Halted on an unresolved Snag."],
     ["Stale", inbox.stale, "Active Briefs idle over a day."],
@@ -221,10 +227,27 @@ async function renderInbox(host) {
     ["In review", inbox.review, "Awaiting reviewer sign-off."],
     ["Unassigned", inbox.unassigned, "Active Briefs with no Operative."],
   ];
-  const total = sections.reduce((n, [,rows]) => n + (rows || []).length, 0);
+  const total = sections.reduce((n, [,rows]) => n + (rows || []).length, 0) + clearances.length;
   $("#inboxBadge").textContent = total;
-  if (!total) return host.append(node("div",{className:"empty",textContent:"Desk is clear — no Briefs need attention."}));
+  if (!total) return host.append(node("div",{className:"empty",textContent:"Desk is clear — nothing needs you."}));
+  // Clearances (pending greenlights) come first — the Board's action center.
+  clearanceSection(host, clearances);
   for (const [title, rows, hint] of sections) inboxSection(host, title, rows || [], hint);
+}
+function clearanceSection(host, rows) {
+  if (!rows.length) return;
+  const sec = node("section",{style:"margin-bottom:16px"});
+  sec.append(node("div",{className:"toolbar",style:"margin-bottom:8px"},[
+    node("strong",{textContent:"Clearances"}),
+    node("span",{className:"badge",textContent:String(rows.length)}),
+    node("span",{className:"muted",style:"font-size:12px",textContent:"Pending greenlights. Decide via the operator CLI (no inline approve yet)."}),
+  ]));
+  rows.forEach(c => sec.append(node("div",{className:"event"},[
+    node("strong",{textContent:c.method || "approval"}),
+    node("div",{textContent:c.reason || ""}),
+    node("div",{className:"mono muted",textContent:(c.agent_id || "")+"  "+(c.approval_id || "")}),
+  ])));
+  host.append(sec);
 }
 function inboxSection(host, title, rows, hint) {
   if (!rows.length) return;
@@ -460,8 +483,38 @@ async function openAgent(id) {
     side.append(agentToggle(id, "timer wake", !!a.wake_on_timer, "wake_on_timer"));
     side.append(agentToggle(id, "on-demand wake", !!a.wake_on_demand, "wake_on_demand"));
     side.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"Allowed categories"}), node("div",{className:"event",textContent:(a.allow_categories || []).join(", ") || "default deny"})]));
+    side.append(await keysBlock(id));
     side.append(await deskBlock(id, a));
   } catch(e) { side.innerHTML = '<div class="err">'+e.message+'</div>'; }
+}
+async function keysBlock(id) {
+  // Org/Work Keys (company-model §5.2). Read the full profile (which
+  // carries the new Keys) and split enforced from stored-only so the
+  // operator is never misled about what actually gates behaviour.
+  const wrap = node("div");
+  let p;
+  try { p = await api("/v1/spine/keys/"+encodeURIComponent(id)); }
+  catch(e) { wrap.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"Keys"}), node("div",{className:"err",textContent:e.message})])); return wrap; }
+  const enf = node("div",{className:"prop"},[node("div",{className:"label",textContent:"Keys — enforced"})]);
+  enf.append(agentToggle(id, "can spawn agents", !!p.can_spawn_agents, "can_spawn_agents"));
+  enf.append(agentSelect(id, "spawn route", p.spawn_route || "founder", ["direct","lead","founder"], "spawn_route"));
+  enf.append(agentToggle(id, "can assign work", !!p.can_assign_work, "can_assign_work"));
+  enf.append(agentSelect(id, "assign scope", p.assign_scope || "specific", ["any","branch","specific"], "assign_scope"));
+  enf.append(agentFieldInput(id, "assign allowed agents (csv)", (p.assign_allowed_agents || []).join(", "), "assign_allowed_agents"));
+  wrap.append(enf);
+  const st = node("div",{className:"prop"},[node("div",{className:"label",textContent:"Keys — stored only (not yet enforced)"})]);
+  st.append(agentToggle(id, "can manage work", !!p.can_manage_work, "can_manage_work"));
+  st.append(agentToggle(id, "can configure agents", !!p.can_configure_agents, "can_configure_agents"));
+  st.append(agentSelect(id, "configure scope", p.configure_scope || "none", ["none","branch","specific"], "configure_scope"));
+  st.append(agentFieldInput(id, "secret allowlist (csv)", (p.secret_allowlist || []).join(", "), "secret_allowlist"));
+  const ta = node("textarea",{rows:4, value:p.instruction_bundle || ""});
+  st.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"charter (instruction bundle)"}), ta, node("button",{className:"ghost",style:"margin-top:6px",textContent:"Save",onclick:async()=>{await patchAgent(id, {instruction_bundle:ta.value}); await openAgent(id);}})]));
+  wrap.append(st);
+  return wrap;
+}
+function agentSelect(id, label, value, opts, field) {
+  const sel = node("select"); opts.forEach(o => sel.append(node("option",{value:o,textContent:o,selected:o===value})));
+  return node("div",{className:"prop"},[node("div",{className:"label",textContent:label}), sel, " ", node("button",{className:"ghost",textContent:"Save",onclick:async()=>{await patchAgent(id, {[field]:sel.value}); await openAgent(id);}})]);
 }
 async function deskBlock(id, a) {
   const block = node("div",{className:"prop"},[node("div",{className:"label",textContent:"Desk"})]);

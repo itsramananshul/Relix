@@ -85,6 +85,16 @@ pub struct ListQuery {
     pub q: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct AssignCheckQuery {
+    /// The Operative that would do the assigning.
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// The proposed assignee.
+    #[serde(default)]
+    pub assignee: Option<String>,
+}
+
 // ── routes ────────────────────────────────────────────────
 
 /// `GET /v1/spine/guild` — the Guild's Mandate/Campaign rollup.
@@ -276,6 +286,57 @@ pub async fn unassigned(
     json_passthrough(call_peer(&state, "brief.unassigned", arg.as_bytes()).await?)
 }
 
+/// `GET /v1/spine/keys/:agent` — the full Operative profile as JSON
+/// (identity + the Keys permission surface, including the org/work
+/// Keys: can_spawn_agents, spawn_route, can_assign_work, assign_scope,
+/// assign_allowed_agents, can_manage_work, can_configure_agents,
+/// configure_scope, secret_allowlist, instruction_bundle). Backs the
+/// per-Operative Keys panel; edits go through `PATCH /v1/agents/:id`.
+pub async fn keys(
+    State(state): State<AppState>,
+    Path(agent): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "agent.keys", agent.as_bytes()).await?)
+}
+
+/// `GET /v1/spine/assign_check?actor=&assignee=` — would `actor` be
+/// permitted to assign a Brief to `assignee` under its Keys? Returns
+/// the JSON KeyVerdict (`{"decision":"allow"}` /
+/// `{"decision":"deny","reason":…}`). Read-only preview of the gate
+/// that `brief.set` enforces.
+pub async fn assign_check(
+    State(state): State<AppState>,
+    Query(q): Query<AssignCheckQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let actor = q.actor.unwrap_or_default();
+    let assignee = q.assignee.unwrap_or_default();
+    if actor.trim().is_empty() || assignee.trim().is_empty() {
+        return Err(bad("actor and assignee required"));
+    }
+    let arg = format!("{}|{}", actor.trim(), assignee.trim());
+    json_passthrough(call_peer(&state, "agent.assign_check", arg.as_bytes()).await?)
+}
+
+/// `GET /v1/spine/clearances?limit=` — the pending Clearances
+/// (approvals awaiting a Founder greenlight) as a JSON array. Sourced
+/// from `coord.approval.pending`, whose TSV lines are parsed into
+/// objects so the Desk can render them. Read-only: approve/reject is
+/// not proxied here (`coord.approval.decide` needs an authorised
+/// approver identity the bridge does not yet forward — documented).
+pub async fn clearances(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let limit = q.limit.unwrap_or(25).min(100);
+    let raw = call_peer(
+        &state,
+        "coord.approval.pending",
+        limit.to_string().as_bytes(),
+    )
+    .await?;
+    json_value(parse_clearance_lines(&raw))
+}
+
 /// `GET /v1/spine/briefs/:id/events?limit=` — a single Brief's
 /// Chronicle (newest first), as a JSON array. Bounded by `limit`.
 pub async fn brief_events(
@@ -368,6 +429,28 @@ fn parse_json(body: &[u8]) -> serde_json::Value {
         return serde_json::Value::Null;
     }
     serde_json::from_slice(body).unwrap_or(serde_json::Value::Null)
+}
+
+/// Parse `coord.approval.pending`'s TSV rows
+/// (`approval_id\tagent_id\tmethod\treason\trequested_at`) into a JSON
+/// array of objects. The trailing `count=N` line is dropped.
+fn parse_clearance_lines(body: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(body);
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with("count="))
+        .map(|l| {
+            let mut cols = l.split('\t');
+            serde_json::json!({
+                "approval_id": cols.next().unwrap_or("").to_string(),
+                "agent_id": cols.next().unwrap_or("").to_string(),
+                "method": cols.next().unwrap_or("").to_string(),
+                "reason": cols.next().unwrap_or("").to_string(),
+                "requested_at": cols.next().unwrap_or("").to_string(),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(rows)
 }
 
 /// Parse `task.events`' newline-delimited JSON objects into an array.
@@ -777,6 +860,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_clearance_lines_parses_tsv_and_drops_count() {
+        let body = b"ap_1\tagt_x\tbrief.clearance_request\tneeds prod deploy\t1700\nap_2\tagt_y\tpayments\tspend $50\t1800\ncount=2\n";
+        let got = parse_clearance_lines(body);
+        let arr = got.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "the count= trailer must be dropped");
+        assert_eq!(arr[0]["approval_id"], "ap_1");
+        assert_eq!(arr[0]["agent_id"], "agt_x");
+        assert_eq!(arr[0]["reason"], "needs prod deploy");
+        assert_eq!(arr[1]["method"], "payments");
+        // An empty body is an empty array, never null.
+        assert_eq!(parse_clearance_lines(b""), serde_json::json!([]));
+    }
+
+    #[test]
     fn parse_event_lines_builds_array_and_skips_blanks() {
         // task.events is newline-delimited JSON objects; the composite
         // turns it into a real array and drops blank / unparseable lines.
@@ -825,6 +922,9 @@ mod tests {
         assert!(SPINE_HTML.contains("/v1/spine/inbox"));
         assert!(SPINE_HTML.contains("/thread"));
         assert!(SPINE_HTML.contains("/v1/spine/desk/"));
+        // Keys panel + pending Clearances on the Desk.
+        assert!(SPINE_HTML.contains("/v1/spine/keys/"));
+        assert!(SPINE_HTML.contains("/v1/spine/clearances"));
     }
 
     /// Build the full spine route table in isolation: matchit panics
@@ -856,6 +956,9 @@ mod tests {
             .route("/v1/spine/stale", get(stale))
             .route("/v1/spine/unblocked", get(unblocked))
             .route("/v1/spine/unassigned", get(unassigned))
+            .route("/v1/spine/keys/:agent", get(keys))
+            .route("/v1/spine/assign_check", get(assign_check))
+            .route("/v1/spine/clearances", get(clearances))
             .route("/v1/spine/inbox", get(inbox))
             .route("/v1/spine/briefs/:id/events", get(brief_events))
             .route("/v1/spine/briefs/:id/thread", get(brief_thread))

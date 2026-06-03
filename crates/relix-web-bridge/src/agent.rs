@@ -173,6 +173,27 @@ pub struct UpdateAgentRequest {
     pub wake_on_timer: Option<bool>,
     #[serde(default)]
     pub wake_on_demand: Option<bool>,
+    // Org/Work Keys (company-model §5.2).
+    #[serde(default)]
+    pub can_spawn_agents: Option<bool>,
+    #[serde(default)]
+    pub spawn_route: Option<String>,
+    #[serde(default)]
+    pub can_assign_work: Option<bool>,
+    #[serde(default)]
+    pub assign_scope: Option<String>,
+    #[serde(default)]
+    pub assign_allowed_agents: Option<String>,
+    #[serde(default)]
+    pub can_manage_work: Option<bool>,
+    #[serde(default)]
+    pub can_configure_agents: Option<bool>,
+    #[serde(default)]
+    pub configure_scope: Option<String>,
+    #[serde(default)]
+    pub secret_allowlist: Option<String>,
+    #[serde(default)]
+    pub instruction_bundle: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -346,6 +367,38 @@ pub async fn update_agent(
     }
     if let Some(v) = req.wake_on_demand {
         commits.push(("wake_on_demand".into(), v.to_string()));
+    }
+    // Org/Work Keys (company-model §5.2). The runtime validates enum
+    // values and list shapes; the bridge just forwards the edit.
+    if let Some(v) = req.can_spawn_agents {
+        commits.push(("can_spawn_agents".into(), v.to_string()));
+    }
+    if let Some(v) = req.spawn_route {
+        commits.push(("spawn_route".into(), v));
+    }
+    if let Some(v) = req.can_assign_work {
+        commits.push(("can_assign_work".into(), v.to_string()));
+    }
+    if let Some(v) = req.assign_scope {
+        commits.push(("assign_scope".into(), v));
+    }
+    if let Some(v) = req.assign_allowed_agents {
+        commits.push(("assign_allowed_agents".into(), v));
+    }
+    if let Some(v) = req.can_manage_work {
+        commits.push(("can_manage_work".into(), v.to_string()));
+    }
+    if let Some(v) = req.can_configure_agents {
+        commits.push(("can_configure_agents".into(), v.to_string()));
+    }
+    if let Some(v) = req.configure_scope {
+        commits.push(("configure_scope".into(), v));
+    }
+    if let Some(v) = req.secret_allowlist {
+        commits.push(("secret_allowlist".into(), v));
+    }
+    if let Some(v) = req.instruction_bundle {
+        commits.push(("instruction_bundle".into(), v));
     }
 
     if commits.is_empty() {

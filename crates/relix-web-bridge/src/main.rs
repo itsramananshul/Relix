@@ -518,6 +518,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/stale", get(spine::stale))
         .route("/v1/spine/unblocked", get(spine::unblocked))
         .route("/v1/spine/unassigned", get(spine::unassigned))
+        // Operative Keys (read) + assign-Key preview + pending Clearances.
+        .route("/v1/spine/keys/:agent", get(spine::keys))
+        .route("/v1/spine/assign_check", get(spine::assign_check))
+        .route("/v1/spine/clearances", get(spine::clearances))
         // Composite Desk/Inbox + Brief live-thread payloads.
         .route("/v1/spine/inbox", get(spine::inbox))
         .route("/v1/spine/briefs/:id/events", get(spine::brief_events))
