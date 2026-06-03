@@ -303,6 +303,12 @@ pub struct ProcessRig {
     /// Cap on the child's captured stdout (the result summary), so a
     /// runaway CLI can't flood the dispatch path / context.
     max_output_bytes: usize,
+    /// How deeply Relix governs this specific adapter. Defaults to
+    /// the conservative `BoxLevel` (a plain stdio process is a black
+    /// box). An operator opts *up* to `PerToolCall` only when their
+    /// adapter genuinely surfaces tool calls Relix can gate (e.g. it
+    /// speaks the Macro `@relix-call` protocol or ACP).
+    governance: RigGovernance,
 }
 
 /// Default stdout cap for a process Rig — generous enough for a real
@@ -320,6 +326,7 @@ impl ProcessRig {
             program: program.into(),
             args,
             max_output_bytes: DEFAULT_RIG_MAX_OUTPUT_BYTES,
+            governance: RigGovernance::BoxLevel,
         }
     }
 
@@ -327,6 +334,14 @@ impl ProcessRig {
     /// boundary). Clamped to at least 1.
     pub fn with_max_output_bytes(mut self, n: usize) -> Self {
         self.max_output_bytes = n.max(1);
+        self
+    }
+
+    /// Declare how deeply Relix governs this adapter. Only set
+    /// `PerToolCall` when the process genuinely exposes its tool
+    /// calls for gating; the default `BoxLevel` is the safe floor.
+    pub fn with_governance(mut self, governance: RigGovernance) -> Self {
+        self.governance = governance;
         self
     }
 
@@ -349,6 +364,10 @@ impl ProcessRig {
 impl Rig for ProcessRig {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn governance(&self) -> RigGovernance {
+        self.governance
     }
 
     fn run(&self, req: &RigRunRequest) -> RigOutcome {
@@ -607,6 +626,17 @@ mod tests {
         for name in ["echo", "claude", "codex", "gemini"] {
             assert!(reg.get(name).is_some(), "{name} should be registered");
         }
+    }
+
+    #[test]
+    fn process_rig_governance_defaults_box_and_opts_up() {
+        // Default: a plain process is a black box.
+        let plain = ProcessRig::new("p", "true", vec![]);
+        assert_eq!(plain.governance(), RigGovernance::BoxLevel);
+        // Opt up when the adapter surfaces its tool calls.
+        let rich = ProcessRig::new("h", "hermes", vec![])
+            .with_governance(RigGovernance::PerToolCall);
+        assert_eq!(rich.governance(), RigGovernance::PerToolCall);
     }
 
     #[test]
