@@ -695,6 +695,111 @@ impl TaskStore {
         Ok(())
     }
 
+    /// PHASE 1 (Brief): **replace** the whole Snag (blocker) set of
+    /// `task` in one shot — relix-execution-and-issue-design §1
+    /// ("Replace-semantics: setting an issue's blocker list replaces
+    /// the whole set; send an empty list to clear all. Self-blocks
+    /// and cycles are rejected.").
+    ///
+    /// Atomic: validates every new blocker (exists, not self, no
+    /// cycle against the set being built) BEFORE committing; on any
+    /// error nothing changes. Duplicates collapse (first wins, order
+    /// preserved). An empty `blockers` clears all Snags. Chronicles a
+    /// single `brief.snags_set` event with the new count.
+    pub fn set_brief_blockers(
+        &self,
+        task: &str,
+        blockers: &[&str],
+    ) -> Result<(), CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, task)? {
+            return Err(CoordinatorError::NotFound(task.to_string()));
+        }
+        // Validate + dedupe up front (no partial state on rejection).
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut want: Vec<String> = Vec::new();
+        for b in blockers {
+            let t = b.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if t == task {
+                return Err(CoordinatorError::Invalid(
+                    "a Brief cannot be its own Snag".to_string(),
+                ));
+            }
+            if !task_row_exists(&conn, t)? {
+                return Err(CoordinatorError::NotFound(t.to_string()));
+            }
+            if seen.insert(t.to_string()) {
+                want.push(t.to_string());
+            }
+        }
+        let now = unix_secs();
+        conn.execute("BEGIN", []).map_err(CoordinatorError::Db)?;
+        let outcome = (|| -> Result<(), CoordinatorError> {
+            conn.execute(
+                "DELETE FROM task_edges WHERE task_id = ?1 AND edge_type = 'blocked_on'",
+                params![task],
+            )
+            .map_err(CoordinatorError::Db)?;
+            const MAX_NODES: usize = 10_000;
+            for b in &want {
+                // Cycle guard: can `b` already reach `task` via
+                // blocked_on (incl. edges inserted earlier in this
+                // replace)? If so, task->b would close a loop.
+                let mut stack = vec![b.clone()];
+                let mut visited: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                while let Some(node) = stack.pop() {
+                    if node == task {
+                        return Err(CoordinatorError::Invalid(
+                            "Snag would create a cycle".to_string(),
+                        ));
+                    }
+                    if !visited.insert(node.clone()) || visited.len() > MAX_NODES {
+                        continue;
+                    }
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT related_task_id FROM task_edges
+                             WHERE task_id = ?1 AND edge_type = 'blocked_on'
+                               AND related_task_id IS NOT NULL",
+                        )
+                        .map_err(CoordinatorError::Db)?;
+                    let next: Vec<String> = stmt
+                        .query_map(params![node], |r| r.get::<_, String>(0))
+                        .map_err(CoordinatorError::Db)?
+                        .collect::<rusqlite::Result<_>>()
+                        .map_err(CoordinatorError::Db)?;
+                    stack.extend(next);
+                }
+                conn.execute(
+                    "INSERT INTO task_edges (task_id, edge_type, related_task_id, created_at)
+                     VALUES (?1, 'blocked_on', ?2, ?3)",
+                    params![task, b, now],
+                )
+                .map_err(CoordinatorError::Db)?;
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => {
+                conn.execute("COMMIT", []).map_err(CoordinatorError::Db)?;
+                let _ = conn.execute(
+                    "INSERT INTO task_events (task_id, ts, event_type, payload)
+                     VALUES (?1, ?2, 'brief.snags_set', ?3)",
+                    params![task, now, want.len().to_string()],
+                );
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
+    }
+
     /// PHASE 1 (Brief): is `task` blocked? True when it has at
     /// least one Snag whose blocker has NOT reached board status
     /// `done`. Per the locked rule, only `done` resolves a Snag —
@@ -6165,6 +6270,16 @@ pub fn register(
     {
         let s = store.clone();
         bridge.register(
+            "brief.set_snags",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_set_snags(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
             "brief.blocked",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -7513,6 +7628,34 @@ fn handle_brief_snags(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome 
     match store.list_snags(task) {
         Ok(ids) => HandlerOutcome::Ok(ids.join("\n").into_bytes()),
         Err(e) => map_edge_err("brief.snags", e),
+    }
+}
+
+/// `brief.set_snags` — REPLACE the whole Snag set of a Brief
+/// (relix-execution-and-issue-design §1 replace-semantics). Arg
+/// `task|b1,b2,b3` — comma-separated blocker ids; an empty list
+/// (`task|`) clears all. Self-blocks and cycles are rejected.
+fn handle_brief_set_snags(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.set_snags utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    let task = parts.first().copied().unwrap_or("").trim();
+    if task.is_empty() {
+        return invalid("brief.set_snags: task required (arg shape: task|b1,b2,…)".to_string());
+    }
+    let blockers: Vec<&str> = parts
+        .get(1)
+        .copied()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    match store.set_brief_blockers(task, &blockers) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.set_snags", e),
     }
 }
 
@@ -11350,6 +11493,61 @@ mod tests {
             .map(|c| c.task_id)
             .collect();
         assert!(!still.contains(&w2)); // cancelled blocker keeps it blocked
+    }
+
+    #[test]
+    fn set_brief_blockers_replaces_whole_set_per_doc_1_6() {
+        // relix-execution-and-issue-design §1: replace-semantics,
+        // empty clears, self-blocks and cycles rejected.
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        let task = mk("task");
+        let b1 = mk("b1");
+        let b2 = mk("b2");
+        let b3 = mk("b3");
+
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        // Start with {b1,b2} via incremental adds.
+        s.add_snag(&task, &b1).unwrap();
+        s.add_snag(&task, &b2).unwrap();
+        assert_eq!(
+            sorted(s.list_snags(&task).unwrap()),
+            sorted(vec![b1.clone(), b2.clone()])
+        );
+
+        // REPLACE with {b2,b3} (dups collapse) — b1 gone, b3 added.
+        s.set_brief_blockers(&task, &[&b2, &b3, &b2]).unwrap();
+        assert_eq!(
+            sorted(s.list_snags(&task).unwrap()),
+            sorted(vec![b2.clone(), b3.clone()])
+        );
+
+        // Empty list clears ALL.
+        s.set_brief_blockers(&task, &[]).unwrap();
+        assert!(s.list_snags(&task).unwrap().is_empty());
+
+        // Self-block rejected, and the set is unchanged on rejection.
+        s.set_brief_blockers(&task, &[&b1]).unwrap(); // task blocked_on b1
+        assert!(matches!(
+            s.set_brief_blockers(&task, &[&b2, &task]),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        assert_eq!(s.list_snags(&task).unwrap(), vec![b1.clone()]); // unchanged
+
+        // Cycle rejected: clear task's set, make b1 wait on task, then
+        // replacing task's blockers with [b1] would close a 2-cycle.
+        s.set_brief_blockers(&task, &[]).unwrap();
+        s.add_snag(&b1, &task).unwrap(); // b1 blocked_on task (fine now)
+        assert!(matches!(
+            s.set_brief_blockers(&task, &[&b1]),
+            Err(CoordinatorError::Invalid(_))
+        ));
     }
 
     #[test]
