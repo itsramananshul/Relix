@@ -60,6 +60,7 @@
     <button class="tab on" data-view="board">Board</button>
     <button class="tab" data-view="mandates">Mandates</button>
     <button class="tab" data-view="roster">Roster</button>
+    <button class="tab" data-view="activity">Activity</button>
   </nav>
   <div class="counts" id="counts"><span class="muted">loading…</span></div>
 </header>
@@ -83,6 +84,13 @@
   <section id="rosterView" hidden>
     <div class="toolbar"><button class="ghost" id="refreshRoster">Refresh</button></div>
     <table id="roster"><thead><tr><th>Name</th><th>Role</th><th>Status</th><th>ID</th></tr></thead><tbody></tbody></table>
+  </section>
+  <section id="activityView" hidden>
+    <div class="toolbar">
+      <button class="ghost" id="refreshActivity">Refresh</button>
+      <label class="muted" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="autoAct" /> auto (3s)</label>
+    </div>
+    <table id="activity"><thead><tr><th>When</th><th>Event</th><th>Brief</th><th>Detail</th></tr></thead><tbody></tbody></table>
   </section>
 </main>
 
@@ -258,18 +266,48 @@ async function loadRoster() {
   } catch(e){ tb.innerHTML = '<tr><td colspan="4" class="err">'+e.message+'</td></tr>'; }
 }
 
+function fmtTime(ts) { try { return new Date((ts<1e12?ts*1000:ts)).toLocaleTimeString(); } catch(_) { return ""+ts; } }
+
+async function loadActivity() {
+  const tb = $("#activity tbody");
+  try {
+    const res = await api("/v1/tasks/events/recent?limit=80");
+    const items = (res && res.items) || [];
+    tb.innerHTML = "";
+    if (!items.length) { tb.append(el("tr",{},[el("td",{colSpan:4,className:"muted",textContent:"No activity yet."})])); return; }
+    for (const ev of items) {
+      tb.append(el("tr",{},[
+        el("td",{className:"muted",textContent:fmtTime(ev.ts)}),
+        el("td",{textContent:ev.event_type}),
+        el("td",{className:"muted", style:"cursor:pointer", textContent:(ev.task_id||"").slice(0,10), onclick:()=>openBrief(ev.task_id)}),
+        el("td",{className:"muted",textContent:ev.summary||ev.payload||""}),
+      ]));
+    }
+  } catch(e){ tb.innerHTML = '<tr><td colspan="4" class="err">'+e.message+'</td></tr>'; }
+}
+let actTimer = null;
+function setAutoActivity(on) {
+  if (actTimer) { clearInterval(actTimer); actTimer = null; }
+  if (on) actTimer = setInterval(loadActivity, 3000);
+}
+
 function switchView(name) {
   for (const t of document.querySelectorAll(".tab")) t.classList.toggle("on", t.dataset.view===name);
   $("#boardView").hidden = name!=="board";
   $("#mandatesView").hidden = name!=="mandates";
   $("#rosterView").hidden = name!=="roster";
+  $("#activityView").hidden = name!=="activity";
+  if (name!=="activity") setAutoActivity(false); // stop polling when away
   if (name==="mandates") loadMandates();
   if (name==="roster") loadRoster();
+  if (name==="activity") { loadActivity(); setAutoActivity($("#autoAct").checked); }
 }
 for (const t of document.querySelectorAll(".tab")) t.onclick = ()=>switchView(t.dataset.view);
 
 $("#refreshMandates").onclick = loadMandates;
 $("#refreshRoster").onclick = loadRoster;
+$("#refreshActivity").onclick = loadActivity;
+$("#autoAct").addEventListener("change", e=>setAutoActivity(e.target.checked));
 $("#newMandate").onclick = async ()=>{
   const title = prompt("Mandate title");
   if (!title || !title.trim()) return;
