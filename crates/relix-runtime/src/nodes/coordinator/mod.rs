@@ -1138,6 +1138,49 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// PHASE 1/2 (rollup): count a Campaign's Briefs by board
+    /// column. The progress read behind a Campaign's summary.
+    pub fn campaign_brief_counts(
+        &self,
+        campaign_id: &str,
+    ) -> Result<Vec<(String, i64)>, CoordinatorError> {
+        self.brief_counts_by_column("campaign_id", campaign_id)
+    }
+
+    /// PHASE 1/2 (rollup): count a Mandate's directly-linked Briefs
+    /// by board column. (Campaign-linked Briefs roll up via
+    /// `campaign_brief_counts`.)
+    pub fn mandate_brief_counts(
+        &self,
+        mandate_id: &str,
+    ) -> Result<Vec<(String, i64)>, CoordinatorError> {
+        self.brief_counts_by_column("mandate_id", mandate_id)
+    }
+
+    /// Shared: Brief counts grouped by board column for a fixed
+    /// spine-link column (`campaign_id` / `mandate_id`, never user
+    /// input). Ordered by column name for stable output.
+    fn brief_counts_by_column(
+        &self,
+        column: &str,
+        value: &str,
+    ) -> Result<Vec<(String, i64)>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let sql = format!(
+            "SELECT board_status, COUNT(*) FROM tasks
+             WHERE {column} = ?1 GROUP BY board_status ORDER BY board_status"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![value], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// Insert a new Task. Returns the freshly-minted `task_id`
     /// (32 hex chars). Optional retry / timeout metadata defaults to
     /// "no retry, no timeout" for backwards compatibility with pre-C1
@@ -5232,6 +5275,27 @@ pub fn register(
             })),
         );
     }
+    // Spine progress rollups (Briefs-by-column for a Campaign / Mandate).
+    {
+        let s = store.clone();
+        bridge.register(
+            "campaign.progress",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_campaign_progress(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "mandate.progress",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_mandate_progress(&s, &ctx) }
+            })),
+        );
+    }
     {
         let s = store.clone();
         bridge.register(
@@ -6308,6 +6372,47 @@ fn handle_brief_children_done(store: &TaskStore, ctx: &InvocationCtx) -> Handler
             Err(e) => internal(format!("brief.children_done encode: {e}")),
         },
         Err(e) => map_edge_err("brief.children_done", e),
+    }
+}
+
+/// Render board-column counts as a JSON object plus a `total` key.
+fn counts_to_json(counts: Vec<(String, i64)>) -> HandlerOutcome {
+    let mut obj = serde_json::Map::new();
+    let mut total = 0i64;
+    for (status, n) in counts {
+        total += n;
+        obj.insert(status, serde_json::Value::from(n));
+    }
+    obj.insert("total".to_string(), serde_json::Value::from(total));
+    match serde_json::to_vec(&serde_json::Value::Object(obj)) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => internal(format!("progress encode: {e}")),
+    }
+}
+
+/// `campaign.progress` — a Campaign's Brief counts by board column
+/// (+ `total`). Arg `campaign_id`.
+fn handle_campaign_progress(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match single_id(ctx, "campaign.progress") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    match store.campaign_brief_counts(id) {
+        Ok(counts) => counts_to_json(counts),
+        Err(e) => map_edge_err("campaign.progress", e),
+    }
+}
+
+/// `mandate.progress` — a Mandate's directly-linked Brief counts by
+/// board column (+ `total`). Arg `mandate_id`.
+fn handle_mandate_progress(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match single_id(ctx, "mandate.progress") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    match store.mandate_brief_counts(id) {
+        Ok(counts) => counts_to_json(counts),
+        Err(e) => map_edge_err("mandate.progress", e),
     }
 }
 
@@ -9416,6 +9521,40 @@ mod tests {
             s.set_board_status(&parent, st).unwrap();
         }
         assert!(!has_parent(&s, &parent));
+    }
+
+    #[test]
+    fn phase2_campaign_and_mandate_progress_counts_by_column() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        let b1 = mk("b1");
+        let b2 = mk("b2");
+        let b3 = mk("b3");
+        s.set_brief_field(&b1, "campaign", "camp_1").unwrap();
+        s.set_brief_field(&b2, "campaign", "camp_1").unwrap();
+        s.set_brief_field(&b3, "campaign", "camp_2").unwrap();
+        s.set_brief_field(&b1, "mandate", "mand_1").unwrap();
+        // b1 backlog, b2 todo (camp_1); b3 backlog (camp_2).
+        s.set_board_status(&b2, "todo").unwrap();
+
+        let c1: std::collections::HashMap<String, i64> =
+            s.campaign_brief_counts("camp_1").unwrap().into_iter().collect();
+        assert_eq!(c1.get("backlog"), Some(&1));
+        assert_eq!(c1.get("todo"), Some(&1));
+        assert_eq!(c1.values().sum::<i64>(), 2);
+
+        assert_eq!(
+            s.campaign_brief_counts("camp_2").unwrap(),
+            vec![("backlog".to_string(), 1)]
+        );
+        assert_eq!(
+            s.mandate_brief_counts("mand_1").unwrap(),
+            vec![("backlog".to_string(), 1)]
+        );
+        assert!(s.campaign_brief_counts("none").unwrap().is_empty());
     }
 
     /// File-backed open helper for the DB-hardening tests. We
