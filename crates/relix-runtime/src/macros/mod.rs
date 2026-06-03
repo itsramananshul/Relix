@@ -32,6 +32,13 @@ pub struct MacroSpec {
     /// Cap on returned `stdout` — the whole point is to keep only a
     /// small result in context, not the firehose.
     pub max_output_bytes: usize,
+    /// Working directory to run in (the Brief's **Bench**, normally).
+    /// `None` inherits the parent's cwd.
+    pub cwd: Option<String>,
+    /// Extra environment variables — the *scoped* set the Cell hands
+    /// the script (a bridge token, the Brief id, …). Applied on top
+    /// of the inherited environment.
+    pub env: Vec<(String, String)>,
 }
 
 impl MacroSpec {
@@ -41,6 +48,8 @@ impl MacroSpec {
             args: Vec::new(),
             script: script.into(),
             max_output_bytes: 64 * 1024,
+            cwd: None,
+            env: Vec::new(),
         }
     }
 
@@ -51,6 +60,18 @@ impl MacroSpec {
 
     pub fn with_max_output_bytes(mut self, n: usize) -> Self {
         self.max_output_bytes = n;
+        self
+    }
+
+    /// Run the Macro in `dir` (the Brief's Bench).
+    pub fn with_cwd(mut self, dir: impl Into<String>) -> Self {
+        self.cwd = Some(dir.into());
+        self
+    }
+
+    /// Add a scoped environment variable handed to the script.
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = env;
         self
     }
 
@@ -130,13 +151,19 @@ pub fn run_macro(spec: &MacroSpec) -> MacroResult {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let mut child = match Command::new(&spec.interpreter)
+    let mut command = Command::new(&spec.interpreter);
+    command
         .args(&spec.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    if let Some(dir) = &spec.cwd {
+        command.current_dir(dir);
+    }
+    if !spec.env.is_empty() {
+        command.envs(spec.env.iter().map(|(k, v)| (k, v)));
+    }
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => return MacroResult::failed(format!("spawn {}: {e}", spec.interpreter)),
     };
@@ -269,6 +296,42 @@ mod tests {
         let r = run_macro_guarded(&spec, &[allow]).expect("allowed");
         assert!(r.success, "stderr: {}", r.stderr);
         assert!(r.stdout.contains("ok"));
+    }
+
+    #[test]
+    fn run_macro_applies_scoped_env() {
+        let line = if cfg!(windows) {
+            "echo %RELIX_MTEST%"
+        } else {
+            "echo $RELIX_MTEST"
+        };
+        let spec = cmd_spec(line, 64).with_env(vec![("RELIX_MTEST".into(), "hello42".into())]);
+        let r = run_macro(&spec);
+        assert!(r.success, "stderr: {}", r.stderr);
+        assert!(r.stdout.contains("hello42"), "stdout: {:?}", r.stdout);
+    }
+
+    #[test]
+    fn run_macro_runs_in_the_given_cwd() {
+        // Use the OS temp dir as a known, existing working directory.
+        let tmp = std::env::temp_dir();
+        let line = if cfg!(windows) { "cd" } else { "pwd" };
+        let spec = cmd_spec(line, 4096).with_cwd(tmp.to_string_lossy().to_string());
+        let r = run_macro(&spec);
+        assert!(r.success, "stderr: {}", r.stderr);
+        // The printed path should reference the temp dir's final
+        // component (robust against symlinked /tmp vs /private/tmp).
+        let leaf = tmp
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !leaf.is_empty() {
+            assert!(
+                r.stdout.to_lowercase().contains(&leaf.to_lowercase()),
+                "cwd not honoured: {:?} (leaf {leaf})",
+                r.stdout
+            );
+        }
     }
 
     #[test]
