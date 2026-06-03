@@ -19,7 +19,9 @@ use crate::nodes::coordinator::agent::store::{
     default_approval_categories,
 };
 use crate::nodes::coordinator::spine::SpineStore;
-use crate::nodes::coordinator::spine::store::{SpineStoreError, TeamPlanRecord};
+use crate::nodes::coordinator::spine::store::{
+    OrchestrationRunRecord, SpineStoreError, TeamPlanRecord,
+};
 use crate::nodes::coordinator::{CoordinatorError, TaskStore};
 
 // ── agent.create ─────────────────────────────────────────
@@ -460,42 +462,60 @@ pub fn handle_team_plan_latest(spine_store: &SpineStore, ctx: &InvocationCtx) ->
 /// `blocked_roles` (`{role, reason}` from denials), `readiness`
 /// (`not_planned` / `awaiting_clearance` / `staffing` / `ready`), and
 /// `next_action`.
-pub fn handle_team_readiness(
+/// A computed snapshot of a Mandate's team staffing — the shared logic
+/// behind `mandate.team_readiness` and `mandate.orchestrate`. Pure of
+/// HTTP shapes; both callers project it into their own JSON.
+pub(crate) struct ReadinessView {
+    pub planned: bool,
+    pub plan: Option<crate::nodes::coordinator::spine::TeamPlan>,
+    pub missing_roles: Vec<String>,
+    /// `{clearance_id, status}` objects for still-pending Clearances.
+    pub pending_clearances: Vec<serde_json::Value>,
+    /// `(role, agent_id)` for hires that are now `active`.
+    pub active_agents: Vec<(String, String)>,
+    /// `{role, agent_id, status}` for hires not yet active.
+    pub pending_hires: Vec<serde_json::Value>,
+    /// `{role, reason}` for denied/disabled roles.
+    pub blocked_roles: Vec<serde_json::Value>,
+    pub readiness: String,
+    pub next_action: String,
+}
+
+impl ReadinessView {
+    pub fn is_ready(&self) -> bool {
+        self.readiness == "ready"
+    }
+
+    fn active_agents_json(&self) -> Vec<serde_json::Value> {
+        self.active_agents
+            .iter()
+            .map(|(role, agent_id)| serde_json::json!({"role": role, "agent_id": agent_id}))
+            .collect()
+    }
+}
+
+/// Compute the live team-readiness snapshot for a Mandate, tenant-
+/// scoped. Combines the latest persisted Team Plan with the CURRENT
+/// status of each minted hire and Clearance.
+pub(crate) fn compute_readiness(
     agent_store: &AgentStore,
     spine_store: &SpineStore,
-    ctx: &InvocationCtx,
-) -> HandlerOutcome {
-    let mandate_id = match std::str::from_utf8(&ctx.args) {
-        Ok(s) => s.trim(),
-        Err(e) => return invalid(format!("mandate.team_readiness utf8: {e}")),
-    };
-    if mandate_id.is_empty() {
-        return invalid("mandate.team_readiness: mandate_id required".into());
-    }
-    let tenant = ctx.tenant_id_or_default();
-    let plan = match spine_store.latest_team_plan(tenant, mandate_id) {
-        Ok(p) => p,
-        Err(e) => return internal(format!("mandate.team_readiness: {e}")),
-    };
+    tenant: &str,
+    mandate_id: &str,
+) -> Result<ReadinessView, SpineStoreError> {
+    let plan = spine_store.latest_team_plan(tenant, mandate_id)?;
     let Some(plan) = plan else {
-        // Never planned → an explicit not-planned readiness.
-        let body = serde_json::json!({
-            "mandate_id": mandate_id,
-            "planned": false,
-            "plan_id": serde_json::Value::Null,
-            "plan_status": serde_json::Value::Null,
-            "missing_roles": [],
-            "pending_clearances": [],
-            "active_agents": [],
-            "pending_hires": [],
-            "blocked_roles": [],
-            "readiness": "not_planned",
-            "next_action": "Plan a team for this Mandate (mandate.team_plan).",
+        return Ok(ReadinessView {
+            planned: false,
+            plan: None,
+            missing_roles: Vec::new(),
+            pending_clearances: Vec::new(),
+            active_agents: Vec::new(),
+            pending_hires: Vec::new(),
+            blocked_roles: Vec::new(),
+            readiness: "not_planned".to_string(),
+            next_action: "Plan a team for this Mandate (mandate.team_plan).".to_string(),
         });
-        return match serde_json::to_vec(&body) {
-            Ok(b) => HandlerOutcome::Ok(b),
-            Err(e) => internal(format!("mandate.team_readiness encode: {e}")),
-        };
     };
 
     let parse_arr = |s: &str| -> Vec<serde_json::Value> {
@@ -505,19 +525,18 @@ pub fn handle_team_readiness(
         .into_iter()
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect();
-    let pending_hires = parse_arr(&plan.pending_hires);
+    let pending_hires_raw = parse_arr(&plan.pending_hires);
     let clearance_ids: Vec<String> = parse_arr(&plan.clearance_ids)
         .into_iter()
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect();
     let denials = parse_arr(&plan.denials);
 
-    // Classify each minted hire by its CURRENT status.
-    let mut active_agents: Vec<serde_json::Value> = Vec::new();
-    let mut pending_hires_out: Vec<serde_json::Value> = Vec::new();
+    let mut active_agents: Vec<(String, String)> = Vec::new();
+    let mut pending_hires: Vec<serde_json::Value> = Vec::new();
     let mut missing_roles: Vec<String> = proposed_roles.clone();
     let mut blocked_roles: Vec<serde_json::Value> = denials.clone();
-    for h in &pending_hires {
+    for h in &pending_hires_raw {
         let role = h.get("role").and_then(|v| v.as_str()).unwrap_or("");
         let agent_id = h.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         if agent_id.is_empty() {
@@ -530,22 +549,20 @@ pub fn handle_team_readiness(
             .map(|p| p.status)
             .unwrap_or_else(|| "missing".to_string());
         match status.as_str() {
-            "active" => active_agents.push(serde_json::json!({"role": role, "agent_id": agent_id})),
+            "active" => active_agents.push((role.to_string(), agent_id.to_string())),
             "disabled" | "missing" => {
-                // A rejected / vanished hire leaves the role unstaffed.
                 missing_roles.push(role.to_string());
                 blocked_roles.push(serde_json::json!({
                     "role": role,
                     "reason": format!("hire {agent_id} is {status}"),
                 }));
             }
-            other => pending_hires_out.push(serde_json::json!({
+            other => pending_hires.push(serde_json::json!({
                 "role": role, "agent_id": agent_id, "status": other,
             })),
         }
     }
 
-    // Classify each Clearance by its CURRENT status.
     let mut pending_clearances: Vec<serde_json::Value> = Vec::new();
     for cid in &clearance_ids {
         let status = agent_store
@@ -567,12 +584,12 @@ pub fn handle_team_readiness(
                 pending_clearances.len()
             ),
         )
-    } else if !pending_hires_out.is_empty() {
+    } else if !pending_hires.is_empty() {
         (
             "staffing",
             format!(
                 "Approve {} pending hire(s) (agent.approve_hire).",
-                pending_hires_out.len()
+                pending_hires.len()
             ),
         )
     } else if !missing_roles.is_empty() {
@@ -595,22 +612,494 @@ pub fn handle_team_readiness(
         )
     };
 
+    Ok(ReadinessView {
+        planned: true,
+        plan: Some(plan),
+        missing_roles,
+        pending_clearances,
+        active_agents,
+        pending_hires,
+        blocked_roles,
+        readiness: readiness.to_string(),
+        next_action,
+    })
+}
+
+pub fn handle_team_readiness(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let mandate_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("mandate.team_readiness utf8: {e}")),
+    };
+    if mandate_id.is_empty() {
+        return invalid("mandate.team_readiness: mandate_id required".into());
+    }
+    let view = match compute_readiness(
+        agent_store,
+        spine_store,
+        ctx.tenant_id_or_default(),
+        mandate_id,
+    ) {
+        Ok(v) => v,
+        Err(e) => return internal(format!("mandate.team_readiness: {e}")),
+    };
     let body = serde_json::json!({
         "mandate_id": mandate_id,
-        "planned": true,
-        "plan_id": plan.plan_id,
-        "plan_status": plan.status,
-        "missing_roles": missing_roles,
-        "pending_clearances": pending_clearances,
-        "active_agents": active_agents,
-        "pending_hires": pending_hires_out,
-        "blocked_roles": blocked_roles,
-        "readiness": readiness,
-        "next_action": next_action,
+        "planned": view.planned,
+        "plan_id": view.plan.as_ref().map(|p| p.plan_id.clone()),
+        "plan_status": view.plan.as_ref().map(|p| p.status.clone()),
+        "missing_roles": view.missing_roles,
+        "pending_clearances": view.pending_clearances,
+        "active_agents": view.active_agents_json(),
+        "pending_hires": view.pending_hires,
+        "blocked_roles": view.blocked_roles,
+        "readiness": view.readiness,
+        "next_action": view.next_action,
     });
     match serde_json::to_vec(&body) {
         Ok(b) => HandlerOutcome::Ok(b),
         Err(e) => internal(format!("mandate.team_readiness encode: {e}")),
+    }
+}
+
+/// Normalise the orchestration `mode`; default is the safe `plan_only`
+/// (compute + report, create nothing).
+fn orchestration_mode(s: Option<&&str>) -> &'static str {
+    match s.map(|x| x.trim()) {
+        Some("create_briefs") => "create_briefs",
+        Some("assign_ready") => "assign_ready",
+        _ => "plan_only",
+    }
+}
+
+/// Deterministic, role-aware work title for a child Brief. Known roles
+/// get a named track; anything else gets a generic "Execute {role}
+/// track" title.
+fn role_track_title(role: &str, mandate_title: &str) -> String {
+    let track = match role.trim().to_ascii_lowercase().as_str() {
+        "engineer" | "engineering" | "swe" | "developer" | "dev" => "Engineering",
+        "designer" | "design" | "ux" | "ui" => "Design",
+        "researcher" | "research" => "Research",
+        "writer" | "writing" | "content" | "copywriter" => "Content",
+        "planner" | "pm" | "product" | "prime" => "Planning",
+        "qa" | "test" | "tester" | "quality" => "QA",
+        "ops" | "devops" | "sre" | "operations" => "Operations",
+        "data" | "analyst" | "analytics" | "scientist" => "Data",
+        "security" | "sec" | "appsec" => "Security",
+        "marketing" | "growth" => "Marketing",
+        _ => return format!("Execute {} track for {mandate_title}", role.trim()),
+    };
+    format!("{track} track: {mandate_title}")
+}
+
+/// Stable signature of the orchestration inputs (deterministic across
+/// processes — `DefaultHasher::new()` uses a fixed seed). Lets a run
+/// record show whether two runs had identical inputs.
+fn orchestration_signature(
+    mandate_id: &str,
+    mode: &str,
+    plan_id: &str,
+    titles: &[String],
+) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    mandate_id.hash(&mut h);
+    mode.hash(&mut h);
+    plan_id.hash(&mut h);
+    for t in titles {
+        t.hash(&mut h);
+    }
+    format!("{:016x}", h.finish())
+}
+
+/// `mandate.orchestrate` — turn an approved-strategy Mandate with a
+/// ready team into an executable Brief tree (company-model §4.6).
+/// Arg: `mandate_id|mode?|max_briefs?|dry_run?`.
+///
+/// - `mode` ∈ `plan_only` (default; compute + report, create nothing) /
+///   `create_briefs` (create the tree, no assignment) / `assign_ready`
+///   (create + assign active team agents).
+/// - `dry_run` (default false) forces report-only regardless of mode.
+///
+/// Deterministic + idempotent: Briefs are keyed by a stable title, so a
+/// repeated run reuses the existing parent/children rather than
+/// duplicating them (and a crash mid-run is recovered on the next run).
+/// Assignment respects the assign-Key gate (`enforce_assign_key`).
+/// Every run is persisted via `record_orchestration_run`.
+#[allow(clippy::too_many_lines)]
+pub fn handle_orchestrate(
+    task_store: &TaskStore,
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("mandate.orchestrate utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(4, '|').collect();
+    let mandate_id = parts.first().copied().unwrap_or("").trim();
+    if mandate_id.is_empty() {
+        return invalid(
+            "mandate.orchestrate: expected `mandate_id|mode?|max_briefs?|dry_run?`".into(),
+        );
+    }
+    let mode = orchestration_mode(parts.get(1));
+    let max_briefs: usize = parts
+        .get(2)
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16)
+        .clamp(1, 50);
+    let dry_run = matches!(
+        parts.get(3).copied().map(|s| s.trim().to_ascii_lowercase()),
+        Some(ref v) if v == "1" || v == "true" || v == "yes"
+    );
+    let tenant = ctx.tenant_id_or_default();
+
+    let mut blockers: Vec<serde_json::Value> = Vec::new();
+    let mut created_briefs: Vec<serde_json::Value> = Vec::new();
+    let mut existing_briefs: Vec<serde_json::Value> = Vec::new();
+    let mut assigned_briefs: Vec<serde_json::Value> = Vec::new();
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+    let mut next_actions: Vec<String> = Vec::new();
+
+    // Gate 1: the Mandate strategy must be approved.
+    match spine_store.strategy_approved(tenant, mandate_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            blockers.push(serde_json::json!({
+                "reason": "strategy_not_approved",
+                "detail": "approve the Mandate strategy before orchestrating",
+            }));
+        }
+        Err(SpineStoreError::BadInput(m)) | Err(SpineStoreError::NotFound(m)) => {
+            return invalid(format!("mandate.orchestrate: {m}"));
+        }
+        Err(e) => return internal(format!("mandate.orchestrate: {e}")),
+    }
+    let mandate = match spine_store.get_mandate_for_tenant(mandate_id, tenant) {
+        Ok(Some(m)) => m,
+        Ok(None) => return invalid(format!("mandate.orchestrate: not found: {mandate_id}")),
+        Err(e) => return internal(format!("mandate.orchestrate: {e}")),
+    };
+
+    // Gate 2 + readiness.
+    let view = match compute_readiness(agent_store, spine_store, tenant, mandate_id) {
+        Ok(v) => v,
+        Err(e) => return internal(format!("mandate.orchestrate: {e}")),
+    };
+    if !view.planned {
+        blockers.push(serde_json::json!({
+            "reason": "no_team_plan",
+            "detail": "run mandate.team_plan first",
+        }));
+    }
+    for c in &view.pending_clearances {
+        blockers.push(serde_json::json!({"reason": "pending_clearance", "detail": c}));
+    }
+    for h in &view.pending_hires {
+        blockers.push(serde_json::json!({"reason": "pending_hire", "detail": h}));
+    }
+    for r in &view.missing_roles {
+        blockers.push(serde_json::json!({"reason": "missing_role", "detail": r}));
+    }
+    for b in &view.blocked_roles {
+        blockers.push(serde_json::json!({"reason": "blocked_role", "detail": b}));
+    }
+
+    let ready = blockers.is_empty() && view.is_ready();
+
+    // Build the deterministic role-track plan (sorted by role).
+    let mut tracks: std::collections::BTreeMap<String, (String, Option<String>)> =
+        std::collections::BTreeMap::new();
+    let mut note_role = |role: &str, agent: Option<&str>| {
+        let key = role.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return;
+        }
+        let entry = tracks
+            .entry(key)
+            .or_insert_with(|| (role.trim().to_string(), None));
+        if let Some(a) = agent {
+            entry.1 = Some(a.to_string());
+        }
+    };
+    for (role, agent_id) in &view.active_agents {
+        note_role(role, Some(agent_id));
+    }
+    // (pending/missing roles are blockers, not staffed tracks, but we
+    // still list them so a `create_briefs` run lays down the work track.)
+    let track_list: Vec<(String, Option<String>)> = tracks
+        .into_values()
+        .take(max_briefs.saturating_sub(1).max(1))
+        .collect();
+
+    // Existing Briefs under this Mandate, by title (idempotency key).
+    let existing = task_store
+        .list_briefs_by_mandate(mandate_id, 500)
+        .unwrap_or_default();
+    let mut by_title: std::collections::HashMap<String, (String, Option<String>)> = existing
+        .into_iter()
+        .map(|c| (c.title.clone(), (c.task_id, c.assignee_agent_id)))
+        .collect();
+
+    let create_allowed = ready && !dry_run && matches!(mode, "create_briefs" | "assign_ready");
+    let assign_allowed = ready && !dry_run && mode == "assign_ready";
+    let owner_subject = ctx.caller.subject_id.to_string();
+    let parent_title = format!("Execute Mandate: {}", mandate.title);
+
+    // All planned titles (parent + children) → the input signature.
+    let mut all_titles: Vec<String> = vec![parent_title.clone()];
+    for (role, _) in &track_list {
+        all_titles.push(role_track_title(role, &mandate.title));
+    }
+    let plan_id = view
+        .plan
+        .as_ref()
+        .map(|p| p.plan_id.clone())
+        .unwrap_or_default();
+    let signature = orchestration_signature(mandate_id, mode, &plan_id, &all_titles);
+
+    // Helper: get-or-create a Brief by title under the Mandate.
+    // Returns (task_id, was_existing) or None when creation is not
+    // allowed and it does not exist (dry_run/plan_only/blocked).
+    let mut ensure_brief = |title: &str,
+                            created: &mut Vec<serde_json::Value>,
+                            existing_out: &mut Vec<serde_json::Value>,
+                            skipped_out: &mut Vec<serde_json::Value>|
+     -> Option<(String, bool, Option<String>)> {
+        if let Some((id, assignee)) = by_title.get(title).cloned() {
+            existing_out.push(serde_json::json!({"task_id": id, "title": title}));
+            return Some((id, true, assignee));
+        }
+        if !create_allowed {
+            skipped_out.push(serde_json::json!({
+                "title": title,
+                "reason": if dry_run { "dry_run: would create" }
+                          else if !ready { "team not ready" }
+                          else { "plan_only: not created" },
+            }));
+            return None;
+        }
+        match task_store.create_brief(
+            tenant,
+            title,
+            &owner_subject,
+            None,
+            Some(mandate_id),
+            None,
+            None,
+        ) {
+            Ok(id) => {
+                created.push(serde_json::json!({"task_id": id, "title": title}));
+                by_title.insert(title.to_string(), (id.clone(), None));
+                Some((id, false, None))
+            }
+            Err(e) => {
+                skipped_out.push(serde_json::json!({"title": title, "reason": e.to_string()}));
+                None
+            }
+        }
+    };
+
+    // Parent Brief.
+    let parent = ensure_brief(
+        &parent_title,
+        &mut created_briefs,
+        &mut existing_briefs,
+        &mut skipped,
+    );
+    if let Some((ref parent_id, was_existing, _)) = parent
+        && !was_existing
+    {
+        // Newly created parent: drop a durable orchestration Dossier.
+        let body = format!(
+            "Orchestration of Mandate '{}' ({mandate_id}). Roles: {}",
+            mandate.title,
+            track_list
+                .iter()
+                .map(|(r, _)| r.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let _ = task_store.add_dossier(parent_id, "orchestration", "Orchestration plan", &body);
+    }
+
+    // Child Briefs per role track.
+    for (role, active_agent) in &track_list {
+        let title = role_track_title(role, &mandate.title);
+        let child = ensure_brief(
+            &title,
+            &mut created_briefs,
+            &mut existing_briefs,
+            &mut skipped,
+        );
+        let Some((child_id, _was_existing, current_assignee)) = child else {
+            continue;
+        };
+        // Link to the parent (idempotent edge insert).
+        if let Some((ref parent_id, _, _)) = parent {
+            let _ = task_store.link_subbrief(parent_id, &child_id);
+        }
+        // Assignment (assign_ready only).
+        if let Some(agent_id) = active_agent {
+            if !assign_allowed {
+                if ready && mode == "create_briefs" {
+                    skipped.push(serde_json::json!({
+                        "task_id": child_id, "reason": "not assigned (mode=create_briefs)",
+                    }));
+                }
+                continue;
+            }
+            if current_assignee.as_deref() == Some(agent_id.as_str()) {
+                // Already assigned to the right Operative — idempotent no-op.
+                assigned_briefs
+                    .push(serde_json::json!({"task_id": child_id, "agent_id": agent_id}));
+                continue;
+            }
+            match enforce_assign_key(agent_store, ctx, agent_id) {
+                Ok(()) => match task_store.set_brief_field(&child_id, "assignee", agent_id) {
+                    Ok(()) => assigned_briefs
+                        .push(serde_json::json!({"task_id": child_id, "agent_id": agent_id})),
+                    Err(e) => skipped.push(
+                        serde_json::json!({"task_id": child_id, "reason": format!("assign: {e}")}),
+                    ),
+                },
+                Err(_) => skipped.push(serde_json::json!({
+                    "task_id": child_id,
+                    "reason": format!("assign denied for `{agent_id}` (assign-Key gate)"),
+                })),
+            }
+        }
+    }
+
+    // Status + next actions.
+    let status = if !ready {
+        "blocked"
+    } else if dry_run || mode == "plan_only" {
+        "planned"
+    } else if mode == "assign_ready" {
+        "assigned"
+    } else {
+        "created"
+    };
+    if !ready {
+        next_actions.push("Resolve the blockers, then re-run mandate.orchestrate.".to_string());
+    } else if dry_run || mode == "plan_only" {
+        next_actions.push(
+            "Re-run with mode=create_briefs or assign_ready to materialise the tree.".to_string(),
+        );
+    } else if mode == "create_briefs" {
+        next_actions.push("Re-run with mode=assign_ready to assign the active team.".to_string());
+    } else {
+        next_actions
+            .push("Briefs created and assigned — the heartbeat will dispatch them.".to_string());
+    }
+
+    // Persist the run (best-effort: a record failure must not lose the
+    // already-created Briefs).
+    let to_json =
+        |v: &[serde_json::Value]| serde_json::to_string(&v).unwrap_or_else(|_| "[]".into());
+    let actions_json = serde_json::to_string(&next_actions).unwrap_or_else(|_| "[]".into());
+    let run_id = match spine_store.record_orchestration_run(&OrchestrationRunRecord {
+        tenant_id: tenant,
+        mandate_id,
+        mode,
+        dry_run,
+        input_signature: &signature,
+        status,
+        created_brief_ids_json: &to_json(&created_briefs),
+        assigned_brief_ids_json: &to_json(&assigned_briefs),
+        blockers_json: &to_json(&blockers),
+        next_actions_json: &actions_json,
+    }) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::warn!(mandate_id = %mandate_id, error = %e, "mandate.orchestrate: persist failed");
+            None
+        }
+    };
+
+    let body = serde_json::json!({
+        "mandate_id": mandate_id,
+        "run_id": run_id,
+        "mode": mode,
+        "dry_run": dry_run,
+        "ready": ready,
+        "status": status,
+        "input_signature": signature,
+        "blockers": blockers,
+        "created_briefs": created_briefs,
+        "assigned_briefs": assigned_briefs,
+        "existing_briefs": existing_briefs,
+        "skipped": skipped,
+        "next_actions": next_actions,
+    });
+    match serde_json::to_vec(&body) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => internal(format!("mandate.orchestrate encode: {e}")),
+    }
+}
+
+/// `mandate.orchestration.latest` — the most recent persisted
+/// orchestration run for a Mandate as JSON (`null` if never run).
+/// Arg: `mandate_id`. Tenant-scoped.
+pub fn handle_orchestration_latest(
+    spine_store: &SpineStore,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let mandate_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("mandate.orchestration.latest utf8: {e}")),
+    };
+    if mandate_id.is_empty() {
+        return invalid("mandate.orchestration.latest: mandate_id required".into());
+    }
+    match spine_store.latest_orchestration_run(ctx.tenant_id_or_default(), mandate_id) {
+        Ok(Some(run)) => match serde_json::to_vec(&run.to_json()) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("mandate.orchestration.latest encode: {e}")),
+        },
+        Ok(None) => HandlerOutcome::Ok(b"null".to_vec()),
+        Err(e) => internal(format!("mandate.orchestration.latest: {e}")),
+    }
+}
+
+/// `mandate.orchestration.list` — recent orchestration runs for a
+/// Mandate as a JSON array (newest first). Arg: `mandate_id|limit?`.
+/// Tenant-scoped.
+pub fn handle_orchestration_list(spine_store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("mandate.orchestration.list utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    let mandate_id = parts.first().copied().unwrap_or("").trim();
+    if mandate_id.is_empty() {
+        return invalid("mandate.orchestration.list: mandate_id required".into());
+    }
+    let limit: usize = parts
+        .get(1)
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    match spine_store.list_orchestration_runs(ctx.tenant_id_or_default(), mandate_id, limit) {
+        Ok(rows) => {
+            let arr: Vec<serde_json::Value> = rows.iter().map(|r| r.to_json()).collect();
+            match serde_json::to_vec(&serde_json::Value::Array(arr)) {
+                Ok(b) => HandlerOutcome::Ok(b),
+                Err(e) => internal(format!("mandate.orchestration.list encode: {e}")),
+            }
+        }
+        Err(e) => internal(format!("mandate.orchestration.list: {e}")),
     }
 }
 
@@ -2613,6 +3102,278 @@ mod tests {
         )
         .unwrap();
         assert_eq!(b["planned"], false, "tenant B must not see tenant A's plan");
+    }
+
+    // ── Mandate orchestration (company-model §4.6) ───────────
+
+    /// Build an approved Mandate with a READY team (one active agent in
+    /// `role`). Returns (mandate_id, active_agent_id).
+    fn ready_team(agents: &AgentStore, spine: &SpineStore, role: &str) -> (String, String) {
+        let m = approved_mandate(spine);
+        let agent_id = agents
+            .create_agent(
+                "Worker", role, "W", "eng", "eng", "prime", "subj-rt", "medium", "default",
+            )
+            .unwrap();
+        let hires = format!("[{{\"role\":\"{role}\",\"agent_id\":\"{agent_id}\"}}]");
+        spine
+            .record_team_plan(&crate::nodes::coordinator::spine::store::TeamPlanRecord {
+                tenant_id: "default",
+                mandate_id: &m,
+                actor_id: "operator",
+                description: "build it",
+                proposed_roles_json: "[]",
+                pending_hires_json: &hires,
+                clearance_ids_json: "[]",
+                denials_json: "[]",
+                next_steps_json: "[]",
+                status: "staffing",
+            })
+            .unwrap();
+        (m, agent_id)
+    }
+
+    fn orchestrate(
+        tasks: &TaskStore,
+        agents: &AgentStore,
+        spine: &SpineStore,
+        arg: &str,
+    ) -> serde_json::Value {
+        let body = ok_body(handle_orchestrate(
+            tasks,
+            agents,
+            spine,
+            &fake_ctx(arg.as_bytes()),
+        ));
+        serde_json::from_slice(&body.into_bytes()).unwrap()
+    }
+
+    #[test]
+    fn orchestrate_blocked_when_team_not_ready() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        // A pending (not-yet-active) hire → team is not ready.
+        let pending = agents
+            .request_hire(
+                "P", "engineer", "P", "e", "e", "prime", "subj-p", "medium", "default",
+            )
+            .unwrap();
+        let hires = format!("[{{\"role\":\"engineer\",\"agent_id\":\"{pending}\"}}]");
+        spine
+            .record_team_plan(&crate::nodes::coordinator::spine::store::TeamPlanRecord {
+                tenant_id: "default",
+                mandate_id: &m,
+                actor_id: "operator",
+                description: "x",
+                proposed_roles_json: "[]",
+                pending_hires_json: &hires,
+                clearance_ids_json: "[]",
+                denials_json: "[]",
+                next_steps_json: "[]",
+                status: "staffing",
+            })
+            .unwrap();
+        let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        assert_eq!(v["ready"], false);
+        assert_eq!(v["status"], "blocked");
+        assert!(!v["blockers"].as_array().unwrap().is_empty());
+        // No work is created for a non-ready team.
+        assert!(v["created_briefs"].as_array().unwrap().is_empty());
+        assert!(tasks.list_briefs_by_mandate(&m, 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn orchestrate_strategy_not_approved_is_blocked() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = spine
+            .create_mandate("default", "Ship", "x", None, None)
+            .unwrap();
+        let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        assert_eq!(v["ready"], false);
+        assert!(
+            v["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["reason"] == "strategy_not_approved")
+        );
+    }
+
+    #[test]
+    fn orchestrate_creates_tree_and_assigns_ready_team() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, agent_id) = ready_team(&agents, &spine, "engineer");
+        let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        assert_eq!(v["ready"], true);
+        assert_eq!(v["status"], "assigned");
+        // Parent + one engineering child were created.
+        let created = v["created_briefs"].as_array().unwrap();
+        assert_eq!(created.len(), 2, "parent + 1 role child");
+        assert!(
+            created
+                .iter()
+                .any(|b| b["title"].as_str().unwrap().starts_with("Execute Mandate:"))
+        );
+        assert!(created.iter().any(|b| {
+            b["title"]
+                .as_str()
+                .unwrap()
+                .starts_with("Engineering track:")
+        }));
+        // The child is assigned to the active agent.
+        let assigned = v["assigned_briefs"].as_array().unwrap();
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0]["agent_id"], agent_id);
+        // The briefs are durable + linked to the Mandate.
+        let cards = tasks.list_briefs_by_mandate(&m, 50).unwrap();
+        assert_eq!(cards.len(), 2);
+        // The latest run is persisted.
+        let latest = spine
+            .latest_orchestration_run("default", &m)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.status, "assigned");
+    }
+
+    #[test]
+    fn orchestrate_is_idempotent_on_double_run() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, _agent) = ready_team(&agents, &spine, "engineer");
+        let first = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        assert_eq!(first["created_briefs"].as_array().unwrap().len(), 2);
+        let after_first = tasks.list_briefs_by_mandate(&m, 50).unwrap().len();
+        // Second run creates nothing new; reuses existing.
+        let second = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        assert!(
+            second["created_briefs"].as_array().unwrap().is_empty(),
+            "a repeated run must not duplicate Briefs"
+        );
+        assert_eq!(second["existing_briefs"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            tasks.list_briefs_by_mandate(&m, 50).unwrap().len(),
+            after_first,
+            "no duplicate Briefs after a second run"
+        );
+        // Same inputs → same signature.
+        assert_eq!(first["input_signature"], second["input_signature"]);
+    }
+
+    #[test]
+    fn orchestrate_dry_run_and_plan_only_create_nothing() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, _a) = ready_team(&agents, &spine, "engineer");
+        // dry_run=true on assign_ready.
+        let dr = orchestrate(
+            &tasks,
+            &agents,
+            &spine,
+            &format!("{m}|assign_ready|16|true"),
+        );
+        assert_eq!(dr["ready"], true);
+        assert_eq!(dr["status"], "planned");
+        assert!(dr["created_briefs"].as_array().unwrap().is_empty());
+        assert!(!dr["skipped"].as_array().unwrap().is_empty());
+        assert!(tasks.list_briefs_by_mandate(&m, 50).unwrap().is_empty());
+        // plan_only (default mode).
+        let po = orchestrate(&tasks, &agents, &spine, &m);
+        assert_eq!(po["mode"], "plan_only");
+        assert!(po["created_briefs"].as_array().unwrap().is_empty());
+        assert!(tasks.list_briefs_by_mandate(&m, 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn orchestrate_create_briefs_mode_does_not_assign() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, _a) = ready_team(&agents, &spine, "engineer");
+        let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        assert_eq!(v["status"], "created");
+        assert_eq!(v["created_briefs"].as_array().unwrap().len(), 2);
+        assert!(
+            v["assigned_briefs"].as_array().unwrap().is_empty(),
+            "create_briefs must not assign"
+        );
+    }
+
+    #[test]
+    fn orchestrate_respects_assign_gate_for_agent_actor() {
+        // A non-operator Prime without can_assign_work creates the Brief
+        // tree but cannot assign — assignment is skipped, not bypassed.
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, _worker) = ready_team(&agents, &spine, "engineer");
+        // The Prime actor (keyed to the ctx subject) has NO assign Key.
+        agents
+            .create_agent(
+                "Prime",
+                "prime",
+                "P",
+                "ops",
+                "ops",
+                "founder",
+                &subject_of(b"prime-seed"),
+                "medium",
+                "default",
+            )
+            .unwrap();
+        let body = ok_body(handle_orchestrate(
+            &tasks,
+            &agents,
+            &spine,
+            &fake_ctx_with_role(
+                format!("{m}|assign_ready").as_bytes(),
+                "prime",
+                b"prime-seed",
+            ),
+        ));
+        let v: serde_json::Value = serde_json::from_slice(&body.into_bytes()).unwrap();
+        // Briefs were created (creation is not assign-gated) ...
+        assert_eq!(v["created_briefs"].as_array().unwrap().len(), 2);
+        // ... but the assignment was refused by the assign-Key gate.
+        assert!(v["assigned_briefs"].as_array().unwrap().is_empty());
+        assert!(
+            v["skipped"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["reason"].as_str().unwrap_or("").contains("assign denied")),
+            "the assign-Key denial must be reported in skipped: {v}"
+        );
+    }
+
+    #[test]
+    fn orchestration_latest_none_until_run_and_tenant_isolated() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        // None before any run.
+        let none = ok_body(handle_orchestration_latest(&spine, &fake_ctx(m.as_bytes())));
+        assert_eq!(none.trim(), "null");
+        // A run persists; latest reads it back for the same tenant only.
+        let (_m2, _a) = ready_team(&agents, &spine, "engineer");
+        orchestrate(&tasks, &agents, &spine, &format!("{m}|plan_only"));
+        let latest = ok_body(handle_orchestration_latest(&spine, &fake_ctx(m.as_bytes())));
+        let lv: serde_json::Value = serde_json::from_slice(latest.as_bytes()).unwrap();
+        assert_eq!(lv["mandate_id"], m);
+        // Tenant B cannot read tenant A's run.
+        let b = ok_body(handle_orchestration_latest(
+            &spine,
+            &fake_ctx_tenant(m.as_bytes(), "tenant-b"),
+        ));
+        assert_eq!(b.trim(), "null");
     }
 
     #[test]

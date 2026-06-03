@@ -3179,6 +3179,38 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // PRIME: Mandate-to-Brief orchestration (strategy + ready-team gated).
+    if let Some(spine) = spine_store.clone() {
+        let s = agent_store.clone();
+        let ts = task_store.clone();
+        bridge.register(
+            "mandate.orchestrate",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let spine = spine.clone();
+                let ts = ts.clone();
+                async move { handlers::handle_orchestrate(&ts, &s, &spine, &ctx) }
+            })),
+        );
+    }
+    if let Some(spine) = spine_store.clone() {
+        bridge.register(
+            "mandate.orchestration.latest",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let spine = spine.clone();
+                async move { handlers::handle_orchestration_latest(&spine, &ctx) }
+            })),
+        );
+    }
+    if let Some(spine) = spine_store.clone() {
+        bridge.register(
+            "mandate.orchestration.list",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let spine = spine.clone();
+                async move { handlers::handle_orchestration_list(&spine, &ctx) }
+            })),
+        );
+    }
     {
         let s = agent_store.clone();
         bridge.register(
@@ -9147,6 +9179,21 @@ fn register_node_type_handlers(
             (
                 "mandate.team_readiness",
                 "Live team readiness for a Mandate: combines the latest plan with current hire/Clearance states. Arg: mandate_id. Returns {missing_roles, pending_clearances, active_agents, pending_hires, blocked_roles, readiness, next_action}. Tenant-scoped.",
+                &["mandate", "read"],
+            ),
+            (
+                "mandate.orchestrate",
+                "Prime Mandate-to-Brief orchestration (deterministic, non-LLM): mandate_id|mode?|max_briefs?|dry_run? where mode ∈ plan_only/create_briefs/assign_ready. Requires an approved strategy + a ready team; creates an idempotent parent+child Brief tree linked to the Mandate and assigns active agents (assign-Key gated). Returns {ready, blockers, created_briefs, assigned_briefs, existing_briefs, skipped, next_actions}.",
+                &["mandate", "persist", "governance"],
+            ),
+            (
+                "mandate.orchestration.latest",
+                "Latest persisted orchestration run for a Mandate as JSON (null if never run). Arg: mandate_id. Tenant-scoped.",
+                &["mandate", "read"],
+            ),
+            (
+                "mandate.orchestration.list",
+                "Recent orchestration runs for a Mandate (newest first). Arg: mandate_id|limit?. Tenant-scoped.",
                 &["mandate", "read"],
             ),
             (
