@@ -126,6 +126,14 @@ pub struct FlowOutcome {
     /// `task.create` call succeeded. `None` when the coordinator is
     /// absent or the call failed (fail-soft).
     pub task_id: Option<String>,
+    /// Durable workspace lease used for this run, when the caller
+    /// supplied `workspace_lease_id` and it resolved for the current
+    /// tenant.
+    pub workspace_lease_id: Option<String>,
+    /// Resolved workspace path from the durable lease. This is what
+    /// gets stamped onto dispatch envelopes for workspace-scoped
+    /// standing approvals.
+    pub workspace_path: Option<String>,
 }
 
 /// Categorised failure so handlers can pick the right HTTP status.
@@ -137,6 +145,9 @@ pub enum FlowExecError {
     /// Mesh transport / dial / RPC layer failure — 502 Bad Gateway.
     #[error("mesh transport: {0}")]
     Transport(String),
+    /// Required production dependency is unavailable.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
     /// Anything else surfaced by the runner — 500 Internal Server Error.
     #[error("{0}")]
     Internal(String),
@@ -147,18 +158,21 @@ pub async fn execute_chat_flow(
     state: &AppState,
     session_id: &str,
     message: &str,
+    workspace_lease_id: Option<&str>,
 ) -> Result<FlowOutcome, FlowExecError> {
     validate_input(session_id, message).map_err(FlowExecError::InvalidInput)?;
+    let workspace = resolve_workspace_binding(state, workspace_lease_id)?;
 
     // B1.2: best-effort task creation. None when coordinator is absent
     // or the call failed (TaskRecorder logs the warning).
-    let task_id = create_task_fail_soft(
+    let task_id = create_task(
         state.task_recorder.as_ref(),
+        task_persistence_required(state),
         "chat",
         "flows/chat_template.sol",
         &chat_params_json(session_id, message),
     )
-    .await;
+    .await?;
     // C2b.1: mint the trace_id upfront so the Coordinator's attempt
     // row and the per-flow event log share the same correlation id.
     let trace_id = TraceId::new();
@@ -177,6 +191,9 @@ pub async fn execute_chat_flow(
         rec.event(tid, "capability.invoked", "method=ai.chat peer=ai")
             .await;
     }
+    // Phase 4: bind the created task to the workspace lease (if any)
+    // so the lease's active-run fields reflect the work using it.
+    bind_workspace_active_run(state, &workspace, task_id.as_deref());
     // W5: record the user turn in the chronicle so
     // task.session_export can reconstruct the transcript.
     record_chat_turn(
@@ -216,6 +233,9 @@ pub async fn execute_chat_flow(
         capability_cache: Some(state.manifest_cache.clone()),
         mesh_client: state.mesh_client.clone(),
         trace_id: Some(trace_id),
+        task_id: task_id.clone(),
+        session_id: Some(session_id.to_string()),
+        workspace_path: workspace.workspace_path.clone(),
         chunk_observer: None,
         cancel_signal: None,
         last_confidence_cell: Some(relix_runtime::confidence::LastConfidenceCell::new()),
@@ -226,6 +246,7 @@ pub async fn execute_chat_flow(
         state.task_recorder.as_ref(),
         task_id,
         Some(session_id.to_string()),
+        workspace,
     )
     .await
 }
@@ -240,6 +261,7 @@ async fn finalize_flow_run(
     recorder: Option<&TaskRecorder>,
     task_id: Option<String>,
     session_id_for_turn: Option<String>,
+    workspace: WorkspaceBinding,
 ) -> Result<FlowOutcome, FlowExecError> {
     match res {
         Ok(result) => {
@@ -297,6 +319,8 @@ async fn finalize_flow_run(
                 trace_id,
                 flow_log_path,
                 task_id,
+                workspace_lease_id: workspace.workspace_lease_id,
+                workspace_path: workspace.workspace_path,
             })
         }
         Err(FlowRunnerError::Transport(m)) => {
@@ -343,6 +367,7 @@ pub async fn execute_chat_with_tool_flow(
     session_id: &str,
     message: &str,
     url: &str,
+    workspace_lease_id: Option<&str>,
 ) -> Result<FlowOutcome, FlowExecError> {
     let Some(tool_template) = state.tool_template.as_ref() else {
         return Err(FlowExecError::InvalidInput(
@@ -351,14 +376,16 @@ pub async fn execute_chat_with_tool_flow(
     };
     validate_input(session_id, message).map_err(FlowExecError::InvalidInput)?;
     validate_url(url).map_err(FlowExecError::InvalidInput)?;
+    let workspace = resolve_workspace_binding(state, workspace_lease_id)?;
 
-    let task_id = create_task_fail_soft(
+    let task_id = create_task(
         state.task_recorder.as_ref(),
+        task_persistence_required(state),
         "chat_with_tool",
         "flows/chat_with_tool.sol",
         &chat_with_tool_params_json(session_id, message, url),
     )
-    .await;
+    .await?;
     let trace_id = TraceId::new();
     let trace_hex = trace_id.to_string();
     if let (Some(rec), Some(tid)) = (state.task_recorder.as_ref(), task_id.as_ref()) {
@@ -393,6 +420,8 @@ pub async fn execute_chat_with_tool_flow(
         rec.event(tid, "capability.invoked", "method=ai.chat peer=ai")
             .await;
     }
+    // Phase 4: bind the created task to the workspace lease (if any).
+    bind_workspace_active_run(state, &workspace, task_id.as_deref());
     // W5: record the user turn for the tool-augmented flow too.
     record_chat_turn(
         state.task_recorder.as_ref(),
@@ -441,6 +470,9 @@ pub async fn execute_chat_with_tool_flow(
         capability_cache: Some(state.manifest_cache.clone()),
         mesh_client: state.mesh_client.clone(),
         trace_id: Some(trace_id),
+        task_id: task_id.clone(),
+        session_id: Some(session_id.to_string()),
+        workspace_path: workspace.workspace_path.clone(),
         chunk_observer: None,
         cancel_signal: None,
         last_confidence_cell: Some(relix_runtime::confidence::LastConfidenceCell::new()),
@@ -451,28 +483,56 @@ pub async fn execute_chat_with_tool_flow(
         state.task_recorder.as_ref(),
         task_id,
         Some(session_id.to_string()),
+        workspace,
     )
     .await
 }
 
-/// Best-effort task creation. Returns `None` when persistence isn't
-/// configured or the Coordinator call failed; the chat path continues
-/// in either case (fail-soft per B1.9).
+fn task_persistence_required(state: &AppState) -> bool {
+    state
+        .cfg
+        .coordinator
+        .as_ref()
+        .is_some_and(|coord| coord.required)
+}
+
+/// Task creation. In local/dev mode this is fail-soft and returns `None`
+/// when persistence is not configured or the Coordinator call fails. When
+/// `[coordinator] required = true`, it fails before flow dispatch so work
+/// cannot run without a durable task id.
 ///
 /// On success, emits a `task.created` chronology event so the
 /// timeline is self-describing from line 1 (no need to cross-
 /// reference `tasks.created_at`).
-async fn create_task_fail_soft(
+async fn create_task(
     recorder: Option<&TaskRecorder>,
+    required: bool,
     flow_label: &str,
     flow_template: &str,
     params_json: &str,
-) -> Option<String> {
-    let rec = recorder?;
+) -> Result<Option<String>, FlowExecError> {
+    let Some(rec) = recorder else {
+        return if required {
+            Err(FlowExecError::Unavailable(
+                "coordinator task persistence is required but unavailable".into(),
+            ))
+        } else {
+            Ok(None)
+        };
+    };
     let title = make_title(flow_label, params_json, 64);
-    let tid = rec.create(&title, flow_template, params_json).await?;
+    let tid = if required {
+        rec.create_required(&title, flow_template, params_json)
+            .await
+            .map_err(FlowExecError::Unavailable)?
+    } else {
+        let Some(tid) = rec.create(&title, flow_template, params_json).await else {
+            return Ok(None);
+        };
+        tid
+    };
     rec.event(&tid, "task.created", flow_template).await;
-    Some(tid)
+    Ok(Some(tid))
 }
 
 /// Build the wire payload for a `chat.user_turn` /
@@ -560,19 +620,22 @@ pub async fn execute_chat_flow_streaming(
     state: &AppState,
     session_id: &str,
     message: &str,
+    workspace_lease_id: Option<&str>,
     streaming_template: &str,
     on_chunk: relix_runtime::flow_runner::ChunkObserver,
     cancel_signal: relix_runtime::flow_runner::CancelSignal,
 ) -> Result<FlowOutcome, FlowExecError> {
     validate_input(session_id, message).map_err(FlowExecError::InvalidInput)?;
+    let workspace = resolve_workspace_binding(state, workspace_lease_id)?;
 
-    let task_id = create_task_fail_soft(
+    let task_id = create_task(
         state.task_recorder.as_ref(),
+        task_persistence_required(state),
         "chat",
         "flows/chat_template_streaming.sol",
         &chat_params_json(session_id, message),
     )
-    .await;
+    .await?;
     let trace_id = TraceId::new();
     let trace_hex = trace_id.to_string();
     if let (Some(rec), Some(tid)) = (state.task_recorder.as_ref(), task_id.as_ref()) {
@@ -582,6 +645,8 @@ pub async fn execute_chat_flow_streaming(
         rec.event(tid, "capability.invoked", "method=ai.chat.stream peer=ai")
             .await;
     }
+    // Phase 4: bind the created task to the workspace lease (if any).
+    bind_workspace_active_run(state, &workspace, task_id.as_deref());
     record_chat_turn(
         state.task_recorder.as_ref(),
         task_id.as_ref(),
@@ -623,6 +688,9 @@ pub async fn execute_chat_flow_streaming(
         capability_cache: Some(state.manifest_cache.clone()),
         mesh_client: state.mesh_client.clone(),
         trace_id: Some(trace_id),
+        task_id: task_id.clone(),
+        session_id: Some(session_id.to_string()),
+        workspace_path: workspace.workspace_path.clone(),
         chunk_observer: Some(on_chunk),
         cancel_signal: Some(cancel_signal),
         last_confidence_cell: Some(relix_runtime::confidence::LastConfidenceCell::new()),
@@ -633,8 +701,49 @@ pub async fn execute_chat_flow_streaming(
         state.task_recorder.as_ref(),
         task_id,
         Some(session_id.to_string()),
+        workspace,
     )
     .await
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorkspaceBinding {
+    workspace_lease_id: Option<String>,
+    workspace_path: Option<String>,
+}
+
+/// Phase 4 — when a chat created a durable task AND bound a workspace
+/// lease, stamp the task onto the lease so the workspace's "active
+/// run" reflects the work currently using it. Best-effort: a binding
+/// failure is logged and never fails the chat itself.
+fn bind_workspace_active_run(
+    state: &AppState,
+    workspace: &WorkspaceBinding,
+    task_id: Option<&str>,
+) {
+    let (Some(lease_id), Some(tid)) = (workspace.workspace_lease_id.as_deref(), task_id) else {
+        return;
+    };
+    if let Err(e) =
+        crate::workspaces::bind_active_run_for_current_tenant(state, lease_id, tid, None)
+    {
+        tracing::warn!(error = %e, lease_id, task_id = tid, "workspace active-run bind failed");
+    }
+}
+
+fn resolve_workspace_binding(
+    state: &AppState,
+    workspace_lease_id: Option<&str>,
+) -> Result<WorkspaceBinding, FlowExecError> {
+    let Some(lease_id) = workspace_lease_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(WorkspaceBinding::default());
+    };
+    let lease = crate::workspaces::resolve_active_lease_for_current_tenant(state, lease_id)
+        .map_err(FlowExecError::InvalidInput)?;
+    Ok(WorkspaceBinding {
+        workspace_lease_id: Some(lease.lease_id),
+        workspace_path: Some(lease.workspace_path),
+    })
 }
 
 /// Truncate a string at `n` characters (not bytes), appending an
@@ -671,6 +780,22 @@ mod tests {
     fn chat_params_json_shape() {
         let s = chat_params_json("demo", "hello world");
         assert_eq!(s, r#"{"session_id":"demo","message":"hello world"}"#);
+    }
+
+    #[tokio::test]
+    async fn required_task_creation_fails_when_recorder_unavailable() {
+        let err = create_task(None, true, "chat", "flows/chat_template.sol", "{}")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FlowExecError::Unavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn optional_task_creation_stays_fail_soft_without_recorder() {
+        let task_id = create_task(None, false, "chat", "flows/chat_template.sol", "{}")
+            .await
+            .expect("optional create should not fail");
+        assert!(task_id.is_none());
     }
 
     #[test]

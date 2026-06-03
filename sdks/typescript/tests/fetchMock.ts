@@ -143,6 +143,9 @@ export function sseResponse(chunks: string[], withDone: boolean = true): Respons
         flow_id: "f1",
         trace_id: "t1",
         flow_log: "/tmp/x",
+        task_id: "task-1",
+        workspace_lease_id: "lease-1",
+        workspace_path: "/work/acme",
       })}\n\n`,
     );
   }

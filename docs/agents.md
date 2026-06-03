@@ -146,26 +146,28 @@ any subject derivation happens. See [`channels/index.md`](channels/index.md).
 ## Standing approvals
 
 For repetitive `approval_required` actions an operator can grant a
-**standing approval**:
+**standing approval**. Standing approvals can expire by time,
+call count (`max_calls`), or estimated spend (`max_cost_micros`):
 
 ```sh
-# CLI
-relix-cli ops standing-approval create \
-    --subject-id <hex> \
-    --category mutate:filesystem \
-    --reason "research jail edits" \
-    --expires-in-hours 24
-
 # HTTP
-POST /v1/agent/standing_approval/create
+POST /v1/agents/<agent_id>/standing-approvals
+{
+  "category": "payments",
+  "expires_at": 1717200000,
+  "scope_kind": "task",
+  "task_id": "<task_id>",
+  "max_calls": 20,
+  "max_cost_micros": 200000
+}
 ```
 
 The gate then admits matching calls without minting per-call
 approvals until expiry. List and revoke:
 
 ```sh
-relix-cli ops standing-approval list   --subject-id <hex>
-relix-cli ops standing-approval revoke --approval-id <id>
+curl localhost:9100/v1/agents/<agent_id>/standing-approvals
+curl -X DELETE localhost:9100/v1/standing-approvals/<standing_id>
 ```
 
 ## Inspecting agent activity

@@ -186,16 +186,62 @@ pub async fn record_decision(
         )
             .into_response();
     }
+    let approval_id = approval_id.trim().to_string();
+    let decision = body.decision.trim().to_string();
+    let note = body.note.clone();
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let args = serde_json::json!({
-        "approval_id": approval_id,
-        "decision": body.decision,
-        "note": body.note,
+        "approval_id": &approval_id,
+        "decision": &decision,
+        "note": note.as_deref(),
     });
     match call_peer_json(&state, &peer, "approval.record_decision", &args, false).await {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Ok(v) => {
+            let tenant_id =
+                crate::tenant::current_tenant_or_none().unwrap_or_else(|| "default".into());
+            let task_id = activity_task_id(&v);
+            let detail = activity_detail(note.as_deref(), &v);
+            if let Err(e) = crate::activity::append_approval_activity(
+                state.cfg.transport.data_dir.as_deref(),
+                &tenant_id,
+                "operator",
+                &approval_id,
+                &decision,
+                task_id.as_deref(),
+                detail,
+            ) {
+                tracing::warn!(
+                    approval_id = approval_id,
+                    decision = decision,
+                    error = %e,
+                    "approval decision accepted but activity ledger append failed"
+                );
+            }
+            (StatusCode::OK, Json(v)).into_response()
+        }
         Err(resp) => resp,
     }
+}
+
+fn activity_task_id(value: &Value) -> Option<String> {
+    value
+        .get("task_id")
+        .or_else(|| value.get("taskId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn activity_detail(note: Option<&str>, response: &Value) -> String {
+    if let Some(note) = note.map(str::trim).filter(|s| !s.is_empty()) {
+        return note.to_string();
+    }
+    response
+        .get("status")
+        .and_then(Value::as_str)
+        .map(|status| format!("coordinator status: {status}"))
+        .unwrap_or_else(|| "approval decision recorded".into())
 }
 
 /// DEFERRED C — `GET /v1/approval/:id`
@@ -483,4 +529,42 @@ fn unavailable(method: &str) -> Value {
         "available": false,
         "reason": format!("capability '{method}' is not enabled on this deployment"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activity_task_id_accepts_snake_and_camel_case() {
+        assert_eq!(
+            activity_task_id(&serde_json::json!({
+                "task_id": " aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
+            }))
+            .as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            activity_task_id(&serde_json::json!({
+                "taskId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }))
+            .as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+    }
+
+    #[test]
+    fn activity_detail_prefers_operator_note() {
+        assert_eq!(
+            activity_detail(
+                Some(" approved by owner "),
+                &serde_json::json!({"status": "ok"})
+            ),
+            "approved by owner"
+        );
+        assert_eq!(
+            activity_detail(Some(" "), &serde_json::json!({"status": "ok"})),
+            "coordinator status: ok"
+        );
+    }
 }

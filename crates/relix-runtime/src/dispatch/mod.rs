@@ -3160,6 +3160,8 @@ pub fn build_request(
         None,
         None,
         None,
+        None,
+        None,
     )
 }
 
@@ -3180,6 +3182,8 @@ pub fn build_request_with_surface(
     surface: Option<String>,
     approval_token: Option<String>,
     task_id: Option<String>,
+    session_id: Option<String>,
+    workspace_path: Option<String>,
 ) -> Vec<u8> {
     let req = RequestEnvelope {
         pv: 1,
@@ -3202,6 +3206,8 @@ pub fn build_request_with_surface(
         surface,
         approval_token,
         task_id,
+        session_id,
+        workspace_path,
         tenant_id: None,
         session_token: None,
     };
@@ -3246,6 +3252,8 @@ pub fn build_request_with_tenant(
         surface,
         approval_token,
         task_id,
+        session_id: None,
+        workspace_path: None,
         tenant_id,
         session_token: None,
     };
@@ -3284,6 +3292,8 @@ pub fn build_request_with_session(
         surface,
         approval_token,
         task_id,
+        session_id: None,
+        workspace_path: None,
         tenant_id,
         session_token,
     };
@@ -5362,6 +5372,8 @@ mod tests {
             surface: None,
             approval_token: None,
             task_id: None,
+            session_id: None,
+            workspace_path: None,
             tenant_id: None,
             session_token: None,
         };
@@ -5392,6 +5404,8 @@ mod tests {
             surface: None,
             approval_token: None,
             task_id: None,
+            session_id: None,
+            workspace_path: None,
             tenant_id: None,
             session_token,
         };

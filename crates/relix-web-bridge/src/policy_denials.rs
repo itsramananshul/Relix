@@ -81,12 +81,40 @@ pub async fn denials(
     };
     let body = call_peer(&state, &peer, "node.policy.recent_denials", arg.as_bytes()).await?;
     let denials = parse_rows(&body);
+    append_policy_activity(&state, &peer, &denials);
     let count = denials.len();
     Ok(Json(PolicyDenialsResponse {
         peer,
         denials,
         count,
     }))
+}
+
+fn append_policy_activity(state: &AppState, peer: &str, rows: &[PolicyDenialRow]) {
+    let tenant_id = crate::tenant::current_tenant_or_none().unwrap_or_else(|| "default".into());
+    for row in rows {
+        let at_ms = row.at.saturating_mul(1000);
+        if let Err(e) = crate::activity::append_policy_denial_activity(
+            state.cfg.transport.data_dir.as_deref(),
+            crate::activity::PolicyDenialActivity {
+                tenant_id: &tenant_id,
+                peer,
+                at_ms,
+                method: &row.method,
+                caller_subject_id: &row.caller_subject_id,
+                caller_name: &row.caller_name,
+                rule: &row.rule,
+                reason: &row.reason,
+            },
+        ) {
+            tracing::warn!(
+                method = row.method,
+                rule = row.rule,
+                error = %e,
+                "policy denial accepted but activity ledger append failed"
+            );
+        }
+    }
 }
 
 /// W2-007e: parse the tab-delim body emitted by

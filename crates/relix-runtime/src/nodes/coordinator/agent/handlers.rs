@@ -8,11 +8,16 @@
 use std::sync::Arc;
 
 use relix_core::types::{ErrorEnvelope, error_kinds};
+use serde::Deserialize;
 
 use crate::dispatch::{HandlerOutcome, InvocationCtx};
 use crate::nodes::coordinator::agent::store::{
-    AgentStore, AgentStoreError, ApprovalStatus, default_approval_categories,
+    AgentStore, AgentStoreError, ApprovalStatus, StandingApprovalCreate,
+    default_approval_categories,
 };
+use crate::nodes::coordinator::spine::SpineStore;
+use crate::nodes::coordinator::spine::store::SpineStoreError;
+use crate::nodes::coordinator::{CoordinatorError, TaskStore};
 
 // ── agent.create ─────────────────────────────────────────
 
@@ -45,6 +50,269 @@ pub fn handle_create(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome 
     }
 }
 
+/// `agent.request_hire` — the **gated** creation path (company-model
+/// §4.4 / §5.5): mints the Operative `pending` (inert — the gate
+/// denies non-active) so a Lead/Founder must approve it before it can
+/// run, be assigned, or hold Keys. Same arg shape as `agent.create`.
+/// Returns the new agent_id.
+pub fn handle_request_hire(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("agent.request_hire utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(8, '|').collect();
+    if parts.len() != 8 {
+        return invalid(
+            "agent.request_hire: expected `name|role|title|department|team|created_by|subject_id|risk_ceiling`".into(),
+        );
+    }
+    match store.request_hire(
+        parts[0],
+        parts[1],
+        parts[2],
+        parts[3],
+        parts[4],
+        parts[5],
+        parts[6],
+        parts[7],
+        ctx.tenant_id_or_default(),
+    ) {
+        Ok(id) => HandlerOutcome::Ok(format!("{id}\n").into_bytes()),
+        Err(AgentStoreError::BadInput(m)) => invalid(m),
+        Err(e) => internal(format!("agent.request_hire: {e}")),
+    }
+}
+
+/// `agent.request_hire_for_mandate` — the strategy-gated team-build
+/// path. Arg:
+/// `mandate_id|name|role|title|department|team|created_by|subject_id|risk_ceiling`.
+///
+/// This is deliberately separate from `agent.request_hire` so the
+/// legacy/manual hire flow stays stable while the Prime/CEO flow gets
+/// a hard, queryable strategy precondition.
+pub fn handle_request_hire_for_mandate(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("agent.request_hire_for_mandate utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(9, '|').collect();
+    if parts.len() != 9 {
+        return invalid(
+            "agent.request_hire_for_mandate: expected `mandate_id|name|role|title|department|team|created_by|subject_id|risk_ceiling`"
+                .into(),
+        );
+    }
+    let mandate_id = parts[0].trim();
+    if mandate_id.is_empty() {
+        return invalid("agent.request_hire_for_mandate: mandate_id required".into());
+    }
+    match spine_store.strategy_approved(ctx.tenant_id_or_default(), mandate_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::POLICY_DENIED,
+                cause: format!(
+                    "agent.request_hire_for_mandate: mandate `{mandate_id}` strategy is not approved"
+                ),
+                retry_hint: 0,
+                retry_after: None,
+            });
+        }
+        Err(SpineStoreError::BadInput(m)) | Err(SpineStoreError::NotFound(m)) => {
+            return invalid(format!("agent.request_hire_for_mandate: {m}"));
+        }
+        Err(e) => return internal(format!("agent.request_hire_for_mandate: {e}")),
+    }
+    match agent_store.request_hire(
+        parts[1],
+        parts[2],
+        parts[3],
+        parts[4],
+        parts[5],
+        parts[6],
+        parts[7],
+        parts[8],
+        ctx.tenant_id_or_default(),
+    ) {
+        Ok(id) => HandlerOutcome::Ok(format!("{id}\n").into_bytes()),
+        Err(AgentStoreError::BadInput(m)) => invalid(m),
+        Err(e) => internal(format!("agent.request_hire_for_mandate: {e}")),
+    }
+}
+
+/// `brief.clearance_request` — create a real pending Clearance
+/// linked to a Brief. Arg:
+/// `brief_id|agent_id|method|category|reason|ttl_secs?`.
+///
+/// Used by the bridge-back HTTP surface when a thin Rig needs to ask
+/// the Founder for permission mid-Shift. The subject id and approver
+/// allowlist are derived from the stored Operative profile, not from
+/// the caller's body.
+pub fn handle_brief_clearance_request(
+    agent_store: &AgentStore,
+    task_store: &TaskStore,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.clearance_request utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(6, '|').collect();
+    if parts.len() < 5 {
+        return invalid(
+            "brief.clearance_request: expected `brief_id|agent_id|method|category|reason|ttl_secs?`"
+                .into(),
+        );
+    }
+    let brief_id = parts[0].trim();
+    let agent_id = parts[1].trim();
+    let method = parts[2].trim();
+    let category = parts[3].trim();
+    let reason = parts[4].trim();
+    if brief_id.is_empty()
+        || agent_id.is_empty()
+        || method.is_empty()
+        || category.is_empty()
+        || reason.is_empty()
+    {
+        return invalid(
+            "brief.clearance_request: brief_id, agent_id, method, category, and reason are required"
+                .into(),
+        );
+    }
+    let brief_fields = match task_store.brief_fields(brief_id) {
+        Ok(Some(fields)) => fields,
+        Ok(None) => {
+            return invalid(format!(
+                "brief.clearance_request: brief not found: {brief_id}"
+            ));
+        }
+        Err(CoordinatorError::NotFound(_)) => {
+            return invalid(format!(
+                "brief.clearance_request: brief not found: {brief_id}"
+            ));
+        }
+        Err(e) => return internal(format!("brief.clearance_request: brief lookup: {e}")),
+    };
+    if brief_fields.assignee_agent_id.as_deref() != Some(agent_id) {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::POLICY_DENIED,
+            cause: format!(
+                "brief.clearance_request: agent `{agent_id}` is not assigned to Brief `{brief_id}`"
+            ),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
+    let profile = match agent_store.get_agent(agent_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return invalid(format!(
+                "brief.clearance_request: unknown agent: {agent_id}"
+            ));
+        }
+        Err(e) => return internal(format!("brief.clearance_request: agent lookup: {e}")),
+    };
+    if profile.status != "active" {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::POLICY_DENIED,
+            cause: format!(
+                "brief.clearance_request: agent `{agent_id}` is `{}`, not active",
+                profile.status
+            ),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
+    let ttl_secs = match parts.get(5).map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(n) => n.clamp(30, 86_400),
+            Err(_) => return invalid(format!("brief.clearance_request: bad ttl_secs: {raw}")),
+        },
+        None => profile.approval_timeout_secs.clamp(30, 86_400),
+    };
+    let expires_at = unix_now().saturating_add(ttl_secs);
+    let hash = hex::encode(blake3::hash(ctx.args.as_slice()).as_bytes());
+    let approval_id = match agent_store.create_approval(
+        agent_id,
+        &profile.subject_id,
+        method,
+        category,
+        &hash,
+        reason,
+        &[],
+        Some(brief_id),
+        expires_at,
+        &profile.authorized_approvers,
+        ctx.tenant_id_or_default(),
+    ) {
+        Ok(id) => id,
+        Err(AgentStoreError::BadInput(m)) => return invalid(m),
+        Err(e) => return internal(format!("brief.clearance_request: {e}")),
+    };
+    if let Err(e) = task_store.update(
+        brief_id,
+        Some("awaiting_input"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ) {
+        tracing::warn!(brief_id, approval_id = %approval_id, error = %e, "brief.clearance_request: awaiting_input update failed");
+    }
+    let payload = format!(
+        "approval_id={approval_id}|agent_id={agent_id}|method={method}|category={category}"
+    );
+    if let Err(e) = task_store.append_event(brief_id, "brief.clearance_requested", &payload) {
+        tracing::warn!(brief_id, approval_id = %approval_id, error = %e, "brief.clearance_request: chronicle event failed");
+    }
+    HandlerOutcome::Ok(format!("{approval_id}\n").into_bytes())
+}
+
+/// `agent.approve_hire` — approve a pending hire (pending → active).
+/// Arg: agent_id.
+pub fn handle_approve_hire(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("agent.approve_hire utf8: {e}")),
+    };
+    if id.is_empty() {
+        return invalid("agent.approve_hire: agent_id required".into());
+    }
+    match store.approve_hire(id) {
+        Ok(()) => HandlerOutcome::Ok(b"approved\n".to_vec()),
+        Err(AgentStoreError::NotFound(m)) => {
+            invalid(format!("agent.approve_hire: not pending: {m}"))
+        }
+        Err(e) => internal(format!("agent.approve_hire: {e}")),
+    }
+}
+
+/// `agent.reject_hire` — reject a pending hire (pending → disabled,
+/// terminal). Arg: agent_id.
+pub fn handle_reject_hire(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("agent.reject_hire utf8: {e}")),
+    };
+    if id.is_empty() {
+        return invalid("agent.reject_hire: agent_id required".into());
+    }
+    match store.reject_hire(id) {
+        Ok(()) => HandlerOutcome::Ok(b"rejected\n".to_vec()),
+        Err(AgentStoreError::NotFound(m)) => {
+            invalid(format!("agent.reject_hire: not pending: {m}"))
+        }
+        Err(e) => internal(format!("agent.reject_hire: {e}")),
+    }
+}
+
 // ── agent.get ────────────────────────────────────────────
 
 pub fn handle_get(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
@@ -58,7 +326,7 @@ pub fn handle_get(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
     match store.get_agent(id) {
         Ok(Some(p)) => {
             let body = format!(
-                "agent_id={}|name={}|role={}|title={}|department={}|team={}|created_by={}|status={}|subject_id={}|risk_ceiling={}|approval_timeout_secs={}|created_at={}|updated_at={}|surface_allowlist={}|allow_categories={}|deny_categories={}|allow_sensitivity_tags={}|deny_sensitivity_tags={}|approval_required_categories={}\n",
+                "agent_id={}|name={}|role={}|title={}|department={}|team={}|created_by={}|status={}|subject_id={}|risk_ceiling={}|approval_timeout_secs={}|created_at={}|updated_at={}|surface_allowlist={}|allow_categories={}|deny_categories={}|allow_sensitivity_tags={}|deny_sensitivity_tags={}|approval_required_categories={}|rig={}|monthly_allowance_cents={}|max_concurrent_runs={}|wake_on_timer={}|wake_on_demand={}\n",
                 p.agent_id,
                 sanitize(&p.name),
                 sanitize(&p.role),
@@ -78,6 +346,13 @@ pub fn handle_get(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
                 csv(&p.allow_sensitivity_tags),
                 csv(&p.deny_sensitivity_tags),
                 csv(&p.approval_required_categories),
+                p.rig.as_deref().unwrap_or(""),
+                p.monthly_allowance_cents
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+                p.max_concurrent_runs,
+                p.wake_on_timer,
+                p.wake_on_demand,
             );
             HandlerOutcome::Ok(body.into_bytes())
         }
@@ -149,6 +424,180 @@ pub fn handle_delete(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome 
         Ok(()) => HandlerOutcome::Ok(b"ok\n".to_vec()),
         Err(AgentStoreError::NotFound(_)) => invalid(format!("agent.delete: not found: {id}")),
         Err(e) => internal(format!("agent.delete: {e}")),
+    }
+}
+
+// ── org tree (Roster / Lattice) reads ────────────────────
+
+/// `agent.reports` — the Operatives directly reporting to `agent_id`
+/// (the Roster children, one level down). Arg: agent_id. Returns one
+/// agent_id per line.
+pub fn handle_reports(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("agent.reports utf8: {e}")),
+    };
+    if id.is_empty() {
+        return invalid("agent.reports: agent_id required".into());
+    }
+    match store.list_direct_reports(id) {
+        Ok(rows) => HandlerOutcome::Ok(
+            rows.into_iter()
+                .map(|a| a.agent_id)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into_bytes(),
+        ),
+        Err(e) => internal(format!("agent.reports: {e}")),
+    }
+}
+
+/// `agent.by_role` — the active Operatives with a given role (the
+/// assignable staff for that role). Arg: role. One agent_id per
+/// line.
+pub fn handle_by_role(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let role = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("agent.by_role utf8: {e}")),
+    };
+    if role.is_empty() {
+        return invalid("agent.by_role: role required".into());
+    }
+    match store.list_by_role(role) {
+        Ok(rows) => HandlerOutcome::Ok(rows.join("\n").into_bytes()),
+        Err(e) => internal(format!("agent.by_role: {e}")),
+    }
+}
+
+/// `agent.peers` — the Operatives reporting to the same Lead as
+/// `agent_id` (excludes the agent itself). Arg: agent_id. One
+/// agent_id per line; empty for an apex with no Lead.
+pub fn handle_peers(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("agent.peers utf8: {e}")),
+    };
+    if id.is_empty() {
+        return invalid("agent.peers: agent_id required".into());
+    }
+    match store.list_peers(id) {
+        Ok(rows) => HandlerOutcome::Ok(rows.join("\n").into_bytes()),
+        Err(e) => internal(format!("agent.peers: {e}")),
+    }
+}
+
+/// `agent.branch` — every Operative at or below `agent_id` (the
+/// manager's Branch / subtree, excluding the manager itself). The
+/// delegated-authority scope. Arg: agent_id. One agent_id per line.
+pub fn handle_branch(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("agent.branch utf8: {e}")),
+    };
+    if id.is_empty() {
+        return invalid("agent.branch: agent_id required".into());
+    }
+    match store.manager_subtree(id) {
+        Ok(ids) => HandlerOutcome::Ok(ids.join("\n").into_bytes()),
+        Err(e) => internal(format!("agent.branch: {e}")),
+    }
+}
+
+/// `agent.line` — the escalation path up from `agent_id` to the apex
+/// (the Line / chain of command), nearest boss first. Arg: agent_id.
+/// One agent_id per line; empty when the agent is the apex.
+pub fn handle_line(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("agent.line utf8: {e}")),
+    };
+    if id.is_empty() {
+        return invalid("agent.line: agent_id required".into());
+    }
+    match store.chain_of_command(id) {
+        Ok(ids) => HandlerOutcome::Ok(ids.join("\n").into_bytes()),
+        Err(e) => internal(format!("agent.line: {e}")),
+    }
+}
+
+/// `agent.keys` — the full Operative profile as JSON: identity
+/// (name/role/title/department/team/status), the **Keys** (the
+/// permission surface — surface_allowlist, risk_ceiling,
+/// allow/deny categories + sensitivity tags, approval-required
+/// categories, authorized approvers, approval timeout, the
+/// allow-all profile flag), and the **Lead** (reports_to). The
+/// structured read backing the per-Operative Keys panel — a
+/// JSON counterpart to the pipe-delimited `agent.get`. Arg:
+/// agent_id.
+pub fn handle_keys(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("agent.keys utf8: {e}")),
+    };
+    if id.is_empty() {
+        return invalid("agent.keys: agent_id required".into());
+    }
+    match store.get_agent(id) {
+        Ok(Some(p)) => match serde_json::to_vec(&p) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("agent.keys encode: {e}")),
+        },
+        Ok(None) => invalid(format!("agent.keys: not found: {id}")),
+        Err(e) => internal(format!("agent.keys: {e}")),
+    }
+}
+
+/// `agent.manages` — does `manager` manage `target` (target in
+/// manager's Branch / subtree)? Arg `manager_id|target_id`. Returns
+/// `true` / `false`. The delegated-authority check.
+pub fn handle_manages(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("agent.manages utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    if parts.len() < 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+        return invalid("agent.manages: expected `manager_id|target_id`".into());
+    }
+    match store.manages(parts[0].trim(), parts[1].trim()) {
+        Ok(b) => HandlerOutcome::Ok(if b {
+            b"true".to_vec()
+        } else {
+            b"false".to_vec()
+        }),
+        Err(e) => internal(format!("agent.manages: {e}")),
+    }
+}
+
+/// `agent.roster_summary` — Operative counts by status (+ `total`)
+/// as JSON. No args. The Roster-at-a-glance for the companion /
+/// dashboard.
+pub fn handle_roster_summary(store: &AgentStore, _ctx: &InvocationCtx) -> HandlerOutcome {
+    match store.status_counts() {
+        Ok(counts) => {
+            let mut obj = serde_json::Map::new();
+            let mut total = 0i64;
+            for (status, n) in counts {
+                total += n;
+                obj.insert(status, serde_json::Value::from(n));
+            }
+            obj.insert("total".to_string(), serde_json::Value::from(total));
+            match serde_json::to_vec(&serde_json::Value::Object(obj)) {
+                Ok(b) => HandlerOutcome::Ok(b),
+                Err(e) => internal(format!("agent.roster_summary encode: {e}")),
+            }
+        }
+        Err(e) => internal(format!("agent.roster_summary: {e}")),
+    }
+}
+
+/// `agent.allowance_committed` — total monthly Allowance committed
+/// across the active roster, in cents (NULL counts as 0). No args.
+/// Pairs with `guild.get` for commitment-vs-budget oversight.
+pub fn handle_allowance_committed(store: &AgentStore, _ctx: &InvocationCtx) -> HandlerOutcome {
+    match store.committed_allowance_cents() {
+        Ok(cents) => HandlerOutcome::Ok(cents.to_string().into_bytes()),
+        Err(e) => internal(format!("agent.allowance_committed: {e}")),
     }
 }
 
@@ -565,12 +1014,76 @@ pub fn handle_approval_decide(
 
 // ── standing approval handlers ──────────────────────────
 
+#[derive(Debug, Deserialize)]
+struct StandingCreateJson {
+    agent_id: String,
+    #[serde(alias = "category")]
+    match_category: String,
+    expires_at: i64,
+    #[serde(default)]
+    granted_by: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default, alias = "path_glob")]
+    match_path_glob: Option<String>,
+    #[serde(default)]
+    scope_kind: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    method_prefix: Option<String>,
+    #[serde(default)]
+    workspace_path_glob: Option<String>,
+    #[serde(default)]
+    max_calls: Option<i64>,
+    #[serde(default)]
+    max_cost_micros: Option<i64>,
+}
+
+/// Legacy wire arg:
 /// `agent_id|category|expires_at|granted_by|note|path_glob?`
+///
+/// Scoped wire arg:
+/// JSON object containing `agent_id`, `category`/`match_category`,
+/// `expires_at`, plus optional `scope_kind`, `task_id`,
+/// `session_id`, `method_prefix`, and `workspace_path_glob`.
 pub fn handle_standing_create(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
         Err(e) => return invalid(format!("agent.standing_approval.create utf8: {e}")),
     };
+    if s.trim_start().starts_with('{') {
+        let req: StandingCreateJson = match serde_json::from_str(s) {
+            Ok(req) => req,
+            Err(e) => {
+                return invalid(format!("agent.standing_approval.create json: {e}"));
+            }
+        };
+        let granted_by = req.granted_by.as_deref().unwrap_or("operator");
+        let note = req.note.as_deref().unwrap_or("");
+        return match store.create_scoped_standing(StandingApprovalCreate {
+            agent_id: &req.agent_id,
+            match_category: &req.match_category,
+            match_path_glob: req.match_path_glob.as_deref(),
+            scope_kind: req.scope_kind.as_deref(),
+            task_id: req.task_id.as_deref(),
+            session_id: req.session_id.as_deref(),
+            method_prefix: req.method_prefix.as_deref(),
+            workspace_path_glob: req.workspace_path_glob.as_deref(),
+            expires_at: req.expires_at,
+            granted_by,
+            max_calls: req.max_calls,
+            max_cost_micros: req.max_cost_micros,
+            note,
+            tenant_id: ctx.tenant_id_or_default(),
+        }) {
+            Ok(id) => HandlerOutcome::Ok(format!("{id}\n").into_bytes()),
+            Err(AgentStoreError::BadInput(m)) => invalid(m),
+            Err(e) => internal(format!("agent.standing_approval.create: {e}")),
+        };
+    }
     let parts: Vec<&str> = s.splitn(6, '|').collect();
     if parts.len() < 5 {
         return invalid(
@@ -618,18 +1131,27 @@ pub fn handle_standing_list(store: &AgentStore, ctx: &InvocationCtx) -> HandlerO
     if agent_id.is_empty() {
         return invalid("agent.standing_approval.list: agent_id required".into());
     }
-    match store.list_standing(agent_id) {
+    match store.list_standing_for_tenant(agent_id, ctx.tenant_id_or_default()) {
         Ok(rows) => {
             let mut out = String::new();
             for r in &rows {
                 out.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                     r.standing_id,
                     r.match_category,
                     r.match_path_glob.as_deref().unwrap_or(""),
+                    r.scope_kind,
+                    r.task_id.as_deref().unwrap_or(""),
+                    r.session_id.as_deref().unwrap_or(""),
+                    r.method_prefix.as_deref().unwrap_or(""),
+                    r.workspace_path_glob.as_deref().unwrap_or(""),
                     r.expires_at,
                     r.granted_by,
-                    sanitize(&r.note),
+                    r.max_calls.map(|n| n.to_string()).unwrap_or_default(),
+                    r.calls_used,
+                    r.max_cost_micros.map(|n| n.to_string()).unwrap_or_default(),
+                    r.cost_used_micros,
+                    sanitize(&r.note)
                 ));
             }
             out.push_str(&format!("count={}\n", rows.len()));
@@ -682,6 +1204,13 @@ fn sanitize(s: &str) -> String {
 
 fn csv(v: &[String]) -> String {
     v.join(",")
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Re-export so the executor module and tests can reach for
@@ -762,6 +1291,144 @@ mod tests {
         let s = store();
         let out = handle_create(&s, &fake_ctx(b"too|few|fields"));
         assert_eq!(err_kind(out), error_kinds::INVALID_ARGS);
+    }
+
+    #[test]
+    fn request_hire_for_mandate_requires_approved_strategy() {
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let mandate = spine
+            .create_mandate("default", "Ship v1", "make the product real", None, None)
+            .unwrap();
+        let arg = format!("{mandate}|Planner|planner|Planner|ops|ops|prime|subj-plan|medium");
+
+        let out = handle_request_hire_for_mandate(&agents, &spine, &fake_ctx(arg.as_bytes()));
+        assert_eq!(err_kind(out), error_kinds::POLICY_DENIED);
+
+        spine
+            .propose_strategy("default", &mandate, "hire planner; assign briefs")
+            .unwrap();
+        let out = handle_request_hire_for_mandate(&agents, &spine, &fake_ctx(arg.as_bytes()));
+        assert_eq!(err_kind(out), error_kinds::POLICY_DENIED);
+    }
+
+    #[test]
+    fn request_hire_for_mandate_creates_pending_hire_after_approval() {
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let mandate = spine
+            .create_mandate("default", "Ship v1", "make the product real", None, None)
+            .unwrap();
+        spine
+            .propose_strategy("default", &mandate, "hire planner; assign briefs")
+            .unwrap();
+        spine.approve_strategy("default", &mandate).unwrap();
+
+        let arg = format!("{mandate}|Planner|planner|Planner|ops|ops|prime|subj-plan|medium");
+        let id = ok_body(handle_request_hire_for_mandate(
+            &agents,
+            &spine,
+            &fake_ctx(arg.as_bytes()),
+        ))
+        .trim()
+        .to_string();
+        let hire = agents.get_agent(&id).unwrap().unwrap();
+        assert_eq!(hire.status, "pending");
+        assert_eq!(hire.name, "Planner");
+    }
+
+    #[test]
+    fn brief_clearance_request_requires_assigned_active_agent() {
+        let agents = store();
+        let tasks = TaskStore::in_memory().unwrap();
+        let agent = agents
+            .create_agent(
+                "Worker",
+                "engineer",
+                "Worker",
+                "eng",
+                "eng",
+                "prime",
+                "subj-worker",
+                "medium",
+                "default",
+            )
+            .unwrap();
+        let brief = tasks
+            .create(
+                "Risky work",
+                "flow.sol",
+                "{}",
+                "owner",
+                crate::nodes::coordinator::RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        let arg = format!("{brief}|{agent}|tool.terminal|terminal|need shell access|300");
+
+        let out = handle_brief_clearance_request(&agents, &tasks, &fake_ctx(arg.as_bytes()));
+        assert_eq!(err_kind(out), error_kinds::POLICY_DENIED);
+    }
+
+    #[test]
+    fn brief_clearance_request_creates_pending_approval_and_parks_brief() {
+        let agents = store();
+        let tasks = TaskStore::in_memory().unwrap();
+        let agent = agents
+            .create_agent(
+                "Worker",
+                "engineer",
+                "Worker",
+                "eng",
+                "eng",
+                "prime",
+                "subj-worker",
+                "medium",
+                "default",
+            )
+            .unwrap();
+        let brief = tasks
+            .create(
+                "Risky work",
+                "flow.sol",
+                "{}",
+                "owner",
+                crate::nodes::coordinator::RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        tasks.set_brief_field(&brief, "assignee", &agent).unwrap();
+        let arg = format!("{brief}|{agent}|tool.terminal|terminal|need shell access|300");
+
+        let approval_id = ok_body(handle_brief_clearance_request(
+            &agents,
+            &tasks,
+            &fake_ctx(arg.as_bytes()),
+        ))
+        .trim()
+        .to_string();
+        let approval = agents.get_approval(&approval_id).unwrap().unwrap();
+        assert_eq!(approval.status, ApprovalStatus::Pending);
+        assert_eq!(approval.agent_id, agent);
+        assert_eq!(approval.subject_id, "subj-worker");
+        assert_eq!(approval.method, "tool.terminal");
+        assert_eq!(approval.task_id.as_deref(), Some(brief.as_str()));
+        assert_eq!(tasks.get(&brief).unwrap().unwrap().status, "awaiting_input");
+        let events = tasks
+            .query_events(
+                &brief,
+                0,
+                20,
+                Some("brief.clearance_requested"),
+                crate::nodes::coordinator::EventOrder::Asc,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].payload.contains(&approval_id));
     }
 
     #[test]

@@ -241,7 +241,9 @@ fn forbidden_csrf() -> Response {
 
 /// Whether the request path is in the always-public allowlist.
 fn is_public_path(path: &str) -> bool {
-    matches!(path, "/health" | "/dashboard" | "/v1/auth/token") || path.starts_with("/assets/")
+    matches!(path, "/health" | "/dashboard" | "/v1/auth/token")
+        || path.starts_with("/assets/")
+        || path.starts_with("/v1/bridge-back/")
 }
 
 // SEC PART 3 (DELETED): `is_openai_shim_path` lived here.
@@ -504,8 +506,10 @@ mod tests {
         assert!(is_public_path("/dashboard"));
         assert!(is_public_path("/v1/auth/token"));
         assert!(is_public_path("/assets/main.css"));
+        assert!(is_public_path("/v1/bridge-back/briefs/b/comment"));
         assert!(!is_public_path("/chat"));
         assert!(!is_public_path("/v1/tasks"));
+        assert!(!is_public_path("/v1/spine/briefs/b/comment"));
         assert!(!is_public_path("/v1/health"));
     }
 

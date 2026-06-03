@@ -3106,6 +3106,7 @@ pub fn register_agent_capabilities(
     bridge: &mut crate::dispatch::DispatchBridge,
     agent_store: Arc<crate::nodes::coordinator::agent::AgentStore>,
     task_store: Arc<crate::nodes::coordinator::TaskStore>,
+    spine_store: Option<Arc<crate::nodes::coordinator::spine::SpineStore>>,
     token_ttl_secs: u64,
     clock: Arc<dyn relix_core::clock::Clock>,
     descriptor_cache: crate::manifest::DescriptorCache,
@@ -3119,6 +3120,48 @@ pub fn register_agent_capabilities(
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handlers::handle_create(&s, &ctx) }
+            })),
+        );
+    }
+    // PHASE 4 (hire flow): the gated creation path (pending → approve).
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.request_hire",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_request_hire(&s, &ctx) }
+            })),
+        );
+    }
+    if let Some(spine) = spine_store.clone() {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.request_hire_for_mandate",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let spine = spine.clone();
+                async move { handlers::handle_request_hire_for_mandate(&s, &spine, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.approve_hire",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_approve_hire(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.reject_hire",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_reject_hire(&s, &ctx) }
             })),
         );
     }
@@ -3139,6 +3182,101 @@ pub fn register_agent_capabilities(
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handlers::handle_list(&s, &ctx) }
+            })),
+        );
+    }
+    // PHASE 2 (org tree): Roster / Lattice reads over reports_to.
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.reports",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_reports(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.peers",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_peers(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.by_role",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_by_role(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.branch",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_branch(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.line",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_line(&s, &ctx) }
+            })),
+        );
+    }
+    // PHASE 2 (Keys panel): structured JSON profile read.
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.keys",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_keys(&s, &ctx) }
+            })),
+        );
+    }
+    // PHASE 2/3: delegated-authority check (Branch / subtree).
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.manages",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_manages(&s, &ctx) }
+            })),
+        );
+    }
+    // PHASE 5 (companion): Roster-at-a-glance status counts.
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.roster_summary",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_roster_summary(&s, &ctx) }
+            })),
+        );
+    }
+    // PHASE 4 (Allowance oversight): committed allowance vs Guild budget.
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.allowance_committed",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_allowance_committed(&s, &ctx) }
             })),
         );
     }
@@ -3189,6 +3327,18 @@ pub fn register_agent_capabilities(
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handlers::handle_approval_pending(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        let ts = task_store.clone();
+        bridge.register(
+            "brief.clearance_request",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let ts = ts.clone();
+                async move { handlers::handle_brief_clearance_request(&s, &ts, &ctx) }
             })),
         );
     }
@@ -7235,13 +7385,44 @@ fn register_node_type_handlers(
         let drift_embedder_cell: crate::nodes::ai::guardrails::DriftEmbedDispatcherCell =
             std::sync::Arc::new(tokio::sync::OnceCell::new());
         let drift_embedder_cell_for_startup = drift_embedder_cell.clone();
+        let agent_store = std::sync::Arc::new(
+            crate::nodes::coordinator::agent::AgentStore::open(&coord_cfg.db_path)
+                .map_err(|e| format!("[coordinator] agent store open: {e}"))?,
+        );
         crate::nodes::coordinator::register(
             bridge,
             store.clone(),
+            Some(agent_store.clone()),
             auto_skill_cfg,
             drift_cfg.clone(),
             drift_embedder_cell,
         );
+        // PHASE 1 (spine): the Mandate + Campaign objects live in
+        // the coordinator DB alongside the Brief (task) ledger.
+        // Open the SpineStore and register the `mandate.*` /
+        // `campaign.*` capabilities. Non-fatal: a spine-open
+        // failure logs and leaves the caps unregistered rather
+        // than aborting coordinator boot (the Brief ledger, which
+        // already opened the same path above, keeps working).
+        let spine_store_for_agent_caps = match crate::nodes::coordinator::spine::SpineStore::open(
+            &coord_cfg.db_path,
+        ) {
+            Ok(spine_store) => {
+                let spine_store = std::sync::Arc::new(spine_store);
+                crate::nodes::coordinator::spine::handlers::register(bridge, spine_store.clone());
+                tracing::info!(
+                    "coordinator startup: spine (mandate/campaign) capabilities registered"
+                );
+                Some(spine_store)
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "coordinator startup: SpineStore open failed; mandate/campaign caps NOT registered"
+                );
+                None
+            }
+        };
         // RELIX-7.30 PART 1: out-of-band approval delivery
         // matrix. Wired when `[approval.delivery]` is present;
         // absent keeps the bridge on the pre-7.30 admission
@@ -8533,10 +8714,6 @@ fn register_node_type_handlers(
         // opened — capabilities are always live so SOL flows
         // can manage agents even when the gate-side wiring
         // (set_agent_gate) is deferred.
-        let agent_store = std::sync::Arc::new(
-            crate::nodes::coordinator::agent::AgentStore::open(&coord_cfg.db_path)
-                .map_err(|e| format!("[coordinator] agent store open: {e}"))?,
-        );
         // Provision the operator-console agent profile so the
         // dashboard/bridge identity passes the fail-closed agent gate
         // (Tasks/Workflows). The subject id is supplied by the boot
@@ -8562,6 +8739,200 @@ fn register_node_type_handlers(
                     ),
                 }
             }
+        }
+        // Shared Rig registry (builtins + CLI subscription Rigs).
+        // Available regardless of the heartbeat loop so `rig.list`
+        // can tell the Keys / agent-config UI which backends exist.
+        let rig_registry = std::sync::Arc::new({
+            let mut r = crate::rig::RigRegistry::with_builtins();
+            crate::rig::register_cli_rigs(&mut r);
+            // Optional Guild-default Rig so an Operative with no Rig
+            // of its own still dispatches (opt-in via env).
+            if let Ok(d) = std::env::var("RELIX_DEFAULT_RIG") {
+                let d = d.trim();
+                if !d.is_empty() {
+                    r.set_default(Some(d.to_string()));
+                }
+            }
+            r
+        });
+        {
+            let reg = rig_registry.clone();
+            bridge.register(
+                "rig.list",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |_ctx: crate::dispatch::InvocationCtx| {
+                        let reg = reg.clone();
+                        async move {
+                            crate::dispatch::HandlerOutcome::Ok(reg.names().join("\n").into_bytes())
+                        }
+                    },
+                )),
+            );
+        }
+        {
+            // Structured Rig feed (name + label + governance) for the
+            // agent-config UI to render backend choices.
+            let reg = rig_registry.clone();
+            bridge.register(
+                "rig.describe",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |_ctx: crate::dispatch::InvocationCtx| {
+                        let reg = reg.clone();
+                        async move {
+                            match serde_json::to_vec(&reg.describe()) {
+                                Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                Err(e) => crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                        cause: format!("rig.describe encode: {e}"),
+                                        retry_hint: 1,
+                                        retry_after: None,
+                                    },
+                                ),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
+        // PHASE 3 (heartbeat loop): the live dispatch tick. Opt-in
+        // via RELIX_HEARTBEAT_ENABLED (off by default so it never
+        // surprises an operator). When on, a timer polls the ready
+        // Briefs and runs each on its Operative's Rig via
+        // `heartbeat::dispatch_batch`. An Operative with no Rig
+        // configured (or an unknown one) resolves to None — the
+        // Brief is left untouched (the Desk surfaces it) — so the
+        // loop is inert until real Rigs are registered + chosen.
+        if std::env::var("RELIX_HEARTBEAT_ENABLED")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+        {
+            let interval_secs = std::env::var("RELIX_HEARTBEAT_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(10);
+            let batch = std::env::var("RELIX_HEARTBEAT_BATCH")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(16);
+            let lease_secs: i64 = 300;
+            let task_store = store.clone();
+            let ag_store = agent_store.clone();
+            let registry = rig_registry.clone();
+            // Per-run bridge-back tokens the dispatch loop mints +
+            // injects so a running agent can call Relix's API back.
+            let bridge_tokens = crate::rig::bridge::BridgeTokenStore::global();
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                loop {
+                    ticker.tick().await;
+                    let ts = task_store.clone();
+                    let ags = ag_store.clone();
+                    let reg = registry.clone();
+                    let bt = bridge_tokens.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        let ags_for_timer = ags.clone();
+                        let ags_for_caps = ags.clone();
+                        crate::nodes::coordinator::heartbeat::dispatch_batch_with_policy(
+                            &ts,
+                            batch,
+                            lease_secs,
+                            Some(&bt),
+                            move |card| {
+                                let Some(assignee) = card.assignee_agent_id.as_deref() else {
+                                    return false;
+                                };
+                                match ags_for_timer.get_agent(assignee) {
+                                    Ok(Some(agent)) if agent.status == "active" => {
+                                        if !agent.wake_on_timer {
+                                            tracing::debug!(
+                                                agent_id = %assignee,
+                                                brief_id = %card.task_id,
+                                                "heartbeat: timer wake disabled for Operative"
+                                            );
+                                            return false;
+                                        }
+                                        true
+                                    }
+                                    Ok(Some(agent)) => {
+                                        tracing::warn!(
+                                            agent_id = %assignee,
+                                            status = %agent.status,
+                                            brief_id = %card.task_id,
+                                            "heartbeat: refusing timer wake for non-active Operative"
+                                        );
+                                        false
+                                    }
+                                    Ok(None) => false,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            agent_id = %assignee,
+                                            error = %e,
+                                            "heartbeat: failed to read Operative for timer wake"
+                                        );
+                                        false
+                                    }
+                                }
+                            },
+                            move |agent_id| {
+                                ags_for_caps
+                                    .get_agent(agent_id)
+                                    .ok()
+                                    .flatten()
+                                    .filter(|a| a.status == "active")
+                                    .map(|a| a.max_concurrent_runs)
+                                    .unwrap_or(0)
+                            },
+                            |card| {
+                                let assignee = card.assignee_agent_id.as_deref()?;
+                                let agent = ags.get_agent(assignee).ok().flatten()?;
+                                if agent.status != "active" {
+                                    tracing::warn!(
+                                        agent_id = %assignee,
+                                        status = %agent.status,
+                                        brief_id = %card.task_id,
+                                        "heartbeat: refusing to dispatch non-active Operative"
+                                    );
+                                    return None;
+                                }
+                                let preferred = agent.rig;
+                                reg.resolve(preferred.as_deref())
+                            },
+                            |card| ts.compose_brief_prompt(&card.task_id, 10),
+                        )
+                    })
+                    .await;
+                    match outcome {
+                        Ok(Ok(records)) if !records.is_empty() => tracing::debug!(
+                            count = records.len(),
+                            "heartbeat: dispatch tick processed Briefs"
+                        ),
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "heartbeat: dispatch tick failed")
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "heartbeat: dispatch task join error")
+                        }
+                    }
+                    // Defensive hygiene: reap any bridge tokens that
+                    // outlived their Shift (e.g. a panicked dispatch
+                    // that never reached its revoke).
+                    let reaped = bridge_tokens.sweep_expired();
+                    if reaped > 0 {
+                        tracing::debug!(reaped, "heartbeat: swept expired bridge tokens");
+                    }
+                }
+            });
+            tracing::info!(
+                interval_secs,
+                batch,
+                "coordinator startup: heartbeat dispatch loop spawned (RELIX_HEARTBEAT_ENABLED)"
+            );
         }
         // NOT-DONE 2: spawn the legacy-token orphaned-task fail
         // pass in the BACKGROUND so it does not block the
@@ -8627,6 +8998,7 @@ fn register_node_type_handlers(
             bridge,
             agent_store.clone(),
             store.clone(),
+            spine_store_for_agent_caps,
             effective_ttl_secs,
             agent_caps_clock,
             manifest.descriptor_cache(),
@@ -8634,8 +9006,28 @@ fn register_node_type_handlers(
         let agent_caps: &[(&str, &str, &[&str])] = &[
             (
                 "agent.create",
-                "Create an agent profile. Arg: name|role|title|department|team|created_by|subject_id|risk_ceiling.",
+                "Create an agent profile (active immediately — the direct/admin path). Arg: name|role|title|department|team|created_by|subject_id|risk_ceiling.",
                 &["agent", "persist"],
+            ),
+            (
+                "agent.request_hire",
+                "Gated creation: mint an Operative `pending` (inert until approved). Same arg shape as agent.create. Returns the new agent_id.",
+                &["agent", "persist"],
+            ),
+            (
+                "agent.request_hire_for_mandate",
+                "Strategy-gated hire: mandate_id|name|role|title|department|team|created_by|subject_id|risk_ceiling. Refuses until the Mandate strategy is approved.",
+                &["agent", "persist", "governance"],
+            ),
+            (
+                "agent.approve_hire",
+                "Approve a pending hire (pending → active). Arg: agent_id.",
+                &["agent", "mutate"],
+            ),
+            (
+                "agent.reject_hire",
+                "Reject a pending hire (pending → disabled, terminal). Arg: agent_id.",
+                &["agent", "mutate"],
             ),
             ("agent.get", "Read one agent profile.", &["agent", "read"]),
             (
@@ -8654,6 +9046,51 @@ fn register_node_type_handlers(
                 &["agent", "mutate"],
             ),
             (
+                "agent.reports",
+                "Org tree: the Operatives directly reporting to an agent (the Roster children). Arg: agent_id. One agent_id per line.",
+                &["agent", "read"],
+            ),
+            (
+                "agent.peers",
+                "Org tree: the Operatives reporting to the same Lead as an agent (its peers, excluding itself). Arg: agent_id. One agent_id per line; empty for an apex.",
+                &["agent", "read"],
+            ),
+            (
+                "agent.by_role",
+                "Staffing: the active Operatives with a given role (assignable staff). Arg: role. One agent_id per line.",
+                &["agent", "read"],
+            ),
+            (
+                "agent.branch",
+                "Org tree: every Operative at or below an agent (the manager's Branch / subtree). Arg: agent_id. One agent_id per line.",
+                &["agent", "read"],
+            ),
+            (
+                "agent.line",
+                "Org tree: the escalation path up from an agent to the apex (the Line / chain of command). Arg: agent_id. One agent_id per line, nearest boss first.",
+                &["agent", "read"],
+            ),
+            (
+                "agent.keys",
+                "The full Operative profile as JSON (identity + the Keys permission surface + the Lead). Structured read for the per-agent Keys panel. Arg: agent_id.",
+                &["agent", "read"],
+            ),
+            (
+                "agent.manages",
+                "Delegated-authority check: does a manager manage a target (target in the manager's Branch/subtree)? Arg: manager_id|target_id. Returns true/false.",
+                &["agent", "read"],
+            ),
+            (
+                "agent.roster_summary",
+                "Operative counts by status (active/pending/suspended/disabled) + total, as JSON. No args. The Roster-at-a-glance.",
+                &["agent", "read"],
+            ),
+            (
+                "agent.allowance_committed",
+                "Total monthly Allowance committed across the active roster, in cents (NULL counts as 0). No args. Pair with guild.get for commitment-vs-budget.",
+                &["agent", "read"],
+            ),
+            (
                 "agent.effective_capabilities",
                 "Given an agent_id and a peer alias, intersect the peer's manifest with the agent's categorical permissions. Returns one method per line + count=N.",
                 &["agent", "read"],
@@ -8662,6 +9099,11 @@ fn register_node_type_handlers(
                 "coord.approval.pending",
                 "List pending approvals (newest first). Arg: limit (default 20).",
                 &["approval", "read"],
+            ),
+            (
+                "brief.clearance_request",
+                "Create a pending Clearance linked to a Brief. Arg: brief_id|agent_id|method|category|reason|ttl_secs?.",
+                &["approval", "persist", "brief"],
             ),
             (
                 "coord.approval.get",

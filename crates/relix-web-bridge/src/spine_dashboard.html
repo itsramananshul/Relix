@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Relix Company Console</title>
+<style>
+:root {
+  --bg:#fff; --fg:#0a0a0a; --muted:#6b7280; --soft:#f6f6f6; --line:#e5e7eb;
+  --panel:#fafafa; --danger:#b91c1c; --ok:#047857; --warn:#b45309;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.45 var(--sans); }
+button, input, select, textarea { font:inherit; color:inherit; }
+button { border:1px solid var(--fg); background:var(--fg); color:#fff; border-radius:6px; padding:7px 10px; cursor:pointer; }
+button.ghost { background:#fff; color:var(--fg); border-color:var(--line); }
+button.icon { width:32px; height:32px; padding:0; display:grid; place-items:center; }
+input, select, textarea { border:1px solid var(--line); border-radius:6px; background:#fff; padding:7px 9px; min-width:0; }
+.app { min-height:100vh; display:grid; grid-template-columns:248px minmax(0,1fr) 340px; }
+.rail { border-right:1px solid var(--line); background:#fff; padding:14px 12px; display:flex; flex-direction:column; gap:14px; }
+.brand { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:4px 6px 10px; border-bottom:1px solid var(--line); }
+.brand strong { font-size:15px; letter-spacing:0; }
+.tenant { font:12px var(--mono); color:var(--muted); }
+.navGroup { display:grid; gap:3px; }
+.navTitle { margin:10px 8px 4px; color:var(--muted); font-size:11px; text-transform:uppercase; }
+.navBtn { border:0; background:transparent; color:var(--fg); text-align:left; padding:8px 9px; border-radius:6px; display:flex; justify-content:space-between; gap:8px; }
+.navBtn.active { background:var(--soft); font-weight:600; }
+.badge { font:11px var(--mono); color:var(--muted); }
+.main { min-width:0; display:flex; flex-direction:column; }
+.top { height:56px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; padding:0 18px; }
+.crumb { color:var(--muted); }
+.top h1 { margin:0; font-size:15px; font-weight:650; }
+.top .spacer { flex:1; }
+.search { width:min(360px, 34vw); }
+.content { padding:18px; overflow:auto; }
+.toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:14px; }
+.seg { display:flex; border:1px solid var(--line); border-radius:7px; overflow:hidden; }
+.seg button { border:0; border-radius:0; background:#fff; color:var(--fg); padding:7px 10px; }
+.seg button.active { background:var(--fg); color:#fff; }
+.metricRow { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-bottom:14px; }
+.metric { border:1px solid var(--line); border-radius:8px; padding:10px 12px; background:#fff; }
+.metric .k { color:var(--muted); font-size:11px; text-transform:uppercase; }
+.metric .v { font:22px/1.1 var(--mono); margin-top:4px; }
+.board { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(245px,1fr); gap:12px; overflow-x:auto; padding-bottom:10px; }
+.col { border:1px solid var(--line); border-radius:8px; background:var(--panel); min-height:320px; }
+.colHead { height:38px; padding:0 10px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); }
+.colHead span:first-child { text-transform:uppercase; font-size:11px; color:var(--muted); }
+.cards { padding:8px; display:grid; gap:8px; }
+.card { border:1px solid var(--line); border-radius:7px; background:#fff; padding:10px; cursor:pointer; }
+.card:hover { border-color:#111; }
+.cardTitle { font-weight:600; margin-bottom:7px; }
+.meta { display:flex; gap:5px; flex-wrap:wrap; align-items:center; }
+.pill { border:1px solid var(--line); border-radius:999px; padding:1px 7px; color:var(--muted); font-size:11px; }
+.pill.live { color:var(--ok); border-color:#bbf7d0; }
+.pill.blocked { color:var(--danger); border-color:#fecaca; }
+.pill.urgent { color:#fff; background:#111; border-color:#111; }
+.list { border:1px solid var(--line); border-radius:8px; overflow:hidden; background:#fff; }
+table { width:100%; border-collapse:collapse; }
+th, td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+th { color:var(--muted); font-size:11px; text-transform:uppercase; background:var(--panel); }
+tr:last-child td { border-bottom:0; }
+.side { border-left:1px solid var(--line); background:#fff; min-width:0; display:flex; flex-direction:column; }
+.sideHead { height:56px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; padding:0 14px; }
+.sideBody { padding:14px; overflow:auto; }
+.prop { margin-bottom:14px; }
+.label { color:var(--muted); font-size:11px; text-transform:uppercase; margin-bottom:5px; }
+.muted { color:var(--muted); }
+.err { color:var(--danger); }
+.empty { color:var(--muted); padding:12px; }
+.thread { display:grid; gap:8px; }
+.event { border:1px solid var(--line); border-radius:7px; padding:8px; background:#fff; }
+.mono { font-family:var(--mono); }
+dialog { border:1px solid var(--line); border-radius:10px; padding:16px; width:min(420px,calc(100vw - 28px)); }
+dialog form { display:grid; gap:10px; }
+@media (max-width: 980px) {
+  .app { grid-template-columns:1fr; }
+  .rail { position:sticky; top:0; z-index:2; border-right:0; border-bottom:1px solid var(--line); }
+  .navGroup { grid-template-columns:repeat(4,minmax(0,1fr)); }
+  .side { display:none; }
+  .metricRow { grid-template-columns:repeat(2,minmax(0,1fr)); }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="rail">
+    <div class="brand">
+      <div><strong>Relix</strong><div class="tenant" id="tenant">company/default</div></div>
+      <button class="icon ghost" id="refreshAll" title="Refresh">R</button>
+    </div>
+    <button id="newIssueTop">New Issue</button>
+    <div class="navGroup">
+      <div class="navTitle">Personal</div>
+      <button class="navBtn active" data-view="inbox">Inbox <span class="badge" id="inboxBadge">0</span></button>
+      <button class="navBtn" data-view="issues">Issues <span class="badge" id="issueBadge">0</span></button>
+    </div>
+    <div class="navGroup">
+      <div class="navTitle">Company</div>
+      <button class="navBtn" data-view="goals">Goals <span class="badge">soon</span></button>
+      <button class="navBtn" data-view="org">Org <span class="badge" id="agentBadge">0</span></button>
+      <button class="navBtn" data-view="agents">Agents</button>
+      <button class="navBtn" data-view="costs">Costs</button>
+      <button class="navBtn" data-view="activity">Activity</button>
+      <button class="navBtn" data-view="chat">Chat</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="top">
+      <span class="crumb" id="crumb">Company</span>
+      <h1 id="pageTitle">Inbox</h1>
+      <div class="spacer"></div>
+      <input class="search" id="search" placeholder="Search issues" />
+      <button class="ghost" id="newIssue">Create</button>
+    </div>
+    <section class="content">
+      <div class="metricRow" id="metrics"></div>
+      <div class="toolbar" id="issueToolbar">
+        <div class="seg"><button id="boardMode" class="active">Board</button><button id="listMode">List</button></div>
+        <select id="groupBy"><option value="status">Group by status</option><option value="priority">Group by priority</option><option value="assignee">Group by assignee</option></select>
+        <input id="labelFilter" placeholder="label" style="width:130px" />
+        <button class="ghost" id="blockedBtn">Blocked</button>
+        <button class="ghost" id="overdueBtn">Overdue</button>
+      </div>
+      <div id="view"></div>
+    </section>
+  </main>
+
+  <aside class="side">
+    <div class="sideHead"><strong>Properties</strong><button class="ghost icon" id="closeSide">X</button></div>
+    <div class="sideBody" id="sideBody"><div class="muted">Select an issue.</div></div>
+  </aside>
+</div>
+
+<dialog id="issueDialog">
+  <form method="dialog" id="issueForm">
+    <strong>New Issue</strong>
+    <label>Title <input name="title" required /></label>
+    <label>Assignee <input name="assignee" placeholder="agent id" /></label>
+    <label>Reviewer <input name="reviewer" placeholder="reviewer id" /></label>
+    <label>Priority <select name="priority"><option>normal</option><option>low</option><option>high</option><option>urgent</option></select></label>
+    <div style="display:flex;gap:8px;justify-content:flex-end"><button class="ghost" value="cancel">Cancel</button><button value="ok">Create</button></div>
+    <div class="err" id="issueErr"></div>
+  </form>
+</dialog>
+
+<script>
+const COLUMNS = ["backlog","todo","in_progress","in_review","blocked","done","cancelled"];
+const FUTURE_ENDPOINTS = ["/v1/spine/mandates"];
+const $ = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => [...r.querySelectorAll(s)];
+const node = (tag, attrs={}, kids=[]) => { const n=document.createElement(tag); Object.assign(n, attrs); for (const k of [].concat(kids)) n.append(k); return n; };
+let state = { view:"inbox", mode:"board", board:{}, selected:null };
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const text = await res.text();
+  if (!res.ok) throw new Error(text || String(res.status));
+  return text ? JSON.parse(text) : null;
+}
+function post(path, body) { return api(path, { method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(body) }); }
+
+async function refresh() {
+  await Promise.all([loadMetrics(), loadBoard()]);
+  render();
+}
+async function loadMetrics() {
+  const box = $("#metrics"); box.innerHTML = "";
+  const [guild, board, roster, blocked] = await Promise.all([
+    api("/v1/spine/guild").catch(()=>({})),
+    api("/v1/spine/board").catch(()=>({})),
+    api("/v1/spine/roster").catch(()=>({})),
+    api("/v1/spine/blocked?limit=50").catch(()=>[]),
+  ]);
+  $("#issueBadge").textContent = board.total ?? 0;
+  $("#agentBadge").textContent = roster.total ?? 0;
+  $("#inboxBadge").textContent = (blocked || []).length;
+  const items = [
+    ["Open issues", board.total ?? 0],
+    ["Blocked", (blocked || []).length],
+    ["Mandates", guild.mandates_total ?? 0],
+    ["Agents", roster.total ?? 0],
+  ];
+  for (const [k,v] of items) box.append(node("div",{className:"metric"},[node("div",{className:"k",textContent:k}), node("div",{className:"v",textContent:String(v)})]));
+}
+async function loadBoard() {
+  state.board = {};
+  await Promise.all(COLUMNS.map(async col => {
+    state.board[col] = await api("/v1/spine/board/"+encodeURIComponent(col)+"?limit=100").catch(()=>[]);
+  }));
+}
+function allIssues() { return COLUMNS.flatMap(c => state.board[c] || []); }
+
+function render() {
+  $$(".navBtn").forEach(b => b.classList.toggle("active", b.dataset.view === state.view));
+  $("#pageTitle").textContent = state.view[0].toUpperCase() + state.view.slice(1);
+  $("#crumb").textContent = state.view === "issues" ? "Company / Work" : "Company";
+  $("#issueToolbar").style.display = state.view === "issues" || state.view === "inbox" ? "flex" : "none";
+  const view = $("#view"); view.innerHTML = "";
+  if (state.view === "issues") return state.mode === "board" ? renderBoard(view, COLUMNS) : renderList(view, allIssues());
+  if (state.view === "inbox") return renderInbox(view);
+  if (state.view === "goals") return renderGoals(view);
+  if (state.view === "org" || state.view === "agents") return renderAgents(view);
+  if (state.view === "costs") return renderCosts(view);
+  if (state.view === "activity") return renderActivity(view);
+  if (state.view === "chat") return renderChat(view);
+  view.append(node("div",{className:"empty",textContent:"This surface is scaffolded. The object model exists; detailed tabs land next."}));
+}
+function renderInbox(host) {
+  const blocked = state.board.blocked || [];
+  const review = state.board.in_review || [];
+  const stale = (state.board.in_progress || []).filter(x => !x.assignee_agent_id);
+  const rows = [...blocked, ...review, ...stale];
+  if (!rows.length) return host.append(node("div",{className:"empty",textContent:"No operator action needed."}));
+  renderList(host, rows);
+}
+function renderBoard(host, columns) {
+  const board = node("div",{className:"board"}); host.append(board);
+  for (const col of columns) {
+    const rows = state.board[col] || [];
+    const wrap = node("section",{className:"col"});
+    wrap.append(node("div",{className:"colHead"},[node("span",{textContent:col.replace("_"," ")}), node("span",{className:"badge",textContent:String(rows.length)})]));
+    const cards = node("div",{className:"cards"}); wrap.append(cards);
+    if (!rows.length) cards.append(node("div",{className:"empty",textContent:"No issues"}));
+    rows.forEach(b => cards.append(issueCard(b)));
+    board.append(wrap);
+  }
+}
+function issueCard(b) {
+  const c = node("article",{className:"card", onclick:()=>openIssue(b.task_id)});
+  c.append(node("div",{className:"cardTitle",textContent:b.title || b.task_id}));
+  const m = node("div",{className:"meta"});
+  m.append(node("span",{className:"pill mono",textContent:(b.human_ref || b.task_id || "").slice(0,12)}));
+  if (b.priority && b.priority !== "normal") m.append(node("span",{className:"pill "+b.priority,textContent:b.priority}));
+  if (b.assignee_agent_id) m.append(node("span",{className:"pill",textContent:"@"+b.assignee_agent_id.slice(0,10)}));
+  if (b.board_status === "in_progress") m.append(node("span",{className:"pill live",textContent:"live"}));
+  if (b.board_status === "blocked") m.append(node("span",{className:"pill blocked",textContent:"blocked"}));
+  c.append(m); return c;
+}
+function renderList(host, rows) {
+  const box = node("div",{className:"list"}); host.append(box);
+  const table = node("table"); box.append(table);
+  table.append(node("thead",{},[node("tr",{},["ID","Title","Status","Priority","Assignee"].map(x=>node("th",{textContent:x})))]));
+  const body = node("tbody"); table.append(body);
+  if (!rows.length) return body.append(node("tr",{},[node("td",{colSpan:5,className:"muted",textContent:"No issues"})]));
+  rows.forEach(b => body.append(node("tr",{onclick:()=>openIssue(b.task_id), style:"cursor:pointer"},[
+    node("td",{className:"mono",textContent:(b.human_ref || b.task_id || "").slice(0,14)}),
+    node("td",{textContent:b.title || ""}),
+    node("td",{textContent:b.board_status || ""}),
+    node("td",{textContent:b.priority || ""}),
+    node("td",{textContent:b.assignee_agent_id || ""}),
+  ])));
+}
+async function renderAgents(host) {
+  const data = await api("/v1/agents").catch(()=>({agents:[]}));
+  const rows = data.agents || [];
+  const box = node("div",{className:"list"}); host.append(box);
+  const table = node("table"); box.append(table);
+  table.append(node("thead",{},[node("tr",{},["Name","Role","Status","Subject"].map(h=>node("th",{textContent:h})))]));
+  const body = node("tbody"); table.append(body);
+  if (!rows.length) return body.append(node("tr",{},[node("td",{colSpan:4,className:"muted",textContent:"No agents"})]));
+  rows.forEach(a => body.append(node("tr",{onclick:()=>openAgent(a.agent_id), style:"cursor:pointer"},[
+    node("td",{textContent:a.name || a.agent_id}),
+    node("td",{textContent:a.role || ""}),
+    node("td",{textContent:a.status || ""}),
+    node("td",{className:"mono muted",textContent:a.subject_id || ""}),
+  ])));
+}
+async function renderGoals(host) {
+  const rows = await api("/v1/spine/mandates").catch(()=>[]);
+  if (!rows.length) return host.append(node("div",{className:"empty",textContent:"No mandates yet."}));
+  const box = node("div",{className:"list"}); host.append(box);
+  const table = node("table"); box.append(table);
+  table.append(node("thead",{},[node("tr",{},["Mandate","Status","Owner","Parent"].map(h=>node("th",{textContent:h})))]));
+  const body = node("tbody"); table.append(body);
+  const byParent = new Map();
+  const ids = new Set(rows.map(r => r.mandate_id));
+  rows.forEach(r => {
+    const p = r.parent_mandate_id && ids.has(r.parent_mandate_id) ? r.parent_mandate_id : "";
+    if (!byParent.has(p)) byParent.set(p, []);
+    byParent.get(p).push(r);
+  });
+  const seen = new Set();
+  const addRows = (parent, depth) => {
+    for (const m of byParent.get(parent) || []) {
+      if (seen.has(m.mandate_id)) continue;
+      seen.add(m.mandate_id);
+      body.append(node("tr",{onclick:()=>openMandate(m.mandate_id), style:"cursor:pointer"},[
+        node("td",{textContent:m.title, style:"padding-left:"+(10 + depth * 18)+"px"}),
+        node("td",{textContent:m.status || ""}),
+        node("td",{textContent:m.owner_agent_id || ""}),
+        node("td",{className:"mono muted",textContent:m.parent_mandate_id || ""}),
+      ]));
+      addRows(m.mandate_id, depth + 1);
+    }
+  };
+  addRows("", 0);
+}
+function renderListLike(host, heads, rows) {
+  const box = node("div",{className:"list"}); host.append(box);
+  const table = node("table"); box.append(table);
+  table.append(node("thead",{},[node("tr",{},heads.map(h=>node("th",{textContent:h})))]));
+  const body = node("tbody"); table.append(body);
+  rows.forEach(r => body.append(node("tr",{},r.map(x=>node("td",{textContent:x || ""})))));
+}
+async function renderCosts(host) {
+  host.append(node("div",{className:"muted",textContent:"Loading allowance..."}));
+  try {
+    const [guild, committedRaw] = await Promise.all([
+      api("/v1/spine/guild/detail").catch(()=>null),
+      api("/v1/spine/allowance/committed").catch(()=>0),
+    ]);
+    const cap = guild && guild.monthly_allowance_cents != null ? Number(guild.monthly_allowance_cents) : null;
+    const committed = Number(committedRaw || 0);
+    const remaining = cap == null ? null : cap - committed;
+    host.innerHTML = "";
+    const row = node("div",{className:"metricRow"});
+    row.append(
+      metric("Guild cap", cap == null ? "unset" : moneyCents(cap)),
+      metric("Committed", moneyCents(committed)),
+      metric("Remaining", remaining == null ? "n/a" : moneyCents(remaining)),
+      metric("Status", cap == null ? "uncapped" : (remaining < 0 ? "over" : "ok"))
+    );
+    host.append(row);
+    const rows = [
+      ["Guild", guild && guild.display_name ? guild.display_name : "default"],
+      ["Monthly allowance", cap == null ? "Not set" : moneyCents(cap)],
+      ["Operative allowance committed", moneyCents(committed)],
+      ["Headroom", remaining == null ? "No cap" : moneyCents(remaining)],
+    ];
+    renderListLike(host, ["Item","Value"], rows);
+    if (cap != null && remaining < 0) {
+      host.append(node("div",{className:"event err",textContent:"Committed Operative allowance exceeds the Guild cap. Relix stores the cap, but hard spend stop is still a roadmap gap."}));
+    }
+  } catch(e) {
+    host.innerHTML = "";
+    host.append(node("div",{className:"err",textContent:e.message}));
+  }
+}
+function metric(k, v) {
+  return node("div",{className:"metric"},[node("div",{className:"k",textContent:k}), node("div",{className:"v",textContent:String(v)})]);
+}
+function moneyCents(cents) {
+  return "$" + (Number(cents || 0) / 100).toFixed(2);
+}
+async function renderActivity(host) {
+  host.append(node("div",{className:"muted",textContent:"Loading activity..."}));
+  try {
+    const data = await api("/v1/tasks/events/recent?limit=80").catch(()=>({items:[]}));
+    const rows = data.items || [];
+    host.innerHTML = "";
+    if (!rows.length) return host.append(node("div",{className:"empty",textContent:"No activity yet."}));
+    const stream = node("div",{className:"thread"});
+    rows.forEach(ev => stream.append(node("div",{className:"event"},[
+      node("div",{className:"mono muted",textContent:"#"+ev.event_id+" / "+(ev.task_id || "").slice(0,12)}),
+      node("strong",{textContent:ev.event_type || ""}),
+      node("div",{textContent:ev.summary || ev.payload || ""}),
+      node("div",{className:"muted",textContent:ev.ts ? new Date(ev.ts * 1000).toLocaleString() : ""})
+    ])));
+    host.append(stream);
+  } catch(e) {
+    host.innerHTML = "";
+    host.append(node("div",{className:"err",textContent:e.message}));
+  }
+}
+function renderChat(host) {
+  const box = node("div",{className:"list", style:"padding:12px;display:grid;gap:10px"});
+  box.append(node("strong",{textContent:"Company companion"}));
+  box.append(node("div",{className:"muted",textContent:"Ask about the company or materialize work into issues. Uses /v1/spine/companion."}));
+  const input = node("textarea",{rows:5,placeholder:"What should the company do next?"});
+  const reply = node("div",{className:"event muted",textContent:"No conversation yet."});
+  box.append(input, node("button",{textContent:"Send",onclick:async()=> {
+    reply.textContent = "thinking...";
+    try { const r = await post("/v1/spine/companion", { message: input.value }); reply.textContent = JSON.stringify(r); }
+    catch(e) { reply.textContent = e.message; reply.className = "event err"; }
+  }}), reply);
+  host.append(box);
+}
+async function openIssue(id) {
+  state.selected = id;
+  const side = $("#sideBody"); side.innerHTML = '<div class="muted">Loading...</div>';
+  try {
+    const d = await api("/v1/spine/briefs/"+encodeURIComponent(id));
+    const wakes = await api("/v1/spine/briefs/"+encodeURIComponent(id)+"/wakeups?limit=6").catch(()=>[]);
+    const f = d.fields || {};
+    side.innerHTML = "";
+    side.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"Issue"}), node("strong",{textContent:f.human_ref || f.task_id || id}), node("div",{className:"muted mono",textContent:f.task_id || id})]));
+    side.append(fieldSelect(id, "status", f.board_status, COLUMNS, v => post("/v1/spine/briefs/"+id+"/move", {status:v})));
+    side.append(fieldSelect(id, "priority", f.priority, ["low","normal","high","urgent"], v => post("/v1/spine/briefs/"+id+"/set", {field:"priority", value:v})));
+    side.append(fieldInput(id, "assignee", f.assignee_agent_id || "", v => post("/v1/spine/briefs/"+id+"/set", {field:"assignee", value:v})));
+    side.append(fieldInput(id, "reviewer", f.reviewer_agent_id || "", v => post("/v1/spine/briefs/"+id+"/set", {field:"reviewer", value:v})));
+    side.append(wakeupBlock(wakes || []));
+    side.append(threadBlock("Blockers", d.snags || []));
+    side.append(threadBlock("Sub-issues", d.subbriefs || []));
+    const text = node("textarea",{rows:3,placeholder:"Comment"});
+    side.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"Thread"}), text, node("button",{style:"margin-top:6px",textContent:"Post",onclick:async()=>{ await post("/v1/spine/briefs/"+id+"/comment", {author:"operator", text:text.value}); text.value=""; }} )]));
+  } catch(e) { side.innerHTML = '<div class="err">'+e.message+'</div>'; }
+}
+async function openAgent(id) {
+  const side = $("#sideBody"); side.innerHTML = '<div class="muted">Loading...</div>';
+  try {
+    const a = await api("/v1/agents/"+encodeURIComponent(id));
+    side.innerHTML = "";
+    side.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"Agent"}), node("strong",{textContent:a.name || id}), node("div",{className:"muted mono",textContent:id})]));
+    side.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"Role"}), node("div",{textContent:(a.role || "")+" / "+(a.title || "")})]));
+    side.append(agentFieldInput(id, "status", a.status || "", "status"));
+    side.append(agentFieldInput(id, "risk ceiling", a.risk_ceiling || "", "risk_ceiling"));
+    side.append(agentFieldInput(id, "rig", a.rig || "", "rig"));
+    side.append(agentNumberInput(id, "monthly allowance cents", a.monthly_allowance_cents || 0, "monthly_allowance_cents", 0, 1000000000));
+    side.append(agentNumberInput(id, "concurrency", a.max_concurrent_runs || 20, "max_concurrent_runs", 1, 50));
+    side.append(agentToggle(id, "timer wake", !!a.wake_on_timer, "wake_on_timer"));
+    side.append(agentToggle(id, "on-demand wake", !!a.wake_on_demand, "wake_on_demand"));
+    side.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"Allowed categories"}), node("div",{className:"event",textContent:(a.allow_categories || []).join(", ") || "default deny"})]));
+  } catch(e) { side.innerHTML = '<div class="err">'+e.message+'</div>'; }
+}
+async function openMandate(id) {
+  const side = $("#sideBody"); side.innerHTML = '<div class="muted">Loading...</div>';
+  try {
+    const t = await api("/v1/spine/mandates/"+encodeURIComponent(id)+"/tree");
+    const m = t.mandate || {};
+    side.innerHTML = "";
+    side.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"Mandate"}), node("strong",{textContent:m.title || id}), node("div",{className:"muted mono",textContent:id})]));
+    side.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"Status"}), node("div",{textContent:m.status || ""})]));
+    side.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"Owner"}), node("div",{textContent:m.owner_agent_id || "unassigned"})]));
+    side.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"Description"}), node("div",{textContent:m.description || "No description"})]));
+    const kids = node("div",{className:"prop"},[node("div",{className:"label",textContent:"Child mandates"})]);
+    if (!(t.child_mandates || []).length) kids.append(node("div",{className:"muted",textContent:"None"}));
+    (t.child_mandates || []).forEach(c => kids.append(node("div",{className:"event",onclick:()=>openMandate(c.mandate_id), style:"cursor:pointer"},[node("strong",{textContent:c.title}), node("div",{className:"muted",textContent:c.status || ""})])));
+    side.append(kids);
+    const campaigns = node("div",{className:"prop"},[node("div",{className:"label",textContent:"Campaigns"})]);
+    if (!(t.campaigns || []).length) campaigns.append(node("div",{className:"muted",textContent:"None"}));
+    (t.campaigns || []).forEach(c => campaigns.append(node("div",{className:"event"},[node("strong",{textContent:c.title}), node("div",{className:"muted",textContent:(c.status || "")+" / "+(c.lead_agent_id || "no lead")})])));
+    side.append(campaigns);
+  } catch(e) { side.innerHTML = '<div class="err">'+e.message+'</div>'; }
+}
+function fieldSelect(id, label, value, opts, save) {
+  const sel = node("select"); opts.forEach(o => sel.append(node("option",{value:o,textContent:o,selected:o===value})));
+  return node("div",{className:"prop"},[node("div",{className:"label",textContent:label}), sel, " ", node("button",{className:"ghost",textContent:"Save",onclick:async()=>{await save(sel.value); await refresh(); await openIssue(id);}})]);
+}
+function agentFieldInput(id, label, value, field) {
+  const input = node("input",{value});
+  return node("div",{className:"prop"},[node("div",{className:"label",textContent:label}), input, " ", node("button",{className:"ghost",textContent:"Save",onclick:async()=>{await patchAgent(id, {[field]:input.value.trim()}); await openAgent(id);}})]);
+}
+function agentNumberInput(id, label, value, field, min, max) {
+  const input = node("input",{type:"number",min,max,value});
+  return node("div",{className:"prop"},[node("div",{className:"label",textContent:label}), input, " ", node("button",{className:"ghost",textContent:"Save",onclick:async()=>{await patchAgent(id, {[field]:Number(input.value)}); await openAgent(id);}})]);
+}
+function agentToggle(id, label, checked, field) {
+  const input = node("input",{type:"checkbox",checked});
+  return node("div",{className:"prop"},[node("label",{},[input, " ", label]), " ", node("button",{className:"ghost",textContent:"Save",onclick:async()=>{await patchAgent(id, {[field]:input.checked}); await openAgent(id);}})]);
+}
+async function patchAgent(id, body) {
+  const r = await fetch("/v1/agents/"+encodeURIComponent(id), {method:"PATCH", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+function fieldInput(id, label, value, save) {
+  const input = node("input",{value});
+  return node("div",{className:"prop"},[node("div",{className:"label",textContent:label}), input, " ", node("button",{className:"ghost",textContent:"Save",onclick:async()=>{await save(input.value.trim()); await refresh(); await openIssue(id);}})]);
+}
+function threadBlock(label, rows) {
+  const block = node("div",{className:"prop"},[node("div",{className:"label",textContent:label})]);
+  if (!rows.length) block.append(node("div",{className:"muted",textContent:"None"}));
+  rows.forEach(x => block.append(node("div",{className:"event mono",textContent:x})));
+  return block;
+}
+function wakeupBlock(rows) {
+  const block = node("div",{className:"prop"},[node("div",{className:"label",textContent:"Runs"})]);
+  if (!rows.length) block.append(node("div",{className:"muted",textContent:"No wakeups"}));
+  rows.forEach(w => block.append(node("div",{className:"event"},[
+    node("strong",{textContent:w.status || ""}),
+    node("div",{className:"muted",textContent:(w.source || "") + " / " + (w.reason || "")}),
+    node("div",{className:"mono muted",textContent:w.execution_run_id || w.wakeup_id || ""})
+  ])));
+  return block;
+}
+
+$("#refreshAll").onclick = refresh;
+$("#newIssue").onclick = $("#newIssueTop").onclick = () => $("#issueDialog").showModal();
+$("#boardMode").onclick = () => { state.mode="board"; $("#boardMode").classList.add("active"); $("#listMode").classList.remove("active"); render(); };
+$("#listMode").onclick = () => { state.mode="list"; $("#listMode").classList.add("active"); $("#boardMode").classList.remove("active"); render(); };
+$("#blockedBtn").onclick = () => { state.view="inbox"; render(); };
+$("#overdueBtn").onclick = async () => { const rows = await api("/v1/spine/overdue?limit=100").catch(()=>[]); $("#view").innerHTML=""; renderList($("#view"), rows || []); };
+$("#search").oninput = async e => { const q=e.target.value.trim(); if(q.length<2) return render(); const rows=await api("/v1/spine/briefs/search?q="+encodeURIComponent(q)+"&limit=100").catch(()=>[]); $("#view").innerHTML=""; renderList($("#view"), rows || []); };
+$$(".navBtn").forEach(b => b.onclick = () => { state.view=b.dataset.view; render(); });
+$("#issueForm").onsubmit = async e => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  try {
+    const created = await post("/v1/spine/briefs", { title:fd.get("title"), assignee:fd.get("assignee"), priority:fd.get("priority") });
+    const reviewer = String(fd.get("reviewer") || "").trim();
+    if (reviewer && created && created.task_id) await post("/v1/spine/briefs/"+created.task_id+"/set", {field:"reviewer", value:reviewer});
+    $("#issueDialog").close(); e.target.reset(); await refresh();
+  } catch(err) { $("#issueErr").textContent = err.message; }
+};
+refresh().catch(e => { $("#view").innerHTML = '<div class="err">'+e.message+'</div>'; });
+</script>
+</body>
+</html>

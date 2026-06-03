@@ -353,7 +353,10 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("<title>Relix"), "missing title");
-        assert!(body.contains("Operator Console"), "missing brand subtitle");
+        assert!(
+            body.contains("Agent Control Plane"),
+            "missing brand subtitle"
+        );
         assert!(body.contains("id=\"sidebar\""), "missing sidebar shell");
         assert!(
             body.contains("id=\"theme-toggle\""),
@@ -363,6 +366,37 @@ mod tests {
             body.contains("data-section=\"overview\""),
             "missing nav routing data"
         );
+    }
+
+    /// Paperclip-inspired product shell guard: the embedded dashboard
+    /// must ship as an actual control-plane surface, not a flat dump of
+    /// unrelated panels. These landmarks keep the grouped navigation,
+    /// topbar context, and bridge/spine status wiring intact.
+    #[tokio::test]
+    async fn page_carries_grouped_control_plane_shell() {
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "class=\"brand-mark\"",
+            "id=\"dashboard-topbar\"",
+            "id=\"topbar-section\"",
+            "id=\"topbar-spine\"",
+            "id=\"topbar-bridge\"",
+            "class: 'nav-group-label'",
+            "data-nav-group",
+            "function updateTopbar(",
+            "function updateSpineTopbar(",
+            "function setStatusPill(",
+        ] {
+            assert!(
+                body.contains(needle),
+                "missing dashboard shell marker {needle:?}"
+            );
+        }
+        for group in ["Work", "Agent Runtime", "Operations", "System"] {
+            assert!(body.contains(group), "missing nav group {group}");
+        }
     }
 
     /// Dark-mode toggle wires through to the `<html>` root via
@@ -402,14 +436,78 @@ mod tests {
     // P4 — dashboard auth-error contract tests
     // ─────────────────────────────────────────────────────
 
-    /// P4 test: "Dashboard with no token shows the auth error
-    /// screen and makes no further requests." We assert the
-    /// shape of the bootstrap path: when /v1/auth/token returns
-    /// no token, Bridge.authFailed flips and initApp aborts
-    /// before wiring any handlers — no Bridge.get/post calls
-    /// run.
+    /// Product-spine hook: the dashboard must consume the
+    /// server-side control-plane manifest instead of carrying an
+    /// unrelated, permanent copy of product surfaces. This does not
+    /// decompose the monolith yet; it establishes the contract the
+    /// split dashboard modules will hang from.
     #[tokio::test]
-    async fn page_bootstrap_aborts_when_auth_token_endpoint_refuses() {
+    async fn page_consumes_control_plane_dashboard_manifest() {
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("/v1/control-plane/dashboard"),
+            "dashboard does not fetch the control-plane dashboard manifest"
+        );
+        assert!(
+            body.contains("function applyDashboardManifest"),
+            "dashboard has no manifest application hook"
+        );
+        assert!(
+            body.contains("data-spine-id"),
+            "dashboard nav does not expose spine ids"
+        );
+        assert!(
+            body.contains("data-spine-status"),
+            "dashboard nav does not expose spine status"
+        );
+    }
+
+    /// Phase 6 — the manifest must drive a VISIBLE spine-status badge
+    /// on each nav item, not just a hover tooltip, so navigation
+    /// reflects the real product contract. Assert the rendering hook,
+    /// the severity mapping, and the badge CSS are all present.
+    #[tokio::test]
+    async fn page_renders_visible_spine_status_badge_from_manifest() {
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("function setNavSpineBadge("),
+            "missing visible nav badge renderer"
+        );
+        assert!(
+            body.contains("function spineBadgeRank("),
+            "missing spine status severity mapping"
+        );
+        // The renderer is actually invoked from manifest application.
+        assert!(
+            body.contains("setNavSpineBadge(item"),
+            "applyDashboardManifest does not render the visible badge"
+        );
+        // The badge has styling for all three severities.
+        for cls in [
+            ".nav-spine-badge.ok",
+            ".nav-spine-badge.warn",
+            ".nav-spine-badge.err",
+        ] {
+            assert!(body.contains(cls), "missing badge style {cls}");
+        }
+        // Built via the safe DOM builder, never innerHTML (covered by
+        // page_javascript_has_no_innerhtml_assignment too).
+        assert!(
+            body.contains("class: 'nav-spine-badge '"),
+            "badge is not built with the safe el() builder"
+        );
+    }
+
+    /// Dashboard bootstrap no longer replaces the entire console
+    /// with a setup-token wall. When `/v1/auth/token` is absent or
+    /// refuses the request, the shell still initializes and surfaces
+    /// the auth state as a status pill/panel-level request failures.
+    #[tokio::test]
+    async fn page_bootstrap_continues_when_auth_token_endpoint_refuses() {
         let resp = page().await.into_response();
         let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
@@ -419,21 +517,17 @@ mod tests {
             body.contains("self.authFailed = true"),
             "bootstrap missing authFailed flag flip"
         );
-        // initApp MUST check the flag before wiring handlers.
         assert!(
             body.contains("if (Bridge.authFailed)"),
-            "initApp does not gate on Bridge.authFailed"
+            "initApp does not inspect Bridge.authFailed"
         );
-        // showAuthErrorScreen is the visible surface.
         assert!(
-            body.contains("function showAuthErrorScreen("),
-            "showAuthErrorScreen helper is missing"
+            body.contains("setStatusPill('topbar-bridge', 'Bridge auth not loaded', 'warn')"),
+            "auth failure is not surfaced in the dashboard shell"
         );
-        // Auth-error screen renders the brand-name text the
-        // operator expects.
         assert!(
-            body.contains("Authentication Required"),
-            "auth error screen body text missing"
+            !body.contains("Authentication Required"),
+            "dashboard still carries a full-page auth wall"
         );
     }
 
@@ -480,9 +574,10 @@ mod tests {
         );
     }
 
-    /// P4 test: "Dashboard session that expires shows the
-    /// auth error screen automatically." The probe interval
-    /// is 5 minutes and it checks /v1/health for 401/403.
+    /// P4 test: "Dashboard session that expires marks the
+    /// bridge status stale." The probe interval is 5 minutes
+    /// and it checks /v1/health for 401/403 without replacing
+    /// the page.
     #[tokio::test]
     async fn page_session_expiry_probe_calls_health_every_five_minutes() {
         let resp = page().await.into_response();
@@ -502,10 +597,14 @@ mod tests {
             body.contains("fetch('/v1/health'"),
             "session probe does not call /v1/health"
         );
-        // 401/403 from the probe MUST trigger showAuthErrorScreen.
+        // 401/403 from the probe MUST mark the bridge status.
         assert!(
             body.contains("r.status === 401 || r.status === 403"),
             "session probe does not check 401/403"
+        );
+        assert!(
+            body.contains("Bridge session expired"),
+            "session expiry is not surfaced in the shell"
         );
     }
 

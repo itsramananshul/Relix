@@ -261,6 +261,13 @@ impl InterventionAudit {
             return;
         };
         line.push('\n');
+        if let Err(e) = crate::activity::append_intervention_activity(path, entry) {
+            tracing::warn!(
+                path = %path.display(),
+                err = %e,
+                "activity ledger: intervention mirror failed"
+            );
+        }
         let _guard = self.file_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Lazy parent dir creation: the bridge's data dir
         // might not exist yet on first run.

@@ -8,6 +8,7 @@ bridge enforces and asserts the SDK decodes it correctly.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -39,16 +40,26 @@ def test_chat_returns_typed_response_with_aliased_reply_field() -> None:
                 "trace_id": "trace-1",
                 "flow_log": "/tmp/log.txt",
                 "task_id": "task-1",
+                "workspace_lease_id": "lease-1",
+                "workspace_path": "/work/acme",
             },
         )
     )
     with RelixClient(BRIDGE, api_key="tok") as c:
-        resp = c.chat(session_id="u1", message="hello")
+        resp = c.chat(
+            session_id="u1",
+            message="hello",
+            workspace_lease_id="lease-1",
+        )
     assert isinstance(resp, ChatResponse)
     assert resp.text == "hi there"
     assert resp.flow_id == "flow-1"
     assert resp.trace_id == "trace-1"
     assert resp.task_id == "task-1"
+    assert resp.workspace_lease_id == "lease-1"
+    assert resp.workspace_path == "/work/acme"
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["workspace_lease_id"] == "lease-1"
     assert route.called
 
 
@@ -145,7 +156,9 @@ def _sse_body(*chunks: str, with_done: bool = True) -> bytes:
     if with_done:
         pieces.append(
             'event: done\ndata: {"flow_id": "f1", "trace_id": "t1", '
-            '"flow_log": "/tmp/x"}\n\n'
+            '"flow_log": "/tmp/x", "task_id": "task-1", '
+            '"workspace_lease_id": "lease-1", '
+            '"workspace_path": "/work/acme"}\n\n'
         )
     return "".join(pieces).encode()
 
@@ -171,6 +184,9 @@ def test_chat_stream_yields_chunks_and_terminal_done_frame() -> None:
     done = [ch for ch in chunks if ch.done]
     assert len(done) == 1
     assert done[0].flow_id == "f1"
+    assert done[0].task_id == "task-1"
+    assert done[0].workspace_lease_id == "lease-1"
+    assert done[0].workspace_path == "/work/acme"
 
 
 @respx.mock

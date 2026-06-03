@@ -29,7 +29,9 @@ use serde_json::Value;
 use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
+use crate::activity::{ToolInvocationActivity, append_tool_invocation_activity};
 use crate::config::AppState;
+use crate::tenant::{DEFAULT_TENANT, current_subject, current_tenant};
 
 const DEFAULT_PEER: &str = "coordinator";
 
@@ -55,6 +57,10 @@ pub struct CreatePlanRequest {
     pub dry_run: Option<bool>,
     #[serde(default)]
     pub peer: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +84,10 @@ pub struct DecidePlanRequest {
     pub note: Option<String>,
     #[serde(default)]
     pub peer: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -107,6 +117,12 @@ pub async fn create_plan(
     if req.spec.trim().is_empty() {
         return bad_request("spec is required");
     }
+    let task_id = match clean_optional_id(req.task_id.as_deref(), "task_id") {
+        Ok(id) => id,
+        Err(e) => return bad_request(&e),
+    };
+    let run_id = clean_optional(req.run_id.as_deref());
+    let detail = create_plan_detail(&req);
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let mut body = serde_json::Map::new();
     body.insert("spec".into(), Value::from(req.spec));
@@ -116,9 +132,40 @@ pub async fn create_plan(
     if let Some(d) = req.dry_run {
         body.insert("dry_run".into(), Value::from(d));
     }
-    match call_peer_json(&state, &peer, "planning.create_plan", &Value::Object(body)).await {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(resp) => resp,
+    match call_peer_json(
+        &state,
+        &peer,
+        "planning.create_plan",
+        &Value::Object(body),
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(mut v) => {
+            attach_scope(&mut v, task_id.as_deref(), run_id.as_deref());
+            record_planning_activity(
+                &state,
+                &peer,
+                "planning.create_plan",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "ok",
+                &detail,
+            );
+            (StatusCode::OK, Json(v)).into_response()
+        }
+        Err(resp) => {
+            record_planning_activity(
+                &state,
+                &peer,
+                "planning.create_plan",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "err",
+                &detail,
+            );
+            resp
+        }
     }
 }
 
@@ -129,7 +176,7 @@ pub async fn list_agents(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
-    match call_peer_json(&state, &peer, "planning.list_agents", &Value::Null).await {
+    match call_peer_json(&state, &peer, "planning.list_agents", &Value::Null, None).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -146,7 +193,7 @@ pub async fn search_agents(
     }
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({ "task": req.task });
-    match call_peer_json(&state, &peer, "planning.find_agents", &body).await {
+    match call_peer_json(&state, &peer, "planning.find_agents", &body, None).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -163,7 +210,7 @@ pub async fn validate_spec(
     }
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({ "spec": req.spec });
-    match call_peer_json(&state, &peer, "planning.validate_spec", &body).await {
+    match call_peer_json(&state, &peer, "planning.validate_spec", &body, None).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -180,7 +227,15 @@ pub async fn orchestrator_status(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
-    match call_peer_json(&state, &peer, "planning.orchestrator_status", &Value::Null).await {
+    match call_peer_json(
+        &state,
+        &peer,
+        "planning.orchestrator_status",
+        &Value::Null,
+        None,
+    )
+    .await
+    {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -195,14 +250,51 @@ pub async fn approve_plan(
     if req.plan_id.trim().is_empty() {
         return bad_request("plan_id is required");
     }
+    let task_id = match clean_optional_id(req.task_id.as_deref(), "task_id") {
+        Ok(id) => id,
+        Err(e) => return bad_request(&e),
+    };
+    let run_id = clean_optional(req.run_id.as_deref());
+    let detail = decide_plan_detail(&req);
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({
         "plan_id": req.plan_id,
         "note": req.note,
     });
-    match call_peer_json(&state, &peer, "planning.approve_plan", &body).await {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(resp) => resp,
+    match call_peer_json(
+        &state,
+        &peer,
+        "planning.approve_plan",
+        &body,
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(mut v) => {
+            attach_scope(&mut v, task_id.as_deref(), run_id.as_deref());
+            record_planning_activity(
+                &state,
+                &peer,
+                "planning.approve_plan",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "ok",
+                &detail,
+            );
+            (StatusCode::OK, Json(v)).into_response()
+        }
+        Err(resp) => {
+            record_planning_activity(
+                &state,
+                &peer,
+                "planning.approve_plan",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "err",
+                &detail,
+            );
+            resp
+        }
     }
 }
 
@@ -215,14 +307,51 @@ pub async fn reject_plan(
     if req.plan_id.trim().is_empty() {
         return bad_request("plan_id is required");
     }
+    let task_id = match clean_optional_id(req.task_id.as_deref(), "task_id") {
+        Ok(id) => id,
+        Err(e) => return bad_request(&e),
+    };
+    let run_id = clean_optional(req.run_id.as_deref());
+    let detail = decide_plan_detail(&req);
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({
         "plan_id": req.plan_id,
         "note": req.note,
     });
-    match call_peer_json(&state, &peer, "planning.reject_plan", &body).await {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(resp) => resp,
+    match call_peer_json(
+        &state,
+        &peer,
+        "planning.reject_plan",
+        &body,
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(mut v) => {
+            attach_scope(&mut v, task_id.as_deref(), run_id.as_deref());
+            record_planning_activity(
+                &state,
+                &peer,
+                "planning.reject_plan",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "ok",
+                &detail,
+            );
+            (StatusCode::OK, Json(v)).into_response()
+        }
+        Err(resp) => {
+            record_planning_activity(
+                &state,
+                &peer,
+                "planning.reject_plan",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "err",
+                &detail,
+            );
+            resp
+        }
     }
 }
 
@@ -242,6 +371,7 @@ pub async fn list_approvals(
         &peer,
         "planning.list_approvals",
         &Value::Object(body),
+        None,
     )
     .await
     {
@@ -262,7 +392,7 @@ pub async fn get_approval(
     }
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({ "plan_id": plan_id });
-    match call_peer_json(&state, &peer, "planning.get_approval", &body).await {
+    match call_peer_json(&state, &peer, "planning.get_approval", &body, None).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -280,7 +410,7 @@ pub async fn verification_log(
     }
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({ "plan_id": plan_id });
-    match call_peer_json(&state, &peer, "planning.verification_log", &body).await {
+    match call_peer_json(&state, &peer, "planning.verification_log", &body, None).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -309,7 +439,7 @@ pub async fn export_spec(
         "plan_id": plan_id,
         "format": format,
     });
-    match call_peer_json(&state, &peer, "planning.export_spec", &body).await {
+    match call_peer_json(&state, &peer, "planning.export_spec", &body, None).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -369,7 +499,7 @@ pub async fn verification_stream(
                 );
                 break;
             }
-            match call_peer_json(&state, &peer, "planning.verification_log", &body).await {
+            match call_peer_json(&state, &peer, "planning.verification_log", &body, None).await {
                 Ok(v) => {
                     let entries = v
                         .get("entries")
@@ -438,11 +568,100 @@ fn unavailable(method: &str) -> Value {
     })
 }
 
+fn clean_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn clean_optional_id(value: Option<&str>, field: &str) -> Result<Option<String>, String> {
+    let Some(clean) = clean_optional(value) else {
+        return Ok(None);
+    };
+    if clean.len() == 32 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(Some(clean))
+    } else {
+        Err(format!("{field} must be 32 hex chars"))
+    }
+}
+
+fn attach_scope(value: &mut Value, task_id: Option<&str>, run_id: Option<&str>) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(task_id) = task_id {
+        obj.insert("task_id".into(), Value::String(task_id.to_string()));
+    }
+    if let Some(run_id) = run_id {
+        obj.insert("run_id".into(), Value::String(run_id.to_string()));
+    }
+}
+
+fn create_plan_detail(req: &CreatePlanRequest) -> String {
+    format!(
+        "spec_len={}; max_agents={}; dry_run={}",
+        req.spec.len(),
+        req.max_agents
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "none".into()),
+        req.dry_run
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "none".into())
+    )
+}
+
+fn decide_plan_detail(req: &DecidePlanRequest) -> String {
+    format!(
+        "plan_id={}; note_len={}",
+        req.plan_id.trim(),
+        req.note.as_deref().map(str::len).unwrap_or(0)
+    )
+}
+
+fn record_planning_activity(
+    state: &AppState,
+    peer: &str,
+    method: &str,
+    task_id: Option<&str>,
+    run_id: Option<&str>,
+    decision: &str,
+    detail: &str,
+) {
+    let tenant_id = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    let actor = current_subject().unwrap_or_else(|| "planning".into());
+    if let Err(e) = append_tool_invocation_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        ToolInvocationActivity {
+            tenant_id: &tenant_id,
+            actor: &actor,
+            peer,
+            method,
+            task_id,
+            run_id,
+            decision,
+            detail,
+        },
+    ) {
+        tracing::warn!(error = %e, method, "failed to append planning activity");
+    }
+    if let (Some(rec), Some(task_id)) = (state.task_recorder.as_ref(), task_id) {
+        let payload = format!("peer={peer} outcome={decision} {detail}");
+        let rec = rec.clone();
+        let task_id = task_id.to_string();
+        let event_type = method.to_string();
+        tokio::spawn(async move {
+            rec.event(&task_id, &event_type, &payload).await;
+        });
+    }
+}
+
 async fn call_peer_json(
     state: &AppState,
     alias: &str,
     method: &str,
     args: &Value,
+    task_id: Option<&str>,
 ) -> Result<Value, axum::response::Response> {
     use axum::response::IntoResponse;
     let mesh = match state.mesh_client.as_ref() {
@@ -477,7 +696,7 @@ async fn call_peer_json(
         deadline_secs,
         None,
         None,
-        None,
+        task_id.map(str::to_string),
         crate::tenant::current_tenant_or_none(),
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
@@ -567,11 +786,79 @@ mod tests {
 
     #[test]
     fn create_plan_request_decodes_full_body() {
-        let r: CreatePlanRequest =
-            serde_json::from_str(r#"{"spec":"do X","max_agents":5,"dry_run":true,"peer":"alt"}"#)
-                .expect("parse");
+        let r: CreatePlanRequest = serde_json::from_str(
+            r#"{
+                "spec":"do X",
+                "max_agents":5,
+                "dry_run":true,
+                "peer":"alt",
+                "task_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "run_id":"run-1"
+            }"#,
+        )
+        .expect("parse");
         assert_eq!(r.max_agents, Some(5));
         assert_eq!(r.dry_run, Some(true));
         assert_eq!(r.peer.as_deref(), Some("alt"));
+        assert_eq!(
+            r.task_id.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(r.run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn planning_detail_does_not_copy_spec_or_operator_note() {
+        let create = CreatePlanRequest {
+            spec: "secret product launch plan".into(),
+            max_agents: Some(3),
+            dry_run: Some(false),
+            peer: None,
+            task_id: None,
+            run_id: None,
+        };
+        let detail = create_plan_detail(&create);
+        assert!(detail.contains("spec_len=26"));
+        assert!(!detail.contains("secret product launch plan"));
+
+        let decide = DecidePlanRequest {
+            plan_id: "plan-1".into(),
+            note: Some("do not log this operator note".into()),
+            peer: None,
+            task_id: None,
+            run_id: None,
+        };
+        let detail = decide_plan_detail(&decide);
+        assert!(detail.contains("plan_id=plan-1"));
+        assert!(detail.contains("note_len=29"));
+        assert!(!detail.contains("do not log this operator note"));
+    }
+
+    #[test]
+    fn attach_scope_only_mutates_object_responses() {
+        let mut value = serde_json::json!({ "plan_id": "plan-1" });
+        attach_scope(
+            &mut value,
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Some("run-1"),
+        );
+        assert_eq!(value["task_id"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(value["run_id"], "run-1");
+
+        let mut scalar = serde_json::json!("ok");
+        attach_scope(&mut scalar, Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), None);
+        assert_eq!(scalar, serde_json::json!("ok"));
+    }
+
+    #[test]
+    fn clean_optional_id_rejects_invalid_task_id() {
+        assert_eq!(
+            clean_optional_id(Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "task_id")
+                .unwrap()
+                .as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert!(clean_optional_id(Some("bad"), "task_id").is_err());
+        assert_eq!(clean_optional_id(Some(" "), "task_id").unwrap(), None);
     }
 }

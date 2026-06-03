@@ -26,7 +26,9 @@ use serde_json::Value;
 use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
+use crate::activity::{ToolInvocationActivity, append_tool_invocation_activity};
 use crate::config::AppState;
+use crate::tenant::{DEFAULT_TENANT, current_subject};
 
 const DEFAULT_PEER: &str = "coordinator";
 
@@ -126,6 +128,11 @@ pub struct AgentDetail {
     pub allow_sensitivity_tags: Vec<String>,
     pub deny_sensitivity_tags: Vec<String>,
     pub approval_required_categories: Vec<String>,
+    pub rig: Option<String>,
+    pub monthly_allowance_cents: Option<i64>,
+    pub max_concurrent_runs: i64,
+    pub wake_on_timer: bool,
+    pub wake_on_demand: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -156,11 +163,25 @@ pub struct UpdateAgentRequest {
     pub approval_required_categories: Option<String>,
     #[serde(default)]
     pub approval_timeout_secs: Option<i64>,
+    #[serde(default)]
+    pub rig: Option<String>,
+    #[serde(default)]
+    pub monthly_allowance_cents: Option<i64>,
+    #[serde(default)]
+    pub max_concurrent_runs: Option<i64>,
+    #[serde(default)]
+    pub wake_on_timer: Option<bool>,
+    #[serde(default)]
+    pub wake_on_demand: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct OkResponse {
     pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 pub async fn list_agents(
@@ -227,20 +248,14 @@ pub async fn issue_agent_token(
             error: format!("agent.get returned an unparseable body: {detail_body:?}"),
         }),
     ))?;
-    let token = try_issue_agent_token(
-        &state,
-        &agent_id,
-        &detail.name,
-        &req.scopes,
-        req.ttl_secs,
-    )
-    .await
-    .ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(ApiError {
-            error: "identity.issue_token capability is not available on this deployment".into(),
-        }),
-    ))?;
+    let token = try_issue_agent_token(&state, &agent_id, &detail.name, &req.scopes, req.ttl_secs)
+        .await
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError {
+                error: "identity.issue_token capability is not available on this deployment".into(),
+            }),
+        ))?;
     Ok(Json(AgentTokenResponse { agent_id, token }))
 }
 
@@ -317,6 +332,21 @@ pub async fn update_agent(
     if let Some(v) = req.approval_timeout_secs {
         commits.push(("approval_timeout_secs".into(), v.to_string()));
     }
+    if let Some(v) = req.rig {
+        commits.push(("rig".into(), v));
+    }
+    if let Some(v) = req.monthly_allowance_cents {
+        commits.push(("monthly_allowance_cents".into(), v.to_string()));
+    }
+    if let Some(v) = req.max_concurrent_runs {
+        commits.push(("max_concurrent_runs".into(), v.to_string()));
+    }
+    if let Some(v) = req.wake_on_timer {
+        commits.push(("wake_on_timer".into(), v.to_string()));
+    }
+    if let Some(v) = req.wake_on_demand {
+        commits.push(("wake_on_demand".into(), v.to_string()));
+    }
 
     if commits.is_empty() {
         return Err(bad("at least one updatable field required".into()));
@@ -327,7 +357,11 @@ pub async fn update_agent(
         applied = true;
     }
     let _ = applied;
-    Ok(Json(OkResponse { ok: true }))
+    Ok(Json(OkResponse {
+        ok: true,
+        task_id: None,
+        run_id: None,
+    }))
 }
 
 pub async fn delete_agent(
@@ -335,7 +369,11 @@ pub async fn delete_agent(
     Path(agent_id): Path<String>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<ApiError>)> {
     let _ = call_peer_string(&state, DEFAULT_PEER, "agent.delete", agent_id.as_bytes()).await?;
-    Ok(Json(OkResponse { ok: true }))
+    Ok(Json(OkResponse {
+        ok: true,
+        task_id: None,
+        run_id: None,
+    }))
 }
 
 // ── Approvals ────────────────────────────────────────────
@@ -420,8 +458,17 @@ pub struct StandingRow {
     pub standing_id: String,
     pub match_category: String,
     pub match_path_glob: Option<String>,
+    pub scope_kind: String,
+    pub task_id: Option<String>,
+    pub session_id: Option<String>,
+    pub method_prefix: Option<String>,
+    pub workspace_path_glob: Option<String>,
     pub expires_at: i64,
     pub granted_by: String,
+    pub max_calls: Option<i64>,
+    pub calls_used: i64,
+    pub max_cost_micros: Option<i64>,
+    pub cost_used_micros: i64,
     pub note: String,
 }
 
@@ -441,11 +488,56 @@ pub struct StandingCreateRequest {
     pub note: Option<String>,
     #[serde(default)]
     pub path_glob: Option<String>,
+    #[serde(default)]
+    pub scope_kind: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub method_prefix: Option<String>,
+    #[serde(default)]
+    pub workspace_path_glob: Option<String>,
+    #[serde(default)]
+    pub max_calls: Option<i64>,
+    #[serde(default)]
+    pub max_cost_micros: Option<i64>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct StandingCreateForward<'a> {
+    agent_id: &'a str,
+    category: &'a str,
+    expires_at: i64,
+    granted_by: &'a str,
+    note: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path_glob: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method_prefix: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_path_glob: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_calls: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_cost_micros: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct StandingCreateResponse {
     pub standing_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 pub async fn list_standing(
@@ -475,37 +567,151 @@ pub async fn create_standing(
     if req.expires_at <= 0 {
         return Err(bad("expires_at must be a positive unix timestamp".into()));
     }
-    let granted_by = req.granted_by.unwrap_or_else(|| "operator".to_string());
-    let note = req.note.unwrap_or_default();
-    let path_glob = req.path_glob.unwrap_or_default();
-    let arg = format!(
-        "{agent_id}|{}|{}|{granted_by}|{note}|{path_glob}",
-        req.category, req.expires_at
+    if req.max_calls.is_some_and(|n| n <= 0) {
+        return Err(bad("max_calls must be positive when provided".into()));
+    }
+    if req.max_cost_micros.is_some_and(|n| n <= 0) {
+        return Err(bad("max_cost_micros must be positive when provided".into()));
+    }
+    let task_id = clean_optional(req.task_id.as_deref());
+    let run_id = clean_optional(req.run_id.as_deref());
+    let detail = standing_create_detail(
+        &agent_id,
+        &req,
+        req.note.as_ref().map(|s| s.len()).unwrap_or_default(),
     );
-    let body = call_peer_string(
+    let granted_by = req
+        .granted_by
+        .clone()
+        .unwrap_or_else(|| "operator".to_string());
+    let note = req.note.clone().unwrap_or_default();
+    let forward = StandingCreateForward {
+        agent_id: &agent_id,
+        category: &req.category,
+        expires_at: req.expires_at,
+        granted_by: &granted_by,
+        note: &note,
+        path_glob: req.path_glob.as_deref(),
+        scope_kind: req.scope_kind.as_deref(),
+        task_id: req.task_id.as_deref(),
+        session_id: req.session_id.as_deref(),
+        method_prefix: req.method_prefix.as_deref(),
+        workspace_path_glob: req.workspace_path_glob.as_deref(),
+        max_calls: req.max_calls,
+        max_cost_micros: req.max_cost_micros,
+    };
+    let arg = serde_json::to_vec(&forward).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("standing approval encode failed: {e}"),
+            }),
+        )
+    })?;
+    let body = match call_peer_string_scoped(
         &state,
         DEFAULT_PEER,
         "agent.standing_approval.create",
-        arg.as_bytes(),
+        &arg,
+        task_id.as_deref(),
     )
-    .await?;
+    .await
+    {
+        Ok(body) => {
+            record_standing_activity(
+                &state,
+                StandingActivity {
+                    actor: &granted_by,
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "agent.standing_approval.create",
+                    decision: "ok",
+                    detail: &detail,
+                },
+            );
+            body
+        }
+        Err(err) => {
+            record_standing_activity(
+                &state,
+                StandingActivity {
+                    actor: &granted_by,
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "agent.standing_approval.create",
+                    decision: "err",
+                    detail: &detail,
+                },
+            );
+            return Err(err);
+        }
+    };
     Ok(Json(StandingCreateResponse {
         standing_id: body.trim().to_string(),
+        task_id,
+        run_id,
     }))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ScopeQuery {
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 pub async fn revoke_standing(
     State(state): State<AppState>,
     Path(standing_id): Path<String>,
+    Query(q): Query<ScopeQuery>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<ApiError>)> {
-    let _ = call_peer_string(
+    let task_id = clean_optional(q.task_id.as_deref());
+    let run_id = clean_optional(q.run_id.as_deref());
+    let detail = standing_revoke_detail(&standing_id);
+    let actor = current_subject().unwrap_or_else(|| "operator".to_string());
+    match call_peer_string_scoped(
         &state,
         DEFAULT_PEER,
         "agent.standing_approval.revoke",
         standing_id.as_bytes(),
+        task_id.as_deref(),
     )
-    .await?;
-    Ok(Json(OkResponse { ok: true }))
+    .await
+    {
+        Ok(_) => {
+            record_standing_activity(
+                &state,
+                StandingActivity {
+                    actor: &actor,
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "agent.standing_approval.revoke",
+                    decision: "ok",
+                    detail: &detail,
+                },
+            );
+            Ok(Json(OkResponse {
+                ok: true,
+                task_id,
+                run_id,
+            }))
+        }
+        Err(err) => {
+            record_standing_activity(
+                &state,
+                StandingActivity {
+                    actor: &actor,
+                    task_id: task_id.as_deref(),
+                    run_id: run_id.as_deref(),
+                    method: "agent.standing_approval.revoke",
+                    decision: "err",
+                    detail: &detail,
+                },
+            );
+            Err(err)
+        }
+    }
 }
 
 // ── Parsers ──────────────────────────────────────────────
@@ -554,6 +760,11 @@ pub fn parse_agent_detail(body: &str) -> Option<AgentDetail> {
         allow_sensitivity_tags: vec![],
         deny_sensitivity_tags: vec![],
         approval_required_categories: vec![],
+        rig: None,
+        monthly_allowance_cents: None,
+        max_concurrent_runs: 20,
+        wake_on_timer: true,
+        wake_on_demand: true,
     };
     for kv in trimmed.split('|') {
         let (k, v) = kv.split_once('=')?;
@@ -577,6 +788,11 @@ pub fn parse_agent_detail(body: &str) -> Option<AgentDetail> {
             "allow_sensitivity_tags" => out.allow_sensitivity_tags = parse_csv(v),
             "deny_sensitivity_tags" => out.deny_sensitivity_tags = parse_csv(v),
             "approval_required_categories" => out.approval_required_categories = parse_csv(v),
+            "rig" => out.rig = opt_string(v),
+            "monthly_allowance_cents" => out.monthly_allowance_cents = v.trim().parse().ok(),
+            "max_concurrent_runs" => out.max_concurrent_runs = v.trim().parse().ok()?,
+            "wake_on_timer" => out.wake_on_timer = parse_bool_wire(v)?,
+            "wake_on_demand" => out.wake_on_demand = parse_bool_wire(v)?,
             _ => {}
         }
     }
@@ -606,24 +822,90 @@ pub fn parse_standing_body(body: &str) -> Vec<StandingRow> {
     body.lines()
         .filter(|line| !line.starts_with("count=") && !line.trim().is_empty())
         .filter_map(|line| {
-            let cols: Vec<&str> = line.splitn(6, '\t').collect();
-            if cols.len() != 6 {
+            let cols: Vec<&str> = line.splitn(15, '\t').collect();
+            if cols.len() == 6 {
+                return Some(StandingRow {
+                    standing_id: cols[0].into(),
+                    match_category: cols[1].into(),
+                    match_path_glob: opt_string(cols[2]),
+                    scope_kind: "agent_category".into(),
+                    task_id: None,
+                    session_id: None,
+                    method_prefix: None,
+                    workspace_path_glob: None,
+                    expires_at: cols[3].parse().ok()?,
+                    granted_by: cols[4].into(),
+                    max_calls: None,
+                    calls_used: 0,
+                    max_cost_micros: None,
+                    cost_used_micros: 0,
+                    note: cols[5].into(),
+                });
+            }
+            if cols.len() == 11 {
+                return Some(StandingRow {
+                    standing_id: cols[0].into(),
+                    match_category: cols[1].into(),
+                    match_path_glob: opt_string(cols[2]),
+                    scope_kind: cols[3].into(),
+                    task_id: opt_string(cols[4]),
+                    session_id: opt_string(cols[5]),
+                    method_prefix: opt_string(cols[6]),
+                    workspace_path_glob: opt_string(cols[7]),
+                    expires_at: cols[8].parse().ok()?,
+                    granted_by: cols[9].into(),
+                    max_calls: None,
+                    calls_used: 0,
+                    max_cost_micros: None,
+                    cost_used_micros: 0,
+                    note: cols[10].into(),
+                });
+            }
+            if cols.len() == 13 {
+                return Some(StandingRow {
+                    standing_id: cols[0].into(),
+                    match_category: cols[1].into(),
+                    match_path_glob: opt_string(cols[2]),
+                    scope_kind: cols[3].into(),
+                    task_id: opt_string(cols[4]),
+                    session_id: opt_string(cols[5]),
+                    method_prefix: opt_string(cols[6]),
+                    workspace_path_glob: opt_string(cols[7]),
+                    expires_at: cols[8].parse().ok()?,
+                    granted_by: cols[9].into(),
+                    max_calls: cols[10].parse().ok(),
+                    calls_used: cols[11].parse().ok()?,
+                    max_cost_micros: None,
+                    cost_used_micros: 0,
+                    note: cols[12].into(),
+                });
+            }
+            if cols.len() != 15 {
                 return None;
             }
             Some(StandingRow {
                 standing_id: cols[0].into(),
                 match_category: cols[1].into(),
-                match_path_glob: if cols[2].is_empty() {
-                    None
-                } else {
-                    Some(cols[2].into())
-                },
-                expires_at: cols[3].parse().ok()?,
-                granted_by: cols[4].into(),
-                note: cols[5].into(),
+                match_path_glob: opt_string(cols[2]),
+                scope_kind: cols[3].into(),
+                task_id: opt_string(cols[4]),
+                session_id: opt_string(cols[5]),
+                method_prefix: opt_string(cols[6]),
+                workspace_path_glob: opt_string(cols[7]),
+                expires_at: cols[8].parse().ok()?,
+                granted_by: cols[9].into(),
+                max_calls: cols[10].parse().ok(),
+                calls_used: cols[11].parse().ok()?,
+                max_cost_micros: cols[12].parse().ok(),
+                cost_used_micros: cols[13].parse().ok()?,
+                note: cols[14].into(),
             })
         })
         .collect()
+}
+
+fn opt_string(s: &str) -> Option<String> {
+    if s.is_empty() { None } else { Some(s.into()) }
 }
 
 fn parse_csv(s: &str) -> Vec<String> {
@@ -638,6 +920,14 @@ fn parse_csv(s: &str) -> Vec<String> {
 
 // ── Helpers (shared with cron / delegate) ────────────────
 
+fn parse_bool_wire(s: &str) -> Option<bool> {
+    match s.trim() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 fn require_field(v: &Option<String>, name: &str) -> Result<String, (StatusCode, Json<ApiError>)> {
     let s = v.as_deref().unwrap_or("").trim();
     if s.is_empty() {
@@ -650,11 +940,82 @@ fn bad(msg: String) -> (StatusCode, Json<ApiError>) {
     (StatusCode::BAD_REQUEST, Json(ApiError { error: msg }))
 }
 
+fn clean_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn standing_create_detail(agent_id: &str, req: &StandingCreateRequest, note_len: usize) -> String {
+    format!(
+        "agent_id={agent_id}; category={}; scope_kind={}; expires_at={}; max_calls={}; max_cost_micros={}; note_len={note_len}",
+        req.category,
+        req.scope_kind.as_deref().unwrap_or("agent_category"),
+        req.expires_at,
+        req.max_calls
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into()),
+        req.max_cost_micros
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into())
+    )
+}
+
+fn standing_revoke_detail(standing_id: &str) -> String {
+    format!("standing_id={standing_id}")
+}
+
+struct StandingActivity<'a> {
+    actor: &'a str,
+    task_id: Option<&'a str>,
+    run_id: Option<&'a str>,
+    method: &'a str,
+    decision: &'a str,
+    detail: &'a str,
+}
+
+fn record_standing_activity(state: &AppState, activity: StandingActivity<'_>) {
+    let tenant_id = crate::tenant::current_tenant_or_none()
+        .as_deref()
+        .unwrap_or(DEFAULT_TENANT)
+        .to_string();
+    if let Err(e) = append_tool_invocation_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        ToolInvocationActivity {
+            tenant_id: &tenant_id,
+            actor: activity.actor,
+            peer: DEFAULT_PEER,
+            method: activity.method,
+            task_id: activity.task_id,
+            run_id: activity.run_id,
+            decision: activity.decision,
+            detail: activity.detail,
+        },
+    ) {
+        tracing::warn!(
+            error = %e,
+            method = activity.method,
+            "failed to append standing approval activity"
+        );
+    }
+}
+
 async fn call_peer_string(
     state: &AppState,
     alias: &str,
     method: &str,
     arg: &[u8],
+) -> Result<String, (StatusCode, Json<ApiError>)> {
+    call_peer_string_scoped(state, alias, method, arg, None).await
+}
+
+async fn call_peer_string_scoped(
+    state: &AppState,
+    alias: &str,
+    method: &str,
+    arg: &[u8],
+    task_id: Option<&str>,
 ) -> Result<String, (StatusCode, Json<ApiError>)> {
     let mesh = state.mesh_client.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -670,7 +1031,7 @@ async fn call_peer_string(
         deadline_secs,
         None,
         None,
-        None,
+        task_id.map(str::to_string),
         crate::tenant::current_tenant_or_none(),
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
@@ -747,9 +1108,14 @@ async fn try_issue_agent_token(
     if let Some(ttl) = ttl_secs {
         body.insert("ttl_secs".into(), Value::from(ttl));
     }
-    let resp = call_peer_json(state, DEFAULT_PEER, "identity.issue_token", &Value::Object(body))
-        .await
-        .ok()?;
+    let resp = call_peer_json(
+        state,
+        DEFAULT_PEER,
+        "identity.issue_token",
+        &Value::Object(body),
+    )
+    .await
+    .ok()?;
     resp.get("wire")
         .and_then(Value::as_str)
         .map(|s| s.to_string())
@@ -868,12 +1234,17 @@ mod tests {
 
     #[test]
     fn parse_agent_detail_round_trips_every_field() {
-        let body = "agent_id=id1|name=Alice|role=research|title=Junior|department=rd|team=ops|created_by=alice|status=active|subject_id=subj-1|risk_ceiling=medium|approval_timeout_secs=86400|created_at=100|updated_at=200|surface_allowlist=telegram,openwebui|allow_categories=browser,fetch|deny_categories=payments|allow_sensitivity_tags=|deny_sensitivity_tags=credentials:read|approval_required_categories=payments,production_deploy\n";
+        let body = "agent_id=id1|name=Alice|role=research|title=Junior|department=rd|team=ops|created_by=alice|status=active|subject_id=subj-1|risk_ceiling=medium|approval_timeout_secs=86400|created_at=100|updated_at=200|surface_allowlist=telegram,openwebui|allow_categories=browser,fetch|deny_categories=payments|allow_sensitivity_tags=|deny_sensitivity_tags=credentials:read|approval_required_categories=payments,production_deploy|rig=codex|monthly_allowance_cents=25000|max_concurrent_runs=3|wake_on_timer=false|wake_on_demand=true\n";
         let d = parse_agent_detail(body).unwrap();
         assert_eq!(d.agent_id, "id1");
         assert_eq!(d.allow_categories, vec!["browser", "fetch"]);
         assert_eq!(d.deny_sensitivity_tags, vec!["credentials:read"]);
         assert_eq!(d.surface_allowlist, vec!["telegram", "openwebui"]);
+        assert_eq!(d.rig.as_deref(), Some("codex"));
+        assert_eq!(d.monthly_allowance_cents, Some(25000));
+        assert_eq!(d.max_concurrent_runs, 3);
+        assert!(!d.wake_on_timer);
+        assert!(d.wake_on_demand);
     }
 
     #[test]
@@ -897,6 +1268,78 @@ mod tests {
     // ── CreateAgentResponse serialisation ───────────────────
 
     #[test]
+    fn parse_scoped_standing_returns_scope_fields() {
+        let body = "std-1\tbrowser\t\tmethod_prefix\t\t\ttool.web_read\t\t9999\talice\tread-only\ncount=1\n";
+        let v = parse_standing_body(body);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].scope_kind, "method_prefix");
+        assert_eq!(v[0].method_prefix.as_deref(), Some("tool.web_read"));
+        assert_eq!(v[0].expires_at, 9999);
+    }
+
+    #[test]
+    fn parse_budgeted_standing_returns_call_and_cost_bounds() {
+        let body = "std-1\tpayments\t\tagent_category\t\t\t\t\t9999\talice\t2\t1\t20000\t10000\tone paid call\ncount=1\n";
+        let v = parse_standing_body(body);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].max_calls, Some(2));
+        assert_eq!(v[0].calls_used, 1);
+        assert_eq!(v[0].max_cost_micros, Some(20_000));
+        assert_eq!(v[0].cost_used_micros, 10_000);
+        assert_eq!(v[0].note, "one paid call");
+    }
+
+    #[test]
+    fn standing_create_detail_does_not_copy_operator_note() {
+        let req = StandingCreateRequest {
+            category: "payments".into(),
+            expires_at: 9999,
+            granted_by: Some("alice".into()),
+            note: Some("sensitive operator reason".into()),
+            path_glob: None,
+            scope_kind: Some("task".into()),
+            task_id: Some("0123456789abcdef0123456789abcdef".into()),
+            session_id: None,
+            method_prefix: None,
+            workspace_path_glob: None,
+            max_calls: Some(2),
+            max_cost_micros: Some(20_000),
+            run_id: Some("run-1".into()),
+        };
+        let detail = standing_create_detail("agt-1", &req, req.note.as_ref().unwrap().len());
+        assert!(detail.contains("agent_id=agt-1"));
+        assert!(detail.contains("category=payments"));
+        assert!(detail.contains("scope_kind=task"));
+        assert!(detail.contains("max_calls=2"));
+        assert!(detail.contains("max_cost_micros=20000"));
+        assert!(detail.contains("note_len=25"));
+        assert!(!detail.contains("sensitive operator reason"));
+    }
+
+    #[test]
+    fn standing_create_response_can_echo_scope_context() {
+        let value = serde_json::to_value(StandingCreateResponse {
+            standing_id: "std_1".into(),
+            task_id: Some("0123456789abcdef0123456789abcdef".into()),
+            run_id: Some("run-1".into()),
+        })
+        .unwrap();
+        assert_eq!(value["standing_id"], "std_1");
+        assert_eq!(value["task_id"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(value["run_id"], "run-1");
+    }
+
+    #[test]
+    fn parse_bounded_standing_returns_call_limits() {
+        let body = "std-1\tbrowser\t\tmethod_prefix\t\t\ttool.web_read\t\t9999\talice\t5\t2\tread-only\ncount=1\n";
+        let v = parse_standing_body(body);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].max_calls, Some(5));
+        assert_eq!(v[0].calls_used, 2);
+        assert_eq!(v[0].note, "read-only");
+    }
+
+    #[test]
     fn create_agent_response_omits_token_when_none() {
         let resp = CreateAgentResponse {
             agent_id: "agt_x_123".into(),
@@ -904,7 +1347,10 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"agent_id\":\"agt_x_123\""));
-        assert!(!json.contains("token"), "token field must be absent when None");
+        assert!(
+            !json.contains("token"),
+            "token field must be absent when None"
+        );
     }
 
     #[test]

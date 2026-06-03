@@ -428,22 +428,28 @@ EOF
 case "$PROVIDER" in
     openai)
         url="${BASE_URL:-https://api.openai.com/v1}"
+        # RELIX_AI_MODEL (set from config by `relix boot`, or exported by
+        # hand) picks the model; otherwise the provider default stands.
+        model="${RELIX_AI_MODEL:-gpt-4o-mini}"
         cat >> "$AI_CONFIG" <<EOF
 
 [ai.providers.openai]
 base_url      = "$url"
 api_key_env   = "OPENAI_API_KEY"
-default_model = "gpt-4o-mini"
+default_model = "$model"
 EOF
         ;;
     openrouter)
         url="${BASE_URL:-https://openrouter.ai/api/v1}"
+        # Default to a $0 free model so chat works out of the box without
+        # burning credits; RELIX_AI_MODEL overrides it. See RELA-45.
+        model="${RELIX_AI_MODEL:-openai/gpt-oss-120b:free}"
         cat >> "$AI_CONFIG" <<EOF
 
 [ai.providers.openrouter]
 base_url      = "$url"
 api_key_env   = "OPENROUTER_API_KEY"
-default_model = "openai/gpt-4o-mini"
+default_model = "$model"
 EOF
         ;;
     xai)
@@ -454,6 +460,7 @@ EOF
 base_url      = "$url"
 api_key_env   = "XAI_API_KEY"
 EOF
+        [ -n "${RELIX_AI_MODEL:-}" ] && printf 'default_model = "%s"\n' "$RELIX_AI_MODEL" >> "$AI_CONFIG"
         ;;
     local)
         url="${BASE_URL:-http://localhost:11434/v1}"
@@ -462,13 +469,15 @@ EOF
 [ai.providers.local]
 base_url      = "$url"
 EOF
+        [ -n "${RELIX_AI_MODEL:-}" ] && printf 'default_model = "%s"\n' "$RELIX_AI_MODEL" >> "$AI_CONFIG"
         ;;
     anthropic)
+        model="${RELIX_AI_MODEL:-claude-3-5-sonnet-latest}"
         cat >> "$AI_CONFIG" <<EOF
 
 [ai.providers.anthropic]
 api_key_env   = "ANTHROPIC_API_KEY"
-default_model = "claude-3-5-sonnet-latest"
+default_model = "$model"
 EOF
         ;;
     gemini)
@@ -477,6 +486,7 @@ EOF
 [ai.providers.gemini]
 api_key_env   = "GEMINI_API_KEY"
 EOF
+        [ -n "${RELIX_AI_MODEL:-}" ] && printf 'default_model = "%s"\n' "$RELIX_AI_MODEL" >> "$AI_CONFIG"
         ;;
     mock)
         ;; # no tail

@@ -308,6 +308,7 @@ async fn legacy_token_full_stack_real_controller_real_bridge_real_http() {
         &mut bridge,
         agent_store.clone(),
         task_store.clone(),
+        None,
         300,
         clock.clone(),
         descriptor_cache,

@@ -27,7 +27,9 @@ use serde_json::Value;
 use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
+use crate::activity::{ToolInvocationActivity, append_tool_invocation_activity};
 use crate::config::AppState;
+use crate::tenant::{DEFAULT_TENANT, current_subject, current_tenant};
 
 const DEFAULT_PEER: &str = "memory";
 
@@ -51,6 +53,10 @@ pub struct ShareRequest {
     pub message: Option<String>,
     #[serde(default)]
     pub peer: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 /// `POST /v1/knowledge/share`
@@ -68,6 +74,12 @@ pub async fn share(
     if req.observation_ids.is_empty() {
         return bad_request("observation_ids must list at least one id");
     }
+    let task_id = match clean_optional_id(req.task_id.as_deref(), "task_id") {
+        Ok(id) => id,
+        Err(e) => return bad_request(&e),
+    };
+    let run_id = clean_optional(req.run_id.as_deref());
+    let detail = share_detail(&req);
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let mut body = serde_json::Map::new();
     body.insert("source_agent".into(), Value::from(req.source_agent));
@@ -76,9 +88,40 @@ pub async fn share(
     if let Some(m) = req.message {
         body.insert("message".into(), Value::from(m));
     }
-    match call_peer_json(&state, &peer, "knowledge.share", &Value::Object(body)).await {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(resp) => resp,
+    match call_peer_json(
+        &state,
+        &peer,
+        "knowledge.share",
+        &Value::Object(body),
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(mut v) => {
+            attach_scope(&mut v, task_id.as_deref(), run_id.as_deref());
+            record_knowledge_activity(
+                &state,
+                &peer,
+                "knowledge.share",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "ok",
+                &detail,
+            );
+            (StatusCode::OK, Json(v)).into_response()
+        }
+        Err(resp) => {
+            record_knowledge_activity(
+                &state,
+                &peer,
+                "knowledge.share",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "err",
+                &detail,
+            );
+            resp
+        }
     }
 }
 
@@ -121,7 +164,15 @@ pub async fn list_shared(
     if let Some(v) = q.min_quality_score {
         body.insert("min_quality_score".into(), Value::from(v));
     }
-    match call_peer_json(&state, &peer, "knowledge.list_shared", &Value::Object(body)).await {
+    match call_peer_json(
+        &state,
+        &peer,
+        "knowledge.list_shared",
+        &Value::Object(body),
+        None,
+    )
+    .await
+    {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -136,6 +187,10 @@ pub struct BroadcastRequest {
     pub message: Option<String>,
     #[serde(default)]
     pub peer: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 /// `POST /v1/knowledge/broadcast`
@@ -153,6 +208,12 @@ pub async fn broadcast(
     if req.observation_ids.is_empty() {
         return bad_request("observation_ids must list at least one id");
     }
+    let task_id = match clean_optional_id(req.task_id.as_deref(), "task_id") {
+        Ok(id) => id,
+        Err(e) => return bad_request(&e),
+    };
+    let run_id = clean_optional(req.run_id.as_deref());
+    let detail = broadcast_detail(&req);
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let mut body = serde_json::Map::new();
     body.insert("caller_agent".into(), Value::from(req.caller_agent));
@@ -166,11 +227,35 @@ pub async fn broadcast(
         &peer,
         "knowledge.group_broadcast",
         &Value::Object(body),
+        task_id.as_deref(),
     )
     .await
     {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(resp) => resp,
+        Ok(mut v) => {
+            attach_scope(&mut v, task_id.as_deref(), run_id.as_deref());
+            record_knowledge_activity(
+                &state,
+                &peer,
+                "knowledge.group_broadcast",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "ok",
+                &detail,
+            );
+            (StatusCode::OK, Json(v)).into_response()
+        }
+        Err(resp) => {
+            record_knowledge_activity(
+                &state,
+                &peer,
+                "knowledge.group_broadcast",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "err",
+                &detail,
+            );
+            resp
+        }
     }
 }
 
@@ -181,7 +266,7 @@ pub async fn groups(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
-    match call_peer_json(&state, &peer, "knowledge.groups", &Value::Null).await {
+    match call_peer_json(&state, &peer, "knowledge.groups", &Value::Null, None).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -192,6 +277,10 @@ pub struct RevokeRequest {
     pub observation_ids: Vec<String>,
     #[serde(default)]
     pub peer: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 /// `POST /v1/knowledge/revoke`
@@ -203,11 +292,40 @@ pub async fn revoke(
     if req.observation_ids.is_empty() {
         return bad_request("observation_ids must list at least one id");
     }
+    let task_id = match clean_optional_id(req.task_id.as_deref(), "task_id") {
+        Ok(id) => id,
+        Err(e) => return bad_request(&e),
+    };
+    let run_id = clean_optional(req.run_id.as_deref());
+    let detail = revoke_detail(&req);
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({ "observation_ids": req.observation_ids });
-    match call_peer_json(&state, &peer, "knowledge.revoke", &body).await {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(resp) => resp,
+    match call_peer_json(&state, &peer, "knowledge.revoke", &body, task_id.as_deref()).await {
+        Ok(mut v) => {
+            attach_scope(&mut v, task_id.as_deref(), run_id.as_deref());
+            record_knowledge_activity(
+                &state,
+                &peer,
+                "knowledge.revoke",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "ok",
+                &detail,
+            );
+            (StatusCode::OK, Json(v)).into_response()
+        }
+        Err(resp) => {
+            record_knowledge_activity(
+                &state,
+                &peer,
+                "knowledge.revoke",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "err",
+                &detail,
+            );
+            resp
+        }
     }
 }
 
@@ -217,6 +335,10 @@ pub struct RecallRequest {
     pub source_observation_ids: Vec<String>,
     #[serde(default)]
     pub peer: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 /// `POST /v1/knowledge/recall` — RELIX-7.16 GAP 2.
@@ -231,14 +353,43 @@ pub async fn recall(
     if req.source_observation_ids.is_empty() {
         return bad_request("source_observation_ids must list at least one id");
     }
+    let task_id = match clean_optional_id(req.task_id.as_deref(), "task_id") {
+        Ok(id) => id,
+        Err(e) => return bad_request(&e),
+    };
+    let run_id = clean_optional(req.run_id.as_deref());
+    let detail = recall_detail(&req);
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({
         "source_agent": req.source_agent,
         "source_observation_ids": req.source_observation_ids,
     });
-    match call_peer_json(&state, &peer, "knowledge.recall", &body).await {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(resp) => resp,
+    match call_peer_json(&state, &peer, "knowledge.recall", &body, task_id.as_deref()).await {
+        Ok(mut v) => {
+            attach_scope(&mut v, task_id.as_deref(), run_id.as_deref());
+            record_knowledge_activity(
+                &state,
+                &peer,
+                "knowledge.recall",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "ok",
+                &detail,
+            );
+            (StatusCode::OK, Json(v)).into_response()
+        }
+        Err(resp) => {
+            record_knowledge_activity(
+                &state,
+                &peer,
+                "knowledge.recall",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "err",
+                &detail,
+            );
+            resp
+        }
     }
 }
 
@@ -260,6 +411,7 @@ async fn call_peer_json(
     alias: &str,
     method: &str,
     args: &Value,
+    task_id: Option<&str>,
 ) -> Result<Value, axum::response::Response> {
     use axum::response::IntoResponse;
     let mesh = match state.mesh_client.as_ref() {
@@ -294,7 +446,7 @@ async fn call_peer_json(
         deadline_secs,
         None,
         None,
-        None,
+        task_id.map(str::to_string),
         crate::tenant::current_tenant_or_none(),
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
@@ -364,6 +516,105 @@ async fn call_peer_json(
     }
 }
 
+fn clean_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn clean_optional_id(value: Option<&str>, field: &str) -> Result<Option<String>, String> {
+    let Some(clean) = clean_optional(value) else {
+        return Ok(None);
+    };
+    if clean.len() == 32 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(Some(clean))
+    } else {
+        Err(format!("{field} must be 32 hex chars"))
+    }
+}
+
+fn attach_scope(value: &mut Value, task_id: Option<&str>, run_id: Option<&str>) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(task_id) = task_id {
+        obj.insert("task_id".into(), Value::String(task_id.to_string()));
+    }
+    if let Some(run_id) = run_id {
+        obj.insert("run_id".into(), Value::String(run_id.to_string()));
+    }
+}
+
+fn share_detail(req: &ShareRequest) -> String {
+    format!(
+        "source_agent={}; target_count={}; observation_count={}; message_len={}",
+        req.source_agent.trim(),
+        req.target_agents.len(),
+        req.observation_ids.len(),
+        req.message.as_deref().map(str::len).unwrap_or(0)
+    )
+}
+
+fn broadcast_detail(req: &BroadcastRequest) -> String {
+    format!(
+        "caller_agent={}; group={}; observation_count={}; message_len={}",
+        req.caller_agent.trim(),
+        req.group.trim(),
+        req.observation_ids.len(),
+        req.message.as_deref().map(str::len).unwrap_or(0)
+    )
+}
+
+fn revoke_detail(req: &RevokeRequest) -> String {
+    format!("observation_count={}", req.observation_ids.len())
+}
+
+fn recall_detail(req: &RecallRequest) -> String {
+    format!(
+        "source_agent={}; observation_count={}",
+        req.source_agent.trim(),
+        req.source_observation_ids.len()
+    )
+}
+
+fn record_knowledge_activity(
+    state: &AppState,
+    peer: &str,
+    method: &str,
+    task_id: Option<&str>,
+    run_id: Option<&str>,
+    decision: &str,
+    detail: &str,
+) {
+    let tenant_id = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    let actor = current_subject().unwrap_or_else(|| "knowledge".into());
+    if let Err(e) = append_tool_invocation_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        ToolInvocationActivity {
+            tenant_id: &tenant_id,
+            actor: &actor,
+            peer,
+            method,
+            task_id,
+            run_id,
+            decision,
+            detail,
+        },
+    ) {
+        tracing::warn!(error = %e, method, "failed to append knowledge activity");
+    }
+    if let (Some(rec), Some(task_id)) = (state.task_recorder.as_ref(), task_id) {
+        let payload = format!("peer={peer} outcome={decision} {detail}");
+        let rec = rec.clone();
+        let task_id = task_id.to_string();
+        let event_type = method.to_string();
+        tokio::spawn(async move {
+            rec.event(&task_id, &event_type, &payload).await;
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +634,74 @@ mod tests {
             parsed.get("error").and_then(Value::as_str),
             Some("source_agent is required")
         );
+    }
+
+    #[test]
+    fn knowledge_mutations_accept_scope_context() {
+        let share: ShareRequest = serde_json::from_str(
+            r#"{
+                "source_agent":"alice",
+                "target_agents":["bob"],
+                "observation_ids":["obs-1"],
+                "message":"private note",
+                "task_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "run_id":"run-1"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            share.task_id.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(share.run_id.as_deref(), Some("run-1"));
+        let detail = share_detail(&share);
+        assert!(detail.contains("message_len=12"));
+        assert!(!detail.contains("private note"));
+
+        let broadcast: BroadcastRequest = serde_json::from_str(
+            r#"{
+                "caller_agent":"alice",
+                "group":"ops",
+                "observation_ids":["obs-1"],
+                "task_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            broadcast.task_id.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(
+            broadcast_detail(&broadcast),
+            "caller_agent=alice; group=ops; observation_count=1; message_len=0"
+        );
+    }
+
+    #[test]
+    fn attach_scope_only_mutates_object_responses() {
+        let mut value = serde_json::json!({ "shared": true });
+        attach_scope(
+            &mut value,
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Some("run-1"),
+        );
+        assert_eq!(value["task_id"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(value["run_id"], "run-1");
+
+        let mut scalar = serde_json::json!("ok");
+        attach_scope(&mut scalar, Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), None);
+        assert_eq!(scalar, serde_json::json!("ok"));
+    }
+
+    #[test]
+    fn clean_optional_id_rejects_invalid_task_id() {
+        assert_eq!(
+            clean_optional_id(Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "task_id")
+                .unwrap()
+                .as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert!(clean_optional_id(Some("bad"), "task_id").is_err());
+        assert_eq!(clean_optional_id(Some(" "), "task_id").unwrap(), None);
     }
 }

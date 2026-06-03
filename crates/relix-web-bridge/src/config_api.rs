@@ -17,15 +17,17 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::activity::{ToolInvocationActivity, append_tool_invocation_activity};
 use crate::config::AppState;
 use crate::intervention_audit::new_correlation_id;
 use crate::secrets::{ALLOWED_PROVIDERS, ALLOWED_TELEGRAM_MODES, ProviderStatus, TelegramStatus};
+use crate::tenant::{DEFAULT_TENANT, current_subject, current_tenant};
 
 /// Standard error envelope.
 #[derive(Debug, Serialize)]
@@ -112,6 +114,10 @@ pub struct PutDefaultProviderReq {
     /// `None` clears the operator-marked default.
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 /// Response for `PUT /v1/config/providers/default`.
@@ -121,6 +127,10 @@ pub struct DefaultProviderResp {
     /// `true` when the change requires a controller restart
     /// to take effect.
     pub restart_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// SEC PART 4: `truncate_for_op` survived the provider-key
@@ -161,6 +171,9 @@ pub async fn put_default_provider(
     Json(req): Json<PutDefaultProviderReq>,
 ) -> Result<Json<DefaultProviderResp>, (StatusCode, Json<ApiError>)> {
     let corr = new_correlation_id();
+    let task_id = clean_optional_id(req.task_id.as_deref(), "task_id")?;
+    let run_id = clean_optional(req.run_id.as_deref());
+    let detail = provider_default_detail(req.name.as_deref());
     if let Some(name) = req.name.as_ref()
         && !ALLOWED_PROVIDERS.contains(&name.as_str())
     {
@@ -188,9 +201,19 @@ pub async fn put_default_provider(
                 "",
                 corr,
             );
+            record_config_activity(
+                &state,
+                "config.provider_default",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "ok",
+                &detail,
+            );
             Ok(Json(DefaultProviderResp {
                 default_provider: current,
                 restart_required: true,
+                task_id,
+                run_id,
             }))
         }
         Err(e) => {
@@ -203,6 +226,14 @@ pub async fn put_default_provider(
                 "error",
                 format!("persist failed: {e}"),
                 corr,
+            );
+            record_config_activity(
+                &state,
+                "config.provider_default",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "err",
+                &detail,
             );
             Err(internal(format!("persist failed: {e}")))
         }
@@ -233,6 +264,10 @@ pub struct PutTelegramReq {
     /// a secret (not redacted in responses).
     #[serde(default)]
     pub webhook_url: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 fn default_mode() -> String {
@@ -249,6 +284,10 @@ pub struct PutTelegramResp {
     /// actionable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// Result of a `POST /v1/config/telegram/test`. Same shape
@@ -267,6 +306,18 @@ pub struct TelegramTestResult {
     /// when the response shape is unexpected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ConfigScopeQuery {
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 /// `POST /v1/config/telegram/test` — validate the saved bot
@@ -279,8 +330,11 @@ pub struct TelegramTestResult {
 /// any tracing event; only the redacted detail summary does.
 pub async fn test_telegram(
     State(state): State<AppState>,
+    Query(q): Query<ConfigScopeQuery>,
 ) -> Result<Json<TelegramTestResult>, (StatusCode, Json<ApiError>)> {
     let corr = new_correlation_id();
+    let task_id = clean_optional_id(q.task_id.as_deref(), "task_id")?;
+    let run_id = clean_optional(q.run_id.as_deref());
     let token = state.secrets.read(|s| {
         s.telegram
             .as_ref()
@@ -302,6 +356,8 @@ pub async fn test_telegram(
             elapsed_ms,
             detail,
             bot_username: username,
+            task_id: task_id.clone(),
+            run_id: run_id.clone(),
         },
         Err((status_code, detail)) => TelegramTestResult {
             ok: false,
@@ -309,6 +365,8 @@ pub async fn test_telegram(
             elapsed_ms,
             detail,
             bot_username: None,
+            task_id: task_id.clone(),
+            run_id: run_id.clone(),
         },
     };
     tracing::info!(
@@ -341,6 +399,14 @@ pub async fn test_telegram(
             }
         ),
         corr,
+    );
+    record_config_activity(
+        &state,
+        "config.telegram_test",
+        task_id.as_deref(),
+        run_id.as_deref(),
+        if result.ok { "ok" } else { "err" },
+        &telegram_test_detail(&result),
     );
     Ok(Json(result))
 }
@@ -453,6 +519,9 @@ pub async fn put_telegram(
     Json(req): Json<PutTelegramReq>,
 ) -> Result<Json<PutTelegramResp>, (StatusCode, Json<ApiError>)> {
     let corr = new_correlation_id();
+    let task_id = clean_optional_id(req.task_id.as_deref(), "task_id")?;
+    let run_id = clean_optional(req.run_id.as_deref());
+    let detail = telegram_save_detail(&req);
     if req.bot_token.trim().is_empty() {
         return Err(bad_request("bot_token required (non-empty)"));
     }
@@ -543,10 +612,20 @@ pub async fn put_telegram(
                 ),
                 corr,
             );
+            record_config_activity(
+                &state,
+                "config.telegram_save",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "ok",
+                &detail,
+            );
             Ok(Json(PutTelegramResp {
                 status,
                 restart_required: true,
                 note,
+                task_id,
+                run_id,
             }))
         }
         Err(e) => {
@@ -558,12 +637,110 @@ pub async fn put_telegram(
                 format!("persist failed: {e}"),
                 corr,
             );
+            record_config_activity(
+                &state,
+                "config.telegram_save",
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "err",
+                &detail,
+            );
             Err(internal(format!("persist failed: {e}")))
         }
     }
 }
 
 // ── Effective bridge config (redacted) ──────────────────────
+
+fn clean_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn clean_optional_id(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<String>, (StatusCode, Json<ApiError>)> {
+    let Some(clean) = clean_optional(value) else {
+        return Ok(None);
+    };
+    if clean.len() == 32 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(Some(clean))
+    } else {
+        Err(bad_request(format!("{field} must be 32 hex chars")))
+    }
+}
+
+fn provider_default_detail(name: Option<&str>) -> String {
+    format!(
+        "provider={}",
+        name.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("cleared")
+    )
+}
+
+fn telegram_save_detail(req: &PutTelegramReq) -> String {
+    format!(
+        "mode={}; webhook_url_present={}",
+        req.mode.trim(),
+        req.webhook_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some()
+    )
+}
+
+fn telegram_test_detail(result: &TelegramTestResult) -> String {
+    format!(
+        "elapsed_ms={}; status_code={}; bot_username_present={}",
+        result.elapsed_ms,
+        result
+            .status_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        result.bot_username.is_some()
+    )
+}
+
+fn record_config_activity(
+    state: &AppState,
+    method: &str,
+    task_id: Option<&str>,
+    run_id: Option<&str>,
+    decision: &str,
+    detail: &str,
+) {
+    let tenant_id = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    let actor = current_subject().unwrap_or_else(|| "config".into());
+    if let Err(e) = append_tool_invocation_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        ToolInvocationActivity {
+            tenant_id: &tenant_id,
+            actor: &actor,
+            peer: "bridge",
+            method,
+            task_id,
+            run_id,
+            decision,
+            detail,
+        },
+    ) {
+        tracing::warn!(error = %e, method, "failed to append config activity");
+    }
+    if let (Some(rec), Some(task_id)) = (state.task_recorder.as_ref(), task_id) {
+        let payload = format!("peer=bridge outcome={decision} {detail}");
+        let rec = rec.clone();
+        let task_id = task_id.to_string();
+        let event_type = method.to_string();
+        tokio::spawn(async move {
+            rec.event(&task_id, &event_type, &payload).await;
+        });
+    }
+}
 
 /// Read-only redacted view of the bridge's effective config.
 /// Shape: a small subset of the bridge's runtime state for the
@@ -736,6 +913,90 @@ mod tests {
         let body = r#"{"bot_token":"1234:abc"}"#;
         let req: PutTelegramReq = serde_json::from_str(body).unwrap();
         assert_eq!(req.mode, "polling");
+    }
+
+    #[test]
+    fn config_mutation_requests_accept_scope_context() {
+        let provider: PutDefaultProviderReq = serde_json::from_str(
+            r#"{
+                "name":"openai",
+                "task_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "run_id":"run-1"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(provider.name.as_deref(), Some("openai"));
+        assert_eq!(
+            provider.task_id.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(provider.run_id.as_deref(), Some("run-1"));
+        assert_eq!(
+            provider_default_detail(provider.name.as_deref()),
+            "provider=openai"
+        );
+
+        let telegram: PutTelegramReq = serde_json::from_str(
+            r#"{
+                "bot_token":"1234:abc",
+                "mode":"webhook",
+                "webhook_url":"https://example.com/secret-hook",
+                "task_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "run_id":"run-2"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            telegram.task_id.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(telegram.run_id.as_deref(), Some("run-2"));
+        let detail = telegram_save_detail(&telegram);
+        assert_eq!(detail, "mode=webhook; webhook_url_present=true");
+        assert!(!detail.contains("1234:abc"));
+        assert!(!detail.contains("secret-hook"));
+    }
+
+    #[test]
+    fn config_scope_query_validates_task_id_shape() {
+        let q: ConfigScopeQuery = serde_json::from_str(
+            r#"{
+                "task_id":"cccccccccccccccccccccccccccccccc",
+                "run_id":"run-3"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            clean_optional_id(q.task_id.as_deref(), "task_id")
+                .unwrap()
+                .as_deref(),
+            Some("cccccccccccccccccccccccccccccccc")
+        );
+        assert_eq!(
+            clean_optional(q.run_id.as_deref()).as_deref(),
+            Some("run-3")
+        );
+        assert!(clean_optional_id(Some("not-a-task"), "task_id").is_err());
+        assert_eq!(clean_optional_id(Some(" "), "task_id").unwrap(), None);
+    }
+
+    #[test]
+    fn telegram_test_detail_does_not_copy_failure_detail() {
+        let result = TelegramTestResult {
+            ok: false,
+            status_code: Some(401),
+            elapsed_ms: 15,
+            detail: "upstream returned token-looking text /bot123:SECRET/getMe".into(),
+            bot_username: None,
+            task_id: None,
+            run_id: None,
+        };
+        let detail = telegram_test_detail(&result);
+        assert_eq!(
+            detail,
+            "elapsed_ms=15; status_code=401; bot_username_present=false"
+        );
+        assert!(!detail.contains("SECRET"));
     }
 
     #[test]

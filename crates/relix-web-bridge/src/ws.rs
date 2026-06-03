@@ -57,6 +57,8 @@ use crate::flow::{FlowExecError, execute_chat_flow};
 struct WsRequest {
     session_id: String,
     message: String,
+    #[serde(default)]
+    workspace_lease_id: Option<String>,
     /// Reserved for future per-call model override; currently
     /// informational. Provider routing lives on the AI node.
     #[serde(default)]
@@ -146,14 +148,29 @@ async fn run_ws_session(
         return;
     };
 
-    match execute_chat_flow(&state, &req.session_id, &req.message).await {
+    match execute_chat_flow(
+        &state,
+        &req.session_id,
+        &req.message,
+        req.workspace_lease_id.as_deref(),
+    )
+    .await
+    {
         Ok(outcome) => {
-            stream_reply(&mut socket, &req.session_id, &outcome.reply).await;
+            stream_reply(
+                &mut socket,
+                &req.session_id,
+                &outcome.reply,
+                outcome.workspace_lease_id.as_deref(),
+                outcome.workspace_path.as_deref(),
+            )
+            .await;
         }
         Err(e) => {
             let msg = match e {
                 FlowExecError::InvalidInput(s) => s,
                 FlowExecError::Transport(s) => format!("mesh transport: {s}"),
+                FlowExecError::Unavailable(s) => s,
                 FlowExecError::Internal(s) => s,
             };
             let payload = json!({ "type": "error", "message": msg }).to_string();
@@ -183,7 +200,13 @@ async fn read_request(socket: &mut WebSocket) -> Option<WsRequest> {
 /// frames so a human watching the dashboard sees the response
 /// appearing word-by-word. Always finishes with a `done` frame
 /// carrying the full assembled text.
-async fn stream_reply(socket: &mut WebSocket, session_id: &str, reply: &str) {
+async fn stream_reply(
+    socket: &mut WebSocket,
+    session_id: &str,
+    reply: &str,
+    workspace_lease_id: Option<&str>,
+    workspace_path: Option<&str>,
+) {
     let chunks = split_words(reply);
     for (i, chunk) in chunks.iter().enumerate() {
         if i > 0 {
@@ -202,6 +225,8 @@ async fn stream_reply(socket: &mut WebSocket, session_id: &str, reply: &str) {
         "type":       "done",
         "session_id": session_id,
         "text":       reply,
+        "workspace_lease_id": workspace_lease_id,
+        "workspace_path": workspace_path,
     })
     .to_string();
     let _ = socket.send(Message::Text(done)).await;

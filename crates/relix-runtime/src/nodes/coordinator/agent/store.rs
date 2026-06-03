@@ -62,8 +62,46 @@ pub struct AgentProfile {
     /// the gate's standard checks in force.
     #[serde(default)]
     pub profile: Option<String>,
+    /// PHASE 0 (org tree): the single agent this one reports to —
+    /// its boss. `None` for the apex (the CEO reports to the
+    /// Board/operator, which is not an agent row). This one link
+    /// turns the flat agent list into the org tree: walking it
+    /// *up* gives the escalation chain, *down* gives a manager's
+    /// subtree. Nullable; existing rows read NULL until set.
+    #[serde(default)]
+    pub reports_to: Option<String>,
+    /// PILLAR 2 (Rig): which agent backend powers this Operative —
+    /// `echo` / `hermes` / `claude` / `codex` / a remote, resolved
+    /// against the Rig registry at dispatch. `None` = the Guild
+    /// default Rig. Nullable; existing rows read NULL.
+    #[serde(default)]
+    pub rig: Option<String>,
+    /// PILLAR 2 / governance: this Operative's monthly **Allowance**
+    /// (budget) in cents. `None` = no per-agent cap. Nullable.
+    #[serde(default)]
+    pub monthly_allowance_cents: Option<i64>,
+    /// Runtime Key: max live Brief runs this Operative may own at
+    /// once. Paperclip allows high parallelism; Relix makes it a
+    /// per-agent control. Clamped 1..=50 at write time.
+    #[serde(default = "default_max_concurrent_runs")]
+    pub max_concurrent_runs: i64,
+    /// Runtime Key: may the scheduled heartbeat wake this Operative?
+    #[serde(default = "default_true")]
+    pub wake_on_timer: bool,
+    /// Runtime Key: may assignment/comment/manual triggers wake this
+    /// Operative on demand?
+    #[serde(default = "default_true")]
+    pub wake_on_demand: bool,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+fn default_max_concurrent_runs() -> i64 {
+    20
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// The default set of capability categories that require an
@@ -236,10 +274,50 @@ pub struct StandingApproval {
     pub agent_id: String,
     pub match_category: String,
     pub match_path_glob: Option<String>,
+    pub scope_kind: String,
+    pub task_id: Option<String>,
+    pub session_id: Option<String>,
+    pub method_prefix: Option<String>,
+    pub workspace_path_glob: Option<String>,
     pub expires_at: i64,
     pub granted_by: String,
+    pub max_calls: Option<i64>,
+    pub calls_used: i64,
+    pub max_cost_micros: Option<i64>,
+    pub cost_used_micros: i64,
     pub note: String,
     pub created_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandingApprovalCreate<'a> {
+    pub agent_id: &'a str,
+    pub match_category: &'a str,
+    pub match_path_glob: Option<&'a str>,
+    pub scope_kind: Option<&'a str>,
+    pub task_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub method_prefix: Option<&'a str>,
+    pub workspace_path_glob: Option<&'a str>,
+    pub expires_at: i64,
+    pub granted_by: &'a str,
+    pub max_calls: Option<i64>,
+    pub max_cost_micros: Option<i64>,
+    pub note: &'a str,
+    pub tenant_id: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandingApprovalMatch<'a> {
+    pub agent_id: &'a str,
+    pub category: &'a str,
+    pub method: &'a str,
+    pub task_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub workspace_path: Option<&'a str>,
+    pub tenant_id: Option<&'a str>,
+    pub estimated_cost_micros: i64,
+    pub now: i64,
 }
 
 /// NOT-DONE 2: one row in the `startup_tasks` ledger. Tracks
@@ -589,7 +667,9 @@ impl AgentStore {
                         allow_sensitivity_tags, deny_sensitivity_tags,
                         approval_required_categories, authorized_approvers,
                         approval_timeout_secs,
-                        created_at, updated_at, profile
+                        created_at, updated_at, profile, reports_to, rig,
+                        monthly_allowance_cents, max_concurrent_runs,
+                        wake_on_timer, wake_on_demand
                  FROM agent_profiles WHERE subject_id = ?1 AND tenant_id = ?2",
                 params![subject_id, tenant],
                 row_to_agent,
@@ -621,7 +701,9 @@ impl AgentStore {
                         allow_sensitivity_tags, deny_sensitivity_tags,
                         approval_required_categories, authorized_approvers,
                         approval_timeout_secs,
-                        created_at, updated_at, profile
+                        created_at, updated_at, profile, reports_to, rig,
+                        monthly_allowance_cents, max_concurrent_runs,
+                        wake_on_timer, wake_on_demand
                  FROM agent_profiles WHERE subject_id = ?1",
                 params![subject_id],
                 row_to_agent,
@@ -663,6 +745,178 @@ impl AgentStore {
                 .collect::<rusqlite::Result<_>>()?
         };
         Ok(rows)
+    }
+
+    /// PHASE 0 (org tree): the agents that directly report to
+    /// `manager_id` — one level down the hierarchy. Powers the
+    /// org-chart children view. Ordered oldest-first for stable
+    /// rendering.
+    pub fn list_direct_reports(
+        &self,
+        manager_id: &str,
+    ) -> Result<Vec<AgentSnapshot>, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, name, role, status, subject_id
+             FROM agent_profiles WHERE reports_to = ?1
+             ORDER BY created_at ASC",
+        )?;
+        let rows: Vec<AgentSnapshot> = stmt
+            .query_map(params![manager_id], |r| {
+                Ok(AgentSnapshot {
+                    agent_id: r.get(0)?,
+                    name: r.get(1)?,
+                    role: r.get(2)?,
+                    status: r.get(3)?,
+                    subject_id: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// PHASE 5 (staffing): the **active** Operatives whose `role`
+    /// matches — the companion's "who can I assign this to" lookup.
+    /// Returns agent_ids, creation order. Suspended/disabled/pending
+    /// Operatives are excluded (only assignable ones).
+    pub fn list_by_role(&self, role: &str) -> Result<Vec<String>, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT agent_id FROM agent_profiles
+             WHERE role = ?1 AND status = 'active'
+             ORDER BY created_at ASC",
+        )?;
+        let rows: Vec<String> = stmt
+            .query_map(params![role], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// PHASE 2 (org tree): an Operative's **peers** — the other
+    /// Operatives reporting to the same Lead (excludes the agent
+    /// itself). Empty for an apex with no Lead set. The "my team"
+    /// sibling row in the org chart.
+    pub fn list_peers(&self, agent_id: &str) -> Result<Vec<String>, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let boss: Option<String> = conn
+            .query_row(
+                "SELECT reports_to FROM agent_profiles WHERE agent_id=?1",
+                params![agent_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(boss) = boss else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "SELECT agent_id FROM agent_profiles
+             WHERE reports_to = ?1 AND agent_id != ?2
+             ORDER BY created_at ASC",
+        )?;
+        let rows: Vec<String> = stmt
+            .query_map(params![boss, agent_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// PHASE 0 (org tree): every agent at or below `manager_id` —
+    /// the manager's *subtree*, as agent_ids (excluding the
+    /// manager itself). This is the scope unit for delegated
+    /// authority ("this planner may only assign work to agents
+    /// under it"). Breadth-first with a visited guard and a hard
+    /// node cap, so a malformed cycle can never spin forever.
+    pub fn manager_subtree(&self, manager_id: &str) -> Result<Vec<String>, AgentStoreError> {
+        const MAX_NODES: usize = 10_000;
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt = conn.prepare("SELECT agent_id FROM agent_profiles WHERE reports_to = ?1")?;
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(manager_id.to_string());
+        let mut frontier: Vec<String> = vec![manager_id.to_string()];
+        while let Some(node) = frontier.pop() {
+            if out.len() >= MAX_NODES {
+                break;
+            }
+            let children: Vec<String> = stmt
+                .query_map(params![node], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for child in children {
+                if seen.insert(child.clone()) {
+                    out.push(child.clone());
+                    frontier.push(child);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// PHASE 0 (org tree): the escalation path *up* from `agent_id`
+    /// to the apex — the chain of bosses, nearest first. Stops at
+    /// the apex (an agent with no boss) or a missing link. A
+    /// visited guard + depth cap bound a malformed cycle.
+    pub fn chain_of_command(&self, agent_id: &str) -> Result<Vec<String>, AgentStoreError> {
+        const MAX_DEPTH: usize = 1024;
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt = conn.prepare("SELECT reports_to FROM agent_profiles WHERE agent_id = ?1")?;
+        let mut chain: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(agent_id.to_string());
+        let mut current = agent_id.to_string();
+        for _ in 0..MAX_DEPTH {
+            let boss: Option<String> = stmt
+                .query_row(params![current], |r| r.get::<_, Option<String>>(0))
+                .optional()?
+                .flatten();
+            let Some(boss) = boss else { break };
+            if !seen.insert(boss.clone()) {
+                break; // cycle guard
+            }
+            chain.push(boss.clone());
+            current = boss;
+        }
+        Ok(chain)
+    }
+
+    /// PHASE 2/3 authority: may `manager` act on `target`? True when
+    /// `target` is in `manager`'s Branch (subtree) — the delegated-
+    /// authority scope ("a planner may only assign to agents under
+    /// it"). A manager does not manage itself.
+    pub fn manages(&self, manager_id: &str, target_id: &str) -> Result<bool, AgentStoreError> {
+        if manager_id == target_id {
+            return Ok(false);
+        }
+        let subtree = self.manager_subtree(manager_id)?;
+        Ok(subtree.iter().any(|id| id == target_id))
+    }
+
+    /// PHASE 5 (companion / Roster): Operative counts by status —
+    /// the Roster-at-a-glance (active / pending / suspended /
+    /// disabled).
+    pub fn status_counts(&self) -> Result<Vec<(String, i64)>, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT status, COUNT(*) FROM agent_profiles GROUP BY status ORDER BY status",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// PHASE 4 (Allowance oversight): the total monthly Allowance
+    /// committed across the *active* roster, in cents. NULL
+    /// allowances count as 0. The Founder compares this against the
+    /// Guild Allowance (`guild.get`) to read commitment vs budget.
+    pub fn committed_allowance_cents(&self) -> Result<i64, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(monthly_allowance_cents), 0)
+             FROM agent_profiles WHERE status = 'active'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(total)
     }
 
     /// Update one field. The set of writable fields is curated;
@@ -761,6 +1015,157 @@ impl AgentStore {
                     params![stored, now, agent_id],
                 )?
             }
+            "reports_to" => {
+                // PHASE 0 (org tree): set or clear this agent's
+                // boss. Empty value clears it (apex / no boss). A
+                // non-empty value must reference an existing agent
+                // and must not be the agent itself (no self-report).
+                // Deeper cycle detection lands with the org-chart
+                // surface in Phase 2.
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    conn.execute(
+                        "UPDATE agent_profiles SET reports_to=NULL, updated_at=?1
+                         WHERE agent_id=?2",
+                        params![now, agent_id],
+                    )?
+                } else {
+                    if trimmed == agent_id {
+                        return Err(AgentStoreError::BadInput(
+                            "an agent cannot report to itself".into(),
+                        ));
+                    }
+                    let boss_exists = conn
+                        .query_row(
+                            "SELECT 1 FROM agent_profiles WHERE agent_id=?1",
+                            params![trimmed],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_some();
+                    if !boss_exists {
+                        return Err(AgentStoreError::BadInput(format!(
+                            "reports_to target '{trimmed}' is not a known agent"
+                        )));
+                    }
+                    // Cycle guard: walk up the chain from the
+                    // prospective boss; if we reach this agent, the
+                    // edge would close a loop in the org tree. Done
+                    // inline (we already hold the lock) so it can't
+                    // deadlock against `manages`/`chain_of_command`.
+                    const MAX_CHAIN_DEPTH: u32 = 10_000;
+                    let mut cursor = trimmed.to_string();
+                    let mut depth = 0u32;
+                    loop {
+                        if cursor == agent_id {
+                            return Err(AgentStoreError::BadInput(
+                                "reports_to would create a cycle in the org tree".into(),
+                            ));
+                        }
+                        depth += 1;
+                        if depth > MAX_CHAIN_DEPTH {
+                            break; // pre-existing corrupt cycle — don't hang
+                        }
+                        let next: Option<String> = conn
+                            .query_row(
+                                "SELECT reports_to FROM agent_profiles WHERE agent_id=?1",
+                                params![cursor],
+                                |r| r.get::<_, Option<String>>(0),
+                            )
+                            .optional()?
+                            .flatten();
+                        match next {
+                            Some(b) => cursor = b,
+                            None => break, // reached an apex — no cycle
+                        }
+                    }
+                    conn.execute(
+                        "UPDATE agent_profiles SET reports_to=?1, updated_at=?2
+                         WHERE agent_id=?3",
+                        params![trimmed, now, agent_id],
+                    )?
+                }
+            }
+            "rig" => {
+                // PILLAR 2 (Rig): set or clear the backend that
+                // powers this Operative. Empty clears it (use the
+                // Guild default). Any non-empty name is accepted;
+                // the dispatcher resolves it against the Rig
+                // registry and falls back to the default if unknown.
+                let trimmed = value.trim();
+                let stored: Option<&str> = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
+                conn.execute(
+                    "UPDATE agent_profiles SET rig=?1, updated_at=?2 WHERE agent_id=?3",
+                    params![stored, now, agent_id],
+                )?
+            }
+            "allowance" => {
+                // Governance: this Operative's monthly Allowance in
+                // cents. Empty clears the cap; negative / non-integer
+                // are rejected.
+                let trimmed = value.trim();
+                let stored: Option<i64> = if trimmed.is_empty() {
+                    None
+                } else {
+                    match trimmed.parse::<i64>() {
+                        Ok(c) if c >= 0 => Some(c),
+                        Ok(_) => {
+                            return Err(AgentStoreError::BadInput("allowance must be >= 0".into()));
+                        }
+                        Err(_) => {
+                            return Err(AgentStoreError::BadInput(format!(
+                                "allowance not an integer: {trimmed}"
+                            )));
+                        }
+                    }
+                };
+                conn.execute(
+                    "UPDATE agent_profiles SET monthly_allowance_cents=?1, updated_at=?2
+                     WHERE agent_id=?3",
+                    params![stored, now, agent_id],
+                )?
+            }
+            "max_concurrent_runs" | "concurrency" => {
+                let trimmed = value.trim();
+                let slots = match trimmed.parse::<i64>() {
+                    Ok(n) if (1..=50).contains(&n) => n,
+                    Ok(_) => {
+                        return Err(AgentStoreError::BadInput(
+                            "max_concurrent_runs must be between 1 and 50".into(),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(AgentStoreError::BadInput(format!(
+                            "max_concurrent_runs not an integer: {trimmed}"
+                        )));
+                    }
+                };
+                conn.execute(
+                    "UPDATE agent_profiles SET max_concurrent_runs=?1, updated_at=?2
+                     WHERE agent_id=?3",
+                    params![slots, now, agent_id],
+                )?
+            }
+            "wake_on_timer" | "timer_wake" => {
+                let flag = parse_bool_key(value, "wake_on_timer")?;
+                conn.execute(
+                    "UPDATE agent_profiles SET wake_on_timer=?1, updated_at=?2
+                     WHERE agent_id=?3",
+                    params![if flag { 1 } else { 0 }, now, agent_id],
+                )?
+            }
+            "wake_on_demand" | "on_demand_wake" => {
+                let flag = parse_bool_key(value, "wake_on_demand")?;
+                conn.execute(
+                    "UPDATE agent_profiles SET wake_on_demand=?1, updated_at=?2
+                     WHERE agent_id=?3",
+                    params![if flag { 1 } else { 0 }, now, agent_id],
+                )?
+            }
             other => {
                 return Err(AgentStoreError::BadInput(format!(
                     "unknown field '{other}'"
@@ -778,6 +1183,77 @@ impl AgentStore {
     /// valid and audit signatures must stay verifiable.
     pub fn soft_delete_agent(&self, agent_id: &str) -> Result<(), AgentStoreError> {
         self.update_agent_field(agent_id, "status", "disabled")
+    }
+
+    // ── PHASE 4: hire flow ────────────────────────────────
+
+    /// Request a hire: mint a new Operative in `pending` status. A
+    /// pending Operative appears in the Roster but is **inert** —
+    /// the fail-closed agent gate denies any non-`active` caller —
+    /// so a CEO-spawned hire can't act until the Founder approves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_hire(
+        &self,
+        name: &str,
+        role: &str,
+        title: &str,
+        department: &str,
+        team: &str,
+        created_by: &str,
+        subject_id: &str,
+        risk_ceiling: &str,
+        tenant_id: &str,
+    ) -> Result<String, AgentStoreError> {
+        let agent_id = self.create_agent(
+            name,
+            role,
+            title,
+            department,
+            team,
+            created_by,
+            subject_id,
+            risk_ceiling,
+            tenant_id,
+        )?;
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        conn.execute(
+            "UPDATE agent_profiles SET status='pending', updated_at=?1 WHERE agent_id=?2",
+            params![now, agent_id],
+        )?;
+        Ok(agent_id)
+    }
+
+    /// Approve a pending hire (pending → active). Errors if the
+    /// Operative isn't pending (so an already-active agent can't be
+    /// "approved" into existence).
+    pub fn approve_hire(&self, agent_id: &str) -> Result<(), AgentStoreError> {
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let changed = conn.execute(
+            "UPDATE agent_profiles SET status='active', updated_at=?1
+             WHERE agent_id=?2 AND status='pending'",
+            params![now, agent_id],
+        )?;
+        if changed == 0 {
+            return Err(AgentStoreError::NotFound(agent_id.into()));
+        }
+        Ok(())
+    }
+
+    /// Reject a pending hire (pending → disabled, terminal).
+    pub fn reject_hire(&self, agent_id: &str) -> Result<(), AgentStoreError> {
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let changed = conn.execute(
+            "UPDATE agent_profiles SET status='disabled', updated_at=?1
+             WHERE agent_id=?2 AND status='pending'",
+            params![now, agent_id],
+        )?;
+        if changed == 0 {
+            return Err(AgentStoreError::NotFound(agent_id.into()));
+        }
+        Ok(())
     }
 
     // ── approval_requests ─────────────────────────────────
@@ -1245,15 +1721,55 @@ impl AgentStore {
         // GROUP 6: caller's VERIFIED tenant (from InvocationCtx).
         tenant_id: &str,
     ) -> Result<String, AgentStoreError> {
-        if agent_id.trim().is_empty() || match_category.trim().is_empty() {
+        self.create_scoped_standing(StandingApprovalCreate {
+            agent_id,
+            match_category,
+            match_path_glob,
+            scope_kind: None,
+            task_id: None,
+            session_id: None,
+            method_prefix: None,
+            workspace_path_glob: None,
+            expires_at,
+            granted_by,
+            max_calls: None,
+            max_cost_micros: None,
+            note,
+            tenant_id,
+        })
+    }
+
+    pub fn create_scoped_standing(
+        &self,
+        input: StandingApprovalCreate<'_>,
+    ) -> Result<String, AgentStoreError> {
+        if input.agent_id.trim().is_empty() || input.match_category.trim().is_empty() {
             return Err(AgentStoreError::BadInput(
                 "agent_id and match_category required".into(),
             ));
         }
-        let tenant = if tenant_id.trim().is_empty() {
+        let scope_kind = normalize_standing_scope(input.scope_kind);
+        validate_standing_scope(
+            &scope_kind,
+            input.task_id,
+            input.session_id,
+            input.method_prefix,
+            input.match_path_glob.or(input.workspace_path_glob),
+        )?;
+        if input.max_calls.is_some_and(|n| n <= 0) {
+            return Err(AgentStoreError::BadInput(
+                "standing approval max_calls must be positive".into(),
+            ));
+        }
+        if input.max_cost_micros.is_some_and(|n| n <= 0) {
+            return Err(AgentStoreError::BadInput(
+                "standing approval max_cost_micros must be positive".into(),
+            ));
+        }
+        let tenant = if input.tenant_id.trim().is_empty() {
             "default"
         } else {
-            tenant_id
+            input.tenant_id
         };
         let now = unix_now();
         let standing_id = new_standing_id();
@@ -1261,16 +1777,25 @@ impl AgentStore {
         conn.execute(
             "INSERT INTO standing_approvals (
                  standing_id, agent_id, match_category, match_path_glob,
-                 expires_at, granted_by, note, created_at, tenant_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 scope_kind, task_id, session_id, method_prefix, workspace_path_glob,
+                 expires_at, granted_by, max_calls, calls_used, max_cost_micros,
+                 cost_used_micros, note, created_at, tenant_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13, 0, ?14, ?15, ?16)",
             params![
                 standing_id,
-                agent_id,
-                match_category,
-                match_path_glob,
-                expires_at,
-                granted_by,
-                note,
+                input.agent_id,
+                input.match_category,
+                input.match_path_glob,
+                scope_kind,
+                input.task_id.and_then(non_empty_opt),
+                input.session_id.and_then(non_empty_opt),
+                input.method_prefix.and_then(non_empty_opt),
+                input.workspace_path_glob.and_then(non_empty_opt),
+                input.expires_at,
+                input.granted_by,
+                input.max_calls,
+                input.max_cost_micros,
+                input.note,
                 now,
                 tenant,
             ],
@@ -1295,24 +1820,44 @@ impl AgentStore {
     }
 
     pub fn list_standing(&self, agent_id: &str) -> Result<Vec<StandingApproval>, AgentStoreError> {
+        self.list_standing_for_tenant(agent_id, "default")
+    }
+
+    pub fn list_standing_for_tenant(
+        &self,
+        agent_id: &str,
+        tenant_id: &str,
+    ) -> Result<Vec<StandingApproval>, AgentStoreError> {
         let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let tenant = non_empty_opt(tenant_id).unwrap_or("default");
         let mut stmt = conn.prepare(
             "SELECT standing_id, agent_id, match_category, match_path_glob,
-                    expires_at, granted_by, note, created_at
-             FROM standing_approvals WHERE agent_id = ?1
+                    scope_kind, task_id, session_id, method_prefix, workspace_path_glob,
+                    expires_at, granted_by, max_calls, calls_used, max_cost_micros,
+                    cost_used_micros, note, created_at
+             FROM standing_approvals WHERE tenant_id = ?1 AND agent_id = ?2
              ORDER BY created_at DESC",
         )?;
         let rows = stmt
-            .query_map(params![agent_id], |r| {
+            .query_map(params![tenant, agent_id], |r| {
                 Ok(StandingApproval {
                     standing_id: r.get(0)?,
                     agent_id: r.get(1)?,
                     match_category: r.get(2)?,
                     match_path_glob: r.get(3)?,
-                    expires_at: r.get(4)?,
-                    granted_by: r.get(5)?,
-                    note: r.get(6)?,
-                    created_at: r.get(7)?,
+                    scope_kind: r.get(4)?,
+                    task_id: r.get(5)?,
+                    session_id: r.get(6)?,
+                    method_prefix: r.get(7)?,
+                    workspace_path_glob: r.get(8)?,
+                    expires_at: r.get(9)?,
+                    granted_by: r.get(10)?,
+                    max_calls: r.get(11)?,
+                    calls_used: r.get(12)?,
+                    max_cost_micros: r.get(13)?,
+                    cost_used_micros: r.get(14)?,
+                    note: r.get(15)?,
+                    created_at: r.get(16)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1328,14 +1873,162 @@ impl AgentStore {
         category: &str,
         now: i64,
     ) -> Result<bool, AgentStoreError> {
+        self.has_active_standing_for(StandingApprovalMatch {
+            agent_id,
+            category,
+            method: "",
+            task_id: None,
+            session_id: None,
+            workspace_path: None,
+            tenant_id: None,
+            estimated_cost_micros: 0,
+            now,
+        })
+    }
+
+    pub fn has_active_standing_for(
+        &self,
+        input: StandingApprovalMatch<'_>,
+    ) -> Result<bool, AgentStoreError> {
         let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM standing_approvals
-             WHERE agent_id = ?1 AND match_category = ?2 AND expires_at > ?3",
-            params![agent_id, category, now],
-            |r| r.get(0),
+        let tenant = input.tenant_id.and_then(non_empty_opt).unwrap_or("default");
+        let mut stmt = conn.prepare(
+            "SELECT standing_id, match_path_glob, scope_kind, task_id, session_id,
+                    method_prefix, workspace_path_glob
+             FROM standing_approvals
+             WHERE tenant_id = ?1 AND agent_id = ?2 AND match_category = ?3 AND expires_at > ?4
+               AND (max_calls IS NULL OR calls_used < max_calls)
+               AND (max_cost_micros IS NULL OR cost_used_micros + ?5 <= max_cost_micros)",
         )?;
-        Ok(n > 0)
+        let rows = stmt
+            .query_map(
+                params![
+                    tenant,
+                    input.agent_id,
+                    input.category,
+                    input.now,
+                    input.estimated_cost_micros.max(0)
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().any(
+            |(
+                _,
+                path_glob,
+                scope_kind,
+                task_id,
+                session_id,
+                method_prefix,
+                workspace_path_glob,
+            )| {
+                standing_scope_matches(
+                    &scope_kind,
+                    StandingScopeRow {
+                        path_glob: path_glob.as_deref(),
+                        task_id: task_id.as_deref(),
+                        session_id: session_id.as_deref(),
+                        method_prefix: method_prefix.as_deref(),
+                        workspace_path_glob: workspace_path_glob.as_deref(),
+                    },
+                    &input,
+                )
+            },
+        ))
+    }
+
+    pub fn consume_active_standing_for(
+        &self,
+        input: StandingApprovalMatch<'_>,
+    ) -> Result<Option<String>, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let tenant = input.tenant_id.and_then(non_empty_opt).unwrap_or("default");
+        let candidates = {
+            let mut stmt = conn.prepare(
+                "SELECT standing_id, match_path_glob, scope_kind, task_id, session_id,
+                        method_prefix, workspace_path_glob, max_calls, max_cost_micros
+                 FROM standing_approvals
+                 WHERE tenant_id = ?1 AND agent_id = ?2 AND match_category = ?3 AND expires_at > ?4
+                   AND (max_calls IS NULL OR calls_used < max_calls)
+                   AND (max_cost_micros IS NULL OR cost_used_micros + ?5 <= max_cost_micros)
+                 ORDER BY created_at ASC, standing_id ASC",
+            )?;
+            stmt.query_map(
+                params![
+                    tenant,
+                    input.agent_id,
+                    input.category,
+                    input.now,
+                    input.estimated_cost_micros.max(0)
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                        r.get::<_, Option<i64>>(7)?,
+                        r.get::<_, Option<i64>>(8)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (
+            standing_id,
+            path_glob,
+            scope_kind,
+            task_id,
+            session_id,
+            method_prefix,
+            workspace_path_glob,
+            max_calls,
+            max_cost_micros,
+        ) in candidates
+        {
+            if !standing_scope_matches(
+                &scope_kind,
+                StandingScopeRow {
+                    path_glob: path_glob.as_deref(),
+                    task_id: task_id.as_deref(),
+                    session_id: session_id.as_deref(),
+                    method_prefix: method_prefix.as_deref(),
+                    workspace_path_glob: workspace_path_glob.as_deref(),
+                },
+                &input,
+            ) {
+                continue;
+            }
+            if max_calls.is_none() && max_cost_micros.is_none() {
+                return Ok(Some(standing_id));
+            }
+            let changed = conn.execute(
+                "UPDATE standing_approvals
+                 SET calls_used = calls_used + CASE WHEN max_calls IS NULL THEN 0 ELSE 1 END,
+                     cost_used_micros = cost_used_micros + CASE WHEN max_cost_micros IS NULL THEN 0 ELSE ?2 END
+                 WHERE standing_id = ?1
+                   AND (max_calls IS NULL OR calls_used < max_calls)
+                   AND (max_cost_micros IS NULL OR cost_used_micros + ?2 <= max_cost_micros)",
+                params![standing_id, input.estimated_cost_micros.max(0)],
+            )?;
+            if changed > 0 {
+                return Ok(Some(standing_id));
+            }
+        }
+        Ok(None)
     }
 
     pub fn revoke_standing(&self, standing_id: &str) -> Result<(), AgentStoreError> {
@@ -1359,7 +2052,8 @@ const SELECT_AGENT: &str = "SELECT agent_id, name, role, title, department, team
         allow_sensitivity_tags, deny_sensitivity_tags,
         approval_required_categories, authorized_approvers,
         approval_timeout_secs,
-        created_at, updated_at, profile
+        created_at, updated_at, profile, reports_to, rig, monthly_allowance_cents,
+        max_concurrent_runs, wake_on_timer, wake_on_demand
  FROM agent_profiles WHERE agent_id = ?1";
 
 const SELECT_APPROVAL: &str =
@@ -1392,10 +2086,18 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              authorized_approvers TEXT NOT NULL DEFAULT '[]',
              approval_timeout_secs INTEGER NOT NULL DEFAULT 86400,
              created_at      INTEGER NOT NULL,
-             updated_at      INTEGER NOT NULL
+             updated_at      INTEGER NOT NULL,
+             reports_to      TEXT,
+             rig             TEXT,
+             monthly_allowance_cents INTEGER,
+             max_concurrent_runs INTEGER NOT NULL DEFAULT 20,
+             wake_on_timer INTEGER NOT NULL DEFAULT 1,
+             wake_on_demand INTEGER NOT NULL DEFAULT 1
          );
          CREATE UNIQUE INDEX IF NOT EXISTS agent_profiles_subject
              ON agent_profiles(subject_id);
+         CREATE INDEX IF NOT EXISTS agent_profiles_reports_to
+             ON agent_profiles(reports_to);
 
          CREATE TABLE IF NOT EXISTS approval_requests (
              approval_id     TEXT PRIMARY KEY,
@@ -1426,8 +2128,17 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              agent_id        TEXT NOT NULL,
              match_category  TEXT NOT NULL,
              match_path_glob TEXT,
+             scope_kind      TEXT NOT NULL DEFAULT 'agent_category',
+             task_id         TEXT,
+             session_id      TEXT,
+             method_prefix   TEXT,
+             workspace_path_glob TEXT,
              expires_at      INTEGER NOT NULL,
              granted_by      TEXT NOT NULL,
+             max_calls       INTEGER,
+             calls_used      INTEGER NOT NULL DEFAULT 0,
+             max_cost_micros INTEGER,
+             cost_used_micros INTEGER NOT NULL DEFAULT 0,
              note            TEXT NOT NULL DEFAULT '',
              created_at      INTEGER NOT NULL
          );
@@ -1487,6 +2198,34 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     // rows continue to flow through the categorical checks
     // (which now default-deny when no profile exists).
     ensure_column(conn, "agent_profiles", "profile", "TEXT")?;
+    // PHASE 0 (org tree): `reports_to` — the single boss link that
+    // turns the flat agent list into the org hierarchy. Nullable;
+    // existing rows read NULL (no boss) until an operator/CEO sets
+    // it via `agent.update agent_id|reports_to|<boss_agent_id>`.
+    ensure_column(conn, "agent_profiles", "reports_to", "TEXT")?;
+    // PILLAR 2 (Rig): the agent backend that powers an Operative.
+    ensure_column(conn, "agent_profiles", "rig", "TEXT")?;
+    // Governance: per-Operative monthly Allowance (budget, cents).
+    ensure_column(conn, "agent_profiles", "monthly_allowance_cents", "INTEGER")?;
+    // Runtime Keys: per-agent wake controls and concurrency slots.
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "max_concurrent_runs",
+        "INTEGER NOT NULL DEFAULT 20",
+    )?;
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "wake_on_timer",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "wake_on_demand",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
     // GROUP 6: tenant isolation. Add `tenant_id` to the per-caller
     // agent/approval tables. Idempotent (ensure_column probes
     // PRAGMA); existing rows default to the reserved 'default'
@@ -1497,10 +2236,35 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     for tbl in ["agent_profiles", "approval_requests", "standing_approvals"] {
         ensure_column(conn, tbl, "tenant_id", "TEXT NOT NULL DEFAULT 'default'")?;
     }
+    ensure_column(
+        conn,
+        "standing_approvals",
+        "scope_kind",
+        "TEXT NOT NULL DEFAULT 'agent_category'",
+    )?;
+    ensure_column(conn, "standing_approvals", "task_id", "TEXT")?;
+    ensure_column(conn, "standing_approvals", "session_id", "TEXT")?;
+    ensure_column(conn, "standing_approvals", "method_prefix", "TEXT")?;
+    ensure_column(conn, "standing_approvals", "workspace_path_glob", "TEXT")?;
+    ensure_column(conn, "standing_approvals", "max_calls", "INTEGER")?;
+    ensure_column(
+        conn,
+        "standing_approvals",
+        "calls_used",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(conn, "standing_approvals", "max_cost_micros", "INTEGER")?;
+    ensure_column(
+        conn,
+        "standing_approvals",
+        "cost_used_micros",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS agent_profiles_tenant ON agent_profiles(tenant_id);\
          CREATE INDEX IF NOT EXISTS approval_requests_tenant ON approval_requests(tenant_id);\
-         CREATE INDEX IF NOT EXISTS standing_approvals_tenant ON standing_approvals(tenant_id);",
+         CREATE INDEX IF NOT EXISTS standing_approvals_tenant ON standing_approvals(tenant_id);\
+         CREATE INDEX IF NOT EXISTS standing_approvals_scope ON standing_approvals(tenant_id, agent_id, match_category, scope_kind, expires_at);",
     )?;
     Ok(())
 }
@@ -1578,6 +2342,117 @@ fn ensure_column(
     Ok(())
 }
 
+fn non_empty_opt(s: &str) -> Option<&str> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn parse_bool_key(value: &str, field: &str) -> Result<bool, AgentStoreError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(AgentStoreError::BadInput(format!(
+            "{field} must be boolean (true/false), got `{other}`"
+        ))),
+    }
+}
+
+fn normalize_standing_scope(scope_kind: Option<&str>) -> String {
+    match scope_kind.and_then(non_empty_opt) {
+        Some("task") => "task".into(),
+        Some("session") => "session".into(),
+        Some("method_prefix") | Some("capability_family") => "method_prefix".into(),
+        Some("workspace_path") => "workspace_path".into(),
+        Some("agent_category") | None => "agent_category".into(),
+        Some(other) => other.to_string(),
+    }
+}
+
+fn validate_standing_scope(
+    scope_kind: &str,
+    task_id: Option<&str>,
+    session_id: Option<&str>,
+    method_prefix: Option<&str>,
+    path_glob: Option<&str>,
+) -> Result<(), AgentStoreError> {
+    match scope_kind {
+        "agent_category" => Ok(()),
+        "task" if task_id.and_then(non_empty_opt).is_some() => Ok(()),
+        "session" if session_id.and_then(non_empty_opt).is_some() => Ok(()),
+        "method_prefix" if method_prefix.and_then(non_empty_opt).is_some() => Ok(()),
+        "workspace_path" if path_glob.and_then(non_empty_opt).is_some() => Ok(()),
+        "task" => Err(AgentStoreError::BadInput(
+            "task scoped standing approval requires task_id".into(),
+        )),
+        "session" => Err(AgentStoreError::BadInput(
+            "session scoped standing approval requires session_id".into(),
+        )),
+        "method_prefix" => Err(AgentStoreError::BadInput(
+            "method_prefix scoped standing approval requires method_prefix".into(),
+        )),
+        "workspace_path" => Err(AgentStoreError::BadInput(
+            "workspace_path scoped standing approval requires path_glob or workspace_path_glob"
+                .into(),
+        )),
+        other => Err(AgentStoreError::BadInput(format!(
+            "unsupported standing approval scope_kind: {other}"
+        ))),
+    }
+}
+
+struct StandingScopeRow<'a> {
+    path_glob: Option<&'a str>,
+    task_id: Option<&'a str>,
+    session_id: Option<&'a str>,
+    method_prefix: Option<&'a str>,
+    workspace_path_glob: Option<&'a str>,
+}
+
+fn standing_scope_matches(
+    scope_kind: &str,
+    row: StandingScopeRow<'_>,
+    input: &StandingApprovalMatch<'_>,
+) -> bool {
+    match scope_kind {
+        "agent_category" => workspace_matches(row.path_glob, input.workspace_path),
+        "task" => {
+            row.task_id == input.task_id && workspace_matches(row.path_glob, input.workspace_path)
+        }
+        "session" => {
+            row.session_id == input.session_id
+                && workspace_matches(row.path_glob, input.workspace_path)
+        }
+        "method_prefix" => {
+            row.method_prefix
+                .is_some_and(|prefix| input.method.starts_with(prefix))
+                && workspace_matches(row.path_glob, input.workspace_path)
+        }
+        "workspace_path" => workspace_matches(
+            row.workspace_path_glob.or(row.path_glob),
+            input.workspace_path,
+        ),
+        _ => false,
+    }
+}
+
+fn workspace_matches(pattern: Option<&str>, workspace_path: Option<&str>) -> bool {
+    let Some(pattern) = pattern.and_then(non_empty_opt) else {
+        return true;
+    };
+    let Some(path) = workspace_path.and_then(non_empty_opt) else {
+        return false;
+    };
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        path.starts_with(prefix)
+    } else {
+        path == pattern
+    }
+}
+
 fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
     let surface_allowlist: String = r.get(9)?;
     let allow_categories: String = r.get(11)?;
@@ -1611,6 +2486,14 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
         // a no-default column, so existing rows read NULL
         // → None and stay subject to the standard checks.
         profile: r.get::<_, Option<String>>(20)?,
+        // PHASE 0 (org tree): appended as the last SELECT column
+        // so every existing positional index above is unchanged.
+        reports_to: r.get::<_, Option<String>>(21)?,
+        rig: r.get::<_, Option<String>>(22)?,
+        monthly_allowance_cents: r.get::<_, Option<i64>>(23)?,
+        max_concurrent_runs: r.get::<_, i64>(24)?,
+        wake_on_timer: r.get::<_, i64>(25)? != 0,
+        wake_on_demand: r.get::<_, i64>(26)? != 0,
     })
 }
 
@@ -1718,6 +2601,448 @@ mod tests {
 
     fn store() -> AgentStore {
         AgentStore::in_memory().unwrap()
+    }
+
+    // ── PHASE 0: org tree (reports_to) ───────────────────
+
+    #[test]
+    fn phase0_reports_to_sets_clears_and_validates() {
+        let s = store();
+        let boss = s
+            .create_agent(
+                "CEO",
+                "ceo",
+                "Chief",
+                "exec",
+                "exec",
+                "operator",
+                "subj-boss",
+                "high",
+                "default",
+            )
+            .unwrap();
+        let report = s
+            .create_agent(
+                "Eng",
+                "engineer",
+                "Engineer",
+                "eng",
+                "eng",
+                "operator",
+                "subj-report",
+                "medium",
+                "default",
+            )
+            .unwrap();
+
+        // Fresh agents have no boss (apex / unset).
+        assert_eq!(s.get_agent(&report).unwrap().unwrap().reports_to, None);
+
+        // Setting the boss link creates the org-tree edge.
+        s.update_agent_field(&report, "reports_to", &boss).unwrap();
+        assert_eq!(
+            s.get_agent(&report).unwrap().unwrap().reports_to,
+            Some(boss.clone())
+        );
+
+        // An agent cannot report to itself.
+        assert!(
+            s.update_agent_field(&report, "reports_to", &report)
+                .is_err()
+        );
+
+        // An unknown boss is rejected — no dangling edges.
+        assert!(
+            s.update_agent_field(&report, "reports_to", "nope-not-an-agent")
+                .is_err()
+        );
+
+        // The previously-set valid edge survived the rejected writes.
+        assert_eq!(
+            s.get_agent(&report).unwrap().unwrap().reports_to,
+            Some(boss)
+        );
+
+        // Empty value clears the link back to apex / no boss.
+        s.update_agent_field(&report, "reports_to", "").unwrap();
+        assert_eq!(s.get_agent(&report).unwrap().unwrap().reports_to, None);
+    }
+
+    #[test]
+    fn phase0_org_tree_queries_walk_up_and_down() {
+        let s = store();
+        // CEO → planner → {worker1, worker2}
+        let ceo = s
+            .create_agent(
+                "CEO", "ceo", "Chief", "exec", "exec", "op", "subj-ceo", "high", "default",
+            )
+            .unwrap();
+        let planner = s
+            .create_agent(
+                "Plan",
+                "planner",
+                "Planner",
+                "eng",
+                "eng",
+                "op",
+                "subj-plan",
+                "medium",
+                "default",
+            )
+            .unwrap();
+        let w1 = s
+            .create_agent(
+                "W1", "worker", "Worker", "eng", "eng", "op", "subj-w1", "low", "default",
+            )
+            .unwrap();
+        let w2 = s
+            .create_agent(
+                "W2", "worker", "Worker", "eng", "eng", "op", "subj-w2", "low", "default",
+            )
+            .unwrap();
+        s.update_agent_field(&planner, "reports_to", &ceo).unwrap();
+        s.update_agent_field(&w1, "reports_to", &planner).unwrap();
+        s.update_agent_field(&w2, "reports_to", &planner).unwrap();
+
+        // Down one level.
+        let ceo_reports: Vec<String> = s
+            .list_direct_reports(&ceo)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.agent_id)
+            .collect();
+        assert_eq!(ceo_reports, vec![planner.clone()]);
+        let planner_reports: Vec<String> = s
+            .list_direct_reports(&planner)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.agent_id)
+            .collect();
+        assert_eq!(planner_reports.len(), 2);
+        assert!(planner_reports.contains(&w1) && planner_reports.contains(&w2));
+
+        // The whole subtree under the CEO is everyone but the CEO.
+        let subtree = s.manager_subtree(&ceo).unwrap();
+        assert_eq!(subtree.len(), 3);
+        for id in [&planner, &w1, &w2] {
+            assert!(subtree.contains(id));
+        }
+        assert!(!subtree.contains(&ceo));
+
+        // Escalation path up from a worker: planner, then CEO.
+        assert_eq!(
+            s.chain_of_command(&w1).unwrap(),
+            vec![planner.clone(), ceo.clone()]
+        );
+        // The apex escalates to nobody.
+        assert!(s.chain_of_command(&ceo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_by_role_returns_active_matches_only() {
+        let s = store();
+        let e1 = s
+            .create_agent(
+                "E1", "engineer", "E", "e", "e", "op", "subj-br1", "low", "default",
+            )
+            .unwrap();
+        let e2 = s
+            .create_agent(
+                "E2", "engineer", "E", "e", "e", "op", "subj-br2", "low", "default",
+            )
+            .unwrap();
+        let _d = s
+            .create_agent(
+                "D", "designer", "D", "e", "e", "op", "subj-br3", "low", "default",
+            )
+            .unwrap();
+        // A pending engineer is not assignable.
+        s.request_hire(
+            "E3", "engineer", "E", "e", "e", "op", "subj-br4", "low", "default",
+        )
+        .unwrap();
+        // A suspended engineer is excluded.
+        s.update_agent_field(&e2, "status", "suspended").unwrap();
+
+        let engineers = s.list_by_role("engineer").unwrap();
+        assert_eq!(engineers, vec![e1]);
+        assert!(s.list_by_role("manager").unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_peers_returns_same_lead_siblings() {
+        let s = store();
+        let ceo = s
+            .create_agent(
+                "CEO", "ceo", "C", "x", "x", "op", "subj-pr0", "high", "default",
+            )
+            .unwrap();
+        let a = s
+            .create_agent(
+                "A", "eng", "A", "e", "e", "op", "subj-pr1", "low", "default",
+            )
+            .unwrap();
+        let b = s
+            .create_agent(
+                "B", "eng", "B", "e", "e", "op", "subj-pr2", "low", "default",
+            )
+            .unwrap();
+        let c = s
+            .create_agent(
+                "C", "eng", "C", "e", "e", "op", "subj-pr3", "low", "default",
+            )
+            .unwrap();
+        // a, b, c all report to ceo.
+        for x in [&a, &b, &c] {
+            s.update_agent_field(x, "reports_to", &ceo).unwrap();
+        }
+
+        let peers = s.list_peers(&a).unwrap();
+        assert_eq!(peers.len(), 2);
+        assert!(peers.contains(&b) && peers.contains(&c));
+        assert!(!peers.contains(&a), "excludes self");
+        // The apex has no Lead → no peers.
+        assert!(s.list_peers(&ceo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reports_to_rejects_cycles() {
+        let s = store();
+        let ceo = s
+            .create_agent(
+                "CEO", "ceo", "C", "x", "x", "op", "subj-cy1", "high", "default",
+            )
+            .unwrap();
+        let lead = s
+            .create_agent(
+                "L", "lead", "L", "e", "e", "op", "subj-cy2", "medium", "default",
+            )
+            .unwrap();
+        let ic = s
+            .create_agent(
+                "IC", "worker", "I", "e", "e", "op", "subj-cy3", "low", "default",
+            )
+            .unwrap();
+        // ceo <- lead <- ic
+        s.update_agent_field(&lead, "reports_to", &ceo).unwrap();
+        s.update_agent_field(&ic, "reports_to", &lead).unwrap();
+
+        // Direct 2-cycle: ceo can't report to its own report.
+        assert!(matches!(
+            s.update_agent_field(&ceo, "reports_to", &lead),
+            Err(AgentStoreError::BadInput(_))
+        ));
+        // Deep cycle: ceo can't report to a descendant further down.
+        assert!(matches!(
+            s.update_agent_field(&ceo, "reports_to", &ic),
+            Err(AgentStoreError::BadInput(_))
+        ));
+        // The valid edges are untouched after the rejected writes.
+        assert_eq!(s.get_agent(&ceo).unwrap().unwrap().reports_to, None);
+        // A legal re-parent still works (ic moves under ceo directly).
+        s.update_agent_field(&ic, "reports_to", &ceo).unwrap();
+        assert_eq!(
+            s.get_agent(&ic).unwrap().unwrap().reports_to.as_deref(),
+            Some(ceo.as_str())
+        );
+    }
+
+    #[test]
+    fn manages_reflects_the_branch_subtree() {
+        let s = store();
+        let ceo = s
+            .create_agent(
+                "CEO", "ceo", "C", "x", "x", "op", "subj-mc", "high", "default",
+            )
+            .unwrap();
+        let planner = s
+            .create_agent(
+                "P", "planner", "P", "e", "e", "op", "subj-mp", "medium", "default",
+            )
+            .unwrap();
+        let worker = s
+            .create_agent(
+                "W", "worker", "W", "e", "e", "op", "subj-mw", "low", "default",
+            )
+            .unwrap();
+        let outsider = s
+            .create_agent(
+                "O", "worker", "O", "e", "e", "op", "subj-mo", "low", "default",
+            )
+            .unwrap();
+        s.update_agent_field(&planner, "reports_to", &ceo).unwrap();
+        s.update_agent_field(&worker, "reports_to", &planner)
+            .unwrap();
+
+        assert!(s.manages(&ceo, &planner).unwrap());
+        assert!(s.manages(&ceo, &worker).unwrap());
+        assert!(s.manages(&planner, &worker).unwrap());
+        assert!(!s.manages(&planner, &ceo).unwrap());
+        assert!(!s.manages(&ceo, &outsider).unwrap());
+        assert!(!s.manages(&ceo, &ceo).unwrap());
+    }
+
+    #[test]
+    fn status_counts_summarize_the_roster() {
+        let s = store();
+        s.create_agent("a", "r", "t", "d", "t", "op", "s1", "low", "default")
+            .unwrap();
+        s.create_agent("b", "r", "t", "d", "t", "op", "s2", "low", "default")
+            .unwrap();
+        s.request_hire("c", "r", "t", "d", "t", "op", "s3", "low", "default")
+            .unwrap();
+
+        let map: std::collections::HashMap<String, i64> =
+            s.status_counts().unwrap().into_iter().collect();
+        assert_eq!(map.get("active"), Some(&2));
+        assert_eq!(map.get("pending"), Some(&1));
+        assert_eq!(map.values().sum::<i64>(), 3);
+    }
+
+    #[test]
+    fn committed_allowance_sums_active_roster_only() {
+        let s = store();
+        let a = s
+            .create_agent("a", "r", "t", "d", "t", "op", "s1", "low", "default")
+            .unwrap();
+        let b = s
+            .create_agent("b", "r", "t", "d", "t", "op", "s2", "low", "default")
+            .unwrap();
+        // A pending hire's allowance must NOT count (inert headcount).
+        let c = s
+            .request_hire("c", "r", "t", "d", "t", "op", "s3", "low", "default")
+            .unwrap();
+        s.update_agent_field(&a, "allowance", "5000").unwrap();
+        s.update_agent_field(&b, "allowance", "2500").unwrap();
+        s.update_agent_field(&c, "allowance", "9999").unwrap();
+
+        // b still has no allowance set on creation; a=5000, b=2500.
+        assert_eq!(s.committed_allowance_cents().unwrap(), 7500);
+    }
+
+    // ── PHASE 4: hire flow ───────────────────────────────
+
+    #[test]
+    fn runtime_keys_default_update_and_validate() {
+        let s = store();
+        let id = s
+            .create_agent(
+                "runner",
+                "worker",
+                "W",
+                "eng",
+                "eng",
+                "op",
+                "subj-runner",
+                "low",
+                "default",
+            )
+            .unwrap();
+        let p = s.get_agent(&id).unwrap().unwrap();
+        assert_eq!(p.max_concurrent_runs, 20);
+        assert!(p.wake_on_timer);
+        assert!(p.wake_on_demand);
+
+        s.update_agent_field(&id, "max_concurrent_runs", "3")
+            .unwrap();
+        s.update_agent_field(&id, "wake_on_timer", "false").unwrap();
+        s.update_agent_field(&id, "wake_on_demand", "off").unwrap();
+        let p = s.get_agent(&id).unwrap().unwrap();
+        assert_eq!(p.max_concurrent_runs, 3);
+        assert!(!p.wake_on_timer);
+        assert!(!p.wake_on_demand);
+
+        assert!(
+            s.update_agent_field(&id, "max_concurrent_runs", "0")
+                .is_err()
+        );
+        assert!(
+            s.update_agent_field(&id, "max_concurrent_runs", "51")
+                .is_err()
+        );
+        assert!(s.update_agent_field(&id, "wake_on_timer", "maybe").is_err());
+    }
+
+    #[test]
+    fn hire_flow_is_pending_until_approved() {
+        let s = store();
+        let id = s
+            .request_hire(
+                "Eng",
+                "engineer",
+                "E",
+                "eng",
+                "eng",
+                "ceo",
+                "subj-hire",
+                "low",
+                "default",
+            )
+            .unwrap();
+        // A fresh hire is pending (inert — gate denies non-active).
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().status, "pending");
+
+        // Approve → active.
+        s.approve_hire(&id).unwrap();
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().status, "active");
+        // Can't "approve" again — it's no longer pending.
+        assert!(s.approve_hire(&id).is_err());
+
+        // Reject a fresh pending hire → disabled (terminal).
+        let id2 = s
+            .request_hire("X", "r", "t", "d", "t", "ceo", "subj-h2", "low", "default")
+            .unwrap();
+        s.reject_hire(&id2).unwrap();
+        assert_eq!(s.get_agent(&id2).unwrap().unwrap().status, "disabled");
+        // Rejecting a non-pending agent errors.
+        assert!(s.reject_hire(&id).is_err());
+    }
+
+    // ── PILLAR 2: Rig (agent backend) ────────────────────
+
+    #[test]
+    fn pillar2_rig_field_sets_and_clears() {
+        let s = store();
+        let id = s
+            .create_agent(
+                "n", "engineer", "Eng", "eng", "eng", "op", "subj-rig", "low", "default",
+            )
+            .unwrap();
+        // Default: no Rig (use the Guild default at dispatch).
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().rig, None);
+        // Set a Rig.
+        s.update_agent_field(&id, "rig", "claude").unwrap();
+        assert_eq!(
+            s.get_agent(&id).unwrap().unwrap().rig.as_deref(),
+            Some("claude")
+        );
+        // Clear it back to the default.
+        s.update_agent_field(&id, "rig", "").unwrap();
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().rig, None);
+    }
+
+    #[test]
+    fn agent_allowance_sets_clears_and_validates() {
+        let s = store();
+        let id = s
+            .create_agent("n", "r", "t", "d", "t", "op", "subj-allw", "low", "default")
+            .unwrap();
+        assert_eq!(
+            s.get_agent(&id).unwrap().unwrap().monthly_allowance_cents,
+            None
+        );
+        s.update_agent_field(&id, "allowance", "25000").unwrap();
+        assert_eq!(
+            s.get_agent(&id).unwrap().unwrap().monthly_allowance_cents,
+            Some(25000)
+        );
+        s.update_agent_field(&id, "allowance", "").unwrap();
+        assert_eq!(
+            s.get_agent(&id).unwrap().unwrap().monthly_allowance_cents,
+            None
+        );
+        assert!(s.update_agent_field(&id, "allowance", "-5").is_err());
+        assert!(s.update_agent_field(&id, "allowance", "abc").is_err());
     }
 
     // ── agent CRUD ───────────────────────────────────────
@@ -2394,5 +3719,238 @@ mod tests {
         .unwrap();
         let v = s.list_standing("agt-1").unwrap();
         assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn list_standing_for_tenant_does_not_cross_tenant_boundary() {
+        let s = store();
+        s.create_standing(
+            "agt-1",
+            "fs",
+            None,
+            unix_now() + 60,
+            "alice",
+            "tenant-a-row",
+            "tenant-a",
+        )
+        .unwrap();
+        s.create_standing(
+            "agt-1",
+            "browser",
+            None,
+            unix_now() + 60,
+            "bob",
+            "tenant-b-row",
+            "tenant-b",
+        )
+        .unwrap();
+
+        let a = s.list_standing_for_tenant("agt-1", "tenant-a").unwrap();
+        let b = s.list_standing_for_tenant("agt-1", "tenant-b").unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].note, "tenant-a-row");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].note, "tenant-b-row");
+    }
+
+    #[test]
+    fn task_scoped_standing_only_matches_the_bound_task() {
+        let s = store();
+        s.create_scoped_standing(StandingApprovalCreate {
+            agent_id: "agt-1",
+            match_category: "fs",
+            match_path_glob: None,
+            scope_kind: Some("task"),
+            task_id: Some("task-123"),
+            session_id: None,
+            method_prefix: None,
+            workspace_path_glob: None,
+            expires_at: unix_now() + 60,
+            granted_by: "alice",
+            max_calls: None,
+            max_cost_micros: None,
+            note: "single task",
+            tenant_id: "default",
+        })
+        .unwrap();
+
+        assert!(
+            s.has_active_standing_for(StandingApprovalMatch {
+                agent_id: "agt-1",
+                category: "fs",
+                method: "tool.fs.read",
+                task_id: Some("task-123"),
+                session_id: None,
+                workspace_path: None,
+                tenant_id: Some("default"),
+                estimated_cost_micros: 0,
+                now: unix_now(),
+            })
+            .unwrap()
+        );
+        assert!(
+            !s.has_active_standing_for(StandingApprovalMatch {
+                agent_id: "agt-1",
+                category: "fs",
+                method: "tool.fs.read",
+                task_id: Some("task-999"),
+                session_id: None,
+                workspace_path: None,
+                tenant_id: Some("default"),
+                estimated_cost_micros: 0,
+                now: unix_now(),
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn method_prefix_scoped_standing_is_not_a_category_wide_bypass() {
+        let s = store();
+        s.create_scoped_standing(StandingApprovalCreate {
+            agent_id: "agt-1",
+            match_category: "browser",
+            match_path_glob: None,
+            scope_kind: Some("method_prefix"),
+            task_id: None,
+            session_id: None,
+            method_prefix: Some("tool.web_read"),
+            workspace_path_glob: None,
+            expires_at: unix_now() + 60,
+            granted_by: "alice",
+            max_calls: None,
+            max_cost_micros: None,
+            note: "read-only browsing",
+            tenant_id: "default",
+        })
+        .unwrap();
+
+        assert!(
+            s.has_active_standing_for(StandingApprovalMatch {
+                agent_id: "agt-1",
+                category: "browser",
+                method: "tool.web_read",
+                task_id: None,
+                session_id: None,
+                workspace_path: None,
+                tenant_id: Some("default"),
+                estimated_cost_micros: 0,
+                now: unix_now(),
+            })
+            .unwrap()
+        );
+        assert!(
+            !s.has_active_standing_for(StandingApprovalMatch {
+                agent_id: "agt-1",
+                category: "browser",
+                method: "tool.web_submit_form",
+                task_id: None,
+                session_id: None,
+                workspace_path: None,
+                tenant_id: Some("default"),
+                estimated_cost_micros: 0,
+                now: unix_now(),
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn bounded_standing_approval_is_consumed_until_exhausted() {
+        let s = store();
+        let id = s
+            .create_scoped_standing(StandingApprovalCreate {
+                agent_id: "agt-1",
+                match_category: "fs",
+                match_path_glob: None,
+                scope_kind: Some("agent_category"),
+                task_id: None,
+                session_id: None,
+                method_prefix: None,
+                workspace_path_glob: None,
+                expires_at: unix_now() + 60,
+                granted_by: "alice",
+                max_calls: Some(2),
+                max_cost_micros: None,
+                note: "two calls",
+                tenant_id: "default",
+            })
+            .unwrap();
+        let input = || StandingApprovalMatch {
+            agent_id: "agt-1",
+            category: "fs",
+            method: "tool.fs.read",
+            task_id: None,
+            session_id: None,
+            workspace_path: None,
+            tenant_id: Some("default"),
+            estimated_cost_micros: 0,
+            now: unix_now(),
+        };
+
+        assert_eq!(
+            s.consume_active_standing_for(input()).unwrap().as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(
+            s.consume_active_standing_for(input()).unwrap().as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(s.consume_active_standing_for(input()).unwrap(), None);
+        assert!(!s.has_active_standing_for(input()).unwrap());
+
+        let rows = s.list_standing("agt-1").unwrap();
+        assert_eq!(rows[0].max_calls, Some(2));
+        assert_eq!(rows[0].calls_used, 2);
+    }
+
+    #[test]
+    fn cost_bounded_standing_approval_is_consumed_until_budget_exhausted() {
+        let s = store();
+        let id = s
+            .create_scoped_standing(StandingApprovalCreate {
+                agent_id: "agt-1",
+                match_category: "external_api:write",
+                match_path_glob: None,
+                scope_kind: Some("agent_category"),
+                task_id: None,
+                session_id: None,
+                method_prefix: None,
+                workspace_path_glob: None,
+                expires_at: unix_now() + 60,
+                granted_by: "alice",
+                max_calls: None,
+                max_cost_micros: Some(20_000),
+                note: "two paid calls",
+                tenant_id: "default",
+            })
+            .unwrap();
+        let input = || StandingApprovalMatch {
+            agent_id: "agt-1",
+            category: "external_api:write",
+            method: "tool.web_post",
+            task_id: None,
+            session_id: None,
+            workspace_path: None,
+            tenant_id: Some("default"),
+            estimated_cost_micros: 10_000,
+            now: unix_now(),
+        };
+
+        assert_eq!(
+            s.consume_active_standing_for(input()).unwrap().as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(
+            s.consume_active_standing_for(input()).unwrap().as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(s.consume_active_standing_for(input()).unwrap(), None);
+        assert!(!s.has_active_standing_for(input()).unwrap());
+
+        let rows = s.list_standing("agt-1").unwrap();
+        assert_eq!(rows[0].max_cost_micros, Some(20_000));
+        assert_eq!(rows[0].cost_used_micros, 20_000);
+        assert_eq!(rows[0].calls_used, 0);
     }
 }

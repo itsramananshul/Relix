@@ -84,6 +84,7 @@ async fn route_latency_log(req: Request, next: Next) -> Response {
     resp
 }
 
+mod activity;
 mod agent;
 mod agent_memory;
 mod agent_metrics;
@@ -101,17 +102,20 @@ mod audit_tenants;
 mod auth;
 mod belief;
 mod blocklist;
+mod bridge_back;
 mod browser_captures;
 mod browser_sessions;
 mod budget;
 mod capabilities;
 mod channels;
 mod chat;
+mod companion;
 mod confidence;
 #[cfg(test)]
 mod confidence_mini_mesh_test;
 mod config;
 mod config_api;
+mod control_plane;
 mod credentials;
 mod cron;
 mod dashboard;
@@ -174,6 +178,7 @@ mod sessions_obs;
 mod skills;
 mod slack;
 mod sol_validate;
+mod spine;
 mod sse;
 #[cfg(test)]
 mod streaming_mini_mesh_test;
@@ -198,6 +203,7 @@ mod validate;
 mod workflows;
 #[cfg(test)]
 mod workflows_mini_mesh_test;
+mod workspaces;
 mod ws;
 mod yaml_validate;
 
@@ -370,6 +376,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "bridge: task persistence enabled (coordinator reachable at startup)"
                     );
                 } else {
+                    if coord_cfg.required {
+                        return Err(format!(
+                            "bridge: [coordinator] required=true but alias '{}' was not discovered; refusing to start without durable task persistence",
+                            coord_cfg.alias
+                        )
+                        .into());
+                    }
                     tracing::warn!(
                         coordinator_alias = %coord_cfg.alias,
                         "bridge: [coordinator] alias configured but peer not in discovered set; task persistence disabled (chat still works)"
@@ -384,6 +397,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.mesh_client = Some(mesh_arc);
         }
         None => {
+            if state
+                .cfg
+                .coordinator
+                .as_ref()
+                .is_some_and(|coord| coord.required)
+            {
+                return Err(
+                    "bridge: [coordinator] required=true but mesh discovery did not return a client; refusing to start without durable task persistence"
+                        .into(),
+                );
+            }
             tracing::warn!(
                 "bridge discovery did not return a mesh client; chat requests will fall back to per-request transport"
             );
@@ -448,10 +472,89 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/models", get(openai::models))
         .route("/v1/info", get(openai::info))
         .route("/v1/schema", get(schema::schema))
+        .route("/v1/control-plane/spine", get(control_plane::spine))
+        .route(
+            "/v1/control-plane/dashboard",
+            get(control_plane::dashboard_manifest),
+        )
+        .route("/v1/activity/recent", get(activity::recent))
+        .route("/v1/workspaces", get(workspaces::list))
+        .route("/v1/workspaces", post(workspaces::create))
+        .route("/v1/workspaces/{lease_id}", get(workspaces::get))
+        .route(
+            "/v1/workspaces/{lease_id}/release",
+            post(workspaces::release),
+        )
         .route("/v1/sessions/export", get(export::export))
         .route("/v1/chat/completions", post(openai::chat_completions))
         // Task-native read API (Track 2). Bridge stays translation-only:
         // each route is a thin forwarder to a Coordinator capability.
+        // Product-spine board page + read surface.
+        .route("/spine", get(spine::page))
+        .route("/v1/spine/companion", post(companion::handle))
+        .route("/v1/spine/guild", get(spine::guild_counts))
+        .route("/v1/spine/guild/detail", get(spine::guild_detail))
+        .route(
+            "/v1/spine/allowance/committed",
+            get(spine::allowance_committed),
+        )
+        .route("/v1/spine/board", get(spine::board_summary))
+        .route("/v1/spine/board/:column", get(spine::board_column))
+        .route("/v1/spine/roster", get(spine::roster_summary))
+        .route(
+            "/v1/spine/mandates",
+            get(spine::mandates).post(spine::create_mandate),
+        )
+        .route("/v1/spine/mandates/search", get(spine::mandate_search))
+        .route("/v1/spine/mandates/:id/tree", get(spine::mandate_tree))
+        .route("/v1/spine/mandates/:id/briefs", get(spine::mandate_briefs))
+        .route("/v1/spine/briefs/search", get(spine::brief_search))
+        .route("/v1/spine/briefs/:id", get(spine::brief_detail))
+        .route("/v1/spine/briefs/:id/wakeups", get(spine::brief_wakeups))
+        .route("/v1/spine/desk/:agent", get(spine::desk))
+        .route("/v1/spine/by-label", get(spine::by_label))
+        .route("/v1/spine/overdue", get(spine::overdue))
+        .route("/v1/spine/blocked", get(spine::blocked))
+        .route("/v1/spine/stale", get(spine::stale))
+        .route("/v1/spine/unblocked", get(spine::unblocked))
+        // Product-spine dashboard write actions.
+        .route("/v1/spine/briefs", post(spine::create_brief))
+        .route("/v1/spine/briefs/:id/move", post(spine::move_brief))
+        .route("/v1/spine/briefs/:id/pin", post(spine::pin_brief))
+        .route("/v1/spine/briefs/:id/comment", post(spine::comment_brief))
+        .route("/v1/spine/briefs/:id/due", post(spine::set_due))
+        .route("/v1/spine/briefs/:id/set", post(spine::set_field))
+        .route("/v1/spine/briefs/:id/snag", post(spine::add_snag))
+        .route("/v1/spine/briefs/:id/unsnag", post(spine::remove_snag))
+        .route("/v1/spine/briefs/:id/subbrief", post(spine::add_subbrief))
+        // Rig bridge-back surface. These routes are exempt from
+        // the global bridge bearer in auth middleware, but each
+        // handler validates its per-Shift `brt_*` token with the
+        // coordinator before forwarding a narrow Brief-local call.
+        .route(
+            "/v1/bridge-back/briefs/:id/comment",
+            post(bridge_back::comment),
+        )
+        .route(
+            "/v1/bridge-back/briefs/:id/subbrief",
+            post(bridge_back::subbrief),
+        )
+        .route(
+            "/v1/bridge-back/briefs/:id/dossier",
+            post(bridge_back::dossier),
+        )
+        .route(
+            "/v1/bridge-back/briefs/:id/snags",
+            post(bridge_back::set_snags),
+        )
+        .route(
+            "/v1/bridge-back/briefs/:id/clearance",
+            post(bridge_back::clearance),
+        )
+        .route(
+            "/v1/bridge-back/briefs/:id/claim-holder",
+            post(bridge_back::claim_holder),
+        )
         .route("/v1/tasks", get(tasks::list))
         .route("/v1/tasks/count", get(tasks::count))
         .route("/v1/tasks/cursor", get(tasks::list_cursor))

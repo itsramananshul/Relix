@@ -29,7 +29,9 @@ use serde_json::Value;
 use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
+use crate::activity::{ToolInvocationActivity, append_tool_invocation_activity};
 use crate::config::AppState;
+use crate::tenant::{DEFAULT_TENANT, current_subject, current_tenant};
 
 const DEFAULT_PEER: &str = "email";
 
@@ -37,6 +39,8 @@ const DEFAULT_PEER: &str = "email";
 pub struct ApiError {
     pub error: String,
 }
+
+type ErrorReply = (StatusCode, Json<ApiError>);
 
 /// `POST /v1/email/send` — send a plain / HTML email.
 ///
@@ -110,6 +114,11 @@ pub async fn send(
                 .into_response();
         }
     }
+    let task_id = match clean_optional_id(req.task_id.as_deref(), "task_id") {
+        Ok(id) => id,
+        Err(resp) => return resp.into_response(),
+    };
+    let run_id = clean_optional(req.run_id.as_deref());
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let args = serde_json::json!({
         "to": req.to,
@@ -123,9 +132,32 @@ pub async fn send(
         "references": req.references,
         "attachments": req.attachments,
     });
-    match call_peer_json(&state, &peer, "email.send", &args).await {
-        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
-        Err(resp) => resp,
+    match call_peer_json(&state, &peer, "email.send", &args, task_id.as_deref()).await {
+        Ok(mut body) => {
+            attach_scope(&mut body, task_id.as_deref(), run_id.as_deref());
+            record_email_activity(
+                &state,
+                &peer,
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "email.send",
+                "ok",
+                send_detail(&args).as_str(),
+            );
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(resp) => {
+            record_email_activity(
+                &state,
+                &peer,
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "email.send",
+                "err",
+                send_detail(&args).as_str(),
+            );
+            resp
+        }
     }
 }
 
@@ -153,6 +185,11 @@ pub async fn send_template(
         )
             .into_response();
     }
+    let task_id = match clean_optional_id(req.task_id.as_deref(), "task_id") {
+        Ok(id) => id,
+        Err(resp) => return resp.into_response(),
+    };
+    let run_id = clean_optional(req.run_id.as_deref());
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let args = serde_json::json!({
         "template_name": req.template_name,
@@ -164,9 +201,40 @@ pub async fn send_template(
         "references": req.references,
         "variables": req.variables,
     });
-    match call_peer_json(&state, &peer, "email.send_template", &args).await {
-        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
-        Err(resp) => resp,
+    match call_peer_json(
+        &state,
+        &peer,
+        "email.send_template",
+        &args,
+        task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(mut body) => {
+            attach_scope(&mut body, task_id.as_deref(), run_id.as_deref());
+            record_email_activity(
+                &state,
+                &peer,
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "email.send_template",
+                "ok",
+                template_detail(&args).as_str(),
+            );
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(resp) => {
+            record_email_activity(
+                &state,
+                &peer,
+                task_id.as_deref(),
+                run_id.as_deref(),
+                "email.send_template",
+                "err",
+                template_detail(&args).as_str(),
+            );
+            resp
+        }
     }
 }
 
@@ -294,6 +362,10 @@ pub struct SendRequest {
     pub attachments: Vec<SendAttachment>,
     #[serde(default)]
     pub peer: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -316,6 +388,10 @@ pub struct SendTemplateRequest {
     pub variables: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub peer: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq)]
@@ -474,11 +550,120 @@ pub fn parse_status_body(body: &str) -> Option<ParsedStatus> {
 
 // ── mesh proxy helpers ───────────────────────────────────
 
+fn record_email_activity(
+    state: &AppState,
+    peer: &str,
+    task_id: Option<&str>,
+    run_id: Option<&str>,
+    method: &str,
+    decision: &str,
+    detail: &str,
+) {
+    let tenant_id = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    let actor = current_subject().unwrap_or_else(|| method.to_string());
+    if let Err(e) = append_tool_invocation_activity(
+        state.cfg.transport.data_dir.as_deref(),
+        ToolInvocationActivity {
+            tenant_id: &tenant_id,
+            actor: &actor,
+            peer,
+            method,
+            task_id,
+            run_id,
+            decision,
+            detail,
+        },
+    ) {
+        tracing::warn!(error = %e, method, "failed to append email activity");
+    }
+    if let (Some(rec), Some(task_id)) = (state.task_recorder.as_ref(), task_id) {
+        let payload = format!("peer={peer} outcome={decision} {detail}");
+        let rec = rec.clone();
+        let task_id = task_id.to_string();
+        let event_type = method.to_string();
+        tokio::spawn(async move {
+            rec.event(&task_id, &event_type, &payload).await;
+        });
+    }
+}
+
+fn attach_scope(value: &mut Value, task_id: Option<&str>, run_id: Option<&str>) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(task_id) = task_id {
+        obj.insert("task_id".into(), Value::String(task_id.to_string()));
+    }
+    if let Some(run_id) = run_id {
+        obj.insert("run_id".into(), Value::String(run_id.to_string()));
+    }
+}
+
+fn send_detail(args: &Value) -> String {
+    format!(
+        "to_count={}; cc_count={}; bcc_count={}; attachment_count={}; html={}",
+        array_len(args, "to"),
+        array_len(args, "cc"),
+        array_len(args, "bcc"),
+        array_len(args, "attachments"),
+        args.get("html").is_some_and(|v| !v.is_null())
+    )
+}
+
+fn template_detail(args: &Value) -> String {
+    let template = args
+        .get("template_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    format!(
+        "template_name={}; to_count={}; cc_count={}; bcc_count={}; variable_count={}",
+        template,
+        array_len(args, "to"),
+        array_len(args, "cc"),
+        array_len(args, "bcc"),
+        args.get("variables")
+            .and_then(Value::as_object)
+            .map(|o| o.len())
+            .unwrap_or(0)
+    )
+}
+
+fn array_len(args: &Value, key: &str) -> usize {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn clean_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn clean_optional_id(value: Option<&str>, field: &str) -> Result<Option<String>, ErrorReply> {
+    let Some(clean) = clean_optional(value) else {
+        return Ok(None);
+    };
+    if clean.len() == 32 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(Some(clean))
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: format!("{field} must be 32 hex chars"),
+            }),
+        ))
+    }
+}
+
 async fn call_peer_json(
     state: &AppState,
     alias: &str,
     method: &str,
     args: &Value,
+    task_id: Option<&str>,
 ) -> Result<Value, axum::response::Response> {
     use axum::response::IntoResponse;
     let mesh = match state.mesh_client.as_ref() {
@@ -513,7 +698,7 @@ async fn call_peer_json(
         deadline_secs,
         None,
         None,
-        None,
+        task_id.map(str::to_string),
         crate::tenant::current_tenant_or_none(),
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
@@ -710,6 +895,115 @@ mod tests {
         assert!(req.to.is_empty());
         assert!(req.subject.is_empty());
         assert!(req.body.is_empty());
+        assert!(req.task_id.is_none());
+        assert!(req.run_id.is_none());
+    }
+
+    #[test]
+    fn send_request_accepts_task_and_run_context() {
+        let req: SendRequest = serde_json::from_value(serde_json::json!({
+            "to": ["ops@example.com"],
+            "subject": "launch",
+            "body": "done",
+            "task_id": "0123456789abcdef0123456789abcdef",
+            "run_id": "run-42"
+        }))
+        .unwrap();
+        assert_eq!(
+            req.task_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(req.run_id.as_deref(), Some("run-42"));
+    }
+
+    #[test]
+    fn send_template_request_accepts_task_and_run_context() {
+        let req: SendTemplateRequest = serde_json::from_value(serde_json::json!({
+            "template_name": "incident",
+            "to": ["ops@example.com"],
+            "variables": { "severity": "high" },
+            "task_id": "abcdef0123456789abcdef0123456789",
+            "run_id": "run-43"
+        }))
+        .unwrap();
+        assert_eq!(
+            req.task_id.as_deref(),
+            Some("abcdef0123456789abcdef0123456789")
+        );
+        assert_eq!(req.run_id.as_deref(), Some("run-43"));
+    }
+
+    #[test]
+    fn attach_scope_only_mutates_object_responses() {
+        let mut obj = serde_json::json!({ "message_id": "m1" });
+        attach_scope(
+            &mut obj,
+            Some("0123456789abcdef0123456789abcdef"),
+            Some("run-1"),
+        );
+        assert_eq!(
+            obj.get("task_id").and_then(Value::as_str),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(obj.get("run_id").and_then(Value::as_str), Some("run-1"));
+
+        let mut scalar = serde_json::json!("ok");
+        attach_scope(
+            &mut scalar,
+            Some("0123456789abcdef0123456789abcdef"),
+            Some("run-1"),
+        );
+        assert_eq!(scalar, serde_json::json!("ok"));
+    }
+
+    #[test]
+    fn clean_optional_id_rejects_invalid_task_id() {
+        assert!(clean_optional_id(None, "task_id").unwrap().is_none());
+        assert_eq!(
+            clean_optional_id(Some(" 0123456789abcdef0123456789abcdef "), "task_id")
+                .unwrap()
+                .as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert!(clean_optional_id(Some("not-a-task"), "task_id").is_err());
+        assert!(clean_optional_id(Some("0123456789abcdef0123456789abcdeg"), "task_id").is_err());
+    }
+
+    #[test]
+    fn send_detail_records_counts_without_body_or_subject() {
+        let args = serde_json::json!({
+            "to": ["a@example.com", "b@example.com"],
+            "cc": ["c@example.com"],
+            "bcc": [],
+            "subject": "secret subject",
+            "body": "secret body",
+            "html": "<p>secret html</p>",
+            "attachments": [{ "path": "report.pdf" }]
+        });
+        let detail = send_detail(&args);
+        assert_eq!(
+            detail,
+            "to_count=2; cc_count=1; bcc_count=0; attachment_count=1; html=true"
+        );
+        assert!(!detail.contains("secret"));
+        assert!(!detail.contains("report.pdf"));
+    }
+
+    #[test]
+    fn template_detail_records_template_and_counts_only() {
+        let args = serde_json::json!({
+            "template_name": "incident",
+            "to": ["a@example.com"],
+            "cc": [],
+            "bcc": ["b@example.com"],
+            "variables": { "token": "secret", "severity": "high" }
+        });
+        let detail = template_detail(&args);
+        assert_eq!(
+            detail,
+            "template_name=incident; to_count=1; cc_count=0; bcc_count=1; variable_count=2"
+        );
+        assert!(!detail.contains("secret"));
     }
 
     #[test]

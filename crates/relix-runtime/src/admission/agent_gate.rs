@@ -25,11 +25,13 @@
 
 use std::sync::Arc;
 
-use relix_core::capability::CapabilityDescriptor;
+use relix_core::capability::{CapabilityDescriptor, CostClass};
 use relix_core::identity::VerifiedIdentity;
 
 use crate::approval::{ApprovalKeySet, ApprovalToken, TokenError};
-use crate::nodes::coordinator::agent::store::{AgentGateView, AgentStore, ApprovalStatus};
+use crate::nodes::coordinator::agent::store::{
+    AgentGateView, AgentStore, ApprovalStatus, StandingApprovalMatch,
+};
 use crate::transport::envelope::RequestEnvelope;
 
 /// What the gate decides about one inbound call.
@@ -506,12 +508,30 @@ fn evaluate_against_view(
                 .find(|c| view.approval_required_categories.iter().any(|r| r == *c))
                 .cloned()
                 .unwrap_or_default();
-            let standing = store
-                .has_active_standing(&view.agent_id, &matched_category, inputs.now)
-                .unwrap_or(false);
-            if standing {
+            let standing_id = store
+                .consume_active_standing_for(StandingApprovalMatch {
+                    agent_id: &view.agent_id,
+                    category: &matched_category,
+                    method: &inputs.envelope.method,
+                    task_id: inputs.envelope.task_id.as_deref().and_then(non_empty_str),
+                    session_id: inputs
+                        .envelope
+                        .session_id
+                        .as_deref()
+                        .and_then(non_empty_str),
+                    workspace_path: inputs
+                        .envelope
+                        .workspace_path
+                        .as_deref()
+                        .and_then(non_empty_str),
+                    tenant_id: inputs.envelope.tenant_id.as_deref(),
+                    estimated_cost_micros: standing_estimated_cost_micros(cap.cost_class),
+                    now: inputs.now,
+                })
+                .unwrap_or(None);
+            if let Some(standing_id) = standing_id {
                 return GateDecision::Allow(GateAllow {
-                    matched_rule: format!("standing_approval:{matched_category}"),
+                    matched_rule: format!("standing_approval:{matched_category}:{standing_id}"),
                     consumed_approval_id: None,
                 });
             }
@@ -591,10 +611,28 @@ fn risk_within_ceiling(level: &str, ceiling: &str) -> bool {
     }
 }
 
+fn non_empty_str(s: &str) -> Option<&str> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn standing_estimated_cost_micros(cost_class: CostClass) -> i64 {
+    match cost_class {
+        CostClass::Cheap => 0,
+        CostClass::Expensive => 1_000,
+        CostClass::ExternalPaid => 10_000,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::approval::ApprovalSigner;
+    use crate::nodes::coordinator::agent::store::StandingApprovalCreate;
     use relix_core::capability::RiskLevel;
     use relix_core::identity::VerifiedIdentity;
     use relix_core::types::{NodeId, RequestId, Timestamp, TraceId};
@@ -649,6 +687,8 @@ mod tests {
             surface: surface.map(|s| s.to_string()),
             approval_token: None,
             task_id: None,
+            session_id: None,
+            workspace_path: None,
             tenant_id: None,
             session_token: None,
         }
@@ -1080,6 +1120,145 @@ mod tests {
     }
 
     // ── SEC PART A — structured approval token ──────────
+
+    #[test]
+    fn task_scoped_standing_approval_does_not_admit_another_task() {
+        let (s, id) = setup_with_profile("high", "active", &[], &[], &["payments"]);
+        let agent_id = s.list_agents(None).unwrap()[0].agent_id.clone();
+        s.create_scoped_standing(StandingApprovalCreate {
+            agent_id: &agent_id,
+            match_category: "payments",
+            match_path_glob: None,
+            scope_kind: Some("task"),
+            task_id: Some("task-approved"),
+            session_id: None,
+            method_prefix: None,
+            workspace_path_glob: None,
+            expires_at: 9_999_999_999,
+            granted_by: "alice",
+            max_calls: None,
+            max_cost_micros: None,
+            note: "",
+            tenant_id: "default",
+        })
+        .unwrap();
+        let c = cap(&["payments"], &[], RiskLevel::Low);
+
+        let mut approved = env("tool.payments.refund", None);
+        approved.task_id = Some("task-approved".into());
+        assert!(matches!(
+            run(&s, &id, &approved, Some(&c)),
+            GateDecision::Allow(_)
+        ));
+
+        let mut other = env("tool.payments.refund", None);
+        other.task_id = Some("task-other".into());
+        assert!(matches!(
+            run(&s, &id, &other, Some(&c)),
+            GateDecision::RequireApproval(_)
+        ));
+    }
+
+    #[test]
+    fn session_scoped_standing_approval_matches_envelope_session_id() {
+        let (s, id) = setup_with_profile("high", "active", &[], &[], &["payments"]);
+        let agent_id = s.list_agents(None).unwrap()[0].agent_id.clone();
+        s.create_scoped_standing(StandingApprovalCreate {
+            agent_id: &agent_id,
+            match_category: "payments",
+            match_path_glob: None,
+            scope_kind: Some("session"),
+            task_id: None,
+            session_id: Some("sess-approved"),
+            method_prefix: None,
+            workspace_path_glob: None,
+            expires_at: 9_999_999_999,
+            granted_by: "alice",
+            max_calls: None,
+            max_cost_micros: None,
+            note: "",
+            tenant_id: "default",
+        })
+        .unwrap();
+        let c = cap(&["payments"], &[], RiskLevel::Low);
+
+        let mut approved = env("tool.payments.refund", None);
+        approved.session_id = Some("sess-approved".into());
+        assert!(matches!(
+            run(&s, &id, &approved, Some(&c)),
+            GateDecision::Allow(_)
+        ));
+
+        let mut other = env("tool.payments.refund", None);
+        other.session_id = Some("sess-other".into());
+        assert!(matches!(
+            run(&s, &id, &other, Some(&c)),
+            GateDecision::RequireApproval(_)
+        ));
+    }
+
+    #[test]
+    fn bounded_standing_approval_stops_admitting_after_max_calls() {
+        let (s, id) = setup_with_profile("high", "active", &[], &[], &["payments"]);
+        let agent_id = s.list_agents(None).unwrap()[0].agent_id.clone();
+        s.create_scoped_standing(StandingApprovalCreate {
+            agent_id: &agent_id,
+            match_category: "payments",
+            match_path_glob: None,
+            scope_kind: Some("agent_category"),
+            task_id: None,
+            session_id: None,
+            method_prefix: None,
+            workspace_path_glob: None,
+            expires_at: 9_999_999_999,
+            granted_by: "alice",
+            max_calls: Some(1),
+            max_cost_micros: None,
+            note: "one call only",
+            tenant_id: "default",
+        })
+        .unwrap();
+        let c = cap(&["payments"], &[], RiskLevel::Low);
+        let e = env("tool.payments.refund", None);
+
+        assert!(matches!(run(&s, &id, &e, Some(&c)), GateDecision::Allow(_)));
+        assert!(matches!(
+            run(&s, &id, &e, Some(&c)),
+            GateDecision::RequireApproval(_)
+        ));
+    }
+
+    #[test]
+    fn cost_bounded_standing_approval_stops_admitting_after_budget() {
+        let (s, id) = setup_with_profile("high", "active", &[], &[], &["payments"]);
+        let agent_id = s.list_agents(None).unwrap()[0].agent_id.clone();
+        s.create_scoped_standing(StandingApprovalCreate {
+            agent_id: &agent_id,
+            match_category: "payments",
+            match_path_glob: None,
+            scope_kind: Some("agent_category"),
+            task_id: None,
+            session_id: None,
+            method_prefix: None,
+            workspace_path_glob: None,
+            expires_at: 9_999_999_999,
+            granted_by: "alice",
+            max_calls: None,
+            max_cost_micros: Some(10_000),
+            note: "one paid call only",
+            tenant_id: "default",
+        })
+        .unwrap();
+        let mut c = cap(&["payments"], &[], RiskLevel::Low);
+        c.cost_class = CostClass::ExternalPaid;
+        let e = env("tool.payments.refund", None);
+
+        assert!(matches!(run(&s, &id, &e, Some(&c)), GateDecision::Allow(_)));
+        assert!(matches!(
+            run(&s, &id, &e, Some(&c)),
+            GateDecision::RequireApproval(_)
+        ));
+    }
 
     /// Test helper: mint an approved approval + return its
     /// freshly-signed wire token + subject_id bytes used to

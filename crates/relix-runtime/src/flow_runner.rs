@@ -39,7 +39,7 @@ use relix_core::codec;
 use relix_core::eventlog::{EventLog, EventType};
 use relix_core::types::{FlowId, RequestId, TraceId};
 
-use crate::dispatch::{build_request, decode_response};
+use crate::dispatch::{build_request_with_surface, decode_response};
 use crate::manifest::{ManifestCache, MeshClient};
 use crate::sflow;
 use crate::sol::dispatcher::{RemoteCallDispatcher, RemoteCallError, RemoteCallResult};
@@ -128,6 +128,20 @@ pub struct FlowRunOptions {
     /// providing it here keeps the two in sync. `None` means the
     /// runner generates its own.
     pub trace_id: Option<TraceId>,
+    /// Optional coordinator task id this flow is executing under.
+    /// When present, every outbound SOL `remote_call` envelope is
+    /// stamped with the same task id so responder-side approval gates,
+    /// audits, and task-pausing logic can bind risky capability calls
+    /// back to the durable work item.
+    pub task_id: Option<String>,
+    /// Optional session id this flow is executing under. Bridge chat
+    /// and OpenAI-shim flows set this so session-scoped standing
+    /// approvals can cover every tool/AI call inside the turn.
+    pub session_id: Option<String>,
+    /// Optional workspace path this flow is executing inside. Future
+    /// workspace leases can set this so workspace-scoped standing
+    /// approvals match the concrete run location.
+    pub workspace_path: Option<String>,
     /// RELIX-2 step 5: optional chunk observer. Wired by the
     /// web bridge when serving a `stream: true` chat request.
     /// Each chunk yielded by a `remote_call_stream` opcode
@@ -269,6 +283,9 @@ impl FlowRunner {
             handle: tokio::runtime::Handle::current(),
             deadline_secs: opts.deadline_secs,
             capability_cache: opts.capability_cache.clone(),
+            task_id: opts.task_id.clone(),
+            session_id: opts.session_id.clone(),
+            workspace_path: opts.workspace_path.clone(),
             mesh: opts.mesh_client.clone(),
             cancel_signal: opts.cancel_signal.clone(),
             last_confidence_cell: opts.last_confidence_cell.clone(),
@@ -520,6 +537,9 @@ struct RealDispatcher {
     handle: tokio::runtime::Handle,
     deadline_secs: i64,
     capability_cache: Option<Arc<ManifestCache>>,
+    task_id: Option<String>,
+    session_id: Option<String>,
+    workspace_path: Option<String>,
     /// When present, calls go through [`MeshClient::call`] which adds
     /// reconnect-on-transport-failure behaviour. When absent (the
     /// `relix-cli flow-run` path), we keep the original direct
@@ -588,6 +608,28 @@ impl RealDispatcher {
     }
 }
 
+fn build_flow_remote_request(
+    method: &str,
+    arg: &[u8],
+    identity: Bundle,
+    deadline_secs: i64,
+    task_id: Option<&str>,
+    session_id: Option<&str>,
+    workspace_path: Option<&str>,
+) -> Vec<u8> {
+    build_request_with_surface(
+        method.to_string(),
+        arg.to_vec(),
+        identity,
+        deadline_secs,
+        None,
+        None,
+        task_id.map(str::to_string),
+        session_id.map(str::to_string),
+        workspace_path.map(str::to_string),
+    )
+}
+
 impl RemoteCallDispatcher for RealDispatcher {
     fn remote_call(&self, peer_alias: &str, method: &str, arg: &[u8]) -> RemoteCallResult {
         // a) Resolve peer alias. Support a `capability:<method>` form (M10.3)
@@ -632,11 +674,14 @@ impl RemoteCallDispatcher for RealDispatcher {
 
         // b) Build envelope. We extract the request_id afterwards so logs and
         //    errors can correlate to the responder's audit record.
-        let envelope_bytes = build_request(
-            method.to_string(),
-            arg.to_vec(),
+        let envelope_bytes = build_flow_remote_request(
+            method,
+            arg,
             self.identity.clone(),
             self.deadline_secs,
+            self.task_id.as_deref(),
+            self.session_id.as_deref(),
+            self.workspace_path.as_deref(),
         );
         let request_id = peek_request_id(&envelope_bytes);
 
@@ -772,11 +817,14 @@ impl RemoteCallDispatcher for RealDispatcher {
         let (resolved_alias, peer_id) = self.resolve_peer(peer_alias, method)?;
         let peer_alias = resolved_alias.as_str();
 
-        let envelope_bytes = build_request(
-            method.to_string(),
-            arg.to_vec(),
+        let envelope_bytes = build_flow_remote_request(
+            method,
+            arg,
             self.identity.clone(),
             self.deadline_secs,
+            self.task_id.as_deref(),
+            self.session_id.as_deref(),
+            self.workspace_path.as_deref(),
         );
         let request_id = peek_request_id(&envelope_bytes);
 
@@ -1075,13 +1123,18 @@ fn resolve_flow_log_path(data_dir: &Option<PathBuf>, flow_id: FlowId) -> PathBuf
 // with the replay-mode VM. `relix-flow-inspect` already prints these as UTF-8.
 
 fn encode_flow_started_payload(opts: &FlowRunOptions, trace_id: TraceId) -> Vec<u8> {
-    format!(
+    let mut out = format!(
         "flow={}\ntrace_id={}\nidentity_issuer={}\n",
         opts.flow_path.display(),
         trace_id,
         opts.identity_bundle.header.kid
-    )
-    .into_bytes()
+    );
+    if let Some(task_id) = opts.task_id.as_deref() {
+        out.push_str("task_id=");
+        out.push_str(task_id);
+        out.push('\n');
+    }
+    out.into_bytes()
 }
 
 fn encode_remote_call_issued_payload(
@@ -1176,6 +1229,60 @@ mod tests {
         let p = resolve_flow_log_path(&Some(PathBuf::from("/tmp/relix-test")), FlowId([0u8; 16]));
         assert!(p.ends_with("00000000000000000000000000000000.log"));
         assert!(p.to_string_lossy().contains("/tmp/relix-test"));
+    }
+
+    #[test]
+    fn flow_remote_request_stamps_task_id_when_flow_is_task_bound() {
+        let bundle = mock_bundle();
+        let bytes = build_flow_remote_request(
+            "tool.web_fetch",
+            b"{}",
+            bundle,
+            30,
+            Some("task-123"),
+            Some("sess-123"),
+            Some("D:/work/relix"),
+        );
+        let req: crate::transport::envelope::RequestEnvelope =
+            relix_core::codec::decode(&bytes).expect("request decodes");
+        assert_eq!(req.method, "tool.web_fetch");
+        assert_eq!(req.task_id.as_deref(), Some("task-123"));
+        assert_eq!(req.session_id.as_deref(), Some("sess-123"));
+        assert_eq!(req.workspace_path.as_deref(), Some("D:/work/relix"));
+        assert!(req.surface.is_none());
+        assert!(req.approval_token.is_none());
+    }
+
+    #[test]
+    fn flow_remote_request_leaves_task_id_absent_for_standalone_runs() {
+        let bundle = mock_bundle();
+        let bytes = build_flow_remote_request("ai.chat", b"hello", bundle, 30, None, None, None);
+        let req: crate::transport::envelope::RequestEnvelope =
+            relix_core::codec::decode(&bytes).expect("request decodes");
+        assert_eq!(req.method, "ai.chat");
+        assert!(req.task_id.is_none());
+        assert!(req.session_id.is_none());
+        assert!(req.workspace_path.is_none());
+    }
+
+    fn mock_bundle() -> Bundle {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        use relix_core::identity::{IdentityBundle, issue_identity};
+        use relix_core::types::NodeId;
+
+        let root = SigningKey::generate(&mut OsRng);
+        let subject = SigningKey::generate(&mut OsRng);
+        let bundle = IdentityBundle {
+            subject_id: NodeId::from_pubkey(&subject.verifying_key().to_bytes()),
+            name: "flow-test".into(),
+            org_id: NodeId::from_pubkey(&root.verifying_key().to_bytes()),
+            groups: vec!["chat".into()],
+            role: "agent".into(),
+            clearance: "internal".into(),
+            supervisors: vec![],
+        };
+        issue_identity(bundle, &root, 3600).expect("identity issues")
     }
 
     /// Stub dispatcher used to exercise dispatcher-replacement plumbing without

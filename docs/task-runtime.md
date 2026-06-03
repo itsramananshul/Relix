@@ -302,6 +302,20 @@ process mid-session, send another `/chat` — the response comes back
 normally with `task_id` absent and the bridge log shows the structured
 WARN.
 
+That fail-soft behavior is the local/dev default, not the production ceiling.
+Production deployments can opt into fail-closed task creation:
+
+```toml
+[coordinator]
+alias = "coordinator"
+required = true
+```
+
+With `required = true`, the bridge refuses to start if the coordinator alias
+is not discovered at boot. If `task.create` fails during a request, the bridge
+returns `503 Service Unavailable` before dispatching the SOL flow. This prevents
+anonymous high-risk execution with no durable task record.
+
 Cost: 3-5 additional `/relix/rpc/1` round-trips per chat request,
 each loopback + admission-pipeline + SQLite-insert latency (single
 digit ms on a local mesh). Worth it for the durable lineage on

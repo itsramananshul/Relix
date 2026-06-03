@@ -75,7 +75,8 @@ class ChatResponse(BaseModel):
     The bridge's wire body is::
 
         { "reply": "...", "flow_id": "...", "trace_id": "...",
-          "flow_log": "...", "task_id"?: "..." }
+          "flow_log": "...", "task_id"?: "...",
+          "workspace_lease_id"?: "...", "workspace_path"?: "..." }
 
     The SDK normalises ``reply`` → ``text`` for parity with the
     TypeScript SDK and the OpenAI shim. Additional fields the bridge
@@ -89,6 +90,8 @@ class ChatResponse(BaseModel):
     trace_id: str
     flow_log: str = ""
     task_id: str | None = None
+    workspace_lease_id: str | None = None
+    workspace_path: str | None = None
     model: str | None = None
     usage: ChatUsage | None = None
 
@@ -110,6 +113,9 @@ class StreamChunk(BaseModel):
     flow_id: str | None = None
     trace_id: str | None = None
     flow_log: str | None = None
+    task_id: str | None = None
+    workspace_lease_id: str | None = None
+    workspace_path: str | None = None
 
 
 def _translate_transport_error(exc: Exception) -> RelixError:
@@ -245,6 +251,9 @@ def _sse_event_to_chunk(event: dict[str, str]) -> StreamChunk | None:
                 flow_id=parsed.get("flow_id"),
                 trace_id=parsed.get("trace_id"),
                 flow_log=parsed.get("flow_log"),
+                task_id=parsed.get("task_id"),
+                workspace_lease_id=parsed.get("workspace_lease_id"),
+                workspace_path=parsed.get("workspace_path"),
             )
         return StreamChunk(text="", done=True)
     # `event: chunk` (or no event field) — the bridge's native shape
@@ -261,6 +270,9 @@ def _sse_event_to_chunk(event: dict[str, str]) -> StreamChunk | None:
             flow_id=parsed.get("flow_id"),
             trace_id=parsed.get("trace_id"),
             flow_log=parsed.get("flow_log"),
+            task_id=parsed.get("task_id"),
+            workspace_lease_id=parsed.get("workspace_lease_id"),
+            workspace_path=parsed.get("workspace_path"),
         )
     if isinstance(parsed, str):
         return StreamChunk(text=parsed, done=False)
@@ -568,6 +580,7 @@ class RelixClient:
         message: str,
         *,
         agent: str | None = None,
+        workspace_lease_id: str | None = None,
     ) -> ChatResponse:
         """Synchronous chat call.
 
@@ -575,10 +588,15 @@ class RelixClient:
         into :class:`ChatResponse`. ``agent`` is currently informational;
         it is forwarded as a hint when the bridge's flow template
         consumes it (the alpha bridge ignores it but accepts the field).
+        ``workspace_lease_id`` binds the chat to an existing execution
+        workspace lease; the response echoes the resolved lease/path when
+        the bridge accepted that binding.
         """
         body = {"session_id": session_id, "message": message}
         if agent:
             body["agent"] = agent
+        if workspace_lease_id:
+            body["workspace_lease_id"] = workspace_lease_id
         data = self._request_sync("POST", "/chat", json_body=body)
         return ChatResponse.model_validate(data)
 
@@ -588,11 +606,14 @@ class RelixClient:
         message: str,
         *,
         agent: str | None = None,
+        workspace_lease_id: str | None = None,
     ) -> ChatResponse:
         """Asynchronous chat call. Async mirror of :meth:`chat`."""
         body = {"session_id": session_id, "message": message}
         if agent:
             body["agent"] = agent
+        if workspace_lease_id:
+            body["workspace_lease_id"] = workspace_lease_id
         data = await self._request_async("POST", "/chat", json_body=body)
         return ChatResponse.model_validate(data)
 
@@ -602,6 +623,7 @@ class RelixClient:
         message: str,
         *,
         agent: str | None = None,
+        workspace_lease_id: str | None = None,
     ) -> Iterator[StreamChunk]:
         """Synchronous streaming chat.
 
@@ -613,6 +635,8 @@ class RelixClient:
         body = {"session_id": session_id, "message": message}
         if agent:
             body["agent"] = agent
+        if workspace_lease_id:
+            body["workspace_lease_id"] = workspace_lease_id
         headers = _build_headers(
             api_key=self._api_key,
             tenant_id=self._tenant_id,
@@ -645,12 +669,15 @@ class RelixClient:
         message: str,
         *,
         agent: str | None = None,
+        workspace_lease_id: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Asynchronous streaming chat. Async mirror of :meth:`chat_stream`."""
         url = self._url("/chat/stream")
         body = {"session_id": session_id, "message": message}
         if agent:
             body["agent"] = agent
+        if workspace_lease_id:
+            body["workspace_lease_id"] = workspace_lease_id
         headers = _build_headers(
             api_key=self._api_key,
             tenant_id=self._tenant_id,

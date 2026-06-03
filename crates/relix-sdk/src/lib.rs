@@ -64,6 +64,42 @@ pub struct MemoryResult {
     pub score: Option<f32>,
 }
 
+/// Full result of a chat call, including the durable task/workspace
+/// binding the bridge created for it.
+///
+/// Phase 2 of the product spine ("task-bound execution") makes every
+/// chat an explicit task-bound run; this struct surfaces that binding
+/// to SDK callers so they can follow the run via `/v1/tasks/{task_id}`
+/// or correlate it in the activity ledger. [`RelixClient::chat`]
+/// returns just the reply text for the common case; use
+/// [`RelixClient::chat_full`] when you need the scope ids.
+///
+/// All binding fields are optional: they are `None` when the bridge
+/// has no coordinator wired (so no durable task was created) or no
+/// workspace lease was bound to the call.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChatReply {
+    /// The assistant's reply text.
+    pub reply: String,
+    /// Coordinator-side durable task id this chat created, when a
+    /// coordinator was wired and `task.create` succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Workspace lease id bound to the call, when the request carried
+    /// (or resolved) an active workspace lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_lease_id: Option<String>,
+    /// Resolved workspace path for the bound lease, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    /// Bridge flow id for the chat execution (always present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_id: Option<String>,
+    /// Bridge trace id for the chat execution (always present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+}
+
 /// Information about the running Relix bridge, returned by
 /// `GET /v1/info`. Stable across patch versions; new fields land
 /// as additive optional keys.
@@ -161,19 +197,47 @@ impl RelixClient {
     /// Uses the bridge's `POST /chat` endpoint (the native Relix
     /// shape — the OpenAI-compat shim sits alongside but is not
     /// what an SDK targets).
+    ///
+    /// This is the convenience form that discards the spine binding.
+    /// Use [`RelixClient::chat_full`] to also obtain the durable
+    /// `task_id` and workspace scope the bridge bound to the call.
     pub async fn chat(&self, prompt: &str) -> Result<String, RelixError> {
+        Ok(self.chat_full(prompt).await?.reply)
+    }
+
+    /// One-shot chat call returning the reply text together with the
+    /// durable task/workspace binding the bridge created (Phase 2 of
+    /// the product spine). Callers that want to follow or audit the
+    /// run read `task_id` off the returned [`ChatReply`].
+    pub async fn chat_full(&self, prompt: &str) -> Result<ChatReply, RelixError> {
+        self.chat_full_in_workspace(prompt, None).await
+    }
+
+    /// Like [`RelixClient::chat_full`] but binds the chat to an
+    /// existing workspace lease (Phase 4 "execution workspaces"). The
+    /// bridge resolves `workspace_lease_id` against the tenant's
+    /// active leases and stamps the resolved path into the dispatch
+    /// envelope; the resolved lease/path are echoed back on the
+    /// returned [`ChatReply`].
+    pub async fn chat_full_in_workspace(
+        &self,
+        prompt: &str,
+        workspace_lease_id: Option<&str>,
+    ) -> Result<ChatReply, RelixError> {
         let url = format!("{}/chat", self.base_url);
-        let body = serde_json::json!({
-            "session_id": new_session_id(&self.tenant),
-            "message": prompt,
-        });
+        let mut body = serde_json::Map::new();
+        body.insert("session_id".into(), new_session_id(&self.tenant).into());
+        body.insert("message".into(), prompt.into());
+        if let Some(lease) = workspace_lease_id.map(str::trim).filter(|s| !s.is_empty()) {
+            body.insert("workspace_lease_id".into(), lease.into());
+        }
         let r = self
             .http
             .post(&url)
             .header("authorization", format!("Bearer {}", self.token))
             .header("x-relix-tenant", &self.tenant)
             .header("content-type", "application/json")
-            .body(body.to_string())
+            .body(serde_json::Value::Object(body).to_string())
             .send()
             .await
             .map_err(|e| RelixError::Transport(e.to_string()))?;
@@ -188,15 +252,18 @@ impl RelixClient {
                 body: text,
             });
         }
-        let v: serde_json::Value =
+        // `POST /chat` returns `{ "reply": "...", "task_id": ..., ... }`.
+        // `ChatReply` uses `#[serde(default)]` on every optional field,
+        // so additional bridge fields (flow_log, etc.) are ignored and
+        // missing binding fields decode as `None`.
+        let reply: ChatReply =
             serde_json::from_str(&text).map_err(|e| RelixError::Decode(e.to_string()))?;
-        // `POST /chat` returns `{ "reply": "...", ... }`. Be
-        // forgiving about additional fields the bridge may add.
-        let reply = v
-            .get("reply")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| RelixError::Decode(format!("no `reply` in response: {text}")))?;
-        Ok(reply.to_string())
+        if reply.reply.is_empty() && !text.contains("\"reply\"") {
+            return Err(RelixError::Decode(format!(
+                "no `reply` in response: {text}"
+            )));
+        }
+        Ok(reply)
     }
 
     /// Streaming chat via the bridge's SSE endpoint
@@ -589,6 +656,62 @@ mod tests {
         assert!(req.starts_with("POST /chat "), "request line wrong: {req}");
         assert!(req.contains(r#""message":"hi there""#));
         assert!(req.contains(r#""session_id""#));
+    }
+
+    /// Phase 2 — chat_full surfaces the durable task binding the
+    /// bridge created so SDK callers can follow / audit the run.
+    #[tokio::test]
+    async fn chat_full_surfaces_task_and_workspace_binding() {
+        let body = r#"{"reply":"hi","flow_id":"f1","trace_id":"t1","flow_log":"/tmp/log","task_id":"task-42","workspace_lease_id":"lease-7","workspace_path":"/work/acme"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body,
+        )
+        .into_bytes();
+        let (port, handle) = one_shot_server(response).await;
+        let c = RelixClient::new(&format!("http://127.0.0.1:{port}"), "tok");
+        let reply = c
+            .chat_full_in_workspace("hi there", Some("lease-7"))
+            .await
+            .expect("chat_full");
+        assert_eq!(reply.reply, "hi");
+        assert_eq!(reply.task_id.as_deref(), Some("task-42"));
+        assert_eq!(reply.workspace_lease_id.as_deref(), Some("lease-7"));
+        assert_eq!(reply.workspace_path.as_deref(), Some("/work/acme"));
+        assert_eq!(reply.flow_id.as_deref(), Some("f1"));
+        let req = handle.await.unwrap();
+        // The workspace lease id rides the request body so the bridge
+        // can resolve + bind it.
+        assert!(
+            req.contains(r#""workspace_lease_id":"lease-7""#),
+            "lease id not sent: {req}"
+        );
+    }
+
+    /// A bridge with no coordinator wired returns no task_id; the
+    /// binding fields decode as None rather than erroring.
+    #[tokio::test]
+    async fn chat_full_tolerates_absent_binding() {
+        let body = r#"{"reply":"hi","flow_id":"f1","trace_id":"t1","flow_log":"/tmp/log"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body,
+        )
+        .into_bytes();
+        let (port, handle) = one_shot_server(response).await;
+        let c = RelixClient::new(&format!("http://127.0.0.1:{port}"), "tok");
+        let reply = c.chat_full("hi").await.expect("chat_full");
+        assert_eq!(reply.reply, "hi");
+        assert!(reply.task_id.is_none());
+        assert!(reply.workspace_lease_id.is_none());
+        let req = handle.await.unwrap();
+        // No lease id requested → not present in the body.
+        assert!(
+            !req.contains("workspace_lease_id"),
+            "unexpected lease: {req}"
+        );
     }
 
     /// PART 1 — real-server test that chat_stream() yields at
