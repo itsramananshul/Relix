@@ -50,6 +50,7 @@ pub enum CompanionAction {
     Move { id: String, status: String },
     Assign { id: String, agent: String },
     Pin { id: String, on: bool },
+    Comment { id: String, text: String },
     Overdue,
     Board,
     Search { query: String },
@@ -125,6 +126,18 @@ pub fn parse_command(message: &str) -> CompanionAction {
         && !id.is_empty()
     {
         return CompanionAction::Pin { id, on: true };
+    }
+    // "comment <id>: <text>"
+    if let Some(rest) = after("comment ")
+        && let Some(idx) = rest.find(':')
+    {
+        let id_raw = rest[..idx].trim();
+        // Allow the natural "comment on <id>:" phrasing.
+        let id = id_raw.strip_prefix("on ").unwrap_or(id_raw).trim().to_string();
+        let text = rest[idx + 1..].trim().to_string();
+        if !id.is_empty() && !text.is_empty() {
+            return CompanionAction::Comment { id, text };
+        }
     }
     // "assign <id> to <agent>"
     if let Some(rest) = after("assign ") {
@@ -221,6 +234,16 @@ pub async fn handle(
             Ok(Json(CompanionResponse {
                 action: "pin".into(),
                 reply: format!("{} {id}.", if on { "Pinned" } else { "Unpinned" }),
+                result: None,
+            }))
+        }
+        CompanionAction::Comment { id, text } => {
+            // `text` is the trailing wire field so it may contain `|`.
+            let arg = format!("{id}|operator|{text}");
+            call_peer(&state, "brief.comment", arg.as_bytes()).await?;
+            Ok(Json(CompanionResponse {
+                action: "comment".into(),
+                reply: format!("Commented on {id}."),
                 result: None,
             }))
         }
@@ -399,6 +422,20 @@ mod tests {
             parse_command("move abc to done"),
             CompanionAction::Move { id: "abc".into(), status: "done".into() }
         );
+    }
+
+    #[test]
+    fn parses_comment_with_optional_on_and_colon() {
+        assert_eq!(
+            parse_command("comment abc: looks good"),
+            CompanionAction::Comment { id: "abc".into(), text: "looks good".into() }
+        );
+        assert_eq!(
+            parse_command("comment on abc: ship it"),
+            CompanionAction::Comment { id: "abc".into(), text: "ship it".into() }
+        );
+        // Missing text → not a comment.
+        assert_eq!(parse_command("comment abc:"), CompanionAction::Unknown);
     }
 
     #[test]
