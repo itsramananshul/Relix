@@ -25,6 +25,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+pub mod bridge;
+
 /// A request to run a Brief on a Rig — what the dispatcher hands an
 /// agent backend when it wakes an Operative.
 #[derive(Clone, Debug, PartialEq, Eq)]
