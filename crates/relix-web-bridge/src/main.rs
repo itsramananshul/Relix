@@ -510,6 +510,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/briefs/:id/pin", post(spine::pin_brief))
         .route("/v1/spine/briefs/:id/comment", post(spine::comment_brief))
         .route("/v1/spine/briefs/:id/due", post(spine::set_due))
+        .route("/v1/spine/briefs/:id/set", post(spine::set_field))
         .route("/v1/tasks", get(tasks::list))
         .route("/v1/tasks/count", get(tasks::count))
         .route("/v1/tasks/cursor", get(tasks::list_cursor))

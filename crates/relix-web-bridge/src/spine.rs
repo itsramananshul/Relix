@@ -305,6 +305,30 @@ pub async fn comment_brief(
     ok_json()
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SetFieldRequest {
+    pub field: String,
+    #[serde(default)]
+    pub value: String,
+}
+
+/// `POST /v1/spine/briefs/:id/set` — set a spine field
+/// (assignee/priority/mandate/campaign). Empty value clears it
+/// (where the field allows).
+pub async fn set_field(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<SetFieldRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if !["assignee", "priority", "mandate", "campaign"].contains(&req.field.as_str()) {
+        return Err(bad("field must be assignee/priority/mandate/campaign"));
+    }
+    // `value` is the trailing wire field so it may contain `|`.
+    let arg = format!("{id}|{}|{}", req.field, req.value);
+    call_peer(&state, "brief.set", arg.as_bytes()).await?;
+    ok_json()
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct DueRequest {
     /// Unix seconds; null/omitted clears the due date.
@@ -560,6 +584,7 @@ mod tests {
             .route("/v1/spine/briefs/:id/move", post(move_brief))
             .route("/v1/spine/briefs/:id/pin", post(pin_brief))
             .route("/v1/spine/briefs/:id/comment", post(comment_brief))
-            .route("/v1/spine/briefs/:id/due", post(set_due));
+            .route("/v1/spine/briefs/:id/due", post(set_due))
+            .route("/v1/spine/briefs/:id/set", post(set_field));
     }
 }

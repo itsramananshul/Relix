@@ -195,6 +195,16 @@ async function openBrief(id) {
       catch(e){ alert(e.message); }
     }});
     move.append(sel," ",mv," ",pin); body.append(move);
+    // Assign + priority controls.
+    const setField = async (field, value)=>{ try { await api("/v1/spine/briefs/"+id+"/set",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({field,value})}); openBrief(id); loadBoard(); } catch(e){ alert(e.message); } };
+    const af = el("div",{className:"row"});
+    af.append(el("div",{className:"lbl",textContent:"Assignee"}));
+    const ain = el("input",{value:f.assignee_agent_id||"", placeholder:"agent id", style:"width:70%"});
+    af.append(ain, " ", el("button",{className:"ghost",textContent:"Set",onclick:()=>setField("assignee", ain.value.trim())})); body.append(af);
+    const pf = el("div",{className:"row"});
+    pf.append(el("div",{className:"lbl",textContent:"Priority"}));
+    const psel = el("select"); for (const p of ["low","normal","high","urgent"]) psel.append(el("option",{value:p,textContent:p,selected:p===f.priority}));
+    pf.append(psel, " ", el("button",{className:"ghost",textContent:"Set",onclick:()=>setField("priority", psel.value)})); body.append(pf);
     const sect = (label, items) => { if(!items||!items.length) return; const r=el("div",{className:"row"}); r.append(el("div",{className:"lbl",textContent:label})); const ul=el("ul"); for(const i of items) ul.append(el("li",{textContent:i})); r.append(ul); body.append(r); };
     sect("Labels", d.labels);
     sect("Sub-briefs", d.subbriefs);
