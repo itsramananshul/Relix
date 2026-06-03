@@ -11,18 +11,18 @@
 | `coordinator/brief.rs` | Brief board state machine (`board_transition_allowed`), priorities, the `BriefCard` / `Dossier` / `BriefFields` types. |
 | `coordinator/mod.rs` (TaskStore) | The Brief ledger: board-status moves, Claim (lease/heartbeat/release), Sub-briefs/Snags, Dossiers, spine-fields, board/ready/children-done/blocked/stale queries, progress rollups, link listings, chronicle events. |
 | `coordinator/heartbeat.rs` | The dispatch loop: `claim_ready_batch`, `dispatch_batch` (claim → run-on-Rig → advance board → release), bridge-token mint/revoke per Shift. |
-| `rig/` | The universal agent-backend contract (`Rig` trait), registry, `EchoRig`, `ProcessRig`, the Claude/Codex/Gemini subscription adapters, and the bridge-back token store. |
-| `macros/` | The **Macro** (native execute_code): `run_macro` — one script, one capped result. |
+| `rig/` | The universal agent-backend contract (`Rig` trait), registry with Guild-default `resolve`, `EchoRig`, `ProcessRig` (stdout-capped), the Claude/Codex/Gemini subscription adapters, and the bridge-back token store (per-method scope). |
+| `macros/` | The **Macro** (native execute_code): `run_macro` (capped) + `run_macro_guarded` (interpreter allowlist) + `run_macro_rpc` (split `@relix-call` tool requests from residual); `cwd` + scoped `env` for the Cell. |
 | `tradecraft/` | The **Keeper**: usage-clock Knack aging + provenance gate; the creation trigger + post-response nudge. |
-| `bench/` | The **Bench**: serverless sleep/wake workspace lifecycle (hibernate to ~$0, wake with snapshot). |
+| `bench/` | The **Bench**: serverless sleep/wake workspace lifecycle (hibernate to ~$0, wake with snapshot); `idle_active_benches` + `hibernate_idle` auto-sleep tick. |
 | `controller_runtime.rs` | Wiring: spine handlers, the shared Rig registry + `rig.list`, and the opt-in live heartbeat loop (`RELIX_HEARTBEAT_ENABLED`). |
 
 ## Capabilities (live on the mesh, in our language)
 
 **Guild** — `guild.get` · `guild.counts` · `guild.set` · `guild.set_allowance`
-**Mandate** — `mandate.create/get/list/update` · `mandate.children` · `mandate.progress` · `mandate.briefs` · `mandate.propose_strategy/approve_strategy/reject_strategy/strategy`
+**Mandate** — `mandate.create/get/list/update` · `mandate.children` · `mandate.tree` · `mandate.progress` · `mandate.briefs` · `mandate.propose_strategy/approve_strategy/reject_strategy/strategy`
 **Campaign** — `campaign.create/get/list/update` · `campaign.progress` · `campaign.briefs`
-**Brief** — `brief.move` (board) · `brief.set`/`brief.fields` · `brief.detail` (full view) · `brief.board`/`brief.board_summary` · `brief.desk` (per-Operative) · `brief.workload` · `brief.comment` · `brief.ready` · `brief.children_done` · `brief.blocked`/`brief.blocked_list` · `brief.stale_list` · `brief.subbrief`/`brief.unsubbrief`/`brief.subbriefs` · `brief.parents` (reverse) · `brief.snag`/`brief.unsnag`/`brief.snags` · `brief.blocking` (reverse) · `brief.dossier_add`/`brief.dossiers`/`brief.dossier_get` · `brief.claim`/`brief.heartbeat`/`brief.release`/`brief.claim_holder` · (plus the existing `task.*` execution surface)
+**Brief** — `brief.create` (materialize) · `brief.move` (board) · `brief.set`/`brief.fields` · `brief.detail` (full view) · `brief.board`/`brief.board_summary` · `brief.desk` (per-Operative) · `brief.workload` · `brief.comment` · `brief.ready` · `brief.children_done` · `brief.blocked`/`brief.blocked_list` · `brief.stale_list` · `brief.subbrief`/`brief.unsubbrief`/`brief.subbriefs` · `brief.parents` (reverse) · `brief.snag`/`brief.unsnag`/`brief.snags` · `brief.blocking` (reverse) · `brief.dossier_add`/`brief.dossiers`/`brief.dossier_get`/`brief.dossier_latest` · `brief.claim`/`brief.heartbeat`/`brief.release`/`brief.claim_holder` · (plus the existing `task.*` execution surface)
 **Operative / Roster** — `agent.create/get/list/update/delete/keys` · `agent.reports`/`agent.branch`/`agent.line` (org tree, cycle-guarded) · `agent.manages` · `agent.roster_summary` · `agent.allowance_committed` · the hire flow on the agent status machine
 **Rig** — `rig.list` · `rig.describe` (name + label + governance) · per-Operative `rig` field; `dispatch_batch` runs a Brief on its Rig
 **Chronicle** — `brief.board_moved` · `brief.assigned` · `brief.comment` · `brief.subbrief_added` · `brief.subbrief_removed` · `brief.snagged` · `brief.snag_cleared` · `brief.dossier_added` · Shift lifecycle: `brief.shift_done` / `brief.continued` / `brief.dispatch_failed`
