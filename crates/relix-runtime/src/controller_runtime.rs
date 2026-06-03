@@ -8769,7 +8769,7 @@ fn register_node_type_handlers(
                                 let rig_name = ags.get_agent(assignee).ok().flatten()?.rig?;
                                 reg.get(&rig_name)
                             },
-                            |card| card.title.clone(),
+                            |card| ts.compose_brief_prompt(&card.task_id, 10),
                         )
                     })
                     .await;

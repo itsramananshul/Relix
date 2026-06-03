@@ -929,6 +929,53 @@ impl TaskStore {
         Ok(())
     }
 
+    /// PHASE 5 (dispatch): compose the prompt handed to a Rig for a
+    /// Brief — its title, its Dossier headers (the plan/spec
+    /// artifacts), and the most recent comments (oldest→newest).
+    /// Best-effort: any sub-read failure simply omits that section,
+    /// degrading to at least the title. Returns an empty string for
+    /// an unknown Brief.
+    pub fn compose_brief_prompt(&self, task_id: &str, max_comments: usize) -> String {
+        let mut out = String::new();
+        // Title — the headline instruction. Scoped so the lock is
+        // dropped before the sub-reads below re-lock.
+        if let Ok(conn) = self.conn.lock() {
+            if let Ok(title) = conn.query_row(
+                "SELECT title FROM tasks WHERE task_id=?1",
+                params![task_id],
+                |r| r.get::<_, String>(0),
+            ) {
+                out.push_str(&title);
+            }
+        }
+        // Dossiers — the durable artifacts (plan/spec/notes).
+        if let Ok(docs) = self.list_dossiers(task_id) {
+            if !docs.is_empty() {
+                out.push_str("\n\nDossiers:");
+                for d in docs {
+                    out.push_str(&format!("\n- [{}] {}", d.kind, d.title));
+                }
+            }
+        }
+        // Recent comments — the conversation thread, oldest→newest.
+        if let Ok(mut comments) = self.query_events(
+            task_id,
+            0,
+            max_comments.max(1),
+            Some("brief.comment"),
+            EventOrder::Desc,
+        ) {
+            if !comments.is_empty() {
+                comments.reverse();
+                out.push_str("\n\nRecent comments:");
+                for c in comments {
+                    out.push_str(&format!("\n- {}", c.payload));
+                }
+            }
+        }
+        out
+    }
+
     /// PHASE 1 (Brief): set one of the Brief's spine fields —
     /// `assignee` / `priority` / `mandate` / `campaign`. Empty
     /// value clears assignee/mandate/campaign (NULL); `priority`
@@ -9771,6 +9818,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload, "todo -> in_progress");
+    }
+
+    #[test]
+    fn compose_brief_prompt_includes_title_dossiers_and_comments() {
+        let s = store();
+        let id = s
+            .create("Ship the auth rewrite", "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .unwrap();
+        s.add_dossier(&id, "spec", "Auth Spec", "body").unwrap();
+        s.comment_on_brief(&id, "founder", "use passkeys").unwrap();
+        s.comment_on_brief(&id, "agt_eng", "starting now").unwrap();
+
+        let prompt = s.compose_brief_prompt(&id, 10);
+        assert!(prompt.starts_with("Ship the auth rewrite"));
+        assert!(prompt.contains("[spec] Auth Spec"));
+        // Comments oldest→newest.
+        let first = prompt.find("use passkeys").unwrap();
+        let second = prompt.find("starting now").unwrap();
+        assert!(first < second, "comments should be oldest-first");
+
+        // Unknown Brief → empty string (degrades cleanly).
+        assert!(s.compose_brief_prompt("nope", 10).is_empty());
     }
 
     #[test]
