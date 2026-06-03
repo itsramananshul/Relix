@@ -62,7 +62,7 @@ pub async fn run(args: CallArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Add a trailing newline only when the body doesn't end in one,
     // so interactive use reads naturally without corrupting piping of
     // already-newline-terminated payloads.
-    if !body.last().is_some_and(|b| *b == b'\n') {
+    if body.last() != Some(&b'\n') {
         out.write_all(b"\n").ok();
     }
     Ok(())
