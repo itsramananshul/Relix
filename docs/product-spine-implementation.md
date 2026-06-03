@@ -41,11 +41,34 @@
 - The **strategy gate** is a *tenant-guarded, queryable* predicate (`strategy_approved`) with the proposed→approved/rejected state machine. ⚠️ It is **not yet enforced** — no hire/team-build path blocks on it (company-model §10.3 wants enforcement; that coupling is follow-up). Do not describe it as enforced until wired.
 
 ## Shipped this roadmap
-- **Phase 6 dashboard** — served at `/spine`, fully functional (Board/Mandates/Roster/Activity + command bar) over the `/v1/spine/*` API.
+- **Phase 6 dashboard** — served at `/spine`, functional (Board/Mandates/Roster/Activity + command bar) over the `/v1/spine/*` API.
 - **Phase 5 materialize-work** — the rule-based companion (`/v1/spine/companion`) + command bar create/move/search/etc. through the spine.
-- **Macro RPC-to-tools** parse layer (`extract_tool_calls`/`run_macro_rpc`); **Hermes Rig adapter** (`hermes_rig`, PerToolCall); the **Keeper** (`KnackLedger`) runnable in-memory.
+- **Macro RPC-to-tools** parse layer (`extract_tool_calls`/`run_macro_rpc`); the **Hermes Rig adapter** stdio placeholder; the **Keeper** (`KnackLedger`) runnable in-memory.
+
+## Known divergences from the design docs (audited 2026-06-03)
+This section is the honest ledger — where the code differs from the locked designs, so nobody (including future me) reads conformance that isn't there.
+
+**Execution & issue design** (`relix-execution-and-issue-design.md`)
+- **Board transitions are a rigid edge graph; the doc (§1.3) wants permissive target-validation + guarded side-effects.** Deliberate stricter choice — flagged, not yet reconciled.
+- **Single-pointer Claim; decision #1 LOCKED a two-pointer split** (checkout-run vs execution-run + agent-name + locked-at). Not implemented.
+- **Missing entry guards** (§1.3): `in_progress` should require an assignee + no unresolved blockers; `in_review` should require a real reviewer. Not enforced.
+- **No coalesce/defer/queue engine** (§2.3, the doc's "core") and **no conservative recovery** (retry-cap → escalation chain, §3.3 DECISION #4). Failure handling is the simple `Failed{retryable:false}→blocked` park.
+- ✅ Fixed in this pass: blockers-resolved wake (`brief.unblocked`), Snag/Sub-brief **cycle** rejection.
+
+**Company model** (`relix-company-model.md`)
+- **Strategy gate is queryable, NOT enforced** (§10.3) — no hire/team-build path blocks on `strategy_approved`. (Hire flow is now wired + tenant-guarded; the strategy→hire coupling is the remaining enforcement step.)
+- **Per-agent toggles unbuilt** (§5.2): spawn-routing (direct vs route-up), assign-scope (subtree/allowlist/project), autonomy (heartbeat/wake/concurrency), secrets allowlist.
+- **Allowance is a stored cap, not an enforced spend** (§3.6/§5.2D — no pause-on-hard-stop). No cost-tree rollup/billing code (§6.6).
+
+**Adapters / Hermes** (`relix-agent-adapters.md`, `relix-hermes-integration.md`)
+- **Tether / plugin-hook system unbuilt** (§5.11/§2.3) — the biggest gap; the existing `plugin/` host is out-of-process capability-provider, not the in-process `register(ctx)` + lifecycle-hook model.
+- **Hermes rich seam unbuilt** — `hermes_rig` is a stdio **placeholder** (now correctly `BoxLevel`); the real `/v1/runs` HTTP + MCP + `relix-bridge` plugin (PerToolCall) is future.
+- **CLI adapters omit structured-output flags** (§3.2/§3.3: `claude --output-format stream-json`, `codex exec --json`) → no token/cost capture, no `$0-but-tracked` ledger, no `CODEX_HOME` per-tenant symlink, no probe / session resume-stop.
+
+**Dashboard** (`relix-dashboard-design.md`)
+- **Vanilla served HTML, not the decided React SPA** (§1) with query-cache + left-rail IA + tenant switcher/prefix-router. Missing surfaces: **Inbox (§5), Org chart + Permissions panel (§9), Costs/Approvals (§10), issue-as-chat-thread detail (§7), Settings hub (§3)**; realtime is polling, not the §11 WebSocket.
 
 ## Remaining (needs external infra, not a tested-Rust slice)
 - **Smarter companion** — swap the rule-based parser for an LLM that composes the same `/v1/spine/*` execution path (needs a model configured).
-- **Sandboxed Cell** — container/VM isolation to safely expose `macro.run` on the mesh (the Macro core + interpreter allowlist + cwd/scoped-env are in).
-- **Persistent Keeper / Bench backends** — SQLite/worktree stores layered over the in-memory `KnackLedger` / `BenchLedger`.
+- **Sandboxed Cell** — container/VM isolation to safely expose `macro.run` (the Macro core + interpreter allowlist + cwd/scoped-env are in).
+- **Persistent Keeper / Bench backends** — SQLite/worktree stores behind the in-memory ledgers.
