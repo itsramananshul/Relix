@@ -556,6 +556,118 @@ impl TaskStore {
         }
     }
 
+    /// PHASE 1 (Brief): link `child` as a **Sub-brief** of
+    /// `parent` (a `task_edges` 'spawned' edge). Both must exist;
+    /// no self-link; idempotent. The planner-decomposition emitter.
+    pub fn link_subbrief(&self, parent: &str, child: &str) -> Result<(), CoordinatorError> {
+        self.add_brief_edge(parent, child, "spawned", "Sub-brief")
+    }
+
+    /// PHASE 1 (Brief): the Sub-briefs of `parent`, as task_ids.
+    pub fn list_subbriefs(&self, parent: &str) -> Result<Vec<String>, CoordinatorError> {
+        self.list_brief_edges(parent, "spawned")
+    }
+
+    /// PHASE 1 (Brief): record that `task` is blocked by `blocker`
+    /// — a **Snag** (a `task_edges` 'blocked_on' edge). Both must
+    /// exist; no self-block; idempotent.
+    pub fn add_snag(&self, task: &str, blocker: &str) -> Result<(), CoordinatorError> {
+        self.add_brief_edge(task, blocker, "blocked_on", "Snag")
+    }
+
+    /// PHASE 1 (Brief): the Snags on `task` — the task_ids it is
+    /// blocked by.
+    pub fn list_snags(&self, task: &str) -> Result<Vec<String>, CoordinatorError> {
+        self.list_brief_edges(task, "blocked_on")
+    }
+
+    /// PHASE 1 (Brief): is `task` blocked? True when it has at
+    /// least one Snag whose blocker has NOT reached board status
+    /// `done`. Per the locked rule, only `done` resolves a Snag —
+    /// a `cancelled` blocker stays unresolved (deliberately
+    /// unsafe to auto-clear).
+    pub fn is_blocked(&self, task: &str) -> Result<bool, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let unresolved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_edges e
+                 JOIN tasks b ON b.task_id = e.related_task_id
+                 WHERE e.task_id = ?1 AND e.edge_type = 'blocked_on'
+                   AND b.board_status != 'done'",
+                params![task],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
+        Ok(unresolved > 0)
+    }
+
+    /// Shared insert for the Brief relation edges (Sub-brief /
+    /// Snag). Validates both endpoints exist, forbids self-links,
+    /// and is idempotent on (task_id, edge_type, related_task_id).
+    fn add_brief_edge(
+        &self,
+        task_id: &str,
+        related: &str,
+        edge_type: &str,
+        label: &str,
+    ) -> Result<(), CoordinatorError> {
+        if task_id == related {
+            return Err(CoordinatorError::Invalid(format!(
+                "a Brief cannot be its own {label}"
+            )));
+        }
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        for id in [task_id, related] {
+            if !task_row_exists(&conn, id)? {
+                return Err(CoordinatorError::NotFound(id.to_string()));
+            }
+        }
+        let already = match conn.query_row(
+            "SELECT 1 FROM task_edges
+             WHERE task_id = ?1 AND edge_type = ?2 AND related_task_id = ?3 LIMIT 1",
+            params![task_id, edge_type, related],
+            |_| Ok(()),
+        ) {
+            Ok(()) => true,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(e) => return Err(CoordinatorError::Db(e)),
+        };
+        if already {
+            return Ok(());
+        }
+        let now = unix_secs();
+        conn.execute(
+            "INSERT INTO task_edges (task_id, edge_type, related_task_id, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![task_id, edge_type, related, now],
+        )
+        .map_err(CoordinatorError::Db)?;
+        Ok(())
+    }
+
+    /// Shared read for the Brief relation edges. Returns the
+    /// `related_task_id`s in insertion order.
+    fn list_brief_edges(
+        &self,
+        task_id: &str,
+        edge_type: &str,
+    ) -> Result<Vec<String>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT related_task_id FROM task_edges
+                 WHERE task_id = ?1 AND edge_type = ?2 AND related_task_id IS NOT NULL
+                 ORDER BY edge_id ASC",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows: Vec<String> = stmt
+            .query_map(params![task_id, edge_type], |r| r.get::<_, String>(0))
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// Insert a new Task. Returns the freshly-minted `task_id`
     /// (32 hex chars). Optional retry / timeout metadata defaults to
     /// "no retry, no timeout" for backwards compatibility with pre-C1
@@ -4449,6 +4561,58 @@ pub fn register(
             })),
         );
     }
+    // PHASE 1 (Brief): Sub-brief + Snag relation edges, over the
+    // reserved `task_edges` 'spawned' / 'blocked_on' types.
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.subbrief",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_subbrief(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.subbriefs",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_subbriefs(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.snag",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_snag(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.snags",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_snags(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.blocked",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_blocked(&s, &ctx) }
+            })),
+        );
+    }
     {
         let s = store.clone();
         bridge.register(
@@ -5139,6 +5303,97 @@ fn handle_brief_move(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Err(CoordinatorError::NotFound(id)) => invalid(format!("brief.move: not found: {id}")),
         Err(CoordinatorError::Invalid(m)) => invalid(format!("brief.move: {m}")),
         Err(e) => internal(format!("brief.move: {e}")),
+    }
+}
+
+/// Parse a two-field `a|b` arg shape for the Brief relation caps.
+fn parse_pair<'a>(ctx: &'a InvocationCtx, method: &str) -> Result<(&'a str, &'a str), HandlerOutcome> {
+    let raw = std::str::from_utf8(&ctx.args)
+        .map_err(|e| invalid(format!("{method} utf8: {e}")))?;
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    if parts.len() < 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+        return Err(invalid(format!("{method}: expected two ids `a|b`")));
+    }
+    Ok((parts[0].trim(), parts[1].trim()))
+}
+
+fn single_id<'a>(ctx: &'a InvocationCtx, method: &str) -> Result<&'a str, HandlerOutcome> {
+    let raw = std::str::from_utf8(&ctx.args)
+        .map_err(|e| invalid(format!("{method} utf8: {e}")))?
+        .trim();
+    if raw.is_empty() {
+        return Err(invalid(format!("{method}: task_id required")));
+    }
+    Ok(raw)
+}
+
+fn map_edge_err(method: &str, e: CoordinatorError) -> HandlerOutcome {
+    match e {
+        CoordinatorError::NotFound(id) => invalid(format!("{method}: not found: {id}")),
+        CoordinatorError::Invalid(m) => invalid(format!("{method}: {m}")),
+        other => internal(format!("{method}: {other}")),
+    }
+}
+
+/// `brief.subbrief` — link `child` as a Sub-brief of `parent`. Arg `parent|child`.
+fn handle_brief_subbrief(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let (parent, child) = match parse_pair(ctx, "brief.subbrief") {
+        Ok(p) => p,
+        Err(o) => return o,
+    };
+    match store.link_subbrief(parent, child) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.subbrief", e),
+    }
+}
+
+/// `brief.subbriefs` — list the Sub-briefs of `parent`. Arg `parent`.
+/// Returns one task_id per line.
+fn handle_brief_subbriefs(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let parent = match single_id(ctx, "brief.subbriefs") {
+        Ok(p) => p,
+        Err(o) => return o,
+    };
+    match store.list_subbriefs(parent) {
+        Ok(ids) => HandlerOutcome::Ok(ids.join("\n").into_bytes()),
+        Err(e) => map_edge_err("brief.subbriefs", e),
+    }
+}
+
+/// `brief.snag` — record that `task` is blocked by `blocker`. Arg `task|blocker`.
+fn handle_brief_snag(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let (task, blocker) = match parse_pair(ctx, "brief.snag") {
+        Ok(p) => p,
+        Err(o) => return o,
+    };
+    match store.add_snag(task, blocker) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.snag", e),
+    }
+}
+
+/// `brief.snags` — list the Snags on `task` (the ids blocking it). Arg `task`.
+fn handle_brief_snags(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task = match single_id(ctx, "brief.snags") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    match store.list_snags(task) {
+        Ok(ids) => HandlerOutcome::Ok(ids.join("\n").into_bytes()),
+        Err(e) => map_edge_err("brief.snags", e),
+    }
+}
+
+/// `brief.blocked` — is `task` blocked by an unresolved Snag? Arg `task`.
+/// Returns `true` / `false`.
+fn handle_brief_blocked(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task = match single_id(ctx, "brief.blocked") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    match store.is_blocked(task) {
+        Ok(b) => HandlerOutcome::Ok(if b { b"true".to_vec() } else { b"false".to_vec() }),
+        Err(e) => map_edge_err("brief.blocked", e),
     }
 }
 
@@ -6795,6 +7050,20 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
     Ok(())
 }
 
+/// PHASE 1 (Brief): does a Brief row exist? Helper for the
+/// relation-edge validators. Takes an already-locked connection.
+fn task_row_exists(conn: &Connection, task_id: &str) -> Result<bool, CoordinatorError> {
+    match conn.query_row(
+        "SELECT 1 FROM tasks WHERE task_id = ?1",
+        params![task_id],
+        |_| Ok(()),
+    ) {
+        Ok(()) => Ok(true),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(e) => Err(CoordinatorError::Db(e)),
+    }
+}
+
 fn new_task_id() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 16];
@@ -7778,6 +8047,58 @@ mod tests {
             s.set_board_status("nope", "todo"),
             Err(CoordinatorError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn phase1_subbriefs_and_snags_track_relations_and_blocking() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        let parent = mk("parent");
+        let c1 = mk("child-1");
+        let c2 = mk("child-2");
+        let blocker = mk("blocker");
+
+        // Sub-briefs: idempotent, ordered, no self-link, validated.
+        s.link_subbrief(&parent, &c1).unwrap();
+        s.link_subbrief(&parent, &c2).unwrap();
+        s.link_subbrief(&parent, &c1).unwrap(); // idempotent no-op
+        assert_eq!(
+            s.list_subbriefs(&parent).unwrap(),
+            vec![c1.clone(), c2.clone()]
+        );
+        assert!(s.list_subbriefs(&c1).unwrap().is_empty());
+        assert!(matches!(
+            s.link_subbrief(&parent, &parent),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        assert!(matches!(
+            s.link_subbrief(&parent, "nope"),
+            Err(CoordinatorError::NotFound(_))
+        ));
+
+        // Snags + blocking.
+        assert!(!s.is_blocked(&parent).unwrap());
+        s.add_snag(&parent, &blocker).unwrap();
+        s.add_snag(&parent, &blocker).unwrap(); // idempotent
+        assert_eq!(s.list_snags(&parent).unwrap(), vec![blocker.clone()]);
+        assert!(s.is_blocked(&parent).unwrap());
+
+        // Locked rule: a cancelled blocker stays UNRESOLVED.
+        s.set_board_status(&blocker, "cancelled").unwrap();
+        assert!(s.is_blocked(&parent).unwrap());
+
+        // Only `done` resolves a Snag.
+        let p2 = mk("parent-2");
+        let b3 = mk("blocker-3");
+        s.add_snag(&p2, &b3).unwrap();
+        assert!(s.is_blocked(&p2).unwrap());
+        for st in ["todo", "in_progress", "in_review", "done"] {
+            s.set_board_status(&b3, st).unwrap();
+        }
+        assert!(!s.is_blocked(&p2).unwrap());
     }
 
     /// File-backed open helper for the DB-hardening tests. We
