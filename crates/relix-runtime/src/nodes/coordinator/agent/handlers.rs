@@ -11,6 +11,7 @@ use relix_core::types::{ErrorEnvelope, error_kinds};
 use serde::Deserialize;
 
 use crate::dispatch::{HandlerOutcome, InvocationCtx};
+use crate::nodes::coordinator::agent::keys::{KeyVerdict, assign_verdict, spawn_verdict};
 use crate::nodes::coordinator::agent::store::{
     AgentStore, AgentStoreError, ApprovalStatus, StandingApprovalCreate,
     default_approval_categories,
@@ -23,6 +24,18 @@ use crate::nodes::coordinator::{CoordinatorError, TaskStore};
 
 /// Wire arg: `name|role|title|department|team|created_by|subject_id|risk_ceiling`
 pub fn handle_create(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    // `agent.create` mints an **active** Operative directly — the
+    // Founder/Board escape hatch. An *agent* actor must not use it to
+    // conjure a live colleague (company-model §4.4 / §5.2A): it is
+    // routed to `agent.request_hire`, which mints a pending-inert hire
+    // and is gated by the spawn Key.
+    if !caller_is_operator(ctx) {
+        return policy_denied(
+            "agent.create is operator-only; an Operative must use agent.request_hire \
+             (spawn Key + pending approval)"
+                .to_string(),
+        );
+    }
     let s = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
         Err(e) => return invalid(format!("agent.create utf8: {e}")),
@@ -66,6 +79,13 @@ pub fn handle_request_hire(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOu
             "agent.request_hire: expected `name|role|title|department|team|created_by|subject_id|risk_ceiling`".into(),
         );
     }
+    // Spawn-Key gate (company-model §5.2A): an agent actor needs
+    // `can_spawn_agents`. The Founder/Board bypasses; a denied actor
+    // never mints a hire. A `Clearance` note is surfaced on success.
+    let clearance = match enforce_spawn_key(store, ctx) {
+        Ok(c) => c,
+        Err(out) => return out,
+    };
     match store.request_hire(
         parts[0],
         parts[1],
@@ -77,7 +97,13 @@ pub fn handle_request_hire(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOu
         parts[7],
         ctx.tenant_id_or_default(),
     ) {
-        Ok(id) => HandlerOutcome::Ok(format!("{id}\n").into_bytes()),
+        Ok(id) => {
+            let mut body = format!("{id}\n");
+            if let Some(reason) = clearance {
+                body.push_str(&format!("clearance: {reason}\n"));
+            }
+            HandlerOutcome::Ok(body.into_bytes())
+        }
         Err(AgentStoreError::BadInput(m)) => invalid(m),
         Err(e) => internal(format!("agent.request_hire: {e}")),
     }
@@ -127,6 +153,12 @@ pub fn handle_request_hire_for_mandate(
         }
         Err(e) => return internal(format!("agent.request_hire_for_mandate: {e}")),
     }
+    // Strategy is approved; now the actor still needs the spawn Key
+    // (company-model §5.2A) — the two gates are independent.
+    let clearance = match enforce_spawn_key(agent_store, ctx) {
+        Ok(c) => c,
+        Err(out) => return out,
+    };
     match agent_store.request_hire(
         parts[1],
         parts[2],
@@ -138,7 +170,13 @@ pub fn handle_request_hire_for_mandate(
         parts[8],
         ctx.tenant_id_or_default(),
     ) {
-        Ok(id) => HandlerOutcome::Ok(format!("{id}\n").into_bytes()),
+        Ok(id) => {
+            let mut body = format!("{id}\n");
+            if let Some(reason) = clearance {
+                body.push_str(&format!("clearance: {reason}\n"));
+            }
+            HandlerOutcome::Ok(body.into_bytes())
+        }
         Err(AgentStoreError::BadInput(m)) => invalid(m),
         Err(e) => internal(format!("agent.request_hire_for_mandate: {e}")),
     }
@@ -816,6 +854,158 @@ pub type TaskResumeFn = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// definition of "operator".
 pub(crate) const OPERATOR_ROLES: &[&str] = &["operator", "admin"];
 
+/// True when the verified caller is the Founder/Board (an
+/// `operator` / `admin` role). This is the sovereign path
+/// (company-model §5.4) that bypasses the per-Operative org/work
+/// Keys — only an *agent*-originated call is gated by them.
+pub(crate) fn caller_is_operator(ctx: &InvocationCtx) -> bool {
+    OPERATOR_ROLES.contains(&ctx.caller.role.as_str())
+}
+
+/// Build a `POLICY_DENIED` outcome with a readable cause.
+fn policy_denied(cause: String) -> HandlerOutcome {
+    HandlerOutcome::Err(ErrorEnvelope {
+        kind: error_kinds::POLICY_DENIED,
+        cause,
+        retry_hint: 0,
+        retry_after: None,
+    })
+}
+
+/// Build a `SECURITY_DENIED` outcome with a readable cause.
+fn security_denied(cause: String) -> HandlerOutcome {
+    HandlerOutcome::Err(ErrorEnvelope {
+        kind: error_kinds::SECURITY_DENIED,
+        cause,
+        retry_hint: 0,
+        retry_after: None,
+    })
+}
+
+/// Enforce the **spawn Key** (company-model §5.2A) for a hire that an
+/// Operative actor originates. Returns:
+///
+/// - `Ok(None)` — Founder/Board path, or the actor may spawn directly:
+///   the caller proceeds to mint a pending-inert hire with no note.
+/// - `Ok(Some(reason))` — permitted but routed up (Clearance): the
+///   caller still mints a pending-inert hire and surfaces `reason`.
+/// - `Err(outcome)` — denied (no Key, or the caller has no Operative
+///   profile in this Guild); the handler returns it verbatim.
+pub(crate) fn enforce_spawn_key(
+    store: &AgentStore,
+    ctx: &InvocationCtx,
+) -> Result<Option<String>, HandlerOutcome> {
+    if caller_is_operator(ctx) {
+        return Ok(None);
+    }
+    let subject = ctx.caller.subject_id.to_string();
+    let actor = match store.get_by_subject_for_tenant(&subject, ctx.tenant_id_or_default()) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Err(security_denied(format!(
+                "spawn denied: caller `{subject}` has no Operative profile in this Guild"
+            )));
+        }
+        Err(e) => return Err(internal(format!("spawn key lookup: {e}"))),
+    };
+    match spawn_verdict(actor.can_spawn_agents, &actor.spawn_route) {
+        KeyVerdict::Allow => Ok(None),
+        KeyVerdict::Clearance { reason } => Ok(Some(reason)),
+        KeyVerdict::Deny { reason } => Err(policy_denied(format!("spawn denied: {reason}"))),
+    }
+}
+
+/// Enforce the **assign Key** (company-model §5.2B / §5.3) for an
+/// agent-originated Brief assignment to `assignee_id`. Returns:
+///
+/// - `Ok(())` — allowed, or bypassed (Founder/Board path, or the
+///   assignee value is empty i.e. the assignment is being *cleared*).
+/// - `Err(outcome)` — denied (no Key / wrong scope / no actor
+///   profile); the caller returns it verbatim.
+///
+/// Branch membership is resolved from the live org tree
+/// (`AgentStore::manages`), so `assign_scope = branch` reflects the
+/// real Branch at decision time.
+pub(crate) fn enforce_assign_key(
+    store: &AgentStore,
+    ctx: &InvocationCtx,
+    assignee_id: &str,
+) -> Result<(), HandlerOutcome> {
+    let assignee = assignee_id.trim();
+    if assignee.is_empty() {
+        // Clearing an assignee is not a grant of work.
+        return Ok(());
+    }
+    if caller_is_operator(ctx) {
+        return Ok(());
+    }
+    let subject = ctx.caller.subject_id.to_string();
+    let actor = match store.get_by_subject_for_tenant(&subject, ctx.tenant_id_or_default()) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Err(security_denied(format!(
+                "assign denied: caller `{subject}` has no Operative profile in this Guild"
+            )));
+        }
+        Err(e) => return Err(internal(format!("assign key lookup: {e}"))),
+    };
+    let in_branch = store.manages(&actor.agent_id, assignee).unwrap_or(false);
+    match assign_verdict(
+        actor.can_assign_work,
+        &actor.assign_scope,
+        &actor.assign_allowed_agents,
+        assignee,
+        in_branch,
+    ) {
+        KeyVerdict::Allow => Ok(()),
+        KeyVerdict::Clearance { reason } | KeyVerdict::Deny { reason } => {
+            Err(policy_denied(format!("assign denied: {reason}")))
+        }
+    }
+}
+
+/// `agent.assign_check` — would `actor` be permitted to assign a Brief
+/// to `assignee` under its Keys? Arg `actor_id|assignee_id`. Returns
+/// the JSON [`KeyVerdict`] (`{"decision":"allow"}` /
+/// `{"decision":"deny","reason":…}`). The queryable counterpart to the
+/// enforcement applied at `brief.set` — usable from the dashboard or a
+/// manager Operative before it tries to delegate.
+pub fn handle_assign_check(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("agent.assign_check utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(2, '|').collect();
+    if parts.len() != 2 {
+        return invalid("agent.assign_check: expected `actor_id|assignee_id`".into());
+    }
+    let actor_id = parts[0].trim();
+    let assignee_id = parts[1].trim();
+    if actor_id.is_empty() || assignee_id.is_empty() {
+        return invalid("agent.assign_check: actor_id and assignee_id required".into());
+    }
+    let actor = match store.get_agent(actor_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return invalid(format!("agent.assign_check: not found: {actor_id}")),
+        Err(e) => return internal(format!("agent.assign_check: {e}")),
+    };
+    let in_branch = match store.manages(actor_id, assignee_id) {
+        Ok(b) => b,
+        Err(e) => return internal(format!("agent.assign_check: {e}")),
+    };
+    let verdict = assign_verdict(
+        actor.can_assign_work,
+        &actor.assign_scope,
+        &actor.assign_allowed_agents,
+        assignee_id,
+        in_branch,
+    );
+    match serde_json::to_vec(&verdict) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => internal(format!("agent.assign_check encode: {e}")),
+    }
+}
+
 /// Default lifetime in seconds for a freshly-minted
 /// [`crate::approval::ApprovalToken`]. Used as the fallback
 /// when the operator did not configure
@@ -1335,6 +1525,186 @@ mod tests {
         let hire = agents.get_agent(&id).unwrap().unwrap();
         assert_eq!(hire.status, "pending");
         assert_eq!(hire.name, "Planner");
+    }
+
+    // ── Spawn-Key enforcement (company-model §5.2A) ──────────
+
+    /// The hex subject_id a `fake_ctx_with_role(_, _, seed)` actor
+    /// carries, so a test profile can be keyed to that caller.
+    fn subject_of(seed: &[u8]) -> String {
+        relix_core::types::NodeId::from_pubkey(seed).to_string()
+    }
+
+    #[test]
+    fn agent_actor_without_spawn_key_is_denied() {
+        let s = store();
+        // Actor exists but is default-deny on can_spawn_agents.
+        s.create_agent(
+            "Planner",
+            "planner",
+            "Lead planner",
+            "ops",
+            "ops",
+            "prime",
+            &subject_of(b"planner-seed"),
+            "medium",
+            "default",
+        )
+        .unwrap();
+        let arg = b"Worker|engineer|Worker|eng|eng|planner|subj-worker|medium";
+        let out = handle_request_hire(&s, &fake_ctx_with_role(arg, "planner", b"planner-seed"));
+        assert_eq!(err_kind(out), error_kinds::POLICY_DENIED);
+    }
+
+    #[test]
+    fn agent_actor_with_direct_spawn_key_mints_pending_hire() {
+        let s = store();
+        let actor = s
+            .create_agent(
+                "Planner",
+                "planner",
+                "Lead",
+                "ops",
+                "ops",
+                "prime",
+                &subject_of(b"planner-seed"),
+                "medium",
+                "default",
+            )
+            .unwrap();
+        s.update_agent_field(&actor, "can_spawn_agents", "true")
+            .unwrap();
+        s.update_agent_field(&actor, "spawn_route", "direct")
+            .unwrap();
+        let arg = b"Worker|engineer|Worker|eng|eng|planner|subj-worker|medium";
+        let body = ok_body(handle_request_hire(
+            &s,
+            &fake_ctx_with_role(arg, "planner", b"planner-seed"),
+        ));
+        // direct route: no escalation note, and the hire is pending-inert.
+        assert!(!body.contains("clearance:"), "{body}");
+        let id = body.lines().next().unwrap().trim();
+        assert_eq!(s.get_agent(id).unwrap().unwrap().status, "pending");
+    }
+
+    #[test]
+    fn agent_actor_with_founder_route_gets_clearance_note() {
+        let s = store();
+        let actor = s
+            .create_agent(
+                "Planner",
+                "planner",
+                "Lead",
+                "ops",
+                "ops",
+                "prime",
+                &subject_of(b"planner-seed"),
+                "medium",
+                "default",
+            )
+            .unwrap();
+        // can_spawn on, spawn_route stays the default ('founder').
+        s.update_agent_field(&actor, "can_spawn_agents", "true")
+            .unwrap();
+        let arg = b"Worker|engineer|Worker|eng|eng|planner|subj-worker|medium";
+        let body = ok_body(handle_request_hire(
+            &s,
+            &fake_ctx_with_role(arg, "planner", b"planner-seed"),
+        ));
+        assert!(
+            body.contains("clearance:"),
+            "founder route must surface a clearance note: {body}"
+        );
+    }
+
+    #[test]
+    fn agent_create_is_operator_only() {
+        let s = store();
+        let arg = b"Worker|engineer|Worker|eng|eng|planner|subj-worker|medium";
+        // An agent actor cannot conjure a live Operative via agent.create.
+        let out = handle_create(&s, &fake_ctx_with_role(arg, "planner", b"planner-seed"));
+        assert_eq!(err_kind(out), error_kinds::POLICY_DENIED);
+        // The Founder/Board path still works.
+        assert!(matches!(
+            handle_create(&s, &fake_ctx(arg)),
+            HandlerOutcome::Ok(_)
+        ));
+    }
+
+    #[test]
+    fn unknown_actor_spawn_is_security_denied() {
+        let s = store();
+        // Non-operator role with no Operative profile for the subject.
+        let out = handle_request_hire(
+            &s,
+            &fake_ctx_with_role(
+                b"W|engineer|W|e|e|p|subj-w|medium",
+                "planner",
+                b"ghost-seed",
+            ),
+        );
+        assert_eq!(err_kind(out), error_kinds::SECURITY_DENIED);
+    }
+
+    // ── Assign-Key verdict (company-model §5.2B / §5.3) ──────
+
+    #[test]
+    fn assign_check_branch_scope_allows_in_branch_denies_out() {
+        let s = store();
+        let mgr = s
+            .create_agent(
+                "Mgr", "planner", "Lead", "ops", "ops", "prime", "subj-mgr", "medium", "default",
+            )
+            .unwrap();
+        s.update_agent_field(&mgr, "can_assign_work", "true")
+            .unwrap();
+        s.update_agent_field(&mgr, "assign_scope", "branch")
+            .unwrap();
+        let worker = s
+            .create_agent(
+                "W", "engineer", "W", "eng", "eng", "mgr", "subj-w", "medium", "default",
+            )
+            .unwrap();
+        s.update_agent_field(&worker, "reports_to", &mgr).unwrap();
+        let outsider = s
+            .create_agent(
+                "O", "engineer", "O", "eng", "eng", "x", "subj-o", "medium", "default",
+            )
+            .unwrap();
+        let body = ok_body(handle_assign_check(
+            &s,
+            &fake_ctx(format!("{mgr}|{worker}").as_bytes()),
+        ));
+        assert!(body.contains("\"allow\""), "in-branch should allow: {body}");
+        let body = ok_body(handle_assign_check(
+            &s,
+            &fake_ctx(format!("{mgr}|{outsider}").as_bytes()),
+        ));
+        assert!(
+            body.contains("\"deny\""),
+            "out-of-branch should deny: {body}"
+        );
+    }
+
+    #[test]
+    fn assign_check_denies_without_key() {
+        let s = store();
+        let mgr = s
+            .create_agent(
+                "Mgr", "planner", "Lead", "ops", "ops", "prime", "subj-mgr", "medium", "default",
+            )
+            .unwrap();
+        let worker = s
+            .create_agent(
+                "W", "engineer", "W", "eng", "eng", "mgr", "subj-w", "medium", "default",
+            )
+            .unwrap();
+        // can_assign_work defaults false (default-deny).
+        let body = ok_body(handle_assign_check(
+            &s,
+            &fake_ctx(format!("{mgr}|{worker}").as_bytes()),
+        ));
+        assert!(body.contains("\"deny\""), "{body}");
     }
 
     #[test]

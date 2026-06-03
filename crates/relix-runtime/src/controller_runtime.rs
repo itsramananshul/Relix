@@ -3258,6 +3258,18 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // KEYS: queryable assign-Key verdict (actor → assignee). The
+    // enforcement counterpart runs at `brief.set` (assignee).
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.assign_check",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_assign_check(&s, &ctx) }
+            })),
+        );
+    }
     // PHASE 5 (companion): Roster-at-a-glance status counts.
     {
         let s = agent_store.clone();
@@ -9056,12 +9068,12 @@ fn register_node_type_handlers(
         let agent_caps: &[(&str, &str, &[&str])] = &[
             (
                 "agent.create",
-                "Create an agent profile (active immediately — the direct/admin path). Arg: name|role|title|department|team|created_by|subject_id|risk_ceiling.",
+                "Create an agent profile (active immediately — operator/admin only; an Operative actor is refused and routed to agent.request_hire). Arg: name|role|title|department|team|created_by|subject_id|risk_ceiling.",
                 &["agent", "persist"],
             ),
             (
                 "agent.request_hire",
-                "Gated creation: mint an Operative `pending` (inert until approved). Same arg shape as agent.create. Returns the new agent_id.",
+                "Gated creation: mint an Operative `pending` (inert until approved). An Operative actor needs the spawn Key (can_spawn_agents); spawn_route=lead/founder returns a `clearance:` note. Same arg shape as agent.create. Returns the new agent_id.",
                 &["agent", "persist"],
             ),
             (
@@ -9087,7 +9099,7 @@ fn register_node_type_handlers(
             ),
             (
                 "agent.update",
-                "Update one of {status, role, title, department, team, surface_allowlist, risk_ceiling, allow_categories, deny_categories, allow_sensitivity_tags, deny_sensitivity_tags, approval_required_categories, approval_timeout_secs}.",
+                "Update one of {status, role, title, department, team, surface_allowlist, risk_ceiling, allow_categories, deny_categories, allow_sensitivity_tags, deny_sensitivity_tags, approval_required_categories, approval_timeout_secs, reports_to, rig, allowance, max_concurrent_runs, wake_on_timer, wake_on_demand, can_spawn_agents, spawn_route, can_assign_work, assign_scope, assign_allowed_agents, can_manage_work, can_configure_agents, configure_scope, secret_allowlist, instruction_bundle}.",
                 &["agent", "mutate"],
             ),
             (
@@ -9128,6 +9140,11 @@ fn register_node_type_handlers(
             (
                 "agent.manages",
                 "Delegated-authority check: does a manager manage a target (target in the manager's Branch/subtree)? Arg: manager_id|target_id. Returns true/false.",
+                &["agent", "read"],
+            ),
+            (
+                "agent.assign_check",
+                "Assign-Key verdict: may `actor` assign a Brief to `assignee` under its Keys? Arg: actor_id|assignee_id. Returns the JSON KeyVerdict (allow/deny + reason). Enforcement counterpart runs at brief.set.",
                 &["agent", "read"],
             ),
             (

@@ -7043,11 +7043,13 @@ pub fn register(
     // mandate/campaign links).
     {
         let s = store.clone();
+        let a = agent_store.clone();
         bridge.register(
             "brief.set",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
-                async move { handle_brief_set(&s, &ctx) }
+                let a = a.clone();
+                async move { handle_brief_set(&s, a.as_deref(), &ctx) }
             })),
         );
     }
@@ -8526,7 +8528,11 @@ fn handle_brief_dossier_get(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOu
 /// `brief.set` — set a Brief spine field. Arg `task_id|field|value`
 /// (field = assignee/priority/mandate/campaign; empty value clears
 /// assignee/mandate/campaign).
-fn handle_brief_set(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+fn handle_brief_set(
+    store: &TaskStore,
+    agent_store: Option<&agent::AgentStore>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
     let raw = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
         Err(e) => return invalid(format!("brief.set utf8: {e}")),
@@ -8535,7 +8541,18 @@ fn handle_brief_set(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     if parts.len() < 3 {
         return invalid("brief.set: expected `task_id|field|value`".to_string());
     }
-    match store.set_brief_field(parts[0].trim(), parts[1].trim(), parts[2]) {
+    let field = parts[1].trim();
+    // Assign-Key gate (company-model §5.2B / §5.3): an agent actor may
+    // only assign a Brief within its `assign_scope`. The Founder/Board
+    // path bypasses; when no agent store is wired the check is skipped
+    // (documented gap). Other fields are unaffected.
+    if field == "assignee"
+        && let Some(astore) = agent_store
+        && let Err(out) = agent::handlers::enforce_assign_key(astore, ctx, parts[2].trim())
+    {
+        return out;
+    }
+    match store.set_brief_field(parts[0].trim(), field, parts[2]) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.set", e),
     }
@@ -12446,6 +12463,103 @@ mod tests {
             s.create_brief("acme", "t", "subj", None, None, None, Some("meh")),
             Err(CoordinatorError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn brief_set_assignee_enforces_actor_assign_key() {
+        // company-model §5.2B/§5.3: an agent actor may only assign a
+        // Brief within its assign_scope. `brief.set` consults the
+        // agent store and refuses out-of-scope assignment.
+        let tasks = store();
+        let agents = agent::AgentStore::in_memory().unwrap();
+        // Manager keyed to the test ctx subject (NodeId::from_pubkey(b"x")),
+        // can assign but only to an explicit allowlist.
+        let mgr_subject = relix_core::types::NodeId::from_pubkey(b"x").to_string();
+        let mgr = agents
+            .create_agent(
+                "Mgr",
+                "planner",
+                "Lead",
+                "ops",
+                "ops",
+                "prime",
+                &mgr_subject,
+                "medium",
+                "default",
+            )
+            .unwrap();
+        agents
+            .update_agent_field(&mgr, "can_assign_work", "true")
+            .unwrap();
+        agents
+            .update_agent_field(&mgr, "assign_scope", "specific")
+            .unwrap();
+        agents
+            .update_agent_field(&mgr, "assign_allowed_agents", "agt_allowed")
+            .unwrap();
+        let brief = tasks
+            .create_brief(
+                "default",
+                "Do the thing",
+                "subj-founder",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Out-of-allowlist assignee → denied (the agent actor has
+        // role "" via the ctx helper, so it is not the Founder path).
+        let deny = handle_brief_set(
+            &tasks,
+            Some(&agents),
+            &ctx(format!("{brief}|assignee|agt_blocked").as_bytes()),
+        );
+        assert!(
+            matches!(deny, HandlerOutcome::Err(e) if e.kind == error_kinds::POLICY_DENIED),
+            "out-of-scope assignment must be POLICY_DENIED"
+        );
+        // Allowlisted assignee → permitted and persisted.
+        let ok = handle_brief_set(
+            &tasks,
+            Some(&agents),
+            &ctx(format!("{brief}|assignee|agt_allowed").as_bytes()),
+        );
+        assert!(matches!(ok, HandlerOutcome::Ok(_)));
+        assert_eq!(
+            tasks
+                .brief_fields(&brief)
+                .unwrap()
+                .unwrap()
+                .assignee_agent_id
+                .as_deref(),
+            Some("agt_allowed")
+        );
+    }
+
+    #[test]
+    fn brief_set_assignee_founder_path_bypasses_key() {
+        // The Founder/Board (operator role) is sovereign — the assign
+        // Key gate never blocks it, even with no actor profile.
+        let tasks = store();
+        let agents = agent::AgentStore::in_memory().unwrap();
+        let brief = tasks
+            .create_brief("default", "T", "subj", None, None, None, None)
+            .unwrap();
+        let mut c = ctx(format!("{brief}|assignee|agt_any").as_bytes());
+        c.caller.role = "operator".into();
+        let ok = handle_brief_set(&tasks, Some(&agents), &c);
+        assert!(matches!(ok, HandlerOutcome::Ok(_)));
+        assert_eq!(
+            tasks
+                .brief_fields(&brief)
+                .unwrap()
+                .unwrap()
+                .assignee_agent_id
+                .as_deref(),
+            Some("agt_any")
+        );
     }
 
     #[test]
