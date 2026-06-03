@@ -76,6 +76,9 @@ pub struct Guild {
     /// The tenant id this Guild *is*.
     pub tenant_id: String,
     pub display_name: String,
+    /// The Guild's monthly **Allowance** (budget) in cents. `None`
+    /// = no cap.
+    pub monthly_allowance_cents: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -163,25 +166,55 @@ impl SpineStore {
         Ok(())
     }
 
-    /// Read a Guild by tenant id. `None` until a name is set.
+    /// Read a Guild by tenant id. `None` until a name or Allowance
+    /// is set.
     pub fn get_guild(&self, tenant_id: &str) -> Result<Option<Guild>, SpineStoreError> {
         let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
         let row = conn
             .query_row(
-                "SELECT tenant_id, display_name, created_at, updated_at
+                "SELECT tenant_id, display_name, monthly_allowance_cents,
+                        created_at, updated_at
                  FROM guilds WHERE tenant_id = ?1",
                 params![normalize_tenant(tenant_id)],
                 |r| {
                     Ok(Guild {
                         tenant_id: r.get(0)?,
                         display_name: r.get(1)?,
-                        created_at: r.get(2)?,
-                        updated_at: r.get(3)?,
+                        monthly_allowance_cents: r.get(2)?,
+                        created_at: r.get(3)?,
+                        updated_at: r.get(4)?,
                     })
                 },
             )
             .optional()?;
         Ok(row)
+    }
+
+    /// Set or clear a Guild's monthly **Allowance** (cents). `None`
+    /// clears the cap. Creates the Guild (named after the tenant) if
+    /// it doesn't exist yet.
+    pub fn set_guild_allowance(
+        &self,
+        tenant_id: &str,
+        cents: Option<i64>,
+    ) -> Result<(), SpineStoreError> {
+        if let Some(c) = cents {
+            if c < 0 {
+                return Err(SpineStoreError::BadInput("allowance must be >= 0".into()));
+            }
+        }
+        let tenant = normalize_tenant(tenant_id);
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        conn.execute(
+            "INSERT INTO guilds
+                 (tenant_id, display_name, monthly_allowance_cents, created_at, updated_at)
+             VALUES (?1, ?1, ?2, ?3, ?3)
+             ON CONFLICT(tenant_id)
+                 DO UPDATE SET monthly_allowance_cents = ?2, updated_at = ?3",
+            params![tenant, cents, now],
+        )?;
+        Ok(())
     }
 
     // ── mandates ─────────────────────────────────────────────
@@ -604,7 +637,14 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              created_at   INTEGER NOT NULL,
              updated_at   INTEGER NOT NULL
          );",
-    )
+    )?;
+    // Defensive additive column: a Guild's monthly Allowance (cents).
+    // Tolerates a guilds table created before this column existed.
+    let _ = conn.execute(
+        "ALTER TABLE guilds ADD COLUMN monthly_allowance_cents INTEGER",
+        [],
+    );
+    Ok(())
 }
 
 /// Confirm `mandate_id` exists and belongs to `tenant`, else a
@@ -751,6 +791,24 @@ mod tests {
         assert!(s.set_guild_name("acme", "  ").is_err());
         // A different tenant is a different Guild.
         assert!(s.get_guild("other").unwrap().is_none());
+
+        // Allowance: set / clear / validate; setting it on an
+        // unnamed Guild creates one named after the tenant.
+        s.set_guild_allowance("acme", Some(50_000)).unwrap();
+        assert_eq!(
+            s.get_guild("acme").unwrap().unwrap().monthly_allowance_cents,
+            Some(50_000)
+        );
+        s.set_guild_allowance("acme", None).unwrap();
+        assert_eq!(
+            s.get_guild("acme").unwrap().unwrap().monthly_allowance_cents,
+            None
+        );
+        assert!(s.set_guild_allowance("acme", Some(-1)).is_err());
+        s.set_guild_allowance("fresh", Some(100)).unwrap();
+        let g = s.get_guild("fresh").unwrap().unwrap();
+        assert_eq!(g.display_name, "fresh");
+        assert_eq!(g.monthly_allowance_cents, Some(100));
     }
 
     #[test]

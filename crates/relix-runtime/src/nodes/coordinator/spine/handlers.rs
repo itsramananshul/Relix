@@ -48,6 +48,7 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<SpineStore>) {
     cap!("campaign.update", handle_campaign_update);
     cap!("guild.get", handle_guild_get);
     cap!("guild.set", handle_guild_set);
+    cap!("guild.set_allowance", handle_guild_set_allowance);
 }
 
 // ── guild.* ───────────────────────────────────────────────
@@ -75,6 +76,30 @@ fn handle_guild_set(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(SpineStoreError::BadInput(m)) => invalid(format!("guild.set: {m}")),
         Err(e) => internal(format!("guild.set: {e}")),
+    }
+}
+
+/// `guild.set_allowance` — set the Guild's monthly Allowance in
+/// cents. Arg `cents` (empty clears the cap). Tenant from ctx.
+fn handle_guild_set_allowance(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("guild.set_allowance utf8: {e}")),
+    };
+    let cents = if raw.is_empty() {
+        None
+    } else {
+        match raw.parse::<i64>() {
+            Ok(c) => Some(c),
+            Err(_) => {
+                return invalid(format!("guild.set_allowance: not an integer: {raw}"));
+            }
+        }
+    };
+    match store.set_guild_allowance(ctx.tenant_id_or_default(), cents) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(SpineStoreError::BadInput(m)) => invalid(format!("guild.set_allowance: {m}")),
+        Err(e) => internal(format!("guild.set_allowance: {e}")),
     }
 }
 
