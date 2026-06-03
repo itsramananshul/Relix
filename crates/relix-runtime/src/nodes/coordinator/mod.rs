@@ -1818,6 +1818,47 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// PHASE 3 (supervisory wake): the **blockers-resolved** wake —
+    /// Briefs that HAD Snags (blocked_on edges) where every blocker
+    /// has now reached `done`, and the Brief itself is still active
+    /// (not done/cancelled). Per relix-execution-and-issue-design
+    /// §1.6 / §3.1.5 this is the co-equal of the children-completed
+    /// wake: the assignee of a now-unblocked Brief should be roused.
+    /// (Only `done` resolves a Snag — a `cancelled` blocker keeps the
+    /// Brief out of this list, matching `is_blocked`.)
+    pub fn list_briefs_with_blockers_resolved(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT t.task_id, t.title, t.board_status, t.priority,
+                        t.assignee_agent_id, t.mandate_id, t.campaign_id
+                 FROM tasks t
+                 WHERE t.board_status NOT IN ('done', 'cancelled')
+                   AND EXISTS (
+                       SELECT 1 FROM task_edges e
+                       WHERE e.task_id = t.task_id AND e.edge_type = 'blocked_on'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM task_edges e
+                       JOIN tasks b ON b.task_id = e.related_task_id
+                       WHERE e.task_id = t.task_id AND e.edge_type = 'blocked_on'
+                         AND b.board_status != 'done'
+                   )
+                 ORDER BY t.updated_at ASC LIMIT ?1",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// PHASE 1/2 (rollup): count a Campaign's Briefs by board
     /// column. The progress read behind a Campaign's summary.
     pub fn campaign_brief_counts(
@@ -6306,6 +6347,17 @@ pub fn register(
             })),
         );
     }
+    {
+        // PHASE 3 (supervisory wake): blockers-resolved.
+        let s = store.clone();
+        bridge.register(
+            "brief.unblocked",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_unblocked(&s, &ctx) }
+            })),
+        );
+    }
     // Spine progress rollups (Briefs-by-column for a Campaign / Mandate).
     {
         let s = store.clone();
@@ -7806,6 +7858,28 @@ fn handle_brief_children_done(store: &TaskStore, ctx: &InvocationCtx) -> Handler
             Err(e) => internal(format!("brief.children_done encode: {e}")),
         },
         Err(e) => map_edge_err("brief.children_done", e),
+    }
+}
+
+/// `brief.unblocked` — the blockers-resolved supervisory wake:
+/// active Briefs that had Snags where every blocker is now `done`.
+/// Arg `limit` (optional, default 50). JSON array of BriefCards.
+fn handle_brief_unblocked(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("brief.unblocked utf8: {e}")),
+    };
+    let limit: usize = if raw.is_empty() {
+        50
+    } else {
+        raw.parse().unwrap_or(50)
+    };
+    match store.list_briefs_with_blockers_resolved(limit) {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.unblocked encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.unblocked", e),
     }
 }
 
@@ -11083,6 +11157,53 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn blockers_resolved_wake_surfaces_newly_unblocked_briefs() {
+        let s = store();
+        let mk = |t: &str| {
+            let id = s
+                .create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap();
+            s.set_board_status(&id, "todo").unwrap();
+            id
+        };
+        let waiter = mk("waiter");
+        let blocker = mk("blocker");
+        s.add_snag(&waiter, &blocker).unwrap();
+
+        // Blocker not done → waiter is NOT in the unblocked list.
+        assert!(s.list_briefs_with_blockers_resolved(50).unwrap().is_empty());
+
+        // Finish the blocker → waiter surfaces (its last blocker is done).
+        s.set_board_status(&blocker, "in_progress").unwrap();
+        s.set_board_status(&blocker, "in_review").unwrap();
+        s.set_board_status(&blocker, "done").unwrap();
+        let unblocked: Vec<String> = s
+            .list_briefs_with_blockers_resolved(50)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.task_id)
+            .collect();
+        assert_eq!(unblocked, vec![waiter.clone()]);
+
+        // A Brief that never had blockers is never in the list.
+        let _free = mk("free");
+        assert_eq!(s.list_briefs_with_blockers_resolved(50).unwrap().len(), 1);
+
+        // A cancelled (not done) blocker does NOT resolve → excluded.
+        let w2 = mk("w2");
+        let b2 = mk("b2");
+        s.add_snag(&w2, &b2).unwrap();
+        s.set_board_status(&b2, "cancelled").unwrap();
+        let still: Vec<String> = s
+            .list_briefs_with_blockers_resolved(50)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.task_id)
+            .collect();
+        assert!(!still.contains(&w2)); // cancelled blocker keeps it blocked
     }
 
     #[test]
