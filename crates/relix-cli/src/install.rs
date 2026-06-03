@@ -684,7 +684,7 @@ fn prompt_memory_choice() -> bool {
 ///   * Qdrant already running        → continue, memory available.
 ///   * choose WITH memory + Docker up → pull/run Qdrant, continue.
 ///   * choose WITH memory + Docker DOWN → print actionable message,
-///                                        return ExitStartDocker.
+///     return ExitStartDocker.
 ///   * choose WITHOUT memory          → continue degraded (no Qdrant).
 pub async fn status_for_setup() -> SetupPreflight {
     let statuses = check_all();
@@ -710,7 +710,9 @@ pub async fn status_for_setup() -> SetupPreflight {
         // (a) WITH memory.
         if !docker_daemon_running().await {
             println!();
-            println!("Docker is not running. Start Docker Desktop, then re-run `relix setup` to enable memory.");
+            println!(
+                "Docker is not running. Start Docker Desktop, then re-run `relix setup` to enable memory."
+            );
             return SetupPreflight::ExitStartDocker;
         }
         match install_qdrant_via_docker().await {

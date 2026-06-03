@@ -415,7 +415,9 @@ mod tests {
     fn default_lifetime_is_one_year() {
         // Guards against an accidental regression back to a short lifetime.
         assert_eq!(DEFAULT_IDENTITY_LIFETIME_SECS, 365 * 24 * 60 * 60);
-        assert!(DEFAULT_RENEWAL_WINDOW_SECS < DEFAULT_IDENTITY_LIFETIME_SECS);
+        // These are constants, so check the ordering at compile time; a
+        // runtime assert on a constant draws clippy::assertions_on_constants.
+        const _: () = assert!(DEFAULT_RENEWAL_WINDOW_SECS < DEFAULT_IDENTITY_LIFETIME_SECS);
     }
 
     #[test]

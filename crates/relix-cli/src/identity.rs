@@ -682,11 +682,8 @@ fn ensure(
                         // self-healed rather than left to break boot.
                         let root_key = read_secret_key(root_key_path)?;
                         let now = now_unix_secs();
-                        match bundle.validate(
-                            &root_key.verifying_key(),
-                            BundleType::Identity,
-                            now,
-                        ) {
+                        match bundle.validate(&root_key.verifying_key(), BundleType::Identity, now)
+                        {
                             Ok(()) => {
                                 if bundle.header.needs_renewal(now, window_secs) {
                                     let days = bundle.header.seconds_until_expiry(now) / 86_400;
@@ -707,12 +704,12 @@ fn ensure(
     match reason {
         None => {
             // Healthy and outside the renewal window — report remaining life.
-            if let Ok(bytes) = fs::read(out_path) {
-                if let Ok(bundle) = codec::decode::<Bundle>(&bytes) {
-                    let days = bundle.header.seconds_until_expiry(now_unix_secs()) / 86_400;
-                    println!("ensure: {name} bundle valid ({days}d remaining); no action");
-                    return Ok(());
-                }
+            if let Ok(bytes) = fs::read(out_path)
+                && let Ok(bundle) = codec::decode::<Bundle>(&bytes)
+            {
+                let days = bundle.header.seconds_until_expiry(now_unix_secs()) / 86_400;
+                println!("ensure: {name} bundle valid ({days}d remaining); no action");
+                return Ok(());
             }
             println!("ensure: {name} bundle valid; no action");
             Ok(())
