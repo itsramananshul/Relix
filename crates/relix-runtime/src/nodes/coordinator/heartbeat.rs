@@ -79,7 +79,10 @@ pub struct DispatchRecord {
 ///     so this stays decoupled from the agent store);
 ///   - if it has a Rig: move `todo → in_progress` (work has
 ///     started), run the Rig with the prompt from `build_prompt`,
-///     and on `Done` advance `in_progress → in_review`;
+///     then advance by outcome — `Done` → `in_review`, an
+///     unrecoverable `Failed` (`retryable: false`) → `blocked` (so
+///     it isn't re-dispatched forever), a `Continue` / retryable
+///     failure stays `in_progress` for the next tick;
 ///   - if no Rig resolves: record a `Failed` outcome and leave the
 ///     board untouched (nothing ran — it re-appears next tick / the
 ///     Desk surfaces it);
@@ -129,9 +132,25 @@ where
                         bt.revoke(&token);
                     }
                 }
-                // On Done, advance to review for a human / supervisor.
-                if matches!(outcome, RigOutcome::Done { .. }) {
-                    store.set_board_status(&card.task_id, "in_review")?;
+                // Advance the board by outcome. The Brief is now
+                // `in_progress` (we either moved it or it already
+                // was), so both transitions below are legal.
+                match &outcome {
+                    // Done → review for a human / supervisor.
+                    RigOutcome::Done { .. } => {
+                        store.set_board_status(&card.task_id, "in_review")?;
+                    }
+                    // Unrecoverable failure → park in `blocked` for
+                    // attention rather than re-dispatching it forever.
+                    RigOutcome::Failed {
+                        retryable: false, ..
+                    } => {
+                        store.set_board_status(&card.task_id, "blocked")?;
+                    }
+                    // Continue / retryable failure → leave it
+                    // `in_progress`; the next tick (or a continuation)
+                    // picks it back up.
+                    _ => {}
                 }
                 DispatchRecord {
                     brief_id: card.task_id.clone(),
@@ -310,6 +329,76 @@ mod tests {
         // Nothing ran → board untouched (still todo); Claim released.
         assert_eq!(s.board_status(&a).unwrap().as_deref(), Some("todo"));
         assert!(s.claim_holder(&a).unwrap().is_none());
+    }
+
+    #[test]
+    fn dispatch_batch_parks_an_unrecoverable_failure_in_blocked() {
+        // A Rig that always fails non-retryably.
+        struct DeadRig;
+        impl Rig for DeadRig {
+            fn name(&self) -> &str {
+                "dead"
+            }
+            fn run(&self, _req: &RigRunRequest) -> RigOutcome {
+                RigOutcome::Failed {
+                    reason: "boom".to_string(),
+                    retryable: false,
+                }
+            }
+        }
+        let s = store();
+        let a = ready_brief(&s, "x", "agt_a"); // todo
+        let rig: Arc<dyn Rig> = Arc::new(DeadRig);
+
+        let records = dispatch_batch(
+            &s,
+            50,
+            300,
+            None,
+            |_: &brief::BriefCard| Some(rig.clone()),
+            |c: &brief::BriefCard| c.title.clone(),
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            records[0].outcome,
+            RigOutcome::Failed { retryable: false, .. }
+        ));
+        // Started then failed unrecoverably → parked in blocked,
+        // Claim released, and no longer ready (won't re-dispatch).
+        assert_eq!(s.board_status(&a).unwrap().as_deref(), Some("blocked"));
+        assert!(s.claim_holder(&a).unwrap().is_none());
+        assert!(s.list_ready_briefs(50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dispatch_batch_leaves_a_retryable_failure_in_progress() {
+        struct FlakyRig;
+        impl Rig for FlakyRig {
+            fn name(&self) -> &str {
+                "flaky"
+            }
+            fn run(&self, _req: &RigRunRequest) -> RigOutcome {
+                RigOutcome::Failed {
+                    reason: "transient".to_string(),
+                    retryable: true,
+                }
+            }
+        }
+        let s = store();
+        let a = ready_brief(&s, "x", "agt_a"); // todo
+        let rig: Arc<dyn Rig> = Arc::new(FlakyRig);
+        dispatch_batch(
+            &s,
+            50,
+            300,
+            None,
+            |_: &brief::BriefCard| Some(rig.clone()),
+            |c: &brief::BriefCard| c.title.clone(),
+        )
+        .unwrap();
+        // Retryable → stays in_progress so the next tick retries it.
+        assert_eq!(s.board_status(&a).unwrap().as_deref(), Some("in_progress"));
     }
 
     #[test]
