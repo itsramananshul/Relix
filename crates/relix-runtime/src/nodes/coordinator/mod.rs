@@ -148,6 +148,7 @@ pub mod brief;
 pub mod cron;
 pub mod delegate;
 pub mod event_summary;
+pub mod heartbeat;
 pub mod messaging;
 pub mod routing;
 pub mod spine;
