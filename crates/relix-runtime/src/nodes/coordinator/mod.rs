@@ -969,6 +969,41 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// PHASE 5 (Desk): an Operative's personal Desk — their in-flight
+    /// Briefs (board_status in todo/in_progress/in_review/blocked),
+    /// priority-ordered then oldest-first. Excludes
+    /// backlog/done/cancelled, so it's the "what's on my plate now"
+    /// view for the companion / per-agent dashboard.
+    pub fn list_desk_for_assignee(
+        &self,
+        assignee: &str,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, title, board_status, priority,
+                        assignee_agent_id, mandate_id, campaign_id
+                 FROM tasks
+                 WHERE assignee_agent_id = ?1
+                   AND board_status IN ('todo','in_progress','in_review','blocked')
+                 ORDER BY
+                   CASE priority
+                       WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
+                       WHEN 'normal' THEN 2 ELSE 3 END,
+                   updated_at ASC
+                 LIMIT ?2",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![assignee, lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// PHASE 2 (Desk): Briefs that are blocked right now — in a live
     /// column with at least one unresolved Snag (a blocker not yet
     /// `done`). The "blocked work" the Desk surfaces. Newest first.
@@ -5370,6 +5405,17 @@ pub fn register(
             })),
         );
     }
+    // PHASE 5 (Desk): an Operative's personal in-flight Briefs.
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.desk",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_desk(&s, &ctx) }
+            })),
+        );
+    }
     {
         let s = store.clone();
         bridge.register(
@@ -6398,6 +6444,35 @@ fn handle_brief_blocked_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerO
             Err(e) => internal(format!("brief.blocked_list encode: {e}")),
         },
         Err(e) => map_edge_err("brief.blocked_list", e),
+    }
+}
+
+/// `brief.desk` — an Operative's personal Desk: their in-flight
+/// Briefs (todo/in_progress/in_review/blocked), priority-ordered.
+/// Arg `assignee|limit` (limit default 50).
+fn handle_brief_desk(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("brief.desk utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    let assignee = parts.first().copied().map(str::trim).unwrap_or("");
+    if assignee.is_empty() {
+        return invalid("brief.desk: assignee required".to_string());
+    }
+    let limit: usize = parts
+        .get(1)
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    match store.list_desk_for_assignee(assignee, limit) {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.desk encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.desk", e),
     }
 }
 
@@ -9399,6 +9474,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload, "todo -> in_progress");
+    }
+
+    #[test]
+    fn desk_lists_an_assignees_in_flight_briefs_by_priority() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        // Two briefs for agt_a: one in_progress (high), one todo (urgent).
+        let b_hi = mk("hi");
+        s.set_brief_field(&b_hi, "assignee", "agt_a").unwrap();
+        s.set_brief_field(&b_hi, "priority", "high").unwrap();
+        s.set_board_status(&b_hi, "todo").unwrap();
+        s.set_board_status(&b_hi, "in_progress").unwrap();
+
+        let b_urgent = mk("urgent");
+        s.set_brief_field(&b_urgent, "assignee", "agt_a").unwrap();
+        s.set_brief_field(&b_urgent, "priority", "urgent").unwrap();
+        s.set_board_status(&b_urgent, "todo").unwrap();
+
+        // A done brief for agt_a is excluded from the Desk.
+        let b_done = mk("done");
+        s.set_brief_field(&b_done, "assignee", "agt_a").unwrap();
+        s.set_board_status(&b_done, "todo").unwrap();
+        s.set_board_status(&b_done, "in_progress").unwrap();
+        s.set_board_status(&b_done, "in_review").unwrap();
+        s.set_board_status(&b_done, "done").unwrap();
+
+        // A brief for someone else is not on agt_a's Desk.
+        let other = mk("other");
+        s.set_brief_field(&other, "assignee", "agt_b").unwrap();
+        s.set_board_status(&other, "todo").unwrap();
+
+        let desk = s.list_desk_for_assignee("agt_a", 50).unwrap();
+        let ids: Vec<&str> = desk.iter().map(|c| c.task_id.as_str()).collect();
+        assert_eq!(ids.len(), 2);
+        // Urgent sorts before high.
+        assert_eq!(ids[0], b_urgent);
+        assert_eq!(ids[1], b_hi);
+        assert!(!ids.contains(&b_done.as_str()));
     }
 
     #[test]
