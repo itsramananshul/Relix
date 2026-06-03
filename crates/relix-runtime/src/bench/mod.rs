@@ -133,6 +133,22 @@ impl BenchLedger {
         v.into_iter().map(|(id, _)| id).collect()
     }
 
+    /// Serverless auto-sleep tick: hibernate every Active Bench
+    /// idle past `idle_after`, taking each one's snapshot via
+    /// `snapshot` (the backend handle — a worktree path, a Modal
+    /// snapshot id, …). Returns the task_ids that were put to sleep.
+    pub fn hibernate_idle<F>(&self, now: i64, idle_after: i64, snapshot: F) -> Vec<String>
+    where
+        F: Fn(&str) -> String,
+    {
+        let candidates = self.idle_active_benches(now, idle_after);
+        for id in &candidates {
+            let snap = snapshot(id);
+            self.hibernate(id, snap);
+        }
+        candidates
+    }
+
     /// Tear a Bench down entirely (its work is done).
     pub fn release(&self, task_id: &str) {
         self.lock().remove(task_id);
@@ -208,6 +224,27 @@ mod tests {
         // Hibernating an unknown Bench is a no-op.
         b.hibernate("nope", "x");
         assert_eq!(b.state("nope"), None);
+    }
+
+    #[test]
+    fn hibernate_idle_sleeps_idle_benches_with_their_snapshot() {
+        let b = BenchLedger::new();
+        b.ensure_active("a");
+        b.ensure_active("c");
+        let far = unix_now() + 10_000;
+
+        // Snapshot fn names the handle after the bench id.
+        let slept = b.hibernate_idle(far, 3600, |id| format!("snap-{id}"));
+        assert_eq!(slept.len(), 2);
+        assert_eq!(b.state("a"), Some(WorkspaceState::Hibernated));
+        assert_eq!(b.state("c"), Some(WorkspaceState::Hibernated));
+        assert_eq!(b.snapshot_ref("a").as_deref(), Some("snap-a"));
+        assert_eq!(b.active_count(), 0);
+
+        // Nothing idle now → no-op.
+        b.ensure_active("d");
+        assert!(b.hibernate_idle(unix_now(), 3600, |_| "x".into()).is_empty());
+        assert_eq!(b.state("d"), Some(WorkspaceState::Active));
     }
 
     #[test]
