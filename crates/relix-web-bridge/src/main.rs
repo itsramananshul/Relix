@@ -492,12 +492,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/board", get(spine::board_summary))
         .route("/v1/spine/board/:column", get(spine::board_column))
         .route("/v1/spine/roster", get(spine::roster_summary))
-        .route("/v1/spine/mandates", get(spine::mandates))
+        .route(
+            "/v1/spine/mandates",
+            get(spine::mandates).post(spine::create_mandate),
+        )
         .route("/v1/spine/mandates/search", get(spine::mandate_search))
         .route("/v1/spine/briefs/search", get(spine::brief_search))
         .route("/v1/spine/briefs/:id", get(spine::brief_detail))
         .route("/v1/spine/desk/:agent", get(spine::desk))
         .route("/v1/spine/overdue", get(spine::overdue))
+        // Product-spine dashboard write actions.
+        .route("/v1/spine/briefs", post(spine::create_brief))
+        .route("/v1/spine/briefs/:id/move", post(spine::move_brief))
+        .route("/v1/spine/briefs/:id/pin", post(spine::pin_brief))
+        .route("/v1/spine/briefs/:id/comment", post(spine::comment_brief))
+        .route("/v1/spine/briefs/:id/due", post(spine::set_due))
         .route("/v1/tasks", get(tasks::list))
         .route("/v1/tasks/count", get(tasks::count))
         .route("/v1/tasks/cursor", get(tasks::list_cursor))
