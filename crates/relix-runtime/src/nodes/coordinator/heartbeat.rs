@@ -81,8 +81,9 @@ pub struct DispatchRecord {
 ///     started), run the Rig with the prompt from `build_prompt`,
 ///     then advance by outcome — `Done` → `in_review`, an
 ///     unrecoverable `Failed` (`retryable: false`) → `blocked` (so
-///     it isn't re-dispatched forever), a `Continue` / retryable
-///     failure stays `in_progress` for the next tick;
+///     it isn't re-dispatched forever), a `Continue` stays
+///     `in_progress` and chronicles its note for the next Shift, a
+///     retryable failure stays `in_progress` for the next tick;
 ///   - if no Rig resolves: record a `Failed` outcome and leave the
 ///     board untouched (nothing ran — it re-appears next tick / the
 ///     Desk surfaces it);
@@ -152,9 +153,14 @@ where
                         let _ =
                             store.append_event(&card.task_id, "brief.dispatch_failed", reason);
                     }
-                    // Continue / retryable failure → leave it
-                    // `in_progress`; the next tick (or a continuation)
-                    // picks it back up.
+                    // Durable yield → stay `in_progress` and
+                    // chronicle the note so the NEXT Shift resumes
+                    // with the continuation context.
+                    RigOutcome::Continue { note } => {
+                        let _ = store.append_event(&card.task_id, "brief.continued", note);
+                    }
+                    // Retryable failure → leave it `in_progress`; the
+                    // next tick picks it back up.
                     _ => {}
                 }
                 DispatchRecord {
@@ -431,6 +437,47 @@ mod tests {
         .unwrap();
         // Retryable → stays in_progress so the next tick retries it.
         assert_eq!(s.board_status(&a).unwrap().as_deref(), Some("in_progress"));
+    }
+
+    #[test]
+    fn dispatch_batch_chronicles_a_continue_note_and_stays_in_progress() {
+        struct YieldRig;
+        impl Rig for YieldRig {
+            fn name(&self) -> &str {
+                "yield"
+            }
+            fn run(&self, _req: &RigRunRequest) -> RigOutcome {
+                RigOutcome::Continue {
+                    note: "waiting on review".to_string(),
+                }
+            }
+        }
+        let s = store();
+        let a = ready_brief(&s, "a", "agt_a"); // todo
+        let rig: Arc<dyn Rig> = Arc::new(YieldRig);
+        dispatch_batch(
+            &s,
+            50,
+            300,
+            None,
+            |_: &brief::BriefCard| Some(rig.clone()),
+            |c: &brief::BriefCard| c.title.clone(),
+        )
+        .unwrap();
+
+        // Stays in_progress (resumable) and the note is chronicled.
+        assert_eq!(s.board_status(&a).unwrap().as_deref(), Some("in_progress"));
+        let events = s
+            .query_events(
+                &a,
+                0,
+                50,
+                Some("brief.continued"),
+                crate::nodes::coordinator::EventOrder::Desc,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload, "waiting on review");
     }
 
     #[test]
