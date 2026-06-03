@@ -130,24 +130,39 @@ pub struct AgentProfile {
     #[serde(default)]
     pub assign_allowed_agents: Vec<String>,
     /// Org Key: may this Operative reassign/override work owned by
-    /// others in its Branch? **Stored/displayed only this pass.**
+    /// others? **Enforced** on Brief management mutations.
     #[serde(default)]
     pub can_manage_work: bool,
+    /// Org Key: scope of `can_manage_work` — `any` / `branch` (only the
+    /// actor's Branch) / `specific` (`manage_allowed_agents`). Default
+    /// `specific` (narrowest).
+    #[serde(default = "default_manage_scope")]
+    pub manage_scope: String,
+    /// Org Key: explicit managed-owner allowlist used when
+    /// `manage_scope = specific`.
+    #[serde(default)]
+    pub manage_allowed_agents: Vec<String>,
     /// Org Key: may this Operative edit other Operatives' config
-    /// (instructions/Keys/budget)? **Stored/displayed only this pass.**
+    /// (profile fields / Keys / scopes)? **Enforced** on `agent.update`
+    /// / `agent.delete`.
     #[serde(default)]
     pub can_configure_agents: bool,
-    /// Org Key: scope of `can_configure_agents` — `branch` / `specific`
-    /// / `none`. Default `none`. **Stored/displayed only this pass.**
+    /// Org Key: scope of `can_configure_agents` — `any` / `branch` /
+    /// `specific` (`configure_allowed_agents`) / `none`. Default `none`.
     #[serde(default = "default_configure_scope")]
     pub configure_scope: String,
+    /// Org Key: explicit target allowlist used when
+    /// `configure_scope = specific`.
+    #[serde(default)]
+    pub configure_allowed_agents: Vec<String>,
     /// Capability Key: stored credential ids this Operative may have
-    /// injected. **Stored/displayed only this pass** — not yet read at
-    /// secret-injection time (the vault has no per-Operative read).
+    /// injected. **Enforced** for non-operator credential reads:
+    /// empty = deny-by-default, otherwise exact-id match.
     #[serde(default)]
     pub secret_allowlist: Vec<String>,
     /// The Operative's **charter** — markdown instruction bundle
-    /// (company-model §4.5). **Stored/displayed only this pass.**
+    /// (company-model §4.5). Operator-authored trusted text; surfaced
+    /// in the profile read and composed into the agent's prompt.
     #[serde(default)]
     pub instruction_bundle: String,
     pub created_at: i64,
@@ -172,6 +187,10 @@ fn default_assign_scope() -> String {
 
 fn default_configure_scope() -> String {
     "none".to_string()
+}
+
+fn default_manage_scope() -> String {
+    "specific".to_string()
 }
 
 /// The default set of capability categories that require an
@@ -742,7 +761,8 @@ impl AgentStore {
                         wake_on_timer, wake_on_demand,
                         can_spawn_agents, spawn_route, can_assign_work, assign_scope,
                         assign_allowed_agents, can_manage_work, can_configure_agents,
-                        configure_scope, secret_allowlist, instruction_bundle
+                        configure_scope, secret_allowlist, instruction_bundle,
+                        manage_scope, manage_allowed_agents, configure_allowed_agents
                  FROM agent_profiles WHERE subject_id = ?1 AND tenant_id = ?2",
                 params![subject_id, tenant],
                 row_to_agent,
@@ -796,7 +816,8 @@ impl AgentStore {
                         wake_on_timer, wake_on_demand,
                         can_spawn_agents, spawn_route, can_assign_work, assign_scope,
                         assign_allowed_agents, can_manage_work, can_configure_agents,
-                        configure_scope, secret_allowlist, instruction_bundle
+                        configure_scope, secret_allowlist, instruction_bundle,
+                        manage_scope, manage_allowed_agents, configure_allowed_agents
                  FROM agent_profiles WHERE subject_id = ?1",
                 params![subject_id],
                 row_to_agent,
@@ -1484,7 +1505,7 @@ impl AgentStore {
                 let v = value.trim();
                 if !super::keys::CONFIGURE_SCOPES.contains(&v) {
                     return Err(AgentStoreError::BadInput(format!(
-                        "configure_scope '{v}' not in branch/specific/none"
+                        "configure_scope '{v}' not in any/branch/specific/none"
                     )));
                 }
                 conn.execute(
@@ -1492,7 +1513,22 @@ impl AgentStore {
                     params![v, now, agent_id],
                 )?
             }
-            "assign_allowed_agents" | "secret_allowlist" => {
+            "manage_scope" => {
+                let v = value.trim();
+                if !super::keys::MANAGE_SCOPES.contains(&v) {
+                    return Err(AgentStoreError::BadInput(format!(
+                        "manage_scope '{v}' not in any/branch/specific"
+                    )));
+                }
+                conn.execute(
+                    "UPDATE agent_profiles SET manage_scope=?1, updated_at=?2 WHERE agent_id=?3",
+                    params![v, now, agent_id],
+                )?
+            }
+            "assign_allowed_agents"
+            | "secret_allowlist"
+            | "manage_allowed_agents"
+            | "configure_allowed_agents" => {
                 let json = normalise_string_list(value)
                     .map_err(|e| AgentStoreError::BadInput(format!("{field}: {e}")))?;
                 let sql = format!(
@@ -2518,7 +2554,8 @@ const SELECT_AGENT: &str = "SELECT agent_id, name, role, title, department, team
         max_concurrent_runs, wake_on_timer, wake_on_demand,
         can_spawn_agents, spawn_route, can_assign_work, assign_scope,
         assign_allowed_agents, can_manage_work, can_configure_agents,
-        configure_scope, secret_allowlist, instruction_bundle
+        configure_scope, secret_allowlist, instruction_bundle,
+        manage_scope, manage_allowed_agents, configure_allowed_agents
  FROM agent_profiles WHERE agent_id = ?1";
 
 /// GROUP 6 (tenant isolation): the agent-id read, additionally scoped
@@ -2534,7 +2571,8 @@ const SELECT_AGENT_FOR_TENANT: &str = "SELECT agent_id, name, role, title, depar
         max_concurrent_runs, wake_on_timer, wake_on_demand,
         can_spawn_agents, spawn_route, can_assign_work, assign_scope,
         assign_allowed_agents, can_manage_work, can_configure_agents,
-        configure_scope, secret_allowlist, instruction_bundle
+        configure_scope, secret_allowlist, instruction_bundle,
+        manage_scope, manage_allowed_agents, configure_allowed_agents
  FROM agent_profiles WHERE agent_id = ?1 AND tenant_id = ?2";
 
 const SELECT_APPROVAL: &str =
@@ -2583,7 +2621,10 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              can_configure_agents INTEGER NOT NULL DEFAULT 0,
              configure_scope TEXT NOT NULL DEFAULT 'none',
              secret_allowlist TEXT NOT NULL DEFAULT '[]',
-             instruction_bundle TEXT NOT NULL DEFAULT ''
+             instruction_bundle TEXT NOT NULL DEFAULT '',
+             manage_scope TEXT NOT NULL DEFAULT 'specific',
+             manage_allowed_agents TEXT NOT NULL DEFAULT '[]',
+             configure_allowed_agents TEXT NOT NULL DEFAULT '[]'
          );
          CREATE UNIQUE INDEX IF NOT EXISTS agent_profiles_subject
              ON agent_profiles(subject_id);
@@ -2779,6 +2820,25 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         "agent_profiles",
         "instruction_bundle",
         "TEXT NOT NULL DEFAULT ''",
+    )?;
+    // Manage/Configure scope Keys (company-model §5.2A/§5.3).
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "manage_scope",
+        "TEXT NOT NULL DEFAULT 'specific'",
+    )?;
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "manage_allowed_agents",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "configure_allowed_agents",
+        "TEXT NOT NULL DEFAULT '[]'",
     )?;
     // GROUP 6: tenant isolation. Add `tenant_id` to the per-caller
     // agent/approval tables. Idempotent (ensure_column probes
@@ -3068,6 +3128,11 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
         configure_scope: r.get::<_, String>(34)?,
         secret_allowlist: parse_json_list(&r.get::<_, String>(35)?),
         instruction_bundle: r.get::<_, String>(36)?,
+        // Appended last (indices 37+) so existing positional indices
+        // above stay stable for rows written before these columns.
+        manage_scope: r.get::<_, String>(37)?,
+        manage_allowed_agents: parse_json_list(&r.get::<_, String>(38)?),
+        configure_allowed_agents: parse_json_list(&r.get::<_, String>(39)?),
     })
 }
 
@@ -3886,6 +3951,40 @@ mod tests {
     }
 
     #[test]
+    fn manage_configure_keys_default_deny_and_round_trip() {
+        let s = store();
+        let id = s
+            .create_agent("n", "r", "t", "d", "t", "c", "subj-mc", "low", "default")
+            .unwrap();
+        let p = s.get_agent(&id).unwrap().unwrap();
+        // Defaults: deny + narrowest scopes + empty allowlists.
+        assert!(!p.can_manage_work);
+        assert!(!p.can_configure_agents);
+        assert_eq!(p.manage_scope, "specific");
+        assert_eq!(p.configure_scope, "none");
+        assert!(p.manage_allowed_agents.is_empty());
+        assert!(p.configure_allowed_agents.is_empty());
+        // Grant + round-trip.
+        s.update_agent_field(&id, "can_manage_work", "true")
+            .unwrap();
+        s.update_agent_field(&id, "manage_scope", "branch").unwrap();
+        s.update_agent_field(&id, "manage_allowed_agents", "agt_m1, agt_m2")
+            .unwrap();
+        s.update_agent_field(&id, "can_configure_agents", "true")
+            .unwrap();
+        s.update_agent_field(&id, "configure_scope", "any").unwrap();
+        s.update_agent_field(&id, "configure_allowed_agents", "agt_c1")
+            .unwrap();
+        let p = s.get_agent(&id).unwrap().unwrap();
+        assert!(p.can_manage_work);
+        assert_eq!(p.manage_scope, "branch");
+        assert_eq!(p.manage_allowed_agents, vec!["agt_m1", "agt_m2"]);
+        assert!(p.can_configure_agents);
+        assert_eq!(p.configure_scope, "any");
+        assert_eq!(p.configure_allowed_agents, vec!["agt_c1"]);
+    }
+
+    #[test]
     fn org_key_scope_values_are_validated() {
         let s = store();
         let id = s
@@ -3903,6 +4002,12 @@ mod tests {
             s.update_agent_field(&id, "configure_scope", "world"),
             Err(AgentStoreError::BadInput(_))
         ));
+        assert!(matches!(
+            s.update_agent_field(&id, "manage_scope", "everyone"),
+            Err(AgentStoreError::BadInput(_))
+        ));
+        // `any` is now a valid configure_scope.
+        s.update_agent_field(&id, "configure_scope", "any").unwrap();
     }
 
     #[test]

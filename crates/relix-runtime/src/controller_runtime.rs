@@ -9148,7 +9148,7 @@ fn register_node_type_handlers(
             ),
             (
                 "agent.update",
-                "Update one of {status, role, title, department, team, surface_allowlist, risk_ceiling, allow_categories, deny_categories, allow_sensitivity_tags, deny_sensitivity_tags, approval_required_categories, approval_timeout_secs, reports_to, rig, allowance, max_concurrent_runs, wake_on_timer, wake_on_demand, can_spawn_agents, spawn_route, can_assign_work, assign_scope, assign_allowed_agents, can_manage_work, can_configure_agents, configure_scope, secret_allowlist, instruction_bundle}.",
+                "Update one of {status, role, title, department, team, surface_allowlist, risk_ceiling, allow_categories, deny_categories, allow_sensitivity_tags, deny_sensitivity_tags, approval_required_categories, approval_timeout_secs, reports_to, rig, allowance, max_concurrent_runs, wake_on_timer, wake_on_demand, can_spawn_agents, spawn_route, can_assign_work, assign_scope, assign_allowed_agents, can_manage_work, manage_scope, manage_allowed_agents, can_configure_agents, configure_scope, configure_allowed_agents, secret_allowlist, instruction_bundle}.",
                 &["agent", "mutate"],
             ),
             (

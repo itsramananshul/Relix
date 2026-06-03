@@ -55,8 +55,14 @@ pub const SPAWN_ROUTES: &[&str] = &["direct", "lead", "founder"];
 /// Valid `assign_scope` values (company-model §5.2B / §5.3).
 pub const ASSIGN_SCOPES: &[&str] = &["any", "branch", "specific"];
 
-/// Valid `configure_scope` values (company-model §5.2A).
-pub const CONFIGURE_SCOPES: &[&str] = &["branch", "specific", "none"];
+/// Valid `manage_scope` values (company-model §5.2A) — the scope of
+/// `can_manage_work` over *another* Operative's Brief.
+pub const MANAGE_SCOPES: &[&str] = &["any", "branch", "specific"];
+
+/// Valid `configure_scope` values (company-model §5.2A). `none` keeps
+/// the column's historical default-deny meaning even when the boolean
+/// `can_configure_agents` is on.
+pub const CONFIGURE_SCOPES: &[&str] = &["any", "branch", "specific", "none"];
 
 /// Normalise a stored `spawn_route`, defaulting to the safest value
 /// (`founder` — route every hire up) when the value is unknown/empty.
@@ -88,6 +94,104 @@ pub fn normalize_configure_scope(scope: &str) -> &str {
     } else {
         "none"
     }
+}
+
+/// Normalise a stored `manage_scope`, defaulting to the narrowest value
+/// (`specific` — explicit allowlist only) when unknown/empty.
+pub fn normalize_manage_scope(scope: &str) -> &str {
+    let s = scope.trim();
+    if MANAGE_SCOPES.contains(&s) {
+        s
+    } else {
+        "specific"
+    }
+}
+
+/// The shared scope decision for the `branch` / `specific` / `any`
+/// family (used by manage + configure). A normalised `scope` of
+/// anything other than these three (e.g. `none`) is a deny. `key`
+/// names the Key in the reason string.
+fn scope_decision(
+    can: bool,
+    key: &str,
+    scope: &str,
+    allowed_agents: &[String],
+    target_id: &str,
+    target_in_branch: bool,
+) -> KeyVerdict {
+    if !can {
+        return KeyVerdict::Deny {
+            reason: format!("{key} is off for this Operative"),
+        };
+    }
+    match scope {
+        "any" => KeyVerdict::Allow,
+        "branch" => {
+            if target_in_branch {
+                KeyVerdict::Allow
+            } else {
+                KeyVerdict::Deny {
+                    reason: format!(
+                        "{key} scope=branch: `{target_id}` is not in this Operative's Branch"
+                    ),
+                }
+            }
+        }
+        "specific" => {
+            if allowed_agents.iter().any(|a| a == target_id) {
+                KeyVerdict::Allow
+            } else {
+                KeyVerdict::Deny {
+                    reason: format!("{key} scope=specific: `{target_id}` is not in the allowlist"),
+                }
+            }
+        }
+        other => KeyVerdict::Deny {
+            reason: format!("{key} scope={other}: no targets permitted"),
+        },
+    }
+}
+
+/// Decide whether an Operative **actor** may *manage* (control the work
+/// of) `target_id` — move/override another Operative's Brief
+/// (company-model §5.2A). Founder/Board bypasses; consulted only for
+/// agent-originated management of *another* agent's work.
+pub fn manage_verdict(
+    can_manage: bool,
+    manage_scope: &str,
+    allowed_agents: &[String],
+    target_id: &str,
+    target_in_branch: bool,
+) -> KeyVerdict {
+    scope_decision(
+        can_manage,
+        "can_manage_work",
+        normalize_manage_scope(manage_scope),
+        allowed_agents,
+        target_id,
+        target_in_branch,
+    )
+}
+
+/// Decide whether an Operative **actor** may *configure* `target_id` —
+/// edit another Operative's profile/Keys (company-model §5.2A).
+/// Founder/Board bypasses; consulted only for agent-originated config
+/// of *another* agent. `configure_scope = none` denies.
+pub fn configure_verdict(
+    can_configure: bool,
+    configure_scope: &str,
+    allowed_agents: &[String],
+    target_id: &str,
+    target_in_branch: bool,
+) -> KeyVerdict {
+    scope_decision(
+        can_configure,
+        "can_configure_agents",
+        normalize_configure_scope(configure_scope),
+        allowed_agents,
+        target_id,
+        target_in_branch,
+    )
 }
 
 /// Decide whether an Operative **actor** may spawn/hire another
@@ -246,5 +350,50 @@ mod tests {
             KeyVerdict::Allow
         );
         assert!(assign_verdict(true, "garbage", &allowed, "agt_z", true).is_deny());
+    }
+
+    #[test]
+    fn manage_verdict_honours_key_and_scope() {
+        assert!(manage_verdict(false, "any", &[], "x", true).is_deny());
+        assert_eq!(
+            manage_verdict(true, "any", &[], "x", false),
+            KeyVerdict::Allow
+        );
+        assert_eq!(
+            manage_verdict(true, "branch", &[], "x", true),
+            KeyVerdict::Allow
+        );
+        assert!(manage_verdict(true, "branch", &[], "x", false).is_deny());
+        let allowed = vec!["agt_a".to_string()];
+        assert_eq!(
+            manage_verdict(true, "specific", &allowed, "agt_a", false),
+            KeyVerdict::Allow
+        );
+        assert!(manage_verdict(true, "specific", &allowed, "agt_b", true).is_deny());
+        // Unknown scope normalises to specific (narrowest), not any.
+        assert!(manage_verdict(true, "garbage", &[], "x", true).is_deny());
+    }
+
+    #[test]
+    fn configure_verdict_honours_key_scope_and_none() {
+        assert!(configure_verdict(false, "any", &[], "x", true).is_deny());
+        assert_eq!(
+            configure_verdict(true, "any", &[], "x", false),
+            KeyVerdict::Allow
+        );
+        assert_eq!(
+            configure_verdict(true, "branch", &[], "x", true),
+            KeyVerdict::Allow
+        );
+        assert!(configure_verdict(true, "branch", &[], "x", false).is_deny());
+        let allowed = vec!["agt_a".to_string()];
+        assert_eq!(
+            configure_verdict(true, "specific", &allowed, "agt_a", false),
+            KeyVerdict::Allow
+        );
+        assert!(configure_verdict(true, "specific", &allowed, "agt_b", true).is_deny());
+        // `none` (and unknown, which normalises to none) deny even with the key on.
+        assert!(configure_verdict(true, "none", &[], "x", true).is_deny());
+        assert!(configure_verdict(true, "garbage", &[], "x", true).is_deny());
     }
 }

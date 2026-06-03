@@ -187,9 +187,15 @@ pub struct UpdateAgentRequest {
     #[serde(default)]
     pub can_manage_work: Option<bool>,
     #[serde(default)]
+    pub manage_scope: Option<String>,
+    #[serde(default)]
+    pub manage_allowed_agents: Option<String>,
+    #[serde(default)]
     pub can_configure_agents: Option<bool>,
     #[serde(default)]
     pub configure_scope: Option<String>,
+    #[serde(default)]
+    pub configure_allowed_agents: Option<String>,
     #[serde(default)]
     pub secret_allowlist: Option<String>,
     #[serde(default)]
@@ -388,11 +394,20 @@ pub async fn update_agent(
     if let Some(v) = req.can_manage_work {
         commits.push(("can_manage_work".into(), v.to_string()));
     }
+    if let Some(v) = req.manage_scope {
+        commits.push(("manage_scope".into(), v));
+    }
+    if let Some(v) = req.manage_allowed_agents {
+        commits.push(("manage_allowed_agents".into(), v));
+    }
     if let Some(v) = req.can_configure_agents {
         commits.push(("can_configure_agents".into(), v.to_string()));
     }
     if let Some(v) = req.configure_scope {
         commits.push(("configure_scope".into(), v));
+    }
+    if let Some(v) = req.configure_allowed_agents {
+        commits.push(("configure_allowed_agents".into(), v));
     }
     if let Some(v) = req.secret_allowlist {
         commits.push(("secret_allowlist".into(), v));
