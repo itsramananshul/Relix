@@ -1233,6 +1233,47 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// PHASE 1/5: the Briefs linked to a Mandate (as cards).
+    pub fn list_briefs_by_mandate(
+        &self,
+        mandate_id: &str,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        self.list_briefs_by_link("mandate_id", mandate_id, limit)
+    }
+
+    /// PHASE 1/5: the Briefs linked to a Campaign (as cards).
+    pub fn list_briefs_by_campaign(
+        &self,
+        campaign_id: &str,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        self.list_briefs_by_link("campaign_id", campaign_id, limit)
+    }
+
+    fn list_briefs_by_link(
+        &self,
+        column: &str,
+        value: &str,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        // `column` is a fixed internal value, never user input.
+        let sql = format!(
+            "SELECT task_id, title, board_status, priority,
+                    assignee_agent_id, mandate_id, campaign_id
+             FROM tasks WHERE {column} = ?1 ORDER BY updated_at DESC LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![value, lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// Insert a new Task. Returns the freshly-minted `task_id`
     /// (32 hex chars). Optional retry / timeout metadata defaults to
     /// "no retry, no timeout" for backwards compatibility with pre-C1
@@ -5253,6 +5294,26 @@ pub fn register(
             })),
         );
     }
+    {
+        let s = store.clone();
+        bridge.register(
+            "mandate.briefs",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_mandate_briefs(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "campaign.briefs",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_campaign_briefs(&s, &ctx) }
+            })),
+        );
+    }
     // PHASE 2 (Desk): blocked + stale work surfaces.
     {
         let s = store.clone();
@@ -6486,6 +6547,54 @@ fn handle_brief_board_summary(store: &TaskStore, _ctx: &InvocationCtx) -> Handle
     match store.board_summary() {
         Ok(counts) => counts_to_json(counts),
         Err(e) => map_edge_err("brief.board_summary", e),
+    }
+}
+
+/// `mandate.briefs` — the Briefs linked to a Mandate (JSON cards).
+/// Arg `mandate_id|limit` (limit default 50).
+fn handle_mandate_briefs(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    brief_link_list(store, ctx, "mandate.briefs", true)
+}
+
+/// `campaign.briefs` — the Briefs linked to a Campaign. Arg
+/// `campaign_id|limit`.
+fn handle_campaign_briefs(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    brief_link_list(store, ctx, "campaign.briefs", false)
+}
+
+fn brief_link_list(
+    store: &TaskStore,
+    ctx: &InvocationCtx,
+    method: &str,
+    is_mandate: bool,
+) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("{method} utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    let id = parts.first().copied().map(str::trim).unwrap_or("");
+    if id.is_empty() {
+        return invalid(format!("{method}: id required"));
+    }
+    let limit: usize = parts
+        .get(1)
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    let res = if is_mandate {
+        store.list_briefs_by_mandate(id, limit)
+    } else {
+        store.list_briefs_by_campaign(id, limit)
+    };
+    match res {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("{method} encode: {e}")),
+        },
+        Err(e) => map_edge_err(method, e),
     }
 }
 
@@ -9484,6 +9593,30 @@ mod tests {
         assert_eq!(map.get("todo"), Some(&1));
         assert_eq!(map.get("in_progress"), Some(&1));
         assert_eq!(map.values().sum::<i64>(), 3);
+    }
+
+    #[test]
+    fn list_briefs_by_link_filters_by_mandate_and_campaign() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        let b1 = mk("b1");
+        let b2 = mk("b2");
+        let b3 = mk("b3");
+        s.set_brief_field(&b1, "mandate", "m1").unwrap();
+        s.set_brief_field(&b2, "mandate", "m1").unwrap();
+        s.set_brief_field(&b3, "campaign", "c1").unwrap();
+
+        assert_eq!(s.list_briefs_by_mandate("m1", 50).unwrap().len(), 2);
+        assert_eq!(s.list_briefs_by_campaign("c1", 50).unwrap().len(), 1);
+        assert!(s.list_briefs_by_mandate("none", 50).unwrap().is_empty());
+        // The card carries the link.
+        assert_eq!(
+            s.list_briefs_by_campaign("c1", 50).unwrap()[0].task_id,
+            b3
+        );
     }
 
     #[test]
