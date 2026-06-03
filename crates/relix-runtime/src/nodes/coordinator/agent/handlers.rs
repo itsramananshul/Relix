@@ -280,6 +280,16 @@ pub fn handle_roster_summary(store: &AgentStore, _ctx: &InvocationCtx) -> Handle
     }
 }
 
+/// `agent.allowance_committed` — total monthly Allowance committed
+/// across the active roster, in cents (NULL counts as 0). No args.
+/// Pairs with `guild.get` for commitment-vs-budget oversight.
+pub fn handle_allowance_committed(store: &AgentStore, _ctx: &InvocationCtx) -> HandlerOutcome {
+    match store.committed_allowance_cents() {
+        Ok(cents) => HandlerOutcome::Ok(cents.to_string().into_bytes()),
+        Err(e) => internal(format!("agent.allowance_committed: {e}")),
+    }
+}
+
 // ── agent.effective_capabilities ─────────────────────────
 
 /// Wire arg: `agent_id|peer_alias`. The handler reaches into the

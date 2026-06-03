@@ -837,6 +837,21 @@ impl AgentStore {
         Ok(rows)
     }
 
+    /// PHASE 4 (Allowance oversight): the total monthly Allowance
+    /// committed across the *active* roster, in cents. NULL
+    /// allowances count as 0. The Founder compares this against the
+    /// Guild Allowance (`guild.get`) to read commitment vs budget.
+    pub fn committed_allowance_cents(&self) -> Result<i64, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(monthly_allowance_cents), 0)
+             FROM agent_profiles WHERE status = 'active'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(total)
+    }
+
     /// Update one field. The set of writable fields is curated;
     /// silent-allow on agent_id / created_at is intentional —
     /// they're never operator-mutable.
@@ -2570,6 +2585,27 @@ mod tests {
         assert_eq!(map.get("active"), Some(&2));
         assert_eq!(map.get("pending"), Some(&1));
         assert_eq!(map.values().sum::<i64>(), 3);
+    }
+
+    #[test]
+    fn committed_allowance_sums_active_roster_only() {
+        let s = store();
+        let a = s
+            .create_agent("a", "r", "t", "d", "t", "op", "s1", "low", "default")
+            .unwrap();
+        let b = s
+            .create_agent("b", "r", "t", "d", "t", "op", "s2", "low", "default")
+            .unwrap();
+        // A pending hire's allowance must NOT count (inert headcount).
+        let c = s
+            .request_hire("c", "r", "t", "d", "t", "op", "s3", "low", "default")
+            .unwrap();
+        s.update_agent_field(&a, "allowance", "5000").unwrap();
+        s.update_agent_field(&b, "allowance", "2500").unwrap();
+        s.update_agent_field(&c, "allowance", "9999").unwrap();
+
+        // b still has no allowance set on creation; a=5000, b=2500.
+        assert_eq!(s.committed_allowance_cents().unwrap(), 7500);
     }
 
     // ── PHASE 4: hire flow ───────────────────────────────

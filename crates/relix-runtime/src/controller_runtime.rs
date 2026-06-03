@@ -3206,6 +3206,17 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // PHASE 4 (Allowance oversight): committed allowance vs Guild budget.
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.allowance_committed",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_allowance_committed(&s, &ctx) }
+            })),
+        );
+    }
     {
         let s = agent_store.clone();
         bridge.register(
@@ -8865,6 +8876,11 @@ fn register_node_type_handlers(
             (
                 "agent.roster_summary",
                 "Operative counts by status (active/pending/suspended/disabled) + total, as JSON. No args. The Roster-at-a-glance.",
+                &["agent", "read"],
+            ),
+            (
+                "agent.allowance_committed",
+                "Total monthly Allowance committed across the active roster, in cents (NULL counts as 0). No args. Pair with guild.get for commitment-vs-budget.",
                 &["agent", "read"],
             ),
             (
