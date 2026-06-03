@@ -213,6 +213,33 @@ pub fn handle_line(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
     }
 }
 
+/// `agent.keys` — the full Operative profile as JSON: identity
+/// (name/role/title/department/team/status), the **Keys** (the
+/// permission surface — surface_allowlist, risk_ceiling,
+/// allow/deny categories + sensitivity tags, approval-required
+/// categories, authorized approvers, approval timeout, the
+/// allow-all profile flag), and the **Lead** (reports_to). The
+/// structured read backing the per-Operative Keys panel — a
+/// JSON counterpart to the pipe-delimited `agent.get`. Arg:
+/// agent_id.
+pub fn handle_keys(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("agent.keys utf8: {e}")),
+    };
+    if id.is_empty() {
+        return invalid("agent.keys: agent_id required".into());
+    }
+    match store.get_agent(id) {
+        Ok(Some(p)) => match serde_json::to_vec(&p) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("agent.keys encode: {e}")),
+        },
+        Ok(None) => invalid(format!("agent.keys: not found: {id}")),
+        Err(e) => internal(format!("agent.keys: {e}")),
+    }
+}
+
 // ── agent.effective_capabilities ─────────────────────────
 
 /// Wire arg: `agent_id|peer_alias`. The handler reaches into the

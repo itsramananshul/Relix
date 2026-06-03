@@ -3173,6 +3173,17 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // PHASE 2 (Keys panel): structured JSON profile read.
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.keys",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_keys(&s, &ctx) }
+            })),
+        );
+    }
     {
         let s = agent_store.clone();
         bridge.register(
@@ -8719,6 +8730,11 @@ fn register_node_type_handlers(
             (
                 "agent.line",
                 "Org tree: the escalation path up from an agent to the apex (the Line / chain of command). Arg: agent_id. One agent_id per line, nearest boss first.",
+                &["agent", "read"],
+            ),
+            (
+                "agent.keys",
+                "The full Operative profile as JSON (identity + the Keys permission surface + the Lead). Structured read for the per-agent Keys panel. Arg: agent_id.",
                 &["agent", "read"],
             ),
             (
