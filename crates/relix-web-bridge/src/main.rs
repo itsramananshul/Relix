@@ -516,6 +516,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/spine/mandates/:id/team_readiness",
             get(spine::team_readiness),
         )
+        .route(
+            "/v1/spine/mandates/:id/orchestrate",
+            post(spine::orchestrate),
+        )
+        .route(
+            "/v1/spine/mandates/:id/orchestration/latest",
+            get(spine::orchestration_latest),
+        )
         .route("/v1/spine/briefs/search", get(spine::brief_search))
         .route("/v1/spine/briefs/:id", get(spine::brief_detail))
         .route("/v1/spine/briefs/:id/wakeups", get(spine::brief_wakeups))

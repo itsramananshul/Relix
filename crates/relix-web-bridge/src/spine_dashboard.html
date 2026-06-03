@@ -594,17 +594,30 @@ function renderReadiness(host, r) {
   box.append(node("div",{className:"muted",textContent:"→ "+(r.next_action||"")}));
   host.append(box);
 }
+function renderOrchestration(host, run) {
+  const box = node("div",{className:"event",style:"margin-top:8px"});
+  box.append(node("strong",{textContent:"Orchestration: "+(run.status||"")+" ("+(run.mode||"")+(run.dry_run?", dry-run":"")+")"}));
+  const ids = a => (a||[]).map(x => (x.task_id||x)).join(", ") || "none";
+  box.append(node("div",{textContent:"Created: "+ids(run.created_brief_ids)}));
+  box.append(node("div",{textContent:"Assigned: "+ids(run.assigned_brief_ids)}));
+  if ((run.blockers||[]).length) box.append(node("div",{className:"err",textContent:"Blockers: "+run.blockers.map(b=>b.reason||JSON.stringify(b)).join(", ")}));
+  (run.next_actions||[]).forEach(s => box.append(node("div",{className:"muted",textContent:"→ "+s})));
+  host.append(box);
+}
 async function teamPlanBlock(mandateId) {
   // Prime team-build foundation (governed): requires an approved
   // strategy + the actor's spawn Key. Roles is a CSV of `role` or
   // `role:subject_id`; only identified roles mint a pending hire.
   const block = node("div",{className:"prop"},[node("div",{className:"label",textContent:"Plan team"})]);
-  // The persisted latest plan + live readiness, if any.
+  // The persisted latest plan + live readiness + latest orchestration.
   const persisted = node("div");
+  let ready = null;
   try {
-    const [latest, ready] = await Promise.all([
+    let latest, orun;
+    [latest, ready, orun] = await Promise.all([
       api("/v1/spine/mandates/"+encodeURIComponent(mandateId)+"/team_plan"),
       api("/v1/spine/mandates/"+encodeURIComponent(mandateId)+"/team_readiness").catch(()=>null),
+      api("/v1/spine/mandates/"+encodeURIComponent(mandateId)+"/orchestration/latest").catch(()=>null),
     ]);
     if (latest) {
       persisted.append(node("div",{className:"muted",style:"font-size:12px",textContent:"Latest plan: "+(latest.status||"")+" ("+(latest.plan_id||"")+")"}));
@@ -613,6 +626,7 @@ async function teamPlanBlock(mandateId) {
       persisted.append(node("div",{className:"muted",textContent:"No team plan yet."}));
     }
     if (ready && ready.planned) renderReadiness(persisted, ready);
+    if (orun) renderOrchestration(persisted, orun);
   } catch(e) { persisted.append(node("div",{className:"err",textContent:e.message})); }
   block.append(persisted);
   const desc = node("input",{placeholder:"goal / team description"});
@@ -627,6 +641,25 @@ async function teamPlanBlock(mandateId) {
       await openMandate(mandateId);
     } catch(e) { out.className = "event err"; out.textContent = e.message; }
   }}), out);
+  // Orchestrate — turn an approved + ready team into a Brief tree.
+  const oout = node("div",{className:"event muted",textContent:"Orchestrate needs an approved strategy + a ready team."});
+  const runOrchestrate = async (mode) => {
+    oout.textContent = "orchestrating ("+mode+")..."; oout.className = "event muted";
+    try {
+      const r = await post("/v1/spine/mandates/"+encodeURIComponent(mandateId)+"/orchestrate", {mode});
+      oout.className = "event"; oout.textContent = "";
+      renderOrchestration(oout, {status:r.status, mode:r.mode, dry_run:r.dry_run, created_brief_ids:r.created_briefs, assigned_brief_ids:r.assigned_briefs, blockers:r.blockers, next_actions:r.next_actions});
+      await refresh();        // refresh board/inbox counts
+      await openMandate(mandateId);  // re-render the panel (shows persisted run)
+    } catch(e) { oout.className = "event err"; oout.textContent = e.message; }
+  };
+  const orchestrateRow = node("div",{style:"display:flex;gap:6px;margin-top:8px;flex-wrap:wrap"},[
+    node("strong",{textContent:"Orchestrate"}),
+    node("button",{className:"ghost",textContent:"Plan",onclick:()=>runOrchestrate("plan_only")}),
+    node("button",{className:"ghost",textContent:"Create briefs",onclick:()=>runOrchestrate("create_briefs")}),
+    node("button",{textContent:"Create + assign",onclick:()=>runOrchestrate("assign_ready")}),
+  ]);
+  block.append(orchestrateRow, oout);
   return block;
 }
 function fieldSelect(id, label, value, opts, save) {

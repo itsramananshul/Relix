@@ -467,6 +467,58 @@ pub async fn team_readiness(
     )
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct OrchestrateRequest {
+    /// `plan_only` (default) / `create_briefs` / `assign_ready`.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Cap on child Briefs (default 16).
+    #[serde(default)]
+    pub max_briefs: Option<usize>,
+    /// Report-only when true (default false).
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
+/// `POST /v1/spine/mandates/:id/orchestrate` — Prime Mandate-to-Brief
+/// orchestration. Body `{ "mode"?, "max_briefs"?, "dry_run"? }`.
+/// Proxies `mandate.orchestrate` (strategy + ready-team gated; creates
+/// an idempotent Brief tree and assigns active agents). Tenant-scoped.
+pub async fn orchestrate(
+    State(state): State<AppState>,
+    Path(mandate_id): Path<String>,
+    Json(req): Json<OrchestrateRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if mandate_id.trim().is_empty() {
+        return Err(bad("mandate_id required"));
+    }
+    let mode = req.mode.unwrap_or_default();
+    let max_briefs = req.max_briefs.map(|n| n.to_string()).unwrap_or_default();
+    let dry_run = req.dry_run.unwrap_or(false);
+    let arg = format!("{}|{mode}|{max_briefs}|{dry_run}", mandate_id.trim());
+    json_passthrough(call_peer(&state, "mandate.orchestrate", arg.as_bytes()).await?)
+}
+
+/// `GET /v1/spine/mandates/:id/orchestration/latest` — the latest
+/// persisted orchestration run for a Mandate (`null` if never run).
+/// Proxies `mandate.orchestration.latest`. Tenant-scoped.
+pub async fn orchestration_latest(
+    State(state): State<AppState>,
+    Path(mandate_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if mandate_id.trim().is_empty() {
+        return Err(bad("mandate_id required"));
+    }
+    json_passthrough(
+        call_peer(
+            &state,
+            "mandate.orchestration.latest",
+            mandate_id.trim().as_bytes(),
+        )
+        .await?,
+    )
+}
+
 /// Normalise a Clearance decision into the wire value
 /// `coord.approval.decide` expects. Accepts the product verbs
 /// (`approve`/`reject`) and the raw runtime values
@@ -1082,6 +1134,9 @@ mod tests {
         // Prime team-build action + readiness in the Mandate panel.
         assert!(SPINE_HTML.contains("/team_plan"));
         assert!(SPINE_HTML.contains("/team_readiness"));
+        // Prime orchestration action + latest-run rendering.
+        assert!(SPINE_HTML.contains("/orchestrate"));
+        assert!(SPINE_HTML.contains("/orchestration/latest"));
     }
 
     /// Build the full spine route table in isolation: matchit panics
@@ -1108,6 +1163,11 @@ mod tests {
                 get(team_plan_latest).post(team_plan),
             )
             .route("/v1/spine/mandates/:id/team_readiness", get(team_readiness))
+            .route("/v1/spine/mandates/:id/orchestrate", post(orchestrate))
+            .route(
+                "/v1/spine/mandates/:id/orchestration/latest",
+                get(orchestration_latest),
+            )
             .route("/v1/spine/briefs/search", get(brief_search))
             .route("/v1/spine/briefs/:id", get(brief_detail))
             .route("/v1/spine/briefs/:id/wakeups", get(brief_wakeups))
