@@ -52,6 +52,20 @@ pub struct BriefFields {
     pub campaign_id: Option<String>,
 }
 
+/// A Brief as it appears on the board — a compact card with its
+/// title, column, priority, assignee, and spine links. The row
+/// shape behind the board view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BriefCard {
+    pub task_id: String,
+    pub title: String,
+    pub board_status: String,
+    pub priority: String,
+    pub assignee_agent_id: Option<String>,
+    pub mandate_id: Option<String>,
+    pub campaign_id: Option<String>,
+}
+
 /// The board columns a Brief can sit in.
 ///
 /// `backlog → todo → in_progress → in_review → done` is the happy
