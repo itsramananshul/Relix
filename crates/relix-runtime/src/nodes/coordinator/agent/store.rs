@@ -80,8 +80,28 @@ pub struct AgentProfile {
     /// (budget) in cents. `None` = no per-agent cap. Nullable.
     #[serde(default)]
     pub monthly_allowance_cents: Option<i64>,
+    /// Runtime Key: max live Brief runs this Operative may own at
+    /// once. Paperclip allows high parallelism; Relix makes it a
+    /// per-agent control. Clamped 1..=50 at write time.
+    #[serde(default = "default_max_concurrent_runs")]
+    pub max_concurrent_runs: i64,
+    /// Runtime Key: may the scheduled heartbeat wake this Operative?
+    #[serde(default = "default_true")]
+    pub wake_on_timer: bool,
+    /// Runtime Key: may assignment/comment/manual triggers wake this
+    /// Operative on demand?
+    #[serde(default = "default_true")]
+    pub wake_on_demand: bool,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+fn default_max_concurrent_runs() -> i64 {
+    20
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// The default set of capability categories that require an
@@ -647,7 +667,9 @@ impl AgentStore {
                         allow_sensitivity_tags, deny_sensitivity_tags,
                         approval_required_categories, authorized_approvers,
                         approval_timeout_secs,
-                        created_at, updated_at, profile, reports_to, rig, monthly_allowance_cents
+                        created_at, updated_at, profile, reports_to, rig,
+                        monthly_allowance_cents, max_concurrent_runs,
+                        wake_on_timer, wake_on_demand
                  FROM agent_profiles WHERE subject_id = ?1 AND tenant_id = ?2",
                 params![subject_id, tenant],
                 row_to_agent,
@@ -679,7 +701,9 @@ impl AgentStore {
                         allow_sensitivity_tags, deny_sensitivity_tags,
                         approval_required_categories, authorized_approvers,
                         approval_timeout_secs,
-                        created_at, updated_at, profile, reports_to, rig, monthly_allowance_cents
+                        created_at, updated_at, profile, reports_to, rig,
+                        monthly_allowance_cents, max_concurrent_runs,
+                        wake_on_timer, wake_on_demand
                  FROM agent_profiles WHERE subject_id = ?1",
                 params![subject_id],
                 row_to_agent,
@@ -805,8 +829,7 @@ impl AgentStore {
     pub fn manager_subtree(&self, manager_id: &str) -> Result<Vec<String>, AgentStoreError> {
         const MAX_NODES: usize = 10_000;
         let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
-        let mut stmt =
-            conn.prepare("SELECT agent_id FROM agent_profiles WHERE reports_to = ?1")?;
+        let mut stmt = conn.prepare("SELECT agent_id FROM agent_profiles WHERE reports_to = ?1")?;
         let mut out: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         seen.insert(manager_id.to_string());
@@ -835,8 +858,7 @@ impl AgentStore {
     pub fn chain_of_command(&self, agent_id: &str) -> Result<Vec<String>, AgentStoreError> {
         const MAX_DEPTH: usize = 1024;
         let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
-        let mut stmt =
-            conn.prepare("SELECT reports_to FROM agent_profiles WHERE agent_id = ?1")?;
+        let mut stmt = conn.prepare("SELECT reports_to FROM agent_profiles WHERE agent_id = ?1")?;
         let mut chain: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         seen.insert(agent_id.to_string());
@@ -1071,8 +1093,11 @@ impl AgentStore {
                 // the dispatcher resolves it against the Rig
                 // registry and falls back to the default if unknown.
                 let trimmed = value.trim();
-                let stored: Option<&str> =
-                    if trimmed.is_empty() { None } else { Some(trimmed) };
+                let stored: Option<&str> = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
                 conn.execute(
                     "UPDATE agent_profiles SET rig=?1, updated_at=?2 WHERE agent_id=?3",
                     params![stored, now, agent_id],
@@ -1089,9 +1114,7 @@ impl AgentStore {
                     match trimmed.parse::<i64>() {
                         Ok(c) if c >= 0 => Some(c),
                         Ok(_) => {
-                            return Err(AgentStoreError::BadInput(
-                                "allowance must be >= 0".into(),
-                            ));
+                            return Err(AgentStoreError::BadInput("allowance must be >= 0".into()));
                         }
                         Err(_) => {
                             return Err(AgentStoreError::BadInput(format!(
@@ -1104,6 +1127,43 @@ impl AgentStore {
                     "UPDATE agent_profiles SET monthly_allowance_cents=?1, updated_at=?2
                      WHERE agent_id=?3",
                     params![stored, now, agent_id],
+                )?
+            }
+            "max_concurrent_runs" | "concurrency" => {
+                let trimmed = value.trim();
+                let slots = match trimmed.parse::<i64>() {
+                    Ok(n) if (1..=50).contains(&n) => n,
+                    Ok(_) => {
+                        return Err(AgentStoreError::BadInput(
+                            "max_concurrent_runs must be between 1 and 50".into(),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(AgentStoreError::BadInput(format!(
+                            "max_concurrent_runs not an integer: {trimmed}"
+                        )));
+                    }
+                };
+                conn.execute(
+                    "UPDATE agent_profiles SET max_concurrent_runs=?1, updated_at=?2
+                     WHERE agent_id=?3",
+                    params![slots, now, agent_id],
+                )?
+            }
+            "wake_on_timer" | "timer_wake" => {
+                let flag = parse_bool_key(value, "wake_on_timer")?;
+                conn.execute(
+                    "UPDATE agent_profiles SET wake_on_timer=?1, updated_at=?2
+                     WHERE agent_id=?3",
+                    params![if flag { 1 } else { 0 }, now, agent_id],
+                )?
+            }
+            "wake_on_demand" | "on_demand_wake" => {
+                let flag = parse_bool_key(value, "wake_on_demand")?;
+                conn.execute(
+                    "UPDATE agent_profiles SET wake_on_demand=?1, updated_at=?2
+                     WHERE agent_id=?3",
+                    params![if flag { 1 } else { 0 }, now, agent_id],
                 )?
             }
             other => {
@@ -1992,7 +2052,8 @@ const SELECT_AGENT: &str = "SELECT agent_id, name, role, title, department, team
         allow_sensitivity_tags, deny_sensitivity_tags,
         approval_required_categories, authorized_approvers,
         approval_timeout_secs,
-        created_at, updated_at, profile, reports_to, rig, monthly_allowance_cents
+        created_at, updated_at, profile, reports_to, rig, monthly_allowance_cents,
+        max_concurrent_runs, wake_on_timer, wake_on_demand
  FROM agent_profiles WHERE agent_id = ?1";
 
 const SELECT_APPROVAL: &str =
@@ -2028,7 +2089,10 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              updated_at      INTEGER NOT NULL,
              reports_to      TEXT,
              rig             TEXT,
-             monthly_allowance_cents INTEGER
+             monthly_allowance_cents INTEGER,
+             max_concurrent_runs INTEGER NOT NULL DEFAULT 20,
+             wake_on_timer INTEGER NOT NULL DEFAULT 1,
+             wake_on_demand INTEGER NOT NULL DEFAULT 1
          );
          CREATE UNIQUE INDEX IF NOT EXISTS agent_profiles_subject
              ON agent_profiles(subject_id);
@@ -2143,6 +2207,25 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     ensure_column(conn, "agent_profiles", "rig", "TEXT")?;
     // Governance: per-Operative monthly Allowance (budget, cents).
     ensure_column(conn, "agent_profiles", "monthly_allowance_cents", "INTEGER")?;
+    // Runtime Keys: per-agent wake controls and concurrency slots.
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "max_concurrent_runs",
+        "INTEGER NOT NULL DEFAULT 20",
+    )?;
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "wake_on_timer",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "wake_on_demand",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
     // GROUP 6: tenant isolation. Add `tenant_id` to the per-caller
     // agent/approval tables. Idempotent (ensure_column probes
     // PRAGMA); existing rows default to the reserved 'default'
@@ -2265,6 +2348,16 @@ fn non_empty_opt(s: &str) -> Option<&str> {
         None
     } else {
         Some(trimmed)
+    }
+}
+
+fn parse_bool_key(value: &str, field: &str) -> Result<bool, AgentStoreError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(AgentStoreError::BadInput(format!(
+            "{field} must be boolean (true/false), got `{other}`"
+        ))),
     }
 }
 
@@ -2398,6 +2491,9 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
         reports_to: r.get::<_, Option<String>>(21)?,
         rig: r.get::<_, Option<String>>(22)?,
         monthly_allowance_cents: r.get::<_, Option<i64>>(23)?,
+        max_concurrent_runs: r.get::<_, i64>(24)?,
+        wake_on_timer: r.get::<_, i64>(25)? != 0,
+        wake_on_demand: r.get::<_, i64>(26)? != 0,
     })
 }
 
@@ -2514,14 +2610,28 @@ mod tests {
         let s = store();
         let boss = s
             .create_agent(
-                "CEO", "ceo", "Chief", "exec", "exec", "operator", "subj-boss", "high",
+                "CEO",
+                "ceo",
+                "Chief",
+                "exec",
+                "exec",
+                "operator",
+                "subj-boss",
+                "high",
                 "default",
             )
             .unwrap();
         let report = s
             .create_agent(
-                "Eng", "engineer", "Engineer", "eng", "eng", "operator", "subj-report",
-                "medium", "default",
+                "Eng",
+                "engineer",
+                "Engineer",
+                "eng",
+                "eng",
+                "operator",
+                "subj-report",
+                "medium",
+                "default",
             )
             .unwrap();
 
@@ -2536,7 +2646,10 @@ mod tests {
         );
 
         // An agent cannot report to itself.
-        assert!(s.update_agent_field(&report, "reports_to", &report).is_err());
+        assert!(
+            s.update_agent_field(&report, "reports_to", &report)
+                .is_err()
+        );
 
         // An unknown boss is rejected — no dangling edges.
         assert!(
@@ -2566,7 +2679,14 @@ mod tests {
             .unwrap();
         let planner = s
             .create_agent(
-                "Plan", "planner", "Planner", "eng", "eng", "op", "subj-plan", "medium",
+                "Plan",
+                "planner",
+                "Planner",
+                "eng",
+                "eng",
+                "op",
+                "subj-plan",
+                "medium",
                 "default",
             )
             .unwrap();
@@ -2622,17 +2742,25 @@ mod tests {
     fn list_by_role_returns_active_matches_only() {
         let s = store();
         let e1 = s
-            .create_agent("E1", "engineer", "E", "e", "e", "op", "subj-br1", "low", "default")
+            .create_agent(
+                "E1", "engineer", "E", "e", "e", "op", "subj-br1", "low", "default",
+            )
             .unwrap();
         let e2 = s
-            .create_agent("E2", "engineer", "E", "e", "e", "op", "subj-br2", "low", "default")
+            .create_agent(
+                "E2", "engineer", "E", "e", "e", "op", "subj-br2", "low", "default",
+            )
             .unwrap();
         let _d = s
-            .create_agent("D", "designer", "D", "e", "e", "op", "subj-br3", "low", "default")
+            .create_agent(
+                "D", "designer", "D", "e", "e", "op", "subj-br3", "low", "default",
+            )
             .unwrap();
         // A pending engineer is not assignable.
-        s.request_hire("E3", "engineer", "E", "e", "e", "op", "subj-br4", "low", "default")
-            .unwrap();
+        s.request_hire(
+            "E3", "engineer", "E", "e", "e", "op", "subj-br4", "low", "default",
+        )
+        .unwrap();
         // A suspended engineer is excluded.
         s.update_agent_field(&e2, "status", "suspended").unwrap();
 
@@ -2645,16 +2773,24 @@ mod tests {
     fn list_peers_returns_same_lead_siblings() {
         let s = store();
         let ceo = s
-            .create_agent("CEO", "ceo", "C", "x", "x", "op", "subj-pr0", "high", "default")
+            .create_agent(
+                "CEO", "ceo", "C", "x", "x", "op", "subj-pr0", "high", "default",
+            )
             .unwrap();
         let a = s
-            .create_agent("A", "eng", "A", "e", "e", "op", "subj-pr1", "low", "default")
+            .create_agent(
+                "A", "eng", "A", "e", "e", "op", "subj-pr1", "low", "default",
+            )
             .unwrap();
         let b = s
-            .create_agent("B", "eng", "B", "e", "e", "op", "subj-pr2", "low", "default")
+            .create_agent(
+                "B", "eng", "B", "e", "e", "op", "subj-pr2", "low", "default",
+            )
             .unwrap();
         let c = s
-            .create_agent("C", "eng", "C", "e", "e", "op", "subj-pr3", "low", "default")
+            .create_agent(
+                "C", "eng", "C", "e", "e", "op", "subj-pr3", "low", "default",
+            )
             .unwrap();
         // a, b, c all report to ceo.
         for x in [&a, &b, &c] {
@@ -2673,13 +2809,19 @@ mod tests {
     fn reports_to_rejects_cycles() {
         let s = store();
         let ceo = s
-            .create_agent("CEO", "ceo", "C", "x", "x", "op", "subj-cy1", "high", "default")
+            .create_agent(
+                "CEO", "ceo", "C", "x", "x", "op", "subj-cy1", "high", "default",
+            )
             .unwrap();
         let lead = s
-            .create_agent("L", "lead", "L", "e", "e", "op", "subj-cy2", "medium", "default")
+            .create_agent(
+                "L", "lead", "L", "e", "e", "op", "subj-cy2", "medium", "default",
+            )
             .unwrap();
         let ic = s
-            .create_agent("IC", "worker", "I", "e", "e", "op", "subj-cy3", "low", "default")
+            .create_agent(
+                "IC", "worker", "I", "e", "e", "op", "subj-cy3", "low", "default",
+            )
             .unwrap();
         // ceo <- lead <- ic
         s.update_agent_field(&lead, "reports_to", &ceo).unwrap();
@@ -2696,10 +2838,7 @@ mod tests {
             Err(AgentStoreError::BadInput(_))
         ));
         // The valid edges are untouched after the rejected writes.
-        assert_eq!(
-            s.get_agent(&ceo).unwrap().unwrap().reports_to,
-            None
-        );
+        assert_eq!(s.get_agent(&ceo).unwrap().unwrap().reports_to, None);
         // A legal re-parent still works (ic moves under ceo directly).
         s.update_agent_field(&ic, "reports_to", &ceo).unwrap();
         assert_eq!(
@@ -2712,7 +2851,9 @@ mod tests {
     fn manages_reflects_the_branch_subtree() {
         let s = store();
         let ceo = s
-            .create_agent("CEO", "ceo", "C", "x", "x", "op", "subj-mc", "high", "default")
+            .create_agent(
+                "CEO", "ceo", "C", "x", "x", "op", "subj-mc", "high", "default",
+            )
             .unwrap();
         let planner = s
             .create_agent(
@@ -2720,13 +2861,18 @@ mod tests {
             )
             .unwrap();
         let worker = s
-            .create_agent("W", "worker", "W", "e", "e", "op", "subj-mw", "low", "default")
+            .create_agent(
+                "W", "worker", "W", "e", "e", "op", "subj-mw", "low", "default",
+            )
             .unwrap();
         let outsider = s
-            .create_agent("O", "worker", "O", "e", "e", "op", "subj-mo", "low", "default")
+            .create_agent(
+                "O", "worker", "O", "e", "e", "op", "subj-mo", "low", "default",
+            )
             .unwrap();
         s.update_agent_field(&planner, "reports_to", &ceo).unwrap();
-        s.update_agent_field(&worker, "reports_to", &planner).unwrap();
+        s.update_agent_field(&worker, "reports_to", &planner)
+            .unwrap();
 
         assert!(s.manages(&ceo, &planner).unwrap());
         assert!(s.manages(&ceo, &worker).unwrap());
@@ -2777,11 +2923,60 @@ mod tests {
     // ── PHASE 4: hire flow ───────────────────────────────
 
     #[test]
+    fn runtime_keys_default_update_and_validate() {
+        let s = store();
+        let id = s
+            .create_agent(
+                "runner",
+                "worker",
+                "W",
+                "eng",
+                "eng",
+                "op",
+                "subj-runner",
+                "low",
+                "default",
+            )
+            .unwrap();
+        let p = s.get_agent(&id).unwrap().unwrap();
+        assert_eq!(p.max_concurrent_runs, 20);
+        assert!(p.wake_on_timer);
+        assert!(p.wake_on_demand);
+
+        s.update_agent_field(&id, "max_concurrent_runs", "3")
+            .unwrap();
+        s.update_agent_field(&id, "wake_on_timer", "false").unwrap();
+        s.update_agent_field(&id, "wake_on_demand", "off").unwrap();
+        let p = s.get_agent(&id).unwrap().unwrap();
+        assert_eq!(p.max_concurrent_runs, 3);
+        assert!(!p.wake_on_timer);
+        assert!(!p.wake_on_demand);
+
+        assert!(
+            s.update_agent_field(&id, "max_concurrent_runs", "0")
+                .is_err()
+        );
+        assert!(
+            s.update_agent_field(&id, "max_concurrent_runs", "51")
+                .is_err()
+        );
+        assert!(s.update_agent_field(&id, "wake_on_timer", "maybe").is_err());
+    }
+
+    #[test]
     fn hire_flow_is_pending_until_approved() {
         let s = store();
         let id = s
             .request_hire(
-                "Eng", "engineer", "E", "eng", "eng", "ceo", "subj-hire", "low", "default",
+                "Eng",
+                "engineer",
+                "E",
+                "eng",
+                "eng",
+                "ceo",
+                "subj-hire",
+                "low",
+                "default",
             )
             .unwrap();
         // A fresh hire is pending (inert — gate denies non-active).
@@ -2795,9 +2990,7 @@ mod tests {
 
         // Reject a fresh pending hire → disabled (terminal).
         let id2 = s
-            .request_hire(
-                "X", "r", "t", "d", "t", "ceo", "subj-h2", "low", "default",
-            )
+            .request_hire("X", "r", "t", "d", "t", "ceo", "subj-h2", "low", "default")
             .unwrap();
         s.reject_hire(&id2).unwrap();
         assert_eq!(s.get_agent(&id2).unwrap().unwrap().status, "disabled");
@@ -2832,9 +3025,7 @@ mod tests {
     fn agent_allowance_sets_clears_and_validates() {
         let s = store();
         let id = s
-            .create_agent(
-                "n", "r", "t", "d", "t", "op", "subj-allw", "low", "default",
-            )
+            .create_agent("n", "r", "t", "d", "t", "op", "subj-allw", "low", "default")
             .unwrap();
         assert_eq!(
             s.get_agent(&id).unwrap().unwrap().monthly_allowance_cents,

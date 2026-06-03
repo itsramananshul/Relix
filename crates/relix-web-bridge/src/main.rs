@@ -102,6 +102,7 @@ mod audit_tenants;
 mod auth;
 mod belief;
 mod blocklist;
+mod bridge_back;
 mod browser_captures;
 mod browser_sessions;
 mod budget;
@@ -492,6 +493,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/spine", get(spine::page))
         .route("/v1/spine/companion", post(companion::handle))
         .route("/v1/spine/guild", get(spine::guild_counts))
+        .route("/v1/spine/guild/detail", get(spine::guild_detail))
+        .route(
+            "/v1/spine/allowance/committed",
+            get(spine::allowance_committed),
+        )
         .route("/v1/spine/board", get(spine::board_summary))
         .route("/v1/spine/board/:column", get(spine::board_column))
         .route("/v1/spine/roster", get(spine::roster_summary))
@@ -504,6 +510,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/mandates/:id/briefs", get(spine::mandate_briefs))
         .route("/v1/spine/briefs/search", get(spine::brief_search))
         .route("/v1/spine/briefs/:id", get(spine::brief_detail))
+        .route("/v1/spine/briefs/:id/wakeups", get(spine::brief_wakeups))
         .route("/v1/spine/desk/:agent", get(spine::desk))
         .route("/v1/spine/by-label", get(spine::by_label))
         .route("/v1/spine/overdue", get(spine::overdue))
@@ -520,6 +527,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/briefs/:id/snag", post(spine::add_snag))
         .route("/v1/spine/briefs/:id/unsnag", post(spine::remove_snag))
         .route("/v1/spine/briefs/:id/subbrief", post(spine::add_subbrief))
+        // Rig bridge-back surface. These routes are exempt from
+        // the global bridge bearer in auth middleware, but each
+        // handler validates its per-Shift `brt_*` token with the
+        // coordinator before forwarding a narrow Brief-local call.
+        .route(
+            "/v1/bridge-back/briefs/:id/comment",
+            post(bridge_back::comment),
+        )
+        .route(
+            "/v1/bridge-back/briefs/:id/subbrief",
+            post(bridge_back::subbrief),
+        )
+        .route(
+            "/v1/bridge-back/briefs/:id/dossier",
+            post(bridge_back::dossier),
+        )
+        .route(
+            "/v1/bridge-back/briefs/:id/snags",
+            post(bridge_back::set_snags),
+        )
+        .route(
+            "/v1/bridge-back/briefs/:id/clearance",
+            post(bridge_back::clearance),
+        )
+        .route(
+            "/v1/bridge-back/briefs/:id/claim-holder",
+            post(bridge_back::claim_holder),
+        )
         .route("/v1/tasks", get(tasks::list))
         .route("/v1/tasks/count", get(tasks::count))
         .route("/v1/tasks/cursor", get(tasks::list_cursor))

@@ -11,7 +11,7 @@
 //! `POST /v1/spine/companion {"message": "..."}` →
 //! `{"action": "...", "reply": "...", "result": <json|null>}`.
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{Json, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
 
 use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
@@ -45,15 +45,33 @@ pub struct CompanionResponse {
 /// What the parser resolved an operator message to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompanionAction {
-    CreateBrief { title: String },
-    CreateMandate { title: String },
-    Move { id: String, status: String },
-    Assign { id: String, agent: String },
-    Pin { id: String, on: bool },
-    Comment { id: String, text: String },
+    CreateBrief {
+        title: String,
+    },
+    CreateMandate {
+        title: String,
+    },
+    Move {
+        id: String,
+        status: String,
+    },
+    Assign {
+        id: String,
+        agent: String,
+    },
+    Pin {
+        id: String,
+        on: bool,
+    },
+    Comment {
+        id: String,
+        text: String,
+    },
     Overdue,
     Board,
-    Search { query: String },
+    Search {
+        query: String,
+    },
     Help,
     /// Unparseable — carries the original for the reply.
     Unknown,
@@ -102,7 +120,13 @@ pub fn parse_command(message: &str) -> CompanionAction {
             return CompanionAction::CreateBrief { title: t };
         }
     }
-    for p in ["create mandate ", "new mandate ", "add mandate ", "new goal ", "create goal "] {
+    for p in [
+        "create mandate ",
+        "new mandate ",
+        "add mandate ",
+        "new goal ",
+        "create goal ",
+    ] {
         if let Some(t) = after(p)
             && !t.is_empty()
         {
@@ -133,7 +157,11 @@ pub fn parse_command(message: &str) -> CompanionAction {
     {
         let id_raw = rest[..idx].trim();
         // Allow the natural "comment on <id>:" phrasing.
-        let id = id_raw.strip_prefix("on ").unwrap_or(id_raw).trim().to_string();
+        let id = id_raw
+            .strip_prefix("on ")
+            .unwrap_or(id_raw)
+            .trim()
+            .to_string();
         let text = rest[idx + 1..].trim().to_string();
         if !id.is_empty() && !text.is_empty() {
             return CompanionAction::Comment { id, text };
@@ -155,7 +183,10 @@ pub fn parse_command(message: &str) -> CompanionAction {
         let rl = rest.to_ascii_lowercase();
         if let Some(idx) = rl.find(" to ") {
             let id = rest[..idx].trim().to_string();
-            let status = rest[idx + 4..].trim().to_ascii_lowercase().replace(' ', "_");
+            let status = rest[idx + 4..]
+                .trim()
+                .to_ascii_lowercase()
+                .replace(' ', "_");
             if !id.is_empty() && BOARD_STATUSES.contains(&status.as_str()) {
                 return CompanionAction::Move { id, status };
             }
@@ -411,16 +442,25 @@ mod tests {
         );
         assert_eq!(
             parse_command("pin abc"),
-            CompanionAction::Pin { id: "abc".into(), on: true }
+            CompanionAction::Pin {
+                id: "abc".into(),
+                on: true
+            }
         );
         assert_eq!(
             parse_command("unpin abc"),
-            CompanionAction::Pin { id: "abc".into(), on: false }
+            CompanionAction::Pin {
+                id: "abc".into(),
+                on: false
+            }
         );
         // "move" must NOT be swallowed by the pin/assign rules.
         assert_eq!(
             parse_command("move abc to done"),
-            CompanionAction::Move { id: "abc".into(), status: "done".into() }
+            CompanionAction::Move {
+                id: "abc".into(),
+                status: "done".into()
+            }
         );
     }
 
@@ -428,11 +468,17 @@ mod tests {
     fn parses_comment_with_optional_on_and_colon() {
         assert_eq!(
             parse_command("comment abc: looks good"),
-            CompanionAction::Comment { id: "abc".into(), text: "looks good".into() }
+            CompanionAction::Comment {
+                id: "abc".into(),
+                text: "looks good".into()
+            }
         );
         assert_eq!(
             parse_command("comment on abc: ship it"),
-            CompanionAction::Comment { id: "abc".into(), text: "ship it".into() }
+            CompanionAction::Comment {
+                id: "abc".into(),
+                text: "ship it".into()
+            }
         );
         // Missing text → not a comment.
         assert_eq!(parse_command("comment abc:"), CompanionAction::Unknown);
@@ -442,7 +488,9 @@ mod tests {
     fn parses_search_overdue_board_help() {
         assert_eq!(
             parse_command("find auth"),
-            CompanionAction::Search { query: "auth".into() }
+            CompanionAction::Search {
+                query: "auth".into()
+            }
         );
         assert_eq!(parse_command("overdue"), CompanionAction::Overdue);
         assert_eq!(parse_command("board"), CompanionAction::Board);

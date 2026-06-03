@@ -128,6 +128,11 @@ pub struct AgentDetail {
     pub allow_sensitivity_tags: Vec<String>,
     pub deny_sensitivity_tags: Vec<String>,
     pub approval_required_categories: Vec<String>,
+    pub rig: Option<String>,
+    pub monthly_allowance_cents: Option<i64>,
+    pub max_concurrent_runs: i64,
+    pub wake_on_timer: bool,
+    pub wake_on_demand: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -158,6 +163,16 @@ pub struct UpdateAgentRequest {
     pub approval_required_categories: Option<String>,
     #[serde(default)]
     pub approval_timeout_secs: Option<i64>,
+    #[serde(default)]
+    pub rig: Option<String>,
+    #[serde(default)]
+    pub monthly_allowance_cents: Option<i64>,
+    #[serde(default)]
+    pub max_concurrent_runs: Option<i64>,
+    #[serde(default)]
+    pub wake_on_timer: Option<bool>,
+    #[serde(default)]
+    pub wake_on_demand: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -316,6 +331,21 @@ pub async fn update_agent(
     }
     if let Some(v) = req.approval_timeout_secs {
         commits.push(("approval_timeout_secs".into(), v.to_string()));
+    }
+    if let Some(v) = req.rig {
+        commits.push(("rig".into(), v));
+    }
+    if let Some(v) = req.monthly_allowance_cents {
+        commits.push(("monthly_allowance_cents".into(), v.to_string()));
+    }
+    if let Some(v) = req.max_concurrent_runs {
+        commits.push(("max_concurrent_runs".into(), v.to_string()));
+    }
+    if let Some(v) = req.wake_on_timer {
+        commits.push(("wake_on_timer".into(), v.to_string()));
+    }
+    if let Some(v) = req.wake_on_demand {
+        commits.push(("wake_on_demand".into(), v.to_string()));
     }
 
     if commits.is_empty() {
@@ -730,6 +760,11 @@ pub fn parse_agent_detail(body: &str) -> Option<AgentDetail> {
         allow_sensitivity_tags: vec![],
         deny_sensitivity_tags: vec![],
         approval_required_categories: vec![],
+        rig: None,
+        monthly_allowance_cents: None,
+        max_concurrent_runs: 20,
+        wake_on_timer: true,
+        wake_on_demand: true,
     };
     for kv in trimmed.split('|') {
         let (k, v) = kv.split_once('=')?;
@@ -753,6 +788,11 @@ pub fn parse_agent_detail(body: &str) -> Option<AgentDetail> {
             "allow_sensitivity_tags" => out.allow_sensitivity_tags = parse_csv(v),
             "deny_sensitivity_tags" => out.deny_sensitivity_tags = parse_csv(v),
             "approval_required_categories" => out.approval_required_categories = parse_csv(v),
+            "rig" => out.rig = opt_string(v),
+            "monthly_allowance_cents" => out.monthly_allowance_cents = v.trim().parse().ok(),
+            "max_concurrent_runs" => out.max_concurrent_runs = v.trim().parse().ok()?,
+            "wake_on_timer" => out.wake_on_timer = parse_bool_wire(v)?,
+            "wake_on_demand" => out.wake_on_demand = parse_bool_wire(v)?,
             _ => {}
         }
     }
@@ -879,6 +919,14 @@ fn parse_csv(s: &str) -> Vec<String> {
 }
 
 // ── Helpers (shared with cron / delegate) ────────────────
+
+fn parse_bool_wire(s: &str) -> Option<bool> {
+    match s.trim() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
 
 fn require_field(v: &Option<String>, name: &str) -> Result<String, (StatusCode, Json<ApiError>)> {
     let s = v.as_deref().unwrap_or("").trim();
@@ -1186,12 +1234,17 @@ mod tests {
 
     #[test]
     fn parse_agent_detail_round_trips_every_field() {
-        let body = "agent_id=id1|name=Alice|role=research|title=Junior|department=rd|team=ops|created_by=alice|status=active|subject_id=subj-1|risk_ceiling=medium|approval_timeout_secs=86400|created_at=100|updated_at=200|surface_allowlist=telegram,openwebui|allow_categories=browser,fetch|deny_categories=payments|allow_sensitivity_tags=|deny_sensitivity_tags=credentials:read|approval_required_categories=payments,production_deploy\n";
+        let body = "agent_id=id1|name=Alice|role=research|title=Junior|department=rd|team=ops|created_by=alice|status=active|subject_id=subj-1|risk_ceiling=medium|approval_timeout_secs=86400|created_at=100|updated_at=200|surface_allowlist=telegram,openwebui|allow_categories=browser,fetch|deny_categories=payments|allow_sensitivity_tags=|deny_sensitivity_tags=credentials:read|approval_required_categories=payments,production_deploy|rig=codex|monthly_allowance_cents=25000|max_concurrent_runs=3|wake_on_timer=false|wake_on_demand=true\n";
         let d = parse_agent_detail(body).unwrap();
         assert_eq!(d.agent_id, "id1");
         assert_eq!(d.allow_categories, vec!["browser", "fetch"]);
         assert_eq!(d.deny_sensitivity_tags, vec!["credentials:read"]);
         assert_eq!(d.surface_allowlist, vec!["telegram", "openwebui"]);
+        assert_eq!(d.rig.as_deref(), Some("codex"));
+        assert_eq!(d.monthly_allowance_cents, Some(25000));
+        assert_eq!(d.max_concurrent_runs, 3);
+        assert!(!d.wake_on_timer);
+        assert!(d.wake_on_demand);
     }
 
     #[test]

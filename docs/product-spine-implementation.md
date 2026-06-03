@@ -1,74 +1,115 @@
-# Product-spine — implementation map
+# Product Spine - Implementation Map
 
-> **Implementation reference** (complements the idea-layer docs: [`relix-company-model.md`](relix-company-model.md), [`relix-lexicon.md`](relix-lexicon.md), [`relix-agent-adapters.md`](relix-agent-adapters.md), [`relix-hermes-integration.md`](relix-hermes-integration.md)). This maps the lexicon to the *shipped* code: modules + mesh capabilities. All entries are live with passing tests on `codex/product-spine-roadmap`.
+> **Implementation reference** for the idea-layer docs:
+> [`relix-company-model.md`](relix-company-model.md),
+> [`relix-execution-and-issue-design.md`](relix-execution-and-issue-design.md),
+> [`relix-dashboard-design.md`](relix-dashboard-design.md),
+> [`relix-agent-adapters.md`](relix-agent-adapters.md),
+> [`relix-hermes-integration.md`](relix-hermes-integration.md), and
+> [`relix-lexicon.md`](relix-lexicon.md). This maps the lexicon to the
+> shipped code: modules, mesh capabilities, and known divergences.
 
-## Modules (where the spine lives)
+## Modules
 
 | Module | What |
 |---|---|
-| `coordinator/agent/store.rs` | Operatives (agent profiles): `reports_to` (Lead), `rig`, `monthly_allowance_cents`; org-tree queries (direct reports / Branch subtree / Line); `manages`; status counts; the hire flow (request/approve/reject). |
-| `coordinator/spine/` | Mandates, Campaigns, Guilds (+ Allowance), and the strategy gate — tenant-scoped store + `mandate.*`/`campaign.*`/`guild.*` handlers. |
-| `coordinator/brief.rs` | Brief board state machine (`board_transition_allowed`), priorities, the `BriefCard` / `Dossier` / `BriefFields` types. |
-| `coordinator/mod.rs` (TaskStore) | The Brief ledger: board-status moves, Claim (lease/heartbeat/release), Sub-briefs/Snags, Dossiers, spine-fields, board/ready/children-done/blocked/stale queries, progress rollups, link listings, chronicle events. |
-| `coordinator/heartbeat.rs` | The dispatch loop: `claim_ready_batch`, `dispatch_batch` (claim → run-on-Rig → advance board → release), bridge-token mint/revoke per Shift. |
-| `rig/` | The universal agent-backend contract (`Rig` trait), registry with Guild-default `resolve`, `EchoRig`, `ProcessRig` (stdout-capped, configurable governance), the Claude/Codex/Gemini subscription adapters + the **Hermes** deep adapter (`hermes_rig`, PerToolCall), and the bridge-back token store (per-method scope). |
-| `macros/` | The **Macro** (native execute_code): `run_macro` (capped) + `run_macro_guarded` (interpreter allowlist) + `run_macro_rpc` (split `@relix-call` tool requests from residual); `cwd` + scoped `env` for the Cell. |
-| `tradecraft/` | The **Keeper**: usage-clock Knack aging + provenance gate; the creation trigger + post-response nudge. |
-| `bench/` | The **Bench**: serverless sleep/wake workspace lifecycle (hibernate to ~$0, wake with snapshot); `idle_active_benches` + `hibernate_idle` auto-sleep tick. |
-| `src/controller_runtime.rs` (crate root, not under `nodes/coordinator/`) | Wiring: spine handlers, the shared Rig registry + `rig.list`/`rig.describe` (+ `RELIX_DEFAULT_RIG`), and the opt-in live heartbeat loop (`RELIX_HEARTBEAT_ENABLED`) with rich prompt composition, failure-parking, and per-tick token sweep. |
-| `relix-cli` `call.rs` | `relix call --method <name> --arg <pipe-delimited>` — generic capability invocation, the operator escape hatch reaching the whole spine surface from the CLI. |
-| `relix-web-bridge` `spine.rs` | The dashboard HTTP surface — `GET /v1/spine/{guild,board,board/:col,roster,mandates,mandates/search,mandates/:id/{tree,briefs},briefs/search,briefs/:id,desk/:agent,overdue}` + write `POST /v1/spine/{briefs,briefs/:id/{move,pin,comment,due},mandates}`, all proxying to the coordinator through the mesh admission pipeline. |
-| `relix-web-bridge` `spine_dashboard.html` | **Phase 6** — the served `/spine` board page (self-contained inline HTML/JS/CSS, B&W): Board (kanban + detail panel: move/pin/comment/assign/priority/snag/subbrief + create + search + label filter), Mandates (goal tree + create), Roster, and Activity (live chronicle) tabs, plus the companion command bar — all driven by `/v1/spine/*`. |
-| `relix-web-bridge` `companion.rs` | **Phase 5** (materialize-work half) — a tested, rule-based command parser (`create brief/mandate`, `move … to …`, `search`, `overdue`, `board`, `help`) behind `POST /v1/spine/companion`. Not an LLM; the verifiable execution spine a model can later sit on. |
+| `coordinator/agent/store.rs` | Operatives: `reports_to` (Lead), `rig`, `monthly_allowance_cents`, runtime Keys (`max_concurrent_runs`, `wake_on_timer`, `wake_on_demand`); org-tree queries, `manages`, status counts, and the hire flow. |
+| `coordinator/spine/` | Mandates, Campaigns, Guilds, Allowance, and the strategy gate. Tenant-scoped store plus `mandate.*`, `campaign.*`, and `guild.*` handlers. |
+| `coordinator/brief.rs` | Brief board vocabulary, priorities, reviewer field, and the `BriefCard`, `Dossier`, and `BriefFields` types. |
+| `coordinator/mod.rs` (`TaskStore`) | Brief ledger: board moves with guarded side effects, two-pointer Claim fields (`checkout_run_id`, `execution_run_id`, holder, locked-at), lease/heartbeat/release, persistent Brief wakeup queue (`queued`, `running`, `coalesced`, `deferred`, `skipped`, terminal rows), Sub-briefs, Snags, Dossiers, spine fields, board/ready/blocked/stale queries, progress rollups, link listings, and Chronicle events. |
+| `coordinator/heartbeat.rs` | Dispatch loop: timer wakes ready Briefs through the persistent wakeup queue, lazily claims queued wakeups with per-Operative concurrency caps, honors timer-wake disablement, runs on Rig, advances board, parks failures, marks wakeup terminal, promotes deferred wakeups, and mints/revokes bridge-back tokens per Shift. |
+| `rig/` | Universal agent-backend contract (`Rig` trait), registry, `EchoRig`, `ProcessRig`, CLI Rigs, probe/install hints, structured-output flag, bridge-back support flag, billing metadata, and per-method bridge-back token store. Hermes is currently a stdio `BoxLevel` placeholder, not the real rich Tether. |
+| `macros/` | Native Macro / execute-code core: capped execution, interpreter allowlist, split `@relix-call` tool requests, scoped `cwd` and env. |
+| `tradecraft/` | Keeper scaffolding: usage-clock Knack aging, provenance gate, creation trigger, post-response nudge. |
+| `bench/` | Bench scaffolding: sleep/wake workspace lifecycle and idle hibernation tick. |
+| `src/controller_runtime.rs` | Wiring: spine handlers, shared Rig registry, `rig.list`/`rig.describe`, `RELIX_DEFAULT_RIG`, optional live heartbeat loop, prompt composition, failure parking, and bridge-token sweep. |
+| `relix-cli` `call.rs` | `relix call --method <name> --arg <pipe-delimited>`: generic operator escape hatch for the spine capability surface. |
+| `relix-web-bridge` `spine.rs` | Dashboard HTTP proxy for `/v1/spine/*`, including board reads, Brief create/move/comment/due/pin/set, Mandates, Roster, Desk, search, overdue, Guild detail, and Allowance committed reads. |
+| `relix-web-bridge` `bridge_back.rs` | Narrow public bridge-back API for scoped Rig tokens: comment, Sub-brief, Dossier add, Snag set, Clearance request, and claim-holder lookup. Every route validates `Authorization: Bearer brt_*` through `bridge_back.authorize` before forwarding. |
+| `relix-web-bridge` `spine_dashboard.html` | Interim `/spine` company console: self-contained HTML/CSS/JS, left rail, Issues board/list, detail properties panel, assignee/reviewer controls, companion chat, Mandate hierarchy/drilldown, Org/Roster, live Allowance summary, and live Chronicle Activity tail. It follows the Paperclip-like work-object IA but is not the final React SPA from `relix-dashboard-design.md`. |
+| `relix-web-bridge` `agent.rs` | Roster HTTP API for listing, reading, and patching Operatives, including persisted runtime Keys surfaced to the dashboard. |
+| `relix-web-bridge` `companion.rs` | Rule-based materialize-work parser behind `POST /v1/spine/companion`. It creates/moves/searches Briefs and Mandates through the same spine API. Not yet an LLM companion. |
 
-## Capabilities (live on the mesh, in our language)
+## Capabilities
 
-**Guild** — `guild.get` · `guild.counts` · `guild.set` · `guild.set_allowance`
-**Mandate** — `mandate.create/get/list/update` · `mandate.children` · `mandate.tree` · `mandate.search` · `mandate.progress` · `mandate.briefs` · `mandate.propose_strategy/approve_strategy/reject_strategy/strategy`
-**Campaign** — `campaign.create/get/list/update` · `campaign.search` · `campaign.progress` · `campaign.briefs`
-**Brief** — `brief.create` (materialize) · `brief.move` (board) · `brief.set`/`brief.fields` · `brief.detail` (full view) · `brief.search` · `brief.set_labels`/`brief.labels`/`brief.by_label` · `brief.pin` · `brief.set_due`/`brief.due`/`brief.overdue` · `brief.board`/`brief.board_summary` · `brief.desk` (per-Operative) · `brief.workload`/`brief.team_workload` · `brief.subbrief_progress` · `brief.comment` · `brief.ready` · `brief.children_done` · `brief.blocked`/`brief.blocked_list` · `brief.stale_list` · `brief.subbrief`/`brief.unsubbrief`/`brief.subbriefs` · `brief.parents` (reverse) · `brief.snag`/`brief.unsnag`/`brief.snags` · `brief.blocking` (reverse) · `brief.dossier_add`/`brief.dossiers`/`brief.dossier_get`/`brief.dossier_latest` · `brief.claim`/`brief.heartbeat`/`brief.release`/`brief.claim_holder` · (plus the existing `task.*` execution surface)
-**Operative / Roster** — `agent.create/get/list/update/delete/keys` · `agent.reports`/`agent.branch`/`agent.line`/`agent.peers` (org tree, cycle-guarded) · `agent.by_role` (staffing) · `agent.manages` · `agent.roster_summary` · `agent.allowance_committed` · the hire flow on the agent status machine
-**Rig** — `rig.list` · `rig.describe` (name + label + governance) · per-Operative `rig` field; `dispatch_batch` runs a Brief on its Rig
-**Chronicle** — `brief.created` · `brief.board_moved` · `brief.assigned` · `brief.comment` · `brief.subbrief_added` · `brief.subbrief_removed` · `brief.snagged` · `brief.snag_cleared` · `brief.dossier_added` · Shift lifecycle: `brief.shift_done` / `brief.continued` / `brief.dispatch_failed`
+**Guild** - `guild.get`, `guild.counts`, `guild.set`, `guild.set_allowance`
 
-## Governance & security carried through
-- Default-deny agent gate; a **pending** hire is inert (gate denies non-active).
-- Tenant-scoped spine reads (a Guild can't read another's Mandates/Campaigns).
-- Org tree is **cycle-guarded** — a `reports_to` edge that would close a loop is rejected.
-- Mesh tools lent to a Rig route through the admission pipeline; the **box is the boundary** for thin Rigs; the **bridge-back token** is scoped per Shift (Brief + Operative) **and optionally per-method** (`mint_scoped`/`authorize_method`), revoked when the Shift ends.
-- The **Macro** (execute_code) runs only **allowlisted interpreters** (`run_macro_guarded`); a `ProcessRig`'s stdout is **capped** so a runaway CLI can't flood context.
-- An unrecoverable dispatch **Failed** parks the Brief in `blocked` (with the reason chronicled) instead of re-dispatching forever.
-- The **strategy gate** is a *tenant-guarded, queryable* predicate (`strategy_approved`) with the proposed→approved/rejected state machine. ⚠️ It is **not yet enforced** — no hire/team-build path blocks on it (company-model §10.3 wants enforcement; that coupling is follow-up). Do not describe it as enforced until wired.
+**Mandate** - `mandate.create/get/list/update`, `mandate.children`, `mandate.tree`, `mandate.search`, `mandate.progress`, `mandate.briefs`, `mandate.propose_strategy/approve_strategy/reject_strategy/strategy`
 
-## Shipped this roadmap
-- **Phase 6 dashboard** — served at `/spine`, functional (Board/Mandates/Roster/Activity + command bar) over the `/v1/spine/*` API.
-- **Phase 5 materialize-work** — the rule-based companion (`/v1/spine/companion`) + command bar create/move/search/etc. through the spine.
-- **Macro RPC-to-tools** parse layer (`extract_tool_calls`/`run_macro_rpc`); the **Hermes Rig adapter** stdio placeholder; the **Keeper** (`KnackLedger`) runnable in-memory.
+**Campaign** - `campaign.create/get/list/update`, `campaign.search`, `campaign.progress`, `campaign.briefs`
 
-## Known divergences from the design docs (audited 2026-06-03)
-This section is the honest ledger — where the code differs from the locked designs, so nobody (including future me) reads conformance that isn't there.
+**Brief** - `brief.create`, `brief.move`, `brief.set`, `brief.fields`, `brief.detail`, `brief.search`, `brief.set_labels`, `brief.labels`, `brief.by_label`, `brief.pin`, `brief.set_due`, `brief.due`, `brief.overdue`, `brief.board`, `brief.board_summary`, `brief.desk`, `brief.workload`, `brief.team_workload`, `brief.subbrief_progress`, `brief.comment`, `brief.ready`, `brief.children_done`, `brief.blocked`, `brief.blocked_list`, `brief.stale_list`, `brief.subbrief`, `brief.unsubbrief`, `brief.subbriefs`, `brief.parents`, `brief.snag`, `brief.unsnag`, `brief.snags`, `brief.blocking`, `brief.dossier_add`, `brief.dossiers`, `brief.dossier_get`, `brief.dossier_latest`, `brief.wakeup`, `brief.wakeups`, `brief.claim`, `brief.heartbeat`, `brief.release`, `brief.claim_holder`
 
-**Execution & issue design** (`relix-execution-and-issue-design.md`)
-- **Board transitions are a rigid edge graph; the doc (§1.3) wants permissive target-validation + guarded side-effects.** Deliberate stricter choice — flagged, not yet reconciled.
-- **Single-pointer Claim; decision #1 LOCKED a two-pointer split** (checkout-run vs execution-run + agent-name + locked-at). Not implemented.
-- **Missing entry guards** (§1.3): `in_progress` should require an assignee + no unresolved blockers; `in_review` should require a real reviewer. Not enforced.
-- **No coalesce/defer/queue engine** (§2.3, the doc's "core") and **no conservative recovery** (retry-cap → escalation chain, §3.3 DECISION #4). Failure handling is the simple `Failed{retryable:false}→blocked` park.
-- ✅ Fixed in this pass: blockers-resolved wake (`brief.unblocked`), Snag/Sub-brief **cycle** rejection.
+**Operative / Roster** - `agent.create/get/list/update/delete/keys`, `agent.request_hire`, `agent.request_hire_for_mandate`, `agent.approve_hire`, `agent.reject_hire`, `agent.reports`, `agent.branch`, `agent.line`, `agent.peers`, `agent.by_role`, `agent.manages`, `agent.roster_summary`, `agent.allowance_committed`, hire status flow
 
-**Company model** (`relix-company-model.md`)
-- **Strategy gate is queryable, NOT enforced** (§10.3) — no hire/team-build path blocks on `strategy_approved`. (Hire flow is now wired + tenant-guarded; the strategy→hire coupling is the remaining enforcement step.)
-- **Per-agent toggles unbuilt** (§5.2): spawn-routing (direct vs route-up), assign-scope (subtree/allowlist/project), autonomy (heartbeat/wake/concurrency), secrets allowlist.
-- **Allowance is a stored cap, not an enforced spend** (§3.6/§5.2D — no pause-on-hard-stop). No cost-tree rollup/billing code (§6.6).
+**Rig** - `rig.list`, `rig.describe` with name, label, governance, bridge-back support, structured-output support, billing metadata, and probe/install hint; per-Operative `rig`; `dispatch_batch` runs a Brief on its Rig
 
-**Adapters / Hermes** (`relix-agent-adapters.md`, `relix-hermes-integration.md`)
-- **Tether / plugin-hook system unbuilt** (§5.11/§2.3) — the biggest gap; the existing `plugin/` host is out-of-process capability-provider, not the in-process `register(ctx)` + lifecycle-hook model.
-- **Hermes rich seam unbuilt** — `hermes_rig` is a stdio **placeholder** (now correctly `BoxLevel`); the real `/v1/runs` HTTP + MCP + `relix-bridge` plugin (PerToolCall) is future.
-- **CLI adapters omit structured-output flags** (§3.2/§3.3: `claude --output-format stream-json`, `codex exec --json`) → no token/cost capture, no `$0-but-tracked` ledger, no `CODEX_HOME` per-tenant symlink, no probe / session resume-stop.
+**Bridge-back** - `bridge_back.authorize` plus public HTTP routes under `/v1/bridge-back/*`, including Brief-local Clearance requests
 
-**Dashboard** (`relix-dashboard-design.md`)
-- **Vanilla served HTML, not the decided React SPA** (§1) with query-cache + left-rail IA + tenant switcher/prefix-router. Missing surfaces: **Inbox (§5), Org chart + Permissions panel (§9), Costs/Approvals (§10), issue-as-chat-thread detail (§7), Settings hub (§3)**; realtime is polling, not the §11 WebSocket.
+**Chronicle** - `brief.created`, `brief.board_moved`, `brief.assigned`, `brief.reviewer_assigned`, `brief.comment`, `brief.subbrief_added`, `brief.subbrief_removed`, `brief.snagged`, `brief.snag_cleared`, `brief.dossier_added`, `brief.clearance_requested`, `brief.shift_done`, `brief.continued`, `brief.dispatch_failed`
 
-## Remaining (needs external infra, not a tested-Rust slice)
-- **Smarter companion** — swap the rule-based parser for an LLM that composes the same `/v1/spine/*` execution path (needs a model configured).
-- **Sandboxed Cell** — container/VM isolation to safely expose `macro.run` (the Macro core + interpreter allowlist + cwd/scoped-env are in).
-- **Persistent Keeper / Bench backends** — SQLite/worktree stores behind the in-memory ledgers.
+## Governance And Security Carried Through
+
+- Default-deny agent gate; a pending hire is inert.
+- Heartbeat Rig resolution now refuses non-active Operatives before dispatch, so pending/suspended/disabled hires cannot run through the default-Rig path.
+- Heartbeat wake admission now checks the assigned Operative's `wake_on_timer` flag and `max_concurrent_runs` cap before claiming queued work.
+- Tenant-scoped spine reads for Mandates/Campaigns/Guild state.
+- Org tree is cycle-guarded.
+- Thin Rigs are governed at the box boundary and through scoped bridge-back tokens.
+- Bridge-back tokens are scoped per Shift, Brief, Operative, and method; tokens are checked by `bridge_back.authorize`, exposed only through narrow HTTP routes, and revoked when the Shift ends.
+- Thin Rigs can raise a real Brief-linked Clearance through `brief.clearance_request`; the handler derives subject/approver metadata from the stored Operative profile, parks the Brief in `awaiting_input`, and writes a pending `approval_requests` row.
+- Macro execution is allowlisted and `ProcessRig` stdout is capped.
+- Hard dispatch failures park the Brief in `blocked` and Chronicle the reason.
+- Strategy gate is queryable and tenant-guarded. The explicit `agent.request_hire_for_mandate` team-build path refuses until the Mandate strategy is approved; legacy/manual `agent.request_hire` and direct `agent.create` remain operator/admin paths and do not check a Mandate.
+
+## Shipped This Roadmap
+
+- Phase 5 materialize-work: rule-based companion plus command-bar operations through `/v1/spine/*`.
+- Phase 6 interim dashboard: `/spine` work-object console over the live spine API.
+- Execution invariant pass: reviewer guard for `in_review`, assignee/no-Snag guard for `in_progress`, two-pointer Claim fields, lock clearing on assignee/status ownership changes, persistent Brief wakeup queue with queue/coalesce/defer/skipped audit rows, lazy claim stamping, deferred promotion on lock release/status unlock, scoped bridge-back HTTP routes.
+- Strategy-gated hire slice: `agent.request_hire_for_mandate` blocks team-build hires until the target Mandate has an approved strategy, then creates only a pending inert hire.
+- Bridge-back Clearance slice: `/v1/bridge-back/briefs/:id/clearance` plus `brief.clearance_request` creates a pending approval from a scoped Rig token.
+- Runtime Keys slice: Operatives persist timer-wake permission, on-demand wake permission, and max concurrent Brief runs; heartbeat dispatch enforces timer wake and concurrency caps, `brief.wakeup` records skipped rows when wake admission is disabled, and the dashboard can edit those values from the Roster panel.
+- Costs panel slice: `/spine` reads `guild.get` and `agent.allowance_committed` through browser-safe spine proxies and shows configured Guild cap, committed Operative allowance, remaining headroom, and over-cap warning. It is visibility only, not a spend hard-stop.
+- Activity slice: `/spine` renders the existing `/v1/tasks/events/recent` Chronicle tail instead of a dead placeholder.
+- Goals slice: `/spine` renders the tenant Mandate hierarchy and side-panel drilldown through `mandate.list` and `mandate.tree`.
+- Adapter metadata pass: Rig descriptions expose probe status, install hints, structured-output support, bridge-back support, and subscription billing metadata for Claude/Codex/Gemini.
+- Macro RPC-to-tools parse layer; Hermes stdio placeholder; Keeper in-memory scaffold.
+
+## Known Divergences From The Design Docs
+
+This is the honest ledger. Do not describe these as done until the code is actually wired and tested.
+
+### Execution And Issue Design
+
+- Board transitions still use a rigid edge graph. `relix-execution-and-issue-design.md` wants permissive target validation plus guarded side effects. Guarded side effects now exist; the transition validator is still stricter than the design.
+- Claim has the two-pointer fields now, but it is not the full Paperclip checkout engine. Implemented: `checkout_run_id`, `execution_run_id`, holder, locked-at, self-refresh, lease/release/admin force-release, lock clearing, persistent wakeup rows, queue/coalesce/defer/skipped decisions, lazy lock stamping from queued wakeups, and deferred promotion. Missing: stale-run adoption by terminal run evidence, explicit HTTP 409 semantics, per-agent start lock, and a dedicated queued-run table separate from wakeup rows.
+- Entry guards are enforced for the current board path: `in_progress` requires an assignee and no unresolved Snags; `in_review` requires `reviewer_agent_id`.
+- There is now a Brief-local wakeup queue and coalesce/defer/queue engine for the heartbeat dispatcher. Implemented: timer wake admission, lazy claim stamping, deferred promotion, and per-Operative max-running caps on queue claims. Still missing: all external triggers funneled exclusively through that chokepoint, a true per-agent start lock separate from claim counts, budget gates on wakeup admission, and the conservative recovery chain. Failure handling is still simple failure-to-blocked parking.
+- Exactly-once plan decomposition, issue documents as approval-bound Dossiers, structured interaction cards, cost tree rollup, and child/blocker auto-wake promotion remain incomplete.
+
+### Company Model
+
+- Strategy gate is enforced only on the explicit `agent.request_hire_for_mandate` path. The broader Prime/CEO flow is still incomplete: direct/admin `agent.create`, legacy/manual `agent.request_hire`, and any future team-build helpers must choose this guarded path or add equivalent enforcement.
+- Per-agent Keys are partial: `rig`, `monthly_allowance_cents`, `max_concurrent_runs`, `wake_on_timer`, and `wake_on_demand` are stored and editable from the dashboard. Heartbeat dispatch enforces `wake_on_timer` and `max_concurrent_runs`; the `brief.wakeup` chokepoint enforces `wake_on_timer`/`wake_on_demand` for explicit queued wakes. Still missing: spawn-routing, assign-scope, secrets allowlists, hard spend stop, and broader autonomy policy gates. Any future wake trigger must use `brief.wakeup` or it will bypass the on-demand policy.
+- Allowance is a stored cap, not enforced spend control. There is no pause-on-hard-stop, no issue-tree cost rollup, and no billing-code attribution.
+- The Prime/CEO flow is not real yet: there is no governed strategy-to-team assembly loop.
+
+### Adapters And Hermes
+
+- Tether / plugin-hook system is unbuilt. The existing plugin host is an out-of-process capability-provider system, not the in-process lifecycle-hook bridge described in `relix-hermes-integration.md`.
+- Hermes rich seam is unbuilt. `hermes_rig` is a stdio placeholder and remains `BoxLevel`; real `/v1/runs`, MCP, `relix-bridge`, and PerToolCall governance are future work.
+- CLI adapters declare structured-output flags and metadata, but do not parse stream-json/JSONL yet. Missing: token/cost capture, `$0-but-tracked` cost ledger rows, quota polling/back-off, Codex per-tenant `CODEX_HOME` symlink, session resume, interrupt, and stop.
+- Bridge-back exists for the narrow universal floor: comment/Sub-brief/Dossier/Snag/Clearance/claim-holder routes. Thin adapters still have no per-tool-call governance; Clearance is the route for an adapter to ask Relix before crossing a boundary it cannot gate internally.
+
+### Dashboard
+
+- The current dashboard is an interim single-file shell, not the decided React SPA in `relix-dashboard-design.md`.
+- The page now follows the work-object IA, but it lacks a componentized router, query cache, tenant-prefix navigation, and surgical realtime invalidation.
+- Missing or partial surfaces: true Desk/Inbox, pan/zoom Lattice org chart, complete governance panel for spawn/assign/secrets policies, full Costs/Approvals with spend enforcement controls, issue-as-live-chat-thread detail with transcripts/interactions, Settings hub, and websocket-driven realtime.
+
+## Remaining External-Infra Work
+
+- Smarter companion: replace the rule parser with an LLM that uses the same governed spine APIs.
+- Sandboxed Cell: container/VM isolation before exposing powerful Macro/Rig execution broadly.
+- Persistent Keeper and Bench backends behind the in-memory ledgers.

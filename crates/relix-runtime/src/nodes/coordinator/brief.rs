@@ -52,6 +52,9 @@ pub struct BriefFields {
     pub assignee_agent_id: Option<String>,
     pub board_status: String,
     pub priority: String,
+    /// The Operative/Lead responsible for review before the Brief
+    /// can enter `in_review`.
+    pub reviewer_agent_id: Option<String>,
     pub mandate_id: Option<String>,
     pub campaign_id: Option<String>,
 }
@@ -202,7 +205,14 @@ mod tests {
 
     #[test]
     fn anything_live_can_be_cancelled_but_cancel_is_terminal() {
-        for s in ["backlog", "todo", "in_progress", "in_review", "done", "blocked"] {
+        for s in [
+            "backlog",
+            "todo",
+            "in_progress",
+            "in_review",
+            "done",
+            "blocked",
+        ] {
             assert!(
                 board_transition_allowed(s, "cancelled"),
                 "{s} should be cancellable"
@@ -228,7 +238,10 @@ mod tests {
     #[test]
     fn idempotent_self_transition_is_allowed() {
         for s in BOARD_STATUSES {
-            assert!(board_transition_allowed(s, s), "{s} → {s} should be a no-op");
+            assert!(
+                board_transition_allowed(s, s),
+                "{s} → {s} should be a no-op"
+            );
         }
     }
 

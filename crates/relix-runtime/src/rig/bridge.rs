@@ -14,7 +14,7 @@
 //! is revocable and naturally expires — no signing key needed.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// What a bridge token authorizes — the scope of one run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +50,15 @@ pub struct BridgeTokenStore {
 impl BridgeTokenStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Process-wide bridge-back token store used by the coordinator
+    /// dispatcher and by `bridge_back.authorize`. A per-run token is
+    /// useless if the dispatcher mints it in one private map and the
+    /// admission path verifies another.
+    pub fn global() -> Self {
+        static GLOBAL: OnceLock<BridgeTokenStore> = OnceLock::new();
+        GLOBAL.get_or_init(BridgeTokenStore::new).clone()
     }
 
     /// Mint a token scoped to one run, valid for `ttl_secs`,

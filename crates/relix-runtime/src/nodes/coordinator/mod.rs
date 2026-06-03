@@ -538,6 +538,18 @@ impl TaskStore {
         // actively work a Brief that's still snagged. Inline check
         // under the held lock (avoids re-locking via `is_blocked`).
         if to == "in_progress" && from != to {
+            let assignee: Option<String> = conn
+                .query_row(
+                    "SELECT assignee_agent_id FROM tasks WHERE task_id = ?1",
+                    params![task_id],
+                    |r| r.get(0),
+                )
+                .map_err(CoordinatorError::Db)?;
+            if assignee.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                return Err(CoordinatorError::Invalid(format!(
+                    "cannot move {task_id} to in_progress: assignee required"
+                )));
+            }
             let unresolved: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM task_edges e
@@ -554,12 +566,41 @@ impl TaskStore {
                 )));
             }
         }
+        if to == "in_review" && from != to {
+            let reviewer: Option<String> = conn
+                .query_row(
+                    "SELECT reviewer_agent_id FROM tasks WHERE task_id = ?1",
+                    params![task_id],
+                    |r| r.get(0),
+                )
+                .map_err(CoordinatorError::Db)?;
+            if reviewer.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                return Err(CoordinatorError::Invalid(format!(
+                    "cannot move {task_id} to in_review: reviewer required"
+                )));
+            }
+        }
         let now = unix_secs();
         conn.execute(
             "UPDATE tasks SET board_status = ?1, updated_at = ?2 WHERE task_id = ?3",
             params![to, now, task_id],
         )
         .map_err(CoordinatorError::Db)?;
+        if from == "in_progress" && to != "in_progress" {
+            conn.execute(
+                "UPDATE tasks
+                 SET claimed_by = NULL,
+                     claim_expires_at = NULL,
+                     checkout_run_id = NULL,
+                     execution_run_id = NULL,
+                     claim_agent_id = NULL,
+                     claim_locked_at = NULL
+                 WHERE task_id = ?1",
+                params![task_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+            let _ = promote_oldest_deferred_wakeup_in_conn(&conn, task_id, now)?;
+        }
         // Record the move on the Brief's chronicle (skip no-ops).
         if from != to {
             conn.execute(
@@ -630,10 +671,7 @@ impl TaskStore {
     /// progress — its Sub-briefs counted by board column. The signal
     /// a planner reads to see how much of its breakdown is done. The
     /// counts sum to the number of Sub-briefs.
-    pub fn subbrief_progress(
-        &self,
-        parent: &str,
-    ) -> Result<Vec<(String, i64)>, CoordinatorError> {
+    pub fn subbrief_progress(&self, parent: &str) -> Result<Vec<(String, i64)>, CoordinatorError> {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let mut stmt = conn
             .prepare(
@@ -972,10 +1010,7 @@ impl TaskStore {
     /// Dossiers + blocked flag. `None` when the Brief doesn't exist.
     /// Each sub-read locks independently (no nested lock), so this is
     /// a convenience composite, not a single transaction.
-    pub fn brief_detail(
-        &self,
-        task: &str,
-    ) -> Result<Option<brief::BriefDetail>, CoordinatorError> {
+    pub fn brief_detail(&self, task: &str) -> Result<Option<brief::BriefDetail>, CoordinatorError> {
         let Some(fields) = self.brief_fields(task)? else {
             return Ok(None);
         };
@@ -1004,10 +1039,14 @@ impl TaskStore {
         body: &str,
     ) -> Result<String, CoordinatorError> {
         if kind.trim().is_empty() {
-            return Err(CoordinatorError::Invalid("dossier kind required".to_string()));
+            return Err(CoordinatorError::Invalid(
+                "dossier kind required".to_string(),
+            ));
         }
         if title.trim().is_empty() {
-            return Err(CoordinatorError::Invalid("dossier title required".to_string()));
+            return Err(CoordinatorError::Invalid(
+                "dossier title required".to_string(),
+            ));
         }
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         if !task_row_exists(&conn, task_id)? {
@@ -1137,10 +1176,14 @@ impl TaskStore {
         let author = author.trim();
         let text = text.trim();
         if author.is_empty() {
-            return Err(CoordinatorError::Invalid("comment author required".to_string()));
+            return Err(CoordinatorError::Invalid(
+                "comment author required".to_string(),
+            ));
         }
         if text.is_empty() {
-            return Err(CoordinatorError::Invalid("comment text required".to_string()));
+            return Err(CoordinatorError::Invalid(
+                "comment text required".to_string(),
+            ));
         }
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         if !task_row_exists(&conn, task_id)? {
@@ -1160,11 +1203,7 @@ impl TaskStore {
     /// trimmed; empties and any containing the `,` separator are
     /// dropped; duplicates are removed (first wins, order preserved).
     /// An empty result clears the column. The Brief must exist.
-    pub fn set_brief_labels(
-        &self,
-        task_id: &str,
-        labels: &[&str],
-    ) -> Result<(), CoordinatorError> {
+    pub fn set_brief_labels(&self, task_id: &str, labels: &[&str]) -> Result<(), CoordinatorError> {
         let mut seen = std::collections::BTreeSet::new();
         let mut norm: Vec<String> = Vec::new();
         for l in labels {
@@ -1177,7 +1216,11 @@ impl TaskStore {
             }
         }
         let joined = norm.join(",");
-        let stored: Option<String> = if joined.is_empty() { None } else { Some(joined) };
+        let stored: Option<String> = if joined.is_empty() {
+            None
+        } else {
+            Some(joined)
+        };
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let changed = conn
             .execute(
@@ -1206,7 +1249,10 @@ impl TaskStore {
         }
         let lim = limit.clamp(1, self.max_list) as i64;
         // Escape LIKE metacharacters so the query is taken literally.
-        let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let escaped = q
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         let pattern = format!("%{escaped}%");
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let mut stmt = conn
@@ -1293,11 +1339,7 @@ impl TaskStore {
 
     /// PHASE 5 (board): pin / unpin a Brief — pinned Briefs sort to
     /// the top of their board column. The Brief must exist.
-    pub fn set_brief_pinned(
-        &self,
-        task_id: &str,
-        pinned: bool,
-    ) -> Result<(), CoordinatorError> {
+    pub fn set_brief_pinned(&self, task_id: &str, pinned: bool) -> Result<(), CoordinatorError> {
         // Pinning is a view-layer concern, not a content edit, so it
         // deliberately does NOT bump `updated_at` (recency ordering
         // within a column stays stable when you pin/unpin).
@@ -1411,17 +1453,19 @@ impl TaskStore {
                 "SELECT title FROM tasks WHERE task_id=?1",
                 params![task_id],
                 |r| r.get::<_, String>(0),
-            ) {
-                out.push_str(&title);
-            }
+            )
+        {
+            out.push_str(&title);
+        }
         // Dossiers — the durable artifacts (plan/spec/notes).
         if let Ok(docs) = self.list_dossiers(task_id)
-            && !docs.is_empty() {
-                out.push_str("\n\nDossiers:");
-                for d in docs {
-                    out.push_str(&format!("\n- [{}] {}", d.kind, d.title));
-                }
+            && !docs.is_empty()
+        {
+            out.push_str("\n\nDossiers:");
+            for d in docs {
+                out.push_str(&format!("\n- [{}] {}", d.kind, d.title));
             }
+        }
         // Deadline, if one is set — so the agent can prioritise.
         if let Ok(Some(due)) = self.brief_due(task_id) {
             out.push_str(&format!("\n\nDue (unix secs): {due}"));
@@ -1429,10 +1473,11 @@ impl TaskStore {
         // The current plan body in full — the agent needs the actual
         // instructions, not just the plan's title.
         if let Ok(Some(plan)) = self.latest_dossier(task_id, "plan")
-            && !plan.body.trim().is_empty() {
-                out.push_str("\n\nCurrent plan:\n");
-                out.push_str(plan.body.trim());
-            }
+            && !plan.body.trim().is_empty()
+        {
+            out.push_str("\n\nCurrent plan:\n");
+            out.push_str(plan.body.trim());
+        }
         // Recent comments — the conversation thread, oldest→newest.
         if let Ok(mut comments) = self.query_events(
             task_id,
@@ -1440,20 +1485,20 @@ impl TaskStore {
             max_comments.max(1),
             Some("brief.comment"),
             EventOrder::Desc,
-        )
-            && !comments.is_empty() {
-                comments.reverse();
-                out.push_str("\n\nRecent comments:");
-                for c in comments {
-                    out.push_str(&format!("\n- {}", c.payload));
-                }
+        ) && !comments.is_empty()
+        {
+            comments.reverse();
+            out.push_str("\n\nRecent comments:");
+            for c in comments {
+                out.push_str(&format!("\n- {}", c.payload));
             }
+        }
         out
     }
 
     /// PHASE 1 (Brief): set one of the Brief's spine fields —
-    /// `assignee` / `priority` / `mandate` / `campaign`. Empty
-    /// value clears assignee/mandate/campaign (NULL); `priority`
+    /// `assignee` / `reviewer` / `priority` / `mandate` / `campaign`. Empty
+    /// value clears assignee/reviewer/mandate/campaign (NULL); `priority`
     /// must be a valid level. The Brief must exist.
     ///
     /// NOTE: assignee/mandate/campaign are stored as soft links
@@ -1485,22 +1530,22 @@ impl TaskStore {
                     params![v, now, task_id],
                 )
             }
-            "assignee" | "mandate" | "campaign" => {
+            "assignee" | "reviewer" | "mandate" | "campaign" => {
                 let col = match field {
                     "assignee" => "assignee_agent_id",
+                    "reviewer" => "reviewer_agent_id",
                     "mandate" => "mandate_id",
                     _ => "campaign_id",
                 };
                 let t = value.trim();
                 let stored: Option<&str> = if t.is_empty() { None } else { Some(t) };
                 // `col` is from the fixed match above, never user input.
-                let sql =
-                    format!("UPDATE tasks SET {col}=?1, updated_at=?2 WHERE task_id=?3");
+                let sql = format!("UPDATE tasks SET {col}=?1, updated_at=?2 WHERE task_id=?3");
                 conn.execute(&sql, params![stored, now, task_id])
             }
             other => {
                 return Err(CoordinatorError::Invalid(format!(
-                    "unknown brief field '{other}' (assignee/priority/mandate/campaign)"
+                    "unknown brief field '{other}' (assignee/reviewer/priority/mandate/campaign)"
                 )));
             }
         }
@@ -1513,7 +1558,14 @@ impl TaskStore {
         // waiting out the previous holder's lease.
         if field == "assignee" {
             let _ = conn.execute(
-                "UPDATE tasks SET claimed_by=NULL, claim_expires_at=NULL WHERE task_id=?1",
+                "UPDATE tasks
+                 SET claimed_by=NULL,
+                     claim_expires_at=NULL,
+                     checkout_run_id=NULL,
+                     execution_run_id=NULL,
+                     claim_agent_id=NULL,
+                     claim_locked_at=NULL
+                 WHERE task_id=?1",
                 params![task_id],
             );
         }
@@ -1522,6 +1574,13 @@ impl TaskStore {
             let _ = conn.execute(
                 "INSERT INTO task_events (task_id, ts, event_type, payload)
                  VALUES (?1, ?2, 'brief.assigned', ?3)",
+                params![task_id, now, value.trim()],
+            );
+        }
+        if field == "reviewer" && !value.trim().is_empty() {
+            let _ = conn.execute(
+                "INSERT INTO task_events (task_id, ts, event_type, payload)
+                 VALUES (?1, ?2, 'brief.reviewer_assigned', ?3)",
                 params![task_id, now, value.trim()],
             );
         }
@@ -1536,7 +1595,8 @@ impl TaskStore {
     ) -> Result<Option<brief::BriefFields>, CoordinatorError> {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         match conn.query_row(
-            "SELECT task_id, assignee_agent_id, board_status, priority, mandate_id, campaign_id, human_ref
+            "SELECT task_id, assignee_agent_id, board_status, priority,
+                    reviewer_agent_id, mandate_id, campaign_id, human_ref
              FROM tasks WHERE task_id = ?1",
             params![task_id],
             |r| {
@@ -1545,9 +1605,10 @@ impl TaskStore {
                     assignee_agent_id: r.get(1)?,
                     board_status: r.get(2)?,
                     priority: r.get(3)?,
-                    mandate_id: r.get(4)?,
-                    campaign_id: r.get(5)?,
-                    human_ref: r.get(6)?,
+                    reviewer_agent_id: r.get(4)?,
+                    mandate_id: r.get(5)?,
+                    campaign_id: r.get(6)?,
+                    human_ref: r.get(7)?,
                 })
             },
         ) {
@@ -1567,11 +1628,12 @@ impl TaskStore {
         limit: usize,
     ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
         if let Some(b) = board
-            && !brief::is_board_status(b) {
-                return Err(CoordinatorError::Invalid(format!(
-                    "unknown board status '{b}'"
-                )));
-            }
+            && !brief::is_board_status(b)
+        {
+            return Err(CoordinatorError::Invalid(format!(
+                "unknown board status '{b}'"
+            )));
+        }
         let lim = limit.clamp(1, self.max_list) as i64;
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let map = |r: &rusqlite::Row| {
@@ -1780,9 +1842,26 @@ impl TaskStore {
         agent_id: &str,
         lease_secs: i64,
     ) -> Result<bool, CoordinatorError> {
+        self.claim_brief_for_run(task_id, agent_id, lease_secs, None)
+    }
+
+    /// PHASE 3 (Claim): atomically claim a Brief for a concrete
+    /// execution Shift. This implements the two-pointer Claim from
+    /// relix-execution-and-issue-design: `checkout_run_id` owns the
+    /// lease and `execution_run_id` names the run being performed.
+    /// `claimed_by`/`claim_expires_at` are kept as legacy mirrors.
+    pub fn claim_brief_for_run(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        lease_secs: i64,
+        execution_run_id: Option<&str>,
+    ) -> Result<bool, CoordinatorError> {
         let agent = agent_id.trim();
         if agent.is_empty() {
-            return Err(CoordinatorError::Invalid("claim: agent_id required".to_string()));
+            return Err(CoordinatorError::Invalid(
+                "claim: agent_id required".to_string(),
+            ));
         }
         let now = unix_secs();
         let expires = now.saturating_add(lease_secs.max(1));
@@ -1790,17 +1869,67 @@ impl TaskStore {
         if !task_row_exists(&conn, task_id)? {
             return Err(CoordinatorError::NotFound(task_id.to_string()));
         }
-        let changed = conn
-            .execute(
-                "UPDATE tasks
-                 SET claimed_by = ?1, claim_expires_at = ?2, updated_at = ?3
-                 WHERE task_id = ?4
-                   AND (claimed_by IS NULL OR claimed_by = ?1
-                        OR claim_expires_at IS NULL OR claim_expires_at < ?3)",
-                params![agent, expires, now, task_id],
+        let current = conn
+            .query_row(
+                "SELECT claim_agent_id, checkout_run_id, execution_run_id, claim_expires_at
+                 FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                },
             )
             .map_err(CoordinatorError::Db)?;
-        Ok(changed == 1)
+        let held_by = current.0.filter(|s| !s.trim().is_empty());
+        let held_by_ref = held_by.as_deref();
+        let live = current.3.is_some_and(|t| t >= now);
+        if live && held_by_ref.is_some_and(|h| h != agent) {
+            return Ok(false);
+        }
+        let checkout_run_id = if live && held_by_ref == Some(agent) {
+            current
+                .1
+                .unwrap_or_else(|| format!("claim_{}", new_task_id()))
+        } else {
+            format!("claim_{}", new_task_id())
+        };
+        let execution_run_id = execution_run_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                if live && held_by_ref == Some(agent) {
+                    current.2
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| checkout_run_id.clone());
+        conn.execute(
+            "UPDATE tasks
+             SET claimed_by = ?1,
+                 claim_expires_at = ?2,
+                 checkout_run_id = ?3,
+                 execution_run_id = ?4,
+                 claim_agent_id = ?1,
+                 claim_locked_at = ?5,
+                 updated_at = ?5
+             WHERE task_id = ?6",
+            params![
+                agent,
+                expires,
+                checkout_run_id,
+                execution_run_id,
+                now,
+                task_id
+            ],
+        )
+        .map_err(CoordinatorError::Db)?;
+        Ok(true)
     }
 
     /// PHASE 3 (Claim): extend the lease on a Brief the caller
@@ -1818,8 +1947,11 @@ impl TaskStore {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let changed = conn
             .execute(
-                "UPDATE tasks SET claim_expires_at = ?1, updated_at = ?2
-                 WHERE task_id = ?3 AND claimed_by = ?4 AND claim_expires_at >= ?2",
+                "UPDATE tasks
+                 SET claim_expires_at = ?1, updated_at = ?2
+                 WHERE task_id = ?3
+                   AND claim_agent_id = ?4
+                   AND claim_expires_at >= ?2",
                 params![expires, now, task_id, agent_id.trim()],
             )
             .map_err(CoordinatorError::Db)?;
@@ -1831,12 +1963,23 @@ impl TaskStore {
     pub fn release_claim(&self, task_id: &str, agent_id: &str) -> Result<(), CoordinatorError> {
         let now = unix_secs();
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
-        conn.execute(
-            "UPDATE tasks SET claimed_by = NULL, claim_expires_at = NULL, updated_at = ?1
-             WHERE task_id = ?2 AND claimed_by = ?3",
-            params![now, task_id, agent_id.trim()],
-        )
-        .map_err(CoordinatorError::Db)?;
+        let changed = conn
+            .execute(
+                "UPDATE tasks
+             SET claimed_by = NULL,
+                 claim_expires_at = NULL,
+                 checkout_run_id = NULL,
+                 execution_run_id = NULL,
+                 claim_agent_id = NULL,
+                 claim_locked_at = NULL,
+                 updated_at = ?1
+             WHERE task_id = ?2 AND claim_agent_id = ?3",
+                params![now, task_id, agent_id.trim()],
+            )
+            .map_err(CoordinatorError::Db)?;
+        if changed == 1 {
+            let _ = promote_oldest_deferred_wakeup_in_conn(&conn, task_id, now)?;
+        }
         Ok(())
     }
 
@@ -1854,7 +1997,7 @@ impl TaskStore {
         }
         let prior: Option<String> = conn
             .query_row(
-                "SELECT claimed_by FROM tasks WHERE task_id = ?1",
+                "SELECT claim_agent_id FROM tasks WHERE task_id = ?1",
                 params![task_id],
                 |r| r.get::<_, Option<String>>(0),
             )
@@ -1862,7 +2005,14 @@ impl TaskStore {
             .map_err(CoordinatorError::Db)?
             .flatten();
         conn.execute(
-            "UPDATE tasks SET claimed_by = NULL, claim_expires_at = NULL, updated_at = ?1
+            "UPDATE tasks
+             SET claimed_by = NULL,
+                 claim_expires_at = NULL,
+                 checkout_run_id = NULL,
+                 execution_run_id = NULL,
+                 claim_agent_id = NULL,
+                 claim_locked_at = NULL,
+                 updated_at = ?1
              WHERE task_id = ?2",
             params![now, task_id],
         )
@@ -1879,15 +2029,12 @@ impl TaskStore {
 
     /// PHASE 3 (Claim): the current live claim holder + lease
     /// expiry, if any. `None` when unclaimed or the lease expired.
-    pub fn claim_holder(
-        &self,
-        task_id: &str,
-    ) -> Result<Option<(String, i64)>, CoordinatorError> {
+    pub fn claim_holder(&self, task_id: &str) -> Result<Option<(String, i64)>, CoordinatorError> {
         let now = unix_secs();
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         match conn.query_row(
-            "SELECT claimed_by, claim_expires_at FROM tasks
-             WHERE task_id = ?1 AND claimed_by IS NOT NULL AND claim_expires_at >= ?2",
+            "SELECT claim_agent_id, claim_expires_at FROM tasks
+             WHERE task_id = ?1 AND claim_agent_id IS NOT NULL AND claim_expires_at >= ?2",
             params![task_id, now],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
         ) {
@@ -1918,7 +2065,7 @@ impl TaskStore {
                  FROM tasks t
                  WHERE t.assignee_agent_id IS NOT NULL
                    AND t.board_status IN ('todo', 'in_progress')
-                   AND (t.claimed_by IS NULL OR t.claim_expires_at IS NULL
+                   AND (t.claim_agent_id IS NULL OR t.claim_expires_at IS NULL
                         OR t.claim_expires_at < ?1)
                    AND NOT EXISTS (
                        SELECT 1 FROM task_edges e
@@ -1936,6 +2083,448 @@ impl TaskStore {
             .map_err(CoordinatorError::Db)?;
         let rows = stmt
             .query_map(params![now, lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
+    /// PHASE 3 (wakeup queue): feed a trigger through the single
+    /// Brief wakeup chokepoint. This records exactly what happened:
+    /// queued when no live run owns the Brief, coalesced when the same
+    /// agent already has work pending/running, deferred when another
+    /// agent owns the live claim, and skipped when gates make the wake
+    /// invalid right now.
+    pub fn request_brief_wakeup(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        source: &str,
+        reason: &str,
+        context: Option<&str>,
+    ) -> Result<BriefWakeupDecision, CoordinatorError> {
+        self.request_brief_wakeup_with_admission(task_id, agent_id, source, reason, context, None)
+    }
+
+    pub fn request_brief_wakeup_with_admission(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        source: &str,
+        reason: &str,
+        context: Option<&str>,
+        admission_skip_reason: Option<&str>,
+    ) -> Result<BriefWakeupDecision, CoordinatorError> {
+        let agent = agent_id.trim();
+        if agent.is_empty() {
+            return Err(CoordinatorError::Invalid(
+                "brief.wakeup: agent_id required".to_string(),
+            ));
+        }
+        let src = source.trim();
+        let src = if src.is_empty() { "on_demand" } else { src };
+        let why = reason.trim();
+        let why = if why.is_empty() { "manual" } else { why };
+        let ctx = context.map(str::trim).filter(|s| !s.is_empty());
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT assignee_agent_id, board_status, claim_agent_id,
+                        claim_expires_at, execution_run_id
+                 FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        let Some((assignee, board, holder, expires, active_run)) = row else {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        };
+        let assignee = assignee.unwrap_or_default();
+        let assignee = assignee.trim();
+        let live_claim = holder
+            .as_deref()
+            .filter(|h| !h.trim().is_empty())
+            .zip(expires)
+            .is_some_and(|(_, exp)| exp >= now);
+
+        let (status, execution_run_id, event_type, event_payload) =
+            if matches!(board.as_str(), "done" | "cancelled") {
+                (
+                    "skipped",
+                    None,
+                    "brief.wakeup_skipped",
+                    format!("{src}:{why}: terminal board={board}"),
+                )
+            } else if assignee.is_empty() {
+                (
+                    "skipped",
+                    None,
+                    "brief.wakeup_skipped",
+                    format!("{src}:{why}: assignee required"),
+                )
+            } else if assignee != agent {
+                (
+                    "skipped",
+                    None,
+                    "brief.wakeup_skipped",
+                    format!("{src}:{why}: assigned_to={assignee}, requested_agent={agent}"),
+                )
+            } else if let Some(skip) = admission_skip_reason
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                (
+                    "skipped",
+                    None,
+                    "brief.wakeup_skipped",
+                    format!("{src}:{why}: {skip}"),
+                )
+            } else if live_claim && holder.as_deref() == Some(agent) {
+                (
+                    "coalesced",
+                    active_run,
+                    "brief.wakeup_coalesced",
+                    format!("{src}:{why}: same agent already running"),
+                )
+            } else if live_claim {
+                (
+                    "deferred",
+                    None,
+                    "brief.wakeup_deferred",
+                    format!(
+                        "{src}:{why}: live holder={}",
+                        holder.as_deref().unwrap_or("-")
+                    ),
+                )
+            } else if self_unresolved_blockers_in_conn(&conn, task_id)? > 0 {
+                (
+                    "skipped",
+                    None,
+                    "brief.wakeup_skipped",
+                    format!("{src}:{why}: unresolved blockers"),
+                )
+            } else if let Some((existing_id, existing_run)) =
+                queued_or_running_wakeup_in_conn(&conn, task_id, agent)?
+            {
+                if src == "timer" && why == "heartbeat" {
+                    return Ok(BriefWakeupDecision {
+                        wakeup_id: existing_id,
+                        task_id: task_id.to_string(),
+                        agent_id: agent.to_string(),
+                        status: "queued".to_string(),
+                        execution_run_id: existing_run,
+                        reason: why.to_string(),
+                    });
+                }
+                let wakeup_id = format!("wake_{}", new_task_id());
+                conn.execute(
+                    "INSERT INTO brief_wakeup_requests
+                        (wakeup_id, task_id, agent_id, source, reason, status,
+                         execution_run_id, context, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'coalesced', ?6, ?7, ?8, ?8)",
+                    params![wakeup_id, task_id, agent, src, why, existing_run, ctx, now],
+                )
+                .map_err(CoordinatorError::Db)?;
+                let payload = format!("{src}:{why}: coalesced_into={existing_id}");
+                let _ = conn.execute(
+                    "INSERT INTO task_events (task_id, ts, event_type, payload)
+                     VALUES (?1, ?2, 'brief.wakeup_coalesced', ?3)",
+                    params![task_id, now, payload],
+                );
+                return Ok(BriefWakeupDecision {
+                    wakeup_id,
+                    task_id: task_id.to_string(),
+                    agent_id: agent.to_string(),
+                    status: "coalesced".to_string(),
+                    execution_run_id: existing_run,
+                    reason: why.to_string(),
+                });
+            } else {
+                (
+                    "queued",
+                    Some(format!("shift_{}", uuid::Uuid::new_v4())),
+                    "brief.wakeup_queued",
+                    format!("{src}:{why}"),
+                )
+            };
+
+        let wakeup_id = format!("wake_{}", new_task_id());
+        conn.execute(
+            "INSERT INTO brief_wakeup_requests
+                (wakeup_id, task_id, agent_id, source, reason, status,
+                 execution_run_id, context, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+            params![
+                wakeup_id,
+                task_id,
+                agent,
+                src,
+                why,
+                status,
+                execution_run_id,
+                ctx,
+                now
+            ],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let _ = conn.execute(
+            "INSERT INTO task_events (task_id, ts, event_type, payload)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![task_id, now, event_type, event_payload],
+        );
+        Ok(BriefWakeupDecision {
+            wakeup_id,
+            task_id: task_id.to_string(),
+            agent_id: agent.to_string(),
+            status: status.to_string(),
+            execution_run_id,
+            reason: why.to_string(),
+        })
+    }
+
+    /// PHASE 3 (wakeup queue): queue timer wakes for currently-ready
+    /// Briefs and atomically claim queued wakeups. Lazy locking lives
+    /// here: a queued wake does not touch the Brief claim until this
+    /// method flips that wake to `running`.
+    pub fn claim_queued_wakeups(
+        &self,
+        limit: usize,
+        lease_secs: i64,
+    ) -> Result<Vec<ClaimedWakeup>, CoordinatorError> {
+        let ready = self.list_ready_briefs(limit)?;
+        for card in &ready {
+            if let Some(agent) = card.assignee_agent_id.as_deref() {
+                let _ =
+                    self.request_brief_wakeup(&card.task_id, agent, "timer", "heartbeat", None)?;
+            }
+        }
+        self.claim_queued_wakeups_with_caps(limit, lease_secs, |_| 20)
+    }
+
+    /// Same as [`claim_queued_wakeups`], but enforces a per-agent
+    /// live-run cap while atomically transitioning queued wakeups to
+    /// running. A cap of 0 leaves that agent's queued wakeups pending.
+    pub fn claim_queued_wakeups_with_caps<F>(
+        &self,
+        limit: usize,
+        lease_secs: i64,
+        mut max_running_for_agent: F,
+    ) -> Result<Vec<ClaimedWakeup>, CoordinatorError>
+    where
+        F: FnMut(&str) -> i64,
+    {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let now = unix_secs();
+        let expires = now.saturating_add(lease_secs.max(1));
+        let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let candidates: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT wakeup_id FROM brief_wakeup_requests
+                     WHERE status = 'queued'
+                     ORDER BY created_at ASC, wakeup_id ASC
+                     LIMIT ?1",
+                )
+                .map_err(CoordinatorError::Db)?;
+            stmt.query_map(params![lim], |r| r.get::<_, String>(0))
+                .map_err(CoordinatorError::Db)?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(CoordinatorError::Db)?
+        };
+        let tx = conn.transaction().map_err(CoordinatorError::Db)?;
+        let mut claimed = Vec::new();
+        let mut batch_by_agent: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        for wakeup_id in candidates {
+            let wake = match tx
+                .query_row(
+                    "SELECT wakeup_id, task_id, agent_id, source, reason, status,
+                            execution_run_id, context, created_at, updated_at,
+                            started_at, finished_at
+                     FROM brief_wakeup_requests
+                     WHERE wakeup_id = ?1 AND status = 'queued'",
+                    params![wakeup_id],
+                    brief_wakeup_from_row,
+                )
+                .optional()
+                .map_err(CoordinatorError::Db)?
+            {
+                Some(w) => w,
+                None => continue,
+            };
+            let cap = max_running_for_agent(&wake.agent_id).clamp(0, 50);
+            if cap == 0 {
+                continue;
+            }
+            let already_running: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks
+                     WHERE claim_agent_id = ?1
+                       AND claim_expires_at IS NOT NULL
+                       AND claim_expires_at >= ?2",
+                    params![wake.agent_id, now],
+                    |r| r.get(0),
+                )
+                .map_err(CoordinatorError::Db)?;
+            let batch_running = *batch_by_agent.get(&wake.agent_id).unwrap_or(&0);
+            if already_running.saturating_add(batch_running) >= cap {
+                continue;
+            }
+            let card = match brief_card_for_claimable_wakeup_in_tx(&tx, &wake, now)? {
+                Some(c) => c,
+                None => {
+                    tx.execute(
+                        "UPDATE brief_wakeup_requests
+                         SET status = 'skipped',
+                             updated_at = ?1,
+                             finished_at = ?1
+                         WHERE wakeup_id = ?2 AND status = 'queued'",
+                        params![now, wake.wakeup_id],
+                    )
+                    .map_err(CoordinatorError::Db)?;
+                    continue;
+                }
+            };
+            let execution_run_id = wake
+                .execution_run_id
+                .clone()
+                .unwrap_or_else(|| format!("shift_{}", uuid::Uuid::new_v4()));
+            let checkout_run_id = format!("claim_{}", new_task_id());
+            let changed = tx
+                .execute(
+                    "UPDATE tasks
+                     SET claimed_by = ?1,
+                         claim_expires_at = ?2,
+                         checkout_run_id = ?3,
+                         execution_run_id = ?4,
+                         claim_agent_id = ?1,
+                         claim_locked_at = ?5,
+                         updated_at = ?5
+                     WHERE task_id = ?6
+                       AND assignee_agent_id = ?1
+                       AND (claim_agent_id IS NULL OR claim_expires_at IS NULL
+                            OR claim_expires_at < ?5 OR claim_agent_id = ?1)",
+                    params![
+                        wake.agent_id,
+                        expires,
+                        checkout_run_id,
+                        execution_run_id,
+                        now,
+                        wake.task_id
+                    ],
+                )
+                .map_err(CoordinatorError::Db)?;
+            if changed != 1 {
+                continue;
+            }
+            tx.execute(
+                "UPDATE brief_wakeup_requests
+                 SET status = 'running',
+                     execution_run_id = ?1,
+                     started_at = ?2,
+                     updated_at = ?2
+                 WHERE wakeup_id = ?3 AND status = 'queued'",
+                params![execution_run_id, now, wake.wakeup_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+            let mut running = wake;
+            running.status = "running".to_string();
+            running.execution_run_id = Some(execution_run_id);
+            running.started_at = Some(now);
+            running.updated_at = now;
+            let _ = tx.execute(
+                "INSERT INTO task_events (task_id, ts, event_type, payload)
+                 VALUES (?1, ?2, 'brief.wakeup_started', ?3)",
+                params![running.task_id, now, running.wakeup_id],
+            );
+            *batch_by_agent.entry(running.agent_id.clone()).or_insert(0) += 1;
+            claimed.push(ClaimedWakeup {
+                wakeup: running,
+                card,
+            });
+        }
+        tx.commit().map_err(CoordinatorError::Db)?;
+        Ok(claimed)
+    }
+
+    /// Mark a wakeup terminal after the Rig returned.
+    pub fn finish_wakeup(
+        &self,
+        wakeup_id: &str,
+        status: &str,
+        note: Option<&str>,
+    ) -> Result<(), CoordinatorError> {
+        let status = status.trim();
+        if !matches!(status, "completed" | "failed" | "continued" | "cancelled") {
+            return Err(CoordinatorError::Invalid(format!(
+                "invalid wakeup terminal status '{status}'"
+            )));
+        }
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let task_id: Option<String> = conn
+            .query_row(
+                "SELECT task_id FROM brief_wakeup_requests WHERE wakeup_id = ?1",
+                params![wakeup_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        let Some(task_id) = task_id else {
+            return Err(CoordinatorError::NotFound(wakeup_id.to_string()));
+        };
+        conn.execute(
+            "UPDATE brief_wakeup_requests
+             SET status = ?1,
+                 updated_at = ?2,
+                 finished_at = ?2,
+                 context = COALESCE(?3, context)
+             WHERE wakeup_id = ?4",
+            params![status, now, note.map(str::trim), wakeup_id],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let _ = conn.execute(
+            "INSERT INTO task_events (task_id, ts, event_type, payload)
+             VALUES (?1, ?2, 'brief.wakeup_finished', ?3)",
+            params![task_id, now, format!("{wakeup_id}:{status}")],
+        );
+        Ok(())
+    }
+
+    /// Read the wakeup ledger for one Brief, newest first.
+    pub fn list_brief_wakeups(
+        &self,
+        task_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BriefWakeupRow>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, task_id)? {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT wakeup_id, task_id, agent_id, source, reason, status,
+                        execution_run_id, context, created_at, updated_at,
+                        started_at, finished_at
+                 FROM brief_wakeup_requests
+                 WHERE task_id = ?1
+                 ORDER BY created_at DESC, wakeup_id DESC
+                 LIMIT ?2",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![task_id, lim], brief_wakeup_from_row)
             .map_err(CoordinatorError::Db)?
             .collect::<rusqlite::Result<_>>()
             .map_err(CoordinatorError::Db)?;
@@ -2229,7 +2818,10 @@ impl TaskStore {
         if title.trim().is_empty() {
             return Err(CoordinatorError::Invalid("brief title required".into()));
         }
-        let pri = priority.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(brief::DEFAULT_PRIORITY);
+        let pri = priority
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(brief::DEFAULT_PRIORITY);
         if !brief::is_priority(pri) {
             return Err(CoordinatorError::Invalid(format!(
                 "priority '{pri}' not in low/normal/high/urgent"
@@ -5966,12 +6558,52 @@ pub struct TaskEdge {
     pub created_at: i64,
 }
 
+/// A persisted wakeup request for a Brief. This is the first real
+/// queue layer under the Paperclip-style execution loop: triggers are
+/// recorded before any Rig is dispatched, and the issue lock is only
+/// stamped when a queued wake transitions to `running`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BriefWakeupRow {
+    pub wakeup_id: String,
+    pub task_id: String,
+    pub agent_id: String,
+    pub source: String,
+    pub reason: String,
+    pub status: String,
+    pub execution_run_id: Option<String>,
+    pub context: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+}
+
+/// Result of feeding a trigger into the wakeup chokepoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BriefWakeupDecision {
+    pub wakeup_id: String,
+    pub task_id: String,
+    pub agent_id: String,
+    pub status: String,
+    pub execution_run_id: Option<String>,
+    pub reason: String,
+}
+
+/// A queued wakeup that has atomically transitioned to running and
+/// now owns the Brief claim.
+#[derive(Debug, Clone)]
+pub struct ClaimedWakeup {
+    pub wakeup: BriefWakeupRow,
+    pub card: brief::BriefCard,
+}
+
 // ──────────────────────────── Capability registration ──────────────────────
 
 /// Register the task capabilities on the dispatch bridge.
 pub fn register(
     bridge: &mut DispatchBridge,
     store: Arc<TaskStore>,
+    agent_store: Option<Arc<agent::AgentStore>>,
     auto_skill_cfg: Option<Arc<crate::nodes::ai::skills::SkillsConfig>>,
     drift_cfg: Option<Arc<crate::nodes::ai::guardrails::DriftConfig>>,
     drift_embedder_cell: crate::nodes::ai::guardrails::DriftEmbedDispatcherCell,
@@ -6511,6 +7143,28 @@ pub fn register(
     }
     {
         let s = store.clone();
+        let agents = agent_store.clone();
+        bridge.register(
+            "brief.wakeup",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let agents = agents.clone();
+                async move { handle_brief_wakeup(&s, agents.as_deref(), &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.wakeups",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_wakeups(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
         bridge.register(
             "brief.heartbeat",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -6546,6 +7200,14 @@ pub fn register(
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_brief_claim_holder(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        bridge.register(
+            "bridge_back.authorize",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| async move {
+                handle_bridge_back_authorize(&ctx)
             })),
         );
     }
@@ -7297,9 +7959,11 @@ fn handle_brief_move(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
 }
 
 /// Parse a two-field `a|b` arg shape for the Brief relation caps.
-fn parse_pair<'a>(ctx: &'a InvocationCtx, method: &str) -> Result<(&'a str, &'a str), HandlerOutcome> {
-    let raw = std::str::from_utf8(&ctx.args)
-        .map_err(|e| invalid(format!("{method} utf8: {e}")))?;
+fn parse_pair<'a>(
+    ctx: &'a InvocationCtx,
+    method: &str,
+) -> Result<(&'a str, &'a str), HandlerOutcome> {
+    let raw = std::str::from_utf8(&ctx.args).map_err(|e| invalid(format!("{method} utf8: {e}")))?;
     let parts: Vec<&str> = raw.splitn(2, '|').collect();
     if parts.len() < 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
         return Err(invalid(format!("{method}: expected two ids `a|b`")));
@@ -7367,7 +8031,13 @@ fn handle_brief_create(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome
                 .to_string(),
         );
     }
-    let opt = |i: usize| parts.get(i).copied().map(str::trim).filter(|s| !s.is_empty());
+    let opt = |i: usize| {
+        parts
+            .get(i)
+            .copied()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
     let owner = ctx.caller.subject_id.to_string();
     match store.create_brief(
         ctx.tenant_id_or_default(),
@@ -7716,7 +8386,11 @@ fn handle_brief_blocked(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcom
         Err(o) => return o,
     };
     match store.is_blocked(task) {
-        Ok(b) => HandlerOutcome::Ok(if b { b"true".to_vec() } else { b"false".to_vec() }),
+        Ok(b) => HandlerOutcome::Ok(if b {
+            b"true".to_vec()
+        } else {
+            b"false".to_vec()
+        }),
         Err(e) => map_edge_err("brief.blocked", e),
     }
 }
@@ -7907,7 +8581,11 @@ fn handle_brief_team_workload(store: &TaskStore, ctx: &InvocationCtx) -> Handler
     if raw.is_empty() {
         return invalid("brief.team_workload: at least one assignee required".to_string());
     }
-    let ids: Vec<&str> = raw.split('|').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let ids: Vec<&str> = raw
+        .split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     if ids.is_empty() {
         return invalid("brief.team_workload: at least one assignee required".to_string());
     }
@@ -7992,18 +8670,142 @@ fn handle_brief_stale_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOut
     }
 }
 
-/// Parse a `task_id|agent_id|lease_secs` arg for the claim caps.
+/// `brief.wakeup` - enqueue/coalesce/defer a Brief wake. Arg:
+/// `task_id|agent_id|source|reason|context` (`source`, `reason`,
+/// and `context` optional). Returns a compact key/value decision.
+fn handle_brief_wakeup(
+    store: &TaskStore,
+    agent_store: Option<&agent::AgentStore>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.wakeup utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(5, '|').collect();
+    let task = parts.first().copied().map(str::trim).unwrap_or("");
+    let agent = parts.get(1).copied().map(str::trim).unwrap_or("");
+    if task.is_empty() || agent.is_empty() {
+        return invalid(
+            "brief.wakeup: expected `task_id|agent_id|source|reason|context`".to_string(),
+        );
+    }
+    let source = parts.get(2).copied().unwrap_or("on_demand");
+    let reason = parts.get(3).copied().unwrap_or("manual");
+    let context = parts.get(4).copied();
+    let admission_skip = match wakeup_admission_skip(agent_store, agent, source) {
+        Ok(skip) => skip,
+        Err(outcome) => return outcome,
+    };
+    match store.request_brief_wakeup_with_admission(
+        task,
+        agent,
+        source,
+        reason,
+        context,
+        admission_skip.as_deref(),
+    ) {
+        Ok(d) => {
+            let run = d.execution_run_id.as_deref().unwrap_or("");
+            HandlerOutcome::Ok(
+                format!(
+                    "wakeup_id={}\ntask_id={}\nagent_id={}\nstatus={}\nexecution_run_id={}\nreason={}\n",
+                    d.wakeup_id, d.task_id, d.agent_id, d.status, run, d.reason
+                )
+                .into_bytes(),
+            )
+        }
+        Err(e) => map_edge_err("brief.wakeup", e),
+    }
+}
+
+fn wakeup_admission_skip(
+    agent_store: Option<&agent::AgentStore>,
+    agent_id: &str,
+    source: &str,
+) -> Result<Option<String>, HandlerOutcome> {
+    let Some(store) = agent_store else {
+        return Ok(None);
+    };
+    let timer_wake = source.trim().eq_ignore_ascii_case("timer");
+    match store.get_agent(agent_id) {
+        Ok(Some(agent)) => {
+            if agent.status != "active" {
+                return Ok(Some(format!("agent status={} not active", agent.status)));
+            }
+            if timer_wake && !agent.wake_on_timer {
+                return Ok(Some("wake_on_timer disabled".to_string()));
+            }
+            if !timer_wake && !agent.wake_on_demand {
+                return Ok(Some("wake_on_demand disabled".to_string()));
+            }
+            Ok(None)
+        }
+        Ok(None) => Ok(Some("agent profile not found".to_string())),
+        Err(e) => Err(internal(format!("brief.wakeup agent lookup: {e}"))),
+    }
+}
+
+/// `brief.wakeups` - list the wakeup ledger for a Brief. Arg
+/// `task_id|limit` (limit default 50). Returns JSON rows.
+fn handle_brief_wakeups(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("brief.wakeups utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    let task = parts.first().copied().map(str::trim).unwrap_or("");
+    if task.is_empty() {
+        return invalid("brief.wakeups: task_id required".to_string());
+    }
+    let limit: usize = parts
+        .get(1)
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    match store.list_brief_wakeups(task, limit) {
+        Ok(rows) => {
+            let mut out = String::from("[");
+            for (i, row) in rows.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&format!(
+                    r#"{{"wakeup_id":"{}","task_id":"{}","agent_id":"{}","source":"{}","reason":"{}","status":"{}","execution_run_id":{},"context":{},"created_at":{},"updated_at":{},"started_at":{},"finished_at":{}}}"#,
+                    json_escape(&row.wakeup_id),
+                    json_escape(&row.task_id),
+                    json_escape(&row.agent_id),
+                    json_escape(&row.source),
+                    json_escape(&row.reason),
+                    json_escape(&row.status),
+                    opt_json_str(row.execution_run_id.as_deref()),
+                    opt_json_str(row.context.as_deref()),
+                    row.created_at,
+                    row.updated_at,
+                    opt_json_i64(row.started_at),
+                    opt_json_i64(row.finished_at),
+                ));
+            }
+            out.push(']');
+            HandlerOutcome::Ok(out.into_bytes())
+        }
+        Err(e) => map_edge_err("brief.wakeups", e),
+    }
+}
+
+/// Parse a `task_id|agent_id|lease_secs|execution_run_id` arg for the claim caps.
 /// lease_secs defaults to 300.
 fn parse_claim_args<'a>(
     ctx: &'a InvocationCtx,
     method: &str,
-) -> Result<(&'a str, &'a str, i64), HandlerOutcome> {
-    let raw = std::str::from_utf8(&ctx.args)
-        .map_err(|e| invalid(format!("{method} utf8: {e}")))?;
-    let parts: Vec<&str> = raw.splitn(3, '|').collect();
+) -> Result<(&'a str, &'a str, i64, Option<&'a str>), HandlerOutcome> {
+    let raw = std::str::from_utf8(&ctx.args).map_err(|e| invalid(format!("{method} utf8: {e}")))?;
+    let parts: Vec<&str> = raw.splitn(4, '|').collect();
     if parts.len() < 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
         return Err(invalid(format!(
-            "{method}: expected `task_id|agent_id|lease_secs`"
+            "{method}: expected `task_id|agent_id|lease_secs|execution_run_id`"
         )));
     }
     let lease: i64 = parts
@@ -8013,17 +8815,22 @@ fn parse_claim_args<'a>(
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse().ok())
         .unwrap_or(300);
-    Ok((parts[0].trim(), parts[1].trim(), lease))
+    let execution_run = parts
+        .get(3)
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    Ok((parts[0].trim(), parts[1].trim(), lease, execution_run))
 }
 
-/// `brief.claim` — atomically claim a Brief. Arg `task_id|agent_id|lease_secs`
+/// `brief.claim` — atomically claim a Brief. Arg `task_id|agent_id|lease_secs|execution_run_id`
 /// (lease default 300). Returns `claimed` if won, `held` if another holds it.
 fn handle_brief_claim(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
-    let (task, agent, lease) = match parse_claim_args(ctx, "brief.claim") {
+    let (task, agent, lease, execution_run) = match parse_claim_args(ctx, "brief.claim") {
         Ok(t) => t,
         Err(o) => return o,
     };
-    match store.claim_brief(task, agent, lease) {
+    match store.claim_brief_for_run(task, agent, lease, execution_run) {
         Ok(true) => HandlerOutcome::Ok(b"claimed".to_vec()),
         Ok(false) => HandlerOutcome::Ok(b"held".to_vec()),
         Err(e) => map_edge_err("brief.claim", e),
@@ -8033,7 +8840,7 @@ fn handle_brief_claim(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome 
 /// `brief.heartbeat` — extend the caller's claim. Arg
 /// `task_id|agent_id|lease_secs`. Returns `ok` or `lost`.
 fn handle_brief_heartbeat(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
-    let (task, agent, lease) = match parse_claim_args(ctx, "brief.heartbeat") {
+    let (task, agent, lease, _) = match parse_claim_args(ctx, "brief.heartbeat") {
         Ok(t) => t,
         Err(o) => return o,
     };
@@ -8093,6 +8900,32 @@ fn handle_brief_claim_holder(store: &TaskStore, ctx: &InvocationCtx) -> HandlerO
 /// `brief.ready` — the dispatcher work-list: Briefs ready to work
 /// (assigned, active column, unblocked, unclaimed). Arg `limit`
 /// (optional, default 50). JSON array of BriefCards, priority-first.
+/// `bridge_back.authorize` - verify a per-Shift bridge-back token.
+/// Arg: `token|brief_id|agent_id|method`. Returns `allow` or `deny`.
+fn handle_bridge_back_authorize(ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("bridge_back.authorize utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(4, '|').collect();
+    if parts.len() != 4 || parts.iter().any(|p| p.trim().is_empty()) {
+        return invalid(
+            "bridge_back.authorize: expected `token|brief_id|agent_id|method`".to_string(),
+        );
+    }
+    let allowed = crate::rig::bridge::BridgeTokenStore::global().authorize_method(
+        parts[0].trim(),
+        parts[1].trim(),
+        parts[2].trim(),
+        parts[3].trim(),
+    );
+    if allowed {
+        HandlerOutcome::Ok(b"allow".to_vec())
+    } else {
+        HandlerOutcome::Ok(b"deny".to_vec())
+    }
+}
+
 fn handle_brief_ready(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let raw = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s.trim(),
@@ -9652,6 +10485,20 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+fn opt_json_str(s: Option<&str>) -> String {
+    match s {
+        Some(v) => format!("\"{}\"", json_escape(v)),
+        None => "null".to_string(),
+    }
+}
+
+fn opt_json_i64(v: Option<i64>) -> String {
+    match v {
+        Some(n) => n.to_string(),
+        None => "null".to_string(),
+    }
+}
+
 fn invalid(cause: String) -> HandlerOutcome {
     HandlerOutcome::Err(ErrorEnvelope {
         kind: error_kinds::INVALID_ARGS,
@@ -9767,6 +10614,33 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             ON task_edges(task_id, edge_id);
         CREATE INDEX IF NOT EXISTS task_edges_by_related
             ON task_edges(related_task_id);
+
+        -- PHASE 3 (wakeup queue): every run trigger funnels through
+        -- this ledger before any Rig starts. `queued` rows are lazy:
+        -- they do not stamp the Brief claim until claimed as
+        -- `running`. `coalesced` and `deferred` rows are explicit
+        -- audit evidence instead of invisible dropped triggers.
+        CREATE TABLE IF NOT EXISTS brief_wakeup_requests (
+            wakeup_id        TEXT PRIMARY KEY,
+            task_id          TEXT    NOT NULL,
+            agent_id         TEXT    NOT NULL,
+            source           TEXT    NOT NULL,
+            reason           TEXT    NOT NULL,
+            status           TEXT    NOT NULL,
+            execution_run_id TEXT,
+            context          TEXT,
+            created_at       INTEGER NOT NULL,
+            updated_at       INTEGER NOT NULL,
+            started_at       INTEGER,
+            finished_at      INTEGER,
+            FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+        );
+        CREATE INDEX IF NOT EXISTS brief_wakeups_by_task
+            ON brief_wakeup_requests(task_id, created_at);
+        CREATE INDEX IF NOT EXISTS brief_wakeups_queue
+            ON brief_wakeup_requests(status, created_at);
+        CREATE INDEX IF NOT EXISTS brief_wakeups_agent
+            ON brief_wakeup_requests(agent_id, status, created_at);
 
         -- PH-WAVE2D: per-task todo list. Ordered subtasks the AI
         -- (or operator) can use to decompose work. Each row is
@@ -9905,6 +10779,10 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         //     is assigned to (distinct from `owner_subject_id`,
         //     which is the creator). NULL = unassigned.
         "ALTER TABLE tasks ADD COLUMN assignee_agent_id TEXT",
+        //   reviewer_agent_id — the Operative / Lead responsible
+        //     for review. A Brief cannot enter `in_review` until this
+        //     is set.
+        "ALTER TABLE tasks ADD COLUMN reviewer_agent_id TEXT",
         //   board_status — the Brief's board column, separate
         //     from the execution `status`. One of: backlog /
         //     todo / in_progress / in_review / done / blocked /
@@ -9925,6 +10803,14 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         // nullable, so existing rows are simply unclaimed.
         "ALTER TABLE tasks ADD COLUMN claimed_by TEXT",
         "ALTER TABLE tasks ADD COLUMN claim_expires_at INTEGER",
+        // Execution-design locked decision: split Claim into the
+        // checkout pointer (lease owner) and the execution pointer
+        // (Shift/run being performed). `claimed_by` remains a legacy
+        // mirror for older surfaces.
+        "ALTER TABLE tasks ADD COLUMN checkout_run_id TEXT",
+        "ALTER TABLE tasks ADD COLUMN execution_run_id TEXT",
+        "ALTER TABLE tasks ADD COLUMN claim_agent_id TEXT",
+        "ALTER TABLE tasks ADD COLUMN claim_locked_at INTEGER",
         // PHASE 5 (Brief): free-form labels — a normalized,
         // comma-joined tag set (bug / feature / customer-x …) for
         // organising the board. NULL = no labels. Additive.
@@ -9967,6 +10853,134 @@ fn brief_card_from_row(r: &rusqlite::Row) -> rusqlite::Result<brief::BriefCard> 
         mandate_id: r.get(5)?,
         campaign_id: r.get(6)?,
     })
+}
+
+fn brief_wakeup_from_row(r: &rusqlite::Row) -> rusqlite::Result<BriefWakeupRow> {
+    Ok(BriefWakeupRow {
+        wakeup_id: r.get(0)?,
+        task_id: r.get(1)?,
+        agent_id: r.get(2)?,
+        source: r.get(3)?,
+        reason: r.get(4)?,
+        status: r.get(5)?,
+        execution_run_id: r.get(6)?,
+        context: r.get(7)?,
+        created_at: r.get(8)?,
+        updated_at: r.get(9)?,
+        started_at: r.get(10)?,
+        finished_at: r.get(11)?,
+    })
+}
+
+fn self_unresolved_blockers_in_conn(
+    conn: &Connection,
+    task_id: &str,
+) -> Result<i64, CoordinatorError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM task_edges e
+         JOIN tasks b ON b.task_id = e.related_task_id
+         WHERE e.task_id = ?1 AND e.edge_type = 'blocked_on'
+           AND b.board_status != 'done'",
+        params![task_id],
+        |r| r.get(0),
+    )
+    .map_err(CoordinatorError::Db)
+}
+
+fn queued_or_running_wakeup_in_conn(
+    conn: &Connection,
+    task_id: &str,
+    agent_id: &str,
+) -> Result<Option<(String, Option<String>)>, CoordinatorError> {
+    conn.query_row(
+        "SELECT wakeup_id, execution_run_id
+         FROM brief_wakeup_requests
+         WHERE task_id = ?1
+           AND agent_id = ?2
+           AND status IN ('queued', 'running')
+         ORDER BY created_at ASC, wakeup_id ASC
+         LIMIT 1",
+        params![task_id, agent_id],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+    )
+    .optional()
+    .map_err(CoordinatorError::Db)
+}
+
+fn brief_card_for_claimable_wakeup_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    wake: &BriefWakeupRow,
+    now: i64,
+) -> Result<Option<brief::BriefCard>, CoordinatorError> {
+    if self_unresolved_blockers_in_tx(tx, &wake.task_id)? > 0 {
+        return Ok(None);
+    }
+    tx.query_row(
+        "SELECT task_id, title, board_status, priority,
+                assignee_agent_id, mandate_id, campaign_id
+         FROM tasks
+         WHERE task_id = ?1
+           AND assignee_agent_id = ?2
+           AND board_status IN ('todo', 'in_progress')
+           AND (claim_agent_id IS NULL OR claim_expires_at IS NULL
+                OR claim_expires_at < ?3 OR claim_agent_id = ?2)",
+        params![wake.task_id, wake.agent_id, now],
+        brief_card_from_row,
+    )
+    .optional()
+    .map_err(CoordinatorError::Db)
+}
+
+fn self_unresolved_blockers_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: &str,
+) -> Result<i64, CoordinatorError> {
+    tx.query_row(
+        "SELECT COUNT(*) FROM task_edges e
+         JOIN tasks b ON b.task_id = e.related_task_id
+         WHERE e.task_id = ?1 AND e.edge_type = 'blocked_on'
+           AND b.board_status != 'done'",
+        params![task_id],
+        |r| r.get(0),
+    )
+    .map_err(CoordinatorError::Db)
+}
+
+fn promote_oldest_deferred_wakeup_in_conn(
+    conn: &Connection,
+    task_id: &str,
+    now: i64,
+) -> Result<Option<String>, CoordinatorError> {
+    let next: Option<String> = conn
+        .query_row(
+            "SELECT wakeup_id FROM brief_wakeup_requests
+             WHERE task_id = ?1 AND status = 'deferred'
+             ORDER BY created_at ASC, wakeup_id ASC
+             LIMIT 1",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(CoordinatorError::Db)?;
+    let Some(wakeup_id) = next else {
+        return Ok(None);
+    };
+    let execution_run_id = format!("shift_{}", uuid::Uuid::new_v4());
+    conn.execute(
+        "UPDATE brief_wakeup_requests
+         SET status = 'queued',
+             execution_run_id = ?1,
+             updated_at = ?2
+         WHERE wakeup_id = ?3 AND status = 'deferred'",
+        params![execution_run_id, now, wakeup_id],
+    )
+    .map_err(CoordinatorError::Db)?;
+    let _ = conn.execute(
+        "INSERT INTO task_events (task_id, ts, event_type, payload)
+         VALUES (?1, ?2, 'brief.wakeup_promoted', ?3)",
+        params![task_id, now, wakeup_id],
+    );
+    Ok(Some(wakeup_id))
 }
 
 /// PHASE 1 (Brief): does a Brief row exist? Helper for the
@@ -10910,6 +11924,26 @@ mod tests {
         TaskStore::in_memory().expect("open")
     }
 
+    fn move_to_review(s: &TaskStore, task_id: &str) {
+        s.set_brief_field(task_id, "reviewer", "reviewer_1")
+            .unwrap();
+        s.set_board_status(task_id, "in_review").unwrap();
+    }
+
+    fn move_to_progress(s: &TaskStore, task_id: &str) {
+        if s.brief_fields(task_id)
+            .unwrap()
+            .and_then(|f| f.assignee_agent_id)
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            s.set_brief_field(task_id, "assignee", "agt_work").unwrap();
+        }
+        s.set_board_status(task_id, "in_progress").unwrap();
+    }
+
     #[test]
     fn phase1_brief_board_move_enforces_the_state_machine() {
         let s = store();
@@ -10934,8 +11968,8 @@ mod tests {
             s.set_board_status(&id, "todo").unwrap(),
             ("backlog".to_string(), "todo".to_string())
         );
-        s.set_board_status(&id, "in_progress").unwrap();
-        s.set_board_status(&id, "in_review").unwrap();
+        move_to_progress(&s, &id);
+        move_to_review(&s, &id);
         s.set_board_status(&id, "done").unwrap();
         assert_eq!(s.board_status(&id).unwrap().as_deref(), Some("done"));
 
@@ -10991,7 +12025,7 @@ mod tests {
             )
             .unwrap();
         s.set_board_status(&id, "todo").unwrap();
-        s.set_board_status(&id, "in_progress").unwrap();
+        move_to_progress(&s, &id);
         // Idempotent no-op records nothing.
         s.set_board_status(&id, "in_progress").unwrap();
 
@@ -11021,8 +12055,17 @@ mod tests {
     fn search_briefs_matches_title_substring_literally() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let a = mk("Ship the auth rewrite");
         let b = mk("Auth bug in login");
@@ -11057,7 +12100,16 @@ mod tests {
         let s = store();
         let mk = |t: &str| {
             let id = s
-                .create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .create(
+                    t,
+                    "flows/none.sol",
+                    "{}",
+                    "subj",
+                    RetryPolicy::None,
+                    0,
+                    None,
+                    None,
+                )
                 .unwrap();
             s.set_board_status(&id, "todo").unwrap();
             id
@@ -11067,8 +12119,8 @@ mod tests {
         let nodue = mk("nodue");
         // A done brief that's overdue must NOT surface.
         let done = mk("done");
-        s.set_board_status(&done, "in_progress").unwrap();
-        s.set_board_status(&done, "in_review").unwrap();
+        move_to_progress(&s, &done);
+        move_to_review(&s, &done);
         s.set_board_status(&done, "done").unwrap();
 
         let now = 1_000_000i64;
@@ -11108,7 +12160,16 @@ mod tests {
         let s = store();
         let mk = |t: &str| {
             let id = s
-                .create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .create(
+                    t,
+                    "flows/none.sol",
+                    "{}",
+                    "subj",
+                    RetryPolicy::None,
+                    0,
+                    None,
+                    None,
+                )
                 .unwrap();
             s.set_board_status(&id, "todo").unwrap();
             id
@@ -11163,7 +12224,16 @@ mod tests {
     fn brief_labels_normalize_dedupe_and_clear() {
         let s = store();
         let id = s
-            .create("b", "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .create(
+                "b",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         // Empty initially.
         assert!(s.brief_labels(&id).unwrap().is_empty());
@@ -11186,8 +12256,17 @@ mod tests {
 
         // Filter by label across briefs (CSV-membership).
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let a = mk("a");
         let b = mk("b");
@@ -11221,7 +12300,16 @@ mod tests {
     fn latest_dossier_returns_the_newest_of_a_kind() {
         let s = store();
         let id = s
-            .create("b", "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .create(
+                "b",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         s.add_dossier(&id, "plan", "Plan v1", "first").unwrap();
         s.add_dossier(&id, "spec", "Spec", "specbody").unwrap();
@@ -11274,7 +12362,11 @@ mod tests {
             .create_brief("other", "Their first", "subj", None, None, None, None)
             .unwrap();
         assert_eq!(
-            s.brief_fields(&other).unwrap().unwrap().human_ref.as_deref(),
+            s.brief_fields(&other)
+                .unwrap()
+                .unwrap()
+                .human_ref
+                .as_deref(),
             Some("REL-1")
         );
 
@@ -11300,7 +12392,16 @@ mod tests {
     fn compose_brief_prompt_includes_title_dossiers_and_comments() {
         let s = store();
         let id = s
-            .create("Ship the auth rewrite", "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .create(
+                "Ship the auth rewrite",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         s.add_dossier(&id, "spec", "Auth Spec", "body").unwrap();
         s.add_dossier(&id, "plan", "The Plan", "step 1: design the token flow")
@@ -11329,8 +12430,17 @@ mod tests {
     fn brief_detail_assembles_the_full_view() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let task = mk("task");
         let child = mk("child");
@@ -11363,8 +12473,17 @@ mod tests {
     fn subbrief_progress_counts_children_by_column() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let parent = mk("parent");
         // Two children done, one in_progress.
@@ -11372,20 +12491,17 @@ mod tests {
             let c = mk(t);
             s.link_subbrief(&parent, &c).unwrap();
             s.set_board_status(&c, "todo").unwrap();
-            s.set_board_status(&c, "in_progress").unwrap();
-            s.set_board_status(&c, "in_review").unwrap();
+            move_to_progress(&s, &c);
+            move_to_review(&s, &c);
             s.set_board_status(&c, "done").unwrap();
         }
         let c3 = mk("c3");
         s.link_subbrief(&parent, &c3).unwrap();
         s.set_board_status(&c3, "todo").unwrap();
-        s.set_board_status(&c3, "in_progress").unwrap();
+        move_to_progress(&s, &c3);
 
-        let map: std::collections::HashMap<String, i64> = s
-            .subbrief_progress(&parent)
-            .unwrap()
-            .into_iter()
-            .collect();
+        let map: std::collections::HashMap<String, i64> =
+            s.subbrief_progress(&parent).unwrap().into_iter().collect();
         assert_eq!(map.get("done"), Some(&2));
         assert_eq!(map.get("in_progress"), Some(&1));
         assert_eq!(map.values().sum::<i64>(), 3);
@@ -11397,8 +12513,17 @@ mod tests {
     fn reverse_edges_list_blocking_and_parents() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let parent = mk("parent");
         let child = mk("child");
@@ -11426,8 +12551,17 @@ mod tests {
     fn unlink_subbrief_detaches_and_chronicles() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let parent = mk("parent");
         let child = mk("child");
@@ -11461,7 +12595,16 @@ mod tests {
     fn force_release_clears_any_holders_claim() {
         let s = store();
         let id = s
-            .create("b", "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .create(
+                "b",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         s.set_brief_field(&id, "assignee", "agt_a").unwrap();
         s.set_board_status(&id, "todo").unwrap();
@@ -11498,13 +12641,24 @@ mod tests {
         let s = store();
         let mk = |t: &str| {
             let id = s
-                .create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .create(
+                    t,
+                    "flows/none.sol",
+                    "{}",
+                    "subj",
+                    RetryPolicy::None,
+                    0,
+                    None,
+                    None,
+                )
                 .unwrap();
             s.set_board_status(&id, "todo").unwrap();
             id
         };
         let task = mk("task");
         let blocker = mk("blocker");
+        s.set_brief_field(&task, "assignee", "agt_work").unwrap();
+        s.set_brief_field(&blocker, "assignee", "agt_work").unwrap();
         s.add_snag(&task, &blocker).unwrap();
 
         // Blocked → can't enter in_progress.
@@ -11515,11 +12669,14 @@ mod tests {
         assert_eq!(s.board_status(&task).unwrap().as_deref(), Some("todo"));
 
         // Resolve the blocker → now allowed.
-        s.set_board_status(&blocker, "in_progress").unwrap();
-        s.set_board_status(&blocker, "in_review").unwrap();
+        move_to_progress(&s, &blocker);
+        move_to_review(&s, &blocker);
         s.set_board_status(&blocker, "done").unwrap();
-        s.set_board_status(&task, "in_progress").unwrap();
-        assert_eq!(s.board_status(&task).unwrap().as_deref(), Some("in_progress"));
+        move_to_progress(&s, &task);
+        assert_eq!(
+            s.board_status(&task).unwrap().as_deref(),
+            Some("in_progress")
+        );
     }
 
     #[test]
@@ -11527,21 +12684,31 @@ mod tests {
         let s = store();
         let mk = |t: &str| {
             let id = s
-                .create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .create(
+                    t,
+                    "flows/none.sol",
+                    "{}",
+                    "subj",
+                    RetryPolicy::None,
+                    0,
+                    None,
+                    None,
+                )
                 .unwrap();
             s.set_board_status(&id, "todo").unwrap();
             id
         };
         let waiter = mk("waiter");
         let blocker = mk("blocker");
+        s.set_brief_field(&blocker, "assignee", "agt_work").unwrap();
         s.add_snag(&waiter, &blocker).unwrap();
 
         // Blocker not done → waiter is NOT in the unblocked list.
         assert!(s.list_briefs_with_blockers_resolved(50).unwrap().is_empty());
 
         // Finish the blocker → waiter surfaces (its last blocker is done).
-        s.set_board_status(&blocker, "in_progress").unwrap();
-        s.set_board_status(&blocker, "in_review").unwrap();
+        move_to_progress(&s, &blocker);
+        move_to_review(&s, &blocker);
         s.set_board_status(&blocker, "done").unwrap();
         let unblocked: Vec<String> = s
             .list_briefs_with_blockers_resolved(50)
@@ -11575,8 +12742,17 @@ mod tests {
         // empty clears, self-blocks and cycles rejected.
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let task = mk("task");
         let b1 = mk("b1");
@@ -11628,8 +12804,17 @@ mod tests {
     fn brief_edges_reject_cycles() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let a = mk("a");
         let b = mk("b");
@@ -11662,8 +12847,17 @@ mod tests {
     fn remove_snag_unblocks_and_chronicles() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let task = mk("task");
         let blocker = mk("blocker");
@@ -11700,7 +12894,16 @@ mod tests {
     fn reassigning_a_brief_drops_the_previous_holders_claim() {
         let s = store();
         let id = s
-            .create("b", "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .create(
+                "b",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         s.set_brief_field(&id, "assignee", "agt_a").unwrap();
         s.set_board_status(&id, "todo").unwrap();
@@ -11723,11 +12926,180 @@ mod tests {
     }
 
     #[test]
+    fn wakeup_queue_queues_and_lazy_claims_ready_brief() {
+        let s = store();
+        let id = s
+            .create(
+                "wake me",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        s.set_brief_field(&id, "assignee", "agt_a").unwrap();
+        s.set_board_status(&id, "todo").unwrap();
+
+        let decision = s
+            .request_brief_wakeup(&id, "agt_a", "assignment", "assigned", Some("go"))
+            .unwrap();
+        assert_eq!(decision.status, "queued");
+        assert!(decision.execution_run_id.is_some());
+        assert!(s.claim_holder(&id).unwrap().is_none(), "queued is lazy");
+
+        let claimed = s.claim_queued_wakeups(10, 300).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].card.task_id, id);
+        assert_eq!(s.claim_holder(&id).unwrap().unwrap().0, "agt_a");
+
+        let rows = s.list_brief_wakeups(&id, 10).unwrap();
+        assert_eq!(rows[0].status, "running");
+        assert_eq!(rows[0].started_at.is_some(), true);
+    }
+
+    #[test]
+    fn brief_wakeup_honors_agent_on_demand_runtime_key() {
+        let s = store();
+        let agents = agent::AgentStore::in_memory().unwrap();
+        let agent_id = agents
+            .create_agent(
+                "Alice",
+                "builder",
+                "Engineer",
+                "product",
+                "platform",
+                "operator",
+                "subj-agent-on-demand",
+                "medium",
+                "default",
+            )
+            .unwrap();
+        agents
+            .update_agent_field(&agent_id, "wake_on_demand", "false")
+            .unwrap();
+        let id = s
+            .create(
+                "manual wake disabled",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        s.set_brief_field(&id, "assignee", &agent_id).unwrap();
+        s.set_board_status(&id, "todo").unwrap();
+
+        let arg = format!("{id}|{agent_id}|comment|operator-comment|please run");
+        let out = handle_brief_wakeup(&s, Some(&agents), &ctx(arg.as_bytes()));
+        let HandlerOutcome::Ok(body) = out else {
+            panic!("expected ok decision");
+        };
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.contains("status=skipped"));
+        assert!(s.claim_holder(&id).unwrap().is_none());
+        let rows = s.list_brief_wakeups(&id, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "skipped");
+        assert_eq!(rows[0].source, "comment");
+    }
+
+    #[test]
+    fn wakeup_queue_coalesces_same_agent_and_defers_other_agent() {
+        let s = store();
+        let id = s
+            .create(
+                "busy",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        s.set_brief_field(&id, "assignee", "agt_a").unwrap();
+        s.set_board_status(&id, "todo").unwrap();
+        assert!(
+            s.claim_brief_for_run(&id, "agt_a", 300, Some("shift_live"))
+                .unwrap()
+        );
+
+        let same = s
+            .request_brief_wakeup(&id, "agt_a", "comment", "new-comment", None)
+            .unwrap();
+        assert_eq!(same.status, "coalesced");
+        assert_eq!(same.execution_run_id.as_deref(), Some("shift_live"));
+
+        s.set_brief_field(&id, "assignee", "agt_b").unwrap();
+        assert!(
+            s.claim_brief_for_run(&id, "agt_a", 300, Some("shift_other"))
+                .unwrap()
+        );
+        let other = s
+            .request_brief_wakeup(&id, "agt_b", "mention", "cto-mentioned", None)
+            .unwrap();
+        assert_eq!(other.status, "deferred");
+    }
+
+    #[test]
+    fn release_promotes_oldest_deferred_wakeup() {
+        let s = store();
+        let id = s
+            .create(
+                "defer",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        s.set_brief_field(&id, "assignee", "agt_b").unwrap();
+        s.set_board_status(&id, "todo").unwrap();
+        assert!(
+            s.claim_brief_for_run(&id, "agt_a", 300, Some("shift_a"))
+                .unwrap()
+        );
+
+        let deferred = s
+            .request_brief_wakeup(&id, "agt_b", "mention", "please-run", None)
+            .unwrap();
+        assert_eq!(deferred.status, "deferred");
+
+        s.release_claim(&id, "agt_a").unwrap();
+        let rows = s.list_brief_wakeups(&id, 10).unwrap();
+        let promoted = rows
+            .iter()
+            .find(|r| r.wakeup_id == deferred.wakeup_id)
+            .unwrap();
+        assert_eq!(promoted.status, "queued");
+        assert!(promoted.execution_run_id.is_some());
+    }
+
+    #[test]
     fn aggregate_board_counts_sum_across_a_team() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let place = |id: &str, who: &str, status: &str| {
             s.set_brief_field(id, "assignee", who).unwrap();
@@ -11762,8 +13134,17 @@ mod tests {
     fn assignee_board_counts_report_workload_by_column() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         // agt_a: two in_progress, one in_review; a done one is excluded.
         for t in ["p1", "p2"] {
@@ -11776,13 +13157,13 @@ mod tests {
         s.set_brief_field(&r, "assignee", "agt_a").unwrap();
         s.set_board_status(&r, "todo").unwrap();
         s.set_board_status(&r, "in_progress").unwrap();
-        s.set_board_status(&r, "in_review").unwrap();
+        move_to_review(&s, &r);
 
         let d = mk("d1");
         s.set_brief_field(&d, "assignee", "agt_a").unwrap();
         s.set_board_status(&d, "todo").unwrap();
         s.set_board_status(&d, "in_progress").unwrap();
-        s.set_board_status(&d, "in_review").unwrap();
+        move_to_review(&s, &d);
         s.set_board_status(&d, "done").unwrap();
 
         let map: std::collections::HashMap<String, i64> = s
@@ -11802,8 +13183,17 @@ mod tests {
     fn desk_lists_an_assignees_in_flight_briefs_by_priority() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         // Two briefs for agt_a: one in_progress (high), one todo (urgent).
         let b_hi = mk("hi");
@@ -11822,7 +13212,7 @@ mod tests {
         s.set_brief_field(&b_done, "assignee", "agt_a").unwrap();
         s.set_board_status(&b_done, "todo").unwrap();
         s.set_board_status(&b_done, "in_progress").unwrap();
-        s.set_board_status(&b_done, "in_review").unwrap();
+        move_to_review(&s, &b_done);
         s.set_board_status(&b_done, "done").unwrap();
 
         // A brief for someone else is not on agt_a's Desk.
@@ -11843,9 +13233,19 @@ mod tests {
     fn brief_comment_appends_to_the_chronicle() {
         let s = store();
         let id = s
-            .create("b", "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .create(
+                "b",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
             .unwrap();
-        s.comment_on_brief(&id, "founder", "ship it by friday").unwrap();
+        s.comment_on_brief(&id, "founder", "ship it by friday")
+            .unwrap();
         s.comment_on_brief(&id, "agt_eng", "on it").unwrap();
 
         // Empty author / text rejected; unknown Brief → NotFound.
@@ -11888,8 +13288,17 @@ mod tests {
     fn relations_and_dossiers_are_chronicled() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let p = mk("p");
         let c = mk("c");
@@ -11916,8 +13325,17 @@ mod tests {
     fn phase1_subbriefs_and_snags_track_relations_and_blocking() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let parent = mk("parent");
         let c1 = mk("child-1");
@@ -11956,11 +13374,14 @@ mod tests {
         // Only `done` resolves a Snag.
         let p2 = mk("parent-2");
         let b3 = mk("blocker-3");
+        s.set_brief_field(&b3, "assignee", "agt_work").unwrap();
         s.add_snag(&p2, &b3).unwrap();
         assert!(s.is_blocked(&p2).unwrap());
-        for st in ["todo", "in_progress", "in_review", "done"] {
+        for st in ["todo", "in_progress"] {
             s.set_board_status(&b3, st).unwrap();
         }
+        move_to_review(&s, &b3);
+        s.set_board_status(&b3, "done").unwrap();
         assert!(!s.is_blocked(&p2).unwrap());
     }
 
@@ -11979,7 +13400,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        let d1 = s.add_dossier(&id, "plan", "The Plan", "step 1\nstep 2").unwrap();
+        let d1 = s
+            .add_dossier(&id, "plan", "The Plan", "step 1\nstep 2")
+            .unwrap();
         let _d2 = s
             .add_dossier(&id, "design", "The Design", "boxes & arrows")
             .unwrap();
@@ -12048,7 +13471,10 @@ mod tests {
 
         // Empty clears the soft links.
         s.set_brief_field(&id, "assignee", "").unwrap();
-        assert_eq!(s.brief_fields(&id).unwrap().unwrap().assignee_agent_id, None);
+        assert_eq!(
+            s.brief_fields(&id).unwrap().unwrap().assignee_agent_id,
+            None
+        );
 
         // Validation.
         assert!(matches!(
@@ -12081,15 +13507,24 @@ mod tests {
     fn phase2_brief_board_lists_by_column() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let a = mk("a");
         let b = mk("b");
         let c = mk("c");
         // a, b stay in backlog; drive c to in_progress.
         s.set_board_status(&c, "todo").unwrap();
-        s.set_board_status(&c, "in_progress").unwrap();
+        move_to_progress(&s, &c);
 
         // All columns.
         assert_eq!(s.list_briefs_by_board(None, 50).unwrap().len(), 3);
@@ -12123,15 +13558,24 @@ mod tests {
     fn board_summary_counts_all_columns() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let _a = mk("a"); // backlog
         let b = mk("b");
         let c = mk("c");
         s.set_board_status(&b, "todo").unwrap();
         s.set_board_status(&c, "todo").unwrap();
-        s.set_board_status(&c, "in_progress").unwrap();
+        move_to_progress(&s, &c);
 
         let map: std::collections::HashMap<String, i64> =
             s.board_summary().unwrap().into_iter().collect();
@@ -12145,8 +13589,17 @@ mod tests {
     fn list_briefs_by_link_filters_by_mandate_and_campaign() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let b1 = mk("b1");
         let b2 = mk("b2");
@@ -12159,37 +13612,47 @@ mod tests {
         assert_eq!(s.list_briefs_by_campaign("c1", 50).unwrap().len(), 1);
         assert!(s.list_briefs_by_mandate("none", 50).unwrap().is_empty());
         // The card carries the link.
-        assert_eq!(
-            s.list_briefs_by_campaign("c1", 50).unwrap()[0].task_id,
-            b3
-        );
+        assert_eq!(s.list_briefs_by_campaign("c1", 50).unwrap()[0].task_id, b3);
     }
 
     #[test]
     fn phase2_desk_surfaces_blocked_and_stale_briefs() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
 
         // Blocked: a live Brief with an unresolved Snag.
         let blocked = mk("blocked");
         let blocker = mk("blocker");
         s.set_board_status(&blocked, "todo").unwrap();
+        s.set_brief_field(&blocker, "assignee", "agt_work").unwrap();
         s.add_snag(&blocked, &blocker).unwrap();
         let bl = s.list_blocked_briefs(50).unwrap();
         assert_eq!(bl.len(), 1);
         assert_eq!(bl[0].task_id, blocked);
         // Resolving the blocker drops it off.
-        for st in ["todo", "in_progress", "in_review", "done"] {
+        s.set_brief_field(&blocker, "assignee", "agt_work").unwrap();
+        for st in ["todo", "in_progress"] {
             s.set_board_status(&blocker, st).unwrap();
         }
+        move_to_review(&s, &blocker);
+        s.set_board_status(&blocker, "done").unwrap();
         assert!(s.list_blocked_briefs(50).unwrap().is_empty());
 
         // Stale: an active Brief backdated past the idle window.
         let stale = mk("stale");
-        s.set_board_status(&stale, "in_progress").unwrap();
+        move_to_progress(&s, &stale);
         {
             let conn = s.conn.lock().unwrap();
             conn.execute(
@@ -12202,7 +13665,7 @@ mod tests {
         assert!(st.iter().any(|c| c.task_id == stale));
         // A fresh active Brief is not stale.
         let fresh = mk("fresh");
-        s.set_board_status(&fresh, "in_progress").unwrap();
+        move_to_progress(&s, &fresh);
         assert!(
             !s.list_stale_briefs(0, 50)
                 .unwrap()
@@ -12265,11 +13728,58 @@ mod tests {
     }
 
     #[test]
+    fn phase3_claim_clears_when_brief_leaves_in_progress() {
+        let s = store();
+        let id = s
+            .create(
+                "brief",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        s.set_brief_field(&id, "assignee", "agt_a").unwrap();
+        s.set_board_status(&id, "todo").unwrap();
+        assert!(
+            s.claim_brief_for_run(&id, "agt_a", 300, Some("shift_1"))
+                .unwrap()
+        );
+        move_to_progress(&s, &id);
+        assert_eq!(s.claim_holder(&id).unwrap().unwrap().0, "agt_a");
+
+        move_to_review(&s, &id);
+        assert!(s.claim_holder(&id).unwrap().is_none());
+        let conn = s.conn.lock().unwrap();
+        let snapshot: (Option<String>, Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT checkout_run_id, execution_run_id, claim_agent_id, claim_locked_at
+                 FROM tasks WHERE task_id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(snapshot, (None, None, None, None));
+    }
+
+    #[test]
     fn phase3_ready_briefs_are_assigned_unblocked_unclaimed_active() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
 
         // Ready: assigned, todo, unblocked, unclaimed.
@@ -12297,9 +13807,11 @@ mod tests {
         // Not ready: done.
         let done = mk("done");
         s.set_brief_field(&done, "assignee", "agt_d").unwrap();
-        for st in ["todo", "in_progress", "in_review", "done"] {
+        for st in ["todo", "in_progress"] {
             s.set_board_status(&done, st).unwrap();
         }
+        move_to_review(&s, &done);
+        s.set_board_status(&done, "done").unwrap();
 
         let ids: Vec<String> = s
             .list_ready_briefs(50)
@@ -12321,9 +13833,12 @@ mod tests {
                 .any(|c| c.task_id == claimed)
         );
         // Resolving the blocker makes 'blocked' ready.
-        for st in ["todo", "in_progress", "in_review", "done"] {
+        s.set_brief_field(&blocker, "assignee", "agt_work").unwrap();
+        for st in ["todo", "in_progress"] {
             s.set_board_status(&blocker, st).unwrap();
         }
+        move_to_review(&s, &blocker);
+        s.set_board_status(&blocker, "done").unwrap();
         assert!(
             s.list_ready_briefs(50)
                 .unwrap()
@@ -12336,8 +13851,17 @@ mod tests {
     fn phase3_children_completed_wake_surfaces_finished_parents() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let has_parent = |s: &TaskStore, p: &str| {
             s.list_briefs_with_all_children_done(50)
@@ -12347,7 +13871,8 @@ mod tests {
         };
 
         let parent = mk("parent");
-        s.set_brief_field(&parent, "assignee", "agt_planner").unwrap();
+        s.set_brief_field(&parent, "assignee", "agt_planner")
+            .unwrap();
         s.set_board_status(&parent, "in_progress").unwrap();
         let c1 = mk("c1");
         let c2 = mk("c2");
@@ -12358,9 +13883,12 @@ mod tests {
         assert!(!has_parent(&s, &parent));
 
         // Finish c1 only → still not (c2 active).
-        for st in ["todo", "in_progress", "in_review", "done"] {
+        s.set_brief_field(&c1, "assignee", "agt_work").unwrap();
+        for st in ["todo", "in_progress"] {
             s.set_board_status(&c1, st).unwrap();
         }
+        move_to_review(&s, &c1);
+        s.set_board_status(&c1, "done").unwrap();
         assert!(!has_parent(&s, &parent));
 
         // Cancel c2 (terminal counts as finished) → now surfaced.
@@ -12369,13 +13897,12 @@ mod tests {
 
         // A childless Brief never appears.
         let solo = mk("solo");
-        s.set_board_status(&solo, "in_progress").unwrap();
+        move_to_progress(&s, &solo);
         assert!(!has_parent(&s, &solo));
 
         // Once the parent itself is done, it drops off.
-        for st in ["in_review", "done"] {
-            s.set_board_status(&parent, st).unwrap();
-        }
+        move_to_review(&s, &parent);
+        s.set_board_status(&parent, "done").unwrap();
         assert!(!has_parent(&s, &parent));
     }
 
@@ -12383,8 +13910,17 @@ mod tests {
     fn phase2_campaign_and_mandate_progress_counts_by_column() {
         let s = store();
         let mk = |t: &str| {
-            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-                .unwrap()
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
         };
         let b1 = mk("b1");
         let b2 = mk("b2");
@@ -12396,8 +13932,11 @@ mod tests {
         // b1 backlog, b2 todo (camp_1); b3 backlog (camp_2).
         s.set_board_status(&b2, "todo").unwrap();
 
-        let c1: std::collections::HashMap<String, i64> =
-            s.campaign_brief_counts("camp_1").unwrap().into_iter().collect();
+        let c1: std::collections::HashMap<String, i64> = s
+            .campaign_brief_counts("camp_1")
+            .unwrap()
+            .into_iter()
+            .collect();
         assert_eq!(c1.get("backlog"), Some(&1));
         assert_eq!(c1.get("todo"), Some(&1));
         assert_eq!(c1.values().sum::<i64>(), 2);
@@ -12924,6 +14463,26 @@ mod tests {
             args: args.to_vec(),
             tenant_id: None,
         }
+    }
+
+    #[test]
+    fn bridge_back_authorize_capability_enforces_method_scope() {
+        let tokens = crate::rig::bridge::BridgeTokenStore::global();
+        let token = tokens.mint_scoped(
+            "brief_scope_test",
+            "agt_scope_test",
+            "tenant_scope_test",
+            300,
+            vec!["brief.comment".to_string()],
+        );
+        let arg = format!("{token}|brief_scope_test|agt_scope_test|brief.comment");
+        let out = handle_bridge_back_authorize(&ctx(arg.as_bytes()));
+        assert!(matches!(out, HandlerOutcome::Ok(body) if body == b"allow"));
+
+        let arg = format!("{token}|brief_scope_test|agt_scope_test|agent.delete");
+        let out = handle_bridge_back_authorize(&ctx(arg.as_bytes()));
+        assert!(matches!(out, HandlerOutcome::Ok(body) if body == b"deny"));
+        tokens.revoke(&token);
     }
 
     #[test]

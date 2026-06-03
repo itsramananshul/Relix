@@ -3106,6 +3106,7 @@ pub fn register_agent_capabilities(
     bridge: &mut crate::dispatch::DispatchBridge,
     agent_store: Arc<crate::nodes::coordinator::agent::AgentStore>,
     task_store: Arc<crate::nodes::coordinator::TaskStore>,
+    spine_store: Option<Arc<crate::nodes::coordinator::spine::SpineStore>>,
     token_ttl_secs: u64,
     clock: Arc<dyn relix_core::clock::Clock>,
     descriptor_cache: crate::manifest::DescriptorCache,
@@ -3130,6 +3131,17 @@ pub fn register_agent_capabilities(
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handlers::handle_request_hire(&s, &ctx) }
+            })),
+        );
+    }
+    if let Some(spine) = spine_store.clone() {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.request_hire_for_mandate",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let spine = spine.clone();
+                async move { handlers::handle_request_hire_for_mandate(&s, &spine, &ctx) }
             })),
         );
     }
@@ -3315,6 +3327,18 @@ pub fn register_agent_capabilities(
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handlers::handle_approval_pending(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        let ts = task_store.clone();
+        bridge.register(
+            "brief.clearance_request",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let ts = ts.clone();
+                async move { handlers::handle_brief_clearance_request(&s, &ts, &ctx) }
             })),
         );
     }
@@ -7361,9 +7385,14 @@ fn register_node_type_handlers(
         let drift_embedder_cell: crate::nodes::ai::guardrails::DriftEmbedDispatcherCell =
             std::sync::Arc::new(tokio::sync::OnceCell::new());
         let drift_embedder_cell_for_startup = drift_embedder_cell.clone();
+        let agent_store = std::sync::Arc::new(
+            crate::nodes::coordinator::agent::AgentStore::open(&coord_cfg.db_path)
+                .map_err(|e| format!("[coordinator] agent store open: {e}"))?,
+        );
         crate::nodes::coordinator::register(
             bridge,
             store.clone(),
+            Some(agent_store.clone()),
             auto_skill_cfg,
             drift_cfg.clone(),
             drift_embedder_cell,
@@ -7375,21 +7404,25 @@ fn register_node_type_handlers(
         // failure logs and leaves the caps unregistered rather
         // than aborting coordinator boot (the Brief ledger, which
         // already opened the same path above, keeps working).
-        match crate::nodes::coordinator::spine::SpineStore::open(&coord_cfg.db_path) {
+        let spine_store_for_agent_caps = match crate::nodes::coordinator::spine::SpineStore::open(
+            &coord_cfg.db_path,
+        ) {
             Ok(spine_store) => {
-                crate::nodes::coordinator::spine::handlers::register(
-                    bridge,
-                    std::sync::Arc::new(spine_store),
-                );
+                let spine_store = std::sync::Arc::new(spine_store);
+                crate::nodes::coordinator::spine::handlers::register(bridge, spine_store.clone());
                 tracing::info!(
                     "coordinator startup: spine (mandate/campaign) capabilities registered"
                 );
+                Some(spine_store)
             }
-            Err(e) => tracing::error!(
-                error = %e,
-                "coordinator startup: SpineStore open failed; mandate/campaign caps NOT registered"
-            ),
-        }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "coordinator startup: SpineStore open failed; mandate/campaign caps NOT registered"
+                );
+                None
+            }
+        };
         // RELIX-7.30 PART 1: out-of-band approval delivery
         // matrix. Wired when `[approval.delivery]` is present;
         // absent keeps the bridge on the pre-7.30 admission
@@ -8681,10 +8714,6 @@ fn register_node_type_handlers(
         // opened — capabilities are always live so SOL flows
         // can manage agents even when the gate-side wiring
         // (set_agent_gate) is deferred.
-        let agent_store = std::sync::Arc::new(
-            crate::nodes::coordinator::agent::AgentStore::open(&coord_cfg.db_path)
-                .map_err(|e| format!("[coordinator] agent store open: {e}"))?,
-        );
         // Provision the operator-console agent profile so the
         // dashboard/bridge identity passes the fail-closed agent gate
         // (Tasks/Workflows). The subject id is supplied by the boot
@@ -8735,9 +8764,7 @@ fn register_node_type_handlers(
                     move |_ctx: crate::dispatch::InvocationCtx| {
                         let reg = reg.clone();
                         async move {
-                            crate::dispatch::HandlerOutcome::Ok(
-                                reg.names().join("\n").into_bytes(),
-                            )
+                            crate::dispatch::HandlerOutcome::Ok(reg.names().join("\n").into_bytes())
                         }
                     },
                 )),
@@ -8797,7 +8824,7 @@ fn register_node_type_handlers(
             let registry = rig_registry.clone();
             // Per-run bridge-back tokens the dispatch loop mints +
             // injects so a running agent can call Relix's API back.
-            let bridge_tokens = crate::rig::bridge::BridgeTokenStore::new();
+            let bridge_tokens = crate::rig::bridge::BridgeTokenStore::global();
             tokio::spawn(async move {
                 let mut ticker =
                     tokio::time::interval(std::time::Duration::from_secs(interval_secs));
@@ -8808,15 +8835,71 @@ fn register_node_type_handlers(
                     let reg = registry.clone();
                     let bt = bridge_tokens.clone();
                     let outcome = tokio::task::spawn_blocking(move || {
-                        crate::nodes::coordinator::heartbeat::dispatch_batch(
+                        let ags_for_timer = ags.clone();
+                        let ags_for_caps = ags.clone();
+                        crate::nodes::coordinator::heartbeat::dispatch_batch_with_policy(
                             &ts,
                             batch,
                             lease_secs,
                             Some(&bt),
+                            move |card| {
+                                let Some(assignee) = card.assignee_agent_id.as_deref() else {
+                                    return false;
+                                };
+                                match ags_for_timer.get_agent(assignee) {
+                                    Ok(Some(agent)) if agent.status == "active" => {
+                                        if !agent.wake_on_timer {
+                                            tracing::debug!(
+                                                agent_id = %assignee,
+                                                brief_id = %card.task_id,
+                                                "heartbeat: timer wake disabled for Operative"
+                                            );
+                                            return false;
+                                        }
+                                        true
+                                    }
+                                    Ok(Some(agent)) => {
+                                        tracing::warn!(
+                                            agent_id = %assignee,
+                                            status = %agent.status,
+                                            brief_id = %card.task_id,
+                                            "heartbeat: refusing timer wake for non-active Operative"
+                                        );
+                                        false
+                                    }
+                                    Ok(None) => false,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            agent_id = %assignee,
+                                            error = %e,
+                                            "heartbeat: failed to read Operative for timer wake"
+                                        );
+                                        false
+                                    }
+                                }
+                            },
+                            move |agent_id| {
+                                ags_for_caps
+                                    .get_agent(agent_id)
+                                    .ok()
+                                    .flatten()
+                                    .filter(|a| a.status == "active")
+                                    .map(|a| a.max_concurrent_runs)
+                                    .unwrap_or(0)
+                            },
                             |card| {
                                 let assignee = card.assignee_agent_id.as_deref()?;
-                                let preferred =
-                                    ags.get_agent(assignee).ok().flatten().and_then(|a| a.rig);
+                                let agent = ags.get_agent(assignee).ok().flatten()?;
+                                if agent.status != "active" {
+                                    tracing::warn!(
+                                        agent_id = %assignee,
+                                        status = %agent.status,
+                                        brief_id = %card.task_id,
+                                        "heartbeat: refusing to dispatch non-active Operative"
+                                    );
+                                    return None;
+                                }
+                                let preferred = agent.rig;
                                 reg.resolve(preferred.as_deref())
                             },
                             |card| ts.compose_brief_prompt(&card.task_id, 10),
@@ -8915,6 +8998,7 @@ fn register_node_type_handlers(
             bridge,
             agent_store.clone(),
             store.clone(),
+            spine_store_for_agent_caps,
             effective_ttl_secs,
             agent_caps_clock,
             manifest.descriptor_cache(),
@@ -8929,6 +9013,11 @@ fn register_node_type_handlers(
                 "agent.request_hire",
                 "Gated creation: mint an Operative `pending` (inert until approved). Same arg shape as agent.create. Returns the new agent_id.",
                 &["agent", "persist"],
+            ),
+            (
+                "agent.request_hire_for_mandate",
+                "Strategy-gated hire: mandate_id|name|role|title|department|team|created_by|subject_id|risk_ceiling. Refuses until the Mandate strategy is approved.",
+                &["agent", "persist", "governance"],
             ),
             (
                 "agent.approve_hire",
@@ -9010,6 +9099,11 @@ fn register_node_type_handlers(
                 "coord.approval.pending",
                 "List pending approvals (newest first). Arg: limit (default 20).",
                 &["approval", "read"],
+            ),
+            (
+                "brief.clearance_request",
+                "Create a pending Clearance linked to a Brief. Arg: brief_id|agent_id|method|category|reason|ttl_secs?.",
+                &["approval", "persist", "brief"],
             ),
             (
                 "coord.approval.get",

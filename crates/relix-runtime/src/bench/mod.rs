@@ -101,7 +101,9 @@ impl BenchLedger {
 
     /// The Bench's snapshot reference, if any.
     pub fn snapshot_ref(&self, task_id: &str) -> Option<String> {
-        self.lock().get(task_id).and_then(|w| w.snapshot_ref.clone())
+        self.lock()
+            .get(task_id)
+            .and_then(|w| w.snapshot_ref.clone())
     }
 
     /// Mark a Bench as freshly active — resets its idle clock
@@ -243,7 +245,10 @@ mod tests {
 
         // Nothing idle now → no-op.
         b.ensure_active("d");
-        assert!(b.hibernate_idle(unix_now(), 3600, |_| "x".into()).is_empty());
+        assert!(
+            b.hibernate_idle(unix_now(), 3600, |_| "x".into())
+                .is_empty()
+        );
         assert_eq!(b.state("d"), Some(WorkspaceState::Active));
     }
 

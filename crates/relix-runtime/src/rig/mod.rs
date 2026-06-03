@@ -129,6 +129,72 @@ pub struct RigInfo {
     pub display_name: String,
     /// `per_tool_call` or `box_level` — how deeply Relix governs it.
     pub governance: String,
+    pub bridge_back: bool,
+    pub structured_output: bool,
+    pub billing: RigBilling,
+    pub probe: RigProbe,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RigBilling {
+    pub mode: String,
+    pub provider: Option<String>,
+    pub subscription_included: bool,
+    pub quota_window: Option<String>,
+}
+
+impl RigBilling {
+    pub fn metered(provider: impl Into<String>) -> Self {
+        Self {
+            mode: "metered".to_string(),
+            provider: Some(provider.into()),
+            subscription_included: false,
+            quota_window: None,
+        }
+    }
+
+    pub fn subscription(provider: impl Into<String>, quota_window: impl Into<String>) -> Self {
+        Self {
+            mode: "subscription".to_string(),
+            provider: Some(provider.into()),
+            subscription_included: true,
+            quota_window: Some(quota_window.into()),
+        }
+    }
+
+    pub fn none() -> Self {
+        Self {
+            mode: "none".to_string(),
+            provider: None,
+            subscription_included: false,
+            quota_window: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RigProbe {
+    pub status: String,
+    pub detail: String,
+    pub install_hint: Option<String>,
+}
+
+impl RigProbe {
+    pub fn available(detail: impl Into<String>) -> Self {
+        Self {
+            status: "available".to_string(),
+            detail: detail.into(),
+            install_hint: None,
+        }
+    }
+
+    pub fn missing(detail: impl Into<String>, install_hint: Option<String>) -> Self {
+        Self {
+            status: "missing".to_string(),
+            detail: detail.into(),
+            install_hint,
+        }
+    }
 }
 
 /// A **Rig** — a pluggable agent backend. The uniform contract
@@ -148,6 +214,22 @@ pub trait Rig: Send + Sync {
     /// `PerToolCall` only when it genuinely exposes its tools.
     fn governance(&self) -> RigGovernance {
         RigGovernance::BoxLevel
+    }
+
+    fn supports_bridge_back(&self) -> bool {
+        true
+    }
+
+    fn structured_output(&self) -> bool {
+        false
+    }
+
+    fn billing(&self) -> RigBilling {
+        RigBilling::none()
+    }
+
+    fn probe(&self) -> RigProbe {
+        RigProbe::available("no probe required")
     }
 
     /// Run one Brief and report the outcome. Synchronous by
@@ -216,9 +298,10 @@ impl RigRegistry {
     /// dispatcher's single resolution point.
     pub fn resolve(&self, preferred: Option<&str>) -> Option<Arc<dyn Rig>> {
         if let Some(name) = preferred.filter(|s| !s.is_empty())
-            && let Some(rig) = self.get(name) {
-                return Some(rig);
-            }
+            && let Some(rig) = self.get(name)
+        {
+            return Some(rig);
+        }
         self.default_name.as_deref().and_then(|d| self.get(d))
     }
 
@@ -236,6 +319,10 @@ impl RigRegistry {
                 name: r.name().to_string(),
                 display_name: r.display_name().to_string(),
                 governance: r.governance().as_str().to_string(),
+                bridge_back: r.supports_bridge_back(),
+                structured_output: r.structured_output(),
+                billing: r.billing(),
+                probe: r.probe(),
             })
             .collect()
     }
@@ -264,6 +351,10 @@ impl Rig for EchoRig {
 
     fn display_name(&self) -> &str {
         "Echo (built-in reference)"
+    }
+
+    fn supports_bridge_back(&self) -> bool {
+        false
     }
 
     fn run(&self, req: &RigRunRequest) -> RigOutcome {
@@ -309,6 +400,9 @@ pub struct ProcessRig {
     /// adapter genuinely surfaces tool calls Relix can gate (e.g. it
     /// speaks the Macro `@relix-call` protocol or ACP).
     governance: RigGovernance,
+    structured_output: bool,
+    billing: RigBilling,
+    install_hint: Option<String>,
 }
 
 /// Default stdout cap for a process Rig — generous enough for a real
@@ -316,17 +410,16 @@ pub struct ProcessRig {
 pub const DEFAULT_RIG_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
 impl ProcessRig {
-    pub fn new(
-        name: impl Into<String>,
-        program: impl Into<String>,
-        args: Vec<String>,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, program: impl Into<String>, args: Vec<String>) -> Self {
         Self {
             name: name.into(),
             program: program.into(),
             args,
             max_output_bytes: DEFAULT_RIG_MAX_OUTPUT_BYTES,
             governance: RigGovernance::BoxLevel,
+            structured_output: false,
+            billing: RigBilling::none(),
+            install_hint: None,
         }
     }
 
@@ -342,6 +435,21 @@ impl ProcessRig {
     /// calls for gating; the default `BoxLevel` is the safe floor.
     pub fn with_governance(mut self, governance: RigGovernance) -> Self {
         self.governance = governance;
+        self
+    }
+
+    pub fn with_structured_output(mut self, structured_output: bool) -> Self {
+        self.structured_output = structured_output;
+        self
+    }
+
+    pub fn with_billing(mut self, billing: RigBilling) -> Self {
+        self.billing = billing;
+        self
+    }
+
+    pub fn with_install_hint(mut self, install_hint: impl Into<String>) -> Self {
+        self.install_hint = Some(install_hint.into());
         self
     }
 
@@ -368,6 +476,25 @@ impl Rig for ProcessRig {
 
     fn governance(&self) -> RigGovernance {
         self.governance
+    }
+
+    fn structured_output(&self) -> bool {
+        self.structured_output
+    }
+
+    fn billing(&self) -> RigBilling {
+        self.billing.clone()
+    }
+
+    fn probe(&self) -> RigProbe {
+        if command_exists(&self.program) {
+            RigProbe::available(format!("{} found on PATH", self.program))
+        } else {
+            RigProbe::missing(
+                format!("{} not found on PATH", self.program),
+                self.install_hint.clone(),
+            )
+        }
     }
 
     fn run(&self, req: &RigRunRequest) -> RigOutcome {
@@ -442,6 +569,28 @@ impl Rig for ProcessRig {
 
 // ── CLI subscription Rigs ─────────────────────────────────
 //
+fn command_exists(program: &str) -> bool {
+    use std::path::Path;
+
+    let candidate = Path::new(program);
+    if candidate.components().count() > 1 {
+        return candidate.is_file();
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let suffixes: Vec<&str> = if cfg!(windows) {
+        vec!["", ".exe", ".cmd", ".bat"]
+    } else {
+        vec![""]
+    };
+    std::env::split_paths(&path).any(|dir| {
+        suffixes
+            .iter()
+            .any(|suffix| dir.join(format!("{program}{suffix}")).is_file())
+    })
+}
+
 // The standard CLI Rigs, as ProcessRigs. Each spawns the operator's
 // installed CLI, which authenticates with ITS OWN subscription
 // login — **no inference key is injected**. This is the
@@ -453,18 +602,39 @@ impl Rig for ProcessRig {
 
 /// Claude Code on a Claude subscription. Prompt piped to stdin.
 pub fn claude_rig() -> ProcessRig {
-    ProcessRig::new("claude", "claude", vec!["--print".to_string()])
+    ProcessRig::new(
+        "claude",
+        "claude",
+        vec![
+            "--print".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+        ],
+    )
+    .with_structured_output(true)
+    .with_billing(RigBilling::subscription("anthropic", "5h/weekly"))
+    .with_install_hint("install Claude Code, then run `claude login`")
 }
 
 /// Codex on a ChatGPT / Codex subscription. Prompt piped via the
 /// trailing `-` (read from stdin).
 pub fn codex_rig() -> ProcessRig {
-    ProcessRig::new("codex", "codex", vec!["exec".to_string(), "-".to_string()])
+    ProcessRig::new(
+        "codex",
+        "codex",
+        vec!["exec".to_string(), "--json".to_string(), "-".to_string()],
+    )
+    .with_structured_output(true)
+    .with_billing(RigBilling::subscription("openai", "5h/weekly/credits"))
+    .with_install_hint("install Codex CLI, then run `codex login`")
 }
 
 /// Gemini CLI on a Google subscription. Prompt piped to stdin.
 pub fn gemini_rig() -> ProcessRig {
     ProcessRig::new("gemini", "gemini", Vec::new())
+        .with_billing(RigBilling::subscription("google", "provider-window"))
+        .with_install_hint("install Gemini CLI, then authenticate it")
 }
 
 /// An installed **Hermes** agent, plugged in as a Rig (Pillar 2 —
@@ -482,6 +652,7 @@ pub fn gemini_rig() -> ProcessRig {
 /// path as `PerToolCall` until that rich transport exists.
 pub fn hermes_rig() -> ProcessRig {
     ProcessRig::new("hermes", "hermes", vec!["run".to_string(), "-".to_string()])
+        .with_install_hint("install Hermes and ensure `hermes` is on PATH")
     // governance left at the conservative BoxLevel default (see above)
 }
 
@@ -519,7 +690,10 @@ mod tests {
         let req = RigRunRequest::new("b", "a", "g", "   ");
         assert!(matches!(
             rig.run(&req),
-            RigOutcome::Failed { retryable: false, .. }
+            RigOutcome::Failed {
+                retryable: false,
+                ..
+            }
         ));
     }
 
@@ -549,7 +723,10 @@ mod tests {
         let mut reg = reg;
         reg.register(Arc::new(CustomEcho));
         assert_eq!(reg.len(), 1, "override keeps a single 'echo' entry");
-        assert_eq!(reg.get("echo").unwrap().governance(), RigGovernance::PerToolCall);
+        assert_eq!(
+            reg.get("echo").unwrap().governance(),
+            RigGovernance::PerToolCall
+        );
     }
 
     // Cross-platform command helpers for the ProcessRig tests.
@@ -609,7 +786,10 @@ mod tests {
         let req = RigRunRequest::new("b", "a", "g", "x");
         assert!(matches!(
             rig.run(&req),
-            RigOutcome::Failed { retryable: true, .. }
+            RigOutcome::Failed {
+                retryable: true,
+                ..
+            }
         ));
     }
 
@@ -619,7 +799,10 @@ mod tests {
         let req = RigRunRequest::new("b", "a", "g", "x");
         assert!(matches!(
             rig.run(&req),
-            RigOutcome::Failed { retryable: true, .. }
+            RigOutcome::Failed {
+                retryable: true,
+                ..
+            }
         ));
     }
 
@@ -629,13 +812,23 @@ mod tests {
         assert_eq!(c.name(), "claude");
         assert_eq!(c.program(), "claude");
         assert!(c.args().iter().any(|a| a == "--print"));
+        assert!(c.args().iter().any(|a| a == "--output-format"));
+        assert!(c.args().iter().any(|a| a == "stream-json"));
+        assert!(c.structured_output());
+        assert_eq!(c.billing().mode, "subscription");
+        assert_eq!(c.billing().provider.as_deref(), Some("anthropic"));
 
         let x = codex_rig();
         assert_eq!(x.name(), "codex");
         assert_eq!(x.program(), "codex");
         assert!(x.args().iter().any(|a| a == "exec"));
+        assert!(x.args().iter().any(|a| a == "--json"));
+        assert!(x.structured_output());
+        assert_eq!(x.billing().mode, "subscription");
+        assert_eq!(x.billing().provider.as_deref(), Some("openai"));
 
         assert_eq!(gemini_rig().name(), "gemini");
+        assert_eq!(gemini_rig().billing().mode, "subscription");
 
         // Hermes stdio placeholder: BoxLevel until the real
         // /v1/runs+MCP+plugin seam (which earns PerToolCall) is built.
@@ -660,9 +853,26 @@ mod tests {
         let plain = ProcessRig::new("p", "true", vec![]);
         assert_eq!(plain.governance(), RigGovernance::BoxLevel);
         // Opt up when the adapter surfaces its tool calls.
-        let rich = ProcessRig::new("h", "hermes", vec![])
-            .with_governance(RigGovernance::PerToolCall);
+        let rich =
+            ProcessRig::new("h", "hermes", vec![]).with_governance(RigGovernance::PerToolCall);
         assert_eq!(rich.governance(), RigGovernance::PerToolCall);
+    }
+
+    #[test]
+    fn process_rig_probe_reports_missing_program_with_hint() {
+        let rig = ProcessRig::new(
+            "missing",
+            "definitely-not-installed-relix-rig-test-binary",
+            vec![],
+        )
+        .with_install_hint("install the missing adapter");
+        let probe = rig.probe();
+        assert_eq!(probe.status, "missing");
+        assert!(probe.detail.contains("definitely-not-installed"));
+        assert_eq!(
+            probe.install_hint.as_deref(),
+            Some("install the missing adapter")
+        );
     }
 
     #[test]
@@ -719,7 +929,25 @@ mod tests {
         // echo is thin (box-level) by default.
         let echo = infos.iter().find(|i| i.name == "echo").unwrap();
         assert_eq!(echo.governance, "box_level");
+        assert!(!echo.bridge_back);
+        assert!(!echo.structured_output);
+        assert_eq!(echo.billing.mode, "none");
+        assert_eq!(echo.probe.status, "available");
+        let claude = infos.iter().find(|i| i.name == "claude").unwrap();
+        assert!(claude.bridge_back);
+        assert!(claude.structured_output);
+        assert_eq!(claude.billing.mode, "subscription");
+        assert_eq!(claude.billing.provider.as_deref(), Some("anthropic"));
+        assert!(matches!(
+            claude.probe.status.as_str(),
+            "available" | "missing"
+        ));
+        if claude.probe.status == "missing" {
+            assert!(claude.probe.install_hint.is_some());
+        }
         // JSON-serialisable for the agent-config UI.
-        assert!(serde_json::to_string(&infos).unwrap().contains("box_level"));
+        let json = serde_json::to_string(&infos).unwrap();
+        assert!(json.contains("box_level"));
+        assert!(json.contains("subscription_included"));
     }
 }

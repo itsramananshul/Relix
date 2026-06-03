@@ -251,9 +251,7 @@ impl KnackLedger {
         self.lock().is_empty()
     }
 
-    fn lock(
-        &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, KnackEntry>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, KnackEntry>> {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

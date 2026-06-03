@@ -8,11 +8,11 @@
 //! browser-friendly shape over the existing capabilities.
 
 use axum::{
+    Json,
     body::Body,
     extract::{Path, Query, State},
-    http::{header, HeaderName, HeaderValue, StatusCode},
+    http::{HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::{Deserialize, Serialize};
 
@@ -95,6 +95,22 @@ pub async fn guild_counts(
 }
 
 /// `GET /v1/spine/board` — Brief counts by board column.
+/// `GET /v1/spine/guild/detail` - Guild profile, including monthly
+/// Allowance when configured.
+pub async fn guild_detail(
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "guild.get", b"").await?)
+}
+
+/// `GET /v1/spine/allowance/committed` - total monthly Allowance
+/// committed to Operatives.
+pub async fn allowance_committed(
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "agent.allowance_committed", b"").await?)
+}
+
 pub async fn board_summary(
     State(state): State<AppState>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
@@ -158,6 +174,16 @@ pub async fn brief_detail(
 }
 
 /// `GET /v1/spine/board/:column?limit=` — the Briefs in one column.
+/// `GET /v1/spine/briefs/:id/wakeups?limit=` - the Brief wakeup ledger.
+pub async fn brief_wakeups(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ListQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let arg = format!("{}|{}", id, q.limit.unwrap_or(50));
+    json_passthrough(call_peer(&state, "brief.wakeups", arg.as_bytes()).await?)
+}
+
 pub async fn board_column(
     State(state): State<AppState>,
     Path(column): Path<String>,
@@ -354,15 +380,17 @@ pub struct SetFieldRequest {
 }
 
 /// `POST /v1/spine/briefs/:id/set` — set a spine field
-/// (assignee/priority/mandate/campaign). Empty value clears it
+/// (assignee/reviewer/priority/mandate/campaign). Empty value clears it
 /// (where the field allows).
 pub async fn set_field(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<SetFieldRequest>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
-    if !["assignee", "priority", "mandate", "campaign"].contains(&req.field.as_str()) {
-        return Err(bad("field must be assignee/priority/mandate/campaign"));
+    if !["assignee", "reviewer", "priority", "mandate", "campaign"].contains(&req.field.as_str()) {
+        return Err(bad(
+            "field must be assignee/reviewer/priority/mandate/campaign",
+        ));
     }
     // `value` is the trailing wire field so it may contain `|`.
     let arg = format!("{id}|{}|{}", req.field, req.value);
@@ -495,7 +523,11 @@ fn bad(msg: &str) -> (StatusCode, Json<ApiError>) {
 /// Wrap a raw mesh body (already JSON for these capabilities) in a
 /// `200 application/json` response. An empty body becomes `null`.
 fn json_passthrough(body: Vec<u8>) -> Result<Response, (StatusCode, Json<ApiError>)> {
-    let payload = if body.is_empty() { b"null".to_vec() } else { body };
+    let payload = if body.is_empty() {
+        b"null".to_vec()
+    } else {
+        body
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
@@ -622,7 +654,10 @@ mod tests {
             .get(header::CONTENT_SECURITY_POLICY)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        assert!(csp.contains("script-src 'self' 'unsafe-inline'"), "csp: {csp:?}");
+        assert!(
+            csp.contains("script-src 'self' 'unsafe-inline'"),
+            "csp: {csp:?}"
+        );
         assert!(csp.contains("connect-src 'self'"), "csp: {csp:?}");
     }
 
@@ -633,8 +668,11 @@ mod tests {
         assert!(SPINE_HTML.contains("/v1/spine/board"));
         assert!(SPINE_HTML.contains("/v1/spine/briefs"));
         assert!(SPINE_HTML.contains("/v1/spine/guild"));
+        assert!(SPINE_HTML.contains("/v1/spine/guild/detail"));
+        assert!(SPINE_HTML.contains("/v1/spine/allowance/committed"));
         assert!(SPINE_HTML.contains("/v1/spine/mandates"));
         assert!(SPINE_HTML.contains("/v1/spine/companion"));
+        assert!(SPINE_HTML.contains("/v1/tasks/events/recent"));
     }
 
     /// Build the full spine route table in isolation: matchit panics
@@ -647,18 +685,18 @@ mod tests {
         let _router: axum::Router<crate::config::AppState> = axum::Router::new()
             .route("/spine", get(page))
             .route("/v1/spine/guild", get(guild_counts))
+            .route("/v1/spine/guild/detail", get(guild_detail))
+            .route("/v1/spine/allowance/committed", get(allowance_committed))
             .route("/v1/spine/board", get(board_summary))
             .route("/v1/spine/board/:column", get(board_column))
             .route("/v1/spine/roster", get(roster_summary))
-            .route(
-                "/v1/spine/mandates",
-                get(mandates).post(create_mandate),
-            )
+            .route("/v1/spine/mandates", get(mandates).post(create_mandate))
             .route("/v1/spine/mandates/search", get(mandate_search))
             .route("/v1/spine/mandates/:id/tree", get(mandate_tree))
             .route("/v1/spine/mandates/:id/briefs", get(mandate_briefs))
             .route("/v1/spine/briefs/search", get(brief_search))
             .route("/v1/spine/briefs/:id", get(brief_detail))
+            .route("/v1/spine/briefs/:id/wakeups", get(brief_wakeups))
             .route("/v1/spine/desk/:agent", get(desk))
             .route("/v1/spine/by-label", get(by_label))
             .route("/v1/spine/overdue", get(overdue))

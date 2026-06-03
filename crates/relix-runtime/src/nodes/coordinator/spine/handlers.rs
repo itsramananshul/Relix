@@ -219,7 +219,13 @@ fn handle_mandate_create(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutc
     let description = parts.get(1).copied().unwrap_or("");
     let owner = parts.get(2).copied().filter(|v| !v.trim().is_empty());
     let parent = parts.get(3).copied().filter(|v| !v.trim().is_empty());
-    match store.create_mandate(ctx.tenant_id_or_default(), title, description, owner, parent) {
+    match store.create_mandate(
+        ctx.tenant_id_or_default(),
+        title,
+        description,
+        owner,
+        parent,
+    ) {
         Ok(id) => HandlerOutcome::Ok(id.into_bytes()),
         Err(SpineStoreError::BadInput(m)) => invalid(format!("mandate.create: {m}")),
         Err(e) => internal(format!("mandate.create: {e}")),

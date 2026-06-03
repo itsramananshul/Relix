@@ -30,6 +30,18 @@ use crate::rig::{Rig, RigOutcome, RigRunRequest};
 /// dispatcher's work is picked up by the next tick).
 pub const DEFAULT_DISPATCH_LEASE_SECS: i64 = 300;
 
+/// Bridge-back methods a Rig may use during one Shift. Keep this
+/// list narrow: it is the difference between "agent can report work
+/// on its Brief" and "leaked token can mutate the whole company."
+pub const BRIDGE_BACK_SHIFT_METHODS: &[&str] = &[
+    "brief.comment",
+    "brief.subbrief",
+    "brief.dossier_add",
+    "brief.set_snags",
+    "brief.claim_holder",
+    "brief.clearance_request",
+];
+
 /// Run one selection-and-claim tick over the ready Briefs.
 ///
 /// For each Brief ready to work, atomically claim it for its
@@ -52,7 +64,13 @@ pub fn claim_ready_batch(
         let Some(assignee) = card.assignee_agent_id.as_deref() else {
             continue;
         };
-        if store.claim_brief(&card.task_id, assignee, lease_secs)? {
+        let execution_run_id = format!("shift_{}", uuid::Uuid::new_v4());
+        if store.claim_brief_for_run(
+            &card.task_id,
+            assignee,
+            lease_secs,
+            Some(&execution_run_id),
+        )? {
             claimed.push(card);
         }
     }
@@ -105,9 +123,53 @@ where
     R: Fn(&brief::BriefCard) -> Option<Arc<dyn Rig>>,
     P: Fn(&brief::BriefCard) -> String,
 {
-    let claimed = claim_ready_batch(store, batch, lease_secs)?;
+    dispatch_batch_with_policy(
+        store,
+        batch,
+        lease_secs,
+        bridge_tokens,
+        |_| true,
+        |_| 20,
+        resolve_rig,
+        build_prompt,
+    )
+}
+
+/// Policy-aware dispatch tick used by the live controller. The
+/// default [`dispatch_batch`] keeps tests and old callers simple;
+/// this variant lets production wiring enforce per-agent runtime
+/// Keys before queueing timer wakes and before claiming queued runs.
+pub fn dispatch_batch_with_policy<R, P, A, C>(
+    store: &TaskStore,
+    batch: usize,
+    lease_secs: i64,
+    bridge_tokens: Option<&BridgeTokenStore>,
+    allow_timer_wakeup: A,
+    max_running_for_agent: C,
+    resolve_rig: R,
+    build_prompt: P,
+) -> Result<Vec<DispatchRecord>, CoordinatorError>
+where
+    R: Fn(&brief::BriefCard) -> Option<Arc<dyn Rig>>,
+    P: Fn(&brief::BriefCard) -> String,
+    A: Fn(&brief::BriefCard) -> bool,
+    C: FnMut(&str) -> i64,
+{
+    let ready = store.list_ready_briefs(batch)?;
+    for card in &ready {
+        let Some(assignee) = card.assignee_agent_id.as_deref() else {
+            continue;
+        };
+        if allow_timer_wakeup(card) {
+            let _ =
+                store.request_brief_wakeup(&card.task_id, assignee, "timer", "heartbeat", None)?;
+        }
+    }
+    let claimed = store.claim_queued_wakeups_with_caps(batch, lease_secs, max_running_for_agent)?;
     let mut records = Vec::with_capacity(claimed.len());
-    for card in claimed {
+    for claimed_wake in claimed {
+        let card = claimed_wake.card;
+        let wakeup_id = claimed_wake.wakeup.wakeup_id;
         let record = match resolve_rig(&card) {
             Some(rig) => {
                 // Work starts: todo → in_progress.
@@ -118,21 +180,29 @@ where
                 // Mint a scoped bridge-back token for this Shift so the
                 // agent can call Relix back; it dies with the Shift.
                 let token = bridge_tokens
-                    .map(|bt| bt.mint(&card.task_id, &assignee, "", lease_secs))
+                    .map(|bt| {
+                        bt.mint_scoped(
+                            &card.task_id,
+                            &assignee,
+                            "",
+                            lease_secs,
+                            BRIDGE_BACK_SHIFT_METHODS
+                                .iter()
+                                .map(|m| (*m).to_string())
+                                .collect(),
+                        )
+                    })
                     .unwrap_or_default();
-                let req = RigRunRequest::new(
-                    &card.task_id,
-                    assignee,
-                    String::new(),
-                    build_prompt(&card),
-                )
-                .with_bridge_token(&token)
-                .with_context(brief_context(&card));
+                let req =
+                    RigRunRequest::new(&card.task_id, assignee, String::new(), build_prompt(&card))
+                        .with_bridge_token(&token)
+                        .with_context(brief_context(&card));
                 let outcome = rig.run(&req);
                 if let Some(bt) = bridge_tokens
-                    && !token.is_empty() {
-                        bt.revoke(&token);
-                    }
+                    && !token.is_empty()
+                {
+                    bt.revoke(&token);
+                }
                 // Advance the board by outcome. The Brief is now
                 // `in_progress` (we either moved it or it already
                 // was), so both transitions below are legal.
@@ -141,8 +211,25 @@ where
                     // chronicle the result summary so the reviewer
                     // sees what the Shift produced.
                     RigOutcome::Done { summary } => {
-                        store.set_board_status(&card.task_id, "in_review")?;
-                        let _ = store.append_event(&card.task_id, "brief.shift_done", summary);
+                        match store.set_board_status(&card.task_id, "in_review") {
+                            Ok(_) => {
+                                let _ = store.finish_wakeup(&wakeup_id, "completed", Some(summary));
+                                let _ =
+                                    store.append_event(&card.task_id, "brief.shift_done", summary);
+                            }
+                            Err(CoordinatorError::Invalid(reason))
+                                if reason.contains("reviewer required") =>
+                            {
+                                store.set_board_status(&card.task_id, "blocked")?;
+                                let _ = store.finish_wakeup(&wakeup_id, "failed", Some(&reason));
+                                let _ = store.append_event(
+                                    &card.task_id,
+                                    "brief.dispatch_failed",
+                                    &format!("reviewer required before review: {summary}"),
+                                );
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                     // Unrecoverable failure → park in `blocked` for
                     // attention rather than re-dispatching it forever,
@@ -152,18 +239,24 @@ where
                         reason,
                     } => {
                         store.set_board_status(&card.task_id, "blocked")?;
-                        let _ =
-                            store.append_event(&card.task_id, "brief.dispatch_failed", reason);
+                        let _ = store.finish_wakeup(&wakeup_id, "failed", Some(reason));
+                        let _ = store.append_event(&card.task_id, "brief.dispatch_failed", reason);
                     }
                     // Durable yield → stay `in_progress` and
                     // chronicle the note so the NEXT Shift resumes
                     // with the continuation context.
                     RigOutcome::Continue { note } => {
+                        let _ = store.finish_wakeup(&wakeup_id, "continued", Some(note));
                         let _ = store.append_event(&card.task_id, "brief.continued", note);
                     }
                     // Retryable failure → leave it `in_progress`; the
                     // next tick picks it back up.
-                    _ => {}
+                    RigOutcome::Failed {
+                        retryable: true,
+                        reason,
+                    } => {
+                        let _ = store.finish_wakeup(&wakeup_id, "failed", Some(reason));
+                    }
                 }
                 DispatchRecord {
                     brief_id: card.task_id.clone(),
@@ -171,14 +264,18 @@ where
                     outcome,
                 }
             }
-            None => DispatchRecord {
-                brief_id: card.task_id.clone(),
-                rig: String::new(),
-                outcome: RigOutcome::Failed {
-                    reason: "no Rig configured and no Guild default".to_string(),
-                    retryable: false,
-                },
-            },
+            None => {
+                let reason = "no Rig configured and no Guild default".to_string();
+                let _ = store.finish_wakeup(&wakeup_id, "failed", Some(&reason));
+                DispatchRecord {
+                    brief_id: card.task_id.clone(),
+                    rig: String::new(),
+                    outcome: RigOutcome::Failed {
+                        reason,
+                        retryable: false,
+                    },
+                }
+            }
         };
         // Always release the Claim after the tick.
         if let Some(assignee) = card.assignee_agent_id.as_deref() {
@@ -227,6 +324,7 @@ mod tests {
             )
             .unwrap();
         s.set_brief_field(&id, "assignee", assignee).unwrap();
+        s.set_brief_field(&id, "reviewer", "reviewer_1").unwrap();
         s.set_board_status(&id, "todo").unwrap();
         id
     }
@@ -254,14 +352,32 @@ mod tests {
 
         // Unassigned: not ready, never dispatched.
         let unassigned = s
-            .create("u", "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .create(
+                "u",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         s.set_board_status(&unassigned, "todo").unwrap();
 
         // Blocked: ready query excludes it.
         let blocked = ready_brief(&s, "blocked", "agt_y");
         let blocker = s
-            .create("blk", "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .create(
+                "blk",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         s.add_snag(&blocked, &blocker).unwrap();
 
@@ -334,7 +450,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(done.len(), 1);
-        assert!(done[0].payload.contains("write docs"), "got {:?}", done[0].payload);
+        assert!(
+            done[0].payload.contains("write docs"),
+            "got {:?}",
+            done[0].payload
+        );
         // No longer ready, so a second tick does nothing.
         assert!(s.list_ready_briefs(50).unwrap().is_empty());
         assert!(
@@ -349,6 +469,62 @@ mod tests {
             .unwrap()
             .is_empty()
         );
+    }
+
+    #[test]
+    fn dispatch_policy_can_disable_timer_wake_for_ready_brief() {
+        use crate::rig::RigRegistry;
+        let s = store();
+        let reg = RigRegistry::with_builtins();
+        let a = ready_brief(&s, "do not wake", "agt_a");
+
+        let records = dispatch_batch_with_policy(
+            &s,
+            50,
+            300,
+            None,
+            |_| false,
+            |_| 20,
+            |_: &brief::BriefCard| reg.get("echo"),
+            |c: &brief::BriefCard| c.title.clone(),
+        )
+        .unwrap();
+        assert!(records.is_empty());
+        assert_eq!(s.board_status(&a).unwrap().as_deref(), Some("todo"));
+        assert!(s.claim_holder(&a).unwrap().is_none());
+        assert!(s.list_brief_wakeups(&a, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dispatch_policy_honors_per_agent_concurrency_cap() {
+        use crate::rig::RigRegistry;
+        let s = store();
+        let reg = RigRegistry::with_builtins();
+        let a = ready_brief(&s, "a", "agt_a");
+        let b = ready_brief(&s, "b", "agt_a");
+
+        let records = dispatch_batch_with_policy(
+            &s,
+            50,
+            300,
+            None,
+            |_| true,
+            |agent| if agent == "agt_a" { 1 } else { 20 },
+            |_: &brief::BriefCard| reg.get("echo"),
+            |c: &brief::BriefCard| c.title.clone(),
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        let done_id = records[0].brief_id.clone();
+        let queued_id = if done_id == a { b } else { a };
+        assert_eq!(
+            s.board_status(&done_id).unwrap().as_deref(),
+            Some("in_review")
+        );
+        assert_eq!(s.board_status(&queued_id).unwrap().as_deref(), Some("todo"));
+        let queued_rows = s.list_brief_wakeups(&queued_id, 10).unwrap();
+        assert_eq!(queued_rows.len(), 1);
+        assert_eq!(queued_rows[0].status, "queued");
     }
 
     #[test]
@@ -402,7 +578,10 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(matches!(
             records[0].outcome,
-            RigOutcome::Failed { retryable: false, .. }
+            RigOutcome::Failed {
+                retryable: false,
+                ..
+            }
         ));
         // Started then failed unrecoverably → parked in blocked,
         // Claim released, and no longer ready (won't re-dispatch).
@@ -540,13 +719,30 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         // A Rig that records the bridge token it was handed.
-        struct RecordingRig(Arc<Mutex<String>>);
+        struct RecordingRig {
+            token: Arc<Mutex<String>>,
+            allowed: Arc<Mutex<bool>>,
+            denied: Arc<Mutex<bool>>,
+            tokens: BridgeTokenStore,
+        }
         impl Rig for RecordingRig {
             fn name(&self) -> &str {
                 "recorder"
             }
             fn run(&self, req: &RigRunRequest) -> RigOutcome {
-                *self.0.lock().unwrap() = req.bridge_token.clone();
+                *self.token.lock().unwrap() = req.bridge_token.clone();
+                *self.allowed.lock().unwrap() = self.tokens.authorize_method(
+                    &req.bridge_token,
+                    &req.brief_id,
+                    &req.agent_id,
+                    "brief.comment",
+                );
+                *self.denied.lock().unwrap() = !self.tokens.authorize_method(
+                    &req.bridge_token,
+                    &req.brief_id,
+                    &req.agent_id,
+                    "agent.delete",
+                );
                 RigOutcome::Done {
                     summary: "ok".to_string(),
                 }
@@ -557,7 +753,14 @@ mod tests {
         let _a = ready_brief(&s, "a", "agt_a");
         let tokens = BridgeTokenStore::new();
         let seen = Arc::new(Mutex::new(String::new()));
-        let rig: Arc<dyn Rig> = Arc::new(RecordingRig(seen.clone()));
+        let allowed = Arc::new(Mutex::new(false));
+        let denied = Arc::new(Mutex::new(false));
+        let rig: Arc<dyn Rig> = Arc::new(RecordingRig {
+            token: seen.clone(),
+            allowed: allowed.clone(),
+            denied: denied.clone(),
+            tokens: tokens.clone(),
+        });
 
         let records = dispatch_batch(
             &s,
@@ -573,6 +776,14 @@ mod tests {
         // A token was minted and handed to the Rig during the run…
         let handed = seen.lock().unwrap().clone();
         assert!(handed.starts_with("brt_"), "got: {handed:?}");
+        assert!(
+            *allowed.lock().unwrap(),
+            "token must permit run-scoped bridge-back methods"
+        );
+        assert!(
+            *denied.lock().unwrap(),
+            "token must deny unrelated bridge methods"
+        );
         // …and revoked when the Shift ended.
         assert!(tokens.is_empty(), "token should be revoked after the run");
     }

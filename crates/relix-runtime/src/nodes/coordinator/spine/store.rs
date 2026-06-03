@@ -222,9 +222,10 @@ impl SpineStore {
         cents: Option<i64>,
     ) -> Result<(), SpineStoreError> {
         if let Some(c) = cents
-            && c < 0 {
-                return Err(SpineStoreError::BadInput("allowance must be >= 0".into()));
-            }
+            && c < 0
+        {
+            return Err(SpineStoreError::BadInput("allowance must be >= 0".into()));
+        }
         let tenant = normalize_tenant(tenant_id);
         let now = unix_now();
         let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
@@ -456,7 +457,10 @@ impl SpineStore {
             return Ok(Vec::new());
         }
         let tenant = normalize_tenant(tenant);
-        let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let escaped = q
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         let pattern = format!("%{escaped}%");
         let lim = limit.clamp(1, 1000) as i64;
         let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
@@ -745,7 +749,10 @@ impl SpineStore {
             return Ok(Vec::new());
         }
         let tenant = normalize_tenant(tenant);
-        let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let escaped = q
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         let pattern = format!("%{escaped}%");
         let lim = limit.clamp(1, 1000) as i64;
         let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
@@ -1052,12 +1059,18 @@ mod tests {
         // unnamed Guild creates one named after the tenant.
         s.set_guild_allowance("acme", Some(50_000)).unwrap();
         assert_eq!(
-            s.get_guild("acme").unwrap().unwrap().monthly_allowance_cents,
+            s.get_guild("acme")
+                .unwrap()
+                .unwrap()
+                .monthly_allowance_cents,
             Some(50_000)
         );
         s.set_guild_allowance("acme", None).unwrap();
         assert_eq!(
-            s.get_guild("acme").unwrap().unwrap().monthly_allowance_cents,
+            s.get_guild("acme")
+                .unwrap()
+                .unwrap()
+                .monthly_allowance_cents,
             None
         );
         assert!(s.set_guild_allowance("acme", Some(-1)).is_err());
@@ -1151,7 +1164,9 @@ mod tests {
             .create_mandate("acme", "Q2", "", None, Some(&root))
             .unwrap();
         // A grandchild is NOT a direct child of root.
-        let _g = s.create_mandate("acme", "Q1-a", "", None, Some(&c1)).unwrap();
+        let _g = s
+            .create_mandate("acme", "Q1-a", "", None, Some(&c1))
+            .unwrap();
 
         let kids: Vec<String> = s
             .list_child_mandates("acme", &root)
@@ -1179,7 +1194,8 @@ mod tests {
         let _c2 = s
             .create_campaign("acme", "Billing", Some(&m1), None, None)
             .unwrap();
-        s.update_campaign_field(&c1, "status", "in_progress").unwrap();
+        s.update_campaign_field(&c1, "status", "in_progress")
+            .unwrap();
         // A different Guild's spine is counted separately.
         s.create_mandate("other", "X", "", None, None).unwrap();
 
@@ -1204,7 +1220,10 @@ mod tests {
 
         // Propose → proposed, still not approved.
         s.propose_strategy("t", &m, "1. hire 2. build").unwrap();
-        assert_eq!(s.strategy_status("t", &m).unwrap().as_deref(), Some("proposed"));
+        assert_eq!(
+            s.strategy_status("t", &m).unwrap().as_deref(),
+            Some("proposed")
+        );
         assert!(!s.strategy_approved("t", &m).unwrap());
 
         // Approve → the gate opens.
@@ -1217,7 +1236,10 @@ mod tests {
         let m2 = s.create_mandate("t", "Other", "", None, None).unwrap();
         s.propose_strategy("t", &m2, "plan").unwrap();
         s.reject_strategy("t", &m2).unwrap();
-        assert_eq!(s.strategy_status("t", &m2).unwrap().as_deref(), Some("rejected"));
+        assert_eq!(
+            s.strategy_status("t", &m2).unwrap().as_deref(),
+            Some("rejected")
+        );
         assert!(!s.strategy_approved("t", &m2).unwrap());
     }
 
@@ -1282,17 +1304,30 @@ mod tests {
             .create_mandate("t", "Child", "", None, Some(&parent))
             .unwrap();
         assert_eq!(
-            s.get_mandate(&child).unwrap().unwrap().parent_mandate_id.as_deref(),
+            s.get_mandate(&child)
+                .unwrap()
+                .unwrap()
+                .parent_mandate_id
+                .as_deref(),
             Some(parent.as_str())
         );
         // A mandate cannot parent itself.
-        assert!(s.update_mandate_field(&child, "parent_mandate_id", &child).is_err());
+        assert!(
+            s.update_mandate_field(&child, "parent_mandate_id", &child)
+                .is_err()
+        );
         // Making the parent report to the child = a cycle → rejected.
-        assert!(s.update_mandate_field(&parent, "parent_mandate_id", &child).is_err());
+        assert!(
+            s.update_mandate_field(&parent, "parent_mandate_id", &child)
+                .is_err()
+        );
         // Unknown parent → rejected.
         assert!(s.create_mandate("t", "X", "", None, Some("nope")).is_err());
         // Cross-tenant parent → rejected.
-        assert!(s.create_mandate("other", "Y", "", None, Some(&parent)).is_err());
+        assert!(
+            s.create_mandate("other", "Y", "", None, Some(&parent))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1300,7 +1335,13 @@ mod tests {
         let s = store();
         let mandate = s.create_mandate("acme", "G", "", None, None).unwrap();
         let proj = s
-            .create_campaign("acme", "Auth rewrite", Some(&mandate), Some("agt_lead"), None)
+            .create_campaign(
+                "acme",
+                "Auth rewrite",
+                Some(&mandate),
+                Some("agt_lead"),
+                None,
+            )
             .unwrap();
         let p = s.get_campaign(&proj).unwrap().unwrap();
         assert_eq!(p.title, "Auth rewrite");
@@ -1308,7 +1349,10 @@ mod tests {
         assert_eq!(p.lead_agent_id.as_deref(), Some("agt_lead"));
         assert_eq!(p.status, "backlog");
         // A campaign in another tenant cannot link this mandate.
-        assert!(s.create_campaign("other", "P", Some(&mandate), None, None).is_err());
+        assert!(
+            s.create_campaign("other", "P", Some(&mandate), None, None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1333,7 +1377,9 @@ mod tests {
 
         // Campaign mandate-filter.
         let mandate = s.create_mandate("a", "GP", "", None, None).unwrap();
-        let p1 = s.create_campaign("a", "P1", Some(&mandate), None, None).unwrap();
+        let p1 = s
+            .create_campaign("a", "P1", Some(&mandate), None, None)
+            .unwrap();
         s.create_campaign("a", "P2", None, None, None).unwrap();
         let under_mandate = s.list_campaigns("a", Some(&mandate)).unwrap();
         assert_eq!(under_mandate.len(), 1);
