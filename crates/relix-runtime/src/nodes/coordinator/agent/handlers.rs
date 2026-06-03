@@ -179,6 +179,23 @@ pub fn handle_reports(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome
     }
 }
 
+/// `agent.peers` — the Operatives reporting to the same Lead as
+/// `agent_id` (excludes the agent itself). Arg: agent_id. One
+/// agent_id per line; empty for an apex with no Lead.
+pub fn handle_peers(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("agent.peers utf8: {e}")),
+    };
+    if id.is_empty() {
+        return invalid("agent.peers: agent_id required".into());
+    }
+    match store.list_peers(id) {
+        Ok(rows) => HandlerOutcome::Ok(rows.join("\n").into_bytes()),
+        Err(e) => internal(format!("agent.peers: {e}")),
+    }
+}
+
 /// `agent.branch` — every Operative at or below `agent_id` (the
 /// manager's Branch / subtree, excluding the manager itself). The
 /// delegated-authority scope. Arg: agent_id. One agent_id per line.

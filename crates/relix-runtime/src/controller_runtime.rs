@@ -3156,6 +3156,16 @@ pub fn register_agent_capabilities(
     {
         let s = agent_store.clone();
         bridge.register(
+            "agent.peers",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_peers(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
             "agent.branch",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -8877,6 +8887,11 @@ fn register_node_type_handlers(
             (
                 "agent.reports",
                 "Org tree: the Operatives directly reporting to an agent (the Roster children). Arg: agent_id. One agent_id per line.",
+                &["agent", "read"],
+            ),
+            (
+                "agent.peers",
+                "Org tree: the Operatives reporting to the same Lead as an agent (its peers, excluding itself). Arg: agent_id. One agent_id per line; empty for an apex.",
                 &["agent", "read"],
             ),
             (

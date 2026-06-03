@@ -751,6 +751,34 @@ impl AgentStore {
         Ok(rows)
     }
 
+    /// PHASE 2 (org tree): an Operative's **peers** — the other
+    /// Operatives reporting to the same Lead (excludes the agent
+    /// itself). Empty for an apex with no Lead set. The "my team"
+    /// sibling row in the org chart.
+    pub fn list_peers(&self, agent_id: &str) -> Result<Vec<String>, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let boss: Option<String> = conn
+            .query_row(
+                "SELECT reports_to FROM agent_profiles WHERE agent_id=?1",
+                params![agent_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(boss) = boss else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "SELECT agent_id FROM agent_profiles
+             WHERE reports_to = ?1 AND agent_id != ?2
+             ORDER BY created_at ASC",
+        )?;
+        let rows: Vec<String> = stmt
+            .query_map(params![boss, agent_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// PHASE 0 (org tree): every agent at or below `manager_id` —
     /// the manager's *subtree*, as agent_ids (excluding the
     /// manager itself). This is the scope unit for delegated
@@ -2571,6 +2599,34 @@ mod tests {
         );
         // The apex escalates to nobody.
         assert!(s.chain_of_command(&ceo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_peers_returns_same_lead_siblings() {
+        let s = store();
+        let ceo = s
+            .create_agent("CEO", "ceo", "C", "x", "x", "op", "subj-pr0", "high", "default")
+            .unwrap();
+        let a = s
+            .create_agent("A", "eng", "A", "e", "e", "op", "subj-pr1", "low", "default")
+            .unwrap();
+        let b = s
+            .create_agent("B", "eng", "B", "e", "e", "op", "subj-pr2", "low", "default")
+            .unwrap();
+        let c = s
+            .create_agent("C", "eng", "C", "e", "e", "op", "subj-pr3", "low", "default")
+            .unwrap();
+        // a, b, c all report to ceo.
+        for x in [&a, &b, &c] {
+            s.update_agent_field(x, "reports_to", &ceo).unwrap();
+        }
+
+        let peers = s.list_peers(&a).unwrap();
+        assert_eq!(peers.len(), 2);
+        assert!(peers.contains(&b) && peers.contains(&c));
+        assert!(!peers.contains(&a), "excludes self");
+        // The apex has no Lead → no peers.
+        assert!(s.list_peers(&ceo).unwrap().is_empty());
     }
 
     #[test]
