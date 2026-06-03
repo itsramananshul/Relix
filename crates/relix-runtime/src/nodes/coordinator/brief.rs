@@ -82,6 +82,8 @@ pub struct BriefDetail {
     /// Upstream: the parent Briefs that spawned this as a Sub-brief.
     pub parents: Vec<String>,
     pub dossiers: Vec<DossierMeta>,
+    /// The Brief's free-form labels.
+    pub labels: Vec<String>,
     /// True when at least one Snag's blocker isn't `done`.
     pub blocked: bool,
 }

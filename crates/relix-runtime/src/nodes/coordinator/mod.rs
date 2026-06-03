@@ -826,6 +826,7 @@ impl TaskStore {
             blocking: self.list_blocking(task)?,
             parents: self.parent_briefs(task)?,
             dossiers: self.list_dossiers(task)?,
+            labels: self.brief_labels(task)?,
             blocked: self.is_blocked(task)?,
         }))
     }
@@ -10464,6 +10465,7 @@ mod tests {
         s.add_snag(&task, &blocker).unwrap(); // task blocked by blocker
         s.add_snag(&waiter, &task).unwrap(); // waiter blocked by task
         s.add_dossier(&task, "plan", "The Plan", "body").unwrap();
+        s.set_brief_labels(&task, &["bug", "urgent"]).unwrap();
 
         let d = s.brief_detail(&task).unwrap().unwrap();
         assert_eq!(d.fields.assignee_agent_id.as_deref(), Some("agt_a"));
@@ -10472,6 +10474,7 @@ mod tests {
         assert_eq!(d.blocking, vec![waiter]);
         assert!(d.parents.is_empty());
         assert_eq!(d.dossiers.len(), 1);
+        assert_eq!(d.labels, vec!["bug".to_string(), "urgent".to_string()]);
         assert!(d.blocked, "blocker isn't done → task is blocked");
 
         // Unknown Brief → None.
