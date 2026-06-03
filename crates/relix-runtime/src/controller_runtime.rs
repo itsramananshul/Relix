@@ -8684,6 +8684,32 @@ fn register_node_type_handlers(
                 )),
             );
         }
+        {
+            // Structured Rig feed (name + label + governance) for the
+            // agent-config UI to render backend choices.
+            let reg = rig_registry.clone();
+            bridge.register(
+                "rig.describe",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |_ctx: crate::dispatch::InvocationCtx| {
+                        let reg = reg.clone();
+                        async move {
+                            match serde_json::to_vec(&reg.describe()) {
+                                Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                Err(e) => crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                        cause: format!("rig.describe encode: {e}"),
+                                        retry_hint: 1,
+                                        retry_after: None,
+                                    },
+                                ),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
         // PHASE 3 (heartbeat loop): the live dispatch tick. Opt-in
         // via RELIX_HEARTBEAT_ENABLED (off by default so it never
         // surprises an operator). When on, a timer polls the ready

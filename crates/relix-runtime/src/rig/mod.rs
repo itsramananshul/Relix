@@ -110,6 +110,27 @@ pub enum RigGovernance {
     BoxLevel,
 }
 
+impl RigGovernance {
+    /// Stable wire string for manifests / the agent-config UI.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RigGovernance::PerToolCall => "per_tool_call",
+            RigGovernance::BoxLevel => "box_level",
+        }
+    }
+}
+
+/// A registry-level description of one Rig — what the Keys /
+/// agent-config UI needs to let an operator pick a backend, without
+/// reaching into the trait object.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RigInfo {
+    pub name: String,
+    pub display_name: String,
+    /// `per_tool_call` or `box_level` — how deeply Relix governs it.
+    pub governance: String,
+}
+
 /// A **Rig** — a pluggable agent backend. The uniform contract
 /// behind every Operative's "what powers it."
 pub trait Rig: Send + Sync {
@@ -171,6 +192,19 @@ impl RigRegistry {
     /// All registered Rig names, sorted.
     pub fn names(&self) -> Vec<String> {
         self.rigs.keys().cloned().collect()
+    }
+
+    /// Describe every registered Rig (name + label + governance),
+    /// sorted by name — the structured feed for the agent-config UI.
+    pub fn describe(&self) -> Vec<RigInfo> {
+        self.rigs
+            .values()
+            .map(|r| RigInfo {
+                name: r.name().to_string(),
+                display_name: r.display_name().to_string(),
+                governance: r.governance().as_str().to_string(),
+            })
+            .collect()
     }
 
     /// How many Rigs are registered.
@@ -512,5 +546,23 @@ mod tests {
         for name in ["echo", "claude", "codex", "gemini"] {
             assert!(reg.get(name).is_some(), "{name} should be registered");
         }
+    }
+
+    #[test]
+    fn describe_reports_name_label_and_governance_sorted() {
+        let mut reg = RigRegistry::with_builtins();
+        register_cli_rigs(&mut reg);
+        let infos = reg.describe();
+        // One entry per registered Rig, sorted by name (BTreeMap).
+        assert_eq!(infos.len(), reg.len());
+        let names: Vec<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+        // echo is thin (box-level) by default.
+        let echo = infos.iter().find(|i| i.name == "echo").unwrap();
+        assert_eq!(echo.governance, "box_level");
+        // JSON-serialisable for the agent-config UI.
+        assert!(serde_json::to_string(&infos).unwrap().contains("box_level"));
     }
 }
