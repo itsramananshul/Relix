@@ -1720,6 +1720,9 @@ impl TaskStore {
             None,
             Some("companion"),
         )?;
+        // Chronicle the creation distinctly (the activity feed's
+        // first entry), then open it on the board.
+        let _ = self.append_event(&task_id, "brief.created", title.trim());
         // Open it on the board (backlog → todo: ready for dispatch).
         self.set_board_status(&task_id, "todo")?;
         if let Some(a) = assignee.map(str::trim).filter(|s| !s.is_empty()) {
@@ -10141,6 +10144,13 @@ mod tests {
         assert_eq!(bf.board_status, "todo");
         assert_eq!(bf.priority, "normal");
         assert!(bf.assignee_agent_id.is_none());
+
+        // Creation is chronicled (the activity feed's first entry).
+        let created = s
+            .query_events(&bare, 0, 10, Some("brief.created"), EventOrder::Desc)
+            .unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].payload, "Just a title");
 
         // Empty title / bad priority rejected.
         assert!(matches!(
