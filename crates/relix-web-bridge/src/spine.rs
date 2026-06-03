@@ -403,6 +403,35 @@ pub async fn decide_clearance(
     }))
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct TeamPlanRequest {
+    /// Optional plain-text goal/team description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Optional CSV of `role` or `role:subject_id` entries.
+    #[serde(default)]
+    pub roles: Option<String>,
+}
+
+/// `POST /v1/spine/mandates/:id/team_plan` — the Prime team-build
+/// foundation. Body `{ "description"?, "roles"? }` (roles is a CSV of
+/// `role` or `role:subject_id`). Proxies `mandate.team_plan`, which
+/// requires an approved strategy + the actor's spawn Key and returns
+/// the structured JSON plan. Governed, not autonomous.
+pub async fn team_plan(
+    State(state): State<AppState>,
+    Path(mandate_id): Path<String>,
+    Json(req): Json<TeamPlanRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if mandate_id.trim().is_empty() {
+        return Err(bad("mandate_id required"));
+    }
+    let description = req.description.unwrap_or_default();
+    let roles = req.roles.unwrap_or_default();
+    let arg = format!("{}|{description}|{roles}", mandate_id.trim());
+    json_passthrough(call_peer(&state, "mandate.team_plan", arg.as_bytes()).await?)
+}
+
 /// Normalise a Clearance decision into the wire value
 /// `coord.approval.decide` expects. Accepts the product verbs
 /// (`approve`/`reject`) and the raw runtime values
@@ -1015,6 +1044,8 @@ mod tests {
         assert!(SPINE_HTML.contains("/v1/spine/keys/"));
         assert!(SPINE_HTML.contains("/v1/spine/clearances"));
         assert!(SPINE_HTML.contains("/decide"));
+        // Prime team-build action in the Mandate panel.
+        assert!(SPINE_HTML.contains("/team_plan"));
     }
 
     /// Build the full spine route table in isolation: matchit panics
@@ -1036,6 +1067,7 @@ mod tests {
             .route("/v1/spine/mandates/search", get(mandate_search))
             .route("/v1/spine/mandates/:id/tree", get(mandate_tree))
             .route("/v1/spine/mandates/:id/briefs", get(mandate_briefs))
+            .route("/v1/spine/mandates/:id/team_plan", post(team_plan))
             .route("/v1/spine/briefs/search", get(brief_search))
             .route("/v1/spine/briefs/:id", get(brief_detail))
             .route("/v1/spine/briefs/:id/wakeups", get(brief_wakeups))

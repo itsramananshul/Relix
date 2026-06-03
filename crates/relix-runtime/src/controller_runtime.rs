@@ -3145,6 +3145,18 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // PRIME: governed team-build foundation (strategy + spawn Key gated).
+    if let Some(spine) = spine_store.clone() {
+        let s = agent_store.clone();
+        bridge.register(
+            "mandate.team_plan",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let spine = spine.clone();
+                async move { handlers::handle_team_plan(&s, &spine, &ctx) }
+            })),
+        );
+    }
     {
         let s = agent_store.clone();
         bridge.register(
@@ -9079,6 +9091,11 @@ fn register_node_type_handlers(
             (
                 "agent.request_hire_for_mandate",
                 "Strategy-gated hire: mandate_id|name|role|title|department|team|created_by|subject_id|risk_ceiling. Refuses until the Mandate strategy is approved.",
+                &["agent", "persist", "governance"],
+            ),
+            (
+                "mandate.team_plan",
+                "Prime team-build foundation (governed, not autonomous): mandate_id|description?|roles? where roles is a CSV of `role` or `role:subject_id`. Requires approved strategy + the actor's spawn Key. Mints pending hires (with spawn Clearances) for roles given an identity; returns a JSON plan {proposed_roles, pending_hires, clearances, denials, next_steps}.",
                 &["agent", "persist", "governance"],
             ),
             (

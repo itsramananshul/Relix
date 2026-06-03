@@ -175,6 +175,201 @@ pub fn handle_request_hire_for_mandate(
     }
 }
 
+/// `mandate.team_plan` — the **Prime team-build foundation**
+/// (company-model §4.2 / §4.5). NOT an autonomous loop: a single,
+/// governed step that lets a Prime (or the Founder) propose a team for
+/// a strategy-approved Mandate and, where identities are supplied,
+/// mint the (still pending-inert) hires under the spawn Key.
+///
+/// Wire arg: `mandate_id|description|roles` where `roles` is a CSV of
+/// `role` or `role:subject_id` entries. A role with a `subject_id`
+/// becomes a real pending hire (through the spawn gate — so a
+/// lead/founder route mints a spawn Clearance); a bare role is only
+/// *proposed* (no fabricated identity).
+///
+/// Governance:
+/// - the Mandate strategy MUST be approved (else POLICY_DENIED);
+/// - an Operative actor MUST hold the spawn Key (the assign Key is
+///   reported as a readiness flag) — the Founder/Board bypasses.
+///
+/// Returns a stable JSON plan: `mandate_id`, `strategy_approved`,
+/// `actor`, `description`, `proposed_roles`, `pending_hires`,
+/// `clearances`, `denials`, `next_steps`. The plan itself is NOT yet
+/// persisted as a Mandate Dossier — no Mandate-level document object
+/// exists (documented gap); the caller receives the structured plan.
+pub fn handle_team_plan(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("mandate.team_plan utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(3, '|').collect();
+    let mandate_id = parts.first().copied().unwrap_or("").trim();
+    if mandate_id.is_empty() {
+        return invalid("mandate.team_plan: expected `mandate_id|description?|roles?`".into());
+    }
+    let description = parts.get(1).copied().unwrap_or("").trim().to_string();
+    let roles_csv = parts.get(2).copied().unwrap_or("");
+    let tenant = ctx.tenant_id_or_default();
+
+    // Gate 1: the Mandate strategy must be approved.
+    match spine_store.strategy_approved(tenant, mandate_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            return policy_denied(format!(
+                "mandate.team_plan: mandate `{mandate_id}` strategy is not approved"
+            ));
+        }
+        Err(SpineStoreError::BadInput(m)) | Err(SpineStoreError::NotFound(m)) => {
+            return invalid(format!("mandate.team_plan: {m}"));
+        }
+        Err(e) => return internal(format!("mandate.team_plan: {e}")),
+    }
+
+    // Gate 2: the actor's spawn Key (Founder/Board bypasses). This also
+    // resolves the SpawnGate reused for every minted hire.
+    let gate = match enforce_spawn_key(agent_store, ctx) {
+        Ok(g) => g,
+        Err(out) => return out,
+    };
+    let is_operator = caller_is_operator(ctx);
+    let actor_label = if is_operator {
+        "operator".to_string()
+    } else {
+        ctx.caller.subject_id.to_string()
+    };
+    // Readiness flag: can this actor also assign the work it staffs?
+    let can_assign = if is_operator {
+        true
+    } else {
+        agent_store
+            .get_by_subject_for_tenant(&ctx.caller.subject_id.to_string(), tenant)
+            .ok()
+            .flatten()
+            .map(|p| p.can_assign_work)
+            .unwrap_or(false)
+    };
+
+    let mut proposed_roles: Vec<String> = Vec::new();
+    let mut pending_hires: Vec<serde_json::Value> = Vec::new();
+    let mut clearances: Vec<serde_json::Value> = Vec::new();
+    let mut denials: Vec<serde_json::Value> = Vec::new();
+
+    for entry in roles_csv
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        let (role, subject) = match entry.split_once(':') {
+            Some((r, sub)) => (r.trim(), sub.trim()),
+            None => (entry, ""),
+        };
+        if role.is_empty() {
+            continue;
+        }
+        if subject.is_empty() {
+            // No identity supplied → proposed only (never fabricate one).
+            proposed_roles.push(role.to_string());
+            continue;
+        }
+        match agent_store.request_hire(
+            role,
+            role,
+            role,
+            "team",
+            mandate_id,
+            &actor_label,
+            subject,
+            "medium",
+            tenant,
+        ) {
+            Ok(hire_id) => {
+                pending_hires.push(serde_json::json!({
+                    "role": role,
+                    "agent_id": hire_id,
+                    "subject_id": subject,
+                }));
+                if let SpawnGate::Clearance {
+                    reason,
+                    approver_subjects,
+                } = &gate
+                {
+                    match agent_store.create_spawn_clearance(
+                        &hire_id,
+                        subject,
+                        reason,
+                        approver_subjects,
+                        tenant,
+                    ) {
+                        Ok(cid) => clearances.push(serde_json::json!({
+                            "agent_id": hire_id,
+                            "clearance_id": cid,
+                        })),
+                        Err(e) => denials.push(serde_json::json!({
+                            "role": role,
+                            "reason": format!("spawn clearance: {e}"),
+                        })),
+                    }
+                }
+            }
+            Err(AgentStoreError::BadInput(m)) => {
+                denials.push(serde_json::json!({"role": role, "reason": m}));
+            }
+            Err(e) => {
+                denials.push(serde_json::json!({"role": role, "reason": e.to_string()}));
+            }
+        }
+    }
+
+    // Honest next steps reflecting what was actually done.
+    let mut next_steps: Vec<String> = Vec::new();
+    if !clearances.is_empty() {
+        next_steps.push(
+            "Greenlight the spawn Clearances to activate the pending hires (coord.approval.decide / the Desk)."
+                .to_string(),
+        );
+    }
+    if !pending_hires.is_empty() && clearances.is_empty() {
+        next_steps.push(
+            "Approve the pending hires (agent.approve_hire) to bring them active.".to_string(),
+        );
+    }
+    if !proposed_roles.is_empty() {
+        next_steps.push(
+            "Provide a subject_id for each proposed role (role:subject_id) to mint its hire."
+                .to_string(),
+        );
+    }
+    if !can_assign {
+        next_steps.push(
+            "Grant this actor can_assign_work to delegate Briefs to the new team.".to_string(),
+        );
+    }
+    if next_steps.is_empty() {
+        next_steps
+            .push("Create Briefs under this Mandate and assign them to the team.".to_string());
+    }
+
+    let plan = serde_json::json!({
+        "mandate_id": mandate_id,
+        "strategy_approved": true,
+        "actor": actor_label,
+        "description": description,
+        "proposed_roles": proposed_roles,
+        "pending_hires": pending_hires,
+        "clearances": clearances,
+        "denials": denials,
+        "next_steps": next_steps,
+    });
+    match serde_json::to_vec(&plan) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => internal(format!("mandate.team_plan encode: {e}")),
+    }
+}
+
 /// `brief.clearance_request` — create a real pending Clearance
 /// linked to a Brief. Arg:
 /// `brief_id|agent_id|method|category|reason|ttl_secs?`.
@@ -1678,6 +1873,138 @@ mod tests {
                 .iter()
                 .any(|r| r.method == SPAWN_CLEARANCE_METHOD && r.agent_id == hire_id),
             "strategy-approved founder-route mandate hire must mint a spawn Clearance"
+        );
+    }
+
+    // ── Prime team-build foundation (mandate.team_plan) ──────
+
+    fn approved_mandate(spine: &SpineStore) -> String {
+        let m = spine
+            .create_mandate("default", "Ship v1", "real product", None, None)
+            .unwrap();
+        spine
+            .propose_strategy("default", &m, "build a team")
+            .unwrap();
+        spine.approve_strategy("default", &m).unwrap();
+        m
+    }
+
+    #[test]
+    fn team_plan_refuses_unapproved_strategy() {
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = spine
+            .create_mandate("default", "Ship v1", "real product", None, None)
+            .unwrap();
+        let arg = format!("{m}|grow|planner");
+        let out = handle_team_plan(&agents, &spine, &fake_ctx(arg.as_bytes()));
+        assert_eq!(err_kind(out), error_kinds::POLICY_DENIED);
+    }
+
+    #[test]
+    fn team_plan_refuses_actor_without_spawn_key() {
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        // Agent actor that exists but lacks can_spawn_agents.
+        agents
+            .create_agent(
+                "Prime",
+                "prime",
+                "L",
+                "ops",
+                "ops",
+                "founder",
+                &subject_of(b"planner-seed"),
+                "medium",
+                "default",
+            )
+            .unwrap();
+        let arg = format!("{m}|grow|planner");
+        let out = handle_team_plan(
+            &agents,
+            &spine,
+            &fake_ctx_with_role(arg.as_bytes(), "prime", b"planner-seed"),
+        );
+        assert_eq!(err_kind(out), error_kinds::POLICY_DENIED);
+    }
+
+    #[test]
+    fn team_plan_operator_proposes_roles_and_mints_identified_hires() {
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        // Founder/operator path: one bare role (proposed) + one with a
+        // subject_id (minted as a pending hire).
+        let arg = format!("{m}|grow the team|planner,engineer:subj-eng");
+        let body = ok_body(handle_team_plan(&agents, &spine, &fake_ctx(arg.as_bytes())));
+        let v: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
+        // Stable JSON shape.
+        assert_eq!(v["mandate_id"], m);
+        assert_eq!(v["strategy_approved"], true);
+        assert_eq!(v["actor"], "operator");
+        assert_eq!(v["description"], "grow the team");
+        assert_eq!(v["proposed_roles"], serde_json::json!(["planner"]));
+        let hires = v["pending_hires"].as_array().unwrap();
+        assert_eq!(hires.len(), 1);
+        assert_eq!(hires[0]["role"], "engineer");
+        assert_eq!(hires[0]["subject_id"], "subj-eng");
+        // Operator path mints no spawn Clearance (hires await approve_hire).
+        assert!(v["clearances"].as_array().unwrap().is_empty());
+        // The minted hire is real + pending-inert.
+        let hire_id = hires[0]["agent_id"].as_str().unwrap();
+        assert_eq!(
+            agents.get_agent(hire_id).unwrap().unwrap().status,
+            "pending"
+        );
+        assert!(v["next_steps"].as_array().unwrap().iter().count() >= 1);
+    }
+
+    #[test]
+    fn team_plan_founder_route_actor_mints_hire_with_spawn_clearance() {
+        use crate::nodes::coordinator::agent::store::SPAWN_CLEARANCE_METHOD;
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        let actor = agents
+            .create_agent(
+                "Prime",
+                "prime",
+                "L",
+                "ops",
+                "ops",
+                "founder",
+                &subject_of(b"planner-seed"),
+                "medium",
+                "default",
+            )
+            .unwrap();
+        agents
+            .update_agent_field(&actor, "can_spawn_agents", "true")
+            .unwrap();
+        // spawn_route stays 'founder' → identified hires get a Clearance.
+        let arg = format!("{m}|build|engineer:subj-eng");
+        let body = ok_body(handle_team_plan(
+            &agents,
+            &spine,
+            &fake_ctx_with_role(arg.as_bytes(), "prime", b"planner-seed"),
+        ));
+        let v: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
+        let hire_id = v["pending_hires"][0]["agent_id"].as_str().unwrap();
+        let clearances = v["clearances"].as_array().unwrap();
+        assert_eq!(
+            clearances.len(),
+            1,
+            "founder route must mint a spawn Clearance"
+        );
+        assert_eq!(clearances[0]["agent_id"], hire_id);
+        // And the Clearance is a real pending approval tied to the hire.
+        assert!(
+            agents
+                .list_pending_approvals(100)
+                .unwrap()
+                .iter()
+                .any(|r| r.method == SPAWN_CLEARANCE_METHOD && r.agent_id == hire_id)
         );
     }
 

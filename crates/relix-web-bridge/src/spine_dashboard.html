@@ -562,7 +562,29 @@ async function openMandate(id) {
     if (!(t.campaigns || []).length) campaigns.append(node("div",{className:"muted",textContent:"None"}));
     (t.campaigns || []).forEach(c => campaigns.append(node("div",{className:"event"},[node("strong",{textContent:c.title}), node("div",{className:"muted",textContent:(c.status || "")+" / "+(c.lead_agent_id || "no lead")})])));
     side.append(campaigns);
+    side.append(teamPlanBlock(id));
   } catch(e) { side.innerHTML = '<div class="err">'+e.message+'</div>'; }
+}
+function teamPlanBlock(mandateId) {
+  // Prime team-build foundation (governed): requires an approved
+  // strategy + the actor's spawn Key. Roles is a CSV of `role` or
+  // `role:subject_id`; only identified roles mint a pending hire.
+  const block = node("div",{className:"prop"},[node("div",{className:"label",textContent:"Plan team"})]);
+  const desc = node("input",{placeholder:"goal / team description"});
+  const roles = node("input",{placeholder:"roles e.g. planner,engineer:subj-eng"});
+  const out = node("div",{className:"event muted",textContent:"Strategy must be approved; you need the spawn Key."});
+  block.append(desc, roles, node("button",{style:"margin-top:6px",textContent:"Plan team",onclick:async()=>{
+    out.textContent = "planning..."; out.className = "event muted";
+    try {
+      const r = await post("/v1/spine/mandates/"+encodeURIComponent(mandateId)+"/team_plan", {description:desc.value, roles:roles.value});
+      out.className = "event"; out.textContent = "";
+      out.append(node("div",{textContent:"Proposed: "+((r.proposed_roles||[]).join(", ") || "none")}));
+      out.append(node("div",{textContent:"Pending hires: "+(r.pending_hires||[]).map(h=>h.role+"/"+h.agent_id).join(", ") || "none"}));
+      out.append(node("div",{textContent:"Clearances: "+(r.clearances||[]).map(c=>c.clearance_id).join(", ") || "none"}));
+      (r.next_steps||[]).forEach(s => out.append(node("div",{className:"muted",textContent:"→ "+s})));
+    } catch(e) { out.className = "event err"; out.textContent = e.message; }
+  }}), out);
+  return block;
 }
 function fieldSelect(id, label, value, opts, save) {
   const sel = node("select"); opts.forEach(o => sel.append(node("option",{value:o,textContent:o,selected:o===value})));
