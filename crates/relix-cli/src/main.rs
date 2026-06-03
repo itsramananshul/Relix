@@ -18,6 +18,7 @@ mod belief;
 mod bridge_token;
 mod browser;
 mod build;
+mod call;
 mod capability;
 mod confidence;
 mod config;
@@ -118,6 +119,10 @@ enum Cmd {
         #[command(subcommand)]
         cmd: capability::Cmd,
     },
+    /// Invoke ANY capability by wire name with a verbatim argument
+    /// string (the operator escape hatch for capabilities without a
+    /// bespoke subcommand — `brief.*`, `mandate.*`, `agent.*`, …).
+    Call(call::CallArgs),
     /// Inspect the mesh topology via the bridge.
     ///
     /// Hits the bridge's `GET /v1/topology` endpoint and prints
@@ -562,6 +567,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Identity { cmd } => identity::run(cmd).await,
         Cmd::Task { cmd } => task::run(cmd).await,
         Cmd::Capability { cmd } => capability::run(cmd).await,
+        Cmd::Call(args) => call::run(args).await,
         Cmd::Topology { cmd } => topology::run(cmd).await,
         Cmd::Ops { cmd } => ops::run(cmd).await,
         Cmd::Email { cmd } => email::run(cmd).await,
