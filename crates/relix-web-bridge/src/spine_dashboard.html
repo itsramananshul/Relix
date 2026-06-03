@@ -192,7 +192,10 @@ async function openBrief(id) {
     const d = await api("/v1/spine/briefs/"+encodeURIComponent(id));
     const f = d.fields||{};
     body.innerHTML = "";
-    body.append(el("h3",{textContent:f.task_id||id}));
+    // §1.2: show the human identifier (REL-N) as the product-facing
+    // id; fall back to the internal task id when absent.
+    body.append(el("h3",{textContent: f.human_ref || f.task_id || id}));
+    if (f.human_ref) body.append(el("div",{className:"muted", style:"font-family:monospace;font-size:11px", textContent:f.task_id||id}));
     body.append(el("div",{className:"muted", textContent:(f.board_status||"")+" · "+(f.priority||"")}));
     const move = el("div",{className:"row"});
     move.append(el("div",{className:"lbl",textContent:"Move to"}));
