@@ -10,8 +10,8 @@
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::{header, StatusCode},
-    response::Response,
+    http::{header, HeaderName, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,49 @@ use crate::config::AppState;
 
 /// The coordinator's mesh alias (same as the `agent.*` routes).
 const DEFAULT_PEER: &str = "coordinator";
+
+/// The self-contained spine board page (inline HTML/JS/CSS, no
+/// bundler / CDN — baked into the binary, same convention as
+/// `/dashboard`). It fetches the `/v1/spine/*` routes below.
+const SPINE_HTML: &str = include_str!("spine_dashboard.html");
+
+/// Per-route CSP allowing the page's inline `<script>`/`<style>`,
+/// same as `/dashboard`. `connect-src 'self'` lets it call the
+/// same-origin `/v1/spine/*` API; every other route keeps the
+/// strict default CSP.
+const SPINE_CSP: &str = "default-src 'self'; \
+                         script-src 'self' 'unsafe-inline'; \
+                         style-src 'self' 'unsafe-inline'; \
+                         img-src 'self' data:; \
+                         connect-src 'self'";
+
+/// `GET /spine` — the product-spine board page.
+pub async fn page() -> Response {
+    let xcto = HeaderName::from_static("x-content-type-options");
+    match Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "public, max-age=300")
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(SPINE_CSP),
+        )
+        .header(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"))
+        .header(xcto, HeaderValue::from_static("nosniff"))
+        .header(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        )
+        .body(SPINE_HTML.to_string())
+    {
+        Ok(r) => r.into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "spine page builder failed",
+        )
+            .into_response(),
+    }
+}
 
 #[derive(Debug, Serialize)]
 pub struct ApiError {
@@ -441,6 +484,34 @@ mod tests {
         assert_eq!(body.0.error, "q required");
     }
 
+    #[tokio::test]
+    async fn spine_page_is_html_with_inline_csp() {
+        let resp = page().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ctype = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ctype.starts_with("text/html"), "ctype was {ctype:?}");
+        let csp = resp
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(csp.contains("script-src 'self' 'unsafe-inline'"), "csp: {csp:?}");
+        assert!(csp.contains("connect-src 'self'"), "csp: {csp:?}");
+    }
+
+    #[test]
+    fn spine_page_html_references_the_api() {
+        // The baked page must actually call the spine API it depends
+        // on — a cheap guard against the HTML drifting from the routes.
+        assert!(SPINE_HTML.contains("/v1/spine/board"));
+        assert!(SPINE_HTML.contains("/v1/spine/briefs"));
+        assert!(SPINE_HTML.contains("/v1/spine/guild"));
+    }
+
     /// Build the full spine route table in isolation: matchit panics
     /// at `.route()` time on an overlapping/ambiguous pattern, so a
     /// clean construction here proves the routes are valid (the full
@@ -449,6 +520,7 @@ mod tests {
     fn spine_routes_construct_without_conflict() {
         use axum::routing::{get, post};
         let _router: axum::Router<crate::config::AppState> = axum::Router::new()
+            .route("/spine", get(page))
             .route("/v1/spine/guild", get(guild_counts))
             .route("/v1/spine/board", get(board_summary))
             .route("/v1/spine/board/:column", get(board_column))

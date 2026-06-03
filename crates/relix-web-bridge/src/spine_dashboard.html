@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Relix — Spine</title>
+<style>
+  :root { --fg:#111; --bg:#fff; --mut:#666; --line:#e3e3e3; --chip:#f4f4f4; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:var(--fg); background:var(--bg); }
+  header { display:flex; align-items:baseline; gap:18px; padding:16px 22px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; font-weight:600; letter-spacing:.02em; margin:0; }
+  .counts { display:flex; gap:14px; color:var(--mut); font-size:12px; }
+  .counts b { color:var(--fg); font-weight:600; }
+  main { padding:18px 22px; }
+  .toolbar { display:flex; gap:8px; margin-bottom:16px; flex-wrap:wrap; }
+  input, select, button, textarea { font:inherit; color:var(--fg); background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:7px 10px; }
+  button { cursor:pointer; background:var(--fg); color:var(--bg); border-color:var(--fg); }
+  button.ghost { background:var(--bg); color:var(--fg); }
+  button:active { transform:translateY(1px); }
+  .board { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(220px,1fr); gap:14px; overflow-x:auto; }
+  .col h2 { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--mut); margin:0 0 8px; display:flex; justify-content:space-between; }
+  .card { border:1px solid var(--line); border-radius:8px; padding:10px 11px; margin-bottom:8px; cursor:pointer; transition:border-color .12s; }
+  .card:hover { border-color:var(--fg); }
+  .card .t { font-weight:500; }
+  .card .m { margin-top:5px; display:flex; gap:6px; flex-wrap:wrap; }
+  .pill { font-size:10px; padding:1px 7px; border-radius:999px; background:var(--chip); color:var(--mut); }
+  .pill.pri-urgent { background:#111; color:#fff; }
+  .pill.pri-high { background:#444; color:#fff; }
+  .empty { color:var(--mut); font-size:12px; padding:6px 2px; }
+  #panel { position:fixed; top:0; right:0; height:100%; width:360px; max-width:90vw; background:var(--bg); border-left:1px solid var(--line); box-shadow:-12px 0 30px rgba(0,0,0,.06); transform:translateX(100%); transition:transform .18s ease; padding:18px 20px; overflow:auto; }
+  #panel.open { transform:translateX(0); }
+  #panel h3 { margin:0 0 4px; font-size:15px; }
+  #panel .row { margin:12px 0; }
+  #panel .lbl { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); margin-bottom:4px; }
+  #panel ul { margin:4px 0; padding-left:18px; }
+  #panel .close { position:absolute; top:14px; right:16px; border:none; background:none; color:var(--mut); font-size:20px; padding:0; }
+  .err { color:#b00; font-size:12px; }
+  .muted { color:var(--mut); }
+  dialog { border:1px solid var(--line); border-radius:10px; padding:18px; width:340px; }
+  dialog .grid { display:grid; gap:8px; }
+  label { font-size:12px; color:var(--mut); }
+</style>
+</head>
+<body>
+<header>
+  <h1>RELIX · Spine</h1>
+  <div class="counts" id="counts"><span class="muted">loading…</span></div>
+</header>
+<main>
+  <div class="toolbar">
+    <button id="newBrief">+ Brief</button>
+    <button class="ghost" id="refresh">Refresh</button>
+    <input id="search" placeholder="Search briefs…" />
+    <button class="ghost" id="overdueBtn">Overdue</button>
+  </div>
+  <div class="board" id="board"></div>
+</main>
+
+<aside id="panel"><button class="close" id="panelClose">×</button><div id="panelBody"></div></aside>
+
+<dialog id="newDlg">
+  <form method="dialog" class="grid" id="newForm">
+    <strong>New Brief</strong>
+    <label>Title <input name="title" required /></label>
+    <label>Assignee <input name="assignee" placeholder="agent id (optional)" /></label>
+    <label>Mandate <input name="mandate" placeholder="mandate id (optional)" /></label>
+    <label>Priority
+      <select name="priority">
+        <option value="normal">normal</option>
+        <option value="low">low</option>
+        <option value="high">high</option>
+        <option value="urgent">urgent</option>
+      </select>
+    </label>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px">
+      <button class="ghost" value="cancel">Cancel</button>
+      <button value="ok">Create</button>
+    </div>
+    <div class="err" id="newErr"></div>
+  </form>
+</dialog>
+
+<script>
+const COLUMNS = ["backlog","todo","in_progress","in_review","blocked","done"];
+const $ = (s, r=document) => r.querySelector(s);
+const el = (t, props={}, kids=[]) => { const n=document.createElement(t); Object.assign(n, props); for(const k of [].concat(kids)) n.append(k); return n; };
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const txt = await r.text();
+  if (!r.ok) throw new Error(txt || (r.status+""));
+  return txt ? JSON.parse(txt) : null;
+}
+
+async function loadCounts() {
+  const c = $("#counts");
+  try {
+    const [guild, board, roster] = await Promise.all([
+      api("/v1/spine/guild").catch(()=>({})),
+      api("/v1/spine/board").catch(()=>({})),
+      api("/v1/spine/roster").catch(()=>({})),
+    ]);
+    c.innerHTML = "";
+    c.append(
+      el("span",{},[ "Mandates ", el("b",{textContent:(guild.mandates_total??0)+""}) ]),
+      el("span",{},[ "Campaigns ", el("b",{textContent:(guild.campaigns_total??0)+""}) ]),
+      el("span",{},[ "Briefs ", el("b",{textContent:(board.total??0)+""}) ]),
+      el("span",{},[ "Operatives ", el("b",{textContent:(roster.total??0)+""}) ]),
+    );
+  } catch(e) { c.innerHTML = '<span class="err">'+e.message+'</span>'; }
+}
+
+function card(b) {
+  const c = el("div",{className:"card", onclick:()=>openBrief(b.task_id)});
+  c.append(el("div",{className:"t", textContent:b.title || b.task_id}));
+  const meta = el("div",{className:"m"});
+  if (b.priority && b.priority!=="normal") meta.append(el("span",{className:"pill pri-"+b.priority, textContent:b.priority}));
+  if (b.assignee_agent_id) meta.append(el("span",{className:"pill", textContent:"@"+b.assignee_agent_id.slice(0,8)}));
+  c.append(meta);
+  return c;
+}
+
+async function loadBoard() {
+  const board = $("#board"); board.innerHTML = "";
+  for (const col of COLUMNS) {
+    const wrap = el("div",{className:"col"});
+    const head = el("h2",{},[ el("span",{textContent:col.replace("_"," ")}) ]);
+    const count = el("span",{textContent:"…"}); head.append(count);
+    wrap.append(head);
+    board.append(wrap);
+    api("/v1/spine/board/"+encodeURIComponent(col)+"?limit=100").then(rows=>{
+      rows = rows||[]; count.textContent = rows.length+"";
+      if (!rows.length) wrap.append(el("div",{className:"empty", textContent:"—"}));
+      for (const b of rows) wrap.append(card(b));
+    }).catch(e=>wrap.append(el("div",{className:"err", textContent:e.message})));
+  }
+}
+
+async function openBrief(id) {
+  const p = $("#panel"), body = $("#panelBody");
+  body.innerHTML = '<div class="muted">loading…</div>'; p.classList.add("open");
+  try {
+    const d = await api("/v1/spine/briefs/"+encodeURIComponent(id));
+    const f = d.fields||{};
+    body.innerHTML = "";
+    body.append(el("h3",{textContent:f.task_id||id}));
+    body.append(el("div",{className:"muted", textContent:(f.board_status||"")+" · "+(f.priority||"")}));
+    const move = el("div",{className:"row"});
+    move.append(el("div",{className:"lbl",textContent:"Move to"}));
+    const sel = el("select"); for (const col of COLUMNS) sel.append(el("option",{value:col,textContent:col,selected:col===f.board_status}));
+    const mv = el("button",{textContent:"Move", onclick:async()=>{
+      try { await api("/v1/spine/briefs/"+id+"/move",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({status:sel.value})}); openBrief(id); loadBoard(); }
+      catch(e){ alert(e.message); }
+    }});
+    const pin = el("button",{className:"ghost",textContent:d.pinned?"Unpin":"Pin", onclick:async()=>{
+      try { await api("/v1/spine/briefs/"+id+"/pin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pinned:!d.pinned})}); openBrief(id); loadBoard(); }
+      catch(e){ alert(e.message); }
+    }});
+    move.append(sel," ",mv," ",pin); body.append(move);
+    const sect = (label, items) => { if(!items||!items.length) return; const r=el("div",{className:"row"}); r.append(el("div",{className:"lbl",textContent:label})); const ul=el("ul"); for(const i of items) ul.append(el("li",{textContent:i})); r.append(ul); body.append(r); };
+    sect("Labels", d.labels);
+    sect("Sub-briefs", d.subbriefs);
+    sect("Snags (blocked by)", d.snags);
+    sect("Blocking", d.blocking);
+    if (d.dossiers && d.dossiers.length) sect("Dossiers", d.dossiers.map(x=>"["+x.kind+"] "+x.title));
+    if (d.blocked) body.append(el("div",{className:"err",textContent:"⚠ blocked"}));
+    const cr = el("div",{className:"row"});
+    cr.append(el("div",{className:"lbl",textContent:"Comment"}));
+    const ta = el("textarea",{rows:2,style:"width:100%"});
+    const send = el("button",{textContent:"Post", onclick:async()=>{
+      if(!ta.value.trim()) return;
+      try { await api("/v1/spine/briefs/"+id+"/comment",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({author:"operator",text:ta.value})}); ta.value=""; }
+      catch(e){ alert(e.message); }
+    }});
+    cr.append(ta, send); body.append(cr);
+  } catch(e) { body.innerHTML = '<div class="err">'+e.message+'</div>'; }
+}
+
+async function showList(title, rows) {
+  const p=$("#panel"), body=$("#panelBody"); p.classList.add("open"); body.innerHTML="";
+  body.append(el("h3",{textContent:title}));
+  if(!rows||!rows.length){ body.append(el("div",{className:"muted",textContent:"none"})); return; }
+  for(const b of rows){ const c=card(b); body.append(c); }
+}
+
+$("#refresh").onclick = ()=>{ loadCounts(); loadBoard(); };
+$("#panelClose").onclick = ()=>$("#panel").classList.remove("open");
+$("#overdueBtn").onclick = async()=>{ try { showList("Overdue", await api("/v1/spine/overdue")); } catch(e){ alert(e.message); } };
+$("#search").addEventListener("keydown", async e=>{ if(e.key==="Enter" && e.target.value.trim()){ try { showList("Search: "+e.target.value, await api("/v1/spine/briefs/search?q="+encodeURIComponent(e.target.value))); } catch(err){ alert(err.message); } } });
+$("#newBrief").onclick = ()=>$("#newDlg").showModal();
+$("#newForm").addEventListener("submit", async e=>{
+  if (e.submitter && e.submitter.value === "cancel") return;
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const payload = { title:fd.get("title"), assignee:fd.get("assignee")||null, mandate:fd.get("mandate")||null, priority:fd.get("priority") };
+  try { await api("/v1/spine/briefs",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(payload)}); $("#newDlg").close(); e.target.reset(); loadCounts(); loadBoard(); }
+  catch(err){ $("#newErr").textContent = err.message; }
+});
+
+loadCounts(); loadBoard();
+</script>
+</body>
+</html>

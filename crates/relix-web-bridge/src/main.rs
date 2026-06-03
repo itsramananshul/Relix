@@ -487,7 +487,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/chat/completions", post(openai::chat_completions))
         // Task-native read API (Track 2). Bridge stays translation-only:
         // each route is a thin forwarder to a Coordinator capability.
-        // Product-spine dashboard read surface.
+        // Product-spine board page + read surface.
+        .route("/spine", get(spine::page))
         .route("/v1/spine/guild", get(spine::guild_counts))
         .route("/v1/spine/board", get(spine::board_summary))
         .route("/v1/spine/board/:column", get(spine::board_column))
