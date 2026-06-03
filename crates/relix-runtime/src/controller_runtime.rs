@@ -3122,6 +3122,37 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // PHASE 4 (hire flow): the gated creation path (pending → approve).
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.request_hire",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_request_hire(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.approve_hire",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_approve_hire(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.reject_hire",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_reject_hire(&s, &ctx) }
+            })),
+        );
+    }
     {
         let s = agent_store.clone();
         bridge.register(
@@ -8891,8 +8922,23 @@ fn register_node_type_handlers(
         let agent_caps: &[(&str, &str, &[&str])] = &[
             (
                 "agent.create",
-                "Create an agent profile. Arg: name|role|title|department|team|created_by|subject_id|risk_ceiling.",
+                "Create an agent profile (active immediately — the direct/admin path). Arg: name|role|title|department|team|created_by|subject_id|risk_ceiling.",
                 &["agent", "persist"],
+            ),
+            (
+                "agent.request_hire",
+                "Gated creation: mint an Operative `pending` (inert until approved). Same arg shape as agent.create. Returns the new agent_id.",
+                &["agent", "persist"],
+            ),
+            (
+                "agent.approve_hire",
+                "Approve a pending hire (pending → active). Arg: agent_id.",
+                &["agent", "mutate"],
+            ),
+            (
+                "agent.reject_hire",
+                "Reject a pending hire (pending → disabled, terminal). Arg: agent_id.",
+                &["agent", "mutate"],
             ),
             ("agent.get", "Read one agent profile.", &["agent", "read"]),
             (

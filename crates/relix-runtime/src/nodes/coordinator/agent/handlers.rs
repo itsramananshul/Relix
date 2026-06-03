@@ -47,6 +47,73 @@ pub fn handle_create(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome 
     }
 }
 
+/// `agent.request_hire` — the **gated** creation path (company-model
+/// §4.4 / §5.5): mints the Operative `pending` (inert — the gate
+/// denies non-active) so a Lead/Founder must approve it before it can
+/// run, be assigned, or hold Keys. Same arg shape as `agent.create`.
+/// Returns the new agent_id.
+pub fn handle_request_hire(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("agent.request_hire utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(8, '|').collect();
+    if parts.len() != 8 {
+        return invalid(
+            "agent.request_hire: expected `name|role|title|department|team|created_by|subject_id|risk_ceiling`".into(),
+        );
+    }
+    match store.request_hire(
+        parts[0],
+        parts[1],
+        parts[2],
+        parts[3],
+        parts[4],
+        parts[5],
+        parts[6],
+        parts[7],
+        ctx.tenant_id_or_default(),
+    ) {
+        Ok(id) => HandlerOutcome::Ok(format!("{id}\n").into_bytes()),
+        Err(AgentStoreError::BadInput(m)) => invalid(m),
+        Err(e) => internal(format!("agent.request_hire: {e}")),
+    }
+}
+
+/// `agent.approve_hire` — approve a pending hire (pending → active).
+/// Arg: agent_id.
+pub fn handle_approve_hire(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("agent.approve_hire utf8: {e}")),
+    };
+    if id.is_empty() {
+        return invalid("agent.approve_hire: agent_id required".into());
+    }
+    match store.approve_hire(id) {
+        Ok(()) => HandlerOutcome::Ok(b"approved\n".to_vec()),
+        Err(AgentStoreError::NotFound(m)) => invalid(format!("agent.approve_hire: not pending: {m}")),
+        Err(e) => internal(format!("agent.approve_hire: {e}")),
+    }
+}
+
+/// `agent.reject_hire` — reject a pending hire (pending → disabled,
+/// terminal). Arg: agent_id.
+pub fn handle_reject_hire(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("agent.reject_hire utf8: {e}")),
+    };
+    if id.is_empty() {
+        return invalid("agent.reject_hire: agent_id required".into());
+    }
+    match store.reject_hire(id) {
+        Ok(()) => HandlerOutcome::Ok(b"rejected\n".to_vec()),
+        Err(AgentStoreError::NotFound(m)) => invalid(format!("agent.reject_hire: not pending: {m}")),
+        Err(e) => internal(format!("agent.reject_hire: {e}")),
+    }
+}
+
 // ── agent.get ────────────────────────────────────────────
 
 pub fn handle_get(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
