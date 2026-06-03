@@ -715,6 +715,40 @@ impl TaskStore {
                 return Err(CoordinatorError::NotFound(id.to_string()));
             }
         }
+        // Cycle guard: adding `task_id --edge--> related` would close a
+        // loop if `related` can already reach `task_id` by following
+        // the SAME edge type. (e.g. A blocked_on B blocked_on A, or a
+        // Sub-brief spawning back into an ancestor.) BFS from `related`
+        // with a visited set + hard node cap so a pre-existing corrupt
+        // cycle can't spin forever. Per relix-execution-and-issue-design
+        // §1.6: "self-blocks and cycles are rejected."
+        {
+            const MAX_NODES: usize = 10_000;
+            let mut stack = vec![related.to_string()];
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT related_task_id FROM task_edges
+                     WHERE task_id = ?1 AND edge_type = ?2 AND related_task_id IS NOT NULL",
+                )
+                .map_err(CoordinatorError::Db)?;
+            while let Some(node) = stack.pop() {
+                if node == task_id {
+                    return Err(CoordinatorError::Invalid(format!(
+                        "{label} would create a cycle"
+                    )));
+                }
+                if !seen.insert(node.clone()) || seen.len() > MAX_NODES {
+                    continue;
+                }
+                let next: Vec<String> = stmt
+                    .query_map(params![node, edge_type], |r| r.get::<_, String>(0))
+                    .map_err(CoordinatorError::Db)?
+                    .collect::<rusqlite::Result<_>>()
+                    .map_err(CoordinatorError::Db)?;
+                stack.extend(next);
+            }
+        }
         let already = match conn.query_row(
             "SELECT 1 FROM task_edges
              WHERE task_id = ?1 AND edge_type = ?2 AND related_task_id = ?3 LIMIT 1",
@@ -11049,6 +11083,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn brief_edges_reject_cycles() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        let a = mk("a");
+        let b = mk("b");
+        let c = mk("c");
+
+        // Snag cycle: a blocked_on b, b blocked_on c, then c blocked_on a → reject.
+        s.add_snag(&a, &b).unwrap();
+        s.add_snag(&b, &c).unwrap();
+        assert!(matches!(
+            s.add_snag(&c, &a),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        // Direct 2-cycle also rejected.
+        assert!(matches!(
+            s.add_snag(&b, &a),
+            Err(CoordinatorError::Invalid(_))
+        ));
+
+        // Sub-brief cycle: a spawned b, then b spawned a → reject.
+        let p = mk("p");
+        let q = mk("q");
+        s.link_subbrief(&p, &q).unwrap();
+        assert!(matches!(
+            s.link_subbrief(&q, &p),
+            Err(CoordinatorError::Invalid(_))
+        ));
     }
 
     #[test]
