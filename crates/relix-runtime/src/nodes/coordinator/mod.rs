@@ -1004,6 +1004,33 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// PHASE 5 (org load): an Operative's workload — their in-flight
+    /// Brief counts by board column (todo/in_progress/in_review/
+    /// blocked). The load signal behind the org chart — who's
+    /// overloaded, who's free for the next assignment.
+    pub fn assignee_board_counts(
+        &self,
+        assignee: &str,
+    ) -> Result<Vec<(String, i64)>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT board_status, COUNT(*) FROM tasks
+                 WHERE assignee_agent_id = ?1
+                   AND board_status IN ('todo','in_progress','in_review','blocked')
+                 GROUP BY board_status ORDER BY board_status",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![assignee], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// PHASE 2 (Desk): Briefs that are blocked right now — in a live
     /// column with at least one unresolved Snag (a blocker not yet
     /// `done`). The "blocked work" the Desk surfaces. Newest first.
@@ -5416,6 +5443,17 @@ pub fn register(
             })),
         );
     }
+    // PHASE 5 (org load): an Operative's workload counts.
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.workload",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_workload(&s, &ctx) }
+            })),
+        );
+    }
     {
         let s = store.clone();
         bridge.register(
@@ -6444,6 +6482,20 @@ fn handle_brief_blocked_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerO
             Err(e) => internal(format!("brief.blocked_list encode: {e}")),
         },
         Err(e) => map_edge_err("brief.blocked_list", e),
+    }
+}
+
+/// `brief.workload` — an Operative's in-flight Brief counts by
+/// board column (+ `total`). Arg `assignee`. The load signal for
+/// the org chart.
+fn handle_brief_workload(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let assignee = match single_id(ctx, "brief.workload") {
+        Ok(a) => a,
+        Err(o) => return o,
+    };
+    match store.assignee_board_counts(assignee) {
+        Ok(counts) => counts_to_json(counts),
+        Err(e) => map_edge_err("brief.workload", e),
     }
 }
 
@@ -9474,6 +9526,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload, "todo -> in_progress");
+    }
+
+    #[test]
+    fn assignee_board_counts_report_workload_by_column() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        // agt_a: two in_progress, one in_review; a done one is excluded.
+        for t in ["p1", "p2"] {
+            let id = mk(t);
+            s.set_brief_field(&id, "assignee", "agt_a").unwrap();
+            s.set_board_status(&id, "todo").unwrap();
+            s.set_board_status(&id, "in_progress").unwrap();
+        }
+        let r = mk("r1");
+        s.set_brief_field(&r, "assignee", "agt_a").unwrap();
+        s.set_board_status(&r, "todo").unwrap();
+        s.set_board_status(&r, "in_progress").unwrap();
+        s.set_board_status(&r, "in_review").unwrap();
+
+        let d = mk("d1");
+        s.set_brief_field(&d, "assignee", "agt_a").unwrap();
+        s.set_board_status(&d, "todo").unwrap();
+        s.set_board_status(&d, "in_progress").unwrap();
+        s.set_board_status(&d, "in_review").unwrap();
+        s.set_board_status(&d, "done").unwrap();
+
+        let map: std::collections::HashMap<String, i64> = s
+            .assignee_board_counts("agt_a")
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(map.get("in_progress"), Some(&2));
+        assert_eq!(map.get("in_review"), Some(&1));
+        assert_eq!(map.get("done"), None); // excluded
+        assert_eq!(map.values().sum::<i64>(), 3);
+        // An assignee with no work has an empty workload.
+        assert!(s.assignee_board_counts("nobody").unwrap().is_empty());
     }
 
     #[test]
