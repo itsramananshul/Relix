@@ -199,6 +199,101 @@ impl Rig for EchoRig {
     }
 }
 
+/// A **process** Rig — runs an Operative by spawning an external
+/// command. This is the generic backend behind the CLI Rigs (a
+/// Claude / Codex / Gemini CLI on a subscription) and any
+/// `process`-style agent: the Brief's prompt is piped to the
+/// child's stdin and the child's stdout becomes the result. A
+/// non-zero exit, or a spawn/wait failure, is a *retryable*
+/// [`RigOutcome::Failed`].
+///
+/// Thin by governance: Relix can't see the child's internal tool
+/// calls, so a process Rig must run inside a Relix-governed sandbox
+/// — the box is the boundary.
+///
+/// NOTE: the prompt is written to stdin synchronously before stdout
+/// is drained, which is fine for the modest prompts/outputs of the
+/// dispatch path. Streaming large I/O on separate threads is a
+/// future refinement the real CLI adapters will layer on.
+pub struct ProcessRig {
+    name: String,
+    program: String,
+    args: Vec<String>,
+}
+
+impl ProcessRig {
+    pub fn new(
+        name: impl Into<String>,
+        program: impl Into<String>,
+        args: Vec<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            program: program.into(),
+            args,
+        }
+    }
+}
+
+impl Rig for ProcessRig {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn run(&self, req: &RigRunRequest) -> RigOutcome {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = match Command::new(&self.program)
+            .args(&self.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return RigOutcome::Failed {
+                    reason: format!("spawn {}: {e}", self.program),
+                    retryable: true,
+                };
+            }
+        };
+
+        // Pipe the prompt to the child, then close stdin (EOF).
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(req.prompt.as_bytes());
+        }
+
+        let output = match child.wait_with_output() {
+            Ok(o) => o,
+            Err(e) => {
+                return RigOutcome::Failed {
+                    reason: format!("wait {}: {e}", self.program),
+                    retryable: true,
+                };
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if output.status.success() {
+            RigOutcome::Done { summary: stdout }
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let code = output
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_string());
+            let detail = if stderr.is_empty() { stdout } else { stderr };
+            RigOutcome::Failed {
+                reason: format!("exit {code}: {detail}"),
+                retryable: true,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +348,55 @@ mod tests {
         reg.register(Arc::new(CustomEcho));
         assert_eq!(reg.len(), 1, "override keeps a single 'echo' entry");
         assert_eq!(reg.get("echo").unwrap().governance(), RigGovernance::PerToolCall);
+    }
+
+    // Cross-platform command helpers for the ProcessRig tests.
+    fn echo_cmd(s: &str) -> (String, Vec<String>) {
+        if cfg!(windows) {
+            ("cmd".into(), vec!["/C".into(), "echo".into(), s.into()])
+        } else {
+            ("sh".into(), vec!["-c".into(), format!("echo {s}")])
+        }
+    }
+    fn fail_cmd() -> (String, Vec<String>) {
+        if cfg!(windows) {
+            ("cmd".into(), vec!["/C".into(), "exit".into(), "1".into()])
+        } else {
+            ("sh".into(), vec!["-c".into(), "exit 1".into()])
+        }
+    }
+
+    #[test]
+    fn process_rig_runs_a_command_and_captures_stdout() {
+        let (prog, args) = echo_cmd("hello-from-rig");
+        let rig = ProcessRig::new("test-echo", prog, args);
+        let req = RigRunRequest::new("b", "a", "g", "ignored stdin");
+        match rig.run(&req) {
+            RigOutcome::Done { summary } => {
+                assert!(summary.contains("hello-from-rig"), "got: {summary:?}")
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_rig_maps_nonzero_exit_to_retryable_failed() {
+        let (prog, args) = fail_cmd();
+        let rig = ProcessRig::new("test-fail", prog, args);
+        let req = RigRunRequest::new("b", "a", "g", "x");
+        assert!(matches!(
+            rig.run(&req),
+            RigOutcome::Failed { retryable: true, .. }
+        ));
+    }
+
+    #[test]
+    fn process_rig_maps_spawn_failure_to_retryable_failed() {
+        let rig = ProcessRig::new("nope", "this-binary-does-not-exist-xyzzy", vec![]);
+        let req = RigRunRequest::new("b", "a", "g", "x");
+        assert!(matches!(
+            rig.run(&req),
+            RigOutcome::Failed { retryable: true, .. }
+        ));
     }
 }
