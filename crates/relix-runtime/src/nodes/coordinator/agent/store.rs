@@ -62,6 +62,14 @@ pub struct AgentProfile {
     /// the gate's standard checks in force.
     #[serde(default)]
     pub profile: Option<String>,
+    /// PHASE 0 (org tree): the single agent this one reports to —
+    /// its boss. `None` for the apex (the CEO reports to the
+    /// Board/operator, which is not an agent row). This one link
+    /// turns the flat agent list into the org tree: walking it
+    /// *up* gives the escalation chain, *down* gives a manager's
+    /// subtree. Nullable; existing rows read NULL until set.
+    #[serde(default)]
+    pub reports_to: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -629,7 +637,7 @@ impl AgentStore {
                         allow_sensitivity_tags, deny_sensitivity_tags,
                         approval_required_categories, authorized_approvers,
                         approval_timeout_secs,
-                        created_at, updated_at, profile
+                        created_at, updated_at, profile, reports_to
                  FROM agent_profiles WHERE subject_id = ?1 AND tenant_id = ?2",
                 params![subject_id, tenant],
                 row_to_agent,
@@ -661,7 +669,7 @@ impl AgentStore {
                         allow_sensitivity_tags, deny_sensitivity_tags,
                         approval_required_categories, authorized_approvers,
                         approval_timeout_secs,
-                        created_at, updated_at, profile
+                        created_at, updated_at, profile, reports_to
                  FROM agent_profiles WHERE subject_id = ?1",
                 params![subject_id],
                 row_to_agent,
@@ -703,6 +711,94 @@ impl AgentStore {
                 .collect::<rusqlite::Result<_>>()?
         };
         Ok(rows)
+    }
+
+    /// PHASE 0 (org tree): the agents that directly report to
+    /// `manager_id` — one level down the hierarchy. Powers the
+    /// org-chart children view. Ordered oldest-first for stable
+    /// rendering.
+    pub fn list_direct_reports(
+        &self,
+        manager_id: &str,
+    ) -> Result<Vec<AgentSnapshot>, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, name, role, status, subject_id
+             FROM agent_profiles WHERE reports_to = ?1
+             ORDER BY created_at ASC",
+        )?;
+        let rows: Vec<AgentSnapshot> = stmt
+            .query_map(params![manager_id], |r| {
+                Ok(AgentSnapshot {
+                    agent_id: r.get(0)?,
+                    name: r.get(1)?,
+                    role: r.get(2)?,
+                    status: r.get(3)?,
+                    subject_id: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// PHASE 0 (org tree): every agent at or below `manager_id` —
+    /// the manager's *subtree*, as agent_ids (excluding the
+    /// manager itself). This is the scope unit for delegated
+    /// authority ("this planner may only assign work to agents
+    /// under it"). Breadth-first with a visited guard and a hard
+    /// node cap, so a malformed cycle can never spin forever.
+    pub fn manager_subtree(&self, manager_id: &str) -> Result<Vec<String>, AgentStoreError> {
+        const MAX_NODES: usize = 10_000;
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt =
+            conn.prepare("SELECT agent_id FROM agent_profiles WHERE reports_to = ?1")?;
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(manager_id.to_string());
+        let mut frontier: Vec<String> = vec![manager_id.to_string()];
+        while let Some(node) = frontier.pop() {
+            if out.len() >= MAX_NODES {
+                break;
+            }
+            let children: Vec<String> = stmt
+                .query_map(params![node], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for child in children {
+                if seen.insert(child.clone()) {
+                    out.push(child.clone());
+                    frontier.push(child);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// PHASE 0 (org tree): the escalation path *up* from `agent_id`
+    /// to the apex — the chain of bosses, nearest first. Stops at
+    /// the apex (an agent with no boss) or a missing link. A
+    /// visited guard + depth cap bound a malformed cycle.
+    pub fn chain_of_command(&self, agent_id: &str) -> Result<Vec<String>, AgentStoreError> {
+        const MAX_DEPTH: usize = 1024;
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt =
+            conn.prepare("SELECT reports_to FROM agent_profiles WHERE agent_id = ?1")?;
+        let mut chain: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(agent_id.to_string());
+        let mut current = agent_id.to_string();
+        for _ in 0..MAX_DEPTH {
+            let boss: Option<String> = stmt
+                .query_row(params![current], |r| r.get::<_, Option<String>>(0))
+                .optional()?
+                .flatten();
+            let Some(boss) = boss else { break };
+            if !seen.insert(boss.clone()) {
+                break; // cycle guard
+            }
+            chain.push(boss.clone());
+            current = boss;
+        }
+        Ok(chain)
     }
 
     /// Update one field. The set of writable fields is curated;
@@ -800,6 +896,46 @@ impl AgentStore {
                     "UPDATE agent_profiles SET profile=?1, updated_at=?2 WHERE agent_id=?3",
                     params![stored, now, agent_id],
                 )?
+            }
+            "reports_to" => {
+                // PHASE 0 (org tree): set or clear this agent's
+                // boss. Empty value clears it (apex / no boss). A
+                // non-empty value must reference an existing agent
+                // and must not be the agent itself (no self-report).
+                // Deeper cycle detection lands with the org-chart
+                // surface in Phase 2.
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    conn.execute(
+                        "UPDATE agent_profiles SET reports_to=NULL, updated_at=?1
+                         WHERE agent_id=?2",
+                        params![now, agent_id],
+                    )?
+                } else {
+                    if trimmed == agent_id {
+                        return Err(AgentStoreError::BadInput(
+                            "an agent cannot report to itself".into(),
+                        ));
+                    }
+                    let boss_exists = conn
+                        .query_row(
+                            "SELECT 1 FROM agent_profiles WHERE agent_id=?1",
+                            params![trimmed],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_some();
+                    if !boss_exists {
+                        return Err(AgentStoreError::BadInput(format!(
+                            "reports_to target '{trimmed}' is not a known agent"
+                        )));
+                    }
+                    conn.execute(
+                        "UPDATE agent_profiles SET reports_to=?1, updated_at=?2
+                         WHERE agent_id=?3",
+                        params![trimmed, now, agent_id],
+                    )?
+                }
             }
             other => {
                 return Err(AgentStoreError::BadInput(format!(
@@ -1616,7 +1752,7 @@ const SELECT_AGENT: &str = "SELECT agent_id, name, role, title, department, team
         allow_sensitivity_tags, deny_sensitivity_tags,
         approval_required_categories, authorized_approvers,
         approval_timeout_secs,
-        created_at, updated_at, profile
+        created_at, updated_at, profile, reports_to
  FROM agent_profiles WHERE agent_id = ?1";
 
 const SELECT_APPROVAL: &str =
@@ -1649,10 +1785,13 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              authorized_approvers TEXT NOT NULL DEFAULT '[]',
              approval_timeout_secs INTEGER NOT NULL DEFAULT 86400,
              created_at      INTEGER NOT NULL,
-             updated_at      INTEGER NOT NULL
+             updated_at      INTEGER NOT NULL,
+             reports_to      TEXT
          );
          CREATE UNIQUE INDEX IF NOT EXISTS agent_profiles_subject
              ON agent_profiles(subject_id);
+         CREATE INDEX IF NOT EXISTS agent_profiles_reports_to
+             ON agent_profiles(reports_to);
 
          CREATE TABLE IF NOT EXISTS approval_requests (
              approval_id     TEXT PRIMARY KEY,
@@ -1753,6 +1892,11 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     // rows continue to flow through the categorical checks
     // (which now default-deny when no profile exists).
     ensure_column(conn, "agent_profiles", "profile", "TEXT")?;
+    // PHASE 0 (org tree): `reports_to` — the single boss link that
+    // turns the flat agent list into the org hierarchy. Nullable;
+    // existing rows read NULL (no boss) until an operator/CEO sets
+    // it via `agent.update agent_id|reports_to|<boss_agent_id>`.
+    ensure_column(conn, "agent_profiles", "reports_to", "TEXT")?;
     // GROUP 6: tenant isolation. Add `tenant_id` to the per-caller
     // agent/approval tables. Idempotent (ensure_column probes
     // PRAGMA); existing rows default to the reserved 'default'
@@ -2003,6 +2147,9 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
         // a no-default column, so existing rows read NULL
         // → None and stay subject to the standard checks.
         profile: r.get::<_, Option<String>>(20)?,
+        // PHASE 0 (org tree): appended as the last SELECT column
+        // so every existing positional index above is unchanged.
+        reports_to: r.get::<_, Option<String>>(21)?,
     })
 }
 
@@ -2110,6 +2257,117 @@ mod tests {
 
     fn store() -> AgentStore {
         AgentStore::in_memory().unwrap()
+    }
+
+    // ── PHASE 0: org tree (reports_to) ───────────────────
+
+    #[test]
+    fn phase0_reports_to_sets_clears_and_validates() {
+        let s = store();
+        let boss = s
+            .create_agent(
+                "CEO", "ceo", "Chief", "exec", "exec", "operator", "subj-boss", "high",
+                "default",
+            )
+            .unwrap();
+        let report = s
+            .create_agent(
+                "Eng", "engineer", "Engineer", "eng", "eng", "operator", "subj-report",
+                "medium", "default",
+            )
+            .unwrap();
+
+        // Fresh agents have no boss (apex / unset).
+        assert_eq!(s.get_agent(&report).unwrap().unwrap().reports_to, None);
+
+        // Setting the boss link creates the org-tree edge.
+        s.update_agent_field(&report, "reports_to", &boss).unwrap();
+        assert_eq!(
+            s.get_agent(&report).unwrap().unwrap().reports_to,
+            Some(boss.clone())
+        );
+
+        // An agent cannot report to itself.
+        assert!(s.update_agent_field(&report, "reports_to", &report).is_err());
+
+        // An unknown boss is rejected — no dangling edges.
+        assert!(
+            s.update_agent_field(&report, "reports_to", "nope-not-an-agent")
+                .is_err()
+        );
+
+        // The previously-set valid edge survived the rejected writes.
+        assert_eq!(
+            s.get_agent(&report).unwrap().unwrap().reports_to,
+            Some(boss)
+        );
+
+        // Empty value clears the link back to apex / no boss.
+        s.update_agent_field(&report, "reports_to", "").unwrap();
+        assert_eq!(s.get_agent(&report).unwrap().unwrap().reports_to, None);
+    }
+
+    #[test]
+    fn phase0_org_tree_queries_walk_up_and_down() {
+        let s = store();
+        // CEO → planner → {worker1, worker2}
+        let ceo = s
+            .create_agent(
+                "CEO", "ceo", "Chief", "exec", "exec", "op", "subj-ceo", "high", "default",
+            )
+            .unwrap();
+        let planner = s
+            .create_agent(
+                "Plan", "planner", "Planner", "eng", "eng", "op", "subj-plan", "medium",
+                "default",
+            )
+            .unwrap();
+        let w1 = s
+            .create_agent(
+                "W1", "worker", "Worker", "eng", "eng", "op", "subj-w1", "low", "default",
+            )
+            .unwrap();
+        let w2 = s
+            .create_agent(
+                "W2", "worker", "Worker", "eng", "eng", "op", "subj-w2", "low", "default",
+            )
+            .unwrap();
+        s.update_agent_field(&planner, "reports_to", &ceo).unwrap();
+        s.update_agent_field(&w1, "reports_to", &planner).unwrap();
+        s.update_agent_field(&w2, "reports_to", &planner).unwrap();
+
+        // Down one level.
+        let ceo_reports: Vec<String> = s
+            .list_direct_reports(&ceo)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.agent_id)
+            .collect();
+        assert_eq!(ceo_reports, vec![planner.clone()]);
+        let planner_reports: Vec<String> = s
+            .list_direct_reports(&planner)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.agent_id)
+            .collect();
+        assert_eq!(planner_reports.len(), 2);
+        assert!(planner_reports.contains(&w1) && planner_reports.contains(&w2));
+
+        // The whole subtree under the CEO is everyone but the CEO.
+        let subtree = s.manager_subtree(&ceo).unwrap();
+        assert_eq!(subtree.len(), 3);
+        for id in [&planner, &w1, &w2] {
+            assert!(subtree.contains(id));
+        }
+        assert!(!subtree.contains(&ceo));
+
+        // Escalation path up from a worker: planner, then CEO.
+        assert_eq!(
+            s.chain_of_command(&w1).unwrap(),
+            vec![planner.clone(), ceo.clone()]
+        );
+        // The apex escalates to nobody.
+        assert!(s.chain_of_command(&ceo).unwrap().is_empty());
     }
 
     // ── agent CRUD ───────────────────────────────────────
