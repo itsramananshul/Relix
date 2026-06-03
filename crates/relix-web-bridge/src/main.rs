@@ -108,6 +108,7 @@ mod budget;
 mod capabilities;
 mod channels;
 mod chat;
+mod companion;
 mod confidence;
 #[cfg(test)]
 mod confidence_mini_mesh_test;
@@ -489,6 +490,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // each route is a thin forwarder to a Coordinator capability.
         // Product-spine board page + read surface.
         .route("/spine", get(spine::page))
+        .route("/v1/spine/companion", post(companion::handle))
         .route("/v1/spine/guild", get(spine::guild_counts))
         .route("/v1/spine/board", get(spine::board_summary))
         .route("/v1/spine/board/:column", get(spine::board_column))

@@ -63,6 +63,10 @@
     <button class="tab" data-view="activity">Activity</button>
   </nav>
   <div class="counts" id="counts"><span class="muted">loading…</span></div>
+  <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
+    <input id="cmd" placeholder="Ask the company…  (try: help)" style="width:260px" />
+    <span id="cmdReply" class="muted" style="font-size:12px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+  </div>
 </header>
 <main>
   <section id="boardView">
@@ -349,6 +353,20 @@ $("#newForm").addEventListener("submit", async e=>{
   const payload = { title:fd.get("title"), assignee:fd.get("assignee")||null, mandate:fd.get("mandate")||null, priority:fd.get("priority") };
   try { await api("/v1/spine/briefs",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(payload)}); $("#newDlg").close(); e.target.reset(); loadCounts(); loadBoard(); }
   catch(err){ $("#newErr").textContent = err.message; }
+});
+
+$("#cmd").addEventListener("keydown", async e=>{
+  if (e.key!=="Enter" || !e.target.value.trim()) return;
+  const reply = $("#cmdReply"); reply.textContent = "…";
+  try {
+    const res = await api("/v1/spine/companion",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({message:e.target.value})});
+    reply.textContent = res.reply || "";
+    reply.className = "muted";
+    e.target.value = "";
+    // Reflect any materialized change.
+    loadCounts(); loadBoard();
+    if (res.action==="search" || res.action==="overdue") showList(res.action, res.result||[]);
+  } catch(err){ reply.textContent = err.message; reply.className = "err"; }
 });
 
 loadCounts(); loadBoard();

@@ -606,6 +606,7 @@ mod tests {
         assert!(SPINE_HTML.contains("/v1/spine/briefs"));
         assert!(SPINE_HTML.contains("/v1/spine/guild"));
         assert!(SPINE_HTML.contains("/v1/spine/mandates"));
+        assert!(SPINE_HTML.contains("/v1/spine/companion"));
     }
 
     /// Build the full spine route table in isolation: matchit panics
