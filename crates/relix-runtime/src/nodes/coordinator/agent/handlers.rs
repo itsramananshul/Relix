@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::dispatch::{HandlerOutcome, InvocationCtx};
 use crate::nodes::coordinator::agent::keys::{
-    KeyVerdict, assign_verdict, manage_verdict, spawn_verdict,
+    KeyVerdict, assign_verdict, configure_verdict, manage_verdict, spawn_verdict,
 };
 use crate::nodes::coordinator::agent::store::{
     AgentStore, AgentStoreError, ApprovalStatus, StandingApprovalCreate,
@@ -870,6 +870,12 @@ pub fn handle_update(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome 
     if parts.len() != 3 {
         return invalid("agent.update: expected `agent_id|field|value`".into());
     }
+    // Configure-Key gate (company-model §5.2A): editing an Operative's
+    // profile/Keys requires can_configure_agents (Founder/Board bypass;
+    // self-config denied; tenant-scoped).
+    if let Err(out) = enforce_configure_key(store, ctx, parts[0]) {
+        return out;
+    }
     match store.update_agent_field_for_tenant(
         parts[0],
         ctx.tenant_id_or_default(),
@@ -894,6 +900,11 @@ pub fn handle_delete(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome 
     };
     if id.is_empty() {
         return invalid("agent.delete: agent_id required".into());
+    }
+    // Configure-Key gate: disabling another Operative is a config
+    // mutation (Founder/Board bypass; self-delete denied; tenant-scoped).
+    if let Err(out) = enforce_configure_key(store, ctx, id) {
+        return out;
     }
     match store.soft_delete_for_tenant(id, ctx.tenant_id_or_default()) {
         Ok(()) => HandlerOutcome::Ok(b"ok\n".to_vec()),
@@ -1559,6 +1570,74 @@ pub(crate) fn enforce_manage_key(
         KeyVerdict::Allow => Ok(()),
         KeyVerdict::Clearance { reason } | KeyVerdict::Deny { reason } => {
             Err(policy_denied(format!("manage denied: {reason}")))
+        }
+    }
+}
+
+/// Enforce the **configure Key** (company-model §5.2A) for an
+/// agent-originated mutation of `target_id`'s profile/Keys
+/// (`agent.update` / `agent.delete`). Returns `Ok(())` — bypassed —
+/// for the Founder/Board only. A non-operator actor:
+/// - must have an Operative profile in this Guild (else
+///   `SECURITY_DENIED`);
+/// - may **not** configure *itself* — self-configuration is denied
+///   outright to prevent privilege self-escalation (the company model
+///   defines no safe self-config subset);
+/// - needs `can_configure_agents` + a `configure_scope` that admits the
+///   target; `configure_scope = none` denies even with the boolean on.
+///
+/// The target must exist in this Guild (cross-tenant fails closed).
+pub(crate) fn enforce_configure_key(
+    store: &AgentStore,
+    ctx: &InvocationCtx,
+    target_id: &str,
+) -> Result<(), HandlerOutcome> {
+    let target = target_id.trim();
+    if caller_is_operator(ctx) {
+        return Ok(());
+    }
+    let tenant = ctx.tenant_id_or_default();
+    let subject = ctx.caller.subject_id.to_string();
+    let actor = match store.get_by_subject_for_tenant(&subject, tenant) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Err(security_denied(format!(
+                "configure denied: caller `{subject}` has no Operative profile in this Guild"
+            )));
+        }
+        Err(e) => return Err(internal(format!("configure key lookup: {e}"))),
+    };
+    // No self-configuration: an Operative cannot edit its own profile /
+    // Keys (would be self-escalation). Only the Founder/Board may.
+    if target == actor.agent_id {
+        return Err(policy_denied(
+            "configure denied: an Operative cannot configure itself (self-escalation)".to_string(),
+        ));
+    }
+    // The target must be a real Operative in this Guild (cross-tenant
+    // and unknown ids fail closed).
+    if store
+        .get_agent_for_tenant(target, tenant)
+        .map_err(|e| internal(format!("configure target lookup: {e}")))?
+        .is_none()
+    {
+        return Err(policy_denied(format!(
+            "configure denied: `{target}` is not an Operative in this Guild"
+        )));
+    }
+    let in_branch = store
+        .manages_for_tenant(&actor.agent_id, target, tenant)
+        .unwrap_or(false);
+    match configure_verdict(
+        actor.can_configure_agents,
+        &actor.configure_scope,
+        &actor.configure_allowed_agents,
+        target,
+        in_branch,
+    ) {
+        KeyVerdict::Allow => Ok(()),
+        KeyVerdict::Clearance { reason } | KeyVerdict::Deny { reason } => {
+            Err(policy_denied(format!("configure denied: {reason}")))
         }
     }
 }
@@ -2902,6 +2981,161 @@ mod tests {
             ),
         );
         assert_eq!(err_kind(out), error_kinds::SECURITY_DENIED);
+    }
+
+    // ── Configure-Key enforcement (company-model §5.2A) ──────
+
+    /// Create a configurer actor keyed to the `cfg-seed` ctx with the
+    /// given scope, plus a report (in its Branch) and an out-of-Branch
+    /// outsider. Returns (store, actor_id, report_id, outsider_id).
+    fn configure_fixture(scope: &str) -> (AgentStore, String, String, String) {
+        let s = store();
+        let actor = s
+            .create_agent(
+                "Lead",
+                "planner",
+                "L",
+                "ops",
+                "ops",
+                "prime",
+                &subject_of(b"cfg-seed"),
+                "medium",
+                "default",
+            )
+            .unwrap();
+        s.update_agent_field(&actor, "can_configure_agents", "true")
+            .unwrap();
+        s.update_agent_field(&actor, "configure_scope", scope)
+            .unwrap();
+        let report = s
+            .create_agent(
+                "R", "engineer", "R", "e", "e", "l", "subj-r", "medium", "default",
+            )
+            .unwrap();
+        s.update_agent_field(&report, "reports_to", &actor).unwrap();
+        let outsider = s
+            .create_agent(
+                "O", "engineer", "O", "e", "e", "x", "subj-o", "medium", "default",
+            )
+            .unwrap();
+        (s, actor, report, outsider)
+    }
+
+    fn update_as(s: &AgentStore, target: &str, field: &str, value: &str) -> HandlerOutcome {
+        handle_update(
+            s,
+            &fake_ctx_with_role(
+                format!("{target}|{field}|{value}").as_bytes(),
+                "planner",
+                b"cfg-seed",
+            ),
+        )
+    }
+
+    #[test]
+    fn configure_non_configurer_cannot_update_another_agent() {
+        let s = store();
+        // Actor exists but lacks can_configure_agents.
+        s.create_agent(
+            "Lead",
+            "planner",
+            "L",
+            "ops",
+            "ops",
+            "prime",
+            &subject_of(b"cfg-seed"),
+            "medium",
+            "default",
+        )
+        .unwrap();
+        let target = s
+            .create_agent(
+                "T", "engineer", "T", "e", "e", "x", "subj-t", "medium", "default",
+            )
+            .unwrap();
+        assert_eq!(
+            err_kind(update_as(&s, &target, "title", "Hacked")),
+            error_kinds::POLICY_DENIED
+        );
+    }
+
+    #[test]
+    fn configure_branch_scope_updates_report_not_peer() {
+        let (s, _actor, report, outsider) = configure_fixture("branch");
+        assert!(matches!(
+            update_as(&s, &report, "title", "Senior"),
+            HandlerOutcome::Ok(_)
+        ));
+        assert_eq!(s.get_agent(&report).unwrap().unwrap().title, "Senior");
+        assert_eq!(
+            err_kind(update_as(&s, &outsider, "title", "X")),
+            error_kinds::POLICY_DENIED
+        );
+    }
+
+    #[test]
+    fn configure_specific_scope_honours_allowlist() {
+        let (s, actor, _report, outsider) = configure_fixture("specific");
+        let listed = s
+            .create_agent(
+                "Lstd", "engineer", "L", "e", "e", "x", "subj-ls", "medium", "default",
+            )
+            .unwrap();
+        s.update_agent_field(&actor, "configure_allowed_agents", &listed)
+            .unwrap();
+        assert!(matches!(
+            update_as(&s, &listed, "title", "Y"),
+            HandlerOutcome::Ok(_)
+        ));
+        assert_eq!(
+            err_kind(update_as(&s, &outsider, "title", "Z")),
+            error_kinds::POLICY_DENIED
+        );
+    }
+
+    #[test]
+    fn configure_self_escalation_is_denied() {
+        // An actor with full configure rights still cannot edit itself.
+        let (s, actor, _r, _o) = configure_fixture("any");
+        assert_eq!(
+            err_kind(update_as(&s, &actor, "can_spawn_agents", "true")),
+            error_kinds::POLICY_DENIED
+        );
+        // ... and certainly cannot disable itself.
+        let out = handle_delete(
+            &s,
+            &fake_ctx_with_role(actor.as_bytes(), "planner", b"cfg-seed"),
+        );
+        assert_eq!(err_kind(out), error_kinds::POLICY_DENIED);
+    }
+
+    #[test]
+    fn configure_wrong_tenant_target_is_denied() {
+        let (s, actor, _r, _o) = configure_fixture("any");
+        let _ = actor;
+        let other = s
+            .create_agent(
+                "Ot", "engineer", "O", "e", "e", "x", "subj-ot", "medium", "tenant-b",
+            )
+            .unwrap();
+        assert_eq!(
+            err_kind(update_as(&s, &other, "title", "X")),
+            error_kinds::POLICY_DENIED
+        );
+    }
+
+    #[test]
+    fn configure_founder_path_is_preserved() {
+        let (s, _a, report, outsider) = configure_fixture("none");
+        // Operator (Founder) bypasses regardless of scope=none.
+        assert!(matches!(
+            handle_update(&s, &fake_ctx(format!("{report}|title|F").as_bytes())),
+            HandlerOutcome::Ok(_)
+        ));
+        assert!(matches!(
+            handle_update(&s, &fake_ctx(format!("{outsider}|title|F").as_bytes())),
+            HandlerOutcome::Ok(_)
+        ));
     }
 
     // ── Assign-Key verdict (company-model §5.2B / §5.3) ──────
