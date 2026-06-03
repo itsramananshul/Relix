@@ -744,6 +744,41 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// Shared *reverse* edge lookup: the task_ids that point AT
+    /// `target` via `edge_type` (WHERE related_task_id = target).
+    fn list_reverse_edges(
+        &self,
+        target: &str,
+        edge_type: &str,
+    ) -> Result<Vec<String>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id FROM task_edges
+                 WHERE related_task_id = ?1 AND edge_type = ?2
+                 ORDER BY edge_id ASC",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows: Vec<String> = stmt
+            .query_map(params![target, edge_type], |r| r.get::<_, String>(0))
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
+    /// PHASE 1 (Brief): the Briefs that THIS Brief blocks — the
+    /// reverse of its Snags (who is waiting on `task` to finish).
+    pub fn list_blocking(&self, task: &str) -> Result<Vec<String>, CoordinatorError> {
+        self.list_reverse_edges(task, "blocked_on")
+    }
+
+    /// PHASE 1 (Brief): the parent Briefs that spawned `task` as a
+    /// Sub-brief (normally one — the planner that decomposed it).
+    pub fn parent_briefs(&self, task: &str) -> Result<Vec<String>, CoordinatorError> {
+        self.list_reverse_edges(task, "spawned")
+    }
+
     /// PHASE 1 (Brief): attach a **Dossier** (durable artifact) to
     /// a Brief. Append-only; returns the new `doc_id`. `kind` and
     /// `title` are required; the Brief must exist.
@@ -5345,6 +5380,26 @@ pub fn register(
     {
         let s = store.clone();
         bridge.register(
+            "brief.blocking",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_blocking(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.parents",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_parents(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
             "brief.subbrief",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -6380,6 +6435,32 @@ fn handle_brief_unsubbrief(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOut
     match store.unlink_subbrief(parent, child) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.unsubbrief", e),
+    }
+}
+
+/// `brief.blocking` — the Briefs that `task` blocks (reverse Snags:
+/// who is waiting on it). Arg `task`. One task_id per line.
+fn handle_brief_blocking(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task = match single_id(ctx, "brief.blocking") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    match store.list_blocking(task) {
+        Ok(ids) => HandlerOutcome::Ok(ids.join("\n").into_bytes()),
+        Err(e) => map_edge_err("brief.blocking", e),
+    }
+}
+
+/// `brief.parents` — the parent Briefs that spawned `task` as a
+/// Sub-brief. Arg `task`. One task_id per line.
+fn handle_brief_parents(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task = match single_id(ctx, "brief.parents") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    match store.parent_briefs(task) {
+        Ok(ids) => HandlerOutcome::Ok(ids.join("\n").into_bytes()),
+        Err(e) => map_edge_err("brief.parents", e),
     }
 }
 
@@ -9639,6 +9720,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload, "todo -> in_progress");
+    }
+
+    #[test]
+    fn reverse_edges_list_blocking_and_parents() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        let parent = mk("parent");
+        let child = mk("child");
+        let blocker = mk("blocker");
+        let waiter1 = mk("w1");
+        let waiter2 = mk("w2");
+
+        s.link_subbrief(&parent, &child).unwrap();
+        // waiter1 and waiter2 are both blocked by `blocker`.
+        s.add_snag(&waiter1, &blocker).unwrap();
+        s.add_snag(&waiter2, &blocker).unwrap();
+
+        // Forward: child's parent. Reverse: parent's children already covered.
+        assert_eq!(s.parent_briefs(&child).unwrap(), vec![parent.clone()]);
+        // `blocker` blocks both waiters (reverse of their Snags).
+        let blocking = s.list_blocking(&blocker).unwrap();
+        assert_eq!(blocking.len(), 2);
+        assert!(blocking.contains(&waiter1) && blocking.contains(&waiter2));
+        // A Brief that blocks nobody / has no parent returns empty.
+        assert!(s.list_blocking(&parent).unwrap().is_empty());
+        assert!(s.parent_briefs(&parent).unwrap().is_empty());
     }
 
     #[test]
