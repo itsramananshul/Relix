@@ -21,6 +21,7 @@
 use std::sync::Arc;
 
 use super::{CoordinatorError, TaskStore, brief};
+use crate::rig::bridge::BridgeTokenStore;
 use crate::rig::{Rig, RigOutcome, RigRunRequest};
 
 /// The default lease a dispatch tick takes on a claimed Brief. The
@@ -92,6 +93,7 @@ pub fn dispatch_batch<R, P>(
     store: &TaskStore,
     batch: usize,
     lease_secs: i64,
+    bridge_tokens: Option<&BridgeTokenStore>,
     resolve_rig: R,
     build_prompt: P,
 ) -> Result<Vec<DispatchRecord>, CoordinatorError>
@@ -109,9 +111,24 @@ where
                     store.set_board_status(&card.task_id, "in_progress")?;
                 }
                 let assignee = card.assignee_agent_id.clone().unwrap_or_default();
-                let req =
-                    RigRunRequest::new(&card.task_id, assignee, String::new(), build_prompt(&card));
+                // Mint a scoped bridge-back token for this Shift so the
+                // agent can call Relix back; it dies with the Shift.
+                let token = bridge_tokens
+                    .map(|bt| bt.mint(&card.task_id, &assignee, "", lease_secs))
+                    .unwrap_or_default();
+                let req = RigRunRequest::new(
+                    &card.task_id,
+                    assignee,
+                    String::new(),
+                    build_prompt(&card),
+                )
+                .with_bridge_token(&token);
                 let outcome = rig.run(&req);
+                if let Some(bt) = bridge_tokens {
+                    if !token.is_empty() {
+                        bt.revoke(&token);
+                    }
+                }
                 // On Done, advance to review for a human / supervisor.
                 if matches!(outcome, RigOutcome::Done { .. }) {
                     store.set_board_status(&card.task_id, "in_review")?;
@@ -246,6 +263,7 @@ mod tests {
             &s,
             50,
             300,
+            None,
             |_: &brief::BriefCard| reg.get("echo"),
             |c: &brief::BriefCard| c.title.clone(),
         )
@@ -265,6 +283,7 @@ mod tests {
                 &s,
                 50,
                 300,
+                None,
                 |_: &brief::BriefCard| reg.get("echo"),
                 |c: &brief::BriefCard| c.title.clone(),
             )
@@ -281,6 +300,7 @@ mod tests {
             &s,
             50,
             300,
+            None,
             |_: &brief::BriefCard| None,
             |c: &brief::BriefCard| c.title.clone(),
         )
@@ -290,5 +310,47 @@ mod tests {
         // Nothing ran → board untouched (still todo); Claim released.
         assert_eq!(s.board_status(&a).unwrap().as_deref(), Some("todo"));
         assert!(s.claim_holder(&a).unwrap().is_none());
+    }
+
+    #[test]
+    fn dispatch_batch_mints_and_revokes_a_bridge_token_per_run() {
+        use std::sync::{Arc, Mutex};
+
+        // A Rig that records the bridge token it was handed.
+        struct RecordingRig(Arc<Mutex<String>>);
+        impl Rig for RecordingRig {
+            fn name(&self) -> &str {
+                "recorder"
+            }
+            fn run(&self, req: &RigRunRequest) -> RigOutcome {
+                *self.0.lock().unwrap() = req.bridge_token.clone();
+                RigOutcome::Done {
+                    summary: "ok".to_string(),
+                }
+            }
+        }
+
+        let s = store();
+        let _a = ready_brief(&s, "a", "agt_a");
+        let tokens = BridgeTokenStore::new();
+        let seen = Arc::new(Mutex::new(String::new()));
+        let rig: Arc<dyn Rig> = Arc::new(RecordingRig(seen.clone()));
+
+        let records = dispatch_batch(
+            &s,
+            50,
+            300,
+            Some(&tokens),
+            |_: &brief::BriefCard| Some(rig.clone()),
+            |c: &brief::BriefCard| c.title.clone(),
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+
+        // A token was minted and handed to the Rig during the run…
+        let handed = seen.lock().unwrap().clone();
+        assert!(handed.starts_with("brt_"), "got: {handed:?}");
+        // …and revoked when the Shift ended.
+        assert!(tokens.is_empty(), "token should be revoked after the run");
     }
 }

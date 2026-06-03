@@ -8660,6 +8660,9 @@ fn register_node_type_handlers(
                 crate::rig::register_cli_rigs(&mut r);
                 r
             });
+            // Per-run bridge-back tokens the dispatch loop mints +
+            // injects so a running agent can call Relix's API back.
+            let bridge_tokens = crate::rig::bridge::BridgeTokenStore::new();
             tokio::spawn(async move {
                 let mut ticker =
                     tokio::time::interval(std::time::Duration::from_secs(interval_secs));
@@ -8668,11 +8671,13 @@ fn register_node_type_handlers(
                     let ts = task_store.clone();
                     let ags = ag_store.clone();
                     let reg = registry.clone();
+                    let bt = bridge_tokens.clone();
                     let outcome = tokio::task::spawn_blocking(move || {
                         crate::nodes::coordinator::heartbeat::dispatch_batch(
                             &ts,
                             batch,
                             lease_secs,
+                            Some(&bt),
                             |card| {
                                 let assignee = card.assignee_agent_id.as_deref()?;
                                 let rig_name = ags.get_agent(assignee).ok().flatten()?.rig?;
