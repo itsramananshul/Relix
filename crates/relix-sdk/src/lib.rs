@@ -454,18 +454,22 @@ impl RelixClient {
     }
 }
 
-/// Generate a deterministic-ish session id rooted in the tenant
-/// and the current time. Tenants don't collide because the
-/// tenant prefix participates in the hash; multiple concurrent
-/// calls from one tenant get different ids because the
-/// timestamp and nanos differ.
+/// Generate a session id rooted in the tenant and the current
+/// time. The tenant prefix keeps tenants from colliding. A
+/// process-global atomic counter is appended so two calls from
+/// one tenant never collide even when the platform clock is too
+/// coarse to advance between them (observed on macOS, where the
+/// timestamp alone could repeat across rapid consecutive calls).
 fn new_session_id(tenant: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("sdk-{tenant}-{now:x}")
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("sdk-{tenant}-{now:x}-{seq:x}")
 }
 
 #[cfg(test)]
@@ -493,6 +497,21 @@ mod tests {
         // Different invocations should produce different ids.
         let s2 = new_session_id("acme");
         assert_ne!(s, s2);
+    }
+
+    #[test]
+    fn session_ids_are_unique_across_rapid_calls() {
+        // Tight loop with no delay: on platforms with coarse clock
+        // resolution the timestamp can repeat, so uniqueness must
+        // come from the atomic counter suffix, not the clock.
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for _ in 0..10_000 {
+            assert!(
+                seen.insert(new_session_id("acme")),
+                "session id collision across rapid calls"
+            );
+        }
     }
 
     #[test]
