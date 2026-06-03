@@ -268,6 +268,27 @@ pub fn run_macro_guarded(spec: &MacroSpec, allow: &[&str]) -> Result<MacroResult
     Ok(run_macro(spec))
 }
 
+/// Run a guarded Macro and split its captured stdout into the tool
+/// calls it requested (via the [`MACRO_CALL_SENTINEL`]) and the
+/// residual result. The returned [`MacroResult`] has its `stdout`
+/// replaced by the residual (sentinel lines removed); the caller
+/// dispatches the [`MacroToolCall`]s through the gated bridge. Same
+/// allowlist refusal as [`run_macro_guarded`].
+pub fn run_macro_rpc(
+    spec: &MacroSpec,
+    allow: &[&str],
+) -> Result<(Vec<MacroToolCall>, MacroResult), MacroDenied> {
+    let result = run_macro_guarded(spec, allow)?;
+    let (calls, residual) = extract_tool_calls(&result.stdout);
+    Ok((
+        calls,
+        MacroResult {
+            stdout: residual,
+            ..result
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +338,27 @@ mod tests {
         assert!(!r.success);
         assert!(r.exit_code.is_none());
         assert!(r.stderr.contains("spawn"));
+    }
+
+    #[test]
+    fn run_macro_rpc_splits_calls_from_residual() {
+        // Emit one sentinel call line and one plain output line.
+        let line = if cfg!(windows) {
+            "echo @relix-call rig.list& echo hello"
+        } else {
+            "printf '@relix-call rig.list\\nhello\\n'"
+        };
+        let allow = if cfg!(windows) { "cmd" } else { "sh" };
+        let (calls, result) = run_macro_rpc(&cmd_spec(line, 4096), &[allow]).expect("allowed");
+        assert!(result.success, "stderr: {}", result.stderr);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].method, "rig.list");
+        // The sentinel line was removed from the residual stdout.
+        assert!(result.stdout.contains("hello"));
+        assert!(!result.stdout.contains("@relix-call"));
+
+        // Off-list interpreter still refused.
+        assert!(run_macro_rpc(&cmd_spec("echo x", 64), &["python3"]).is_err());
     }
 
     #[test]
