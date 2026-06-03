@@ -1337,6 +1337,33 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// Desk/Inbox: Briefs in an active column (`todo` / `in_progress`
+    /// / `in_review` / `blocked`) with **no assignee** — work that
+    /// needs staffing. Newest-updated first, bounded by `limit`.
+    pub fn list_unassigned_briefs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, title, board_status, priority,
+                        assignee_agent_id, mandate_id, campaign_id
+                 FROM tasks
+                 WHERE assignee_agent_id IS NULL
+                   AND board_status IN ('todo','in_progress','in_review','blocked')
+                 ORDER BY updated_at DESC LIMIT ?1",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// PHASE 5 (board): pin / unpin a Brief — pinned Briefs sort to
     /// the top of their board column. The Brief must exist.
     pub fn set_brief_pinned(&self, task_id: &str, pinned: bool) -> Result<(), CoordinatorError> {
@@ -7244,6 +7271,17 @@ pub fn register(
             })),
         );
     }
+    {
+        // Desk/Inbox: Briefs needing staffing (no assignee).
+        let s = store.clone();
+        bridge.register(
+            "brief.unassigned",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_unassigned(&s, &ctx) }
+            })),
+        );
+    }
     // Spine progress rollups (Briefs-by-column for a Campaign / Mandate).
     {
         let s = store.clone();
@@ -8567,6 +8605,28 @@ fn handle_brief_blocked_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerO
             Err(e) => internal(format!("brief.blocked_list encode: {e}")),
         },
         Err(e) => map_edge_err("brief.blocked_list", e),
+    }
+}
+
+/// `brief.unassigned` — Briefs in an active column with no assignee
+/// (the Desk's "needs staffing" list). Arg `limit` (optional,
+/// default 50).
+fn handle_brief_unassigned(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("brief.unassigned utf8: {e}")),
+    };
+    let limit: usize = if raw.is_empty() {
+        50
+    } else {
+        raw.parse().unwrap_or(50)
+    };
+    match store.list_unassigned_briefs(limit) {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.unassigned encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.unassigned", e),
     }
 }
 
@@ -13227,6 +13287,57 @@ mod tests {
         assert_eq!(ids[0], b_urgent);
         assert_eq!(ids[1], b_hi);
         assert!(!ids.contains(&b_done.as_str()));
+    }
+
+    #[test]
+    fn unassigned_lists_active_briefs_with_no_assignee() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        // Unassigned + active → included. (An unassigned Brief can
+        // only sit in `todo`: the board entry guard requires an
+        // assignee to enter `in_progress`.)
+        let open1 = mk("open1");
+        s.set_board_status(&open1, "todo").unwrap();
+        let open2 = mk("open2");
+        s.set_board_status(&open2, "todo").unwrap();
+        // Assigned + active → excluded (it's staffed).
+        let staffed = mk("staffed");
+        s.set_brief_field(&staffed, "assignee", "agt_a").unwrap();
+        s.set_board_status(&staffed, "todo").unwrap();
+        // Unassigned but still in backlog (not an active column) → excluded.
+        let backlog = mk("backlog");
+        // Assigned + done (terminal) → excluded by status.
+        let done = mk("done");
+        s.set_brief_field(&done, "assignee", "agt_a").unwrap();
+        s.set_board_status(&done, "todo").unwrap();
+        s.set_board_status(&done, "in_progress").unwrap();
+        move_to_review(&s, &done);
+        s.set_board_status(&done, "done").unwrap();
+
+        let ids: Vec<String> = s
+            .list_unassigned_briefs(50)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.task_id)
+            .collect();
+        assert!(ids.contains(&open1));
+        assert!(ids.contains(&open2));
+        assert!(!ids.contains(&staffed));
+        assert!(!ids.contains(&backlog));
+        assert!(!ids.contains(&done));
+        assert_eq!(ids.len(), 2);
     }
 
     #[test]
