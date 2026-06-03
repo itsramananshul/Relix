@@ -24,6 +24,20 @@ pub struct BridgeClaims {
     pub tenant_id: String,
     /// Unix seconds after which the token is dead.
     pub expires_at: i64,
+    /// The bridge-back methods this token may invoke. Empty =
+    /// unrestricted (any bridge method) — the default for `mint`. A
+    /// scoped token (`mint_scoped`) lists exactly what it may call,
+    /// so a leaked token can't reach beyond its run's needs.
+    pub methods: Vec<String>,
+}
+
+impl BridgeClaims {
+    /// Does this token's scope permit `method`? An unrestricted
+    /// token (empty `methods`) permits everything; a scoped token
+    /// must list the method exactly.
+    pub fn permits(&self, method: &str) -> bool {
+        self.methods.is_empty() || self.methods.iter().any(|m| m == method)
+    }
 }
 
 /// A process-wide store of live bridge tokens. Cheap to clone (an
@@ -38,8 +52,9 @@ impl BridgeTokenStore {
         Self::default()
     }
 
-    /// Mint a token scoped to one run, valid for `ttl_secs`. Returns
-    /// the opaque token string to inject into the Rig.
+    /// Mint a token scoped to one run, valid for `ttl_secs`,
+    /// unrestricted on methods. Returns the opaque token string to
+    /// inject into the Rig.
     pub fn mint(
         &self,
         brief_id: impl Into<String>,
@@ -47,12 +62,28 @@ impl BridgeTokenStore {
         tenant_id: impl Into<String>,
         ttl_secs: i64,
     ) -> String {
+        self.mint_scoped(brief_id, agent_id, tenant_id, ttl_secs, Vec::new())
+    }
+
+    /// Mint a token restricted to exactly `methods` (least
+    /// privilege). An empty `methods` is equivalent to [`mint`]
+    /// (unrestricted). Use this when the Rig only needs a narrow
+    /// slice of the bridge-back surface.
+    pub fn mint_scoped(
+        &self,
+        brief_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        tenant_id: impl Into<String>,
+        ttl_secs: i64,
+        methods: Vec<String>,
+    ) -> String {
         let token = new_token();
         let claims = BridgeClaims {
             brief_id: brief_id.into(),
             agent_id: agent_id.into(),
             tenant_id: tenant_id.into(),
             expires_at: unix_now().saturating_add(ttl_secs.max(0)),
+            methods,
         };
         self.lock().insert(token.clone(), claims);
         token
@@ -77,6 +108,23 @@ impl BridgeTokenStore {
     pub fn authorize(&self, token: &str, brief_id: &str, agent_id: &str) -> bool {
         match self.verify(token) {
             Some(c) => c.brief_id == brief_id && c.agent_id == agent_id,
+            None => false,
+        }
+    }
+
+    /// Authorize an inbound call AND enforce the method scope: the
+    /// token must be live, scoped to this Brief + Operative, and
+    /// permit `method`. Bridge-back handlers that want least-privilege
+    /// call this instead of [`authorize`].
+    pub fn authorize_method(
+        &self,
+        token: &str,
+        brief_id: &str,
+        agent_id: &str,
+        method: &str,
+    ) -> bool {
+        match self.verify(token) {
+            Some(c) => c.brief_id == brief_id && c.agent_id == agent_id && c.permits(method),
             None => false,
         }
     }
@@ -149,6 +197,34 @@ mod tests {
         // Unknown token is never authorized.
         assert!(store.verify("brt_nope").is_none());
         assert!(!store.authorize("brt_nope", "brief_1", "agt_a"));
+    }
+
+    #[test]
+    fn method_scope_enforces_least_privilege() {
+        let store = BridgeTokenStore::new();
+
+        // Unrestricted token (mint) permits any method.
+        let open = store.mint("b", "a", "g", 300);
+        assert!(store.authorize_method(&open, "b", "a", "brief.comment"));
+        assert!(store.authorize_method(&open, "b", "a", "agent.delete"));
+
+        // Scoped token only permits its listed methods.
+        let scoped = store.mint_scoped(
+            "b",
+            "a",
+            "g",
+            300,
+            vec!["brief.comment".to_string(), "brief.subbrief".to_string()],
+        );
+        assert!(store.authorize_method(&scoped, "b", "a", "brief.comment"));
+        assert!(store.authorize_method(&scoped, "b", "a", "brief.subbrief"));
+        // Off-scope method denied even with correct Brief + Operative.
+        assert!(!store.authorize_method(&scoped, "b", "a", "agent.delete"));
+        // Wrong scope still requires correct Brief/Operative too.
+        assert!(!store.authorize_method(&scoped, "other", "a", "brief.comment"));
+
+        // The plain authorize (no method) still works on scoped tokens.
+        assert!(store.authorize(&scoped, "b", "a"));
     }
 
     #[test]
