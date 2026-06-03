@@ -1063,6 +1063,46 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// PHASE 5 (board): pin / unpin a Brief — pinned Briefs sort to
+    /// the top of their board column. The Brief must exist.
+    pub fn set_brief_pinned(
+        &self,
+        task_id: &str,
+        pinned: bool,
+    ) -> Result<(), CoordinatorError> {
+        // Pinning is a view-layer concern, not a content edit, so it
+        // deliberately does NOT bump `updated_at` (recency ordering
+        // within a column stays stable when you pin/unpin).
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let changed = conn
+            .execute(
+                "UPDATE tasks SET pinned = ?1 WHERE task_id = ?2",
+                params![i64::from(pinned), task_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+        if changed == 0 {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// PHASE 5 (board): is a Brief pinned? `NotFound` when absent.
+    pub fn brief_pinned(&self, task_id: &str) -> Result<bool, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let v: Option<i64> = conn
+            .query_row(
+                "SELECT pinned FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        match v {
+            Some(n) => Ok(n != 0),
+            None => Err(CoordinatorError::NotFound(task_id.to_string())),
+        }
+    }
+
     /// PHASE 5 (board): the Briefs carrying `label` (CSV-column
     /// membership), newest first. Empty `label` → empty result.
     /// (Labels with SQL `LIKE` wildcards aren't expected; set_labels
@@ -1319,7 +1359,7 @@ impl TaskStore {
             Some(b) => {
                 let sql = format!(
                     "SELECT {cols} FROM tasks WHERE board_status = ?1 \
-                     ORDER BY updated_at DESC LIMIT ?2"
+                     ORDER BY pinned DESC, updated_at DESC LIMIT ?2"
                 );
                 let mut stmt = conn.prepare(&sql).map_err(CoordinatorError::Db)?;
                 stmt.query_map(params![b, lim], map)
@@ -1328,8 +1368,9 @@ impl TaskStore {
                     .map_err(CoordinatorError::Db)?
             }
             None => {
-                let sql =
-                    format!("SELECT {cols} FROM tasks ORDER BY updated_at DESC LIMIT ?1");
+                let sql = format!(
+                    "SELECT {cols} FROM tasks ORDER BY pinned DESC, updated_at DESC LIMIT ?1"
+                );
                 let mut stmt = conn.prepare(&sql).map_err(CoordinatorError::Db)?;
                 stmt.query_map(params![lim], map)
                     .map_err(CoordinatorError::Db)?
@@ -5769,6 +5810,16 @@ pub fn register(
     {
         let s = store.clone();
         bridge.register(
+            "brief.pin",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_pin(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
             "brief.by_label",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -6992,6 +7043,28 @@ fn handle_brief_by_label(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutco
             Err(e) => internal(format!("brief.by_label encode: {e}")),
         },
         Err(e) => map_edge_err("brief.by_label", e),
+    }
+}
+
+/// `brief.pin` — pin/unpin a Brief (pinned sorts to the top of its
+/// column). Arg `task|1` to pin, `task|0` to unpin (default pin).
+fn handle_brief_pin(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.pin utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    let task = parts.first().copied().unwrap_or("").trim();
+    if task.is_empty() {
+        return invalid("brief.pin: task required (arg shape: task|0|1)".to_string());
+    }
+    let pinned = match parts.get(1).copied().map(str::trim) {
+        Some("0") | Some("false") => false,
+        _ => true, // default + "1"/"true"
+    };
+    match store.set_brief_pinned(task, pinned) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.pin", e),
     }
 }
 
@@ -9293,6 +9366,9 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         // comma-joined tag set (bug / feature / customer-x …) for
         // organising the board. NULL = no labels. Additive.
         "ALTER TABLE tasks ADD COLUMN labels TEXT",
+        // PHASE 5 (Brief): pin a Brief to the top of its board
+        // column. 0 = normal, 1 = pinned. Additive, defaulted.
+        "ALTER TABLE tasks ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the
@@ -10404,6 +10480,62 @@ mod tests {
 
         // Empty query → empty result.
         assert!(s.search_briefs("  ", 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pinned_briefs_sort_to_the_top_of_their_column() {
+        let s = store();
+        let mk = |t: &str| {
+            let id = s
+                .create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap();
+            s.set_board_status(&id, "todo").unwrap();
+            id
+        };
+        let a = mk("a");
+        let b = mk("b"); // middle by insertion order
+        let c = mk("c");
+        // Natural order (equal updated_at → insertion order): a, b, c.
+        let natural: Vec<String> = s
+            .list_briefs_by_board(Some("todo"), 50)
+            .unwrap()
+            .into_iter()
+            .map(|card| card.task_id)
+            .collect();
+        assert_eq!(natural.first(), Some(&a));
+        assert!(!s.brief_pinned(&b).unwrap());
+
+        // Pin the MIDDLE one → it overrides natural order and leads.
+        s.set_brief_pinned(&b, true).unwrap();
+        assert!(s.brief_pinned(&b).unwrap());
+        let order: Vec<String> = s
+            .list_briefs_by_board(Some("todo"), 50)
+            .unwrap()
+            .into_iter()
+            .map(|card| card.task_id)
+            .collect();
+        assert_eq!(order.first(), Some(&b), "pinned Brief leads its column");
+        assert!(order.contains(&a) && order.contains(&c));
+
+        // Unpin → back to natural order (a leads again).
+        s.set_brief_pinned(&b, false).unwrap();
+        let order2: Vec<String> = s
+            .list_briefs_by_board(Some("todo"), 50)
+            .unwrap()
+            .into_iter()
+            .map(|card| card.task_id)
+            .collect();
+        assert_eq!(order2.first(), Some(&a));
+
+        // Unknown Brief → NotFound.
+        assert!(matches!(
+            s.set_brief_pinned("nope", true),
+            Err(CoordinatorError::NotFound(_))
+        ));
+        assert!(matches!(
+            s.brief_pinned("nope"),
+            Err(CoordinatorError::NotFound(_))
+        ));
     }
 
     #[test]
