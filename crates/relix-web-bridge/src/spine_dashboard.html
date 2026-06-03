@@ -70,6 +70,7 @@
       <button id="newBrief">+ Brief</button>
       <button class="ghost" id="refresh">Refresh</button>
       <input id="search" placeholder="Search briefs…" />
+      <input id="labelFilter" placeholder="label…" style="width:110px" />
       <button class="ghost" id="overdueBtn">Overdue</button>
     </div>
     <div class="board" id="board"></div>
@@ -338,6 +339,7 @@ $("#newMandate").onclick = async ()=>{
 $("#refresh").onclick = ()=>{ loadCounts(); loadBoard(); };
 $("#panelClose").onclick = ()=>$("#panel").classList.remove("open");
 $("#overdueBtn").onclick = async()=>{ try { showList("Overdue", await api("/v1/spine/overdue")); } catch(e){ alert(e.message); } };
+$("#labelFilter").addEventListener("keydown", async e=>{ if(e.key==="Enter" && e.target.value.trim()){ try { showList("Label: "+e.target.value, await api("/v1/spine/by-label?q="+encodeURIComponent(e.target.value))); } catch(err){ alert(err.message); } } });
 $("#search").addEventListener("keydown", async e=>{ if(e.key==="Enter" && e.target.value.trim()){ try { showList("Search: "+e.target.value, await api("/v1/spine/briefs/search?q="+encodeURIComponent(e.target.value))); } catch(err){ alert(err.message); } } });
 $("#newBrief").onclick = ()=>$("#newDlg").showModal();
 $("#newForm").addEventListener("submit", async e=>{

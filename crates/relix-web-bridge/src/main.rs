@@ -503,6 +503,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/briefs/search", get(spine::brief_search))
         .route("/v1/spine/briefs/:id", get(spine::brief_detail))
         .route("/v1/spine/desk/:agent", get(spine::desk))
+        .route("/v1/spine/by-label", get(spine::by_label))
         .route("/v1/spine/overdue", get(spine::overdue))
         // Product-spine dashboard write actions.
         .route("/v1/spine/briefs", post(spine::create_brief))

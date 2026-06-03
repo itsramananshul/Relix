@@ -177,6 +177,19 @@ pub async fn desk(
     json_passthrough(call_peer(&state, "brief.desk", arg.as_bytes()).await?)
 }
 
+/// `GET /v1/spine/by-label?q=&limit=` — Briefs carrying a label.
+pub async fn by_label(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let label = q.q.unwrap_or_default();
+    if label.trim().is_empty() {
+        return Err(bad("q (label) required"));
+    }
+    let arg = format!("{}|{}", label, q.limit.unwrap_or(100));
+    json_passthrough(call_peer(&state, "brief.by_label", arg.as_bytes()).await?)
+}
+
 /// `GET /v1/spine/overdue?limit=` — the overdue Briefs.
 pub async fn overdue(
     State(state): State<AppState>,
@@ -618,6 +631,7 @@ mod tests {
             .route("/v1/spine/briefs/search", get(brief_search))
             .route("/v1/spine/briefs/:id", get(brief_detail))
             .route("/v1/spine/desk/:agent", get(desk))
+            .route("/v1/spine/by-label", get(by_label))
             .route("/v1/spine/overdue", get(overdue))
             .route("/v1/spine/briefs", post(create_brief))
             .route("/v1/spine/briefs/:id/move", post(move_brief))
