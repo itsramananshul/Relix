@@ -441,6 +441,177 @@ pub fn handle_team_plan_latest(spine_store: &SpineStore, ctx: &InvocationCtx) ->
     }
 }
 
+/// `mandate.team_readiness` — a live summary of how staffed a Mandate
+/// is, combining the latest persisted Team Plan with the *current*
+/// state of its hires and Clearances. Arg: `mandate_id`. Tenant-scoped.
+///
+/// This is what makes "the team is becoming active" visible without
+/// mutating the plan row when a Clearance is approved: readiness is
+/// recomputed on read from each hire's live status and each
+/// Clearance's live status.
+///
+/// Returns JSON: `mandate_id`, `planned`, `plan_id`, `plan_status`,
+/// `missing_roles` (proposed roles with no identity yet, plus roles
+/// whose hire is disabled), `pending_clearances` (`{clearance_id,
+/// status}`), `active_agents` (`{role, agent_id}` now active),
+/// `pending_hires` (`{role, agent_id, status}` not yet active),
+/// `blocked_roles` (`{role, reason}` from denials), `readiness`
+/// (`not_planned` / `awaiting_clearance` / `staffing` / `ready`), and
+/// `next_action`.
+pub fn handle_team_readiness(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let mandate_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("mandate.team_readiness utf8: {e}")),
+    };
+    if mandate_id.is_empty() {
+        return invalid("mandate.team_readiness: mandate_id required".into());
+    }
+    let tenant = ctx.tenant_id_or_default();
+    let plan = match spine_store.latest_team_plan(tenant, mandate_id) {
+        Ok(p) => p,
+        Err(e) => return internal(format!("mandate.team_readiness: {e}")),
+    };
+    let Some(plan) = plan else {
+        // Never planned → an explicit not-planned readiness.
+        let body = serde_json::json!({
+            "mandate_id": mandate_id,
+            "planned": false,
+            "plan_id": serde_json::Value::Null,
+            "plan_status": serde_json::Value::Null,
+            "missing_roles": [],
+            "pending_clearances": [],
+            "active_agents": [],
+            "pending_hires": [],
+            "blocked_roles": [],
+            "readiness": "not_planned",
+            "next_action": "Plan a team for this Mandate (mandate.team_plan).",
+        });
+        return match serde_json::to_vec(&body) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("mandate.team_readiness encode: {e}")),
+        };
+    };
+
+    let parse_arr = |s: &str| -> Vec<serde_json::Value> {
+        serde_json::from_str::<Vec<serde_json::Value>>(s).unwrap_or_default()
+    };
+    let proposed_roles: Vec<String> = parse_arr(&plan.proposed_roles)
+        .into_iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    let pending_hires = parse_arr(&plan.pending_hires);
+    let clearance_ids: Vec<String> = parse_arr(&plan.clearance_ids)
+        .into_iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    let denials = parse_arr(&plan.denials);
+
+    // Classify each minted hire by its CURRENT status.
+    let mut active_agents: Vec<serde_json::Value> = Vec::new();
+    let mut pending_hires_out: Vec<serde_json::Value> = Vec::new();
+    let mut missing_roles: Vec<String> = proposed_roles.clone();
+    let mut blocked_roles: Vec<serde_json::Value> = denials.clone();
+    for h in &pending_hires {
+        let role = h.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = h.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if agent_id.is_empty() {
+            continue;
+        }
+        let status = agent_store
+            .get_agent_for_tenant(agent_id, tenant)
+            .ok()
+            .flatten()
+            .map(|p| p.status)
+            .unwrap_or_else(|| "missing".to_string());
+        match status.as_str() {
+            "active" => active_agents.push(serde_json::json!({"role": role, "agent_id": agent_id})),
+            "disabled" | "missing" => {
+                // A rejected / vanished hire leaves the role unstaffed.
+                missing_roles.push(role.to_string());
+                blocked_roles.push(serde_json::json!({
+                    "role": role,
+                    "reason": format!("hire {agent_id} is {status}"),
+                }));
+            }
+            other => pending_hires_out.push(serde_json::json!({
+                "role": role, "agent_id": agent_id, "status": other,
+            })),
+        }
+    }
+
+    // Classify each Clearance by its CURRENT status.
+    let mut pending_clearances: Vec<serde_json::Value> = Vec::new();
+    for cid in &clearance_ids {
+        let status = agent_store
+            .get_approval_record_for_tenant(cid, tenant)
+            .ok()
+            .flatten()
+            .map(|r| r.status.as_wire().to_string())
+            .unwrap_or_else(|| "missing".to_string());
+        if status == "pending" {
+            pending_clearances.push(serde_json::json!({"clearance_id": cid, "status": status}));
+        }
+    }
+
+    let (readiness, next_action): (&str, String) = if !pending_clearances.is_empty() {
+        (
+            "awaiting_clearance",
+            format!(
+                "Greenlight {} pending Clearance(s) to activate the hires.",
+                pending_clearances.len()
+            ),
+        )
+    } else if !pending_hires_out.is_empty() {
+        (
+            "staffing",
+            format!(
+                "Approve {} pending hire(s) (agent.approve_hire).",
+                pending_hires_out.len()
+            ),
+        )
+    } else if !missing_roles.is_empty() {
+        (
+            "staffing",
+            format!(
+                "Staff {} missing role(s) (mandate.team_plan with role:subject_id).",
+                missing_roles.len()
+            ),
+        )
+    } else if !active_agents.is_empty() {
+        (
+            "ready",
+            "Team is active — create Briefs under this Mandate and assign them.".to_string(),
+        )
+    } else {
+        (
+            "staffing",
+            "Add roles to the team (mandate.team_plan).".to_string(),
+        )
+    };
+
+    let body = serde_json::json!({
+        "mandate_id": mandate_id,
+        "planned": true,
+        "plan_id": plan.plan_id,
+        "plan_status": plan.status,
+        "missing_roles": missing_roles,
+        "pending_clearances": pending_clearances,
+        "active_agents": active_agents,
+        "pending_hires": pending_hires_out,
+        "blocked_roles": blocked_roles,
+        "readiness": readiness,
+        "next_action": next_action,
+    });
+    match serde_json::to_vec(&body) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => internal(format!("mandate.team_readiness encode: {e}")),
+    }
+}
+
 /// `brief.clearance_request` — create a real pending Clearance
 /// linked to a Brief. Arg:
 /// `brief_id|agent_id|method|category|reason|ttl_secs?`.
@@ -2140,6 +2311,115 @@ mod tests {
         let m = approved_mandate(&spine);
         let body = ok_body(handle_team_plan_latest(&spine, &fake_ctx(m.as_bytes())));
         assert_eq!(body.trim(), "null");
+    }
+
+    #[test]
+    fn team_readiness_not_planned_until_a_plan_exists() {
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        let body = ok_body(handle_team_readiness(
+            &agents,
+            &spine,
+            &fake_ctx(m.as_bytes()),
+        ));
+        let v: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
+        assert_eq!(v["planned"], false);
+        assert_eq!(v["readiness"], "not_planned");
+    }
+
+    #[test]
+    fn team_readiness_reflects_clearance_approval_activating_the_hire() {
+        // Plan via a founder-route actor → a pending hire + spawn
+        // Clearance. Readiness starts `awaiting_clearance`; approving
+        // the Clearance activates the hire and readiness becomes `ready`.
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        let actor = agents
+            .create_agent(
+                "Prime",
+                "prime",
+                "L",
+                "ops",
+                "ops",
+                "founder",
+                &subject_of(b"planner-seed"),
+                "medium",
+                "default",
+            )
+            .unwrap();
+        agents
+            .update_agent_field(&actor, "can_spawn_agents", "true")
+            .unwrap();
+        let arg = format!("{m}|build|engineer:subj-eng");
+        ok_body(handle_team_plan(
+            &agents,
+            &spine,
+            &fake_ctx_with_role(arg.as_bytes(), "prime", b"planner-seed"),
+        ));
+        // Before deciding: awaiting_clearance with one pending clearance.
+        let before: serde_json::Value = serde_json::from_slice(
+            ok_body(handle_team_readiness(
+                &agents,
+                &spine,
+                &fake_ctx(m.as_bytes()),
+            ))
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(before["readiness"], "awaiting_clearance");
+        assert_eq!(before["pending_clearances"].as_array().unwrap().len(), 1);
+        assert!(before["active_agents"].as_array().unwrap().is_empty());
+        // Approve the spawn Clearance (Founder/operator path).
+        let cid = before["pending_clearances"][0]["clearance_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(matches!(
+            decide(&agents, &cid, "approved"),
+            HandlerOutcome::Ok(_)
+        ));
+        // After: the hire is active → readiness is ready.
+        let after: serde_json::Value = serde_json::from_slice(
+            ok_body(handle_team_readiness(
+                &agents,
+                &spine,
+                &fake_ctx(m.as_bytes()),
+            ))
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(after["readiness"], "ready");
+        assert_eq!(after["active_agents"].as_array().unwrap().len(), 1);
+        assert!(after["pending_clearances"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn team_readiness_is_tenant_isolated() {
+        // A plan in tenant A must not surface as readiness for tenant B.
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = spine
+            .create_mandate("tenant-a", "Ship", "real", None, None)
+            .unwrap();
+        spine.propose_strategy("tenant-a", &m, "plan").unwrap();
+        spine.approve_strategy("tenant-a", &m).unwrap();
+        ok_body(handle_team_plan(
+            &agents,
+            &spine,
+            &fake_ctx_tenant(format!("{m}|grow|planner").as_bytes(), "tenant-a"),
+        ));
+        let b: serde_json::Value = serde_json::from_slice(
+            ok_body(handle_team_readiness(
+                &agents,
+                &spine,
+                &fake_ctx_tenant(m.as_bytes(), "tenant-b"),
+            ))
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(b["planned"], false, "tenant B must not see tenant A's plan");
     }
 
     #[test]

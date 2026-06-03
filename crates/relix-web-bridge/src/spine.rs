@@ -452,6 +452,26 @@ pub async fn team_plan_latest(
     )
 }
 
+/// `GET /v1/spine/mandates/:id/team_readiness` — live team readiness
+/// for a Mandate (plan + current hire/Clearance states). Proxies
+/// `mandate.team_readiness`. Tenant-scoped.
+pub async fn team_readiness(
+    State(state): State<AppState>,
+    Path(mandate_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if mandate_id.trim().is_empty() {
+        return Err(bad("mandate_id required"));
+    }
+    json_passthrough(
+        call_peer(
+            &state,
+            "mandate.team_readiness",
+            mandate_id.trim().as_bytes(),
+        )
+        .await?,
+    )
+}
+
 /// Normalise a Clearance decision into the wire value
 /// `coord.approval.decide` expects. Accepts the product verbs
 /// (`approve`/`reject`) and the raw runtime values
@@ -1064,8 +1084,9 @@ mod tests {
         assert!(SPINE_HTML.contains("/v1/spine/keys/"));
         assert!(SPINE_HTML.contains("/v1/spine/clearances"));
         assert!(SPINE_HTML.contains("/decide"));
-        // Prime team-build action in the Mandate panel.
+        // Prime team-build action + readiness in the Mandate panel.
         assert!(SPINE_HTML.contains("/team_plan"));
+        assert!(SPINE_HTML.contains("/team_readiness"));
     }
 
     /// Build the full spine route table in isolation: matchit panics
@@ -1091,6 +1112,7 @@ mod tests {
                 "/v1/spine/mandates/:id/team_plan",
                 get(team_plan_latest).post(team_plan),
             )
+            .route("/v1/spine/mandates/:id/team_readiness", get(team_readiness))
             .route("/v1/spine/briefs/search", get(brief_search))
             .route("/v1/spine/briefs/:id", get(brief_detail))
             .route("/v1/spine/briefs/:id/wakeups", get(brief_wakeups))

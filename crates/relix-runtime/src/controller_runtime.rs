@@ -3167,6 +3167,18 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // PRIME: live team readiness (plan + current hire/Clearance states).
+    if let Some(spine) = spine_store.clone() {
+        let s = agent_store.clone();
+        bridge.register(
+            "mandate.team_readiness",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let spine = spine.clone();
+                async move { handlers::handle_team_readiness(&s, &spine, &ctx) }
+            })),
+        );
+    }
     {
         let s = agent_store.clone();
         bridge.register(
@@ -9111,6 +9123,11 @@ fn register_node_type_handlers(
             (
                 "mandate.team_plan.latest",
                 "Read the latest persisted Team Plan for a Mandate as JSON (null if never planned). Arg: mandate_id. Tenant-scoped.",
+                &["mandate", "read"],
+            ),
+            (
+                "mandate.team_readiness",
+                "Live team readiness for a Mandate: combines the latest plan with current hire/Clearance states. Arg: mandate_id. Returns {missing_roles, pending_clearances, active_agents, pending_hires, blocked_roles, readiness, next_action}. Tenant-scoped.",
                 &["mandate", "read"],
             ),
             (

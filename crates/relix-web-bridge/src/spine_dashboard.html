@@ -571,21 +571,36 @@ function renderPlan(host, p) {
   host.append(node("div",{textContent:"Clearances: "+((p.clearance_ids||[]).join(", ") || "none")}));
   (p.next_steps||[]).forEach(s => host.append(node("div",{className:"muted",textContent:"→ "+s})));
 }
+function renderReadiness(host, r) {
+  const box = node("div",{className:"event",style:"margin-top:8px"});
+  box.append(node("strong",{textContent:"Readiness: "+(r.readiness||"")}));
+  box.append(node("div",{textContent:"Active: "+((r.active_agents||[]).map(a=>a.role).join(", ") || "none")}));
+  box.append(node("div",{textContent:"Pending hires: "+((r.pending_hires||[]).map(h=>h.role+" ("+h.status+")").join(", ") || "none")}));
+  box.append(node("div",{textContent:"Pending clearances: "+((r.pending_clearances||[]).length || 0)}));
+  box.append(node("div",{textContent:"Missing roles: "+((r.missing_roles||[]).join(", ") || "none")}));
+  if ((r.blocked_roles||[]).length) box.append(node("div",{className:"err",textContent:"Blocked: "+r.blocked_roles.map(b=>b.role+" ("+b.reason+")").join(", ")}));
+  box.append(node("div",{className:"muted",textContent:"→ "+(r.next_action||"")}));
+  host.append(box);
+}
 async function teamPlanBlock(mandateId) {
   // Prime team-build foundation (governed): requires an approved
   // strategy + the actor's spawn Key. Roles is a CSV of `role` or
   // `role:subject_id`; only identified roles mint a pending hire.
   const block = node("div",{className:"prop"},[node("div",{className:"label",textContent:"Plan team"})]);
-  // The persisted latest plan, if any.
+  // The persisted latest plan + live readiness, if any.
   const persisted = node("div");
   try {
-    const latest = await api("/v1/spine/mandates/"+encodeURIComponent(mandateId)+"/team_plan");
+    const [latest, ready] = await Promise.all([
+      api("/v1/spine/mandates/"+encodeURIComponent(mandateId)+"/team_plan"),
+      api("/v1/spine/mandates/"+encodeURIComponent(mandateId)+"/team_readiness").catch(()=>null),
+    ]);
     if (latest) {
       persisted.append(node("div",{className:"muted",style:"font-size:12px",textContent:"Latest plan: "+(latest.status||"")+" ("+(latest.plan_id||"")+")"}));
       renderPlan(persisted, latest);
     } else {
       persisted.append(node("div",{className:"muted",textContent:"No team plan yet."}));
     }
+    if (ready && ready.planned) renderReadiness(persisted, ready);
   } catch(e) { persisted.append(node("div",{className:"err",textContent:e.message})); }
   block.append(persisted);
   const desc = node("input",{placeholder:"goal / team description"});
