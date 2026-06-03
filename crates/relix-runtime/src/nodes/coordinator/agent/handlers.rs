@@ -154,6 +154,65 @@ pub fn handle_delete(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome 
     }
 }
 
+// ── org tree (Roster / Lattice) reads ────────────────────
+
+/// `agent.reports` — the Operatives directly reporting to `agent_id`
+/// (the Roster children, one level down). Arg: agent_id. Returns one
+/// agent_id per line.
+pub fn handle_reports(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("agent.reports utf8: {e}")),
+    };
+    if id.is_empty() {
+        return invalid("agent.reports: agent_id required".into());
+    }
+    match store.list_direct_reports(id) {
+        Ok(rows) => HandlerOutcome::Ok(
+            rows.into_iter()
+                .map(|a| a.agent_id)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into_bytes(),
+        ),
+        Err(e) => internal(format!("agent.reports: {e}")),
+    }
+}
+
+/// `agent.branch` — every Operative at or below `agent_id` (the
+/// manager's Branch / subtree, excluding the manager itself). The
+/// delegated-authority scope. Arg: agent_id. One agent_id per line.
+pub fn handle_branch(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("agent.branch utf8: {e}")),
+    };
+    if id.is_empty() {
+        return invalid("agent.branch: agent_id required".into());
+    }
+    match store.manager_subtree(id) {
+        Ok(ids) => HandlerOutcome::Ok(ids.join("\n").into_bytes()),
+        Err(e) => internal(format!("agent.branch: {e}")),
+    }
+}
+
+/// `agent.line` — the escalation path up from `agent_id` to the apex
+/// (the Line / chain of command), nearest boss first. Arg: agent_id.
+/// One agent_id per line; empty when the agent is the apex.
+pub fn handle_line(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("agent.line utf8: {e}")),
+    };
+    if id.is_empty() {
+        return invalid("agent.line: agent_id required".into());
+    }
+    match store.chain_of_command(id) {
+        Ok(ids) => HandlerOutcome::Ok(ids.join("\n").into_bytes()),
+        Err(e) => internal(format!("agent.line: {e}")),
+    }
+}
+
 // ── agent.effective_capabilities ─────────────────────────
 
 /// Wire arg: `agent_id|peer_alias`. The handler reaches into the

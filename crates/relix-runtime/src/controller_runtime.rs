@@ -3142,6 +3142,37 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // PHASE 2 (org tree): Roster / Lattice reads over reports_to.
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.reports",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_reports(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.branch",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_branch(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.line",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_line(&s, &ctx) }
+            })),
+        );
+    }
     {
         let s = agent_store.clone();
         bridge.register(
@@ -8674,6 +8705,21 @@ fn register_node_type_handlers(
                 "agent.delete",
                 "Soft delete: flip the profile's status to `disabled`.",
                 &["agent", "mutate"],
+            ),
+            (
+                "agent.reports",
+                "Org tree: the Operatives directly reporting to an agent (the Roster children). Arg: agent_id. One agent_id per line.",
+                &["agent", "read"],
+            ),
+            (
+                "agent.branch",
+                "Org tree: every Operative at or below an agent (the manager's Branch / subtree). Arg: agent_id. One agent_id per line.",
+                &["agent", "read"],
+            ),
+            (
+                "agent.line",
+                "Org tree: the escalation path up from an agent to the apex (the Line / chain of command). Arg: agent_id. One agent_id per line, nearest boss first.",
+                &["agent", "read"],
             ),
             (
                 "agent.effective_capabilities",
