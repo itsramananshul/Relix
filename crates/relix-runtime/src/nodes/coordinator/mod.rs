@@ -1029,6 +1029,40 @@ impl TaskStore {
         Ok(())
     }
 
+    /// PHASE 5 (board): Briefs whose title contains `query`
+    /// (case-insensitive substring), newest first. The `%`/`_`
+    /// wildcards in `query` are escaped so it's a literal search.
+    /// Empty `query` → empty result.
+    pub fn search_briefs(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lim = limit.clamp(1, self.max_list) as i64;
+        // Escape LIKE metacharacters so the query is taken literally.
+        let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, title, board_status, priority,
+                        assignee_agent_id, mandate_id, campaign_id
+                 FROM tasks WHERE title LIKE ?1 ESCAPE '\\'
+                 ORDER BY updated_at DESC LIMIT ?2",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![pattern, lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// PHASE 5 (board): the Briefs carrying `label` (CSV-column
     /// membership), newest first. Empty `label` → empty result.
     /// (Labels with SQL `LIKE` wildcards aren't expected; set_labels
@@ -5745,6 +5779,16 @@ pub fn register(
     {
         let s = store.clone();
         bridge.register(
+            "brief.search",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_search(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
             "brief.detail",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -6891,6 +6935,35 @@ fn handle_brief_set_labels(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOut
     match store.set_brief_labels(task, &labels) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.set_labels", e),
+    }
+}
+
+/// `brief.search` — Briefs whose title contains the query (JSON
+/// cards). Arg `query|limit` (limit default 50). Literal substring
+/// (wildcards escaped).
+fn handle_brief_search(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.search utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    let query = parts.first().copied().unwrap_or("").trim();
+    if query.is_empty() {
+        return invalid("brief.search: query required".to_string());
+    }
+    let limit: usize = parts
+        .get(1)
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    match store.search_briefs(query, limit) {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.search encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.search", e),
     }
 }
 
@@ -10296,6 +10369,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload, "todo -> in_progress");
+    }
+
+    #[test]
+    fn search_briefs_matches_title_substring_literally() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        let a = mk("Ship the auth rewrite");
+        let b = mk("Auth bug in login");
+        let _c = mk("Unrelated billing work");
+        // 50% literal — must NOT act as a wildcard.
+        let pct = mk("Migrate 50% of traffic");
+
+        let ids: std::collections::HashSet<String> = s
+            .search_briefs("auth", 50)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.task_id)
+            .collect();
+        assert!(ids.contains(&a) && ids.contains(&b));
+        assert_eq!(ids.len(), 2);
+
+        // The '%' is escaped → literal match, not "match anything".
+        let pcts: Vec<String> = s
+            .search_briefs("50%", 50)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.task_id)
+            .collect();
+        assert_eq!(pcts, vec![pct]);
+
+        // Empty query → empty result.
+        assert!(s.search_briefs("  ", 50).unwrap().is_empty());
     }
 
     #[test]
