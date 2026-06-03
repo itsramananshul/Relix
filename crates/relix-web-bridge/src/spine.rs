@@ -266,6 +266,134 @@ pub async fn brief_search(
     json_passthrough(call_peer(&state, "brief.search", arg.as_bytes()).await?)
 }
 
+/// `GET /v1/spine/unassigned?limit=` — Briefs in an active column
+/// with no assignee (the Desk's "needs staffing" list).
+pub async fn unassigned(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let arg = q.limit.unwrap_or(50).to_string();
+    json_passthrough(call_peer(&state, "brief.unassigned", arg.as_bytes()).await?)
+}
+
+/// `GET /v1/spine/briefs/:id/events?limit=` — a single Brief's
+/// Chronicle (newest first), as a JSON array. Bounded by `limit`.
+pub async fn brief_events(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ListQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let limit = q.limit.unwrap_or(200).min(500);
+    // task.events arg: task_id|after_id|limit|type|order
+    let arg = format!("{id}|0|{limit}||desc");
+    let raw = call_peer(&state, "task.events", arg.as_bytes()).await?;
+    json_value(parse_event_lines(&raw))
+}
+
+/// `GET /v1/spine/inbox?limit=` — a single Desk/Inbox payload: the
+/// real "needs attention" surfaces (blocked, stale, overdue, in
+/// review, unassigned) in one bounded response. Each section is a
+/// JSON array of Brief cards; no fabricated data, no counters.
+pub async fn inbox(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let limit = q.limit.unwrap_or(25).min(100);
+    let blocked = call_peer(&state, "brief.blocked_list", limit.to_string().as_bytes()).await?;
+    let stale = call_peer(
+        &state,
+        "brief.stale_list",
+        format!("86400|{limit}").as_bytes(),
+    )
+    .await?;
+    let overdue = call_peer(&state, "brief.overdue", format!("|{limit}").as_bytes()).await?;
+    let review = call_peer(
+        &state,
+        "brief.board",
+        format!("in_review|{limit}").as_bytes(),
+    )
+    .await?;
+    let unassigned = call_peer(&state, "brief.unassigned", limit.to_string().as_bytes()).await?;
+    let body = serde_json::json!({
+        "blocked": parse_json(&blocked),
+        "stale": parse_json(&stale),
+        "overdue": parse_json(&overdue),
+        "review": parse_json(&review),
+        "unassigned": parse_json(&unassigned),
+    });
+    json_value(body)
+}
+
+/// `GET /v1/spine/briefs/:id/thread?limit=` — the Brief live work
+/// thread in one payload: the full detail (fields, snags, sub-briefs,
+/// parents, dossiers, labels, due, pinned, blocked), the Chronicle
+/// timeline (newest first, bounded), the wakeup ledger, and the
+/// current Claim holder. Composes existing capabilities; no new
+/// runtime logic, no fabricated data.
+pub async fn brief_thread(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ListQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let limit = q.limit.unwrap_or(100).min(500);
+    // `brief.detail` errors (not found) propagate, so a bad id 404s.
+    let detail = call_peer(&state, "brief.detail", id.as_bytes()).await?;
+    let events = call_peer(
+        &state,
+        "task.events",
+        format!("{id}|0|{limit}||desc").as_bytes(),
+    )
+    .await
+    .unwrap_or_default();
+    let wakeups = call_peer(&state, "brief.wakeups", format!("{id}|50").as_bytes())
+        .await
+        .unwrap_or_default();
+    let claim = call_peer(&state, "brief.claim_holder", id.as_bytes())
+        .await
+        .unwrap_or_default();
+    let body = serde_json::json!({
+        "detail": parse_json(&detail),
+        "events": parse_event_lines(&events),
+        "wakeups": parse_json(&wakeups),
+        "claim": parse_json(&claim),
+    });
+    json_value(body)
+}
+
+// ── composite helpers ─────────────────────────────────────
+
+/// Parse a JSON mesh body into a `Value`; empty / unparseable → Null.
+fn parse_json(body: &[u8]) -> serde_json::Value {
+    if body.is_empty() {
+        return serde_json::Value::Null;
+    }
+    serde_json::from_slice(body).unwrap_or(serde_json::Value::Null)
+}
+
+/// Parse `task.events`' newline-delimited JSON objects into an array.
+fn parse_event_lines(body: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(body);
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    serde_json::Value::Array(rows)
+}
+
+/// Serialize a composed `Value` into a JSON `200` response.
+fn json_value(v: serde_json::Value) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    match serde_json::to_vec(&v) {
+        Ok(b) => json_passthrough(b),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("encode: {e}"),
+            }),
+        )),
+    }
+}
+
 // ── write routes ──────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -639,6 +767,26 @@ mod tests {
         assert_eq!(body.0.error, "q required");
     }
 
+    #[test]
+    fn parse_json_is_null_safe() {
+        // Real JSON parses; empty and garbage degrade to null so the
+        // composite payload is always well-formed.
+        assert_eq!(parse_json(br#"[1,2]"#), serde_json::json!([1, 2]));
+        assert_eq!(parse_json(b""), serde_json::Value::Null);
+        assert_eq!(parse_json(b"not json"), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn parse_event_lines_builds_array_and_skips_blanks() {
+        // task.events is newline-delimited JSON objects; the composite
+        // turns it into a real array and drops blank / unparseable lines.
+        let body = b"{\"id\":1}\n\n{\"id\":2}\ngarbage\n";
+        let got = parse_event_lines(body);
+        assert_eq!(got, serde_json::json!([{"id":1},{"id":2}]));
+        // An empty body is an empty array, never null.
+        assert_eq!(parse_event_lines(b""), serde_json::json!([]));
+    }
+
     #[tokio::test]
     async fn spine_page_is_html_with_inline_csp() {
         let resp = page().await;
@@ -703,6 +851,10 @@ mod tests {
             .route("/v1/spine/blocked", get(blocked))
             .route("/v1/spine/stale", get(stale))
             .route("/v1/spine/unblocked", get(unblocked))
+            .route("/v1/spine/unassigned", get(unassigned))
+            .route("/v1/spine/inbox", get(inbox))
+            .route("/v1/spine/briefs/:id/events", get(brief_events))
+            .route("/v1/spine/briefs/:id/thread", get(brief_thread))
             .route("/v1/spine/briefs", post(create_brief))
             .route("/v1/spine/briefs/:id/move", post(move_brief))
             .route("/v1/spine/briefs/:id/pin", post(pin_brief))

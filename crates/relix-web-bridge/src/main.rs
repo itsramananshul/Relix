@@ -517,6 +517,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/blocked", get(spine::blocked))
         .route("/v1/spine/stale", get(spine::stale))
         .route("/v1/spine/unblocked", get(spine::unblocked))
+        .route("/v1/spine/unassigned", get(spine::unassigned))
+        // Composite Desk/Inbox + Brief live-thread payloads.
+        .route("/v1/spine/inbox", get(spine::inbox))
+        .route("/v1/spine/briefs/:id/events", get(spine::brief_events))
+        .route("/v1/spine/briefs/:id/thread", get(spine::brief_thread))
         // Product-spine dashboard write actions.
         .route("/v1/spine/briefs", post(spine::create_brief))
         .route("/v1/spine/briefs/:id/move", post(spine::move_brief))
