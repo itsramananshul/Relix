@@ -1206,6 +1206,25 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// PHASE 5 (companion / board): Brief counts across all board
+    /// columns — the board-at-a-glance the chat companion reads for
+    /// context and the dashboard header shows.
+    pub fn board_summary(&self) -> Result<Vec<(String, i64)>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT board_status, COUNT(*) FROM tasks
+                 GROUP BY board_status ORDER BY board_status",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// Insert a new Task. Returns the freshly-minted `task_id`
     /// (32 hex chars). Optional retry / timeout metadata defaults to
     /// "no retry, no timeout" for backwards compatibility with pre-C1
@@ -5215,6 +5234,17 @@ pub fn register(
             })),
         );
     }
+    {
+        // PHASE 5 (companion): the board-at-a-glance counts.
+        let s = store.clone();
+        bridge.register(
+            "brief.board_summary",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_board_summary(&s, &ctx) }
+            })),
+        );
+    }
     // PHASE 2 (Desk): blocked + stale work surfaces.
     {
         let s = store.clone();
@@ -6438,6 +6468,16 @@ fn handle_mandate_progress(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOut
     match store.mandate_brief_counts(id) {
         Ok(counts) => counts_to_json(counts),
         Err(e) => map_edge_err("mandate.progress", e),
+    }
+}
+
+/// `brief.board_summary` — Brief counts across all board columns (+
+/// `total`). No args. The board-at-a-glance for the companion /
+/// dashboard.
+fn handle_brief_board_summary(store: &TaskStore, _ctx: &InvocationCtx) -> HandlerOutcome {
+    match store.board_summary() {
+        Ok(counts) => counts_to_json(counts),
+        Err(e) => map_edge_err("brief.board_summary", e),
     }
 }
 
@@ -9402,6 +9442,28 @@ mod tests {
         let inprog = s.list_briefs_by_board(Some("in_progress"), 50).unwrap();
         assert_eq!(inprog[0].priority, "high");
         assert_eq!(inprog[0].assignee_agent_id.as_deref(), Some("agt_x"));
+    }
+
+    #[test]
+    fn board_summary_counts_all_columns() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        let _a = mk("a"); // backlog
+        let b = mk("b");
+        let c = mk("c");
+        s.set_board_status(&b, "todo").unwrap();
+        s.set_board_status(&c, "todo").unwrap();
+        s.set_board_status(&c, "in_progress").unwrap();
+
+        let map: std::collections::HashMap<String, i64> =
+            s.board_summary().unwrap().into_iter().collect();
+        assert_eq!(map.get("backlog"), Some(&1));
+        assert_eq!(map.get("todo"), Some(&1));
+        assert_eq!(map.get("in_progress"), Some(&1));
+        assert_eq!(map.values().sum::<i64>(), 3);
     }
 
     #[test]
