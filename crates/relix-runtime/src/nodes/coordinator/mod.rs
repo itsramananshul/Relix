@@ -652,6 +652,17 @@ impl TaskStore {
             params![task_id, edge_type, related, now],
         )
         .map_err(CoordinatorError::Db)?;
+        // Chronicle the relation on the Brief.
+        let event_type = if edge_type == "blocked_on" {
+            "brief.snagged"
+        } else {
+            "brief.subbrief_added"
+        };
+        let _ = conn.execute(
+            "INSERT INTO task_events (task_id, ts, event_type, payload)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![task_id, now, event_type, related],
+        );
         Ok(())
     }
 
@@ -707,6 +718,11 @@ impl TaskStore {
             params![doc_id, task_id, kind.trim(), title.trim(), body, now],
         )
         .map_err(CoordinatorError::Db)?;
+        let _ = conn.execute(
+            "INSERT INTO task_events (task_id, ts, event_type, payload)
+             VALUES (?1, ?2, 'brief.dossier_added', ?3)",
+            params![task_id, now, format!("{}: {}", kind.trim(), title.trim())],
+        );
         Ok(doc_id)
     }
 
@@ -9163,6 +9179,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload, "todo -> in_progress");
+    }
+
+    #[test]
+    fn relations_and_dossiers_are_chronicled() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        let p = mk("p");
+        let c = mk("c");
+        let b = mk("b");
+        s.link_subbrief(&p, &c).unwrap();
+        s.add_snag(&p, &b).unwrap();
+        s.add_dossier(&p, "plan", "The Plan", "body").unwrap();
+
+        let conn = s.conn.lock().unwrap();
+        let count = |et: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM task_events WHERE task_id = ?1 AND event_type = ?2",
+                params![p, et],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count("brief.subbrief_added"), 1);
+        assert_eq!(count("brief.snagged"), 1);
+        assert_eq!(count("brief.dossier_added"), 1);
     }
 
     #[test]
