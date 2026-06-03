@@ -468,15 +468,21 @@ pub fn gemini_rig() -> ProcessRig {
 }
 
 /// An installed **Hermes** agent, plugged in as a Rig (Pillar 2 —
-/// the deepest "plug in any agent" target). Spawns the `hermes`
-/// binary with the prompt on stdin. Declared `PerToolCall`:
-/// Hermes is a rich agent that surfaces its tool calls, so Relix
-/// governs it more deeply than a black-box CLI — the dispatcher can
-/// give it a looser sandbox and lean on per-tool gating + the
-/// scoped bridge-back token.
+/// the deepest "plug in any agent" target).
+///
+/// IMPORTANT: this is a **stdio placeholder**, governed `BoxLevel`.
+/// A plain process over stdin/stdout is a black box — Relix can only
+/// gate it at the box wall, so per the adapters §6 invariant
+/// ("governance reflects what Relix can actually gate") it must be
+/// `BoxLevel`, NOT `PerToolCall`. The *real* Hermes adapter the docs
+/// describe (relix-hermes-integration §2.2: the structured `/v1/runs`
+/// HTTP seam + gated tools over MCP + the `relix-bridge` in-Hermes
+/// plugin with `pre_tool_call`/`pre_approval` hooks) is what earns
+/// `PerToolCall`; it is not built yet. Do not relabel this stdio
+/// path as `PerToolCall` until that rich transport exists.
 pub fn hermes_rig() -> ProcessRig {
     ProcessRig::new("hermes", "hermes", vec!["run".to_string(), "-".to_string()])
-        .with_governance(RigGovernance::PerToolCall)
+    // governance left at the conservative BoxLevel default (see above)
 }
 
 /// Register the standard CLI subscription Rigs into `registry`.
@@ -631,11 +637,12 @@ mod tests {
 
         assert_eq!(gemini_rig().name(), "gemini");
 
-        // Hermes is the deep adapter — rich governance.
+        // Hermes stdio placeholder: BoxLevel until the real
+        // /v1/runs+MCP+plugin seam (which earns PerToolCall) is built.
         let h = hermes_rig();
         assert_eq!(h.name(), "hermes");
         assert_eq!(h.program(), "hermes");
-        assert_eq!(h.governance(), RigGovernance::PerToolCall);
+        assert_eq!(h.governance(), RigGovernance::BoxLevel);
     }
 
     #[test]
