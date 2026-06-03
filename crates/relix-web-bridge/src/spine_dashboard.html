@@ -208,13 +208,34 @@ function render() {
   if (state.view === "chat") return renderChat(view);
   view.append(node("div",{className:"empty",textContent:"This surface is scaffolded. The object model exists; detailed tabs land next."}));
 }
-function renderInbox(host) {
-  const blocked = state.board.blocked || [];
-  const review = state.board.in_review || [];
-  const stale = (state.board.in_progress || []).filter(x => !x.assignee_agent_id);
-  const rows = [...blocked, ...review, ...stale];
-  if (!rows.length) return host.append(node("div",{className:"empty",textContent:"No operator action needed."}));
-  renderList(host, rows);
+async function renderInbox(host) {
+  host.append(node("div",{className:"muted",textContent:"Loading desk..."}));
+  let inbox;
+  try { inbox = await api("/v1/spine/inbox?limit=25"); }
+  catch(e) { host.innerHTML = ""; return host.append(node("div",{className:"err",textContent:e.message})); }
+  host.innerHTML = "";
+  const sections = [
+    ["Blocked", inbox.blocked, "Halted on an unresolved Snag."],
+    ["Stale", inbox.stale, "Active Briefs idle over a day."],
+    ["Overdue", inbox.overdue, "Past the due date."],
+    ["In review", inbox.review, "Awaiting reviewer sign-off."],
+    ["Unassigned", inbox.unassigned, "Active Briefs with no Operative."],
+  ];
+  const total = sections.reduce((n, [,rows]) => n + (rows || []).length, 0);
+  $("#inboxBadge").textContent = total;
+  if (!total) return host.append(node("div",{className:"empty",textContent:"Desk is clear — no Briefs need attention."}));
+  for (const [title, rows, hint] of sections) inboxSection(host, title, rows || [], hint);
+}
+function inboxSection(host, title, rows, hint) {
+  if (!rows.length) return;
+  const sec = node("section",{style:"margin-bottom:16px"});
+  sec.append(node("div",{className:"toolbar",style:"margin-bottom:8px"},[
+    node("strong",{textContent:title}),
+    node("span",{className:"badge",textContent:String(rows.length)}),
+    node("span",{className:"muted",style:"font-size:12px",textContent:hint}),
+  ]));
+  renderList(sec, rows);
+  host.append(sec);
 }
 function renderBoard(host, columns) {
   const board = node("div",{className:"board"}); host.append(board);
@@ -387,21 +408,42 @@ async function openIssue(id) {
   state.selected = id;
   const side = $("#sideBody"); side.innerHTML = '<div class="muted">Loading...</div>';
   try {
-    const d = await api("/v1/spine/briefs/"+encodeURIComponent(id));
-    const wakes = await api("/v1/spine/briefs/"+encodeURIComponent(id)+"/wakeups?limit=6").catch(()=>[]);
+    const t = await api("/v1/spine/briefs/"+encodeURIComponent(id)+"/thread?limit=60");
+    const d = t.detail || {};
     const f = d.fields || {};
     side.innerHTML = "";
     side.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"Issue"}), node("strong",{textContent:f.human_ref || f.task_id || id}), node("div",{className:"muted mono",textContent:f.task_id || id})]));
+    side.append(claimBlock(t.claim));
     side.append(fieldSelect(id, "status", f.board_status, COLUMNS, v => post("/v1/spine/briefs/"+id+"/move", {status:v})));
     side.append(fieldSelect(id, "priority", f.priority, ["low","normal","high","urgent"], v => post("/v1/spine/briefs/"+id+"/set", {field:"priority", value:v})));
     side.append(fieldInput(id, "assignee", f.assignee_agent_id || "", v => post("/v1/spine/briefs/"+id+"/set", {field:"assignee", value:v})));
     side.append(fieldInput(id, "reviewer", f.reviewer_agent_id || "", v => post("/v1/spine/briefs/"+id+"/set", {field:"reviewer", value:v})));
-    side.append(wakeupBlock(wakes || []));
+    side.append(wakeupBlock(t.wakeups || []));
     side.append(threadBlock("Blockers", d.snags || []));
     side.append(threadBlock("Sub-issues", d.subbriefs || []));
+    side.append(chronicleBlock(t.events || []));
     const text = node("textarea",{rows:3,placeholder:"Comment"});
-    side.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"Thread"}), text, node("button",{style:"margin-top:6px",textContent:"Post",onclick:async()=>{ await post("/v1/spine/briefs/"+id+"/comment", {author:"operator", text:text.value}); text.value=""; }} )]));
+    side.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"Comment"}), text, node("button",{style:"margin-top:6px",textContent:"Post",onclick:async()=>{ await post("/v1/spine/briefs/"+id+"/comment", {author:"operator", text:text.value}); text.value=""; await openIssue(id); }} )]));
   } catch(e) { side.innerHTML = '<div class="err">'+e.message+'</div>'; }
+}
+function claimBlock(claim) {
+  const block = node("div",{className:"prop"},[node("div",{className:"label",textContent:"Claim"})]);
+  if (!claim || !claim.holder) { block.append(node("div",{className:"muted",textContent:"Unclaimed"})); return block; }
+  const when = claim.expires_at ? new Date(claim.expires_at * 1000).toLocaleString() : "";
+  block.append(node("div",{className:"event"},[node("strong",{textContent:"@"+claim.holder}), node("div",{className:"muted",textContent:when ? "lease until "+when : ""})]));
+  return block;
+}
+function chronicleBlock(events) {
+  const block = node("div",{className:"prop"},[node("div",{className:"label",textContent:"Chronicle"})]);
+  if (!events.length) { block.append(node("div",{className:"muted",textContent:"No events yet."})); return block; }
+  const stream = node("div",{className:"thread"});
+  events.forEach(ev => stream.append(node("div",{className:"event"},[
+    node("strong",{textContent:ev.type || ""}),
+    node("div",{textContent:ev.payload || ""}),
+    node("div",{className:"mono muted",textContent:(ev.ts ? new Date(ev.ts * 1000).toLocaleString() : "") + (ev.id != null ? "  #"+ev.id : "")}),
+  ])));
+  block.append(stream);
+  return block;
 }
 async function openAgent(id) {
   const side = $("#sideBody"); side.innerHTML = '<div class="muted">Loading...</div>';
@@ -418,7 +460,23 @@ async function openAgent(id) {
     side.append(agentToggle(id, "timer wake", !!a.wake_on_timer, "wake_on_timer"));
     side.append(agentToggle(id, "on-demand wake", !!a.wake_on_demand, "wake_on_demand"));
     side.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"Allowed categories"}), node("div",{className:"event",textContent:(a.allow_categories || []).join(", ") || "default deny"})]));
+    side.append(await deskBlock(id, a));
   } catch(e) { side.innerHTML = '<div class="err">'+e.message+'</div>'; }
+}
+async function deskBlock(id, a) {
+  const block = node("div",{className:"prop"},[node("div",{className:"label",textContent:"Desk"})]);
+  const cap = a.monthly_allowance_cents != null ? Number(a.monthly_allowance_cents) : null;
+  block.append(node("div",{className:"muted",style:"margin-bottom:6px;font-size:12px",textContent:"Allowance "+(cap == null || cap === 0 ? "0 (hard-stop)" : moneyCents(cap)+" / mo")+" · Rig "+(a.rig || "unset")}));
+  let rows;
+  try { rows = await api("/v1/spine/desk/"+encodeURIComponent(id)+"?limit=50"); }
+  catch(e) { block.append(node("div",{className:"err",textContent:e.message})); return block; }
+  rows = rows || [];
+  if (!rows.length) { block.append(node("div",{className:"muted",textContent:"No active Briefs."})); return block; }
+  rows.forEach(b => block.append(node("div",{className:"event",style:"cursor:pointer",onclick:()=>openIssue(b.task_id)},[
+    node("strong",{textContent:b.title || b.task_id}),
+    node("div",{className:"muted",textContent:(b.board_status || "")+(b.priority && b.priority !== "normal" ? " · "+b.priority : "")}),
+  ])));
+  return block;
 }
 async function openMandate(id) {
   const side = $("#sideBody"); side.innerHTML = '<div class="muted">Loading...</div>';

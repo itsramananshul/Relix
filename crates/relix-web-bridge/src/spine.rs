@@ -821,6 +821,10 @@ mod tests {
         assert!(SPINE_HTML.contains("/v1/spine/mandates"));
         assert!(SPINE_HTML.contains("/v1/spine/companion"));
         assert!(SPINE_HTML.contains("/v1/tasks/events/recent"));
+        // Desk/Inbox + Brief live-thread composites the page now drives.
+        assert!(SPINE_HTML.contains("/v1/spine/inbox"));
+        assert!(SPINE_HTML.contains("/thread"));
+        assert!(SPINE_HTML.contains("/v1/spine/desk/"));
     }
 
     /// Build the full spine route table in isolation: matchit panics
