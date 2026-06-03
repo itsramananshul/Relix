@@ -539,6 +539,15 @@ impl TaskStore {
             params![to, now, task_id],
         )
         .map_err(CoordinatorError::Db)?;
+        // Record the move on the Brief's chronicle (skip no-ops).
+        if from != to {
+            conn.execute(
+                "INSERT INTO task_events (task_id, ts, event_type, payload)
+                 VALUES (?1, ?2, 'brief.board_moved', ?3)",
+                params![task_id, now, format!("{from} -> {to}")],
+            )
+            .map_err(CoordinatorError::Db)?;
+        }
         Ok((from, to.to_string()))
     }
 
@@ -9112,6 +9121,48 @@ mod tests {
             s.set_board_status("nope", "todo"),
             Err(CoordinatorError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn board_move_records_a_chronicle_event() {
+        let s = store();
+        let id = s
+            .create(
+                "b",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        s.set_board_status(&id, "todo").unwrap();
+        s.set_board_status(&id, "in_progress").unwrap();
+        // Idempotent no-op records nothing.
+        s.set_board_status(&id, "in_progress").unwrap();
+
+        let conn = s.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_events
+                 WHERE task_id = ?1 AND event_type = 'brief.board_moved'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2, "two real moves → two chronicle events");
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM task_events
+                 WHERE task_id = ?1 AND event_type = 'brief.board_moved'
+                 ORDER BY event_id DESC LIMIT 1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(payload, "todo -> in_progress");
     }
 
     #[test]
