@@ -164,6 +164,10 @@ pub trait Rig: Send + Sync {
 #[derive(Clone, Default)]
 pub struct RigRegistry {
     rigs: BTreeMap<String, Arc<dyn Rig>>,
+    /// The Guild-default Rig name, used when an Operative has no Rig
+    /// of its own. `None` = no default (unconfigured agents don't
+    /// dispatch).
+    default_name: Option<String>,
 }
 
 impl RigRegistry {
@@ -184,9 +188,39 @@ impl RigRegistry {
         self.rigs.insert(rig.name().to_string(), rig);
     }
 
+    /// Set the Guild-default Rig name (builder style). An Operative
+    /// with no Rig of its own resolves to this one.
+    pub fn with_default(mut self, name: impl Into<String>) -> Self {
+        self.default_name = Some(name.into());
+        self
+    }
+
+    /// Set / clear the Guild-default Rig name.
+    pub fn set_default(&mut self, name: Option<String>) {
+        self.default_name = name;
+    }
+
+    /// The configured default Rig name, if any.
+    pub fn default_name(&self) -> Option<&str> {
+        self.default_name.as_deref()
+    }
+
     /// Look up a Rig by name.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Rig>> {
         self.rigs.get(name).cloned()
+    }
+
+    /// Resolve the Rig to run for an Operative: its `preferred` Rig
+    /// if set and known, else the Guild default. `None` when neither
+    /// resolves — the Brief is left for the Desk. This is the
+    /// dispatcher's single resolution point.
+    pub fn resolve(&self, preferred: Option<&str>) -> Option<Arc<dyn Rig>> {
+        if let Some(name) = preferred.filter(|s| !s.is_empty()) {
+            if let Some(rig) = self.get(name) {
+                return Some(rig);
+            }
+        }
+        self.default_name.as_deref().and_then(|d| self.get(d))
     }
 
     /// All registered Rig names, sorted.
@@ -594,6 +628,26 @@ mod tests {
             }
             _ => panic!("expected Done"),
         }
+    }
+
+    #[test]
+    fn resolve_prefers_the_agents_rig_then_falls_back_to_default() {
+        let reg = RigRegistry::with_builtins().with_default("echo");
+        assert_eq!(reg.default_name(), Some("echo"));
+
+        // Preferred + known → that Rig.
+        assert_eq!(reg.resolve(Some("echo")).unwrap().name(), "echo");
+        // Preferred but unknown → fall back to default.
+        assert_eq!(reg.resolve(Some("ghost")).unwrap().name(), "echo");
+        // None / empty preferred → default.
+        assert_eq!(reg.resolve(None).unwrap().name(), "echo");
+        assert_eq!(reg.resolve(Some("")).unwrap().name(), "echo");
+
+        // No default configured → unknown/none resolves to nothing.
+        let bare = RigRegistry::with_builtins();
+        assert!(bare.resolve(Some("ghost")).is_none());
+        assert!(bare.resolve(None).is_none());
+        assert_eq!(bare.resolve(Some("echo")).unwrap().name(), "echo");
     }
 
     #[test]

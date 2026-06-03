@@ -8676,6 +8676,14 @@ fn register_node_type_handlers(
         let rig_registry = std::sync::Arc::new({
             let mut r = crate::rig::RigRegistry::with_builtins();
             crate::rig::register_cli_rigs(&mut r);
+            // Optional Guild-default Rig so an Operative with no Rig
+            // of its own still dispatches (opt-in via env).
+            if let Ok(d) = std::env::var("RELIX_DEFAULT_RIG") {
+                let d = d.trim();
+                if !d.is_empty() {
+                    r.set_default(Some(d.to_string()));
+                }
+            }
             r
         });
         {
@@ -8766,8 +8774,9 @@ fn register_node_type_handlers(
                             Some(&bt),
                             |card| {
                                 let assignee = card.assignee_agent_id.as_deref()?;
-                                let rig_name = ags.get_agent(assignee).ok().flatten()?.rig?;
-                                reg.get(&rig_name)
+                                let preferred =
+                                    ags.get_agent(assignee).ok().flatten().and_then(|a| a.rig);
+                                reg.resolve(preferred.as_deref())
                             },
                             |card| ts.compose_brief_prompt(&card.task_id, 10),
                         )
