@@ -267,7 +267,14 @@ pub struct ProcessRig {
     name: String,
     program: String,
     args: Vec<String>,
+    /// Cap on the child's captured stdout (the result summary), so a
+    /// runaway CLI can't flood the dispatch path / context.
+    max_output_bytes: usize,
 }
+
+/// Default stdout cap for a process Rig — generous enough for a real
+/// agent's final answer, bounded enough to stop a firehose.
+pub const DEFAULT_RIG_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
 impl ProcessRig {
     pub fn new(
@@ -279,7 +286,15 @@ impl ProcessRig {
             name: name.into(),
             program: program.into(),
             args,
+            max_output_bytes: DEFAULT_RIG_MAX_OUTPUT_BYTES,
         }
+    }
+
+    /// Cap the captured stdout to `n` bytes (truncated on a char
+    /// boundary). Clamped to at least 1.
+    pub fn with_max_output_bytes(mut self, n: usize) -> Self {
+        self.max_output_bytes = n.max(1);
+        self
     }
 
     /// The program this Rig spawns.
@@ -290,6 +305,11 @@ impl ProcessRig {
     /// The arguments passed to the program.
     pub fn args(&self) -> &[String] {
         &self.args
+    }
+
+    /// The current stdout cap.
+    pub fn max_output_bytes(&self) -> usize {
+        self.max_output_bytes
     }
 }
 
@@ -341,7 +361,15 @@ impl Rig for ProcessRig {
             }
         };
 
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let mut stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // Cap the result so a runaway CLI can't flood context.
+        if stdout.len() > self.max_output_bytes {
+            let mut end = self.max_output_bytes;
+            while end > 0 && !stdout.is_char_boundary(end) {
+                end -= 1;
+            }
+            stdout.truncate(end);
+        }
         if output.status.success() {
             RigOutcome::Done { summary: stdout }
         } else {
@@ -545,6 +573,26 @@ mod tests {
         register_cli_rigs(&mut reg);
         for name in ["echo", "claude", "codex", "gemini"] {
             assert!(reg.get(name).is_some(), "{name} should be registered");
+        }
+    }
+
+    #[test]
+    fn process_rig_caps_stdout() {
+        let long = "x".repeat(1000);
+        let rig = if cfg!(windows) {
+            ProcessRig::new("p", "cmd", vec!["/C".into(), format!("echo {long}")])
+        } else {
+            ProcessRig::new("p", "sh", vec!["-c".into(), format!("printf '{long}'")])
+        }
+        .with_max_output_bytes(10);
+        assert_eq!(rig.max_output_bytes(), 10);
+
+        let req = RigRunRequest::new("b", "a", "g", "prompt");
+        match rig.run(&req) {
+            RigOutcome::Done { summary } => {
+                assert!(summary.len() <= 10, "summary len {}", summary.len());
+            }
+            _ => panic!("expected Done"),
         }
     }
 
