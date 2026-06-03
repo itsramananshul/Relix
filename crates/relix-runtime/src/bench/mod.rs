@@ -104,6 +104,35 @@ impl BenchLedger {
         self.lock().get(task_id).and_then(|w| w.snapshot_ref.clone())
     }
 
+    /// Mark a Bench as freshly active — resets its idle clock
+    /// without changing state. The heartbeat calls this each Shift
+    /// tick so a Bench that's busy mid-work isn't auto-hibernated
+    /// out from under it. No-op if the Bench doesn't exist.
+    pub fn touch(&self, task_id: &str) {
+        let now = unix_now();
+        let mut g = self.lock();
+        if let Some(w) = g.get_mut(task_id) {
+            w.updated_at = now;
+        }
+    }
+
+    /// The Briefs whose Bench is **Active** but has been idle (no
+    /// `ensure_active`/`touch`) for at least `idle_after` seconds as
+    /// of `now` — the serverless auto-sleep candidates. The caller
+    /// snapshots each and calls [`hibernate`]. Longest-idle first.
+    pub fn idle_active_benches(&self, now: i64, idle_after: i64) -> Vec<String> {
+        let g = self.lock();
+        let mut v: Vec<(String, i64)> = g
+            .values()
+            .filter(|w| w.state == WorkspaceState::Active)
+            .filter(|w| now.saturating_sub(w.updated_at) >= idle_after)
+            .map(|w| (w.task_id.clone(), w.updated_at))
+            .collect();
+        // Oldest `updated_at` = longest idle → first.
+        v.sort_by_key(|(_, updated)| *updated);
+        v.into_iter().map(|(id, _)| id).collect()
+    }
+
     /// Tear a Bench down entirely (its work is done).
     pub fn release(&self, task_id: &str) {
         self.lock().remove(task_id);
@@ -179,5 +208,26 @@ mod tests {
         // Hibernating an unknown Bench is a no-op.
         b.hibernate("nope", "x");
         assert_eq!(b.state("nope"), None);
+    }
+
+    #[test]
+    fn idle_active_benches_lists_auto_sleep_candidates() {
+        let b = BenchLedger::new();
+        b.ensure_active("x");
+        b.ensure_active("y");
+
+        // Far in the future → both are long-idle candidates.
+        let far = unix_now() + 10_000;
+        assert_eq!(b.idle_active_benches(far, 3600).len(), 2);
+        // At ~creation time → neither has aged out yet.
+        assert!(b.idle_active_benches(unix_now(), 3600).is_empty());
+
+        // A hibernated Bench is never an auto-sleep candidate.
+        b.hibernate("x", "snap");
+        assert_eq!(b.idle_active_benches(far, 3600), vec!["y".to_string()]);
+
+        // touch resets the idle clock — y is busy again.
+        b.touch("y");
+        assert!(b.idle_active_benches(unix_now(), 3600).is_empty());
     }
 }
