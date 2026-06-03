@@ -1734,6 +1734,43 @@ impl TaskStore {
         Ok(())
     }
 
+    /// PHASE 3 (Claim): **operator force-release** — clear a Brief's
+    /// Claim regardless of who holds it (relix-execution-and-issue-
+    /// design §1.4). For a stuck/abandoned lock an operator can't
+    /// reach via the holder-only `release_claim`. Chronicles
+    /// `brief.claim_force_released` with the prior holder. The Brief
+    /// must exist; a no-op (already unclaimed) is `Ok`.
+    pub fn force_release_claim(&self, task_id: &str) -> Result<(), CoordinatorError> {
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, task_id)? {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let prior: Option<String> = conn
+            .query_row(
+                "SELECT claimed_by FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?
+            .flatten();
+        conn.execute(
+            "UPDATE tasks SET claimed_by = NULL, claim_expires_at = NULL, updated_at = ?1
+             WHERE task_id = ?2",
+            params![now, task_id],
+        )
+        .map_err(CoordinatorError::Db)?;
+        if let Some(holder) = prior {
+            let _ = conn.execute(
+                "INSERT INTO task_events (task_id, ts, event_type, payload)
+                 VALUES (?1, ?2, 'brief.claim_force_released', ?3)",
+                params![task_id, now, holder],
+            );
+        }
+        Ok(())
+    }
+
     /// PHASE 3 (Claim): the current live claim holder + lease
     /// expiry, if any. `None` when unclaimed or the lease expired.
     pub fn claim_holder(
@@ -6339,6 +6376,16 @@ pub fn register(
     {
         let s = store.clone();
         bridge.register(
+            "brief.force_release",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_force_release(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
             "brief.claim_holder",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -7814,6 +7861,19 @@ fn handle_brief_release(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcom
     match store.release_claim(task, agent) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.release", e),
+    }
+}
+
+/// `brief.force_release` — operator force-release of a stuck Claim
+/// regardless of holder. Arg `task_id`.
+fn handle_brief_force_release(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task = match single_id(ctx, "brief.force_release") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    match store.force_release_claim(task) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.force_release", e),
     }
 }
 
@@ -11178,6 +11238,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn force_release_clears_any_holders_claim() {
+        let s = store();
+        let id = s
+            .create("b", "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .unwrap();
+        s.set_brief_field(&id, "assignee", "agt_a").unwrap();
+        s.set_board_status(&id, "todo").unwrap();
+        assert!(s.claim_brief(&id, "agt_a", 300).unwrap());
+
+        // Holder-only release by a DIFFERENT agent is a no-op.
+        s.release_claim(&id, "agt_b").unwrap();
+        assert_eq!(s.claim_holder(&id).unwrap().unwrap().0, "agt_a");
+
+        // Force-release clears it regardless of holder + chronicles.
+        s.force_release_claim(&id).unwrap();
+        assert!(s.claim_holder(&id).unwrap().is_none());
+        let conn = s.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_events
+                 WHERE task_id = ?1 AND event_type = 'brief.claim_force_released'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        drop(conn);
+        // Idempotent (already unclaimed) + unknown → NotFound.
+        s.force_release_claim(&id).unwrap();
+        assert!(matches!(
+            s.force_release_claim("nope"),
+            Err(CoordinatorError::NotFound(_))
+        ));
     }
 
     #[test]
