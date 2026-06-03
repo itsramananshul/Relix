@@ -145,6 +145,121 @@ pub fn plan_curation_default(records: &[KnackRecord], now: i64) -> CurationPlan 
     )
 }
 
+/// An in-memory **Knack library** with the Keeper wired in: holds
+/// Knacks (id → meta + state), advances their usage clock on a
+/// sweep, and heals them on use. The persistent store layers the
+/// same shape over SQLite later; this makes the closed loop
+/// runnable + testable today. Cheap to clone (an `Arc` handle).
+#[derive(Clone, Default)]
+pub struct KnackLedger {
+    inner: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, KnackEntry>>>,
+}
+
+#[derive(Clone, Debug)]
+struct KnackEntry {
+    meta: KnackMeta,
+    state: KnackState,
+}
+
+impl KnackLedger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add (or replace) a Knack, Active as of `now`. `created_by`
+    /// drives the provenance gate — only `"agent"` Knacks are ever
+    /// auto-managed.
+    pub fn add(&self, id: impl Into<String>, created_by: impl Into<String>, now: i64) {
+        let entry = KnackEntry {
+            meta: KnackMeta {
+                last_used_at: now,
+                created_by: created_by.into(),
+                pinned: false,
+            },
+            state: KnackState::Active,
+        };
+        self.lock().insert(id.into(), entry);
+    }
+
+    /// Record a use: refresh `last_used_at` and heal the Knack back
+    /// to Active (a re-used Knack is never stale). No-op if absent.
+    pub fn touch(&self, id: &str, now: i64) {
+        if let Some(e) = self.lock().get_mut(id) {
+            e.meta.last_used_at = now;
+            e.state = KnackState::Active;
+        }
+    }
+
+    /// Pin / unpin a Knack (pinned Knacks are exempt from aging).
+    pub fn set_pinned(&self, id: &str, pinned: bool) {
+        if let Some(e) = self.lock().get_mut(id) {
+            e.meta.pinned = pinned;
+        }
+    }
+
+    /// The Keeper's sweep: compute the transition plan over every
+    /// Knack and apply it (ages idle agent-Knacks, heals re-used
+    /// ones). Returns the plan that was applied.
+    pub fn sweep(&self, now: i64, stale_after: i64, archive_after: i64) -> CurationPlan {
+        let mut g = self.lock();
+        let records: Vec<KnackRecord> = g
+            .iter()
+            .map(|(id, e)| KnackRecord {
+                id: id.clone(),
+                meta: e.meta.clone(),
+                state: e.state,
+            })
+            .collect();
+        let plan = plan_curation(&records, now, stale_after, archive_after);
+        for id in &plan.to_stale {
+            if let Some(e) = g.get_mut(id) {
+                e.state = KnackState::Stale;
+            }
+        }
+        for id in &plan.to_archive {
+            if let Some(e) = g.get_mut(id) {
+                e.state = KnackState::Archived;
+            }
+        }
+        for id in &plan.to_reactivate {
+            if let Some(e) = g.get_mut(id) {
+                e.state = KnackState::Active;
+            }
+        }
+        plan
+    }
+
+    /// Convenience: [`sweep`] with the default 30/90-day clock.
+    pub fn sweep_default(&self, now: i64) -> CurationPlan {
+        self.sweep(now, DEFAULT_STALE_AFTER_SECS, DEFAULT_ARCHIVE_AFTER_SECS)
+    }
+
+    /// A Knack's current state, if present.
+    pub fn state(&self, id: &str) -> Option<KnackState> {
+        self.lock().get(id).map(|e| e.state)
+    }
+
+    pub fn count_in(&self, state: KnackState) -> usize {
+        self.lock().values().filter(|e| e.state == state).count()
+    }
+
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, KnackEntry>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// Default: a run that made this many tool calls is "hard enough"
 /// to be worth reviewing for a new Knack.
 pub const DEFAULT_KNACK_REVIEW_TOOL_THRESHOLD: u32 = 6;
@@ -311,6 +426,35 @@ mod tests {
         assert!(!should_review_for_knack(t - 1, true, t));
         // Hard but failed → nothing to capture.
         assert!(!should_review_for_knack(t + 5, false, t));
+    }
+
+    #[test]
+    fn knack_ledger_ages_heals_and_protects() {
+        let now = 100 * DAY;
+        let led = KnackLedger::new();
+        led.add("k_agent", "agent", now - 31 * DAY); // idle 31d
+        led.add("k_user", "user", now - 500 * DAY); // ancient, protected
+        led.add("k_pin", "agent", now - 500 * DAY); // ancient but will pin
+        led.set_pinned("k_pin", true);
+
+        // First sweep: only the unpinned agent Knack ages to Stale.
+        let plan = led.sweep_default(now);
+        assert_eq!(plan.to_stale, vec!["k_agent".to_string()]);
+        assert_eq!(led.state("k_agent"), Some(KnackState::Stale));
+        assert_eq!(led.state("k_user"), Some(KnackState::Active));
+        assert_eq!(led.state("k_pin"), Some(KnackState::Active));
+
+        // Using the stale Knack heals it back to Active on next sweep.
+        led.touch("k_agent", now);
+        assert_eq!(led.state("k_agent"), Some(KnackState::Active));
+        // A no-change sweep produces an empty plan.
+        assert!(led.sweep_default(now).is_empty());
+
+        // Long idle archives the agent Knack.
+        let later = now + 200 * DAY;
+        let plan2 = led.sweep_default(later);
+        assert!(plan2.to_archive.contains(&"k_agent".to_string()));
+        assert_eq!(led.count_in(KnackState::Archived), 1);
     }
 
     #[test]
