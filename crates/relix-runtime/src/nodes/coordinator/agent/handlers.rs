@@ -2661,6 +2661,95 @@ mod tests {
     }
 
     #[test]
+    fn deciding_an_already_decided_clearance_errors_and_does_not_double_apply() {
+        let s = store();
+        spawn_actor(&s, "founder");
+        let body = ok_body(handle_request_hire(
+            &s,
+            &fake_ctx_with_role(
+                b"Worker|engineer|Worker|eng|eng|planner|subj-worker|medium",
+                "planner",
+                b"planner-seed",
+            ),
+        ));
+        let hire_id = body.lines().next().unwrap().trim().to_string();
+        let cid = spawn_clearance_for(&s, &hire_id).expect("clearance exists");
+        // First approve activates the hire exactly once.
+        assert!(matches!(
+            decide(&s, &cid, "approved"),
+            HandlerOutcome::Ok(_)
+        ));
+        assert_eq!(s.get_agent(&hire_id).unwrap().unwrap().status, "active");
+        // Manually flip it to a sentinel so a (forbidden) re-activation
+        // would be observable.
+        s.update_agent_field(&hire_id, "status", "suspended")
+            .unwrap();
+        // Second decide is refused (already terminal) — no double apply.
+        let out = decide(&s, &cid, "approved");
+        assert_eq!(err_kind(out), error_kinds::INVALID_ARGS);
+        assert_eq!(
+            s.get_agent(&hire_id).unwrap().unwrap().status,
+            "suspended",
+            "a re-decide must not re-activate the hire"
+        );
+        // Rejecting it afterwards is likewise refused.
+        let out = decide(&s, &cid, "rejected");
+        assert_eq!(err_kind(out), error_kinds::INVALID_ARGS);
+    }
+
+    #[test]
+    fn clearance_cannot_be_decided_cross_tenant() {
+        // An approval minted in tenant A is invisible (not-found) to a
+        // caller scoped to tenant B — it can be neither read nor decided.
+        let s = store();
+        let id = s
+            .create_approval(
+                "agt_x",
+                "subj",
+                "m",
+                "c",
+                "",
+                "needs yes",
+                &[],
+                None,
+                9_999_999_999,
+                &[],
+                "tenant-a",
+            )
+            .unwrap();
+        let resume: TaskResumeFn = Arc::new(|_| Ok(()));
+        let fail: TaskResumeFn = Arc::new(|_| Ok(()));
+        let arg = format!("{id}|approved|operator|ok");
+        let out = handle_approval_decide(
+            &s,
+            &fake_ctx_tenant(arg.as_bytes(), "tenant-b"),
+            &resume,
+            &fail,
+            None,
+            APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+            &relix_core::clock::SystemClock,
+        );
+        assert_eq!(err_kind(out), error_kinds::INVALID_ARGS);
+        // The approval is still pending (untouched by the cross-tenant try).
+        assert_eq!(
+            s.get_approval(&id).unwrap().unwrap().status.as_wire(),
+            "pending"
+        );
+        // Tenant A can still decide it.
+        let arg = format!("{id}|approved|operator|ok");
+        let out = handle_approval_decide(
+            &s,
+            &fake_ctx_tenant(arg.as_bytes(), "tenant-a"),
+            &resume,
+            &fail,
+            None,
+            APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+            &relix_core::clock::SystemClock,
+        );
+        assert!(matches!(out, HandlerOutcome::Ok(_)));
+    }
+
+    #[test]
     fn direct_route_mints_no_spawn_clearance() {
         let s = store();
         spawn_actor(&s, "direct");

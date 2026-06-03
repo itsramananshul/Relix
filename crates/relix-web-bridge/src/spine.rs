@@ -345,24 +345,23 @@ pub struct ClearanceDecision {
     /// Optional operator note recorded on the decision.
     #[serde(default)]
     pub note: Option<String>,
-    /// Accepted for API symmetry but NOT forwarded: the minted token's
-    /// TTL is controller-configured (`[approval] approval_token_ttl_secs`),
-    /// not settable per-decision by `coord.approval.decide`.
-    #[serde(default)]
-    pub ttl_secs: Option<i64>,
 }
 
 /// `POST /v1/spine/clearances/:approval_id/decide` — greenlight or
 /// refuse a pending Clearance inline from the Desk. Body:
-/// `{ "decision": "approve"|"reject", "note": "...", "ttl_secs"?: n }`.
+/// `{ "decision": "approve"|"reject", "note"?: "..." }`.
 ///
 /// The bridge forwards to `coord.approval.decide` **as its own
 /// verified identity** — exactly like the existing
 /// `/v1/approvals/:id/decide` route. The runtime cap enforces the
 /// real authorisation (`authorized_approvers` ∪ operator/admin role),
 /// so this never fabricates approval: an unauthorised bridge identity
-/// is refused by the cap, not waved through here. Tenant scoping
-/// (chunk 1) means the approval must belong to the caller's Guild.
+/// is refused by the cap, not waved through here. Tenant scoping means
+/// the approval must belong to the caller's Guild, and the runtime
+/// refuses to re-decide an already-terminal approval (so side effects —
+/// e.g. activating a spawn hire — apply exactly once). The minted
+/// token's TTL is controller-configured; there is intentionally no
+/// per-decision TTL knob.
 pub async fn decide_clearance(
     State(state): State<AppState>,
     Path(approval_id): Path<String>,
@@ -396,10 +395,6 @@ pub async fn decide_clearance(
         "approval_id": approval_id.trim(),
         "decision": decision,
         "approval_token": token,
-        // Echoed for transparency: a per-decision TTL is NOT applied —
-        // the minted token uses the controller-configured TTL. Surfaced
-        // so a caller that sent ttl_secs knows it was not honoured.
-        "ttl_secs_ignored": req.ttl_secs,
     }))
 }
 
