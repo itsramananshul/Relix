@@ -45,6 +45,10 @@ pub struct DossierMeta {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BriefFields {
     pub task_id: String,
+    /// The human identifier (e.g. `REL-42`) per
+    /// relix-execution-and-issue-design §1.2; `None` for a Task that
+    /// was never materialized as a Brief.
+    pub human_ref: Option<String>,
     pub assignee_agent_id: Option<String>,
     pub board_status: String,
     pub priority: String,

@@ -1536,7 +1536,7 @@ impl TaskStore {
     ) -> Result<Option<brief::BriefFields>, CoordinatorError> {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         match conn.query_row(
-            "SELECT task_id, assignee_agent_id, board_status, priority, mandate_id, campaign_id
+            "SELECT task_id, assignee_agent_id, board_status, priority, mandate_id, campaign_id, human_ref
              FROM tasks WHERE task_id = ?1",
             params![task_id],
             |r| {
@@ -1547,6 +1547,7 @@ impl TaskStore {
                     priority: r.get(3)?,
                     mandate_id: r.get(4)?,
                     campaign_id: r.get(5)?,
+                    human_ref: r.get(6)?,
                 })
             },
         ) {
@@ -2178,8 +2179,46 @@ impl TaskStore {
     /// `todo`, and links the optional spine fields (assignee /
     /// mandate / campaign / priority). Returns the new task_id.
     #[allow(clippy::too_many_arguments)]
+    /// PHASE 1 (Brief identity, relix-execution-and-issue-design
+    /// §1.2): allocate the next human Brief identifier (e.g. `REL-42`)
+    /// from the per-company counter and stamp it on `task_id`. Atomic
+    /// per-tenant increment; returns the assigned ref.
+    pub fn assign_brief_ref(
+        &self,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<String, CoordinatorError> {
+        let t = {
+            let tt = tenant.trim();
+            if tt.is_empty() { "default" } else { tt }
+        };
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        conn.execute(
+            "INSERT INTO guild_brief_counters (tenant_id, seq) VALUES (?1, 1)
+             ON CONFLICT(tenant_id) DO UPDATE SET seq = seq + 1",
+            params![t],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let seq: i64 = conn
+            .query_row(
+                "SELECT seq FROM guild_brief_counters WHERE tenant_id = ?1",
+                params![t],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
+        let href = format!("REL-{seq}");
+        conn.execute(
+            "UPDATE tasks SET human_ref = ?1 WHERE task_id = ?2",
+            params![href, task_id],
+        )
+        .map_err(CoordinatorError::Db)?;
+        Ok(href)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn create_brief(
         &self,
+        tenant: &str,
         title: &str,
         owner_subject_id: &str,
         assignee: Option<&str>,
@@ -2206,6 +2245,8 @@ impl TaskStore {
             None,
             Some("companion"),
         )?;
+        // Allocate the human identifier from the per-company counter (§1.2).
+        let _ = self.assign_brief_ref(tenant, &task_id);
         // Chronicle the creation distinctly (the activity feed's
         // first entry), then open it on the board.
         let _ = self.append_event(&task_id, "brief.created", title.trim());
@@ -7328,7 +7369,15 @@ fn handle_brief_create(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome
     }
     let opt = |i: usize| parts.get(i).copied().map(str::trim).filter(|s| !s.is_empty());
     let owner = ctx.caller.subject_id.to_string();
-    match store.create_brief(title, &owner, opt(1), opt(2), opt(3), opt(4)) {
+    match store.create_brief(
+        ctx.tenant_id_or_default(),
+        title,
+        &owner,
+        opt(1),
+        opt(2),
+        opt(3),
+        opt(4),
+    ) {
         Ok(id) => HandlerOutcome::Ok(id.into_bytes()),
         Err(e) => map_edge_err("brief.create", e),
     }
@@ -9754,6 +9803,14 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         );
         CREATE INDEX IF NOT EXISTS task_documents_by_task
             ON task_documents(task_id, created_at);
+        -- PHASE 1 (Brief identity, relix-execution-and-issue-design
+        -- §1.2): the per-company (per-Guild) counter the human Brief
+        -- identifier (e.g. REL-42) is allocated from. One row per
+        -- tenant; `seq` is the last number handed out.
+        CREATE TABLE IF NOT EXISTS guild_brief_counters (
+            tenant_id TEXT PRIMARY KEY,
+            seq       INTEGER NOT NULL DEFAULT 0
+        );
         "#,
     )
     .map_err(CoordinatorError::Db)?;
@@ -9878,6 +9935,10 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         // PHASE 5 (Brief): an optional due date (unix secs). NULL =
         // no due date. Additive.
         "ALTER TABLE tasks ADD COLUMN due_at INTEGER",
+        // PHASE 1 (Brief identity, relix-execution-and-issue-design
+        // §1.2): the human identifier (e.g. `REL-42`) allocated from
+        // the per-company counter. NULL for Tasks that aren't Briefs.
+        "ALTER TABLE tasks ADD COLUMN human_ref TEXT",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the
@@ -11179,6 +11240,7 @@ mod tests {
         let s = store();
         let id = s
             .create_brief(
+                "acme",
                 "Build the onboarding flow",
                 "subj-founder",
                 Some("agt_eng"),
@@ -11194,15 +11256,27 @@ mod tests {
         assert_eq!(f.mandate_id.as_deref(), Some("mandate_x"));
         assert_eq!(f.campaign_id.as_deref(), Some("camp_y"));
         assert_eq!(f.priority, "high");
+        // §1.2: a human identifier allocated from the per-company counter.
+        assert_eq!(f.human_ref.as_deref(), Some("REL-1"));
 
         // Minimal: title only → defaults (todo, normal, no links).
         let bare = s
-            .create_brief("Just a title", "subj", None, None, None, None)
+            .create_brief("acme", "Just a title", "subj", None, None, None, None)
             .unwrap();
         let bf = s.brief_fields(&bare).unwrap().unwrap();
         assert_eq!(bf.board_status, "todo");
         assert_eq!(bf.priority, "normal");
         assert!(bf.assignee_agent_id.is_none());
+        // The per-company counter increments: second Brief is REL-2.
+        assert_eq!(bf.human_ref.as_deref(), Some("REL-2"));
+        // A DIFFERENT company's counter is independent (starts at REL-1).
+        let other = s
+            .create_brief("other", "Their first", "subj", None, None, None, None)
+            .unwrap();
+        assert_eq!(
+            s.brief_fields(&other).unwrap().unwrap().human_ref.as_deref(),
+            Some("REL-1")
+        );
 
         // Creation is chronicled (the activity feed's first entry).
         let created = s
@@ -11213,11 +11287,11 @@ mod tests {
 
         // Empty title / bad priority rejected.
         assert!(matches!(
-            s.create_brief("  ", "subj", None, None, None, None),
+            s.create_brief("acme", "  ", "subj", None, None, None, None),
             Err(CoordinatorError::Invalid(_))
         ));
         assert!(matches!(
-            s.create_brief("t", "subj", None, None, None, Some("meh")),
+            s.create_brief("acme", "t", "subj", None, None, None, Some("meh")),
             Err(CoordinatorError::Invalid(_))
         ));
     }
