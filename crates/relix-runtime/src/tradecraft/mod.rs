@@ -77,6 +77,74 @@ pub fn curate_default(meta: &KnackMeta, now: i64) -> KnackState {
     )
 }
 
+/// One Knack the Keeper looks at in a batch sweep: its id, the
+/// metadata it reasons over, and the Knack's *current* stored state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnackRecord {
+    pub id: String,
+    pub meta: KnackMeta,
+    pub state: KnackState,
+}
+
+/// The Keeper's batch decision: the Knacks that should *transition*,
+/// grouped by their new state. Only Knacks whose target state
+/// differs from their current state appear — applying an empty plan
+/// is a no-op. The Keeper both ages (active→stale→archived) and
+/// heals (`to_reactivate`: a Knack used again climbs back to Active).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CurationPlan {
+    pub to_stale: Vec<String>,
+    pub to_archive: Vec<String>,
+    pub to_reactivate: Vec<String>,
+}
+
+impl CurationPlan {
+    pub fn is_empty(&self) -> bool {
+        self.to_stale.is_empty() && self.to_archive.is_empty() && self.to_reactivate.is_empty()
+    }
+
+    /// Total number of Knacks that change state under this plan.
+    pub fn changes(&self) -> usize {
+        self.to_stale.len() + self.to_archive.len() + self.to_reactivate.len()
+    }
+}
+
+/// Sweep a batch of Knacks and report only the transitions. A
+/// non-auto-managed Knack (user/bundled/hub-authored, or pinned)
+/// always targets `Active` via [`curate`], so it can only ever be
+/// *healed* out of an accidental stale/archived state, never aged
+/// into one — the provenance gate holds at the batch level too.
+pub fn plan_curation(
+    records: &[KnackRecord],
+    now: i64,
+    stale_after: i64,
+    archive_after: i64,
+) -> CurationPlan {
+    let mut plan = CurationPlan::default();
+    for r in records {
+        let target = curate(&r.meta, now, stale_after, archive_after);
+        if target == r.state {
+            continue;
+        }
+        match target {
+            KnackState::Stale => plan.to_stale.push(r.id.clone()),
+            KnackState::Archived => plan.to_archive.push(r.id.clone()),
+            KnackState::Active => plan.to_reactivate.push(r.id.clone()),
+        }
+    }
+    plan
+}
+
+/// Convenience over [`plan_curation`] with the default 30/90-day clock.
+pub fn plan_curation_default(records: &[KnackRecord], now: i64) -> CurationPlan {
+    plan_curation(
+        records,
+        now,
+        DEFAULT_STALE_AFTER_SECS,
+        DEFAULT_ARCHIVE_AFTER_SECS,
+    )
+}
+
 /// Default: a run that made this many tool calls is "hard enough"
 /// to be worth reviewing for a new Knack.
 pub const DEFAULT_KNACK_REVIEW_TOOL_THRESHOLD: u32 = 6;
@@ -186,6 +254,51 @@ mod tests {
         };
         assert!(!is_auto_managed(&meta));
         assert_eq!(curate_default(&meta, now), KnackState::Active);
+    }
+
+    #[test]
+    fn plan_curation_reports_only_transitions_and_heals() {
+        let now = 100 * DAY;
+        let rec = |id: &str, idle_days: i64, state: KnackState| KnackRecord {
+            id: id.to_string(),
+            meta: agent_knack(now - idle_days * DAY),
+            state,
+        };
+        let records = vec![
+            // Fresh, already Active → no change.
+            rec("a", 0, KnackState::Active),
+            // Idle 31d but stored Active → to_stale.
+            rec("b", 31, KnackState::Active),
+            // Idle 91d but stored Stale → to_archive.
+            rec("c", 91, KnackState::Stale),
+            // Used again (idle 0) but stored Stale → heal to Active.
+            rec("d", 0, KnackState::Stale),
+            // Already Stale and still stale → no change.
+            rec("e", 40, KnackState::Stale),
+        ];
+        let plan = plan_curation_default(&records, now);
+        assert_eq!(plan.to_stale, vec!["b".to_string()]);
+        assert_eq!(plan.to_archive, vec!["c".to_string()]);
+        assert_eq!(plan.to_reactivate, vec!["d".to_string()]);
+        assert_eq!(plan.changes(), 3);
+        assert!(!plan.is_empty());
+    }
+
+    #[test]
+    fn plan_curation_never_ages_protected_knacks() {
+        let now = 1000 * DAY;
+        // A user-authored Knack, ancient and stored Active.
+        let user = KnackRecord {
+            id: "u".to_string(),
+            meta: KnackMeta {
+                last_used_at: 0,
+                created_by: "user".to_string(),
+                pinned: false,
+            },
+            state: KnackState::Active,
+        };
+        let plan = plan_curation_default(&[user], now);
+        assert!(plan.is_empty(), "protected Knack must never be aged");
     }
 
     #[test]
