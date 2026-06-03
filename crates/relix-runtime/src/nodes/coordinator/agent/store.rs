@@ -70,6 +70,12 @@ pub struct AgentProfile {
     /// subtree. Nullable; existing rows read NULL until set.
     #[serde(default)]
     pub reports_to: Option<String>,
+    /// PILLAR 2 (Rig): which agent backend powers this Operative —
+    /// `echo` / `hermes` / `claude` / `codex` / a remote, resolved
+    /// against the Rig registry at dispatch. `None` = the Guild
+    /// default Rig. Nullable; existing rows read NULL.
+    #[serde(default)]
+    pub rig: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -637,7 +643,7 @@ impl AgentStore {
                         allow_sensitivity_tags, deny_sensitivity_tags,
                         approval_required_categories, authorized_approvers,
                         approval_timeout_secs,
-                        created_at, updated_at, profile, reports_to
+                        created_at, updated_at, profile, reports_to, rig
                  FROM agent_profiles WHERE subject_id = ?1 AND tenant_id = ?2",
                 params![subject_id, tenant],
                 row_to_agent,
@@ -669,7 +675,7 @@ impl AgentStore {
                         allow_sensitivity_tags, deny_sensitivity_tags,
                         approval_required_categories, authorized_approvers,
                         approval_timeout_secs,
-                        created_at, updated_at, profile, reports_to
+                        created_at, updated_at, profile, reports_to, rig
                  FROM agent_profiles WHERE subject_id = ?1",
                 params![subject_id],
                 row_to_agent,
@@ -936,6 +942,20 @@ impl AgentStore {
                         params![trimmed, now, agent_id],
                     )?
                 }
+            }
+            "rig" => {
+                // PILLAR 2 (Rig): set or clear the backend that
+                // powers this Operative. Empty clears it (use the
+                // Guild default). Any non-empty name is accepted;
+                // the dispatcher resolves it against the Rig
+                // registry and falls back to the default if unknown.
+                let trimmed = value.trim();
+                let stored: Option<&str> =
+                    if trimmed.is_empty() { None } else { Some(trimmed) };
+                conn.execute(
+                    "UPDATE agent_profiles SET rig=?1, updated_at=?2 WHERE agent_id=?3",
+                    params![stored, now, agent_id],
+                )?
             }
             other => {
                 return Err(AgentStoreError::BadInput(format!(
@@ -1752,7 +1772,7 @@ const SELECT_AGENT: &str = "SELECT agent_id, name, role, title, department, team
         allow_sensitivity_tags, deny_sensitivity_tags,
         approval_required_categories, authorized_approvers,
         approval_timeout_secs,
-        created_at, updated_at, profile, reports_to
+        created_at, updated_at, profile, reports_to, rig
  FROM agent_profiles WHERE agent_id = ?1";
 
 const SELECT_APPROVAL: &str =
@@ -1786,7 +1806,8 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              approval_timeout_secs INTEGER NOT NULL DEFAULT 86400,
              created_at      INTEGER NOT NULL,
              updated_at      INTEGER NOT NULL,
-             reports_to      TEXT
+             reports_to      TEXT,
+             rig             TEXT
          );
          CREATE UNIQUE INDEX IF NOT EXISTS agent_profiles_subject
              ON agent_profiles(subject_id);
@@ -1897,6 +1918,8 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     // existing rows read NULL (no boss) until an operator/CEO sets
     // it via `agent.update agent_id|reports_to|<boss_agent_id>`.
     ensure_column(conn, "agent_profiles", "reports_to", "TEXT")?;
+    // PILLAR 2 (Rig): the agent backend that powers an Operative.
+    ensure_column(conn, "agent_profiles", "rig", "TEXT")?;
     // GROUP 6: tenant isolation. Add `tenant_id` to the per-caller
     // agent/approval tables. Idempotent (ensure_column probes
     // PRAGMA); existing rows default to the reserved 'default'
@@ -2150,6 +2173,7 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
         // PHASE 0 (org tree): appended as the last SELECT column
         // so every existing positional index above is unchanged.
         reports_to: r.get::<_, Option<String>>(21)?,
+        rig: r.get::<_, Option<String>>(22)?,
     })
 }
 
@@ -2368,6 +2392,29 @@ mod tests {
         );
         // The apex escalates to nobody.
         assert!(s.chain_of_command(&ceo).unwrap().is_empty());
+    }
+
+    // ── PILLAR 2: Rig (agent backend) ────────────────────
+
+    #[test]
+    fn pillar2_rig_field_sets_and_clears() {
+        let s = store();
+        let id = s
+            .create_agent(
+                "n", "engineer", "Eng", "eng", "eng", "op", "subj-rig", "low", "default",
+            )
+            .unwrap();
+        // Default: no Rig (use the Guild default at dispatch).
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().rig, None);
+        // Set a Rig.
+        s.update_agent_field(&id, "rig", "claude").unwrap();
+        assert_eq!(
+            s.get_agent(&id).unwrap().unwrap().rig.as_deref(),
+            Some("claude")
+        );
+        // Clear it back to the default.
+        s.update_agent_field(&id, "rig", "").unwrap();
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().rig, None);
     }
 
     // ── agent CRUD ───────────────────────────────────────
