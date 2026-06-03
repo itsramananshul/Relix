@@ -981,6 +981,37 @@ impl AgentStore {
                             "reports_to target '{trimmed}' is not a known agent"
                         )));
                     }
+                    // Cycle guard: walk up the chain from the
+                    // prospective boss; if we reach this agent, the
+                    // edge would close a loop in the org tree. Done
+                    // inline (we already hold the lock) so it can't
+                    // deadlock against `manages`/`chain_of_command`.
+                    const MAX_CHAIN_DEPTH: u32 = 10_000;
+                    let mut cursor = trimmed.to_string();
+                    let mut depth = 0u32;
+                    loop {
+                        if cursor == agent_id {
+                            return Err(AgentStoreError::BadInput(
+                                "reports_to would create a cycle in the org tree".into(),
+                            ));
+                        }
+                        depth += 1;
+                        if depth > MAX_CHAIN_DEPTH {
+                            break; // pre-existing corrupt cycle — don't hang
+                        }
+                        let next: Option<String> = conn
+                            .query_row(
+                                "SELECT reports_to FROM agent_profiles WHERE agent_id=?1",
+                                params![cursor],
+                                |r| r.get::<_, Option<String>>(0),
+                            )
+                            .optional()?
+                            .flatten();
+                        match next {
+                            Some(b) => cursor = b,
+                            None => break, // reached an apex — no cycle
+                        }
+                    }
                     conn.execute(
                         "UPDATE agent_profiles SET reports_to=?1, updated_at=?2
                          WHERE agent_id=?3",
@@ -2540,6 +2571,45 @@ mod tests {
         );
         // The apex escalates to nobody.
         assert!(s.chain_of_command(&ceo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reports_to_rejects_cycles() {
+        let s = store();
+        let ceo = s
+            .create_agent("CEO", "ceo", "C", "x", "x", "op", "subj-cy1", "high", "default")
+            .unwrap();
+        let lead = s
+            .create_agent("L", "lead", "L", "e", "e", "op", "subj-cy2", "medium", "default")
+            .unwrap();
+        let ic = s
+            .create_agent("IC", "worker", "I", "e", "e", "op", "subj-cy3", "low", "default")
+            .unwrap();
+        // ceo <- lead <- ic
+        s.update_agent_field(&lead, "reports_to", &ceo).unwrap();
+        s.update_agent_field(&ic, "reports_to", &lead).unwrap();
+
+        // Direct 2-cycle: ceo can't report to its own report.
+        assert!(matches!(
+            s.update_agent_field(&ceo, "reports_to", &lead),
+            Err(AgentStoreError::BadInput(_))
+        ));
+        // Deep cycle: ceo can't report to a descendant further down.
+        assert!(matches!(
+            s.update_agent_field(&ceo, "reports_to", &ic),
+            Err(AgentStoreError::BadInput(_))
+        ));
+        // The valid edges are untouched after the rejected writes.
+        assert_eq!(
+            s.get_agent(&ceo).unwrap().unwrap().reports_to,
+            None
+        );
+        // A legal re-parent still works (ic moves under ceo directly).
+        s.update_agent_field(&ic, "reports_to", &ceo).unwrap();
+        assert_eq!(
+            s.get_agent(&ic).unwrap().unwrap().reports_to.as_deref(),
+            Some(ceo.as_str())
+        );
     }
 
     #[test]
