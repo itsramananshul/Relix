@@ -92,6 +92,50 @@ pub struct AgentProfile {
     /// Operative on demand?
     #[serde(default = "default_true")]
     pub wake_on_demand: bool,
+    // ── Org/Work Keys (company-model §5.2) ──────────────────
+    /// Org Key: may this Operative spawn/hire other Operatives?
+    /// Default-deny (§5.1). **Enforced** on agent-originated hires.
+    #[serde(default)]
+    pub can_spawn_agents: bool,
+    /// Org Key: how a permitted spawn is routed — `direct` (the actor
+    /// originates the pending hire) / `lead` / `founder` (route the
+    /// hire up for greenlight). Default `founder` (safest).
+    #[serde(default = "default_spawn_route")]
+    pub spawn_route: String,
+    /// Work Key: may this Operative assign Briefs to other Operatives?
+    /// Default-deny. **Enforced** on agent-originated assignment.
+    #[serde(default)]
+    pub can_assign_work: bool,
+    /// Work Key: scope of `can_assign_work` — `any` / `branch` (only
+    /// the actor's Branch) / `specific` (`assign_allowed_agents`).
+    /// Default `specific` (narrowest).
+    #[serde(default = "default_assign_scope")]
+    pub assign_scope: String,
+    /// Work Key: explicit assignee allowlist used when
+    /// `assign_scope = specific`.
+    #[serde(default)]
+    pub assign_allowed_agents: Vec<String>,
+    /// Org Key: may this Operative reassign/override work owned by
+    /// others in its Branch? **Stored/displayed only this pass.**
+    #[serde(default)]
+    pub can_manage_work: bool,
+    /// Org Key: may this Operative edit other Operatives' config
+    /// (instructions/Keys/budget)? **Stored/displayed only this pass.**
+    #[serde(default)]
+    pub can_configure_agents: bool,
+    /// Org Key: scope of `can_configure_agents` — `branch` / `specific`
+    /// / `none`. Default `none`. **Stored/displayed only this pass.**
+    #[serde(default = "default_configure_scope")]
+    pub configure_scope: String,
+    /// Capability Key: stored credential ids this Operative may have
+    /// injected. **Stored/displayed only this pass** — not yet read at
+    /// secret-injection time (the vault has no per-Operative read).
+    #[serde(default)]
+    pub secret_allowlist: Vec<String>,
+    /// The Operative's **charter** — markdown instruction bundle
+    /// (company-model §4.5). **Stored/displayed only this pass.**
+    #[serde(default)]
+    pub instruction_bundle: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -102,6 +146,18 @@ fn default_max_concurrent_runs() -> i64 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_spawn_route() -> String {
+    "founder".to_string()
+}
+
+fn default_assign_scope() -> String {
+    "specific".to_string()
+}
+
+fn default_configure_scope() -> String {
+    "none".to_string()
 }
 
 /// The default set of capability categories that require an
@@ -669,7 +725,10 @@ impl AgentStore {
                         approval_timeout_secs,
                         created_at, updated_at, profile, reports_to, rig,
                         monthly_allowance_cents, max_concurrent_runs,
-                        wake_on_timer, wake_on_demand
+                        wake_on_timer, wake_on_demand,
+                        can_spawn_agents, spawn_route, can_assign_work, assign_scope,
+                        assign_allowed_agents, can_manage_work, can_configure_agents,
+                        configure_scope, secret_allowlist, instruction_bundle
                  FROM agent_profiles WHERE subject_id = ?1 AND tenant_id = ?2",
                 params![subject_id, tenant],
                 row_to_agent,
@@ -703,7 +762,10 @@ impl AgentStore {
                         approval_timeout_secs,
                         created_at, updated_at, profile, reports_to, rig,
                         monthly_allowance_cents, max_concurrent_runs,
-                        wake_on_timer, wake_on_demand
+                        wake_on_timer, wake_on_demand,
+                        can_spawn_agents, spawn_route, can_assign_work, assign_scope,
+                        assign_allowed_agents, can_manage_work, can_configure_agents,
+                        configure_scope, secret_allowlist, instruction_bundle
                  FROM agent_profiles WHERE subject_id = ?1",
                 params![subject_id],
                 row_to_agent,
@@ -1164,6 +1226,83 @@ impl AgentStore {
                     "UPDATE agent_profiles SET wake_on_demand=?1, updated_at=?2
                      WHERE agent_id=?3",
                     params![if flag { 1 } else { 0 }, now, agent_id],
+                )?
+            }
+            // ── Org/Work Keys (company-model §5.2) ────────────
+            "can_spawn_agents" | "can_manage_work" | "can_configure_agents" => {
+                let flag = parse_bool_key(value, field)?;
+                let sql = format!(
+                    "UPDATE agent_profiles SET {field}=?1, updated_at=?2 WHERE agent_id=?3"
+                );
+                conn.execute(&sql, params![if flag { 1 } else { 0 }, now, agent_id])?
+            }
+            "can_assign_work" => {
+                let flag = parse_bool_key(value, "can_assign_work")?;
+                conn.execute(
+                    "UPDATE agent_profiles SET can_assign_work=?1, updated_at=?2
+                     WHERE agent_id=?3",
+                    params![if flag { 1 } else { 0 }, now, agent_id],
+                )?
+            }
+            "spawn_route" => {
+                let v = value.trim();
+                if !super::keys::SPAWN_ROUTES.contains(&v) {
+                    return Err(AgentStoreError::BadInput(format!(
+                        "spawn_route '{v}' not in direct/lead/founder"
+                    )));
+                }
+                conn.execute(
+                    "UPDATE agent_profiles SET spawn_route=?1, updated_at=?2 WHERE agent_id=?3",
+                    params![v, now, agent_id],
+                )?
+            }
+            "assign_scope" => {
+                let v = value.trim();
+                if !super::keys::ASSIGN_SCOPES.contains(&v) {
+                    return Err(AgentStoreError::BadInput(format!(
+                        "assign_scope '{v}' not in any/branch/specific"
+                    )));
+                }
+                conn.execute(
+                    "UPDATE agent_profiles SET assign_scope=?1, updated_at=?2 WHERE agent_id=?3",
+                    params![v, now, agent_id],
+                )?
+            }
+            "configure_scope" => {
+                let v = value.trim();
+                if !super::keys::CONFIGURE_SCOPES.contains(&v) {
+                    return Err(AgentStoreError::BadInput(format!(
+                        "configure_scope '{v}' not in branch/specific/none"
+                    )));
+                }
+                conn.execute(
+                    "UPDATE agent_profiles SET configure_scope=?1, updated_at=?2 WHERE agent_id=?3",
+                    params![v, now, agent_id],
+                )?
+            }
+            "assign_allowed_agents" | "secret_allowlist" => {
+                let json = normalise_string_list(value)
+                    .map_err(|e| AgentStoreError::BadInput(format!("{field}: {e}")))?;
+                let sql = format!(
+                    "UPDATE agent_profiles SET {field}=?1, updated_at=?2 WHERE agent_id=?3"
+                );
+                conn.execute(&sql, params![json, now, agent_id])?
+            }
+            "instruction_bundle" | "charter" => {
+                // Charter markdown (company-model §4.5). Stored verbatim
+                // but length-capped so a runaway bundle can't bloat the
+                // row; the gate never executes this — it is context only.
+                const MAX_BUNDLE: usize = 64 * 1024;
+                if value.len() > MAX_BUNDLE {
+                    return Err(AgentStoreError::BadInput(format!(
+                        "instruction_bundle too large ({} bytes; max {MAX_BUNDLE})",
+                        value.len()
+                    )));
+                }
+                conn.execute(
+                    "UPDATE agent_profiles SET instruction_bundle=?1, updated_at=?2
+                     WHERE agent_id=?3",
+                    params![value, now, agent_id],
                 )?
             }
             other => {
@@ -2053,7 +2192,10 @@ const SELECT_AGENT: &str = "SELECT agent_id, name, role, title, department, team
         approval_required_categories, authorized_approvers,
         approval_timeout_secs,
         created_at, updated_at, profile, reports_to, rig, monthly_allowance_cents,
-        max_concurrent_runs, wake_on_timer, wake_on_demand
+        max_concurrent_runs, wake_on_timer, wake_on_demand,
+        can_spawn_agents, spawn_route, can_assign_work, assign_scope,
+        assign_allowed_agents, can_manage_work, can_configure_agents,
+        configure_scope, secret_allowlist, instruction_bundle
  FROM agent_profiles WHERE agent_id = ?1";
 
 const SELECT_APPROVAL: &str =
@@ -2092,7 +2234,17 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              monthly_allowance_cents INTEGER,
              max_concurrent_runs INTEGER NOT NULL DEFAULT 20,
              wake_on_timer INTEGER NOT NULL DEFAULT 1,
-             wake_on_demand INTEGER NOT NULL DEFAULT 1
+             wake_on_demand INTEGER NOT NULL DEFAULT 1,
+             can_spawn_agents INTEGER NOT NULL DEFAULT 0,
+             spawn_route TEXT NOT NULL DEFAULT 'founder',
+             can_assign_work INTEGER NOT NULL DEFAULT 0,
+             assign_scope TEXT NOT NULL DEFAULT 'specific',
+             assign_allowed_agents TEXT NOT NULL DEFAULT '[]',
+             can_manage_work INTEGER NOT NULL DEFAULT 0,
+             can_configure_agents INTEGER NOT NULL DEFAULT 0,
+             configure_scope TEXT NOT NULL DEFAULT 'none',
+             secret_allowlist TEXT NOT NULL DEFAULT '[]',
+             instruction_bundle TEXT NOT NULL DEFAULT ''
          );
          CREATE UNIQUE INDEX IF NOT EXISTS agent_profiles_subject
              ON agent_profiles(subject_id);
@@ -2225,6 +2377,69 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         "agent_profiles",
         "wake_on_demand",
         "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    // Org/Work Keys (company-model §5.2). Default-deny booleans; the
+    // scope/route text columns default to their safest value so an
+    // existing row never silently widens. Idempotent via ensure_column.
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "can_spawn_agents",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "spawn_route",
+        "TEXT NOT NULL DEFAULT 'founder'",
+    )?;
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "can_assign_work",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "assign_scope",
+        "TEXT NOT NULL DEFAULT 'specific'",
+    )?;
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "assign_allowed_agents",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "can_manage_work",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "can_configure_agents",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "configure_scope",
+        "TEXT NOT NULL DEFAULT 'none'",
+    )?;
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "secret_allowlist",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "instruction_bundle",
+        "TEXT NOT NULL DEFAULT ''",
     )?;
     // GROUP 6: tenant isolation. Add `tenant_id` to the per-caller
     // agent/approval tables. Idempotent (ensure_column probes
@@ -2494,6 +2709,18 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
         max_concurrent_runs: r.get::<_, i64>(24)?,
         wake_on_timer: r.get::<_, i64>(25)? != 0,
         wake_on_demand: r.get::<_, i64>(26)? != 0,
+        // Org/Work Keys appended last so positional indices above
+        // stay stable for existing rows.
+        can_spawn_agents: r.get::<_, i64>(27)? != 0,
+        spawn_route: r.get::<_, String>(28)?,
+        can_assign_work: r.get::<_, i64>(29)? != 0,
+        assign_scope: r.get::<_, String>(30)?,
+        assign_allowed_agents: parse_json_list(&r.get::<_, String>(31)?),
+        can_manage_work: r.get::<_, i64>(32)? != 0,
+        can_configure_agents: r.get::<_, i64>(33)? != 0,
+        configure_scope: r.get::<_, String>(34)?,
+        secret_allowlist: parse_json_list(&r.get::<_, String>(35)?),
+        instruction_bundle: r.get::<_, String>(36)?,
     })
 }
 
@@ -3178,6 +3405,61 @@ mod tests {
         let s = store();
         let r = s.create_agent("n", "r", "t", "d", "t", "c", "subj", "extreme", "default");
         assert!(matches!(r, Err(AgentStoreError::BadInput(_))));
+    }
+
+    #[test]
+    fn new_org_keys_default_deny_and_round_trip_through_update() {
+        let s = store();
+        let id = s
+            .create_agent("n", "r", "t", "d", "t", "c", "subj-keys", "low", "default")
+            .unwrap();
+        // Fresh Operative is default-deny on the org/work Keys (§5.1).
+        let p = s.get_agent(&id).unwrap().unwrap();
+        assert!(!p.can_spawn_agents);
+        assert!(!p.can_assign_work);
+        assert_eq!(p.spawn_route, "founder");
+        assert_eq!(p.assign_scope, "specific");
+        assert_eq!(p.configure_scope, "none");
+        assert!(p.assign_allowed_agents.is_empty());
+        assert!(p.instruction_bundle.is_empty());
+        // The Founder grants Keys via agent.update.
+        s.update_agent_field(&id, "can_spawn_agents", "true")
+            .unwrap();
+        s.update_agent_field(&id, "spawn_route", "direct").unwrap();
+        s.update_agent_field(&id, "can_assign_work", "true")
+            .unwrap();
+        s.update_agent_field(&id, "assign_scope", "branch").unwrap();
+        s.update_agent_field(&id, "assign_allowed_agents", "agt_a, agt_b")
+            .unwrap();
+        s.update_agent_field(&id, "charter", "# You lead.\nDelegate.")
+            .unwrap();
+        let p = s.get_agent(&id).unwrap().unwrap();
+        assert!(p.can_spawn_agents);
+        assert_eq!(p.spawn_route, "direct");
+        assert!(p.can_assign_work);
+        assert_eq!(p.assign_scope, "branch");
+        assert_eq!(p.assign_allowed_agents, vec!["agt_a", "agt_b"]);
+        assert_eq!(p.instruction_bundle, "# You lead.\nDelegate.");
+    }
+
+    #[test]
+    fn org_key_scope_values_are_validated() {
+        let s = store();
+        let id = s
+            .create_agent("n", "r", "t", "d", "t", "c", "subj-val", "low", "default")
+            .unwrap();
+        assert!(matches!(
+            s.update_agent_field(&id, "spawn_route", "sideways"),
+            Err(AgentStoreError::BadInput(_))
+        ));
+        assert!(matches!(
+            s.update_agent_field(&id, "assign_scope", "everyone"),
+            Err(AgentStoreError::BadInput(_))
+        ));
+        assert!(matches!(
+            s.update_agent_field(&id, "configure_scope", "world"),
+            Err(AgentStoreError::BadInput(_))
+        ));
     }
 
     #[test]

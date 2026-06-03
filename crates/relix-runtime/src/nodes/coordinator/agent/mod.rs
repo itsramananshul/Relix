@@ -15,8 +15,10 @@
 //!   pre-approvals.
 
 pub mod handlers;
+pub mod keys;
 pub mod store;
 
+pub use keys::{KeyVerdict, assign_verdict, spawn_verdict};
 pub use store::{
     AgentGateView, AgentProfile, AgentSnapshot, AgentStore, AgentStoreError, ApprovalRecord,
     ApprovalStatus, StandingApproval,
