@@ -508,21 +508,33 @@ async function keysBlock(id) {
   let p;
   try { p = await api("/v1/spine/keys/"+encodeURIComponent(id)); }
   catch(e) { wrap.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"Keys"}), node("div",{className:"err",textContent:e.message})])); return wrap; }
+  // Enforced governance Keys (spawn / assign / manage / configure /
+  // secrets). Each toggle/scope below maps to a real runtime gate.
   const enf = node("div",{className:"prop"},[node("div",{className:"label",textContent:"Keys — enforced"})]);
   enf.append(agentToggle(id, "can spawn agents", !!p.can_spawn_agents, "can_spawn_agents"));
   enf.append(agentSelect(id, "spawn route", p.spawn_route || "founder", ["direct","lead","founder"], "spawn_route"));
   enf.append(agentToggle(id, "can assign work", !!p.can_assign_work, "can_assign_work"));
   enf.append(agentSelect(id, "assign scope", p.assign_scope || "specific", ["any","branch","specific"], "assign_scope"));
   enf.append(agentFieldInput(id, "assign allowed agents (csv)", (p.assign_allowed_agents || []).join(", "), "assign_allowed_agents"));
+  // Manage Work — gates brief.move / set / due / pin / snag on work
+  // owned by another Operative.
+  enf.append(agentToggle(id, "can manage work", !!p.can_manage_work, "can_manage_work"));
+  enf.append(agentSelect(id, "manage scope", p.manage_scope || "specific", ["any","branch","specific"], "manage_scope"));
+  enf.append(agentFieldInput(id, "manage allowed agents (csv)", (p.manage_allowed_agents || []).join(", "), "manage_allowed_agents"));
+  // Configure Agents — gates agent.update / agent.delete on others
+  // (self-config always denied).
+  enf.append(agentToggle(id, "can configure agents", !!p.can_configure_agents, "can_configure_agents"));
+  enf.append(agentSelect(id, "configure scope", p.configure_scope || "none", ["none","any","branch","specific"], "configure_scope"));
+  enf.append(agentFieldInput(id, "configure allowed agents (csv)", (p.configure_allowed_agents || []).join(", "), "configure_allowed_agents"));
+  // Secret allowlist — gates credentials.get (exact id; empty = deny).
+  enf.append(agentFieldInput(id, "secret allowlist (csv, exact ids)", (p.secret_allowlist || []).join(", "), "secret_allowlist"));
   wrap.append(enf);
-  const st = node("div",{className:"prop"},[node("div",{className:"label",textContent:"Keys — stored only (not yet enforced)"})]);
-  st.append(agentToggle(id, "can manage work", !!p.can_manage_work, "can_manage_work"));
-  st.append(agentToggle(id, "can configure agents", !!p.can_configure_agents, "can_configure_agents"));
-  st.append(agentSelect(id, "configure scope", p.configure_scope || "none", ["none","branch","specific"], "configure_scope"));
-  st.append(agentFieldInput(id, "secret allowlist (csv)", (p.secret_allowlist || []).join(", "), "secret_allowlist"));
+  // Charter — operator-authored trusted text injected into the agent's
+  // prompt; edited under the same configure-Key rules.
   const ta = node("textarea",{rows:4, value:p.instruction_bundle || ""});
-  st.append(node("div",{className:"prop"},[node("div",{className:"label",textContent:"charter (instruction bundle)"}), ta, node("button",{className:"ghost",style:"margin-top:6px",textContent:"Save",onclick:async()=>{await patchAgent(id, {instruction_bundle:ta.value}); await openAgent(id);}})]));
-  wrap.append(st);
+  const charter = node("div",{className:"prop"},[node("div",{className:"label",textContent:"charter (instruction bundle) — injected into the agent prompt"})]);
+  charter.append(ta, node("button",{className:"ghost",style:"margin-top:6px",textContent:"Save",onclick:async()=>{await patchAgent(id, {instruction_bundle:ta.value}); await openAgent(id);}}));
+  wrap.append(charter);
   return wrap;
 }
 function agentSelect(id, label, value, opts, field) {
