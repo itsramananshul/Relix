@@ -198,6 +198,50 @@ pub fn run_macro(spec: &MacroSpec) -> MacroResult {
     }
 }
 
+/// The line prefix a Macro uses to request a Relix tool call
+/// mid-script (the RPC-to-tools sentinel). A script prints
+/// `@relix-call method|args` to stdout; the runtime intercepts
+/// those lines, dispatches each through the gated bridge (using the
+/// Macro's bridge token), and the remaining stdout is the result.
+pub const MACRO_CALL_SENTINEL: &str = "@relix-call ";
+
+/// A tool call a Macro requested via [`MACRO_CALL_SENTINEL`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MacroToolCall {
+    pub method: String,
+    /// Everything after the first `|` — passed through verbatim as
+    /// the call's pipe-delimited args (empty when none).
+    pub args: String,
+}
+
+/// Split a Macro's stdout into (requested tool calls, residual
+/// output). Lines beginning with [`MACRO_CALL_SENTINEL`] are parsed
+/// as `method|args` and pulled out; everything else is preserved (in
+/// order, minus a trailing newline) as the residual result. A
+/// sentinel line with a blank method is ignored. This is the pure
+/// parse half of Macro RPC — dispatch of the calls layers on top.
+pub fn extract_tool_calls(stdout: &str) -> (Vec<MacroToolCall>, String) {
+    let mut calls = Vec::new();
+    let mut residual_lines = Vec::new();
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix(MACRO_CALL_SENTINEL) {
+            let (method, args) = match rest.split_once('|') {
+                Some((m, a)) => (m.trim(), a),
+                None => (rest.trim(), ""),
+            };
+            if !method.is_empty() {
+                calls.push(MacroToolCall {
+                    method: method.to_string(),
+                    args: args.to_string(),
+                });
+            }
+        } else {
+            residual_lines.push(line);
+        }
+    }
+    (calls, residual_lines.join("\n"))
+}
+
 /// Run a Macro only if its interpreter is on `allow` (see
 /// [`MacroSpec::interpreter_allowed`]); otherwise refuse *before*
 /// spawning anything. This is the execute_code safety gate — the
@@ -261,6 +305,36 @@ mod tests {
         assert!(!r.success);
         assert!(r.exit_code.is_none());
         assert!(r.stderr.contains("spawn"));
+    }
+
+    #[test]
+    fn extract_tool_calls_pulls_sentinel_lines_from_residual() {
+        let stdout = "\
+line one
+@relix-call brief.comment|b1|agt|hello
+middle output
+@relix-call brief.move|b1|in_progress
+@relix-call
+last line";
+        let (calls, residual) = extract_tool_calls(stdout);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].method, "brief.comment");
+        assert_eq!(calls[0].args, "b1|agt|hello");
+        assert_eq!(calls[1].method, "brief.move");
+        assert_eq!(calls[1].args, "b1|in_progress");
+        // Residual keeps the non-sentinel lines in order.
+        assert_eq!(residual, "line one\nmiddle output\nlast line");
+
+        // A call with no args parses to an empty args string.
+        let (c2, _) = extract_tool_calls("@relix-call rig.list");
+        assert_eq!(c2.len(), 1);
+        assert_eq!(c2[0].method, "rig.list");
+        assert_eq!(c2[0].args, "");
+
+        // No sentinels → no calls, residual == input (sans trailing \n).
+        let (c3, r3) = extract_tool_calls("just\noutput\n");
+        assert!(c3.is_empty());
+        assert_eq!(r3, "just\noutput");
     }
 
     #[test]
