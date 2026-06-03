@@ -141,11 +141,15 @@ where
                         store.set_board_status(&card.task_id, "in_review")?;
                     }
                     // Unrecoverable failure → park in `blocked` for
-                    // attention rather than re-dispatching it forever.
+                    // attention rather than re-dispatching it forever,
+                    // and chronicle WHY so the Desk shows the reason.
                     RigOutcome::Failed {
-                        retryable: false, ..
+                        retryable: false,
+                        reason,
                     } => {
                         store.set_board_status(&card.task_id, "blocked")?;
+                        let _ =
+                            store.append_event(&card.task_id, "brief.dispatch_failed", reason);
                     }
                     // Continue / retryable failure → leave it
                     // `in_progress`; the next tick (or a continuation)
@@ -369,6 +373,18 @@ mod tests {
         assert_eq!(s.board_status(&a).unwrap().as_deref(), Some("blocked"));
         assert!(s.claim_holder(&a).unwrap().is_none());
         assert!(s.list_ready_briefs(50).unwrap().is_empty());
+        // The reason is chronicled so the Desk can show why.
+        let events = s
+            .query_events(
+                &a,
+                0,
+                50,
+                Some("brief.dispatch_failed"),
+                crate::nodes::coordinator::EventOrder::Desc,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload, "boom");
     }
 
     #[test]
