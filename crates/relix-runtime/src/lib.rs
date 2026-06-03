@@ -37,6 +37,7 @@ pub mod admission;
 pub mod agent_registry;
 pub mod approval;
 pub mod audit_partition;
+pub mod bench;
 pub mod confidence;
 pub mod controller_runtime;
 pub mod coordinator;
