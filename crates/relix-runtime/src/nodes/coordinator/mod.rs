@@ -1097,6 +1097,46 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// PHASE 3 (supervisory wake): parent Briefs whose Sub-briefs
+    /// are ALL finished (every child `done` or `cancelled`) while
+    /// the parent itself is still active. This is the
+    /// "children-completed" wake — the planner that decomposed the
+    /// work is roused to review the finished slice and assign the
+    /// next. Requires: has ≥1 Sub-brief, no still-active Sub-brief,
+    /// parent not itself terminal.
+    pub fn list_briefs_with_all_children_done(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT t.task_id, t.title, t.board_status, t.priority,
+                        t.assignee_agent_id, t.mandate_id, t.campaign_id
+                 FROM tasks t
+                 WHERE t.board_status NOT IN ('done', 'cancelled')
+                   AND EXISTS (
+                       SELECT 1 FROM task_edges e
+                       WHERE e.task_id = t.task_id AND e.edge_type = 'spawned'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM task_edges e
+                       JOIN tasks c ON c.task_id = e.related_task_id
+                       WHERE e.task_id = t.task_id AND e.edge_type = 'spawned'
+                         AND c.board_status NOT IN ('done', 'cancelled')
+                   )
+                 ORDER BY t.updated_at ASC LIMIT ?1",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// Insert a new Task. Returns the freshly-minted `task_id`
     /// (32 hex chars). Optional retry / timeout metadata defaults to
     /// "no retry, no timeout" for backwards compatibility with pre-C1
@@ -5181,6 +5221,17 @@ pub fn register(
         );
     }
     {
+        // PHASE 3 (supervisory wake): children-completed.
+        let s = store.clone();
+        bridge.register(
+            "brief.children_done",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_children_done(&s, &ctx) }
+            })),
+        );
+    }
+    {
         let s = store.clone();
         bridge.register(
             "task.recover",
@@ -6234,6 +6285,28 @@ fn handle_brief_ready(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome 
             Err(e) => internal(format!("brief.ready encode: {e}")),
         },
         Err(e) => map_edge_err("brief.ready", e),
+    }
+}
+
+/// `brief.children_done` — the children-completed supervisory wake:
+/// parent Briefs whose Sub-briefs are all finished. Arg `limit`
+/// (optional, default 50). JSON array of BriefCards.
+fn handle_brief_children_done(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("brief.children_done utf8: {e}")),
+    };
+    let limit: usize = if raw.is_empty() {
+        50
+    } else {
+        raw.parse().unwrap_or(50)
+    };
+    match store.list_briefs_with_all_children_done(limit) {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.children_done encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.children_done", e),
     }
 }
 
@@ -9295,6 +9368,53 @@ mod tests {
                 .iter()
                 .any(|c| c.task_id == blocked)
         );
+    }
+
+    #[test]
+    fn phase3_children_completed_wake_surfaces_finished_parents() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+        let has_parent = |s: &TaskStore, p: &str| {
+            s.list_briefs_with_all_children_done(50)
+                .unwrap()
+                .iter()
+                .any(|b| b.task_id == p)
+        };
+
+        let parent = mk("parent");
+        s.set_brief_field(&parent, "assignee", "agt_planner").unwrap();
+        s.set_board_status(&parent, "in_progress").unwrap();
+        let c1 = mk("c1");
+        let c2 = mk("c2");
+        s.link_subbrief(&parent, &c1).unwrap();
+        s.link_subbrief(&parent, &c2).unwrap();
+
+        // Children unfinished → not surfaced.
+        assert!(!has_parent(&s, &parent));
+
+        // Finish c1 only → still not (c2 active).
+        for st in ["todo", "in_progress", "in_review", "done"] {
+            s.set_board_status(&c1, st).unwrap();
+        }
+        assert!(!has_parent(&s, &parent));
+
+        // Cancel c2 (terminal counts as finished) → now surfaced.
+        s.set_board_status(&c2, "cancelled").unwrap();
+        assert!(has_parent(&s, &parent));
+
+        // A childless Brief never appears.
+        let solo = mk("solo");
+        s.set_board_status(&solo, "in_progress").unwrap();
+        assert!(!has_parent(&s, &solo));
+
+        // Once the parent itself is done, it drops off.
+        for st in ["in_review", "done"] {
+            s.set_board_status(&parent, st).unwrap();
+        }
+        assert!(!has_parent(&s, &parent));
     }
 
     /// File-backed open helper for the DB-hardening tests. We
