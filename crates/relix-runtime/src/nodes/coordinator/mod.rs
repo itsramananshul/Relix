@@ -1064,6 +1064,72 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// PHASE 5 (Brief): set or clear a Brief's due date (unix secs;
+    /// `None` clears). The Brief must exist.
+    pub fn set_brief_due(
+        &self,
+        task_id: &str,
+        due_at: Option<i64>,
+    ) -> Result<(), CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let changed = conn
+            .execute(
+                "UPDATE tasks SET due_at = ?1, updated_at = ?2 WHERE task_id = ?3",
+                params![due_at, unix_secs(), task_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+        if changed == 0 {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// PHASE 5 (Brief): a Brief's due date, if set. `NotFound` when
+    /// the Brief doesn't exist; `Ok(None)` when it has no due date.
+    pub fn brief_due(&self, task_id: &str) -> Result<Option<i64>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let v: Option<Option<i64>> = conn
+            .query_row(
+                "SELECT due_at FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        match v {
+            Some(inner) => Ok(inner),
+            None => Err(CoordinatorError::NotFound(task_id.to_string())),
+        }
+    }
+
+    /// PHASE 5 (Desk): the overdue Briefs — those in a live column
+    /// (todo/in_progress/in_review/blocked) with a due date before
+    /// `now`. Most-overdue first. The Desk's "past due" surface.
+    pub fn list_overdue_briefs(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, title, board_status, priority,
+                        assignee_agent_id, mandate_id, campaign_id
+                 FROM tasks
+                 WHERE due_at IS NOT NULL AND due_at < ?1
+                   AND board_status IN ('todo','in_progress','in_review','blocked')
+                 ORDER BY due_at ASC LIMIT ?2",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![now, lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// PHASE 5 (board): pin / unpin a Brief — pinned Briefs sort to
     /// the top of their board column. The Brief must exist.
     pub fn set_brief_pinned(
@@ -5821,6 +5887,36 @@ pub fn register(
     {
         let s = store.clone();
         bridge.register(
+            "brief.set_due",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_set_due(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.due",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_due(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.overdue",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_overdue(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
             "brief.by_label",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -7044,6 +7140,78 @@ fn handle_brief_by_label(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutco
             Err(e) => internal(format!("brief.by_label encode: {e}")),
         },
         Err(e) => map_edge_err("brief.by_label", e),
+    }
+}
+
+/// `brief.set_due` — set/clear a Brief's due date. Arg `task|epoch`
+/// (empty epoch clears).
+fn handle_brief_set_due(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.set_due utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    let task = parts.first().copied().unwrap_or("").trim();
+    if task.is_empty() {
+        return invalid("brief.set_due: task required (arg shape: task|epoch)".to_string());
+    }
+    let due_raw = parts.get(1).copied().map(str::trim).unwrap_or("");
+    let due_at: Option<i64> = if due_raw.is_empty() {
+        None
+    } else {
+        match due_raw.parse::<i64>() {
+            Ok(v) => Some(v),
+            Err(_) => return invalid(format!("brief.set_due: bad epoch '{due_raw}'")),
+        }
+    };
+    match store.set_brief_due(task, due_at) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.set_due", e),
+    }
+}
+
+/// `brief.due` — a Brief's due date (unix secs), or empty when
+/// unset. Arg `task`.
+fn handle_brief_due(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task = match single_id(ctx, "brief.due") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    match store.brief_due(task) {
+        Ok(Some(due)) => HandlerOutcome::Ok(due.to_string().into_bytes()),
+        Ok(None) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.due", e),
+    }
+}
+
+/// `brief.overdue` — the overdue Briefs (JSON cards), most-overdue
+/// first. Arg `now|limit` (now default = server time; limit 50).
+fn handle_brief_overdue(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("brief.overdue utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(2, '|').collect();
+    let now: i64 = parts
+        .first()
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(unix_secs);
+    let limit: usize = parts
+        .get(1)
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    match store.list_overdue_briefs(now, limit) {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.overdue encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.overdue", e),
     }
 }
 
@@ -9370,6 +9538,9 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         // PHASE 5 (Brief): pin a Brief to the top of its board
         // column. 0 = normal, 1 = pinned. Additive, defaulted.
         "ALTER TABLE tasks ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        // PHASE 5 (Brief): an optional due date (unix secs). NULL =
+        // no due date. Additive.
+        "ALTER TABLE tasks ADD COLUMN due_at INTEGER",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the
@@ -10481,6 +10652,57 @@ mod tests {
 
         // Empty query → empty result.
         assert!(s.search_briefs("  ", 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn brief_due_dates_and_overdue_listing() {
+        let s = store();
+        let mk = |t: &str| {
+            let id = s
+                .create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap();
+            s.set_board_status(&id, "todo").unwrap();
+            id
+        };
+        let past = mk("past");
+        let future = mk("future");
+        let nodue = mk("nodue");
+        // A done brief that's overdue must NOT surface.
+        let done = mk("done");
+        s.set_board_status(&done, "in_progress").unwrap();
+        s.set_board_status(&done, "in_review").unwrap();
+        s.set_board_status(&done, "done").unwrap();
+
+        let now = 1_000_000i64;
+        s.set_brief_due(&past, Some(now - 100)).unwrap();
+        s.set_brief_due(&future, Some(now + 100)).unwrap();
+        s.set_brief_due(&done, Some(now - 100)).unwrap();
+
+        assert_eq!(s.brief_due(&past).unwrap(), Some(now - 100));
+        assert_eq!(s.brief_due(&nodue).unwrap(), None);
+
+        let overdue: Vec<String> = s
+            .list_overdue_briefs(now, 50)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.task_id)
+            .collect();
+        assert_eq!(overdue, vec![past.clone()]); // only past; future/nodue/done excluded
+
+        // Clear the due date → no longer overdue.
+        s.set_brief_due(&past, None).unwrap();
+        assert_eq!(s.brief_due(&past).unwrap(), None);
+        assert!(s.list_overdue_briefs(now, 50).unwrap().is_empty());
+
+        // Unknown Brief → NotFound.
+        assert!(matches!(
+            s.brief_due("nope"),
+            Err(CoordinatorError::NotFound(_))
+        ));
+        assert!(matches!(
+            s.set_brief_due("nope", Some(1)),
+            Err(CoordinatorError::NotFound(_))
+        ));
     }
 
     #[test]
