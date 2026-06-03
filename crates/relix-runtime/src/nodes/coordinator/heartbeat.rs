@@ -138,9 +138,12 @@ where
                 // `in_progress` (we either moved it or it already
                 // was), so both transitions below are legal.
                 match &outcome {
-                    // Done → review for a human / supervisor.
-                    RigOutcome::Done { .. } => {
+                    // Done → review for a human / supervisor, and
+                    // chronicle the result summary so the reviewer
+                    // sees what the Shift produced.
+                    RigOutcome::Done { summary } => {
                         store.set_board_status(&card.task_id, "in_review")?;
+                        let _ = store.append_event(&card.task_id, "brief.shift_done", summary);
                     }
                     // Unrecoverable failure → park in `blocked` for
                     // attention rather than re-dispatching it forever,
@@ -321,6 +324,18 @@ mod tests {
         // Board advanced todo → in_progress → in_review; Claim released.
         assert_eq!(s.board_status(&a).unwrap().as_deref(), Some("in_review"));
         assert!(s.claim_holder(&a).unwrap().is_none());
+        // The Shift result was chronicled for the reviewer.
+        let done = s
+            .query_events(
+                &a,
+                0,
+                50,
+                Some("brief.shift_done"),
+                crate::nodes::coordinator::EventOrder::Desc,
+            )
+            .unwrap();
+        assert_eq!(done.len(), 1);
+        assert!(done[0].payload.contains("write docs"), "got {:?}", done[0].payload);
         // No longer ready, so a second tick does nothing.
         assert!(s.list_ready_briefs(50).unwrap().is_empty());
         assert!(
