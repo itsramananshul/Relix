@@ -1586,6 +1586,57 @@ impl TaskStore {
         Ok(task_id)
     }
 
+    /// PHASE 5 (companion): create a Brief and place it on the spine
+    /// in one call — the "materialize work" path. Creates the
+    /// underlying Task (flow-less, `companion` origin), opens it in
+    /// `todo`, and links the optional spine fields (assignee /
+    /// mandate / campaign / priority). Returns the new task_id.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_brief(
+        &self,
+        title: &str,
+        owner_subject_id: &str,
+        assignee: Option<&str>,
+        mandate: Option<&str>,
+        campaign: Option<&str>,
+        priority: Option<&str>,
+    ) -> Result<String, CoordinatorError> {
+        if title.trim().is_empty() {
+            return Err(CoordinatorError::Invalid("brief title required".into()));
+        }
+        let pri = priority.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(brief::DEFAULT_PRIORITY);
+        if !brief::is_priority(pri) {
+            return Err(CoordinatorError::Invalid(format!(
+                "priority '{pri}' not in low/normal/high/urgent"
+            )));
+        }
+        let task_id = self.create(
+            title.trim(),
+            "brief/manual",
+            "{}",
+            owner_subject_id,
+            RetryPolicy::None,
+            0,
+            None,
+            Some("companion"),
+        )?;
+        // Open it on the board (backlog → todo: ready for dispatch).
+        self.set_board_status(&task_id, "todo")?;
+        if let Some(a) = assignee.map(str::trim).filter(|s| !s.is_empty()) {
+            self.set_brief_field(&task_id, "assignee", a)?;
+        }
+        if let Some(m) = mandate.map(str::trim).filter(|s| !s.is_empty()) {
+            self.set_brief_field(&task_id, "mandate", m)?;
+        }
+        if let Some(c) = campaign.map(str::trim).filter(|s| !s.is_empty()) {
+            self.set_brief_field(&task_id, "campaign", c)?;
+        }
+        if pri != brief::DEFAULT_PRIORITY {
+            self.set_brief_field(&task_id, "priority", pri)?;
+        }
+        Ok(task_id)
+    }
+
     /// Mutate a Task. Any of `status` / `result` / `flow_id` /
     /// `flow_log_path` / `error_kind` / `error_cause` /
     /// `failure_class` may be `None`, in which case the existing
@@ -5450,6 +5501,16 @@ pub fn register(
     {
         let s = store.clone();
         bridge.register(
+            "brief.create",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_create(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
             "brief.detail",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -6515,6 +6576,31 @@ fn handle_brief_unsubbrief(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOut
     match store.unlink_subbrief(parent, child) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.unsubbrief", e),
+    }
+}
+
+/// `brief.create` — materialize a Brief and place it on the spine.
+/// Arg `title|assignee|mandate|campaign|priority` (only `title`
+/// required; the rest optional, empty = skip). Owner subject comes
+/// from the caller. Returns the new task_id.
+fn handle_brief_create(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.create utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(5, '|').collect();
+    let title = parts.first().copied().unwrap_or("").trim();
+    if title.is_empty() {
+        return invalid(
+            "brief.create: title required (arg shape: title|assignee|mandate|campaign|priority)"
+                .to_string(),
+        );
+    }
+    let opt = |i: usize| parts.get(i).copied().map(str::trim).filter(|s| !s.is_empty());
+    let owner = ctx.caller.subject_id.to_string();
+    match store.create_brief(title, &owner, opt(1), opt(2), opt(3), opt(4)) {
+        Ok(id) => HandlerOutcome::Ok(id.into_bytes()),
+        Err(e) => map_edge_err("brief.create", e),
     }
 }
 
@@ -9818,6 +9904,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload, "todo -> in_progress");
+    }
+
+    #[test]
+    fn create_brief_materializes_on_the_spine() {
+        let s = store();
+        let id = s
+            .create_brief(
+                "Build the onboarding flow",
+                "subj-founder",
+                Some("agt_eng"),
+                Some("mandate_x"),
+                Some("camp_y"),
+                Some("high"),
+            )
+            .unwrap();
+
+        let f = s.brief_fields(&id).unwrap().unwrap();
+        assert_eq!(f.board_status, "todo");
+        assert_eq!(f.assignee_agent_id.as_deref(), Some("agt_eng"));
+        assert_eq!(f.mandate_id.as_deref(), Some("mandate_x"));
+        assert_eq!(f.campaign_id.as_deref(), Some("camp_y"));
+        assert_eq!(f.priority, "high");
+
+        // Minimal: title only → defaults (todo, normal, no links).
+        let bare = s
+            .create_brief("Just a title", "subj", None, None, None, None)
+            .unwrap();
+        let bf = s.brief_fields(&bare).unwrap().unwrap();
+        assert_eq!(bf.board_status, "todo");
+        assert_eq!(bf.priority, "normal");
+        assert!(bf.assignee_agent_id.is_none());
+
+        // Empty title / bad priority rejected.
+        assert!(matches!(
+            s.create_brief("  ", "subj", None, None, None, None),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        assert!(matches!(
+            s.create_brief("t", "subj", None, None, None, Some("meh")),
+            Err(CoordinatorError::Invalid(_))
+        ));
     }
 
     #[test]
