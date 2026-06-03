@@ -11,6 +11,34 @@
 //! are testable in isolation and called from wherever the
 //! coordinator writes `board_status`.
 
+use serde::{Deserialize, Serialize};
+
+/// A **Dossier** — a durable artifact attached to a Brief (the
+/// "Document" in the lexicon): a plan, a design, a note, a
+/// deliverable. Append-only and versioned by id, so the artifact
+/// trail of a Brief is auditable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dossier {
+    pub doc_id: String,
+    pub task_id: String,
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// A lightweight Dossier listing row (metadata only, no body) for
+/// the artifacts panel.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DossierMeta {
+    pub doc_id: String,
+    pub kind: String,
+    pub title: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 /// The board columns a Brief can sit in.
 ///
 /// `backlog → todo → in_progress → in_review → done` is the happy

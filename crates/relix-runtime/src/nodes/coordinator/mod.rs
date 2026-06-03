@@ -668,6 +668,94 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// PHASE 1 (Brief): attach a **Dossier** (durable artifact) to
+    /// a Brief. Append-only; returns the new `doc_id`. `kind` and
+    /// `title` are required; the Brief must exist.
+    pub fn add_dossier(
+        &self,
+        task_id: &str,
+        kind: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<String, CoordinatorError> {
+        if kind.trim().is_empty() {
+            return Err(CoordinatorError::Invalid("dossier kind required".to_string()));
+        }
+        if title.trim().is_empty() {
+            return Err(CoordinatorError::Invalid("dossier title required".to_string()));
+        }
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, task_id)? {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let doc_id = new_doc_id();
+        let now = unix_secs();
+        conn.execute(
+            "INSERT INTO task_documents
+                 (doc_id, task_id, kind, title, body, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![doc_id, task_id, kind.trim(), title.trim(), body, now],
+        )
+        .map_err(CoordinatorError::Db)?;
+        Ok(doc_id)
+    }
+
+    /// PHASE 1 (Brief): read a Dossier by id (full body). `None`
+    /// when absent.
+    pub fn get_dossier(&self, doc_id: &str) -> Result<Option<brief::Dossier>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        match conn.query_row(
+            "SELECT doc_id, task_id, kind, title, body, created_at, updated_at
+             FROM task_documents WHERE doc_id = ?1",
+            params![doc_id],
+            |r| {
+                Ok(brief::Dossier {
+                    doc_id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    title: r.get(3)?,
+                    body: r.get(4)?,
+                    created_at: r.get(5)?,
+                    updated_at: r.get(6)?,
+                })
+            },
+        ) {
+            Ok(d) => Ok(Some(d)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(CoordinatorError::Db(e)),
+        }
+    }
+
+    /// PHASE 1 (Brief): list a Brief's Dossiers (metadata only, no
+    /// body), oldest first.
+    pub fn list_dossiers(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<brief::DossierMeta>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT doc_id, kind, title, created_at, updated_at
+                 FROM task_documents WHERE task_id = ?1
+                 ORDER BY created_at ASC, doc_id ASC",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows: Vec<brief::DossierMeta> = stmt
+            .query_map(params![task_id], |r| {
+                Ok(brief::DossierMeta {
+                    doc_id: r.get(0)?,
+                    kind: r.get(1)?,
+                    title: r.get(2)?,
+                    created_at: r.get(3)?,
+                    updated_at: r.get(4)?,
+                })
+            })
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// Insert a new Task. Returns the freshly-minted `task_id`
     /// (32 hex chars). Optional retry / timeout metadata defaults to
     /// "no retry, no timeout" for backwards compatibility with pre-C1
@@ -4613,6 +4701,37 @@ pub fn register(
             })),
         );
     }
+    // PHASE 1 (Brief): Dossiers — durable artifacts on a Brief.
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.dossier_add",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_dossier_add(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.dossiers",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_dossiers(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.dossier_get",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_dossier_get(&s, &ctx) }
+            })),
+        );
+    }
     {
         let s = store.clone();
         bridge.register(
@@ -5394,6 +5513,55 @@ fn handle_brief_blocked(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcom
     match store.is_blocked(task) {
         Ok(b) => HandlerOutcome::Ok(if b { b"true".to_vec() } else { b"false".to_vec() }),
         Err(e) => map_edge_err("brief.blocked", e),
+    }
+}
+
+/// `brief.dossier_add` — attach a Dossier. Arg `task_id|kind|title|body`
+/// (body may contain pipes). Returns the new doc_id.
+fn handle_brief_dossier_add(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.dossier_add utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(4, '|').collect();
+    if parts.len() < 3 {
+        return invalid("brief.dossier_add: expected `task_id|kind|title|body`".to_string());
+    }
+    let body = parts.get(3).copied().unwrap_or("");
+    match store.add_dossier(parts[0].trim(), parts[1].trim(), parts[2].trim(), body) {
+        Ok(id) => HandlerOutcome::Ok(id.into_bytes()),
+        Err(e) => map_edge_err("brief.dossier_add", e),
+    }
+}
+
+/// `brief.dossiers` — list a Brief's Dossiers (metadata JSON). Arg `task_id`.
+fn handle_brief_dossiers(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task = match single_id(ctx, "brief.dossiers") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    match store.list_dossiers(task) {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.dossiers encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.dossiers", e),
+    }
+}
+
+/// `brief.dossier_get` — read a Dossier by id (full JSON). Arg `doc_id`.
+fn handle_brief_dossier_get(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let doc_id = match single_id(ctx, "brief.dossier_get") {
+        Ok(d) => d,
+        Err(o) => return o,
+    };
+    match store.get_dossier(doc_id) {
+        Ok(Some(d)) => match serde_json::to_vec(&d) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.dossier_get encode: {e}")),
+        },
+        Ok(None) => invalid(format!("brief.dossier_get: not found: {doc_id}")),
+        Err(e) => map_edge_err("brief.dossier_get", e),
     }
 }
 
@@ -6928,6 +7096,23 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         );
         CREATE INDEX IF NOT EXISTS task_todos_by_task
             ON task_todos(task_id, position);
+
+        -- PHASE 1 (Brief): Dossiers — durable artifacts attached to
+        -- a Brief (plan / design / note / deliverable). Append-only;
+        -- the artifact trail of a Brief is auditable. `kind` is an
+        -- operator/agent-curated label; `body` holds the content.
+        CREATE TABLE IF NOT EXISTS task_documents (
+            doc_id     TEXT PRIMARY KEY,
+            task_id    TEXT NOT NULL,
+            kind       TEXT NOT NULL,
+            title      TEXT NOT NULL,
+            body       TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+        );
+        CREATE INDEX IF NOT EXISTS task_documents_by_task
+            ON task_documents(task_id, created_at);
         "#,
     )
     .map_err(CoordinatorError::Db)?;
@@ -7069,6 +7254,13 @@ fn new_task_id() -> String {
     let mut bytes = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+fn new_doc_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    format!("doc_{}", hex::encode(bytes))
 }
 
 fn unix_secs() -> i64 {
@@ -8099,6 +8291,53 @@ mod tests {
             s.set_board_status(&b3, st).unwrap();
         }
         assert!(!s.is_blocked(&p2).unwrap());
+    }
+
+    #[test]
+    fn phase1_dossiers_attach_durable_artifacts() {
+        let s = store();
+        let id = s
+            .create(
+                "brief",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        let d1 = s.add_dossier(&id, "plan", "The Plan", "step 1\nstep 2").unwrap();
+        let _d2 = s
+            .add_dossier(&id, "design", "The Design", "boxes & arrows")
+            .unwrap();
+
+        let metas = s.list_dossiers(&id).unwrap();
+        assert_eq!(metas.len(), 2);
+        let kinds: Vec<&str> = metas.iter().map(|m| m.kind.as_str()).collect();
+        assert!(kinds.contains(&"plan") && kinds.contains(&"design"));
+
+        let full = s.get_dossier(&d1).unwrap().unwrap();
+        assert_eq!(full.title, "The Plan");
+        assert_eq!(full.body, "step 1\nstep 2");
+        assert_eq!(full.task_id, id);
+        assert_eq!(full.kind, "plan");
+
+        // Validation.
+        assert!(matches!(
+            s.add_dossier(&id, "", "t", "b"),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        assert!(matches!(
+            s.add_dossier(&id, "plan", "", "b"),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        assert!(matches!(
+            s.add_dossier("nope", "plan", "t", "b"),
+            Err(CoordinatorError::NotFound(_))
+        ));
+        assert!(s.get_dossier("missing").unwrap().is_none());
     }
 
     /// File-backed open helper for the DB-hardening tests. We
