@@ -221,22 +221,34 @@ pub struct MacroToolCall {
 /// sentinel line with a blank method is ignored. This is the pure
 /// parse half of Macro RPC — dispatch of the calls layers on top.
 pub fn extract_tool_calls(stdout: &str) -> (Vec<MacroToolCall>, String) {
+    // The sentinel keyword without the trailing space, so a bare
+    // `@relix-call` line (empty call) is still recognised — and
+    // dropped — rather than leaking into the residual output.
+    let keyword = MACRO_CALL_SENTINEL.trim_end();
     let mut calls = Vec::new();
     let mut residual_lines = Vec::new();
     for line in stdout.lines() {
-        if let Some(rest) = line.strip_prefix(MACRO_CALL_SENTINEL) {
-            let (method, args) = match rest.split_once('|') {
-                Some((m, a)) => (m.trim(), a),
-                None => (rest.trim(), ""),
-            };
-            if !method.is_empty() {
-                calls.push(MacroToolCall {
-                    method: method.to_string(),
-                    args: args.to_string(),
-                });
+        let after = line
+            .strip_prefix(keyword)
+            // Only a sentinel if followed by whitespace or end-of-line
+            // (so `@relix-callbroken` is ordinary output).
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
+        match after {
+            Some(rest) => {
+                let rest = rest.trim();
+                let (method, args) = match rest.split_once('|') {
+                    Some((m, a)) => (m.trim(), a),
+                    None => (rest, ""),
+                };
+                if !method.is_empty() {
+                    calls.push(MacroToolCall {
+                        method: method.to_string(),
+                        args: args.to_string(),
+                    });
+                }
+                // A sentinel line (even an empty one) is never residual.
             }
-        } else {
-            residual_lines.push(line);
+            None => residual_lines.push(line),
         }
     }
     (calls, residual_lines.join("\n"))
