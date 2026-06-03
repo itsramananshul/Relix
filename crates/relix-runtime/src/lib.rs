@@ -56,6 +56,7 @@ pub mod plugin;
 pub mod rig;
 pub mod sflow;
 pub mod sol;
+pub mod tradecraft;
 pub mod training;
 pub mod transport;
 pub mod workflow;
