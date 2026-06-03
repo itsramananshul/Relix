@@ -1052,6 +1052,51 @@ impl TaskStore {
         }
     }
 
+    /// PHASE 3 (Pulse): the dispatcher's work-list — Briefs ready to
+    /// be worked right now: assigned to an Operative, in an active
+    /// column (todo / in_progress), not blocked by an unresolved
+    /// Snag, and not currently claimed (or the claim has expired).
+    /// Priority-ordered (urgent → high → normal → low), then oldest
+    /// update first. This is what the heartbeat loop polls to wake +
+    /// claim + dispatch.
+    pub fn list_ready_briefs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT t.task_id, t.title, t.board_status, t.priority,
+                        t.assignee_agent_id, t.mandate_id, t.campaign_id
+                 FROM tasks t
+                 WHERE t.assignee_agent_id IS NOT NULL
+                   AND t.board_status IN ('todo', 'in_progress')
+                   AND (t.claimed_by IS NULL OR t.claim_expires_at IS NULL
+                        OR t.claim_expires_at < ?1)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM task_edges e
+                       JOIN tasks b ON b.task_id = e.related_task_id
+                       WHERE e.task_id = t.task_id AND e.edge_type = 'blocked_on'
+                         AND b.board_status != 'done'
+                   )
+                 ORDER BY
+                   CASE t.priority
+                       WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
+                       WHEN 'normal' THEN 2 ELSE 3 END,
+                   t.updated_at ASC
+                 LIMIT ?2",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![now, lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// Insert a new Task. Returns the freshly-minted `task_id`
     /// (32 hex chars). Optional retry / timeout metadata defaults to
     /// "no retry, no timeout" for backwards compatibility with pre-C1
@@ -5125,6 +5170,17 @@ pub fn register(
         );
     }
     {
+        // PHASE 3 (Pulse): the dispatcher work-list.
+        let s = store.clone();
+        bridge.register(
+            "brief.ready",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_ready(&s, &ctx) }
+            })),
+        );
+    }
+    {
         let s = store.clone();
         bridge.register(
             "task.recover",
@@ -6156,6 +6212,28 @@ fn handle_brief_claim_holder(store: &TaskStore, ctx: &InvocationCtx) -> HandlerO
         }
         Ok(None) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.claim_holder", e),
+    }
+}
+
+/// `brief.ready` — the dispatcher work-list: Briefs ready to work
+/// (assigned, active column, unblocked, unclaimed). Arg `limit`
+/// (optional, default 50). JSON array of BriefCards, priority-first.
+fn handle_brief_ready(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("brief.ready utf8: {e}")),
+    };
+    let limit: usize = if raw.is_empty() {
+        50
+    } else {
+        raw.parse().unwrap_or(50)
+    };
+    match store.list_ready_briefs(limit) {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.ready encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.ready", e),
     }
 }
 
@@ -9149,6 +9227,74 @@ mod tests {
             s.claim_brief("nope", "agt_a", 300),
             Err(CoordinatorError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn phase3_ready_briefs_are_assigned_unblocked_unclaimed_active() {
+        let s = store();
+        let mk = |t: &str| {
+            s.create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap()
+        };
+
+        // Ready: assigned, todo, unblocked, unclaimed.
+        let ready = mk("ready");
+        s.set_brief_field(&ready, "assignee", "agt_a").unwrap();
+        s.set_board_status(&ready, "todo").unwrap();
+
+        // Not ready: no assignee.
+        let unassigned = mk("unassigned");
+        s.set_board_status(&unassigned, "todo").unwrap();
+
+        // Not ready: blocked by an unresolved Snag.
+        let blocked = mk("blocked");
+        let blocker = mk("blocker");
+        s.set_brief_field(&blocked, "assignee", "agt_b").unwrap();
+        s.set_board_status(&blocked, "todo").unwrap();
+        s.add_snag(&blocked, &blocker).unwrap();
+
+        // Not ready: already claimed (live).
+        let claimed = mk("claimed");
+        s.set_brief_field(&claimed, "assignee", "agt_c").unwrap();
+        s.set_board_status(&claimed, "todo").unwrap();
+        assert!(s.claim_brief(&claimed, "agt_c", 300).unwrap());
+
+        // Not ready: done.
+        let done = mk("done");
+        s.set_brief_field(&done, "assignee", "agt_d").unwrap();
+        for st in ["todo", "in_progress", "in_review", "done"] {
+            s.set_board_status(&done, st).unwrap();
+        }
+
+        let ids: Vec<String> = s
+            .list_ready_briefs(50)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.task_id)
+            .collect();
+        assert!(ids.contains(&ready));
+        for not in [&unassigned, &blocked, &claimed, &done] {
+            assert!(!ids.contains(not), "{not} should not be ready");
+        }
+
+        // Releasing the claim makes 'claimed' ready.
+        s.release_claim(&claimed, "agt_c").unwrap();
+        assert!(
+            s.list_ready_briefs(50)
+                .unwrap()
+                .iter()
+                .any(|c| c.task_id == claimed)
+        );
+        // Resolving the blocker makes 'blocked' ready.
+        for st in ["todo", "in_progress", "in_review", "done"] {
+            s.set_board_status(&blocker, st).unwrap();
+        }
+        assert!(
+            s.list_ready_briefs(50)
+                .unwrap()
+                .iter()
+                .any(|c| c.task_id == blocked)
+        );
     }
 
     /// File-backed open helper for the DB-hardening tests. We
