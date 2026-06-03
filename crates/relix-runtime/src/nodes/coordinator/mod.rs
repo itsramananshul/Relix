@@ -993,6 +993,14 @@ impl TaskStore {
                 }
             }
         }
+        // The current plan body in full — the agent needs the actual
+        // instructions, not just the plan's title.
+        if let Ok(Some(plan)) = self.latest_dossier(task_id, "plan") {
+            if !plan.body.trim().is_empty() {
+                out.push_str("\n\nCurrent plan:\n");
+                out.push_str(plan.body.trim());
+            }
+        }
         // Recent comments — the conversation thread, oldest→newest.
         if let Ok(mut comments) = self.query_events(
             task_id,
@@ -10041,12 +10049,17 @@ mod tests {
             .create("Ship the auth rewrite", "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
             .unwrap();
         s.add_dossier(&id, "spec", "Auth Spec", "body").unwrap();
+        s.add_dossier(&id, "plan", "The Plan", "step 1: design the token flow")
+            .unwrap();
         s.comment_on_brief(&id, "founder", "use passkeys").unwrap();
         s.comment_on_brief(&id, "agt_eng", "starting now").unwrap();
 
         let prompt = s.compose_brief_prompt(&id, 10);
         assert!(prompt.starts_with("Ship the auth rewrite"));
         assert!(prompt.contains("[spec] Auth Spec"));
+        // The plan body is inlined for the agent.
+        assert!(prompt.contains("Current plan:"));
+        assert!(prompt.contains("step 1: design the token flow"));
         // Comments oldest→newest.
         let first = prompt.find("use passkeys").unwrap();
         let second = prompt.find("starting now").unwrap();
