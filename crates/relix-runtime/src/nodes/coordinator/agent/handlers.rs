@@ -361,7 +361,7 @@ pub fn handle_get(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
     if id.is_empty() {
         return invalid("agent.get: agent_id required".into());
     }
-    match store.get_agent(id) {
+    match store.get_agent_for_tenant(id, ctx.tenant_id_or_default()) {
         Ok(Some(p)) => {
             let body = format!(
                 "agent_id={}|name={}|role={}|title={}|department={}|team={}|created_by={}|status={}|subject_id={}|risk_ceiling={}|approval_timeout_secs={}|created_at={}|updated_at={}|surface_allowlist={}|allow_categories={}|deny_categories={}|allow_sensitivity_tags={}|deny_sensitivity_tags={}|approval_required_categories={}|rig={}|monthly_allowance_cents={}|max_concurrent_runs={}|wake_on_timer={}|wake_on_demand={}\n",
@@ -438,7 +438,12 @@ pub fn handle_update(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome 
     if parts.len() != 3 {
         return invalid("agent.update: expected `agent_id|field|value`".into());
     }
-    match store.update_agent_field(parts[0], parts[1], parts[2]) {
+    match store.update_agent_field_for_tenant(
+        parts[0],
+        ctx.tenant_id_or_default(),
+        parts[1],
+        parts[2],
+    ) {
         Ok(()) => HandlerOutcome::Ok(b"ok\n".to_vec()),
         Err(AgentStoreError::NotFound(_)) => {
             invalid(format!("agent.update: not found: {}", parts[0]))
@@ -458,7 +463,7 @@ pub fn handle_delete(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome 
     if id.is_empty() {
         return invalid("agent.delete: agent_id required".into());
     }
-    match store.soft_delete_agent(id) {
+    match store.soft_delete_for_tenant(id, ctx.tenant_id_or_default()) {
         Ok(()) => HandlerOutcome::Ok(b"ok\n".to_vec()),
         Err(AgentStoreError::NotFound(_)) => invalid(format!("agent.delete: not found: {id}")),
         Err(e) => internal(format!("agent.delete: {e}")),
@@ -478,7 +483,7 @@ pub fn handle_reports(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome
     if id.is_empty() {
         return invalid("agent.reports: agent_id required".into());
     }
-    match store.list_direct_reports(id) {
+    match store.list_direct_reports_for_tenant(id, ctx.tenant_id_or_default()) {
         Ok(rows) => HandlerOutcome::Ok(
             rows.into_iter()
                 .map(|a| a.agent_id)
@@ -501,7 +506,7 @@ pub fn handle_by_role(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome
     if role.is_empty() {
         return invalid("agent.by_role: role required".into());
     }
-    match store.list_by_role(role) {
+    match store.list_by_role_for_tenant(role, ctx.tenant_id_or_default()) {
         Ok(rows) => HandlerOutcome::Ok(rows.join("\n").into_bytes()),
         Err(e) => internal(format!("agent.by_role: {e}")),
     }
@@ -518,7 +523,7 @@ pub fn handle_peers(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
     if id.is_empty() {
         return invalid("agent.peers: agent_id required".into());
     }
-    match store.list_peers(id) {
+    match store.list_peers_for_tenant(id, ctx.tenant_id_or_default()) {
         Ok(rows) => HandlerOutcome::Ok(rows.join("\n").into_bytes()),
         Err(e) => internal(format!("agent.peers: {e}")),
     }
@@ -535,7 +540,7 @@ pub fn handle_branch(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome 
     if id.is_empty() {
         return invalid("agent.branch: agent_id required".into());
     }
-    match store.manager_subtree(id) {
+    match store.manager_subtree_for_tenant(id, ctx.tenant_id_or_default()) {
         Ok(ids) => HandlerOutcome::Ok(ids.join("\n").into_bytes()),
         Err(e) => internal(format!("agent.branch: {e}")),
     }
@@ -552,7 +557,7 @@ pub fn handle_line(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
     if id.is_empty() {
         return invalid("agent.line: agent_id required".into());
     }
-    match store.chain_of_command(id) {
+    match store.chain_of_command_for_tenant(id, ctx.tenant_id_or_default()) {
         Ok(ids) => HandlerOutcome::Ok(ids.join("\n").into_bytes()),
         Err(e) => internal(format!("agent.line: {e}")),
     }
@@ -575,7 +580,7 @@ pub fn handle_keys(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
     if id.is_empty() {
         return invalid("agent.keys: agent_id required".into());
     }
-    match store.get_agent(id) {
+    match store.get_agent_for_tenant(id, ctx.tenant_id_or_default()) {
         Ok(Some(p)) => match serde_json::to_vec(&p) {
             Ok(b) => HandlerOutcome::Ok(b),
             Err(e) => internal(format!("agent.keys encode: {e}")),
@@ -597,7 +602,7 @@ pub fn handle_manages(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome
     if parts.len() < 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
         return invalid("agent.manages: expected `manager_id|target_id`".into());
     }
-    match store.manages(parts[0].trim(), parts[1].trim()) {
+    match store.manages_for_tenant(parts[0].trim(), parts[1].trim(), ctx.tenant_id_or_default()) {
         Ok(b) => HandlerOutcome::Ok(if b {
             b"true".to_vec()
         } else {
@@ -632,8 +637,8 @@ pub fn handle_roster_summary(store: &AgentStore, _ctx: &InvocationCtx) -> Handle
 /// `agent.allowance_committed` — total monthly Allowance committed
 /// across the active roster, in cents (NULL counts as 0). No args.
 /// Pairs with `guild.get` for commitment-vs-budget oversight.
-pub fn handle_allowance_committed(store: &AgentStore, _ctx: &InvocationCtx) -> HandlerOutcome {
-    match store.committed_allowance_cents() {
+pub fn handle_allowance_committed(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    match store.committed_allowance_cents_for_tenant(ctx.tenant_id_or_default()) {
         Ok(cents) => HandlerOutcome::Ok(cents.to_string().into_bytes()),
         Err(e) => internal(format!("agent.allowance_committed: {e}")),
     }
@@ -754,7 +759,7 @@ pub fn handle_approval_pending(store: &AgentStore, ctx: &InvocationCtx) -> Handl
             Err(_) => return invalid(format!("coord.approval.pending: bad limit: {arg}")),
         }
     };
-    match store.list_pending_approvals(limit) {
+    match store.list_pending_approvals_for_tenant(limit, ctx.tenant_id_or_default()) {
         Ok(rows) => {
             let mut out = String::new();
             for r in &rows {
@@ -814,7 +819,7 @@ pub fn handle_approval_get(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOu
     if id.is_empty() {
         return invalid("coord.approval.get: approval_id required".into());
     }
-    match store.get_approval(id) {
+    match store.get_approval_record_for_tenant(id, ctx.tenant_id_or_default()) {
         Ok(Some(r)) => {
             let body = serde_json::json!({
                 "approval_id": r.approval_id,
@@ -949,7 +954,9 @@ pub(crate) fn enforce_assign_key(
         }
         Err(e) => return Err(internal(format!("assign key lookup: {e}"))),
     };
-    let in_branch = store.manages(&actor.agent_id, assignee).unwrap_or(false);
+    let in_branch = store
+        .manages_for_tenant(&actor.agent_id, assignee, ctx.tenant_id_or_default())
+        .unwrap_or(false);
     match assign_verdict(
         actor.can_assign_work,
         &actor.assign_scope,
@@ -984,12 +991,13 @@ pub fn handle_assign_check(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOu
     if actor_id.is_empty() || assignee_id.is_empty() {
         return invalid("agent.assign_check: actor_id and assignee_id required".into());
     }
-    let actor = match store.get_agent(actor_id) {
+    let tenant = ctx.tenant_id_or_default();
+    let actor = match store.get_agent_for_tenant(actor_id, tenant) {
         Ok(Some(p)) => p,
         Ok(None) => return invalid(format!("agent.assign_check: not found: {actor_id}")),
         Err(e) => return internal(format!("agent.assign_check: {e}")),
     };
-    let in_branch = match store.manages(actor_id, assignee_id) {
+    let in_branch = match store.manages_for_tenant(actor_id, assignee_id, tenant) {
         Ok(b) => b,
         Err(e) => return internal(format!("agent.assign_check: {e}")),
     };
@@ -1107,7 +1115,11 @@ pub fn handle_approval_decide(
     // Capture the task_id BEFORE deciding so we can resume / fail
     // on the right row even if the decide call writes the
     // terminal state first.
-    let record = match store.get_approval(approval_id) {
+    // GROUP 6 (tenant isolation): only this Guild's approval is
+    // visible — a known approval_id from another tenant resolves to
+    // not-found, so it can be neither read nor decided cross-tenant.
+    let record = match store.get_approval_record_for_tenant(approval_id, ctx.tenant_id_or_default())
+    {
         Ok(Some(r)) => r,
         Ok(None) => return invalid(format!("coord.approval.decide: not found: {approval_id}")),
         Err(e) => return internal(format!("coord.approval.decide: {e}")),
@@ -1442,6 +1454,15 @@ pub(crate) fn fake_ctx_with_role(args: &[u8], role: &str, subject_seed: &[u8]) -
     }
 }
 
+/// Operator-role ctx carrying an explicit verified tenant — used to
+/// prove the product agent routes scope by tenant.
+#[cfg(test)]
+pub(crate) fn fake_ctx_tenant(args: &[u8], tenant: &str) -> InvocationCtx {
+    let mut c = fake_ctx_with_role(args, "operator", b"caller");
+    c.tenant_id = Some(tenant.to_string());
+    c
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1705,6 +1726,40 @@ mod tests {
             &fake_ctx(format!("{mgr}|{worker}").as_bytes()),
         ));
         assert!(body.contains("\"deny\""), "{body}");
+    }
+
+    #[test]
+    fn assign_check_is_tenant_scoped() {
+        // GROUP 6: agent.assign_check resolves the actor by agent_id
+        // scoped to the caller's tenant — tenant B cannot probe tenant
+        // A's Operative.
+        let s = store();
+        let mgr = s
+            .create_agent(
+                "Mgr", "planner", "Lead", "ops", "ops", "prime", "subj-mgr", "medium", "tenant-a",
+            )
+            .unwrap();
+        let worker = s
+            .create_agent(
+                "W", "engineer", "W", "eng", "eng", "mgr", "subj-w", "medium", "tenant-a",
+            )
+            .unwrap();
+        s.update_agent_field_for_tenant(&mgr, "tenant-a", "can_assign_work", "true")
+            .unwrap();
+        s.update_agent_field_for_tenant(&mgr, "tenant-a", "assign_scope", "any")
+            .unwrap();
+        // From tenant A the verdict resolves (allow).
+        let body = ok_body(handle_assign_check(
+            &s,
+            &fake_ctx_tenant(format!("{mgr}|{worker}").as_bytes(), "tenant-a"),
+        ));
+        assert!(body.contains("\"allow\""), "{body}");
+        // From tenant B the actor is not found — never a cross-tenant read.
+        let out = handle_assign_check(
+            &s,
+            &fake_ctx_tenant(format!("{mgr}|{worker}").as_bytes(), "tenant-b"),
+        );
+        assert_eq!(err_kind(out), error_kinds::INVALID_ARGS);
     }
 
     #[test]

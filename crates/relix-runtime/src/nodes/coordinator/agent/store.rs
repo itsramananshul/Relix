@@ -745,6 +745,23 @@ impl AgentStore {
         Ok(row)
     }
 
+    /// GROUP 6 (tenant isolation): read one Operative profile by
+    /// `agent_id` ONLY when it belongs to `tenant`. The product-facing
+    /// `agent.get` / `agent.keys` routes use this so a known agent_id
+    /// from one Guild cannot read another Guild's Operative.
+    pub fn get_agent_for_tenant(
+        &self,
+        agent_id: &str,
+        tenant: &str,
+    ) -> Result<Option<AgentProfile>, AgentStoreError> {
+        let t = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let row = conn
+            .query_row(SELECT_AGENT_FOR_TENANT, params![agent_id, t], row_to_agent)
+            .optional()?;
+        Ok(row)
+    }
+
     /// Lookup by the AIC subject_id — the admission gate's
     /// primary read path.
     pub fn get_by_subject(
@@ -882,6 +899,86 @@ impl AgentStore {
         Ok(rows)
     }
 
+    // ── GROUP 6: tenant-scoped org-tree reads ─────────────
+    // Each mirrors the unscoped read above but adds `tenant_id = ?`
+    // so a known agent_id from another Guild yields nothing.
+
+    /// Tenant-scoped [`Self::list_direct_reports`].
+    pub fn list_direct_reports_for_tenant(
+        &self,
+        manager_id: &str,
+        tenant: &str,
+    ) -> Result<Vec<AgentSnapshot>, AgentStoreError> {
+        let t = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, name, role, status, subject_id
+             FROM agent_profiles WHERE reports_to = ?1 AND tenant_id = ?2
+             ORDER BY created_at ASC",
+        )?;
+        let rows: Vec<AgentSnapshot> = stmt
+            .query_map(params![manager_id, t], |r| {
+                Ok(AgentSnapshot {
+                    agent_id: r.get(0)?,
+                    name: r.get(1)?,
+                    role: r.get(2)?,
+                    status: r.get(3)?,
+                    subject_id: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Tenant-scoped [`Self::list_by_role`].
+    pub fn list_by_role_for_tenant(
+        &self,
+        role: &str,
+        tenant: &str,
+    ) -> Result<Vec<String>, AgentStoreError> {
+        let t = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT agent_id FROM agent_profiles
+             WHERE role = ?1 AND status = 'active' AND tenant_id = ?2
+             ORDER BY created_at ASC",
+        )?;
+        let rows: Vec<String> = stmt
+            .query_map(params![role, t], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Tenant-scoped [`Self::list_peers`].
+    pub fn list_peers_for_tenant(
+        &self,
+        agent_id: &str,
+        tenant: &str,
+    ) -> Result<Vec<String>, AgentStoreError> {
+        let t = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let boss: Option<String> = conn
+            .query_row(
+                "SELECT reports_to FROM agent_profiles WHERE agent_id=?1 AND tenant_id=?2",
+                params![agent_id, t],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(boss) = boss else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "SELECT agent_id FROM agent_profiles
+             WHERE reports_to = ?1 AND agent_id != ?2 AND tenant_id = ?3
+             ORDER BY created_at ASC",
+        )?;
+        let rows: Vec<String> = stmt
+            .query_map(params![boss, agent_id, t], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// PHASE 0 (org tree): every agent at or below `manager_id` —
     /// the manager's *subtree*, as agent_ids (excluding the
     /// manager itself). This is the scope unit for delegated
@@ -952,6 +1049,88 @@ impl AgentStore {
         Ok(subtree.iter().any(|id| id == target_id))
     }
 
+    /// Tenant-scoped [`Self::manager_subtree`] — the BFS only follows
+    /// `reports_to` edges within `tenant`, so a Branch never leaks an
+    /// agent_id from another Guild.
+    pub fn manager_subtree_for_tenant(
+        &self,
+        manager_id: &str,
+        tenant: &str,
+    ) -> Result<Vec<String>, AgentStoreError> {
+        const MAX_NODES: usize = 10_000;
+        let t = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT agent_id FROM agent_profiles WHERE reports_to = ?1 AND tenant_id = ?2",
+        )?;
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(manager_id.to_string());
+        let mut frontier: Vec<String> = vec![manager_id.to_string()];
+        while let Some(node) = frontier.pop() {
+            if out.len() >= MAX_NODES {
+                break;
+            }
+            let children: Vec<String> = stmt
+                .query_map(params![node, t], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for child in children {
+                if seen.insert(child.clone()) {
+                    out.push(child.clone());
+                    frontier.push(child);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Tenant-scoped [`Self::chain_of_command`].
+    pub fn chain_of_command_for_tenant(
+        &self,
+        agent_id: &str,
+        tenant: &str,
+    ) -> Result<Vec<String>, AgentStoreError> {
+        const MAX_DEPTH: usize = 1024;
+        let t = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT reports_to FROM agent_profiles WHERE agent_id = ?1 AND tenant_id = ?2",
+        )?;
+        let mut chain: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(agent_id.to_string());
+        let mut current = agent_id.to_string();
+        for _ in 0..MAX_DEPTH {
+            let boss: Option<String> = stmt
+                .query_row(params![current, t], |r| r.get::<_, Option<String>>(0))
+                .optional()?
+                .flatten();
+            let Some(boss) = boss else { break };
+            if !seen.insert(boss.clone()) {
+                break;
+            }
+            chain.push(boss.clone());
+            current = boss;
+        }
+        Ok(chain)
+    }
+
+    /// Tenant-scoped [`Self::manages`] — the delegated-authority check
+    /// used by the assign-Key gate, scoped so cross-tenant agent_ids
+    /// never resolve as "in Branch".
+    pub fn manages_for_tenant(
+        &self,
+        manager_id: &str,
+        target_id: &str,
+        tenant: &str,
+    ) -> Result<bool, AgentStoreError> {
+        if manager_id == target_id {
+            return Ok(false);
+        }
+        let subtree = self.manager_subtree_for_tenant(manager_id, tenant)?;
+        Ok(subtree.iter().any(|id| id == target_id))
+    }
+
     /// PHASE 5 (companion / Roster): Operative counts by status —
     /// the Roster-at-a-glance (active / pending / suspended /
     /// disabled).
@@ -976,6 +1155,25 @@ impl AgentStore {
             "SELECT COALESCE(SUM(monthly_allowance_cents), 0)
              FROM agent_profiles WHERE status = 'active'",
             [],
+            |r| r.get(0),
+        )?;
+        Ok(total)
+    }
+
+    /// GROUP 6 (tenant isolation): committed Allowance for ONE Guild's
+    /// active roster. The unscoped variant sums across every tenant,
+    /// which would leak another Guild's spend commitment — the
+    /// product `agent.allowance_committed` route uses this.
+    pub fn committed_allowance_cents_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Result<i64, AgentStoreError> {
+        let t = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(monthly_allowance_cents), 0)
+             FROM agent_profiles WHERE status = 'active' AND tenant_id = ?1",
+            params![t],
             |r| r.get(0),
         )?;
         Ok(total)
@@ -1324,6 +1522,39 @@ impl AgentStore {
         self.update_agent_field(agent_id, "status", "disabled")
     }
 
+    /// GROUP 6 (tenant isolation): edit one field ONLY when the
+    /// Operative belongs to `tenant`. `agent_id` is a globally-unique
+    /// PRIMARY KEY, so an ownership check fully isolates the write:
+    /// once we confirm the row is this Guild's, mutating by agent_id
+    /// cannot touch another Guild. Returns `NotFound` (never an
+    /// "exists but wrong tenant" leak) when the row is not visible.
+    pub fn update_agent_field_for_tenant(
+        &self,
+        agent_id: &str,
+        tenant: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<(), AgentStoreError> {
+        if self.get_agent_for_tenant(agent_id, tenant)?.is_none() {
+            return Err(AgentStoreError::NotFound(agent_id.to_string()));
+        }
+        self.update_agent_field(agent_id, field, value)
+    }
+
+    /// GROUP 6 (tenant isolation): soft-delete ONLY when the Operative
+    /// belongs to `tenant`. Same ownership-check rationale as
+    /// [`Self::update_agent_field_for_tenant`].
+    pub fn soft_delete_for_tenant(
+        &self,
+        agent_id: &str,
+        tenant: &str,
+    ) -> Result<(), AgentStoreError> {
+        if self.get_agent_for_tenant(agent_id, tenant)?.is_none() {
+            return Err(AgentStoreError::NotFound(agent_id.to_string()));
+        }
+        self.soft_delete_agent(agent_id)
+    }
+
     // ── PHASE 4: hire flow ────────────────────────────────
 
     /// Request a hire: mint a new Operative in `pending` status. A
@@ -1481,6 +1712,24 @@ impl AgentStore {
         let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
         let row = conn
             .query_row(SELECT_APPROVAL, params![approval_id], row_to_approval)
+            .optional()?;
+        Ok(row)
+    }
+
+    /// GROUP 6 (tenant isolation): the full approval record, ONLY when
+    /// it belongs to `tenant`. The product `coord.approval.get` /
+    /// `coord.approval.decide` paths use this so a known approval_id
+    /// from another Guild cannot be read or decided.
+    pub fn get_approval_record_for_tenant(
+        &self,
+        approval_id: &str,
+        tenant: &str,
+    ) -> Result<Option<ApprovalRecord>, AgentStoreError> {
+        let t = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let sql = format!("{SELECT_APPROVAL} AND tenant_id = ?2");
+        let row = conn
+            .query_row(&sql, params![approval_id, t], row_to_approval)
             .optional()?;
         Ok(row)
     }
@@ -1806,6 +2055,35 @@ impl AgentStore {
         )?;
         let rows: Vec<ApprovalRecord> = stmt
             .query_map(params![cap as i64], row_to_approval)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// GROUP 6 (tenant isolation): pending approvals for ONE Guild —
+    /// the product `coord.approval.pending` / `/v1/spine/clearances`
+    /// read uses this so the Desk only surfaces this Guild's
+    /// Clearances.
+    pub fn list_pending_approvals_for_tenant(
+        &self,
+        limit: usize,
+        tenant: &str,
+    ) -> Result<Vec<ApprovalRecord>, AgentStoreError> {
+        let t = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let cap = limit.clamp(1, 500);
+        let mut stmt = conn.prepare(
+            "SELECT approval_id, agent_id, subject_id, method, capability_category,
+                    args_redacted_hash, reason, approver_groups,
+                    requested_at, expires_at, status,
+                    decided_at, decided_by, decision_note,
+                    task_id, approval_token, authorized_approvers
+             FROM approval_requests
+             WHERE status = 'pending' AND tenant_id = ?1
+             ORDER BY requested_at ASC
+             LIMIT ?2",
+        )?;
+        let rows: Vec<ApprovalRecord> = stmt
+            .query_map(params![t, cap as i64], row_to_approval)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -2198,6 +2476,22 @@ const SELECT_AGENT: &str = "SELECT agent_id, name, role, title, department, team
         configure_scope, secret_allowlist, instruction_bundle
  FROM agent_profiles WHERE agent_id = ?1";
 
+/// GROUP 6 (tenant isolation): the agent-id read, additionally scoped
+/// to a verified tenant so a known `agent_id` cannot reach another
+/// Guild's Operative. Same columns/order as [`SELECT_AGENT`].
+const SELECT_AGENT_FOR_TENANT: &str = "SELECT agent_id, name, role, title, department, team,
+        created_by, status, subject_id, surface_allowlist,
+        risk_ceiling, allow_categories, deny_categories,
+        allow_sensitivity_tags, deny_sensitivity_tags,
+        approval_required_categories, authorized_approvers,
+        approval_timeout_secs,
+        created_at, updated_at, profile, reports_to, rig, monthly_allowance_cents,
+        max_concurrent_runs, wake_on_timer, wake_on_demand,
+        can_spawn_agents, spawn_route, can_assign_work, assign_scope,
+        assign_allowed_agents, can_manage_work, can_configure_agents,
+        configure_scope, secret_allowlist, instruction_bundle
+ FROM agent_profiles WHERE agent_id = ?1 AND tenant_id = ?2";
+
 const SELECT_APPROVAL: &str =
     "SELECT approval_id, agent_id, subject_id, method, capability_category,
         args_redacted_hash, reason, approver_groups,
@@ -2564,6 +2858,14 @@ fn non_empty_opt(s: &str) -> Option<&str> {
     } else {
         Some(trimmed)
     }
+}
+
+/// GROUP 6 (tenant isolation): normalise a tenant id, mapping
+/// empty/blank to the reserved `default` tenant — the same convention
+/// the write paths use, so reads and writes agree on scoping.
+fn norm_tenant(tenant: &str) -> &str {
+    let t = tenant.trim();
+    if t.is_empty() { "default" } else { t }
 }
 
 fn parse_bool_key(value: &str, field: &str) -> Result<bool, AgentStoreError> {
@@ -3368,6 +3670,102 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "tenant B must not read tenant A's agent profile"
+        );
+    }
+
+    #[test]
+    fn tenant_scoped_agent_id_reads_writes_isolate_across_guilds() {
+        // GROUP 6: a known agent_id from tenant A must not be readable,
+        // updatable, or deletable as tenant B.
+        let s = store();
+        let id = s
+            .create_agent(
+                "A", "research", "t", "d", "tm", "creator", "subj-a", "medium", "tenant-a",
+            )
+            .unwrap();
+        // Read: visible to A, invisible to B.
+        assert!(s.get_agent_for_tenant(&id, "tenant-a").unwrap().is_some());
+        assert!(
+            s.get_agent_for_tenant(&id, "tenant-b").unwrap().is_none(),
+            "tenant B must not read tenant A's Operative by agent_id"
+        );
+        // Update: B is refused (NotFound, not a wrong-tenant leak); A works.
+        assert!(matches!(
+            s.update_agent_field_for_tenant(&id, "tenant-b", "title", "pwned"),
+            Err(AgentStoreError::NotFound(_))
+        ));
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().title, "t");
+        s.update_agent_field_for_tenant(&id, "tenant-a", "title", "lead")
+            .unwrap();
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().title, "lead");
+        // Delete: B is refused; the Operative stays active.
+        assert!(matches!(
+            s.soft_delete_for_tenant(&id, "tenant-b"),
+            Err(AgentStoreError::NotFound(_))
+        ));
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().status, "active");
+        s.soft_delete_for_tenant(&id, "tenant-a").unwrap();
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().status, "disabled");
+    }
+
+    #[test]
+    fn tenant_scoped_branch_and_manages_do_not_cross_guilds() {
+        // GROUP 6: the org tree is per-Guild. A manager + worker in
+        // tenant A must not appear as a Branch / management edge for B.
+        let s = store();
+        let mgr = s
+            .create_agent(
+                "M", "planner", "t", "d", "tm", "creator", "subj-m", "medium", "tenant-a",
+            )
+            .unwrap();
+        let worker = s
+            .create_agent(
+                "W", "engineer", "t", "d", "tm", "creator", "subj-w", "medium", "tenant-a",
+            )
+            .unwrap();
+        s.update_agent_field_for_tenant(&worker, "tenant-a", "reports_to", &mgr)
+            .unwrap();
+        // Branch + manages resolve within tenant A only.
+        assert_eq!(
+            s.manager_subtree_for_tenant(&mgr, "tenant-a").unwrap(),
+            vec![worker.clone()]
+        );
+        assert!(s.manages_for_tenant(&mgr, &worker, "tenant-a").unwrap());
+        // From tenant B the Branch is empty and the edge does not exist.
+        assert!(
+            s.manager_subtree_for_tenant(&mgr, "tenant-b")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!s.manages_for_tenant(&mgr, &worker, "tenant-b").unwrap());
+    }
+
+    #[test]
+    fn tenant_scoped_allowance_sums_only_that_guild() {
+        // GROUP 6: committed Allowance must not leak another Guild's
+        // spend commitment.
+        let s = store();
+        let a = s
+            .create_agent(
+                "A", "research", "t", "d", "tm", "creator", "subj-a", "medium", "tenant-a",
+            )
+            .unwrap();
+        let b = s
+            .create_agent(
+                "B", "research", "t", "d", "tm", "creator", "subj-b", "medium", "tenant-b",
+            )
+            .unwrap();
+        s.update_agent_field_for_tenant(&a, "tenant-a", "allowance", "1000")
+            .unwrap();
+        s.update_agent_field_for_tenant(&b, "tenant-b", "allowance", "9999")
+            .unwrap();
+        assert_eq!(
+            s.committed_allowance_cents_for_tenant("tenant-a").unwrap(),
+            1000
+        );
+        assert_eq!(
+            s.committed_allowance_cents_for_tenant("tenant-b").unwrap(),
+            9999
         );
     }
 
