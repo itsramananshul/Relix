@@ -960,6 +960,98 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// PHASE 3 (Claim): atomically claim a Brief for execution.
+    /// Single-owner — succeeds only if the Brief is unclaimed, its
+    /// lease has expired, or it is already held by `agent_id`
+    /// (re-entrant refresh). Sets a fresh lease of `lease_secs`.
+    /// Returns true if claimed, false if another Operative holds a
+    /// live claim. `NotFound` if the Brief doesn't exist.
+    pub fn claim_brief(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        lease_secs: i64,
+    ) -> Result<bool, CoordinatorError> {
+        let agent = agent_id.trim();
+        if agent.is_empty() {
+            return Err(CoordinatorError::Invalid("claim: agent_id required".to_string()));
+        }
+        let now = unix_secs();
+        let expires = now.saturating_add(lease_secs.max(1));
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, task_id)? {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let changed = conn
+            .execute(
+                "UPDATE tasks
+                 SET claimed_by = ?1, claim_expires_at = ?2, updated_at = ?3
+                 WHERE task_id = ?4
+                   AND (claimed_by IS NULL OR claimed_by = ?1
+                        OR claim_expires_at IS NULL OR claim_expires_at < ?3)",
+                params![agent, expires, now, task_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+        Ok(changed == 1)
+    }
+
+    /// PHASE 3 (Claim): extend the lease on a Brief the caller
+    /// holds — the heartbeat that keeps a live claim alive. Returns
+    /// true if extended, false if the claim was lost (expired, or
+    /// someone else holds it now).
+    pub fn heartbeat_claim(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        lease_secs: i64,
+    ) -> Result<bool, CoordinatorError> {
+        let now = unix_secs();
+        let expires = now.saturating_add(lease_secs.max(1));
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let changed = conn
+            .execute(
+                "UPDATE tasks SET claim_expires_at = ?1, updated_at = ?2
+                 WHERE task_id = ?3 AND claimed_by = ?4 AND claim_expires_at >= ?2",
+                params![expires, now, task_id, agent_id.trim()],
+            )
+            .map_err(CoordinatorError::Db)?;
+        Ok(changed == 1)
+    }
+
+    /// PHASE 3 (Claim): release a Brief the caller holds, freeing it
+    /// for the next Operative. No-op (Ok) when not held by caller.
+    pub fn release_claim(&self, task_id: &str, agent_id: &str) -> Result<(), CoordinatorError> {
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        conn.execute(
+            "UPDATE tasks SET claimed_by = NULL, claim_expires_at = NULL, updated_at = ?1
+             WHERE task_id = ?2 AND claimed_by = ?3",
+            params![now, task_id, agent_id.trim()],
+        )
+        .map_err(CoordinatorError::Db)?;
+        Ok(())
+    }
+
+    /// PHASE 3 (Claim): the current live claim holder + lease
+    /// expiry, if any. `None` when unclaimed or the lease expired.
+    pub fn claim_holder(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<(String, i64)>, CoordinatorError> {
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        match conn.query_row(
+            "SELECT claimed_by, claim_expires_at FROM tasks
+             WHERE task_id = ?1 AND claimed_by IS NOT NULL AND claim_expires_at >= ?2",
+            params![task_id, now],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        ) {
+            Ok(t) => Ok(Some(t)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(CoordinatorError::Db(e)),
+        }
+    }
+
     /// Insert a new Task. Returns the freshly-minted `task_id`
     /// (32 hex chars). Optional retry / timeout metadata defaults to
     /// "no retry, no timeout" for backwards compatibility with pre-C1
@@ -4990,6 +5082,48 @@ pub fn register(
             })),
         );
     }
+    // PHASE 3 (heartbeat loop): the atomic Claim — single-owner
+    // execution lock with lease/heartbeat/release.
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.claim",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_claim(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.heartbeat",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_heartbeat(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.release",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_release(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.claim_holder",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_claim_holder(&s, &ctx) }
+            })),
+        );
+    }
     {
         let s = store.clone();
         bridge.register(
@@ -5937,6 +6071,91 @@ fn handle_brief_stale_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOut
             Err(e) => internal(format!("brief.stale_list encode: {e}")),
         },
         Err(e) => map_edge_err("brief.stale_list", e),
+    }
+}
+
+/// Parse a `task_id|agent_id|lease_secs` arg for the claim caps.
+/// lease_secs defaults to 300.
+fn parse_claim_args<'a>(
+    ctx: &'a InvocationCtx,
+    method: &str,
+) -> Result<(&'a str, &'a str, i64), HandlerOutcome> {
+    let raw = std::str::from_utf8(&ctx.args)
+        .map_err(|e| invalid(format!("{method} utf8: {e}")))?;
+    let parts: Vec<&str> = raw.splitn(3, '|').collect();
+    if parts.len() < 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+        return Err(invalid(format!(
+            "{method}: expected `task_id|agent_id|lease_secs`"
+        )));
+    }
+    let lease: i64 = parts
+        .get(2)
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
+    Ok((parts[0].trim(), parts[1].trim(), lease))
+}
+
+/// `brief.claim` — atomically claim a Brief. Arg `task_id|agent_id|lease_secs`
+/// (lease default 300). Returns `claimed` if won, `held` if another holds it.
+fn handle_brief_claim(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let (task, agent, lease) = match parse_claim_args(ctx, "brief.claim") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    match store.claim_brief(task, agent, lease) {
+        Ok(true) => HandlerOutcome::Ok(b"claimed".to_vec()),
+        Ok(false) => HandlerOutcome::Ok(b"held".to_vec()),
+        Err(e) => map_edge_err("brief.claim", e),
+    }
+}
+
+/// `brief.heartbeat` — extend the caller's claim. Arg
+/// `task_id|agent_id|lease_secs`. Returns `ok` or `lost`.
+fn handle_brief_heartbeat(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let (task, agent, lease) = match parse_claim_args(ctx, "brief.heartbeat") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    match store.heartbeat_claim(task, agent, lease) {
+        Ok(true) => HandlerOutcome::Ok(b"ok".to_vec()),
+        Ok(false) => HandlerOutcome::Ok(b"lost".to_vec()),
+        Err(e) => map_edge_err("brief.heartbeat", e),
+    }
+}
+
+/// `brief.release` — release the caller's claim. Arg `task_id|agent_id`.
+fn handle_brief_release(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let (task, agent) = match parse_pair(ctx, "brief.release") {
+        Ok(p) => p,
+        Err(o) => return o,
+    };
+    match store.release_claim(task, agent) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.release", e),
+    }
+}
+
+/// `brief.claim_holder` — the current live claim holder + expiry as
+/// JSON `{"holder":..,"expires_at":..}`, or empty body when
+/// unclaimed. Arg `task_id`.
+fn handle_brief_claim_holder(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task = match single_id(ctx, "brief.claim_holder") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    match store.claim_holder(task) {
+        Ok(Some((holder, expires))) => {
+            let v = serde_json::json!({ "holder": holder, "expires_at": expires });
+            match serde_json::to_vec(&v) {
+                Ok(b) => HandlerOutcome::Ok(b),
+                Err(e) => internal(format!("brief.claim_holder encode: {e}")),
+            }
+        }
+        Ok(None) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.claim_holder", e),
     }
 }
 
@@ -7595,6 +7814,13 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         //     at write time once the handlers are wired.
         "ALTER TABLE tasks ADD COLUMN mandate_id TEXT",
         "ALTER TABLE tasks ADD COLUMN campaign_id TEXT",
+        // PHASE 3 (heartbeat loop): the atomic Claim — single-owner
+        // execution lock on a Brief. `claimed_by` is the Operative
+        // holding it; `claim_expires_at` is the lease deadline (unix
+        // secs). NULL or past-deadline = claimable. Both additive +
+        // nullable, so existing rows are simply unclaimed.
+        "ALTER TABLE tasks ADD COLUMN claimed_by TEXT",
+        "ALTER TABLE tasks ADD COLUMN claim_expires_at INTEGER",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the
@@ -8870,6 +9096,59 @@ mod tests {
                 .iter()
                 .any(|c| c.task_id == fresh)
         );
+    }
+
+    #[test]
+    fn phase3_brief_claim_is_single_owner_with_lease() {
+        let s = store();
+        let id = s
+            .create(
+                "brief",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Unclaimed to start.
+        assert!(s.claim_holder(&id).unwrap().is_none());
+
+        // A claims; B is locked out while A's lease is live.
+        assert!(s.claim_brief(&id, "agt_a", 300).unwrap());
+        assert_eq!(s.claim_holder(&id).unwrap().unwrap().0, "agt_a");
+        assert!(!s.claim_brief(&id, "agt_b", 300).unwrap());
+
+        // A is re-entrant; A heartbeats; B's heartbeat fails.
+        assert!(s.claim_brief(&id, "agt_a", 300).unwrap());
+        assert!(s.heartbeat_claim(&id, "agt_a", 300).unwrap());
+        assert!(!s.heartbeat_claim(&id, "agt_b", 300).unwrap());
+
+        // A releases; B can now claim.
+        s.release_claim(&id, "agt_a").unwrap();
+        assert!(s.claim_holder(&id).unwrap().is_none());
+        assert!(s.claim_brief(&id, "agt_b", 300).unwrap());
+
+        // An expired lease shows no holder and is reclaimable.
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE tasks SET claim_expires_at = 100 WHERE task_id = ?1",
+                params![id],
+            )
+            .unwrap();
+        }
+        assert!(s.claim_holder(&id).unwrap().is_none());
+        assert!(s.claim_brief(&id, "agt_a", 300).unwrap());
+
+        // Unknown Brief → NotFound.
+        assert!(matches!(
+            s.claim_brief("nope", "agt_a", 300),
+            Err(CoordinatorError::NotFound(_))
+        ));
     }
 
     /// File-backed open helper for the DB-hardening tests. We
