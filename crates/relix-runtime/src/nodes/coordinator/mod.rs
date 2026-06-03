@@ -533,6 +533,27 @@ impl TaskStore {
                 "illegal board move {from} -> {to}"
             )));
         }
+        // Entry guard (relix-execution-and-issue-design §1.3):
+        // `in_progress` requires no unresolved blockers — you can't
+        // actively work a Brief that's still snagged. Inline check
+        // under the held lock (avoids re-locking via `is_blocked`).
+        if to == "in_progress" && from != to {
+            let unresolved: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM task_edges e
+                     JOIN tasks b ON b.task_id = e.related_task_id
+                     WHERE e.task_id = ?1 AND e.edge_type = 'blocked_on'
+                       AND b.board_status != 'done'",
+                    params![task_id],
+                    |r| r.get(0),
+                )
+                .map_err(CoordinatorError::Db)?;
+            if unresolved > 0 {
+                return Err(CoordinatorError::Invalid(format!(
+                    "cannot move {task_id} to in_progress: {unresolved} unresolved blocker(s)"
+                )));
+            }
+        }
         let now = unix_secs();
         conn.execute(
             "UPDATE tasks SET board_status = ?1, updated_at = ?2 WHERE task_id = ?3",
@@ -11157,6 +11178,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn in_progress_is_blocked_by_unresolved_snags() {
+        let s = store();
+        let mk = |t: &str| {
+            let id = s
+                .create(t, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+                .unwrap();
+            s.set_board_status(&id, "todo").unwrap();
+            id
+        };
+        let task = mk("task");
+        let blocker = mk("blocker");
+        s.add_snag(&task, &blocker).unwrap();
+
+        // Blocked → can't enter in_progress.
+        assert!(matches!(
+            s.set_board_status(&task, "in_progress"),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        assert_eq!(s.board_status(&task).unwrap().as_deref(), Some("todo"));
+
+        // Resolve the blocker → now allowed.
+        s.set_board_status(&blocker, "in_progress").unwrap();
+        s.set_board_status(&blocker, "in_review").unwrap();
+        s.set_board_status(&blocker, "done").unwrap();
+        s.set_board_status(&task, "in_progress").unwrap();
+        assert_eq!(s.board_status(&task).unwrap().as_deref(), Some("in_progress"));
     }
 
     #[test]
