@@ -1574,6 +1574,50 @@ pub(crate) fn enforce_manage_key(
     }
 }
 
+/// Enforce the **secret allowlist** (company-model §5.2C) for an
+/// Operative reading a credential by `secret_name`. This is an
+/// *additional* per-Operative layer on top of the credential vault's
+/// existing owner + tenant gate. Returns:
+///
+/// - `Ok(())` — bypassed: the Founder/Board (operator/admin), or the
+///   caller is **not** an Operative in this Guild (a non-spine system
+///   identity — the vault's owner/tenant gate still protects it).
+/// - `Err(outcome)` — the caller IS an Operative and is refused: it is
+///   not active, or `secret_name` is not in its `secret_allowlist`
+///   (empty allowlist = deny-by-default; exact match only).
+pub(crate) fn enforce_secret_allowlist(
+    store: &AgentStore,
+    ctx: &InvocationCtx,
+    secret_name: &str,
+) -> Result<(), HandlerOutcome> {
+    if caller_is_operator(ctx) {
+        return Ok(());
+    }
+    let tenant = ctx.tenant_id_or_default();
+    let subject = ctx.caller.subject_id.to_string();
+    let actor = match store.get_by_subject_for_tenant(&subject, tenant) {
+        Ok(Some(p)) => p,
+        // Not an Operative in this Guild → the secret_allowlist concept
+        // does not apply; defer to the vault's owner/tenant gate.
+        Ok(None) => return Ok(()),
+        Err(e) => return Err(internal(format!("secret allowlist lookup: {e}"))),
+    };
+    if actor.status != "active" {
+        return Err(security_denied(format!(
+            "secret denied: Operative `{}` is {} (not active)",
+            actor.agent_id, actor.status
+        )));
+    }
+    if super::keys::secret_allowed(&actor.secret_allowlist, secret_name) {
+        Ok(())
+    } else {
+        Err(security_denied(format!(
+            "secret denied: `{secret_name}` is not in Operative `{}`'s secret_allowlist",
+            actor.agent_id
+        )))
+    }
+}
+
 /// Enforce the **configure Key** (company-model §5.2A) for an
 /// agent-originated mutation of `target_id`'s profile/Keys
 /// (`agent.update` / `agent.delete`). Returns `Ok(())` — bypassed —
@@ -3136,6 +3180,107 @@ mod tests {
             handle_update(&s, &fake_ctx(format!("{outsider}|title|F").as_bytes())),
             HandlerOutcome::Ok(_)
         ));
+    }
+
+    // ── Secret allowlist enforcement (company-model §5.2C) ───
+
+    fn secret_check(s: &AgentStore, seed: &[u8], secret: &str) -> Result<(), u32> {
+        match enforce_secret_allowlist(s, &fake_ctx_with_role(b"", "engineer", seed), secret) {
+            Ok(()) => Ok(()),
+            Err(o) => Err(err_kind(o)),
+        }
+    }
+
+    #[test]
+    fn secret_empty_allowlist_denies_operative() {
+        let s = store();
+        s.create_agent(
+            "A",
+            "engineer",
+            "A",
+            "e",
+            "e",
+            "p",
+            &subject_of(b"sec-seed"),
+            "medium",
+            "default",
+        )
+        .unwrap();
+        // No secret_allowlist → deny by default.
+        assert_eq!(
+            secret_check(&s, b"sec-seed", "db"),
+            Err(error_kinds::SECURITY_DENIED)
+        );
+    }
+
+    #[test]
+    fn secret_allowlisted_operative_can_read_exact_only() {
+        let s = store();
+        let id = s
+            .create_agent(
+                "A",
+                "engineer",
+                "A",
+                "e",
+                "e",
+                "p",
+                &subject_of(b"sec-seed"),
+                "medium",
+                "default",
+            )
+            .unwrap();
+        s.update_agent_field(&id, "secret_allowlist", "db, stripe_key")
+            .unwrap();
+        assert_eq!(secret_check(&s, b"sec-seed", "db"), Ok(()));
+        assert_eq!(secret_check(&s, b"sec-seed", "stripe_key"), Ok(()));
+        // Substring / prefix tricks do not bypass.
+        assert_eq!(
+            secret_check(&s, b"sec-seed", "db-prod"),
+            Err(error_kinds::SECURITY_DENIED)
+        );
+        assert_eq!(
+            secret_check(&s, b"sec-seed", "stripe_key2"),
+            Err(error_kinds::SECURITY_DENIED)
+        );
+    }
+
+    #[test]
+    fn secret_disabled_operative_cannot_read() {
+        let s = store();
+        let id = s
+            .create_agent(
+                "A",
+                "engineer",
+                "A",
+                "e",
+                "e",
+                "p",
+                &subject_of(b"sec-seed"),
+                "medium",
+                "default",
+            )
+            .unwrap();
+        s.update_agent_field(&id, "secret_allowlist", "db").unwrap();
+        s.soft_delete_agent(&id).unwrap(); // → disabled
+        assert_eq!(
+            secret_check(&s, b"sec-seed", "db"),
+            Err(error_kinds::SECURITY_DENIED)
+        );
+    }
+
+    #[test]
+    fn secret_non_operative_passes_through_to_vault_gate() {
+        // A caller with no Operative profile is not subject to the
+        // allowlist (the vault's owner/tenant gate still protects it).
+        let s = store();
+        assert_eq!(secret_check(&s, b"ghost-seed", "db"), Ok(()));
+    }
+
+    #[test]
+    fn secret_operator_bypasses_allowlist() {
+        let s = store();
+        // Operator role bypasses even with no profile / no allowlist.
+        assert!(enforce_secret_allowlist(&s, &fake_ctx(b""), "db").is_ok());
     }
 
     // ── Assign-Key verdict (company-model §5.2B / §5.3) ──────

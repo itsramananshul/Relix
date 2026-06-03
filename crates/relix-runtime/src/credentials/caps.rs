@@ -15,7 +15,14 @@ use super::store::{CredentialKind, CredentialStore};
 /// additionally enforces caller == owner_agent in-handler so
 /// even a permissive policy can't leak a credential to a
 /// non-owner.
-pub fn register(bridge: &mut DispatchBridge, store: CredentialStore) {
+pub fn register(
+    bridge: &mut DispatchBridge,
+    store: CredentialStore,
+    // Optional spine agent store: when present, `credentials.get`
+    // additionally enforces the reading Operative's `secret_allowlist`
+    // (company-model §5.2C) on top of the vault's owner/tenant gate.
+    agent_store: Option<Arc<crate::nodes::coordinator::agent::AgentStore>>,
+) {
     {
         let s = store.clone();
         bridge.register(
@@ -28,11 +35,13 @@ pub fn register(bridge: &mut DispatchBridge, store: CredentialStore) {
     }
     {
         let s = store.clone();
+        let a = agent_store.clone();
         bridge.register(
             "credentials.get",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
-                async move { handle_get(&s, &ctx) }
+                let a = a.clone();
+                async move { handle_get(&s, a.as_deref(), &ctx) }
             })),
         );
     }
@@ -138,13 +147,32 @@ struct NameArgs {
     name: String,
 }
 
-fn handle_get(store: &CredentialStore, ctx: &InvocationCtx) -> HandlerOutcome {
+fn handle_get(
+    store: &CredentialStore,
+    agent_store: Option<&crate::nodes::coordinator::agent::AgentStore>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
     let args: NameArgs = match decode(ctx) {
         Ok(a) => a,
         Err(out) => return out,
     };
     if args.name.trim().is_empty() {
         return invalid("name is required");
+    }
+    // Per-Operative secret_allowlist gate (company-model §5.2C), layered
+    // on top of the vault's owner/tenant gate below. Skipped when no
+    // spine agent store is wired or the caller is not an Operative.
+    if let Some(astore) = agent_store
+        && let Err(out) = crate::nodes::coordinator::agent::handlers::enforce_secret_allowlist(
+            astore, ctx, &args.name,
+        )
+    {
+        tracing::warn!(
+            secret = %args.name,
+            caller = %ctx.caller.name,
+            "credentials.get: denied by Operative secret_allowlist"
+        );
+        return out;
     }
     // Lookup the row first so we can authorisation-check
     // caller vs owner_agent before decrypting.
@@ -400,7 +428,7 @@ mod gate2_ownership_failclosed_tests {
             vec!["operators".into(), "admin".into()],
             "shared-key",
         );
-        let outcome = handle_get(&store, &ctx);
+        let outcome = handle_get(&store, None, &ctx);
         assert!(
             is_security_denied(&outcome),
             "no-owner credential must be denied by default, even for operators/admin groups"
@@ -427,15 +455,67 @@ mod gate2_ownership_failclosed_tests {
         // Non-owner (even in operators group) → denied.
         let bob = ctx_for("bob", vec!["operators".into()], "alice-key");
         assert!(
-            is_security_denied(&handle_get(&store, &bob)),
+            is_security_denied(&handle_get(&store, None, &bob)),
             "a non-owner must be denied"
         );
 
         // Owner → allowed.
         let alice = ctx_for("alice", vec![], "alice-key");
         assert!(
-            matches!(handle_get(&store, &alice), HandlerOutcome::Ok(_)),
+            matches!(handle_get(&store, None, &alice), HandlerOutcome::Ok(_)),
             "the owner must be able to read their own credential"
+        );
+    }
+
+    #[test]
+    fn operative_secret_allowlist_layers_on_top_of_ownership() {
+        // company-model §5.2C: even the credential's owner, when it is
+        // an Operative, must have the secret in its `secret_allowlist`.
+        let store = CredentialStore::open_in_memory("test-master-secret").unwrap();
+        store
+            .store(
+                "alice-key",
+                "v",
+                CredentialKind::Secret,
+                Some("alice"),
+                None,
+                None,
+                Some("seed"),
+            )
+            .unwrap();
+        let agents = crate::nodes::coordinator::agent::AgentStore::in_memory().unwrap();
+        // `ctx_for("alice", ..)` carries subject_id = from_pubkey("alice").
+        let alice_subject = relix_core::types::NodeId::from_pubkey(b"alice").to_string();
+        let alice_id = agents
+            .create_agent(
+                "alice",
+                "engineer",
+                "A",
+                "e",
+                "e",
+                "p",
+                &alice_subject,
+                "medium",
+                "default",
+            )
+            .unwrap();
+        let alice = ctx_for("alice", vec![], "alice-key");
+
+        // Owner Operative WITHOUT the secret in its allowlist → denied.
+        assert!(
+            is_security_denied(&handle_get(&store, Some(&agents), &alice)),
+            "owner Operative must still be gated by its secret_allowlist"
+        );
+        // Grant the secret → now allowed.
+        agents
+            .update_agent_field(&alice_id, "secret_allowlist", "alice-key")
+            .unwrap();
+        assert!(
+            matches!(
+                handle_get(&store, Some(&agents), &alice),
+                HandlerOutcome::Ok(_)
+            ),
+            "an allowlisted owner Operative must be able to read its secret"
         );
     }
 }

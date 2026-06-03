@@ -194,6 +194,15 @@ pub fn configure_verdict(
     )
 }
 
+/// Exact-match secret-allowlist check (company-model §5.2C). An
+/// **empty** allowlist denies (deny-by-default for an Operative);
+/// otherwise the secret name must equal an allowlist entry exactly —
+/// no substring / prefix / glob tricks, so `db` never grants `db-prod`.
+pub fn secret_allowed(allowlist: &[String], secret_name: &str) -> bool {
+    let name = secret_name.trim();
+    !name.is_empty() && allowlist.iter().any(|a| a == name)
+}
+
 /// Decide whether an Operative **actor** may spawn/hire another
 /// Operative (company-model §5.2A). The Founder/Board path bypasses
 /// this entirely — it is only consulted when an *agent* originates the
@@ -372,6 +381,21 @@ mod tests {
         assert!(manage_verdict(true, "specific", &allowed, "agt_b", true).is_deny());
         // Unknown scope normalises to specific (narrowest), not any.
         assert!(manage_verdict(true, "garbage", &[], "x", true).is_deny());
+    }
+
+    #[test]
+    fn secret_allowed_is_exact_and_deny_by_default() {
+        // Empty allowlist → deny.
+        assert!(!secret_allowed(&[], "db"));
+        let allow = vec!["db".to_string(), "stripe_key".to_string()];
+        assert!(secret_allowed(&allow, "db"));
+        assert!(secret_allowed(&allow, "stripe_key"));
+        // Substring / prefix / suffix tricks do NOT bypass.
+        assert!(!secret_allowed(&allow, "db-prod"));
+        assert!(!secret_allowed(&allow, "prod-db"));
+        assert!(!secret_allowed(&allow, "d"));
+        assert!(!secret_allowed(&allow, "stripe_key2"));
+        assert!(!secret_allowed(&allow, ""));
     }
 
     #[test]

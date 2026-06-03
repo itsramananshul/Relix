@@ -7687,7 +7687,11 @@ fn register_node_type_handlers(
                     false,
                 ) {
                     Ok(store) => {
-                        crate::credentials::caps::register(bridge, store.clone());
+                        crate::credentials::caps::register(
+                            bridge,
+                            store.clone(),
+                            Some(agent_store.clone()),
+                        );
                         let notifier: std::sync::Arc<dyn crate::credentials::RotationNotifier> =
                             std::sync::Arc::new(crate::credentials::scheduler::LogRotationNotifier);
                         let scheduler = crate::credentials::RotationScheduler::new(
