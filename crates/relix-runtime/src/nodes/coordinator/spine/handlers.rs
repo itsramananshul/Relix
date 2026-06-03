@@ -42,6 +42,7 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<SpineStore>) {
     cap!("mandate.get", handle_mandate_get);
     cap!("mandate.list", handle_mandate_list);
     cap!("mandate.children", handle_mandate_children);
+    cap!("mandate.tree", handle_mandate_tree);
     cap!("mandate.update", handle_mandate_update);
     cap!("campaign.create", handle_campaign_create);
     cap!("campaign.get", handle_campaign_get);
@@ -253,6 +254,27 @@ fn handle_mandate_list(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcom
             Err(e) => internal(format!("mandate.list encode: {e}")),
         },
         Err(e) => internal(format!("mandate.list: {e}")),
+    }
+}
+
+/// `mandate.tree` — args `mandate_id`. Tenant-scoped. Returns the
+/// Mandate with its direct sub-Mandates + Campaigns as one JSON
+/// object; `not found` when the Mandate isn't in the caller's Guild.
+fn handle_mandate_tree(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("mandate.tree utf8: {e}")),
+    };
+    if raw.is_empty() {
+        return invalid("mandate.tree: mandate_id required".to_string());
+    }
+    match store.mandate_tree(ctx.tenant_id_or_default(), raw) {
+        Ok(Some(t)) => match serde_json::to_vec(&t) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("mandate.tree encode: {e}")),
+        },
+        Ok(None) => invalid(format!("mandate.tree: not found: {raw}")),
+        Err(e) => internal(format!("mandate.tree: {e}")),
     }
 }
 

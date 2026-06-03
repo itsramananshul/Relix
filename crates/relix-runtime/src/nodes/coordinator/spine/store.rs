@@ -96,6 +96,16 @@ pub struct SpineCounts {
     pub campaigns_active: i64,
 }
 
+/// A Mandate with its immediate spine children — the drill-down a
+/// dashboard renders for one Mandate: the Mandate itself, its direct
+/// sub-Mandates, and the Campaigns hanging off it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MandateTree {
+    pub mandate: Mandate,
+    pub child_mandates: Vec<Mandate>,
+    pub campaigns: Vec<Campaign>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SpineStoreError {
     #[error("spine store: {0}")]
@@ -420,6 +430,25 @@ impl SpineStore {
             .query_map(params![tenant, parent_mandate_id], row_to_mandate)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    /// PHASE 1 (spine tree): a Mandate plus its immediate spine
+    /// children (direct sub-Mandates + its Campaigns) in one
+    /// tenant-scoped read. `None` when the Mandate doesn't exist in
+    /// `tenant`.
+    pub fn mandate_tree(
+        &self,
+        tenant: &str,
+        mandate_id: &str,
+    ) -> Result<Option<MandateTree>, SpineStoreError> {
+        let Some(mandate) = self.get_mandate_for_tenant(mandate_id, tenant)? else {
+            return Ok(None);
+        };
+        Ok(Some(MandateTree {
+            mandate,
+            child_mandates: self.list_child_mandates(tenant, mandate_id)?,
+            campaigns: self.list_campaigns(tenant, Some(mandate_id))?,
+        }))
     }
 
     /// PHASE 5 (companion): the Guild's spine counts in one
@@ -942,6 +971,29 @@ mod tests {
         let g = s.get_guild("fresh").unwrap().unwrap();
         assert_eq!(g.display_name, "fresh");
         assert_eq!(g.monthly_allowance_cents, Some(100));
+    }
+
+    #[test]
+    fn mandate_tree_bundles_children_and_campaigns() {
+        let s = store();
+        let root = s.create_mandate("acme", "Company", "", None, None).unwrap();
+        let sub = s
+            .create_mandate("acme", "Q1", "", None, Some(&root))
+            .unwrap();
+        s.create_campaign("acme", "Auth", Some(&root), None, None)
+            .unwrap();
+        s.create_campaign("acme", "Billing", Some(&root), None, None)
+            .unwrap();
+
+        let tree = s.mandate_tree("acme", &root).unwrap().unwrap();
+        assert_eq!(tree.mandate.mandate_id, root);
+        assert_eq!(tree.child_mandates.len(), 1);
+        assert_eq!(tree.child_mandates[0].mandate_id, sub);
+        assert_eq!(tree.campaigns.len(), 2);
+
+        // Cross-tenant / unknown → None.
+        assert!(s.mandate_tree("other", &root).unwrap().is_none());
+        assert!(s.mandate_tree("acme", "mandate_nope").unwrap().is_none());
     }
 
     #[test]
