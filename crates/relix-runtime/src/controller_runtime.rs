@@ -8795,6 +8795,13 @@ fn register_node_type_handlers(
                             tracing::error!(error = %e, "heartbeat: dispatch task join error")
                         }
                     }
+                    // Defensive hygiene: reap any bridge tokens that
+                    // outlived their Shift (e.g. a panicked dispatch
+                    // that never reached its revoke).
+                    let reaped = bridge_tokens.sweep_expired();
+                    if reaped > 0 {
+                        tracing::debug!(reaped, "heartbeat: swept expired bridge tokens");
+                    }
                 }
             });
             tracing::info!(
