@@ -18,7 +18,10 @@
 //! the claim core here means the loop's correctness is unit-tested
 //! without standing up the outbound mesh path.
 
+use std::sync::Arc;
+
 use super::{CoordinatorError, TaskStore, brief};
+use crate::rig::{Rig, RigOutcome, RigRunRequest};
 
 /// The default lease a dispatch tick takes on a claimed Brief. The
 /// dispatcher must heartbeat (`TaskStore::heartbeat_claim`) before
@@ -53,6 +56,88 @@ pub fn claim_ready_batch(
         }
     }
     Ok(claimed)
+}
+
+/// What one dispatched Brief produced this tick.
+#[derive(Clone, Debug)]
+pub struct DispatchRecord {
+    /// The Brief that was dispatched.
+    pub brief_id: String,
+    /// The Rig that ran it (empty if none resolved).
+    pub rig: String,
+    /// The Rig's outcome.
+    pub outcome: RigOutcome,
+}
+
+/// Run one full dispatch tick: claim the ready Briefs, run each on
+/// its Rig, advance the board, and release the Claim.
+///
+/// For each claimed Brief:
+///   - resolve its Rig via `resolve_rig` (the assignee's chosen
+///     backend, or the Guild default — the caller owns that lookup
+///     so this stays decoupled from the agent store);
+///   - if it has a Rig: move `todo → in_progress` (work has
+///     started), run the Rig with the prompt from `build_prompt`,
+///     and on `Done` advance `in_progress → in_review`;
+///   - if no Rig resolves: record a `Failed` outcome and leave the
+///     board untouched (nothing ran — it re-appears next tick / the
+///     Desk surfaces it);
+///   - always release the Claim afterwards, so a continuation or
+///     the next tick can pick the Brief up.
+///
+/// The board transitions are always valid by construction (the
+/// ready set is `todo`/`in_progress`), so they propagate real DB
+/// errors but never an illegal-transition error.
+pub fn dispatch_batch<R, P>(
+    store: &TaskStore,
+    batch: usize,
+    lease_secs: i64,
+    resolve_rig: R,
+    build_prompt: P,
+) -> Result<Vec<DispatchRecord>, CoordinatorError>
+where
+    R: Fn(&brief::BriefCard) -> Option<Arc<dyn Rig>>,
+    P: Fn(&brief::BriefCard) -> String,
+{
+    let claimed = claim_ready_batch(store, batch, lease_secs)?;
+    let mut records = Vec::with_capacity(claimed.len());
+    for card in claimed {
+        let record = match resolve_rig(&card) {
+            Some(rig) => {
+                // Work starts: todo → in_progress.
+                if card.board_status == "todo" {
+                    store.set_board_status(&card.task_id, "in_progress")?;
+                }
+                let assignee = card.assignee_agent_id.clone().unwrap_or_default();
+                let req =
+                    RigRunRequest::new(&card.task_id, assignee, String::new(), build_prompt(&card));
+                let outcome = rig.run(&req);
+                // On Done, advance to review for a human / supervisor.
+                if matches!(outcome, RigOutcome::Done { .. }) {
+                    store.set_board_status(&card.task_id, "in_review")?;
+                }
+                DispatchRecord {
+                    brief_id: card.task_id.clone(),
+                    rig: rig.name().to_string(),
+                    outcome,
+                }
+            }
+            None => DispatchRecord {
+                brief_id: card.task_id.clone(),
+                rig: String::new(),
+                outcome: RigOutcome::Failed {
+                    reason: "no Rig configured and no Guild default".to_string(),
+                    retryable: false,
+                },
+            },
+        };
+        // Always release the Claim after the tick.
+        if let Some(assignee) = card.assignee_agent_id.as_deref() {
+            store.release_claim(&card.task_id, assignee)?;
+        }
+        records.push(record);
+    }
+    Ok(records)
 }
 
 #[cfg(test)]
@@ -148,5 +233,62 @@ mod tests {
             .map(|c| c.task_id)
             .collect();
         assert!(again.contains(&id));
+    }
+
+    #[test]
+    fn dispatch_batch_runs_each_brief_on_its_rig_and_advances_the_board() {
+        use crate::rig::RigRegistry;
+        let s = store();
+        let reg = RigRegistry::with_builtins();
+        let a = ready_brief(&s, "write docs", "agt_a"); // starts in todo
+
+        let records = dispatch_batch(
+            &s,
+            50,
+            300,
+            |_: &brief::BriefCard| reg.get("echo"),
+            |c: &brief::BriefCard| c.title.clone(),
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].brief_id, a);
+        assert_eq!(records[0].rig, "echo");
+        assert!(matches!(records[0].outcome, RigOutcome::Done { .. }));
+
+        // Board advanced todo → in_progress → in_review; Claim released.
+        assert_eq!(s.board_status(&a).unwrap().as_deref(), Some("in_review"));
+        assert!(s.claim_holder(&a).unwrap().is_none());
+        // No longer ready, so a second tick does nothing.
+        assert!(s.list_ready_briefs(50).unwrap().is_empty());
+        assert!(
+            dispatch_batch(
+                &s,
+                50,
+                300,
+                |_: &brief::BriefCard| reg.get("echo"),
+                |c: &brief::BriefCard| c.title.clone(),
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn dispatch_batch_fails_a_brief_with_no_rig_and_leaves_the_board() {
+        let s = store();
+        let a = ready_brief(&s, "x", "agt_a"); // todo
+        let records = dispatch_batch(
+            &s,
+            50,
+            300,
+            |_: &brief::BriefCard| None,
+            |c: &brief::BriefCard| c.title.clone(),
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0].outcome, RigOutcome::Failed { .. }));
+        // Nothing ran → board untouched (still todo); Claim released.
+        assert_eq!(s.board_status(&a).unwrap().as_deref(), Some("todo"));
+        assert!(s.claim_holder(&a).unwrap().is_none());
     }
 }
