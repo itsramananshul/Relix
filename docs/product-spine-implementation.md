@@ -18,7 +18,8 @@
 | `controller_runtime.rs` | Wiring: spine handlers, the shared Rig registry + `rig.list`/`rig.describe` (+ `RELIX_DEFAULT_RIG`), and the opt-in live heartbeat loop (`RELIX_HEARTBEAT_ENABLED`) with rich prompt composition, failure-parking, and per-tick token sweep. |
 | `relix-cli` `call.rs` | `relix call --method <name> --arg <pipe-delimited>` — generic capability invocation, the operator escape hatch reaching the whole spine surface from the CLI. |
 | `relix-web-bridge` `spine.rs` | The dashboard HTTP surface — `GET /v1/spine/{guild,board,board/:col,roster,mandates,mandates/search,mandates/:id/{tree,briefs},briefs/search,briefs/:id,desk/:agent,overdue}` + write `POST /v1/spine/{briefs,briefs/:id/{move,pin,comment,due},mandates}`, all proxying to the coordinator through the mesh admission pipeline. |
-| `relix-web-bridge` `spine_dashboard.html` | **Phase 6** — the served `/spine` board page (self-contained inline HTML/JS/CSS, B&W): Board (kanban + detail panel + move/pin/comment/create), Mandates (goal tree), and Roster tabs, driven by `/v1/spine/*`. |
+| `relix-web-bridge` `spine_dashboard.html` | **Phase 6** — the served `/spine` board page (self-contained inline HTML/JS/CSS, B&W): Board (kanban + detail panel: move/pin/comment/assign/priority/snag/subbrief + create + search + label filter), Mandates (goal tree + create), Roster, and Activity (live chronicle) tabs, plus the companion command bar — all driven by `/v1/spine/*`. |
+| `relix-web-bridge` `companion.rs` | **Phase 5** (materialize-work half) — a tested, rule-based command parser (`create brief/mandate`, `move … to …`, `search`, `overdue`, `board`, `help`) behind `POST /v1/spine/companion`. Not an LLM; the verifiable execution spine a model can later sit on. |
 
 ## Capabilities (live on the mesh, in our language)
 
@@ -39,7 +40,12 @@
 - An unrecoverable dispatch **Failed** parks the Brief in `blocked` (with the reason chronicled) instead of re-dispatching forever.
 - The enforced **strategy gate** (`strategy_approved`) — a CEO can't build a team until the plan is approved.
 
-## What's primitives-ready but not yet a full feature
-- **Phase 5 chat companion** — all the company-aware reads (`*_summary`, `*.briefs`, board/roster) and the materialize surface (create Briefs/Mandates) exist; the AI companion that composes them is the integration.
-- **Phase 6 dashboard** — the React SPA renders these capabilities; the frontend is the remaining build.
-- **Macro RPC-to-tools** + **learning-loop store integration** + **Hermes Rig adapter** — the cores (`run_macro`, the Keeper decisions, the Rig contract + bridge token) are in; the deeper wiring is next.
+## Shipped this roadmap
+- **Phase 6 dashboard** — served at `/spine`, fully functional (Board/Mandates/Roster/Activity + command bar) over the `/v1/spine/*` API.
+- **Phase 5 materialize-work** — the rule-based companion (`/v1/spine/companion`) + command bar create/move/search/etc. through the spine.
+- **Macro RPC-to-tools** parse layer (`extract_tool_calls`/`run_macro_rpc`); **Hermes Rig adapter** (`hermes_rig`, PerToolCall); the **Keeper** (`KnackLedger`) runnable in-memory.
+
+## Remaining (needs external infra, not a tested-Rust slice)
+- **Smarter companion** — swap the rule-based parser for an LLM that composes the same `/v1/spine/*` execution path (needs a model configured).
+- **Sandboxed Cell** — container/VM isolation to safely expose `macro.run` on the mesh (the Macro core + interpreter allowlist + cwd/scoped-env are in).
+- **Persistent Keeper / Bench backends** — SQLite/worktree stores layered over the in-memory `KnackLedger` / `BenchLedger`.
