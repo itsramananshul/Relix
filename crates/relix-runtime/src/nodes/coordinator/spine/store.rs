@@ -400,6 +400,28 @@ impl SpineStore {
         Ok(rows)
     }
 
+    /// PHASE 1 (spine tree): a Mandate's direct child Mandates
+    /// (sub-Mandates), newest first. Tenant-scoped — the drill-down
+    /// for a nested-Mandate tree in the dashboard.
+    pub fn list_child_mandates(
+        &self,
+        tenant: &str,
+        parent_mandate_id: &str,
+    ) -> Result<Vec<Mandate>, SpineStoreError> {
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let tenant = normalize_tenant(tenant);
+        let mut stmt = conn.prepare(
+            "SELECT mandate_id, tenant_id, title, description, owner_agent_id,
+                    status, parent_mandate_id, created_at, updated_at
+             FROM mandates WHERE tenant_id = ?1 AND parent_mandate_id = ?2
+             ORDER BY created_at DESC",
+        )?;
+        let rows: Vec<Mandate> = stmt
+            .query_map(params![tenant, parent_mandate_id], row_to_mandate)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// PHASE 5 (companion): the Guild's spine counts in one
     /// tenant-scoped read — Mandate & Campaign totals plus the
     /// in-flight subset.
@@ -920,6 +942,33 @@ mod tests {
         let g = s.get_guild("fresh").unwrap().unwrap();
         assert_eq!(g.display_name, "fresh");
         assert_eq!(g.monthly_allowance_cents, Some(100));
+    }
+
+    #[test]
+    fn list_child_mandates_returns_direct_children_per_tenant() {
+        let s = store();
+        let root = s.create_mandate("acme", "Company", "", None, None).unwrap();
+        let c1 = s
+            .create_mandate("acme", "Q1", "", None, Some(&root))
+            .unwrap();
+        let c2 = s
+            .create_mandate("acme", "Q2", "", None, Some(&root))
+            .unwrap();
+        // A grandchild is NOT a direct child of root.
+        let _g = s.create_mandate("acme", "Q1-a", "", None, Some(&c1)).unwrap();
+
+        let kids: Vec<String> = s
+            .list_child_mandates("acme", &root)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.mandate_id)
+            .collect();
+        assert_eq!(kids.len(), 2);
+        assert!(kids.contains(&c1) && kids.contains(&c2));
+        // c1 has exactly one child (the grandchild).
+        assert_eq!(s.list_child_mandates("acme", &c1).unwrap().len(), 1);
+        // Cross-tenant isolation.
+        assert!(s.list_child_mandates("other", &root).unwrap().is_empty());
     }
 
     #[test]

@@ -41,6 +41,7 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<SpineStore>) {
     cap!("mandate.create", handle_mandate_create);
     cap!("mandate.get", handle_mandate_get);
     cap!("mandate.list", handle_mandate_list);
+    cap!("mandate.children", handle_mandate_children);
     cap!("mandate.update", handle_mandate_update);
     cap!("campaign.create", handle_campaign_create);
     cap!("campaign.get", handle_campaign_get);
@@ -252,6 +253,26 @@ fn handle_mandate_list(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcom
             Err(e) => internal(format!("mandate.list encode: {e}")),
         },
         Err(e) => internal(format!("mandate.list: {e}")),
+    }
+}
+
+/// `mandate.children` — args `parent_mandate_id`. Tenant-scoped.
+/// Returns a JSON array of the parent's direct child Mandates,
+/// newest first — the nested-Mandate drill-down.
+fn handle_mandate_children(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("mandate.children utf8: {e}")),
+    };
+    if raw.is_empty() {
+        return invalid("mandate.children: parent_mandate_id required".to_string());
+    }
+    match store.list_child_mandates(ctx.tenant_id_or_default(), raw) {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("mandate.children encode: {e}")),
+        },
+        Err(e) => internal(format!("mandate.children: {e}")),
     }
 }
 
