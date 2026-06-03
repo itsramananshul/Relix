@@ -19,18 +19,21 @@
 
 ## Capabilities (live on the mesh, in our language)
 
-**Guild** — `guild.get` · `guild.set` · `guild.set_allowance`
-**Mandate** — `mandate.create/get/list/update` · `mandate.progress` · `mandate.briefs` · `mandate.propose_strategy/approve_strategy/reject_strategy/strategy`
+**Guild** — `guild.get` · `guild.counts` · `guild.set` · `guild.set_allowance`
+**Mandate** — `mandate.create/get/list/update` · `mandate.children` · `mandate.progress` · `mandate.briefs` · `mandate.propose_strategy/approve_strategy/reject_strategy/strategy`
 **Campaign** — `campaign.create/get/list/update` · `campaign.progress` · `campaign.briefs`
-**Brief** — `brief.move` (board) · `brief.set`/`brief.fields` · `brief.board`/`brief.board_summary` · `brief.ready` · `brief.children_done` · `brief.blocked`/`brief.blocked_list` · `brief.stale_list` · `brief.subbrief`/`brief.subbriefs` · `brief.snag`/`brief.snags` · `brief.dossier_add`/`brief.dossiers`/`brief.dossier_get` · `brief.claim`/`brief.heartbeat`/`brief.release`/`brief.claim_holder` · (plus the existing `task.*` execution surface)
-**Operative / Roster** — `agent.create/get/list/update/delete/keys` · `agent.reports`/`agent.branch`/`agent.line` (org tree) · `agent.manages` · `agent.roster_summary` · the hire flow on the agent status machine
-**Rig** — `rig.list` · per-Operative `rig` field; `dispatch_batch` runs a Brief on its Rig
-**Chronicle** — `brief.board_moved` · `brief.assigned` · `brief.subbrief_added` · `brief.snagged` · `brief.dossier_added`
+**Brief** — `brief.move` (board) · `brief.set`/`brief.fields` · `brief.board`/`brief.board_summary` · `brief.desk` (per-Operative) · `brief.comment` · `brief.ready` · `brief.children_done` · `brief.blocked`/`brief.blocked_list` · `brief.stale_list` · `brief.subbrief`/`brief.subbriefs` · `brief.snag`/`brief.snags` · `brief.dossier_add`/`brief.dossiers`/`brief.dossier_get` · `brief.claim`/`brief.heartbeat`/`brief.release`/`brief.claim_holder` · (plus the existing `task.*` execution surface)
+**Operative / Roster** — `agent.create/get/list/update/delete/keys` · `agent.reports`/`agent.branch`/`agent.line` (org tree, cycle-guarded) · `agent.manages` · `agent.roster_summary` · `agent.allowance_committed` · the hire flow on the agent status machine
+**Rig** — `rig.list` · `rig.describe` (name + label + governance) · per-Operative `rig` field; `dispatch_batch` runs a Brief on its Rig
+**Chronicle** — `brief.board_moved` · `brief.assigned` · `brief.comment` · `brief.subbrief_added` · `brief.snagged` · `brief.dossier_added` · `brief.dispatch_failed`
 
 ## Governance & security carried through
 - Default-deny agent gate; a **pending** hire is inert (gate denies non-active).
 - Tenant-scoped spine reads (a Guild can't read another's Mandates/Campaigns).
-- Mesh tools lent to a Rig route through the admission pipeline; the **box is the boundary** for thin Rigs; the **bridge-back token** is scoped per Shift (Brief + Operative), revoked when the Shift ends.
+- Org tree is **cycle-guarded** — a `reports_to` edge that would close a loop is rejected.
+- Mesh tools lent to a Rig route through the admission pipeline; the **box is the boundary** for thin Rigs; the **bridge-back token** is scoped per Shift (Brief + Operative) **and optionally per-method** (`mint_scoped`/`authorize_method`), revoked when the Shift ends.
+- The **Macro** (execute_code) runs only **allowlisted interpreters** (`run_macro_guarded`); a `ProcessRig`'s stdout is **capped** so a runaway CLI can't flood context.
+- An unrecoverable dispatch **Failed** parks the Brief in `blocked` (with the reason chronicled) instead of re-dispatching forever.
 - The enforced **strategy gate** (`strategy_approved`) — a CEO can't build a team until the plan is approved.
 
 ## What's primitives-ready but not yet a full feature
