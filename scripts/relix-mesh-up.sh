@@ -1322,6 +1322,10 @@ name = "spine_task_recent_edges"
 method = "task.recent_edges"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_task_events"
+method = "task.events"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_mandate_search"
 method = "mandate.search"
 allow_groups = ["chat-users"]

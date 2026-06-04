@@ -3,6 +3,13 @@ import { useAuth } from "../auth";
 import { asArray, Empty, useAsync } from "../components/common";
 
 interface Provider { name?: string; id?: string; configured?: boolean; enabled?: boolean; model?: string }
+interface Adapter {
+  name?: string;
+  display_name?: string;
+  governance?: string;
+  billing?: { mode?: string; provider?: string };
+  probe?: { status?: string; detail?: string; install_hint?: string | null };
+}
 
 function extractProviders(v: unknown): Provider[] {
   if (Array.isArray(v)) return v as Provider[];
@@ -16,15 +23,17 @@ function extractProviders(v: unknown): Provider[] {
 export function Settings() {
   const { status, logout } = useAuth();
   const { data, loading } = useAsync(async () => {
-    const [info, providers] = await Promise.all([
+    const [info, providers, adapters] = await Promise.all([
       tryGet<Record<string, unknown>>("/v1/info", {}),
       tryGet<unknown>("/v1/config/providers", {}),
+      tryGet<Adapter[]>("/v1/adapters", []),
     ]);
-    return { info, providers: extractProviders(providers) };
+    return { info, providers: extractProviders(providers), adapters: Array.isArray(adapters) ? adapters : [] };
   }, []);
 
   const info = data?.info ?? {};
   const providers = data?.providers ?? [];
+  const adapters = data?.adapters ?? [];
 
   return (
     <div className="grid cols-2">
@@ -93,6 +102,56 @@ export function Settings() {
                   </td>
                 </tr>
               ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="card" style={{ gridColumn: "1 / -1" }}>
+        <h3>Agent adapters (Rigs)</h3>
+        <p className="muted" style={{ marginTop: -6, marginBottom: 12 }}>
+          Local coding-agent backends an Operative can run work through. Availability is probed live
+          on the coordinator — install + log in to the CLI to make it available.
+        </p>
+        {loading ? (
+          <div className="loading">Loading adapters…</div>
+        ) : adapters.length === 0 ? (
+          <Empty>No adapters registered.</Empty>
+        ) : (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Adapter</th>
+                <th>Billing</th>
+                <th>Governance</th>
+                <th>Availability</th>
+              </tr>
+            </thead>
+            <tbody>
+              {adapters.map((a, i) => {
+                const avail = a.probe?.status === "available";
+                return (
+                  <tr key={a.name ?? i}>
+                    <td><strong>{a.display_name ?? a.name}</strong> <span className="mono">{a.name}</span></td>
+                    <td className="muted">
+                      {a.billing?.mode === "subscription"
+                        ? `subscription${a.billing?.provider ? ` (${a.billing.provider})` : ""}`
+                        : a.billing?.mode ?? "—"}
+                    </td>
+                    <td className="muted">{a.governance ?? "—"}</td>
+                    <td>
+                      <span className={"badge " + (avail ? "done" : "blocked")}>
+                        {avail ? "available" : "missing"}
+                      </span>
+                      {!avail && a.probe?.install_hint && (
+                        <div className="muted" style={{ fontSize: 12, marginTop: 3 }}>
+                          {a.probe.install_hint}
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}

@@ -12,6 +12,26 @@ interface Card {
   mandate_id?: string | null;
 }
 
+interface RunReport {
+  brief_id: string;
+  status: string;
+  rig: string;
+  summary: string;
+  install_hint?: string | null;
+}
+
+// Human labels for the pre-run refusal states (no command was spawned).
+const REFUSALS: Record<string, string> = {
+  unassigned: "assign an Operative first",
+  no_adapter: "no adapter configured for this Operative",
+  adapter_unavailable: "adapter not installed",
+  already_running: "already running",
+  not_found: "brief not found",
+  done: "run complete",
+  failed: "run failed",
+  continued: "run continued (more work to do)",
+};
+
 const COLUMNS = ["backlog", "todo", "in_progress", "in_review", "done"];
 const COLUMN_LABEL: Record<string, string> = {
   backlog: "Backlog",
@@ -62,6 +82,28 @@ export function Briefs() {
       reload();
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Move failed" });
+    }
+  }
+
+  // Run a Brief NOW through its Operative's agent adapter. Surfaces the
+  // structured RunReport — real outcomes AND clear adapter-unavailable
+  // refusals (never a faked run).
+  async function run(c: Card) {
+    setBanner({ kind: "info", msg: `Running ${c.title ?? "brief"}…` });
+    try {
+      const r = await api.post<RunReport>(`/v1/spine/briefs/${encodeURIComponent(cardId(c))}/run`, {});
+      const done = r.status === "done";
+      const refusal = ["unassigned", "no_adapter", "adapter_unavailable", "already_running", "not_found"].includes(r.status);
+      const kind = done ? "ok" : refusal ? "info" : "err";
+      const label = REFUSALS[r.status] ?? r.status;
+      let msg = `${c.title ?? "Brief"}: ${label}`;
+      if (r.rig) msg += ` · adapter ${r.rig}`;
+      if (r.summary) msg += ` — ${r.summary}`;
+      if (r.install_hint) msg += ` (${r.install_hint})`;
+      setBanner({ kind, msg });
+      reload();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Run failed" });
     }
   }
 
@@ -118,18 +160,27 @@ export function Briefs() {
                         {c.priority && <span>{c.priority}</span>}
                         {c.assignee_agent_id && <span>· {c.assignee_agent_id.slice(0, 8)}</span>}
                       </div>
-                      <select
-                        className="select"
-                        style={{ marginTop: 8, fontSize: 11, padding: "3px 6px" }}
-                        value={col}
-                        onChange={(e) => move(c, e.target.value)}
-                      >
-                        {COLUMNS.map((s) => (
-                          <option key={s} value={s}>
-                            → {COLUMN_LABEL[s]}
-                          </option>
-                        ))}
-                      </select>
+                      <div className="row" style={{ marginTop: 8, gap: 6 }}>
+                        <select
+                          className="select"
+                          style={{ fontSize: 11, padding: "3px 6px", flex: 1 }}
+                          value={col}
+                          onChange={(e) => move(c, e.target.value)}
+                        >
+                          {COLUMNS.map((s) => (
+                            <option key={s} value={s}>
+                              → {COLUMN_LABEL[s]}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          className="btn sm"
+                          title="Run this Brief through its Operative's agent adapter now"
+                          onClick={() => run(c)}
+                        >
+                          Run
+                        </button>
+                      </div>
                     </div>
                   ))}
                   {cards.length === 0 && <div className="muted" style={{ fontSize: 12, padding: 6 }}>empty</div>}
