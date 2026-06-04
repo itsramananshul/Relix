@@ -27,6 +27,7 @@ interface RunReport {
   summary: string;
   install_hint?: string | null;
   run_id?: string | null;
+  workspace?: string | null;
 }
 
 // Human labels for the run states. `running` = accepted + executing in
@@ -39,6 +40,7 @@ const REFUSALS: Record<string, string> = {
   adapter_unavailable: "adapter not installed",
   already_running: "already running",
   not_found: "brief not found",
+  workspace_error: "could not prepare a run workspace",
   done: "run complete",
   failed: "run failed",
   continued: "run continued (more work to do)",
@@ -126,12 +128,14 @@ export function Briefs() {
       // `running` = accepted, executing in the background (async dispatch).
       const accepted = r.status === "running" || r.status === "done";
       const refusal = ["unassigned", "no_adapter", "adapter_unavailable", "already_running", "not_found"].includes(r.status);
+      // workspace_error is a real failure to set up a safe sandbox.
       const kind = accepted ? "ok" : refusal ? "info" : "err";
       const label = REFUSALS[r.status] ?? r.status;
       let msg = `${c.title ?? "Brief"}: ${label}`;
       if (r.rig) msg += ` · adapter ${r.rig}`;
       if (r.summary && r.status !== "running") msg += ` — ${r.summary}`;
       if (r.install_hint) msg += ` (${r.install_hint})`;
+      if (r.workspace) msg += ` · workspace ${r.workspace}`;
       if (r.status === "running") msg += " — see Active Runs";
       setBanner({ kind, msg });
       reload();

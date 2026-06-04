@@ -392,6 +392,10 @@ pub struct RunReport {
     /// dashboard polls `/v1/runs` for this id to watch the run finish.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// The scoped per-run workspace the Rig executes in — so the operator
+    /// sees WHERE the run happened. `None` for a refusal / `inherit` mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 impl RunReport {
@@ -403,6 +407,7 @@ impl RunReport {
             summary: summary.into(),
             install_hint: None,
             run_id: None,
+            workspace: None,
         }
     }
 }
@@ -417,9 +422,87 @@ pub struct ReadyRun {
     pub assignee: String,
     pub run_id: String,
     pub rig_name: String,
+    /// The scoped per-run workspace the Rig will execute in (`None` in
+    /// `inherit` mode — legacy coordinator-CWD execution).
+    pub workspace: Option<String>,
     rig: std::sync::Arc<dyn Rig>,
     req: RigRunRequest,
     token: String,
+}
+
+/// Per-run workspace mode. Default `scoped` (a dedicated dir per run);
+/// `inherit` opts OUT (legacy coordinator-CWD execution) and must be
+/// explicitly set, so a Brief never runs repo-wide by accident.
+fn workspace_mode_is_inherit() -> bool {
+    std::env::var("RELIX_RUN_WORKSPACE_MODE")
+        .map(|v| v.trim().eq_ignore_ascii_case("inherit"))
+        .unwrap_or(false)
+}
+
+/// A run id is safe to use as a single workspace path segment iff it is
+/// our generated `run_<uuid>` shape: non-empty, bounded, alphanumeric +
+/// `_`/`-` only (no separators, no `.`/`..`). The traversal defense — the
+/// path is derived ONLY from this, never from Brief content.
+pub fn run_id_is_safe(run_id: &str) -> bool {
+    !run_id.is_empty()
+        && run_id.len() <= 80
+        && run_id != "."
+        && run_id != ".."
+        && run_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Make a path absolute WITHOUT canonicalizing (no `\\?\` prefix, no
+/// symlink resolution) — clean enough to show an operator and to use as a
+/// child `current_dir`.
+fn absolute_clean(p: &std::path::Path) -> std::path::PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    }
+}
+
+/// Create the scoped per-run workspace `<root>/<run_id>` and drop a small
+/// trusted `BRIEF.md` instruction file in it. Returns the absolute
+/// workspace path. The path is derived ONLY from the validated `run_id`
+/// and the configured root — NEVER from Brief content — so a prompt can't
+/// choose where work lands, and traversal is impossible.
+pub fn prepare_run_workspace(
+    root: &std::path::Path,
+    run_id: &str,
+    brief_id: &str,
+    title: &str,
+    context: &str,
+) -> Result<std::path::PathBuf, String> {
+    if !run_id_is_safe(run_id) {
+        return Err(format!("unsafe run id for workspace: {run_id:?}"));
+    }
+    std::fs::create_dir_all(root).map_err(|e| format!("create workspace root: {e}"))?;
+    let root = absolute_clean(root);
+    let ws = root.join(run_id);
+    // Belt-and-suspenders traversal guard: with a validated single-segment
+    // run_id the workspace is always a DIRECT child of root.
+    if ws.parent() != Some(root.as_path()) {
+        return Err(format!("workspace path escapes its root: {}", ws.display()));
+    }
+    std::fs::create_dir_all(&ws).map_err(|e| format!("create workspace: {e}"))?;
+    // A small, trusted instruction file — no secrets, no prompt-chosen
+    // path. Best-effort: a write failure does not fail the run.
+    let brief_md = format!(
+        "# Relix Brief workspace\n\n\
+         - brief_id: {brief_id}\n\
+         - run_id: {run_id}\n\
+         - title: {title}\n\
+         - context: {context}\n\n\
+         This folder is the scoped sandbox for one Brief run. Keep all work \
+         for this Brief inside it.\n"
+    );
+    let _ = std::fs::write(ws.join("BRIEF.md"), brief_md);
+    Ok(ws)
 }
 
 /// Outcome of [`preflight_run`]: either a clear refusal (no command was
@@ -505,6 +588,7 @@ pub fn preflight_run(
             summary: probe.detail,
             install_hint: probe.install_hint,
             run_id: None,
+            workspace: None,
         }));
     }
     // Single-owner: claim the Brief so a duplicate concurrent run can't
@@ -518,14 +602,51 @@ pub fn preflight_run(
             summary: "another run holds the Claim on this Brief".to_string(),
             install_hint: None,
             run_id: None,
+            workspace: None,
         }));
     }
     let rig_name = rig.name().to_string();
+    // Scoped per-run workspace — the Rig executes HERE, not in the
+    // coordinator/repo CWD, unless `inherit` mode is explicitly set. The
+    // path is derived only from `run_id` (a prompt can't choose it). A
+    // creation failure refuses cleanly WITHOUT opening a run record and
+    // releases the just-won Claim (no phantom run, no repo-wide fallback).
+    let workspace: Option<String> = if workspace_mode_is_inherit() {
+        None
+    } else {
+        match prepare_run_workspace(
+            store.run_workspace_root(),
+            &run_id,
+            &card.task_id,
+            &card.title,
+            &brief_context(&card),
+        ) {
+            Ok(ws) => Some(ws.to_string_lossy().into_owned()),
+            Err(e) => {
+                let _ = store.release_claim(&card.task_id, &assignee);
+                return Ok(Preflight::Refused(RunReport {
+                    brief_id: brief_id.to_string(),
+                    status: "workspace_error".to_string(),
+                    rig: rig_name,
+                    summary: format!("could not prepare a run workspace: {e}"),
+                    install_hint: None,
+                    run_id: None,
+                    workspace: None,
+                }));
+            }
+        }
+    };
     if card.board_status == "todo" {
         store.set_board_status(&card.task_id, "in_progress")?;
     }
     // Durable run record (status `running`) — the dashboard polls this.
-    let _ = store.record_run_start(&run_id, &card.task_id, &assignee, &rig_name);
+    let _ = store.record_run_start(
+        &run_id,
+        &card.task_id,
+        &assignee,
+        &rig_name,
+        workspace.as_deref(),
+    );
     let _ = store.append_event(
         &card.task_id,
         "brief.run_started",
@@ -546,14 +667,19 @@ pub fn preflight_run(
             )
         })
         .unwrap_or_default();
-    let req = RigRunRequest::new(&card.task_id, &assignee, String::new(), prompt)
+    let mut req = RigRunRequest::new(&card.task_id, &assignee, String::new(), prompt)
         .with_bridge_token(&token)
         .with_context(brief_context(&card));
+    // Pin the child's working directory to the scoped workspace.
+    if let Some(ws) = &workspace {
+        req = req.with_working_dir(std::path::PathBuf::from(ws));
+    }
     Ok(Preflight::Ready(ReadyRun {
         brief_id: card.task_id,
         assignee,
         run_id,
         rig_name,
+        workspace,
         rig,
         req,
         token,
@@ -574,6 +700,7 @@ pub fn execute_ready(
         assignee,
         run_id,
         rig_name,
+        workspace,
         rig,
         req,
         token,
@@ -638,6 +765,7 @@ pub fn execute_ready(
         summary,
         install_hint: None,
         run_id: Some(run_id),
+        workspace,
     }
 }
 
@@ -663,6 +791,16 @@ mod tests {
 
     fn store() -> TaskStore {
         TaskStore::in_memory().unwrap()
+    }
+
+    /// A store whose scoped-run workspaces land in a fresh tempdir (held
+    /// by the returned guard) so a real `preflight_run` creates + cleans
+    /// its workspaces deterministically, without touching the global temp.
+    fn store_ws() -> (TaskStore, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = TaskStore::in_memory().unwrap();
+        s.set_run_workspace_root(tmp.path().join("runs"));
+        (s, tmp)
     }
 
     fn ready_brief(s: &TaskStore, title: &str, assignee: &str) -> String {
@@ -1258,7 +1396,7 @@ mod tests {
 
     #[test]
     fn run_brief_now_runs_on_echo_and_moves_to_review() {
-        let s = store();
+        let (s, _tmp) = store_ws();
         let id = ready_brief(&s, "Write the readme", "agt_a");
         let reg = echo_registry();
         let report =
@@ -1333,7 +1471,7 @@ mod tests {
 
     #[test]
     fn run_brief_now_opens_and_closes_a_durable_run_record() {
-        let s = store();
+        let (s, _tmp) = store_ws();
         let reg = crate::rig::RigRegistry::with_builtins();
         let id = ready_brief(&s, "ship it", "agt_a");
 
@@ -1388,7 +1526,7 @@ mod tests {
     fn preflight_then_execute_matches_the_synchronous_path() {
         // The async split (preflight → execute_ready) yields the same
         // durable run + board outcome as run_brief_now.
-        let s = store();
+        let (s, _tmp) = store_ws();
         let reg = crate::rig::RigRegistry::with_builtins();
         let id = ready_brief(&s, "async shift", "agt_a");
 
@@ -1409,5 +1547,133 @@ mod tests {
         assert_eq!(closed[0].status, "done");
         assert!(closed[0].finished_at.is_some());
         assert_eq!(s.board_status(&id).unwrap().as_deref(), Some("in_review"));
+    }
+
+    // ── Scoped per-run workspaces ───────────────────────────────
+
+    #[test]
+    fn prepare_run_workspace_creates_dir_and_brief_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = prepare_run_workspace(
+            &tmp.path().join("runs"),
+            "run_abc123",
+            "brief_1",
+            "Ship it",
+            "priority=normal",
+        )
+        .unwrap();
+        assert!(ws.is_dir(), "workspace dir created");
+        assert!(ws.ends_with("run_abc123"));
+        let brief_md = std::fs::read_to_string(ws.join("BRIEF.md")).unwrap();
+        assert!(brief_md.contains("brief_1"));
+        assert!(brief_md.contains("Ship it"));
+    }
+
+    #[test]
+    fn workspace_rejects_path_traversal_run_ids() {
+        assert!(run_id_is_safe("run_1f75a50e-ee53-4771-8d01-294fde5b623d"));
+        for bad in ["..", ".", "a/b", "a\\b", "../escape", "run_/..", "", "a b", "x/../y"] {
+            assert!(!run_id_is_safe(bad), "{bad:?} must be rejected");
+        }
+        // And prepare refuses an unsafe id (never touches the filesystem
+        // outside its single validated segment).
+        let tmp = tempfile::tempdir().unwrap();
+        let err = prepare_run_workspace(tmp.path(), "../escape", "b", "t", "c").unwrap_err();
+        assert!(err.contains("unsafe run id"), "got: {err}");
+    }
+
+    #[test]
+    fn run_executes_inside_its_scoped_workspace() {
+        // A ProcessRig that prints its working directory — its cwd must be
+        // the per-run workspace (not the coordinator CWD).
+        let (s, _tmp) = store_ws();
+        let id = ready_brief(&s, "where am I", "agt_a");
+        let (prog, args) = if cfg!(windows) {
+            ("cmd".to_string(), vec!["/C".to_string(), "cd".to_string()])
+        } else {
+            ("sh".to_string(), vec!["-c".to_string(), "pwd".to_string()])
+        };
+        let mut reg = crate::rig::RigRegistry::new();
+        reg.register(std::sync::Arc::new(crate::rig::ProcessRig::new(
+            "pwd", prog, args,
+        )));
+        reg.set_default(Some("pwd".to_string()));
+
+        let report = run_brief_now(&s, &reg, None, 300, &id, None, "x".into()).unwrap();
+        assert_eq!(report.status, "done", "got: {report:?}");
+        let run_id = report.run_id.clone().unwrap();
+        // The run ledger persists the workspace path (NOT secret-redacted)
+        // and it is the per-run scoped dir.
+        let runs = s.runs_for_brief(&id, 5).unwrap();
+        let ws = runs[0].workspace.as_deref().expect("workspace recorded");
+        assert!(ws.ends_with(&run_id), "ledger workspace {ws} ends with {run_id}");
+        assert_eq!(report.workspace.as_deref(), Some(ws));
+        // The child's printed cwd is UNDER that scoped workspace root. (The
+        // run_id segment itself is redacted in the summary because it is a
+        // 40-char base64url-shaped token — expected; the ledger keeps the
+        // real path.) The parent (`…/runs`) is enough to prove the cwd.
+        let ws_parent = std::path::Path::new(ws)
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            report.summary.contains(&ws_parent),
+            "cwd {:?} should sit under the workspace root {ws_parent}",
+            report.summary
+        );
+    }
+
+    #[test]
+    fn workspace_creation_failure_refuses_cleanly() {
+        // Root pointed at an existing FILE → create_dir_all fails →
+        // a clean `workspace_error` refusal: no run record, Claim released,
+        // no repo-wide fallback.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_root = tmp.path().join("not-a-dir");
+        std::fs::write(&file_root, b"x").unwrap();
+        let mut s = TaskStore::in_memory().unwrap();
+        s.set_run_workspace_root(&file_root);
+        let id = ready_brief(&s, "t", "agt_a");
+        let reg = echo_registry();
+
+        let report = run_brief_now(&s, &reg, None, 300, &id, Some("echo"), "x".into()).unwrap();
+        assert_eq!(report.status, "workspace_error", "got: {report:?}");
+        assert!(report.run_id.is_none());
+        assert!(report.summary.contains("workspace"));
+        // No phantom run row; Claim released so a fixed config can retry.
+        assert!(s.runs_for_brief(&id, 5).unwrap().is_empty());
+        assert!(s.claim_holder(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_runs_get_distinct_non_colliding_workspaces() {
+        // A different assignee can't steal the Claim → already_running.
+        let (s, _tmp) = store_ws();
+        let reg = crate::rig::RigRegistry::with_builtins();
+        let id = ready_brief(&s, "dup", "agt_a");
+        let first = preflight_run(&s, &reg, None, 300, &id, Some("echo"), "x".into()).unwrap();
+        let r1 = match first {
+            Preflight::Ready(r) => r,
+            Preflight::Refused(r) => panic!("expected ready, got {r:?}"),
+        };
+        // The SAME Operative re-claiming (the lease is per-agent + idempotent)
+        // still gets its OWN unique run_id + workspace — the unique run_id is
+        // the workspace key, so a second run never clobbers the first.
+        let second = preflight_run(&s, &reg, None, 300, &id, Some("echo"), "y".into()).unwrap();
+        let r2 = match second {
+            Preflight::Ready(r) => r,
+            Preflight::Refused(r) => panic!("expected ready, got {r:?}"),
+        };
+        assert_ne!(r1.run_id, r2.run_id, "distinct run ids");
+        let w1 = r1.workspace.clone().unwrap();
+        let w2 = r2.workspace.clone().unwrap();
+        assert_ne!(w1, w2, "distinct workspace dirs — no collision");
+        assert!(std::path::Path::new(&w1).is_dir());
+        assert!(std::path::Path::new(&w2).is_dir());
+        // Two committed run records, both with their workspace recorded.
+        let runs = s.runs_for_brief(&id, 5).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|r| r.workspace.is_some()));
     }
 }

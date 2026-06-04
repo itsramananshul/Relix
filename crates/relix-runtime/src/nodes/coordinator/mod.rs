@@ -463,6 +463,29 @@ pub const MAX_ROWS_PER_RETENTION_PASS: i64 = 1000;
 pub struct TaskStore {
     conn: Arc<Mutex<Connection>>,
     max_list: usize,
+    /// Base directory under which each run gets its own scoped workspace
+    /// folder (`<root>/<run_id>`). Derived from the db dir
+    /// (`<db_parent>/workspaces/runs`) or `RELIX_RUN_WORKSPACE_ROOT`. The
+    /// per-Brief execution sandbox lives here so a Claude/Codex Shift
+    /// never runs repo-wide by accident.
+    workspace_root: PathBuf,
+}
+
+/// Resolve the scoped-run workspace base. `RELIX_RUN_WORKSPACE_ROOT`
+/// wins; otherwise it sits beside the coordinator db
+/// (`<db_parent>/workspaces/runs`).
+fn resolve_workspace_root(db_path: &std::path::Path) -> PathBuf {
+    if let Some(explicit) = std::env::var_os("RELIX_RUN_WORKSPACE_ROOT") {
+        let p = PathBuf::from(explicit);
+        if !p.as_os_str().is_empty() {
+            return p;
+        }
+    }
+    db_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("workspaces")
+        .join("runs")
 }
 
 impl TaskStore {
@@ -482,6 +505,7 @@ impl TaskStore {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             max_list: cfg.max_list.max(1),
+            workspace_root: resolve_workspace_root(&cfg.db_path),
         })
     }
 
@@ -494,7 +518,22 @@ impl TaskStore {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             max_list: 200,
+            workspace_root: resolve_workspace_root(
+                &std::env::temp_dir().join("relix-run-workspaces").join("tasks.db"),
+            ),
         })
+    }
+
+    /// The base directory under which each run's scoped workspace folder
+    /// is created (`<root>/<run_id>`).
+    pub fn run_workspace_root(&self) -> &std::path::Path {
+        &self.workspace_root
+    }
+
+    /// Override the scoped-run workspace base (e.g. an explicit deployment
+    /// path, or a tempdir in tests).
+    pub fn set_run_workspace_root(&mut self, root: impl Into<PathBuf>) {
+        self.workspace_root = root.into();
     }
 
     /// PHASE 1 (Brief): move a Brief's **board status**, enforcing
@@ -2402,14 +2441,15 @@ impl TaskStore {
         brief_id: &str,
         agent_id: &str,
         rig: &str,
+        workspace: Option<&str>,
     ) -> Result<(), CoordinatorError> {
         let now = unix_secs();
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         conn.execute(
             "INSERT OR IGNORE INTO brief_runs
-                 (run_id, brief_id, agent_id, rig, status, started_at, summary)
-             VALUES (?1, ?2, ?3, ?4, 'running', ?5, '')",
-            params![run_id, brief_id, agent_id, rig, now],
+                 (run_id, brief_id, agent_id, rig, status, started_at, summary, workspace)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, '', ?6)",
+            params![run_id, brief_id, agent_id, rig, now, workspace],
         )
         .map_err(CoordinatorError::Db)?;
         Ok(())
@@ -2443,7 +2483,7 @@ impl TaskStore {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let mut stmt = conn
             .prepare(
-                "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary
+                "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary, workspace
                  FROM brief_runs
                  ORDER BY started_at DESC, rowid DESC
                  LIMIT ?1",
@@ -2470,7 +2510,7 @@ impl TaskStore {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let mut stmt = conn
             .prepare(
-                "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary
+                "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary, workspace
                  FROM brief_runs
                  WHERE brief_id = ?1
                  ORDER BY started_at DESC, rowid DESC
@@ -7073,6 +7113,10 @@ pub struct RunRecord {
     pub duration_secs: Option<i64>,
     /// Rig result/reason — already secret-redacted by the Rig.
     pub summary: String,
+    /// The scoped per-run workspace the Rig executed in. `None` for
+    /// legacy rows / `inherit` mode (coordinator-CWD execution).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 impl RunRecord {
@@ -7089,6 +7133,7 @@ impl RunRecord {
             finished_at,
             duration_secs: finished_at.map(|f| (f - started_at).max(0)),
             summary: r.get(7)?,
+            workspace: r.get(8)?,
         })
     }
 }
@@ -11663,6 +11708,9 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             started_at  INTEGER NOT NULL,
             finished_at INTEGER,
             summary     TEXT NOT NULL DEFAULT '',
+            -- The scoped per-run workspace the Rig executed in. NULL for
+            -- legacy rows / `inherit` mode (coordinator-CWD execution).
+            workspace   TEXT,
             FOREIGN KEY (brief_id) REFERENCES tasks(task_id)
         );
         CREATE INDEX IF NOT EXISTS brief_runs_by_brief
@@ -11824,6 +11872,9 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         // default Guild and single-tenant deployments keep seeing every
         // existing row while a *named* Guild sees only its own.
         "ALTER TABLE tasks ADD COLUMN tenant_id TEXT",
+        // Scoped per-run workspace path the Rig executed in (run ledger).
+        // NULL for legacy rows / `inherit` mode.
+        "ALTER TABLE brief_runs ADD COLUMN workspace TEXT",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the

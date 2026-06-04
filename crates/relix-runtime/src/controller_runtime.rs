@@ -9017,6 +9017,7 @@ fn register_node_type_handlers(
                                             summary: "run started".to_string(),
                                             install_hint: None,
                                             run_id: Some(ready.run_id.clone()),
+                                            workspace: ready.workspace.clone(),
                                         };
                                     let st_bg = st.clone();
                                     tokio::task::spawn_blocking(move || {

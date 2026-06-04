@@ -15,6 +15,16 @@ interface RunRecord {
   finished_at?: number;
   duration_secs?: number;
   summary?: string;
+  workspace?: string;
+}
+
+// Short label for the scoped per-run workspace: the leaf folder (the
+// run_id segment), with the full path on hover. "inherited CWD" when a
+// run executed without a scoped workspace (legacy / inherit mode).
+function wsLabel(ws?: string): string {
+  if (!ws) return "inherited CWD";
+  const parts = ws.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? ws;
 }
 
 // Run status → badge tone. `running` is in-flight; the rest are terminal.
@@ -103,6 +113,7 @@ export function Runs() {
                   <th>Adapter</th>
                   <th>Brief</th>
                   <th>Operative</th>
+                  <th>Workspace</th>
                   <th>Result</th>
                   <th>Duration</th>
                   <th>Started</th>
@@ -115,7 +126,8 @@ export function Runs() {
                     <td className="muted">{r.rig || "—"}</td>
                     <td className="mono">{(r.brief_id ?? "").slice(0, 12)}</td>
                     <td className="muted">{(r.agent_id ?? "").slice(0, 10) || "—"}</td>
-                    <td className="muted" style={{ maxWidth: 360, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.summary || (r.status === "running" ? "…" : "—")}</td>
+                    <td className="mono" style={{ fontSize: 11 }} title={r.workspace ?? "ran in the coordinator working directory (no scoped workspace)"}>{wsLabel(r.workspace)}</td>
+                    <td className="muted" style={{ maxWidth: 320, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.summary || (r.status === "running" ? "…" : "—")}</td>
                     <td className="muted">{fmtDuration(r)}</td>
                     <td className="muted">{r.started_at ? new Date(r.started_at * 1000).toLocaleTimeString() : ""}</td>
                   </tr>
