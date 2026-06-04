@@ -1464,6 +1464,18 @@ allow_groups = ["chat-users"]
 name = "spine_run_cancel"
 method = "run.cancel"
 allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_run_artifacts"
+method = "run.artifacts"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_run_artifact_preview"
+method = "run.artifact_preview"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_run_review"
+method = "run.review"
+allow_groups = ["chat-users"]
 "@ | Set-Content -Encoding utf8 $Policy
 
 # 6) Peer alias map consumed by the bridge. Tool entry omitted when -NoTool.

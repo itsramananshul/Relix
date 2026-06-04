@@ -442,6 +442,9 @@ pub struct ReadyRun {
     pub workspace_context: Option<String>,
     pub workspace_files: Option<i64>,
     pub workspace_bytes: Option<i64>,
+    /// Snapshot of the workspace files BEFORE the run, used after to detect
+    /// what the agent changed. Empty in `inherit` mode (no scoped dir).
+    baseline: WorkspaceManifest,
     rig: std::sync::Arc<dyn Rig>,
     req: RigRunRequest,
     token: String,
@@ -849,11 +852,232 @@ pub fn prepare_run_workspace(
     })
 }
 
+// ── Run artifacts: detect what the agent changed in the workspace ──
+
+/// Don't hash files larger than this — `size` alone decides "modified"
+/// for big files (avoids reading huge blobs just to detect a change).
+const ARTIFACT_HASH_MAX_BYTES: u64 = 1024 * 1024; // 1 MiB
+/// Hard cap on files walked during an artifact scan (safety net on top of
+/// the workspace copy caps).
+const ARTIFACT_SCAN_MAX_FILES: usize = 8000;
+
+/// A lightweight signature of one workspace file for change detection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileSig {
+    size: u64,
+    /// Content hash for files ≤ [`ARTIFACT_HASH_MAX_BYTES`]; `None` for
+    /// larger (then `size` alone decides "modified").
+    hash: Option<u64>,
+    is_text: bool,
+}
+
+/// A manifest of a workspace's files at one instant, used as the before /
+/// after baseline for change detection.
+#[derive(Clone, Debug, Default)]
+pub struct WorkspaceManifest {
+    files: std::collections::HashMap<String, FileSig>,
+    /// True when the walk hit [`ARTIFACT_SCAN_MAX_FILES`] (partial scan).
+    truncated: bool,
+}
+
+/// Heuristic: treat the first chunk of `bytes` as text iff it has no NUL
+/// byte (the cheap, reliable binary tell). Empty = text.
+fn looks_text(bytes: &[u8]) -> bool {
+    !bytes.iter().take(8192).any(|&b| b == 0)
+}
+
+/// Signature of one file: size, a deterministic content hash for small
+/// files, and a text/binary flag. `DefaultHasher` is fixed-key so the
+/// hash is comparable across the before/after scans (same process).
+fn file_sig(path: &std::path::Path, size: u64) -> FileSig {
+    use std::hash::{Hash, Hasher};
+    let mut head = Vec::new();
+    let is_text;
+    let hash = if size <= ARTIFACT_HASH_MAX_BYTES {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                is_text = looks_text(&bytes);
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut h);
+                Some(h.finish())
+            }
+            Err(_) => {
+                is_text = false;
+                None
+            }
+        }
+    } else {
+        // Big file: sniff only the head for the text flag; don't hash.
+        if let Ok(mut f) = std::fs::File::open(path) {
+            use std::io::Read;
+            let mut buf = [0u8; 8192];
+            if let Ok(n) = f.read(&mut buf) {
+                head.extend_from_slice(&buf[..n]);
+            }
+        }
+        is_text = looks_text(&head);
+        None
+    };
+    FileSig { size, hash, is_text }
+}
+
+/// Walk a run workspace and build its [`WorkspaceManifest`], reusing the
+/// copy-filter exclusions (no `.git`/`target`/`node_modules`/`dev-data`/
+/// secrets/…), skipping symlinks, and capping the file count. Paths are
+/// recorded relative to `root` with `/` separators.
+pub fn scan_workspace_manifest(root: &std::path::Path) -> WorkspaceManifest {
+    let mut m = WorkspaceManifest::default();
+    if !root.is_dir() {
+        return m;
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                if !is_excluded_dir(&name) {
+                    stack.push(entry.path());
+                }
+                continue;
+            }
+            if !ft.is_file() || is_excluded_file(&name) {
+                continue;
+            }
+            if m.files.len() >= ARTIFACT_SCAN_MAX_FILES {
+                m.truncated = true;
+                return m;
+            }
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| name.clone());
+            let size = entry.metadata().map(|md| md.len()).unwrap_or(0);
+            m.files.insert(rel, file_sig(&path, size));
+        }
+    }
+    m
+}
+
+/// One detected change between a before / after manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactChange {
+    pub rel_path: String,
+    /// `created` / `modified` / `deleted`.
+    pub kind: &'static str,
+    pub size: u64,
+    pub hash: Option<String>,
+    pub is_text: bool,
+}
+
+/// Diff two manifests into the agent's changes (created / modified /
+/// deleted), sorted by path. `unchanged` files are intentionally NOT
+/// returned — only what the run actually touched (so `BRIEF.md`, copied
+/// context, etc. don't show up unless the agent edited them).
+pub fn diff_manifests(before: &WorkspaceManifest, after: &WorkspaceManifest) -> Vec<ArtifactChange> {
+    let mut out = Vec::new();
+    for (rel, sig) in &after.files {
+        match before.files.get(rel) {
+            None => out.push(ArtifactChange {
+                rel_path: rel.clone(),
+                kind: "created",
+                size: sig.size,
+                hash: sig.hash.map(|h| format!("{h:016x}")),
+                is_text: sig.is_text,
+            }),
+            Some(prev) if prev != sig => out.push(ArtifactChange {
+                rel_path: rel.clone(),
+                kind: "modified",
+                size: sig.size,
+                hash: sig.hash.map(|h| format!("{h:016x}")),
+                is_text: sig.is_text,
+            }),
+            Some(_) => {} // unchanged — not an artifact
+        }
+    }
+    for (rel, sig) in &before.files {
+        if !after.files.contains_key(rel) {
+            out.push(ArtifactChange {
+                rel_path: rel.clone(),
+                kind: "deleted",
+                size: 0,
+                hash: None,
+                is_text: sig.is_text,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    out
+}
+
+/// Result of reading a small-text artifact preview.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreviewOutcome {
+    /// A safe, secret-redacted text preview (possibly truncated).
+    Text { content: String, truncated: bool },
+    /// Binary / non-text — refused (no preview).
+    Binary,
+    /// The file no longer exists (e.g. a deleted artifact).
+    Missing,
+    /// The resolved path escaped the workspace — refused.
+    Unsafe,
+}
+
+/// Read a length-bounded, secret-redacted text preview of an artifact at
+/// `<workspace>/<rel_path>`. The path is built ONLY from the stored
+/// (server-side) artifact row, and is verified to stay UNDER the
+/// workspace (no traversal); binaries and missing files are refused.
+pub fn read_artifact_preview(
+    workspace: &str,
+    rel_path: &str,
+    is_text: bool,
+    max_bytes: usize,
+) -> PreviewOutcome {
+    if !is_text {
+        return PreviewOutcome::Binary;
+    }
+    let path = std::path::Path::new(workspace).join(rel_path);
+    let (Ok(ws_canon), Ok(file_canon)) =
+        (std::fs::canonicalize(workspace), std::fs::canonicalize(&path))
+    else {
+        return PreviewOutcome::Missing;
+    };
+    if !file_canon.starts_with(&ws_canon) {
+        return PreviewOutcome::Unsafe;
+    }
+    let bytes = match std::fs::read(&file_canon) {
+        Ok(b) => b,
+        Err(_) => return PreviewOutcome::Missing,
+    };
+    // Re-check binary on the actual bytes (the row flag could be stale).
+    if !looks_text(&bytes) {
+        return PreviewOutcome::Binary;
+    }
+    let truncated = bytes.len() > max_bytes;
+    let slice = &bytes[..bytes.len().min(max_bytes)];
+    let raw = String::from_utf8_lossy(slice).into_owned();
+    PreviewOutcome::Text {
+        content: crate::rig::redact_secrets(&raw, ""),
+        truncated,
+    }
+}
+
 /// Outcome of [`preflight_run`]: either a clear refusal (no command was
 /// spawned) or a committed [`ReadyRun`].
+// A transient result that is returned by value and immediately matched
+// (never stored in a collection), so the variant size delta is irrelevant.
+#[allow(clippy::large_enum_variant)]
 pub enum Preflight {
     Refused(RunReport),
-    Ready(ReadyRun),
+    // Boxed: a `ReadyRun` carries the pre-run workspace baseline manifest.
+    Ready(Box<ReadyRun>),
 }
 
 /// Run ONE Brief synchronously through its Operative's Rig — the manual
@@ -881,7 +1105,7 @@ pub fn run_brief_now(
         prompt,
     )? {
         Preflight::Refused(report) => Ok(report),
-        Preflight::Ready(ready) => Ok(execute_ready(store, bridge_tokens, ready)),
+        Preflight::Ready(ready) => Ok(execute_ready(store, bridge_tokens, *ready)),
     }
 }
 
@@ -1064,7 +1288,13 @@ pub fn preflight_run(
     if let Some(ws) = &workspace {
         req = req.with_working_dir(std::path::PathBuf::from(ws));
     }
-    Ok(Preflight::Ready(ReadyRun {
+    // Snapshot the workspace BEFORE the run so we can detect what the agent
+    // changed (created/modified/deleted) when it finishes.
+    let baseline = match &workspace {
+        Some(ws) => scan_workspace_manifest(std::path::Path::new(ws)),
+        None => WorkspaceManifest::default(),
+    };
+    Ok(Preflight::Ready(Box::new(ReadyRun {
         brief_id: card.task_id,
         assignee,
         run_id,
@@ -1073,10 +1303,11 @@ pub fn preflight_run(
         workspace_context,
         workspace_files,
         workspace_bytes,
+        baseline,
         rig,
         req,
         token,
-    }))
+    })))
 }
 
 /// Execute a [`ReadyRun`]: run the Rig (blocking), advance the board,
@@ -1097,6 +1328,7 @@ pub fn execute_ready(
         workspace_context,
         workspace_files,
         workspace_bytes,
+        baseline,
         rig,
         req,
         token,
@@ -1135,6 +1367,53 @@ pub fn execute_ready(
     let was_cancelled = crate::rig::CancelRegistry::global().is_cancelled(&run_id);
     crate::rig::CancelRegistry::global().clear(&run_id);
     let _ = store.append_run_event(&run_id, "process_exited", "relix", "process exited", None, false);
+
+    // Detect what the agent changed in the scoped workspace (the
+    // reviewable result). Only scopes-runs are scanned — `inherit` mode
+    // has no scoped dir and we NEVER scan the repo. Failures are surfaced
+    // as a transcript event, never swallowed silently.
+    if let Some(ws) = &workspace {
+        let _ = store.append_run_event(&run_id, "artifacts.scan_started", "relix", "scanning the workspace for changes", None, false);
+        let after = scan_workspace_manifest(std::path::Path::new(ws));
+        let changes = diff_manifests(&baseline, &after);
+        let total = changes.len();
+        let mut recorded = 0usize;
+        let mut truncated = false;
+        for ch in &changes {
+            match store.record_run_artifact(
+                &run_id,
+                &brief_id,
+                ws,
+                &ch.rel_path,
+                ch.kind,
+                ch.size as i64,
+                ch.hash.as_deref(),
+                ch.is_text,
+            ) {
+                Ok(true) => recorded += 1,
+                Ok(false) => {
+                    truncated = true;
+                    break;
+                }
+                Err(e) => {
+                    let _ = store.append_run_event(&run_id, "artifacts.scan_failed", "relix", &format!("could not record an artifact: {e}"), None, false);
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+        let created = changes.iter().filter(|c| c.kind == "created").count();
+        let modified = changes.iter().filter(|c| c.kind == "modified").count();
+        let deleted = changes.iter().filter(|c| c.kind == "deleted").count();
+        let note = if truncated || after.truncated {
+            format!(
+                "{recorded}/{total} change(s) recorded (truncated): {created} created, {modified} modified, {deleted} deleted"
+            )
+        } else {
+            format!("{total} change(s): {created} created, {modified} modified, {deleted} deleted")
+        };
+        let _ = store.append_run_event(&run_id, "artifacts.detected", "relix", &note, None, false);
+    }
 
     let (status, summary) = if was_cancelled {
         let _ = store.set_board_status(&brief_id, "blocked");
@@ -1981,7 +2260,7 @@ mod tests {
 
         let pre = preflight_run(&s, &reg, None, 300, &id, Some("echo"), "work".into()).unwrap();
         let ready = match pre {
-            Preflight::Ready(r) => r,
+            Preflight::Ready(r) => *r,
             Preflight::Refused(r) => panic!("expected ready, got {r:?}"),
         };
         // The run is already recorded as `running` before execution.
@@ -2281,7 +2560,7 @@ mod tests {
         let id = ready_brief(&s, "dup", "agt_a");
         let first = preflight_run(&s, &reg, None, 300, &id, Some("echo"), "x".into()).unwrap();
         let r1 = match first {
-            Preflight::Ready(r) => r,
+            Preflight::Ready(r) => *r,
             Preflight::Refused(r) => panic!("expected ready, got {r:?}"),
         };
         // The SAME Operative re-claiming (the lease is per-agent + idempotent)
@@ -2289,7 +2568,7 @@ mod tests {
         // the workspace key, so a second run never clobbers the first.
         let second = preflight_run(&s, &reg, None, 300, &id, Some("echo"), "y".into()).unwrap();
         let r2 = match second {
-            Preflight::Ready(r) => r,
+            Preflight::Ready(r) => *r,
             Preflight::Refused(r) => panic!("expected ready, got {r:?}"),
         };
         assert_ne!(r1.run_id, r2.run_id, "distinct run ids");
@@ -2362,7 +2641,7 @@ mod tests {
         reg.set_default(Some("p".to_string()));
 
         let ready = match preflight_run(&s, &reg, None, 300, &id, None, "x".into()).unwrap() {
-            Preflight::Ready(r) => r,
+            Preflight::Ready(r) => *r,
             Preflight::Refused(r) => panic!("expected ready, got {r:?}"),
         };
         let run_id = ready.run_id.clone();

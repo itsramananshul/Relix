@@ -2501,14 +2501,175 @@ impl TaskStore {
     ) -> Result<(), CoordinatorError> {
         let now = unix_secs();
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        // A `done` run is reviewable → open it `pending_review`; other
+        // terminal states leave review NULL (nothing to accept/reject).
         conn.execute(
             "UPDATE brief_runs
-             SET status = ?1, summary = ?2, finished_at = ?3
+             SET status = ?1, summary = ?2, finished_at = ?3,
+                 review = CASE WHEN ?1 = 'done' THEN 'pending_review' ELSE review END
              WHERE run_id = ?4",
             params![status, summary, now, run_id],
         )
         .map_err(CoordinatorError::Db)?;
         Ok(())
+    }
+
+    /// True iff `run_id`'s Brief belongs to `tenant` (so a caller scoped to
+    /// one Guild can't read another's run artifacts/preview/review). A
+    /// missing run / cross-tenant run both return false — no existence leak.
+    pub fn run_belongs_to_tenant(
+        &self,
+        run_id: &str,
+        tenant: &str,
+    ) -> Result<bool, CoordinatorError> {
+        let tenant = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM brief_runs r JOIN tasks t ON t.task_id = r.brief_id
+                 WHERE r.run_id = ?1 AND COALESCE(t.tenant_id, 'default') = ?2",
+                params![run_id, tenant],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        Ok(found.is_some())
+    }
+
+    /// Record one run artifact. Enforces [`MAX_RUN_ARTIFACTS`]: returns
+    /// `false` once the cap is hit (the caller records a truncation note in
+    /// the transcript), otherwise inserts and returns `true`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_run_artifact(
+        &self,
+        run_id: &str,
+        brief_id: &str,
+        workspace: &str,
+        rel_path: &str,
+        kind: &str,
+        size: i64,
+        hash: Option<&str>,
+        is_text: bool,
+    ) -> Result<bool, CoordinatorError> {
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_artifacts WHERE run_id = ?1",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if count as usize >= MAX_RUN_ARTIFACTS {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO run_artifacts
+                 (run_id, brief_id, workspace, rel_path, kind, size, hash, is_text, captured_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                run_id,
+                brief_id,
+                workspace,
+                rel_path,
+                kind,
+                size,
+                hash,
+                i64::from(is_text),
+                now
+            ],
+        )
+        .map_err(CoordinatorError::Db)?;
+        Ok(true)
+    }
+
+    /// All artifacts for a run (the changed-files list). Ordered by path.
+    pub fn list_run_artifacts(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<RunArtifact>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT artifact_id, run_id, brief_id, workspace, rel_path, kind, size, hash,
+                        is_text, captured_at
+                 FROM run_artifacts WHERE run_id = ?1
+                 ORDER BY rel_path ASC, artifact_id ASC",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![run_id], RunArtifact::from_row)
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(CoordinatorError::Db)?);
+        }
+        Ok(out)
+    }
+
+    /// One artifact by id, scoped to its run — used by the preview API to
+    /// resolve `<workspace>/<rel_path>` server-side (never user-supplied).
+    pub fn get_run_artifact(
+        &self,
+        run_id: &str,
+        artifact_id: i64,
+    ) -> Result<Option<RunArtifact>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT artifact_id, run_id, brief_id, workspace, rel_path, kind, size, hash,
+                        is_text, captured_at
+                 FROM run_artifacts WHERE run_id = ?1 AND artifact_id = ?2",
+                params![run_id, artifact_id],
+                RunArtifact::from_row,
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        Ok(row)
+    }
+
+    /// Record an operator's review decision on a run. `decision` must be
+    /// `accepted` or `rejected`; the run must exist + be `done`. Returns
+    /// the updated review state, or an error for an invalid decision /
+    /// non-reviewable run.
+    pub fn set_run_review(
+        &self,
+        run_id: &str,
+        decision: &str,
+        note: &str,
+    ) -> Result<String, CoordinatorError> {
+        if decision != "accepted" && decision != "rejected" {
+            return Err(CoordinatorError::Invalid(format!(
+                "review decision must be `accepted` or `rejected`, got `{decision}`"
+            )));
+        }
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM brief_runs WHERE run_id = ?1",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        match status.as_deref() {
+            None => Err(CoordinatorError::NotFound(run_id.to_string())),
+            Some("done") => {
+                let note = clamp_bytes(note, MAX_RUN_EVENT_FIELD_BYTES);
+                conn.execute(
+                    "UPDATE brief_runs
+                     SET review = ?1, review_note = ?2, reviewed_at = ?3
+                     WHERE run_id = ?4",
+                    params![decision, note, now, run_id],
+                )
+                .map_err(CoordinatorError::Db)?;
+                Ok(decision.to_string())
+            }
+            Some(other) => Err(CoordinatorError::Invalid(format!(
+                "only a `done` run is reviewable (this run is `{other}`)"
+            ))),
+        }
     }
 
     /// Recent run records across all Briefs, newest first — the Active
@@ -2519,7 +2680,8 @@ impl TaskStore {
         let mut stmt = conn
             .prepare(
                 "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary,
-                        workspace, workspace_context, workspace_files, workspace_bytes
+                        workspace, workspace_context, workspace_files, workspace_bytes,
+                        review, review_note, reviewed_at
                  FROM brief_runs
                  ORDER BY started_at DESC, rowid DESC
                  LIMIT ?1",
@@ -2547,7 +2709,8 @@ impl TaskStore {
         let mut stmt = conn
             .prepare(
                 "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary,
-                        workspace, workspace_context, workspace_files, workspace_bytes
+                        workspace, workspace_context, workspace_files, workspace_bytes,
+                        review, review_note, reviewed_at
                  FROM brief_runs
                  WHERE brief_id = ?1
                  ORDER BY started_at DESC, rowid DESC
@@ -2570,7 +2733,8 @@ impl TaskStore {
         let row = conn
             .query_row(
                 "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary,
-                        workspace, workspace_context, workspace_files, workspace_bytes
+                        workspace, workspace_context, workspace_files, workspace_bytes,
+                        review, review_note, reviewed_at
                  FROM brief_runs WHERE run_id = ?1",
                 params![run_id],
                 RunRecord::from_row,
@@ -7258,7 +7422,60 @@ pub struct RunRecord {
     /// Bytes copied into the workspace (`copy_repo`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_bytes: Option<i64>,
+    /// Operator review state: `pending_review` / `accepted` / `rejected`.
+    /// `None` for non-`done` runs / legacy rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<i64>,
 }
+
+/// One reviewable run artifact (`run_artifacts`) — metadata about a file
+/// the agent created/modified/deleted in the run workspace. Content is
+/// NOT stored here; previews are read live with size limits.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RunArtifact {
+    pub artifact_id: i64,
+    pub run_id: String,
+    pub brief_id: String,
+    /// The run workspace this path is relative to (server-side only — the
+    /// preview API reads `<workspace>/<rel_path>`; never user-supplied).
+    #[serde(skip)]
+    pub workspace: String,
+    pub rel_path: String,
+    /// `created` / `modified` / `deleted`.
+    pub kind: String,
+    pub size: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    pub is_text: bool,
+    pub captured_at: i64,
+}
+
+impl RunArtifact {
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            artifact_id: r.get(0)?,
+            run_id: r.get(1)?,
+            brief_id: r.get(2)?,
+            workspace: r.get(3)?,
+            rel_path: r.get(4)?,
+            kind: r.get(5)?,
+            size: r.get(6)?,
+            hash: r.get(7)?,
+            is_text: r.get::<_, i64>(8)? != 0,
+            captured_at: r.get(9)?,
+        })
+    }
+}
+
+/// Cap on the number of artifacts recorded per run; beyond it the scan
+/// records a truncation note in the transcript and stops.
+pub const MAX_RUN_ARTIFACTS: usize = 1000;
+/// Max bytes a small-text artifact preview may return.
+pub const ARTIFACT_PREVIEW_MAX_BYTES: usize = 64 * 1024;
 
 /// One transcript event for a run (`run_events`) — the focused
 /// "what happened" record the dashboard renders chronologically.
@@ -7326,6 +7543,9 @@ impl RunRecord {
             workspace_context: r.get(9)?,
             workspace_files: r.get(10)?,
             workspace_bytes: r.get(11)?,
+            review: r.get(12)?,
+            review_note: r.get(13)?,
+            reviewed_at: r.get(14)?,
         })
     }
 }
@@ -11908,12 +12128,38 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             workspace_context TEXT,
             workspace_files   INTEGER,
             workspace_bytes   INTEGER,
+            -- Operator review of the run's result. `pending_review` once a
+            -- `done` run finishes; `accepted` / `rejected` after a decision.
+            -- NULL for non-`done` runs / legacy rows.
+            review       TEXT,
+            review_note  TEXT,
+            reviewed_at  INTEGER,
             FOREIGN KEY (brief_id) REFERENCES tasks(task_id)
         );
         CREATE INDEX IF NOT EXISTS brief_runs_by_brief
             ON brief_runs(brief_id, started_at);
         CREATE INDEX IF NOT EXISTS brief_runs_recent
             ON brief_runs(started_at);
+        -- Reviewable run artifacts (the "what did the agent change" record).
+        -- METADATA + path references only — file CONTENT is never stored
+        -- here; small text previews are read live from the workspace by the
+        -- preview API with size limits. The scan reuses the workspace copy
+        -- filters (no .git/target/node_modules/dev-data/secrets/binaries),
+        -- skips symlinks, and is bounded by a max file count.
+        CREATE TABLE IF NOT EXISTS run_artifacts (
+            artifact_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id       TEXT NOT NULL,
+            brief_id     TEXT NOT NULL,
+            workspace    TEXT NOT NULL,
+            rel_path     TEXT NOT NULL,
+            kind         TEXT NOT NULL,   -- created / modified / deleted
+            size         INTEGER NOT NULL DEFAULT 0,
+            hash         TEXT,
+            is_text      INTEGER NOT NULL DEFAULT 0,
+            captured_at  INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS run_artifacts_by_run
+            ON run_artifacts(run_id, artifact_id);
         -- Per-run transcript (the "what happened" record the dashboard
         -- shows when an operator clicks a run). Focused + capped: lifecycle
         -- events (relix), plus parsed adapter events (claude/codex/echo).
@@ -12094,6 +12340,10 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         "ALTER TABLE brief_runs ADD COLUMN workspace_context TEXT",
         "ALTER TABLE brief_runs ADD COLUMN workspace_files INTEGER",
         "ALTER TABLE brief_runs ADD COLUMN workspace_bytes INTEGER",
+        // Run review (operator accept/reject of the run result).
+        "ALTER TABLE brief_runs ADD COLUMN review TEXT",
+        "ALTER TABLE brief_runs ADD COLUMN review_note TEXT",
+        "ALTER TABLE brief_runs ADD COLUMN reviewed_at INTEGER",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the

@@ -795,6 +795,49 @@ pub async fn run_cancel(
     json_passthrough(call_peer(&state, "run.cancel", run_id.as_bytes()).await?)
 }
 
+/// `GET /v1/runs/:run_id/artifacts` — the changed files a run produced.
+pub async fn run_artifacts(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "run.artifacts", run_id.as_bytes()).await?)
+}
+
+/// `GET /v1/runs/:run_id/artifacts/:artifact_id/preview` — a safe,
+/// size-limited text preview of one artifact (refuses binary/large).
+pub async fn run_artifact_preview(
+    State(state): State<AppState>,
+    Path((run_id, artifact_id)): Path<(String, String)>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let arg = format!("{run_id}|{artifact_id}");
+    json_passthrough(call_peer(&state, "run.artifact_preview", arg.as_bytes()).await?)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReviewRequest {
+    pub decision: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// `POST /v1/runs/:run_id/review` — record an operator accept/reject of a
+/// run's result. Does NOT apply files back to the project (future, guarded).
+pub async fn run_review(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(req): Json<ReviewRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let decision = req.decision.trim();
+    if decision != "accepted" && decision != "rejected" {
+        return Err(bad("decision must be `accepted` or `rejected`"));
+    }
+    if req.note.contains('|') {
+        return Err(bad("note must not contain `|`"));
+    }
+    let arg = format!("{run_id}|{decision}|{}", req.note);
+    json_passthrough(call_peer(&state, "run.review", arg.as_bytes()).await?)
+}
+
 /// `GET /v1/spine/company` — first-run status: whether the Guild has a
 /// Founder yet, the Founder profile, and the Operative count. The
 /// dashboard reads this to show the "Initialize Company" first-run state.

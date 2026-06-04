@@ -9029,7 +9029,7 @@ fn register_node_type_handlers(
                                         let _ = crate::nodes::coordinator::heartbeat::execute_ready(
                                             &st_bg,
                                             Some(&bt),
-                                            ready,
+                                            *ready,
                                         );
                                     });
                                     accepted
@@ -9261,6 +9261,180 @@ fn register_node_type_handlers(
                                         retry_after: None,
                                     },
                                 ),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
+        {
+            // `run.artifacts` — the changed files a run produced (`GET
+            // /v1/runs/:id/artifacts`). Tenant-scoped: a run whose Brief is
+            // in another Guild reads as not-found (no existence leak).
+            let st = store.clone();
+            bridge.register(
+                "run.artifacts",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            let run_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
+                            let tenant = ctx.tenant_id_or_default().to_string();
+                            let invalid = |c: String| {
+                                crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                        cause: c,
+                                        retry_hint: 0,
+                                        retry_after: None,
+                                    },
+                                )
+                            };
+                            match st.run_belongs_to_tenant(&run_id, &tenant) {
+                                Ok(true) => {}
+                                Ok(false) => return invalid(format!("run not found: {run_id}")),
+                                Err(e) => return invalid(format!("run.artifacts: {e}")),
+                            }
+                            match st.list_run_artifacts(&run_id) {
+                                Ok(a) => match serde_json::to_vec(&a) {
+                                    Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                    Err(e) => invalid(format!("run.artifacts encode: {e}")),
+                                },
+                                Err(e) => invalid(format!("run.artifacts: {e}")),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
+        {
+            // `run.artifact_preview` — a safe text preview of one artifact
+            // (`GET /v1/runs/:id/artifacts/:aid/preview`). Arg
+            // `run_id|artifact_id`. Tenant-scoped; binaries / large files /
+            // missing files are refused; the path is server-resolved.
+            let st = store.clone();
+            bridge.register(
+                "run.artifact_preview",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            let arg = String::from_utf8_lossy(&ctx.args).to_string();
+                            let mut parts = arg.splitn(2, '|');
+                            let run_id = parts.next().unwrap_or("").trim().to_string();
+                            let aid: i64 =
+                                parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(-1);
+                            let tenant = ctx.tenant_id_or_default().to_string();
+                            let invalid = |c: String| {
+                                crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                        cause: c,
+                                        retry_hint: 0,
+                                        retry_after: None,
+                                    },
+                                )
+                            };
+                            match st.run_belongs_to_tenant(&run_id, &tenant) {
+                                Ok(true) => {}
+                                Ok(false) => return invalid(format!("run not found: {run_id}")),
+                                Err(e) => return invalid(format!("run.artifact_preview: {e}")),
+                            }
+                            let art = match st.get_run_artifact(&run_id, aid) {
+                                Ok(Some(a)) => a,
+                                Ok(None) => return invalid(format!("artifact not found: {aid}")),
+                                Err(e) => return invalid(format!("run.artifact_preview: {e}")),
+                            };
+                            use crate::nodes::coordinator::heartbeat::{
+                                read_artifact_preview, PreviewOutcome,
+                            };
+                            let max = crate::nodes::coordinator::ARTIFACT_PREVIEW_MAX_BYTES;
+                            let outcome = read_artifact_preview(
+                                &art.workspace,
+                                &art.rel_path,
+                                art.is_text,
+                                max,
+                            );
+                            let body = match outcome {
+                                PreviewOutcome::Text { content, truncated } => serde_json::json!({
+                                    "rel_path": art.rel_path, "kind": art.kind, "size": art.size,
+                                    "is_text": true, "available": true, "truncated": truncated,
+                                    "content": content,
+                                }),
+                                PreviewOutcome::Binary => serde_json::json!({
+                                    "rel_path": art.rel_path, "kind": art.kind, "size": art.size,
+                                    "is_text": false, "available": false,
+                                    "reason": "binary or non-text file — no preview",
+                                }),
+                                PreviewOutcome::Missing => serde_json::json!({
+                                    "rel_path": art.rel_path, "kind": art.kind, "size": art.size,
+                                    "available": false,
+                                    "reason": "file no longer exists in the workspace",
+                                }),
+                                PreviewOutcome::Unsafe => serde_json::json!({
+                                    "rel_path": art.rel_path, "kind": art.kind,
+                                    "available": false, "reason": "path refused (outside workspace)",
+                                }),
+                            };
+                            match serde_json::to_vec(&body) {
+                                Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                Err(e) => invalid(format!("run.artifact_preview encode: {e}")),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
+        {
+            // `run.review` — record an operator accept/reject on a run
+            // (`POST /v1/runs/:id/review`). Arg `run_id|decision|note`.
+            // Tenant-scoped; only a `done` run is reviewable. Records a
+            // `review` transcript event. Does NOT apply files (future).
+            let st = store.clone();
+            bridge.register(
+                "run.review",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            let arg = String::from_utf8_lossy(&ctx.args).to_string();
+                            let mut parts = arg.splitn(3, '|');
+                            let run_id = parts.next().unwrap_or("").trim().to_string();
+                            let decision = parts.next().unwrap_or("").trim().to_string();
+                            let note = parts.next().unwrap_or("").to_string();
+                            let tenant = ctx.tenant_id_or_default().to_string();
+                            let invalid = |c: String| {
+                                crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                        cause: c,
+                                        retry_hint: 0,
+                                        retry_after: None,
+                                    },
+                                )
+                            };
+                            match st.run_belongs_to_tenant(&run_id, &tenant) {
+                                Ok(true) => {}
+                                Ok(false) => return invalid(format!("run not found: {run_id}")),
+                                Err(e) => return invalid(format!("run.review: {e}")),
+                            }
+                            match st.set_run_review(&run_id, &decision, &note) {
+                                Ok(state) => {
+                                    let msg = if note.trim().is_empty() {
+                                        format!("operator {state} the run")
+                                    } else {
+                                        format!("operator {state} the run — {}", note.trim())
+                                    };
+                                    let _ = st.append_run_event(
+                                        &run_id, "review", "relix", &msg, None, false,
+                                    );
+                                    let body = serde_json::json!({"run_id": run_id, "review": state});
+                                    match serde_json::to_vec(&body) {
+                                        Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                        Err(e) => invalid(format!("run.review encode: {e}")),
+                                    }
+                                }
+                                Err(e) => invalid(format!("run.review: {e}")),
                             }
                         }
                     },
