@@ -67,6 +67,31 @@ default-deny so the operator console can reach the spine. If you run a
 custom policy, add the same `[[rules]]` (see the boot script) or the
 spine pages will return 502 (`default_deny`).
 
+## Agent execution (adapters / Rigs)
+
+An Operative executes a Brief through a local **agent adapter** (a Rig):
+a coding-agent CLI such as **Claude CLI** or **Codex CLI**, run on the
+operator's own subscription (no API key injected). The dashboard surfaces
+this end-to-end:
+
+- **Settings → Agent adapters** and **Crew** show every registered
+  adapter with a *live availability probe* (installed / missing + an
+  install hint). Nothing assumes a CLI exists.
+- **Briefs → Run** (`POST /v1/spine/briefs/:id/run`) runs the Brief now
+  through its Operative's adapter and returns a structured RunReport.
+  Refusals are explicit (`unassigned`, `no_adapter`, `adapter_unavailable`,
+  `already_running`) — never a faked run.
+- **Active Runs** lists the run lifecycle from the Brief Chronicle
+  (`brief.run_started` → `brief.shift_done` / `dispatch_failed`), tagged
+  with the adapter that handled it.
+
+Backend: the adapter abstraction (`ProcessRig`) spawns the CLI with safe
+argv construction (no shell), a hard timeout + child-kill (cancellation),
+streamed output capture, a validated working directory, and secret
+redaction on captured output. The optional `RELIX_DEFAULT_RIG` env sets a
+Guild-default adapter so an Operative with no Rig of its own still runs;
+`RELIX_HEARTBEAT_ENABLED` turns on the autonomous timer dispatch.
+
 ## Known backend gaps (UI degrades, not faked)
 
 - **List-all mandates**: there is no list endpoint — only
