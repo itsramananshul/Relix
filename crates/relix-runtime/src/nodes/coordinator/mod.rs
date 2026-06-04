@@ -993,16 +993,67 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// GROUP 6 (tenant isolation): reverse-edge read that filters the
+    /// related (`task_id`) side to `tenant`'s Guild via a JOIN on `tasks`,
+    /// so a cross-Guild related Brief id is never returned.
+    fn list_reverse_edges_for_tenant(
+        &self,
+        target: &str,
+        edge_type: &str,
+        tenant: &str,
+    ) -> Result<Vec<String>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.task_id FROM task_edges e
+                 JOIN tasks t ON t.task_id = e.task_id
+                 WHERE e.related_task_id = ?1 AND e.edge_type = ?2
+                   AND COALESCE(t.tenant_id, 'default') = ?3
+                 ORDER BY e.edge_id ASC",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows: Vec<String> = stmt
+            .query_map(params![target, edge_type, norm_tenant(tenant)], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// PHASE 1 (Brief): the Briefs that THIS Brief blocks — the
     /// reverse of its Snags (who is waiting on `task` to finish).
     pub fn list_blocking(&self, task: &str) -> Result<Vec<String>, CoordinatorError> {
         self.list_reverse_edges(task, "blocked_on")
     }
 
+    /// GROUP 6 (tenant isolation): like [`Self::list_blocking`], but only
+    /// the related Briefs in `tenant`'s Guild — so a reverse-edge read can
+    /// never leak a cross-Guild Brief id even if a legacy edge crosses
+    /// tenants.
+    pub fn list_blocking_for_tenant(
+        &self,
+        task: &str,
+        tenant: &str,
+    ) -> Result<Vec<String>, CoordinatorError> {
+        self.list_reverse_edges_for_tenant(task, "blocked_on", tenant)
+    }
+
     /// PHASE 1 (Brief): the parent Briefs that spawned `task` as a
     /// Sub-brief (normally one — the planner that decomposed it).
     pub fn parent_briefs(&self, task: &str) -> Result<Vec<String>, CoordinatorError> {
         self.list_reverse_edges(task, "spawned")
+    }
+
+    /// GROUP 6 (tenant isolation): like [`Self::parent_briefs`], but only
+    /// the parent Briefs in `tenant`'s Guild.
+    pub fn parent_briefs_for_tenant(
+        &self,
+        task: &str,
+        tenant: &str,
+    ) -> Result<Vec<String>, CoordinatorError> {
+        self.list_reverse_edges_for_tenant(task, "spawned", tenant)
     }
 
     /// PHASE 1 (Brief): the full detail view of a Brief in one read —
@@ -8492,6 +8543,11 @@ fn handle_brief_move(
     if task_id.is_empty() {
         return invalid("brief.move: task_id required".to_string());
     }
+    // Tenant ownership FIRST: a cross-Guild Brief id is not-found before
+    // any board-state / manage-gate business logic runs.
+    if let Some(out) = deny_cross_tenant(store, ctx, task_id, "brief.move") {
+        return out;
+    }
     // Manage gate (company-model §5.2A): moving a Brief owned by ANOTHER
     // Operative is controlling that agent's work, so a non-operator
     // actor needs `can_manage_work` + a `manage_scope` admitting the
@@ -8779,6 +8835,9 @@ fn handle_brief_due(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Ok(t) => t,
         Err(o) => return o,
     };
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.due") {
+        return out;
+    }
     match store.brief_due(task) {
         Ok(Some(due)) => HandlerOutcome::Ok(due.to_string().into_bytes()),
         Ok(None) => HandlerOutcome::Ok(Vec::new()),
@@ -8856,6 +8915,9 @@ fn handle_brief_labels(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome
         Ok(t) => t,
         Err(o) => return o,
     };
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.labels") {
+        return out;
+    }
     match store.brief_labels(task) {
         Ok(labels) => HandlerOutcome::Ok(labels.join("\n").into_bytes()),
         Err(e) => map_edge_err("brief.labels", e),
@@ -8904,7 +8966,12 @@ fn handle_brief_blocking(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutco
         Ok(t) => t,
         Err(o) => return o,
     };
-    match store.list_blocking(task) {
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.blocking") {
+        return out;
+    }
+    // Tenant-scoped reverse-edge read: never leak a related Brief from
+    // another Guild, even if a legacy edge crosses tenants.
+    match store.list_blocking_for_tenant(task, ctx.tenant_id_or_default()) {
         Ok(ids) => HandlerOutcome::Ok(ids.join("\n").into_bytes()),
         Err(e) => map_edge_err("brief.blocking", e),
     }
@@ -8917,7 +8984,11 @@ fn handle_brief_parents(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcom
         Ok(t) => t,
         Err(o) => return o,
     };
-    match store.parent_briefs(task) {
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.parents") {
+        return out;
+    }
+    // Tenant-scoped: never leak a parent Brief id/title from another Guild.
+    match store.parent_briefs_for_tenant(task, ctx.tenant_id_or_default()) {
         Ok(ids) => HandlerOutcome::Ok(ids.join("\n").into_bytes()),
         Err(e) => map_edge_err("brief.parents", e),
     }
@@ -9046,6 +9117,9 @@ fn handle_brief_blocked(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcom
         Ok(t) => t,
         Err(o) => return o,
     };
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.blocked") {
+        return out;
+    }
     match store.is_blocked(task) {
         Ok(b) => HandlerOutcome::Ok(if b {
             b"true".to_vec()
@@ -9067,6 +9141,12 @@ fn handle_brief_comment(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcom
     let parts: Vec<&str> = raw.splitn(3, '|').collect();
     if parts.len() < 3 {
         return invalid("brief.comment: expected `task_id|author|text`".to_string());
+    }
+    // Communication is not authorization-free across Guilds: the comment
+    // must target a Brief in the caller's Guild before any Chronicle event
+    // is appended (a cross-Guild id reads as not-found, no event written).
+    if let Some(out) = deny_cross_tenant(store, ctx, parts[0].trim(), "brief.comment") {
+        return out;
     }
     match store.comment_on_brief(parts[0].trim(), parts[1].trim(), parts[2]) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
@@ -9211,6 +9291,9 @@ fn handle_brief_fields(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome
         Ok(t) => t,
         Err(o) => return o,
     };
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.fields") {
+        return out;
+    }
     match store.brief_fields(task) {
         Ok(Some(f)) => match serde_json::to_vec(&f) {
             Ok(b) => HandlerOutcome::Ok(b),
@@ -16275,6 +16358,158 @@ mod tests {
             handle_brief_unsubbrief(&s, &ctx_tenant(format!("{a}|{b}").as_bytes(), "acme")),
             HandlerOutcome::Err(_)
         ));
+    }
+
+    #[test]
+    fn brief_move_and_comment_deny_across_tenant() {
+        let s = TaskStore::in_memory().unwrap();
+        // Assigned so the positive `todo -> in_progress` move is legal
+        // (the entry guard requires an assignee).
+        let a = s
+            .create_brief(
+                "acme",
+                "Acme work",
+                "subj",
+                Some("agt_acme"),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        // brief.move: a cross-Guild caller is refused before any board
+        // logic; the same-Guild caller succeeds.
+        assert!(matches!(
+            handle_brief_move(
+                &s,
+                None,
+                &ctx_tenant(format!("{a}|in_progress").as_bytes(), "globex")
+            ),
+            HandlerOutcome::Err(_)
+        ));
+        assert!(matches!(
+            handle_brief_move(
+                &s,
+                None,
+                &ctx_tenant(format!("{a}|in_progress").as_bytes(), "acme")
+            ),
+            HandlerOutcome::Ok(_)
+        ));
+        // brief.comment: a cross-Guild comment is refused AND appends no
+        // Chronicle event.
+        let comments = |s: &TaskStore, t: &str| {
+            s.list_events_after(t, 0, 500)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.event_type == "brief.comment")
+                .count()
+        };
+        assert_eq!(comments(&s, &a), 0);
+        assert!(matches!(
+            handle_brief_comment(
+                &s,
+                &ctx_tenant(format!("{a}|globex_user|hi").as_bytes(), "globex")
+            ),
+            HandlerOutcome::Err(_)
+        ));
+        assert_eq!(
+            comments(&s, &a),
+            0,
+            "a denied comment must not write a Chronicle event"
+        );
+        // The owning Guild can comment.
+        assert!(matches!(
+            handle_brief_comment(
+                &s,
+                &ctx_tenant(format!("{a}|acme_user|hi").as_bytes(), "acme")
+            ),
+            HandlerOutcome::Ok(_)
+        ));
+        assert_eq!(comments(&s, &a), 1);
+    }
+
+    #[test]
+    fn brief_single_field_reads_deny_across_tenant() {
+        let s = TaskStore::in_memory().unwrap();
+        let a = s
+            .create_brief("acme", "Acme", "subj", None, None, None, None)
+            .unwrap();
+        let parent = s
+            .create_brief("acme", "Acme parent", "subj", None, None, None, None)
+            .unwrap();
+        let blocker = s
+            .create_brief("acme", "Acme blocker", "subj", None, None, None, None)
+            .unwrap();
+        // Wire same-tenant relations so the reverse-edge reads return data.
+        s.link_subbrief(&parent, &a).unwrap();
+        s.add_snag(&blocker, &a).unwrap(); // `a` blocks `blocker`
+        let is_err = |o: HandlerOutcome| matches!(o, HandlerOutcome::Err(_));
+        let is_ok = |o: HandlerOutcome| matches!(o, HandlerOutcome::Ok(_));
+
+        for (out_x, out_a) in [
+            (
+                handle_brief_fields(&s, &ctx_tenant(a.as_bytes(), "globex")),
+                handle_brief_fields(&s, &ctx_tenant(a.as_bytes(), "acme")),
+            ),
+            (
+                handle_brief_labels(&s, &ctx_tenant(a.as_bytes(), "globex")),
+                handle_brief_labels(&s, &ctx_tenant(a.as_bytes(), "acme")),
+            ),
+            (
+                handle_brief_due(&s, &ctx_tenant(a.as_bytes(), "globex")),
+                handle_brief_due(&s, &ctx_tenant(a.as_bytes(), "acme")),
+            ),
+            (
+                handle_brief_blocked(&s, &ctx_tenant(a.as_bytes(), "globex")),
+                handle_brief_blocked(&s, &ctx_tenant(a.as_bytes(), "acme")),
+            ),
+            (
+                handle_brief_blocking(&s, &ctx_tenant(a.as_bytes(), "globex")),
+                handle_brief_blocking(&s, &ctx_tenant(a.as_bytes(), "acme")),
+            ),
+            (
+                handle_brief_parents(&s, &ctx_tenant(a.as_bytes(), "globex")),
+                handle_brief_parents(&s, &ctx_tenant(a.as_bytes(), "acme")),
+            ),
+        ] {
+            assert!(is_err(out_x), "cross-tenant read must be denied");
+            assert!(is_ok(out_a), "same-tenant read must succeed");
+        }
+        // The same-tenant relationship reads actually return the related ids.
+        let blocking = match handle_brief_blocking(&s, &ctx_tenant(a.as_bytes(), "acme")) {
+            HandlerOutcome::Ok(body) => String::from_utf8(body).unwrap(),
+            HandlerOutcome::Err(_) => panic!("blocking errored"),
+        };
+        assert!(blocking.contains(&blocker));
+        let parents = match handle_brief_parents(&s, &ctx_tenant(a.as_bytes(), "acme")) {
+            HandlerOutcome::Ok(body) => String::from_utf8(body).unwrap(),
+            HandlerOutcome::Err(_) => panic!("parents errored"),
+        };
+        assert!(parents.contains(&parent));
+    }
+
+    #[test]
+    fn brief_reverse_edges_do_not_leak_cross_tenant_related() {
+        // A cross-Guild reverse edge (legacy / hypothetical) must not leak
+        // the related Brief id even when the queried Brief is in-tenant.
+        let s = TaskStore::in_memory().unwrap();
+        let acme_parent = s
+            .create_brief("acme", "Acme parent", "subj", None, None, None, None)
+            .unwrap();
+        let globex_child = s
+            .create_brief("globex", "Globex child", "subj", None, None, None, None)
+            .unwrap();
+        // Force a cross-tenant parent→child edge directly in the store.
+        s.link_subbrief(&acme_parent, &globex_child).unwrap();
+        // globex_child's parents, scoped to globex, must NOT include the
+        // acme parent.
+        let parents = s.parent_briefs_for_tenant(&globex_child, "globex").unwrap();
+        assert!(!parents.contains(&acme_parent));
+        // But the unscoped read would (proving the filter is doing work).
+        assert!(
+            s.parent_briefs(&globex_child)
+                .unwrap()
+                .contains(&acme_parent)
+        );
     }
 
     #[test]
