@@ -2628,8 +2628,6 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
          );
          CREATE UNIQUE INDEX IF NOT EXISTS agent_profiles_subject
              ON agent_profiles(subject_id);
-         CREATE INDEX IF NOT EXISTS agent_profiles_reports_to
-             ON agent_profiles(reports_to);
 
          CREATE TABLE IF NOT EXISTS approval_requests (
              approval_id     TEXT PRIMARY KEY,
@@ -2735,6 +2733,10 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     // existing rows read NULL (no boss) until an operator/CEO sets
     // it via `agent.update agent_id|reports_to|<boss_agent_id>`.
     ensure_column(conn, "agent_profiles", "reports_to", "TEXT")?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS agent_profiles_reports_to ON agent_profiles(reports_to)",
+        [],
+    )?;
     // PILLAR 2 (Rig): the agent backend that powers an Operative.
     ensure_column(conn, "agent_profiles", "rig", "TEXT")?;
     // Governance: per-Operative monthly Allowance (budget, cents).
