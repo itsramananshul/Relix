@@ -1,4 +1,5 @@
-import { tryGet } from "../api";
+import { useState } from "react";
+import { api, tryGet } from "../api";
 import { Badge, Empty, extractList, Section, useAsync } from "../components/common";
 
 interface Agent {
@@ -12,13 +13,26 @@ interface Agent {
   tier?: string;
   rig?: string | null;
 }
-interface Adapter { name?: string; display_name?: string; probe?: { status?: string; install_hint?: string | null } }
+interface Adapter {
+  name?: string;
+  display_name?: string;
+  probe?: { status?: string; detail?: string; install_hint?: string | null };
+}
+
+// Friendly labels for the rich readiness statuses.
+const STATUS_LABEL: Record<string, string> = {
+  available: "available",
+  missing_binary: "not installed",
+  not_authenticated: "needs login",
+  unsupported_version: "version issue",
+  interactive_only: "needs a TTY",
+  probe_failed: "probe failed",
+};
 
 export function Agents() {
-  // The Operative list is /v1/agents/access ({agents:[…]}); /spine/roster
-  // is only a count summary. Adapters tell each Operative's Rig + whether
-  // it is actually installed.
-  const { data, loading, error } = useAsync(async () => {
+  const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
+
+  const { data, loading, error, reload } = useAsync(async () => {
     const [agentsRes, adapters] = await Promise.all([
       tryGet<unknown>("/v1/agents/access", {}),
       tryGet<Adapter[]>("/v1/adapters", []),
@@ -31,16 +45,40 @@ export function Agents() {
 
   const agents = data?.agents ?? [];
   const adapters = data?.adapters ?? [];
-  const availability = new Map(adapters.map((a) => [a.name, a.probe?.status === "available"]));
+  const byName = new Map(adapters.map((a) => [a.name ?? "", a]));
   const availCount = adapters.filter((a) => a.probe?.status === "available").length;
 
-  function rigCell(rig?: string | null) {
-    if (!rig) return <span className="muted">— (no adapter)</span>;
-    const ok = availability.get(rig);
+  async function setRig(agentId: string, rig: string) {
+    const adapter = byName.get(rig);
+    const avail = adapter?.probe?.status === "available";
+    if (rig && !avail) {
+      const label = STATUS_LABEL[adapter?.probe?.status ?? ""] ?? "unavailable";
+      if (!confirm(`Adapter "${rig}" is ${label}. Assign it anyway? Runs will be refused until it is ready.`)) {
+        reload();
+        return;
+      }
+    }
+    setBanner(null);
+    try {
+      await api.patch(`/v1/agents/${encodeURIComponent(agentId)}`, { rig });
+      setBanner({ kind: "ok", msg: `Adapter set to ${rig || "(none)"}.` });
+      reload();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Update failed" });
+    }
+  }
+
+  function rigStatusCell(rig?: string | null) {
+    if (!rig) return <span className="muted">no adapter</span>;
+    const a = byName.get(rig);
+    const status = a?.probe?.status ?? "unknown";
+    const ok = status === "available";
     return (
       <span>
-        <span className="mono">{rig}</span>{" "}
-        <span className={"badge " + (ok ? "done" : "blocked")}>{ok ? "available" : "missing"}</span>
+        <span className={"badge " + (ok ? "done" : "blocked")}>{STATUS_LABEL[status] ?? status}</span>
+        {!ok && a?.probe?.install_hint && (
+          <div className="muted" style={{ fontSize: 11, marginTop: 3 }}>{a.probe.install_hint}</div>
+        )}
       </span>
     );
   }
@@ -48,10 +86,11 @@ export function Agents() {
   return (
     <Section title="Crew">
       {error && <div className="banner err">{error}</div>}
+      {banner && <div className={"banner " + banner.kind}>{banner.msg}</div>}
       <div className={"banner " + (availCount ? "ok" : "info")}>
         {availCount
-          ? `${availCount}/${adapters.length} agent adapter(s) available — Operatives with an available Rig can execute Briefs.`
-          : "No agent adapters installed. Install a coding-agent CLI (Claude, Codex) so Operatives can execute work — see Settings."}
+          ? `${availCount}/${adapters.length} agent adapter(s) available — an Operative with an available adapter can execute Briefs.`
+          : "No agent adapters available. Install + log in to a coding-agent CLI (Claude, Codex) — see Settings."}
       </div>
       <div className="card">
         {loading ? (
@@ -66,6 +105,7 @@ export function Agents() {
                 <th>Role</th>
                 <th>Status</th>
                 <th>Adapter (Rig)</th>
+                <th>Readiness</th>
                 <th>ID</th>
               </tr>
             </thead>
@@ -77,7 +117,25 @@ export function Agents() {
                     <td><strong>{a.name ?? a.display_name ?? id.slice(0, 10) ?? "operative"}</strong></td>
                     <td className="dim">{a.role ?? a.tier ?? "—"}</td>
                     <td><Badge status={a.status ?? "active"} /></td>
-                    <td>{rigCell(a.rig)}</td>
+                    <td>
+                      <select
+                        className="select"
+                        style={{ fontSize: 12, padding: "3px 6px", minWidth: 120 }}
+                        value={a.rig ?? ""}
+                        onChange={(e) => setRig(id, e.target.value)}
+                      >
+                        <option value="">(none)</option>
+                        {adapters.map((ad) => {
+                          const av = ad.probe?.status === "available";
+                          return (
+                            <option key={ad.name} value={ad.name}>
+                              {ad.name}{av ? "" : " ⚠"}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    </td>
+                    <td>{rigStatusCell(a.rig)}</td>
                     <td className="mono">{id.slice(0, 12)}</td>
                   </tr>
                 );

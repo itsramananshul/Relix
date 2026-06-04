@@ -11,6 +11,15 @@ interface Adapter {
   probe?: { status?: string; detail?: string; install_hint?: string | null };
 }
 
+const STATUS_LABEL: Record<string, string> = {
+  available: "available",
+  missing_binary: "not installed",
+  not_authenticated: "needs login",
+  unsupported_version: "version issue",
+  interactive_only: "needs a TTY",
+  probe_failed: "probe failed",
+};
+
 function extractProviders(v: unknown): Provider[] {
   if (Array.isArray(v)) return v as Provider[];
   if (v && typeof v === "object") {
@@ -22,7 +31,7 @@ function extractProviders(v: unknown): Provider[] {
 
 export function Settings() {
   const { status, logout } = useAuth();
-  const { data, loading } = useAsync(async () => {
+  const { data, loading, reload } = useAsync(async () => {
     const [info, providers, adapters] = await Promise.all([
       tryGet<Record<string, unknown>>("/v1/info", {}),
       tryGet<unknown>("/v1/config/providers", {}),
@@ -108,13 +117,20 @@ export function Settings() {
       </div>
 
       <div className="card" style={{ gridColumn: "1 / -1" }}>
-        <h3>Agent adapters (Rigs)</h3>
-        <p className="muted" style={{ marginTop: -6, marginBottom: 12 }}>
-          Local coding-agent backends an Operative can run work through. Availability is probed live
-          on the coordinator — install + log in to the CLI to make it available.
+        <div className="row" style={{ marginBottom: 8 }}>
+          <h3 style={{ margin: 0 }}>Agent adapters (Rigs)</h3>
+          <div className="spacer" style={{ flex: 1 }} />
+          <button className="btn ghost sm" onClick={reload} disabled={loading}>
+            {loading ? "Probing…" : "Refresh probes"}
+          </button>
+        </div>
+        <p className="muted" style={{ marginTop: -2, marginBottom: 12 }}>
+          Local coding-agent backends an Operative can run work through. Readiness is probed live on
+          the coordinator (binary + a noninteractive `--version` check) — install + log in to the CLI
+          to make it available.
         </p>
         {loading ? (
-          <div className="loading">Loading adapters…</div>
+          <div className="loading">Probing adapters…</div>
         ) : adapters.length === 0 ? (
           <Empty>No adapters registered.</Empty>
         ) : (
@@ -124,12 +140,14 @@ export function Settings() {
                 <th>Adapter</th>
                 <th>Billing</th>
                 <th>Governance</th>
-                <th>Availability</th>
+                <th>Readiness</th>
+                <th>Detail</th>
               </tr>
             </thead>
             <tbody>
               {adapters.map((a, i) => {
-                const avail = a.probe?.status === "available";
+                const st = a.probe?.status ?? "unknown";
+                const avail = st === "available";
                 return (
                   <tr key={a.name ?? i}>
                     <td><strong>{a.display_name ?? a.name}</strong> <span className="mono">{a.name}</span></td>
@@ -141,12 +159,13 @@ export function Settings() {
                     <td className="muted">{a.governance ?? "—"}</td>
                     <td>
                       <span className={"badge " + (avail ? "done" : "blocked")}>
-                        {avail ? "available" : "missing"}
+                        {STATUS_LABEL[st] ?? st}
                       </span>
+                    </td>
+                    <td className="muted" style={{ fontSize: 12, maxWidth: 320 }}>
+                      {a.probe?.detail}
                       {!avail && a.probe?.install_hint && (
-                        <div className="muted" style={{ fontSize: 12, marginTop: 3 }}>
-                          {a.probe.install_hint}
-                        </div>
+                        <div style={{ marginTop: 3, color: "var(--warn)" }}>→ {a.probe.install_hint}</div>
                       )}
                     </td>
                   </tr>
