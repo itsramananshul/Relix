@@ -1016,6 +1016,26 @@ pub fn preflight_run(
             bytes: workspace_bytes,
         },
     );
+    // Register the run as cancellable + open its transcript with the
+    // lifecycle events an operator needs to follow the run.
+    crate::rig::CancelRegistry::global().register(&run_id);
+    let _ = store.append_run_event(
+        &run_id,
+        "accepted",
+        "relix",
+        &format!("run accepted on adapter `{rig_name}`"),
+        None,
+        false,
+    );
+    let ws_msg = match &workspace {
+        Some(ws) => format!(
+            "workspace ready ({}): {}",
+            workspace_context.as_deref().unwrap_or("empty"),
+            ws
+        ),
+        None => "running in the coordinator working directory (inherit mode)".to_string(),
+    };
+    let _ = store.append_run_event(&run_id, "workspace_prepared", "relix", &ws_msg, None, false);
     let _ = store.append_event(
         &card.task_id,
         "brief.run_started",
@@ -1037,6 +1057,7 @@ pub fn preflight_run(
         })
         .unwrap_or_default();
     let mut req = RigRunRequest::new(&card.task_id, &assignee, String::new(), prompt)
+        .with_run_id(&run_id)
         .with_bridge_token(&token)
         .with_context(brief_context(&card));
     // Pin the child's working directory to the scoped workspace.
@@ -1080,57 +1101,107 @@ pub fn execute_ready(
         req,
         token,
     } = ready;
-    let outcome = rig.run(&req);
+    let _ = store.append_run_event(
+        &run_id,
+        "process_started",
+        "relix",
+        &format!("executing on adapter `{rig_name}`"),
+        None,
+        false,
+    );
+    // Run the Rig AND collect its transcript events (parsed adapter
+    // output). The blocking call here is what async dispatch moves onto a
+    // background thread; the wait loop polls the cancel flag.
+    let run = rig.run_transcript(&req);
+    let outcome = run.outcome;
+    // Persist the parsed adapter events (already redacted + bounded).
+    for ev in &run.events {
+        let _ = store.append_run_event(
+            &run_id,
+            &ev.kind,
+            &ev.source,
+            &ev.message,
+            ev.payload_json.as_deref(),
+            true,
+        );
+    }
     if let Some(bt) = bridge_tokens
         && !token.is_empty()
     {
         bt.revoke(&token);
     }
-    let (status, summary) = match &outcome {
-        RigOutcome::Done { summary } => {
-            // Done → in_review (best-effort; a missing reviewer parks it).
-            if store.set_board_status(&brief_id, "in_review").is_err() {
-                let _ = store.set_board_status(&brief_id, "blocked");
+    // A cancel request that landed mid-run wins over the raw outcome: the
+    // process was killed, so report the run `cancelled`, not `failed`.
+    let was_cancelled = crate::rig::CancelRegistry::global().is_cancelled(&run_id);
+    crate::rig::CancelRegistry::global().clear(&run_id);
+    let _ = store.append_run_event(&run_id, "process_exited", "relix", "process exited", None, false);
+
+    let (status, summary) = if was_cancelled {
+        let _ = store.set_board_status(&brief_id, "blocked");
+        let _ = store.append_event(
+            &brief_id,
+            "brief.dispatch_failed",
+            &format!("[{rig_name}] cancelled by operator"),
+        );
+        (
+            "cancelled",
+            "run cancelled by operator (process killed)".to_string(),
+        )
+    } else {
+        match &outcome {
+            RigOutcome::Done { summary } => {
+                // Done → in_review (best-effort; a missing reviewer parks it).
+                if store.set_board_status(&brief_id, "in_review").is_err() {
+                    let _ = store.set_board_status(&brief_id, "blocked");
+                }
+                let _ = store.append_event(
+                    &brief_id,
+                    "brief.shift_done",
+                    &format!("[{rig_name}] {summary}"),
+                );
+                ("done", summary.clone())
             }
-            let _ = store.append_event(
-                &brief_id,
-                "brief.shift_done",
-                &format!("[{rig_name}] {summary}"),
-            );
-            ("done", summary.clone())
-        }
-        RigOutcome::Failed {
-            retryable: false,
-            reason,
-        } => {
-            let _ = store.set_board_status(&brief_id, "blocked");
-            let _ = store.append_event(
-                &brief_id,
-                "brief.dispatch_failed",
-                &format!("[{rig_name}] {reason}"),
-            );
-            ("failed", reason.clone())
-        }
-        RigOutcome::Failed {
-            retryable: true,
-            reason,
-        } => {
-            let _ = store.append_event(
-                &brief_id,
-                "brief.dispatch_failed",
-                &format!("[{rig_name}] {reason}"),
-            );
-            ("failed", reason.clone())
-        }
-        RigOutcome::Continue { note } => {
-            let _ = store.append_event(
-                &brief_id,
-                "brief.continued",
-                &format!("[{rig_name}] {note}"),
-            );
-            ("continued", note.clone())
+            RigOutcome::Failed {
+                retryable: false,
+                reason,
+            } => {
+                let _ = store.set_board_status(&brief_id, "blocked");
+                let _ = store.append_event(
+                    &brief_id,
+                    "brief.dispatch_failed",
+                    &format!("[{rig_name}] {reason}"),
+                );
+                ("failed", reason.clone())
+            }
+            RigOutcome::Failed {
+                retryable: true,
+                reason,
+            } => {
+                let _ = store.append_event(
+                    &brief_id,
+                    "brief.dispatch_failed",
+                    &format!("[{rig_name}] {reason}"),
+                );
+                ("failed", reason.clone())
+            }
+            RigOutcome::Continue { note } => {
+                let _ = store.append_event(
+                    &brief_id,
+                    "brief.continued",
+                    &format!("[{rig_name}] {note}"),
+                );
+                ("continued", note.clone())
+            }
         }
     };
+    // Terminal lifecycle transcript event.
+    let term_kind = match status {
+        "done" => "result",
+        "cancelled" => "cancelled",
+        "continued" => "continued",
+        _ => "failed",
+    };
+    let _ = store.append_run_event(&run_id, term_kind, "relix", &summary, None, true);
     let _ = store.record_run_finish(&run_id, status, &summary);
     let _ = store.release_claim(&brief_id, &assignee);
     RunReport {
@@ -2231,5 +2302,81 @@ mod tests {
         let runs = s.runs_for_brief(&id, 5).unwrap();
         assert_eq!(runs.len(), 2);
         assert!(runs.iter().all(|r| r.workspace.is_some()));
+    }
+
+    // ── Run transcript + cancellation ───────────────────────────
+
+    #[test]
+    fn run_records_a_lifecycle_transcript() {
+        let (s, _tmp) = store_ws();
+        let id = ready_brief(&s, "transcript", "agt_a");
+        let report =
+            run_brief_now(&s, &echo_registry(), None, 300, &id, Some("echo"), "work".into()).unwrap();
+        let run_id = report.run_id.unwrap();
+        let kinds: Vec<String> = s
+            .list_run_events(&run_id, 100)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        // The lifecycle is present + chronological (accepted first).
+        assert_eq!(kinds.first().map(String::as_str), Some("accepted"));
+        for k in ["accepted", "workspace_prepared", "process_started", "process_exited", "result"] {
+            assert!(kinds.contains(&k.to_string()), "missing {k}: {kinds:?}");
+        }
+        // get_run returns the same run.
+        assert_eq!(s.get_run(&run_id).unwrap().unwrap().run_id, run_id);
+    }
+
+    #[test]
+    fn append_run_event_caps_and_records_truncated() {
+        let s = store();
+        let cap = crate::nodes::coordinator::MAX_RUN_EVENTS;
+        for i in 0..(cap + 5) {
+            s.append_run_event("run_t", "tick", "relix", &format!("ev {i}"), None, false)
+                .unwrap();
+        }
+        let events = s.list_run_events("run_t", cap + 50).unwrap();
+        // cap real events + exactly one truncation marker.
+        assert_eq!(events.len() as i64, cap + 1);
+        assert_eq!(events.last().unwrap().kind, "truncated");
+        // A second overflow does NOT add another marker.
+        s.append_run_event("run_t", "tick", "relix", "more", None, false).unwrap();
+        let again = s.list_run_events("run_t", cap + 50).unwrap();
+        assert_eq!(again.len() as i64, cap + 1);
+    }
+
+    #[test]
+    fn cancellation_marks_the_run_cancelled() {
+        // A ProcessRig polls the cancel flag; setting it before execution
+        // makes the run report `cancelled` (process killed), not `failed`.
+        let (s, _tmp) = store_ws();
+        let id = ready_brief(&s, "stoppable", "agt_a");
+        let (prog, args) = if cfg!(windows) {
+            ("cmd".to_string(), vec!["/C".to_string(), "echo".to_string(), "hi".to_string()])
+        } else {
+            ("sh".to_string(), vec!["-c".to_string(), "echo hi".to_string()])
+        };
+        let mut reg = crate::rig::RigRegistry::new();
+        reg.register(std::sync::Arc::new(crate::rig::ProcessRig::new("p", prog, args)));
+        reg.set_default(Some("p".to_string()));
+
+        let ready = match preflight_run(&s, &reg, None, 300, &id, None, "x".into()).unwrap() {
+            Preflight::Ready(r) => r,
+            Preflight::Refused(r) => panic!("expected ready, got {r:?}"),
+        };
+        let run_id = ready.run_id.clone();
+        // Operator cancels before/while it runs.
+        assert!(crate::rig::CancelRegistry::global().request(&run_id));
+        let report = execute_ready(&s, None, ready);
+        assert_eq!(report.status, "cancelled", "got: {report:?}");
+        assert_eq!(s.get_run(&run_id).unwrap().unwrap().status, "cancelled");
+        assert!(
+            s.list_run_events(&run_id, 100)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "cancelled"),
+            "a cancelled transcript event is recorded"
+        );
     }
 }

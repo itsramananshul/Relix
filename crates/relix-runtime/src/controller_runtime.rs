@@ -9127,6 +9127,146 @@ fn register_node_type_handlers(
                 )),
             );
         }
+        {
+            // `run.get` — one run record by id (`GET /v1/runs/:id`).
+            let st = store.clone();
+            bridge.register(
+                "run.get",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            let run_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
+                            let internal = |c: String| {
+                                crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                        cause: c,
+                                        retry_hint: 1,
+                                        retry_after: None,
+                                    },
+                                )
+                            };
+                            match st.get_run(&run_id) {
+                                Ok(Some(r)) => match serde_json::to_vec(&r) {
+                                    Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                    Err(e) => internal(format!("run.get encode: {e}")),
+                                },
+                                Ok(None) => crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                        cause: format!("run not found: {run_id}"),
+                                        retry_hint: 0,
+                                        retry_after: None,
+                                    },
+                                ),
+                                Err(e) => internal(format!("run.get: {e}")),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
+        {
+            // `run.events` — a run's transcript, chronological (`GET
+            // /v1/runs/:id/events`). Bounded + already redacted.
+            let st = store.clone();
+            bridge.register(
+                "run.events",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            let run_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
+                            match st.list_run_events(&run_id, 500) {
+                                Ok(events) => match serde_json::to_vec(&events) {
+                                    Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                    Err(e) => crate::dispatch::HandlerOutcome::Err(
+                                        relix_core::types::ErrorEnvelope {
+                                            kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                            cause: format!("run.events encode: {e}"),
+                                            retry_hint: 1,
+                                            retry_after: None,
+                                        },
+                                    ),
+                                },
+                                Err(e) => crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                        cause: format!("run.events: {e}"),
+                                        retry_hint: 1,
+                                        retry_after: None,
+                                    },
+                                ),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
+        {
+            // `run.cancel` — request cancellation of an in-flight run. Flips
+            // the run's [`CancelRegistry`] flag; the `ProcessRig` wait loop
+            // polls it and kills the child, then `execute_ready` records the
+            // run `cancelled`. Truthful: `active` reflects whether a live
+            // process was actually signalled (vs already-finished).
+            let st = store.clone();
+            bridge.register(
+                "run.cancel",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            let run_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
+                            let record = st.get_run(&run_id).ok().flatten();
+                            let already_terminal = record
+                                .as_ref()
+                                .map(|r| r.status != "running")
+                                .unwrap_or(false);
+                            let active = crate::rig::CancelRegistry::global().request(&run_id);
+                            let _ = st.append_run_event(
+                                &run_id,
+                                "cancel_requested",
+                                "relix",
+                                if active {
+                                    "operator requested cancellation — killing the running process"
+                                } else if already_terminal {
+                                    "cancel requested but the run had already finished"
+                                } else {
+                                    "cancel requested but no live process is registered for this run"
+                                },
+                                None,
+                                false,
+                            );
+                            let body = serde_json::json!({
+                                "run_id": run_id,
+                                "requested": true,
+                                "active": active,
+                                "already_terminal": already_terminal,
+                                "note": if active {
+                                    "cancellation signalled; the run will report `cancelled`"
+                                } else if already_terminal {
+                                    "run already finished — nothing to cancel"
+                                } else {
+                                    "no live process registered (run may be on another node, or already done)"
+                                },
+                            });
+                            match serde_json::to_vec(&body) {
+                                Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                Err(e) => crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                        cause: format!("run.cancel encode: {e}"),
+                                        retry_hint: 1,
+                                        retry_after: None,
+                                    },
+                                ),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
         // PHASE 3 (heartbeat loop): the live dispatch tick. Opt-in
         // via RELIX_HEARTBEAT_ENABLED (off by default so it never
         // surprises an operator). When on, a timer polls the ready

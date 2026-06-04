@@ -2564,6 +2564,101 @@ impl TaskStore {
         Ok(out)
     }
 
+    /// One run record by id (the `GET /v1/runs/:id` detail).
+    pub fn get_run(&self, run_id: &str) -> Result<Option<RunRecord>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary,
+                        workspace, workspace_context, workspace_files, workspace_bytes
+                 FROM brief_runs WHERE run_id = ?1",
+                params![run_id],
+                RunRecord::from_row,
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        Ok(row)
+    }
+
+    /// Append a transcript event for a run, secret-redaction + length
+    /// bounding applied by the caller. Enforces the per-run event cap:
+    /// once `MAX_RUN_EVENTS` real events exist, a single `truncated`
+    /// marker is recorded and further events are dropped (idempotent — a
+    /// second overflow does not add another marker). Best-effort: a write
+    /// failure never fails the run.
+    pub fn append_run_event(
+        &self,
+        run_id: &str,
+        kind: &str,
+        source: &str,
+        message: &str,
+        payload_json: Option<&str>,
+        redacted: bool,
+    ) -> Result<(), CoordinatorError> {
+        if run_id.trim().is_empty() {
+            return Ok(());
+        }
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_events WHERE run_id = ?1",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if count >= MAX_RUN_EVENTS {
+            // Record exactly one truncation marker, then drop the rest.
+            if count == MAX_RUN_EVENTS {
+                let _ = conn.execute(
+                    "INSERT INTO run_events (run_id, ts, kind, source, message, redacted)
+                     VALUES (?1, ?2, 'truncated', 'relix', ?3, 0)",
+                    params![
+                        run_id,
+                        now,
+                        format!("transcript capped at {MAX_RUN_EVENTS} events — further events dropped")
+                    ],
+                );
+            }
+            return Ok(());
+        }
+        let msg = clamp_bytes(message, MAX_RUN_EVENT_FIELD_BYTES);
+        let payload = payload_json.map(|p| clamp_bytes(p, MAX_RUN_EVENT_FIELD_BYTES));
+        conn.execute(
+            "INSERT INTO run_events (run_id, ts, kind, source, message, payload_json, redacted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![run_id, now, kind, source, msg, payload, i64::from(redacted)],
+        )
+        .map_err(CoordinatorError::Db)?;
+        Ok(())
+    }
+
+    /// A run's transcript, oldest event first (chronological). Bounded.
+    pub fn list_run_events(
+        &self,
+        run_id: &str,
+        limit: i64,
+    ) -> Result<Vec<RunEvent>, CoordinatorError> {
+        let limit = limit.clamp(1, MAX_RUN_EVENTS + 1);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_id, run_id, ts, kind, source, message, payload_json, redacted
+                 FROM run_events WHERE run_id = ?1
+                 ORDER BY event_id ASC
+                 LIMIT ?2",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![run_id, limit], RunEvent::from_row)
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(CoordinatorError::Db)?);
+        }
+        Ok(out)
+    }
+
     /// PHASE 3 (Claim): **operator force-release** — clear a Brief's
     /// Claim regardless of who holds it (relix-execution-and-issue-
     /// design §1.4). For a stuck/abandoned lock an operator can't
@@ -7164,6 +7259,44 @@ pub struct RunRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_bytes: Option<i64>,
 }
+
+/// One transcript event for a run (`run_events`) — the focused
+/// "what happened" record the dashboard renders chronologically.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RunEvent {
+    pub event_id: i64,
+    pub run_id: String,
+    pub ts: i64,
+    pub kind: String,
+    pub source: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_json: Option<String>,
+    pub redacted: bool,
+}
+
+impl RunEvent {
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            event_id: r.get(0)?,
+            run_id: r.get(1)?,
+            ts: r.get(2)?,
+            kind: r.get(3)?,
+            source: r.get(4)?,
+            message: r.get(5)?,
+            payload_json: r.get(6)?,
+            redacted: r.get::<_, i64>(7)? != 0,
+        })
+    }
+}
+
+/// Cap on transcript events per run. Beyond this a single `truncated`
+/// event is recorded and further events are dropped — a chatty agent
+/// can't grow the ledger unbounded.
+pub const MAX_RUN_EVENTS: i64 = 400;
+/// Cap on a single event's message / payload bytes at the store layer
+/// (belt-and-suspenders over the Rig's own bounding).
+pub const MAX_RUN_EVENT_FIELD_BYTES: usize = 8 * 1024;
 
 /// The workspace fields stamped on a run record at start. A small struct
 /// so the `record_run_start` arg list stays readable.
@@ -11781,6 +11914,24 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             ON brief_runs(brief_id, started_at);
         CREATE INDEX IF NOT EXISTS brief_runs_recent
             ON brief_runs(started_at);
+        -- Per-run transcript (the "what happened" record the dashboard
+        -- shows when an operator clicks a run). Focused + capped: lifecycle
+        -- events (relix), plus parsed adapter events (claude/codex/echo).
+        -- `message`/`payload_json` arrive already secret-redacted +
+        -- length-bounded; the per-run event-count cap is enforced on write
+        -- and a single `truncated` event is recorded when it's hit.
+        CREATE TABLE IF NOT EXISTS run_events (
+            event_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id       TEXT NOT NULL,
+            ts           INTEGER NOT NULL,
+            kind         TEXT NOT NULL,
+            source       TEXT NOT NULL,
+            message      TEXT NOT NULL DEFAULT '',
+            payload_json TEXT,
+            redacted     INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS run_events_by_run
+            ON run_events(run_id, event_id);
         "#,
     )
     .map_err(CoordinatorError::Db)?;
@@ -12157,6 +12308,19 @@ fn unix_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Truncate a string to at most `max` bytes on a char boundary (a final
+/// store-layer guard on transcript field sizes).
+fn clamp_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 // ──────────────────────────── Typed event emit (S2) ────────────────────────

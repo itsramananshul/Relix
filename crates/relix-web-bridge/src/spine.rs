@@ -769,6 +769,32 @@ pub async fn brief_runs(
     json_passthrough(call_peer(&state, "brief.runs", id.as_bytes()).await?)
 }
 
+/// `GET /v1/runs/:run_id` — one run record (detail).
+pub async fn run_get(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "run.get", run_id.as_bytes()).await?)
+}
+
+/// `GET /v1/runs/:run_id/events` — a run's transcript, chronological.
+pub async fn run_events(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "run.events", run_id.as_bytes()).await?)
+}
+
+/// `POST /v1/runs/:run_id/cancel` — request cancellation of an in-flight
+/// run (kills the live process if still active; truthful about whether it
+/// was active).
+pub async fn run_cancel(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "run.cancel", run_id.as_bytes()).await?)
+}
+
 /// `GET /v1/spine/company` — first-run status: whether the Guild has a
 /// Founder yet, the Founder profile, and the Operative count. The
 /// dashboard reads this to show the "Initialize Company" first-run state.

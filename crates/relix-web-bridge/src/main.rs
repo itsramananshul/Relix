@@ -560,6 +560,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Execution-run ledger: recent runs (Active Runs feed) + a
         // Brief's run/Shift history.
         .route("/v1/runs", get(spine::runs_recent))
+        .route("/v1/runs/:run_id", get(spine::run_get))
+        .route("/v1/runs/:run_id/events", get(spine::run_events))
+        .route("/v1/runs/:run_id/cancel", post(spine::run_cancel))
         .route("/v1/spine/briefs/:id/runs", get(spine::brief_runs))
         // First-run company bootstrap: status read, Crew roster, and the
         // owner-gated "Initialize Company" (create the Founder) action.

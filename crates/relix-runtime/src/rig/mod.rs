@@ -31,6 +31,10 @@ pub mod bridge;
 /// agent backend when it wakes an Operative.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RigRunRequest {
+    /// The durable run id (`brief_runs.run_id`). Used to poll the
+    /// [`CancelRegistry`] so an operator can stop an in-flight run, and to
+    /// key the run's transcript. Empty for ad-hoc / timer runs.
+    pub run_id: String,
     /// The Brief (coordinator task id) being worked.
     pub brief_id: String,
     /// The Operative (agent id) assigned to it.
@@ -62,6 +66,7 @@ impl RigRunRequest {
         prompt: impl Into<String>,
     ) -> Self {
         Self {
+            run_id: String::new(),
             brief_id: brief_id.into(),
             agent_id: agent_id.into(),
             tenant_id: tenant_id.into(),
@@ -70,6 +75,12 @@ impl RigRunRequest {
             bridge_token: String::new(),
             working_dir: None,
         }
+    }
+
+    /// Set the durable run id (builder style) — enables cancellation.
+    pub fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
+        self.run_id = run_id.into();
+        self
     }
 
     /// Attach opaque context (builder style).
@@ -106,6 +117,113 @@ pub enum RigOutcome {
     /// transient failure (retry next tick) from a hard one (escalate
     /// to the Desk).
     Failed { reason: String, retryable: bool },
+}
+
+/// One transcript event from a run — the focused "what happened" record
+/// the dashboard shows when an operator clicks a run. Already
+/// secret-redacted + length-bounded by the Rig before it reaches the
+/// store; the store applies the per-run event-count cap.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RigEvent {
+    /// e.g. `assistant_message`, `tool_use`, `command`, `file_change`,
+    /// `permission_denied`, `error`, `result`, `usage`, `output`.
+    pub kind: String,
+    /// Which side produced it: `claude` / `codex` / `echo` (the Rig).
+    pub source: String,
+    /// Short human-readable line (bounded).
+    pub message: String,
+    /// Optional compact structured detail (bounded JSON). Never raw JSONL.
+    pub payload_json: Option<String>,
+}
+
+impl RigEvent {
+    pub fn new(
+        kind: impl Into<String>,
+        source: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            source: source.into(),
+            message: message.into(),
+            payload_json: None,
+        }
+    }
+    pub fn with_payload(mut self, payload: impl Into<String>) -> Self {
+        self.payload_json = Some(payload.into());
+        self
+    }
+}
+
+/// A run's outcome PLUS its transcript events — returned by
+/// [`Rig::run_transcript`].
+#[derive(Clone, Debug)]
+pub struct RigRun {
+    pub outcome: RigOutcome,
+    pub events: Vec<RigEvent>,
+}
+
+/// Process-global registry of in-flight, cancellable runs. A run
+/// registers its `run_id` before spawning; a `ProcessRig` polls the flag
+/// (lock-free `AtomicBool`) in its wait loop and kills the child when it
+/// flips; the cancel endpoint flips it. Keyed by `run_id` so no
+/// non-`Eq` handle has to live inside [`RigRunRequest`].
+#[derive(Default)]
+pub struct CancelRegistry {
+    map: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+}
+
+impl CancelRegistry {
+    pub fn global() -> &'static CancelRegistry {
+        static REG: std::sync::OnceLock<CancelRegistry> = std::sync::OnceLock::new();
+        REG.get_or_init(CancelRegistry::default)
+    }
+
+    /// Register a run as cancellable; returns its (cleared) flag handle.
+    pub fn register(&self, run_id: &str) {
+        if run_id.is_empty() {
+            return;
+        }
+        if let Ok(mut m) = self.map.lock() {
+            m.insert(
+                run_id.to_string(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+        }
+    }
+
+    /// The lock-free flag for `run_id`, if it is a live cancellable run.
+    pub fn handle(&self, run_id: &str) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.map.lock().ok()?.get(run_id).cloned()
+    }
+
+    /// Request cancellation — flips the flag. Returns true when the run was
+    /// live (registered); false when it is unknown / already finished.
+    pub fn request(&self, run_id: &str) -> bool {
+        match self.map.lock().ok().and_then(|m| m.get(run_id).cloned()) {
+            Some(flag) => {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether cancellation was requested for `run_id`.
+    pub fn is_cancelled(&self, run_id: &str) -> bool {
+        self.map
+            .lock()
+            .ok()
+            .and_then(|m| m.get(run_id).map(|f| f.load(std::sync::atomic::Ordering::SeqCst)))
+            .unwrap_or(false)
+    }
+
+    /// Drop a finished run's entry.
+    pub fn clear(&self, run_id: &str) {
+        if let Ok(mut m) = self.map.lock() {
+            m.remove(run_id);
+        }
+    }
 }
 
 /// How much Relix can govern *inside* a Rig. Rich Rigs expose every
@@ -492,6 +610,17 @@ pub trait Rig: Send + Sync {
     /// and block the worker thread (the dispatcher calls this off
     /// the async runtime).
     fn run(&self, req: &RigRunRequest) -> RigOutcome;
+
+    /// Run one Brief AND return its transcript events (the "what
+    /// happened" record). The default wraps [`Rig::run`] with no events
+    /// (raw adapters rely on the coordinator's lifecycle events);
+    /// `ProcessRig` overrides it to parse adapter JSONL into events.
+    fn run_transcript(&self, req: &RigRunRequest) -> RigRun {
+        RigRun {
+            outcome: self.run(req),
+            events: Vec::new(),
+        }
+    }
 }
 
 /// A registry of Rigs, keyed by [`Rig::name`]. Built-ins are
@@ -802,6 +931,195 @@ pub fn parse_codex_jsonl(stdout: &str) -> Option<CodexRunResult> {
     }
 }
 
+/// Max bytes for a single transcript-event message / payload before it is
+/// truncated. Keeps the per-run transcript bounded — a chatty agent can't
+/// flood the ledger.
+pub const MAX_EVENT_MESSAGE_BYTES: usize = 2048;
+pub const MAX_EVENT_PAYLOAD_BYTES: usize = 4096;
+
+/// Truncate a string to `max` bytes on a char boundary, appending a clear
+/// marker when it was cut.
+fn bounded(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} …[truncated]", &s[..end])
+}
+
+fn bounded_line(s: &str) -> String {
+    bounded(s.trim(), MAX_EVENT_MESSAGE_BYTES)
+}
+
+/// Extract focused transcript events from Claude `stream-json` JSONL.
+/// Captures assistant text, tool-use, the final result, permission
+/// denials, usage/cost, and errors — never the raw JSONL, and every text
+/// field is secret-redacted + length-bounded.
+pub fn claude_events(stdout: &str, bridge_token: &str) -> Vec<RigEvent> {
+    let red = |s: &str| bounded_line(&redact_secrets(s, bridge_token));
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("assistant") => {
+                if let Some(content) = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
+                    for block in content {
+                        match block.get("type").and_then(|t| t.as_str()) {
+                            Some("text") => {
+                                if let Some(t) = block.get("text").and_then(|t| t.as_str())
+                                    && !t.trim().is_empty()
+                                {
+                                    out.push(RigEvent::new("assistant_message", "claude", red(t)));
+                                }
+                            }
+                            Some("tool_use") => {
+                                let name = block
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("tool");
+                                let input = block
+                                    .get("input")
+                                    .map(|i| bounded(&i.to_string(), MAX_EVENT_PAYLOAD_BYTES));
+                                let mut ev = RigEvent::new(
+                                    "tool_use",
+                                    "claude",
+                                    format!("tool: {name}"),
+                                );
+                                if let Some(p) = input {
+                                    ev = ev.with_payload(redact_secrets(&p, bridge_token));
+                                }
+                                out.push(ev);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Some("result") => {
+                if let Some(t) = v.get("result").and_then(|r| r.as_str())
+                    && !t.trim().is_empty()
+                {
+                    out.push(RigEvent::new("result", "claude", red(t)));
+                }
+                let denials = v
+                    .get("permission_denials")
+                    .and_then(|d| d.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if denials > 0 {
+                    out.push(RigEvent::new(
+                        "permission_denied",
+                        "claude",
+                        format!("{denials} tool permission(s) denied (noninteractive run)"),
+                    ));
+                }
+                if let Some(cost) = v.get("total_cost_usd").and_then(|c| c.as_f64()) {
+                    out.push(RigEvent::new(
+                        "usage",
+                        "claude",
+                        format!("cost ${cost:.4}"),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Extract focused transcript events from Codex `exec --json` JSONL:
+/// thread/turn lifecycle, agent messages, command + file-change items,
+/// and errors. Never the raw JSONL; text is redacted + bounded.
+pub fn codex_events(stdout: &str, bridge_token: &str) -> Vec<RigEvent> {
+    let red = |s: &str| bounded_line(&redact_secrets(s, bridge_token));
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(ty) = v.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        match ty {
+            "thread.started" => out.push(RigEvent::new("thread_started", "codex", "thread started")),
+            "turn.started" => out.push(RigEvent::new("turn_started", "codex", "turn started")),
+            "turn.completed" => {
+                let msg = v
+                    .get("usage")
+                    .map(|u| format!("turn completed ({u})"))
+                    .unwrap_or_else(|| "turn completed".to_string());
+                out.push(RigEvent::new("turn_completed", "codex", bounded_line(&msg)));
+            }
+            "turn.failed" | "error" | "thread.error" => {
+                let m = v
+                    .get("message")
+                    .or_else(|| v.get("error").and_then(|e| e.get("message")))
+                    .or_else(|| v.get("error"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("codex error");
+                out.push(RigEvent::new("error", "codex", red(m)));
+            }
+            "item.completed" | "item.started" => {
+                let item = v.get("item");
+                let item_ty = item
+                    .and_then(|i| i.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                match item_ty {
+                    "agent_message" => {
+                        if let Some(t) = item.and_then(|i| i.get("text")).and_then(|t| t.as_str())
+                            && !t.trim().is_empty()
+                        {
+                            out.push(RigEvent::new("assistant_message", "codex", red(t)));
+                        }
+                    }
+                    "command_execution" => {
+                        let cmd = item
+                            .and_then(|i| i.get("command"))
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("command");
+                        out.push(RigEvent::new("command", "codex", red(cmd)));
+                    }
+                    "file_change" => {
+                        let path = item
+                            .and_then(|i| i.get("path").or_else(|| i.get("file")))
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("file");
+                        out.push(RigEvent::new("file_change", "codex", red(path)));
+                    }
+                    "error" => {
+                        let m = item
+                            .and_then(|i| i.get("message").or_else(|| i.get("text")))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("codex item error");
+                        out.push(RigEvent::new("error", "codex", red(m)));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 pub struct ProcessRig {
     name: String,
     program: String,
@@ -1037,6 +1355,21 @@ impl Rig for ProcessRig {
     }
 
     fn run(&self, req: &RigRunRequest) -> RigOutcome {
+        self.execute(req).0
+    }
+
+    fn run_transcript(&self, req: &RigRunRequest) -> RigRun {
+        let (outcome, events) = self.execute(req);
+        RigRun { outcome, events }
+    }
+}
+
+impl ProcessRig {
+    /// The shared run body: spawn the child, stream + cap + redact its
+    /// output, poll the [`CancelRegistry`] (kill on cancel), and — for CLI
+    /// adapters — parse the JSONL into BOTH a clean outcome AND transcript
+    /// events. `run` / `run_transcript` are thin wrappers over this.
+    fn execute(&self, req: &RigRunRequest) -> (RigOutcome, Vec<RigEvent>) {
         use std::io::{Read, Write};
         use std::process::Stdio;
 
@@ -1048,20 +1381,26 @@ impl Rig for ProcessRig {
         if let Some(dir) = working_dir
             && !dir.is_dir()
         {
-            return RigOutcome::Failed {
-                reason: format!("working dir does not exist: {}", dir.display()),
-                retryable: false,
-            };
+            return (
+                RigOutcome::Failed {
+                    reason: format!("working dir does not exist: {}", dir.display()),
+                    retryable: false,
+                },
+                Vec::new(),
+            );
         }
 
         // Resolve the program to a spawnable (PATH+PATHEXT, npm-shim
         // fallback, `.cmd`/`.bat` → `cmd.exe /C`). A non-resolvable
         // program is a clear, non-retryable failure (it isn't installed).
         let Some(spawn) = resolve_program(&self.program, &self.fallback_paths) else {
-            return RigOutcome::Failed {
-                reason: format!("{} not found on PATH", self.program),
-                retryable: false,
-            };
+            return (
+                RigOutcome::Failed {
+                    reason: format!("{} not found on PATH", self.program),
+                    retryable: false,
+                },
+                Vec::new(),
+            );
         };
         let mut command = command_for(&spawn, &self.args);
         command
@@ -1082,10 +1421,13 @@ impl Rig for ProcessRig {
         let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) => {
-                return RigOutcome::Failed {
-                    reason: format!("spawn {}: {e}", self.program),
-                    retryable: true,
-                };
+                return (
+                    RigOutcome::Failed {
+                        reason: format!("spawn {}: {e}", self.program),
+                        retryable: true,
+                    },
+                    Vec::new(),
+                );
             }
         };
 
@@ -1137,26 +1479,44 @@ impl Rig for ProcessRig {
             let _ = stdin.write_all(req.prompt.as_bytes());
         }
 
-        // Wait with a hard deadline. On expiry, KILL the child
-        // (cancellation) and report a retryable timeout.
+        // Wait with a hard deadline, ALSO polling the cancel flag each
+        // tick. On the deadline or a cancel request, KILL the child.
+        let cancel = CancelRegistry::global().handle(&req.run_id);
+        enum End {
+            Exited(std::process::ExitStatus),
+            TimedOut,
+            Cancelled,
+        }
         let deadline = std::time::Instant::now() + self.timeout;
-        let status = loop {
+        let end = loop {
+            if cancel
+                .as_ref()
+                .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+                .unwrap_or(false)
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                break End::Cancelled;
+            }
             match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
+                Ok(Some(status)) => break End::Exited(status),
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
                         let _ = child.kill();
                         let _ = child.wait();
-                        break None; // timed out
+                        break End::TimedOut;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Err(e) => {
                     let _ = child.kill();
-                    return RigOutcome::Failed {
-                        reason: format!("wait {}: {e}", self.program),
-                        retryable: true,
-                    };
+                    return (
+                        RigOutcome::Failed {
+                            reason: format!("wait {}: {e}", self.program),
+                            retryable: true,
+                        },
+                        Vec::new(),
+                    );
                 }
             }
         };
@@ -1178,16 +1538,26 @@ impl Rig for ProcessRig {
         // Redact obvious secrets BEFORE anything is persisted/returned.
         let stdout = self.cap(redact_secrets(&raw_stdout, &req.bridge_token));
         let stderr = self.cap(redact_secrets(&raw_stderr, &req.bridge_token));
+        // Build the transcript events from the captured output (already
+        // bounded + redacted inside the extractors).
+        let events = self.transcript_events(&raw_stdout, &stdout, &stderr, &req.bridge_token);
 
-        match status {
-            None => RigOutcome::Failed {
-                reason: format!(
-                    "timed out after {}s (killed)",
-                    self.timeout.as_secs()
-                ),
-                retryable: true,
-            },
-            Some(status) => {
+        match end {
+            End::Cancelled => (
+                RigOutcome::Failed {
+                    reason: "run cancelled by operator".to_string(),
+                    retryable: false,
+                },
+                events,
+            ),
+            End::TimedOut => (
+                RigOutcome::Failed {
+                    reason: format!("timed out after {}s (killed)", self.timeout.as_secs()),
+                    retryable: true,
+                },
+                events,
+            ),
+            End::Exited(status) => {
                 // Claude's terminal `result` event is authoritative — it
                 // can exit 0 with `is_error`, or non-zero while still
                 // carrying a usable result — so parse it FIRST (off the
@@ -1195,32 +1565,62 @@ impl Rig for ProcessRig {
                 if matches!(self.output_format, RigOutputFormat::ClaudeStreamJson)
                     && let Some(outcome) = self.claude_outcome(&raw_stdout, &req.bridge_token)
                 {
-                    return outcome;
+                    return (outcome, events);
                 }
                 if matches!(self.output_format, RigOutputFormat::CodexJsonl)
                     && let Some(outcome) = self.codex_outcome(&raw_stdout, &req.bridge_token)
                 {
-                    return outcome;
+                    return (outcome, events);
                 }
                 if status.success() {
-                    RigOutcome::Done { summary: stdout }
+                    (RigOutcome::Done { summary: stdout }, events)
                 } else {
                     let code = status
                         .code()
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| "signal".to_string());
                     let detail = if stderr.is_empty() { stdout } else { stderr };
-                    RigOutcome::Failed {
-                        reason: format!("exit {code}: {detail}"),
-                        retryable: true,
-                    }
+                    (
+                        RigOutcome::Failed {
+                            reason: format!("exit {code}: {detail}"),
+                            retryable: true,
+                        },
+                        events,
+                    )
                 }
             }
         }
     }
-}
 
-impl ProcessRig {
+    /// Turn captured output into a bounded transcript: parsed adapter
+    /// events for Claude/Codex, or a compact stdout/stderr summary for a
+    /// raw adapter. Adapter events come pre-bounded + redacted; the raw
+    /// summary is redacted+capped here.
+    fn transcript_events(
+        &self,
+        raw_stdout: &str,
+        capped_stdout: &str,
+        capped_stderr: &str,
+        bridge_token: &str,
+    ) -> Vec<RigEvent> {
+        match self.output_format {
+            RigOutputFormat::ClaudeStreamJson => claude_events(raw_stdout, bridge_token),
+            RigOutputFormat::CodexJsonl => codex_events(raw_stdout, bridge_token),
+            RigOutputFormat::Raw => {
+                let mut ev = Vec::new();
+                if !capped_stdout.is_empty() {
+                    ev.push(
+                        RigEvent::new("output", self.name.clone(), bounded_line(capped_stdout)),
+                    );
+                }
+                if !capped_stderr.is_empty() {
+                    ev.push(RigEvent::new("stderr", self.name.clone(), bounded_line(capped_stderr)));
+                }
+                ev
+            }
+        }
+    }
+
     /// Map Claude Code `stream-json` stdout to a [`RigOutcome`]. Parses
     /// the terminal `result` event (off the raw, pre-redaction stdout so
     /// the JSON parses), then redacts + caps only the extracted answer:
@@ -2745,6 +3145,101 @@ mod tests {
         assert_eq!(
             r.auth_args.as_deref(),
             Some(&["login".to_string(), "status".to_string()][..])
+        );
+    }
+
+    // ── Transcript events + cancellation ────────────────────────
+
+    #[test]
+    fn claude_events_extracts_focused_transcript() {
+        let jsonl = format!(
+            "{}\n{}\n{}\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working on it"},{"type":"tool_use","name":"Write","input":{"path":"a.txt"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}"#,
+            r#"{"type":"result","result":"All set","permission_denials":[{"tool":"Bash"}],"total_cost_usd":0.0123}"#,
+        );
+        let ev = claude_events(&jsonl, "");
+        let kinds: Vec<&str> = ev.iter().map(|e| e.kind.as_str()).collect();
+        assert!(kinds.contains(&"assistant_message"));
+        assert!(kinds.contains(&"tool_use"));
+        assert!(kinds.contains(&"result"));
+        assert!(kinds.contains(&"permission_denied"));
+        assert!(kinds.contains(&"usage"));
+        // No raw JSON leaks into a message.
+        assert!(ev.iter().all(|e| !e.message.contains("\"type\"")));
+        assert!(ev.iter().all(|e| e.source == "claude"));
+    }
+
+    #[test]
+    fn codex_events_extracts_lifecycle_and_items() {
+        let jsonl = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            r#"{"type":"thread.started","thread_id":"t"}"#,
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"ls -la"}}"#,
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Listed files"}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":5}}"#,
+        );
+        let ev = codex_events(&jsonl, "");
+        let kinds: Vec<&str> = ev.iter().map(|e| e.kind.as_str()).collect();
+        assert!(kinds.contains(&"thread_started"));
+        assert!(kinds.contains(&"turn_started"));
+        assert!(kinds.contains(&"command"));
+        assert!(kinds.contains(&"assistant_message"));
+        assert!(kinds.contains(&"turn_completed"));
+        assert!(ev.iter().all(|e| e.source == "codex"));
+    }
+
+    #[test]
+    fn transcript_events_redact_and_bound() {
+        // A secret-shaped token in an assistant message is masked.
+        let secret = "sk-".to_string() + &"a".repeat(40);
+        let jsonl = format!(
+            r#"{{"type":"result","result":{}}}"#,
+            serde_json::to_string(&format!("here is the key {secret}")).unwrap()
+        );
+        let ev = claude_events(&jsonl, "");
+        assert!(ev.iter().any(|e| e.kind == "result"));
+        assert!(
+            ev.iter().all(|e| !e.message.contains(&secret)),
+            "secret must be redacted from events"
+        );
+        // Over-long text is truncated.
+        let big = "x".repeat(MAX_EVENT_MESSAGE_BYTES + 500);
+        let jsonl2 = format!(
+            r#"{{"type":"result","result":{}}}"#,
+            serde_json::to_string(&big).unwrap()
+        );
+        let ev2 = claude_events(&jsonl2, "");
+        let msg = &ev2.iter().find(|e| e.kind == "result").unwrap().message;
+        assert!(msg.len() <= MAX_EVENT_MESSAGE_BYTES + 32);
+        assert!(msg.contains("truncated"));
+    }
+
+    #[test]
+    fn cancel_registry_register_request_clear() {
+        let reg = CancelRegistry::default();
+        assert!(!reg.is_cancelled("run_x"));
+        assert!(!reg.request("run_x"), "unknown run is not active");
+        reg.register("run_x");
+        assert!(!reg.is_cancelled("run_x"));
+        assert!(reg.request("run_x"), "registered run is active");
+        assert!(reg.is_cancelled("run_x"));
+        reg.clear("run_x");
+        assert!(!reg.is_cancelled("run_x"));
+        assert!(!reg.request("run_x"), "cleared run is no longer active");
+    }
+
+    #[test]
+    fn raw_rig_run_transcript_emits_output_event() {
+        let (prog, args) = echo_cmd("transcript-hello");
+        let rig = ProcessRig::new("echo-like", prog, args);
+        let run = rig.run_transcript(&RigRunRequest::new("b", "a", "g", "x"));
+        assert!(matches!(run.outcome, RigOutcome::Done { .. }));
+        assert!(
+            run.events.iter().any(|e| e.kind == "output" && e.message.contains("transcript-hello")),
+            "events: {:?}",
+            run.events
         );
     }
 }
