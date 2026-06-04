@@ -565,14 +565,38 @@ pub(crate) fn compute_readiness(
 
     let mut pending_clearances: Vec<serde_json::Value> = Vec::new();
     for cid in &clearance_ids {
-        let status = agent_store
+        let rec = agent_store
             .get_approval_record_for_tenant(cid, tenant)
             .ok()
-            .flatten()
+            .flatten();
+        let status = rec
+            .as_ref()
             .map(|r| r.status.as_wire().to_string())
             .unwrap_or_else(|| "missing".to_string());
         if status == "pending" {
-            pending_clearances.push(serde_json::json!({"clearance_id": cid, "status": status}));
+            // Role identity: a spawn Clearance records the pending hire's
+            // agent_id; map that back to its role via the plan's pending
+            // hires so orchestration can give the blocked seat a
+            // placeholder role track.
+            let agent_id = rec.as_ref().map(|r| r.agent_id.clone()).unwrap_or_default();
+            let role = pending_hires_raw.iter().find_map(|h| {
+                if h.get("agent_id").and_then(|v| v.as_str()) == Some(agent_id.as_str()) {
+                    h.get("role")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            });
+            let mut obj = serde_json::json!({"clearance_id": cid, "status": status});
+            if !agent_id.is_empty() {
+                obj["agent_id"] = serde_json::json!(agent_id);
+            }
+            if let Some(role) = role {
+                obj["role"] = serde_json::json!(role);
+            }
+            pending_clearances.push(obj);
         }
     }
 
@@ -721,6 +745,20 @@ fn placeholder_track_title(role: &str, reason: &str) -> String {
         Some(label) => format!("{label} track blocked: {reason}"),
         None => format!("{} track blocked: {reason}", role.trim()),
     }
+}
+
+/// Is `title` an auto-generated placeholder title for `role`? True only
+/// when it still carries the machine-written `… track blocked:` prefix —
+/// any operator rename (which would not reproduce that exact prefix)
+/// reads as user-edited and must be preserved. Used to safely promote a
+/// placeholder role track's title to the active title when its role
+/// becomes active, without ever clobbering a hand-edited title.
+fn is_auto_placeholder_title(role: &str, title: &str) -> bool {
+    let prefix = match role_label(role) {
+        Some(label) => format!("{label} track blocked:"),
+        None => format!("{} track blocked:", role.trim()),
+    };
+    title.starts_with(&prefix)
 }
 
 /// Stable signature of the orchestration inputs (deterministic across
@@ -879,16 +917,27 @@ pub fn handle_orchestrate(
             if key.is_empty() || active_role_keys.contains(&key) {
                 return;
             }
+            // First writer wins, so the most specific reason is noted
+            // first: pending clearance → pending hire → missing → blocked.
             gap.entry(key)
                 .or_insert_with(|| (role.trim().to_string(), reason.to_string()));
         };
-        for r in &view.missing_roles {
-            note_gap(r, "crew not ready");
+        // A role blocked on a pending spawn Clearance gets the most
+        // actionable reason (the approval id), ahead of the generic
+        // pending-hire reason for the same seat.
+        for c in &view.pending_clearances {
+            if let Some(role) = c.get("role").and_then(|v| v.as_str()) {
+                let cid = c.get("clearance_id").and_then(|v| v.as_str()).unwrap_or("");
+                note_gap(role, &format!("pending clearance {cid}"));
+            }
         }
         for h in &view.pending_hires {
             if let Some(r) = h.get("role").and_then(|v| v.as_str()) {
                 note_gap(r, "pending hire");
             }
+        }
+        for r in &view.missing_roles {
+            note_gap(r, "crew not ready");
         }
         for b in &view.blocked_roles {
             if let Some(r) = b.get("role").and_then(|v| v.as_str()) {
@@ -902,12 +951,24 @@ pub fn handle_orchestrate(
     }
 
     // Cap total role tracks at `max_briefs - 1` (the parent is one Brief);
-    // active tracks take priority over placeholders.
+    // active tracks take priority over placeholders. Placeholder roles that
+    // do not fit are recorded EXPLICITLY (never silently dropped) so a
+    // staffing gap cannot disappear from the report.
     let cap = max_briefs.saturating_sub(1).max(1);
     let active_plan: Vec<(String, String)> = active.into_values().take(cap).collect();
-    let gap_plan: Vec<(String, String)> = gap
-        .into_values()
-        .take(cap.saturating_sub(active_plan.len()))
+    let gap_budget = cap.saturating_sub(active_plan.len());
+    let gap_all: Vec<(String, String)> = gap.into_values().collect();
+    let gap_plan: Vec<(String, String)> = gap_all.iter().take(gap_budget).cloned().collect();
+    let placeholder_tracks_omitted: Vec<serde_json::Value> = gap_all
+        .iter()
+        .skip(gap_budget)
+        .map(|(role, reason)| {
+            serde_json::json!({
+                "role": role,
+                "reason": reason,
+                "omitted": "max_briefs",
+            })
+        })
         .collect();
 
     // Materialisation gate. We create the parent + role tracks (active and
@@ -976,22 +1037,23 @@ pub fn handle_orchestrate(
     let mut placeholder_tracks_existing: Vec<serde_json::Value> = Vec::new();
 
     // Helper: get-or-create a Brief by its stable source marker.
-    // Returns (task_id, was_existing, current_assignee) or None when
-    // creation is not allowed and it does not yet exist. Reuse is by
-    // marker only; a reused Brief's title is left untouched so manual
-    // user edits are never clobbered.
+    // Returns (task_id, was_existing, current_assignee, current_title) or
+    // None when creation is not allowed and it does not yet exist. Reuse
+    // is by marker only; a reused Brief's title is left untouched here so
+    // manual user edits are never clobbered (the caller decides any safe
+    // auto-title promotion).
     let ensure_marked = |marker: &str,
                          title: &str,
                          created: &mut Vec<serde_json::Value>,
                          existing_out: &mut Vec<serde_json::Value>,
                          skipped_out: &mut Vec<serde_json::Value>|
-     -> Option<(String, bool, Option<String>)> {
+     -> Option<(String, bool, Option<String>, String)> {
         match task_store.get_brief_by_source_marker(marker) {
             Ok(Some(card)) => {
                 existing_out.push(serde_json::json!({
                     "task_id": card.task_id, "title": card.title, "marker": marker,
                 }));
-                return Some((card.task_id, true, card.assignee_agent_id));
+                return Some((card.task_id, true, card.assignee_agent_id, card.title));
             }
             Ok(None) => {}
             Err(e) => {
@@ -1018,7 +1080,7 @@ pub fn handle_orchestrate(
         ) {
             Ok(id) => {
                 created.push(serde_json::json!({"task_id": id, "title": title, "marker": marker}));
-                Some((id, false, None))
+                Some((id, false, None, title.to_string()))
             }
             Err(e) => {
                 skipped_out.push(
@@ -1038,7 +1100,7 @@ pub fn handle_orchestrate(
         &mut parent_existing,
         &mut skipped,
     );
-    if let Some((ref parent_id, was_existing, _)) = parent
+    if let Some((ref parent_id, was_existing, _, _)) = parent
         && !was_existing
     {
         // Newly created parent: drop a durable orchestration Dossier.
@@ -1059,18 +1121,34 @@ pub fn handle_orchestrate(
     for (role, agent_id) in &active_plan {
         let rm = role_marker(role);
         markers_used.push(rm.clone());
+        let active_title = role_track_title(role, &mandate.title);
         let role_track = ensure_marked(
             &rm,
-            &role_track_title(role, &mandate.title),
+            &active_title,
             &mut role_tracks_created,
             &mut role_tracks_existing,
             &mut skipped,
         );
-        let Some((role_id, _was, _assignee)) = role_track else {
+        let Some((role_id, was_existing, _assignee, current_title)) = role_track else {
             continue;
         };
+        // Title lifecycle: when a role that was a placeholder becomes
+        // active, promote its auto-generated `… track blocked:` title to
+        // the normal active title — but ONLY if it is still the
+        // machine-written placeholder title (a user rename is preserved).
+        if was_existing
+            && current_title != active_title
+            && is_auto_placeholder_title(role, &current_title)
+            && task_store
+                .set_brief_field(&role_id, "title", &active_title)
+                .is_ok()
+            && let Some(last) = role_tracks_existing.last_mut()
+        {
+            last["title"] = serde_json::json!(active_title);
+            last["title_promoted_from_placeholder"] = serde_json::json!(true);
+        }
         // Link the role track under the parent (idempotent edge insert).
-        if let Some((ref parent_id, _, _)) = parent {
+        if let Some((ref parent_id, _, _, _)) = parent {
             let _ = task_store.link_subbrief(parent_id, &role_id);
         }
 
@@ -1086,7 +1164,7 @@ pub fn handle_orchestrate(
             &mut subject_briefs_existing,
             &mut skipped,
         );
-        let Some((subject_id, _sw, subject_assignee)) = subject else {
+        let Some((subject_id, _sw, subject_assignee, _st)) = subject else {
             continue;
         };
         // Link the subject Brief under its role track.
@@ -1137,7 +1215,7 @@ pub fn handle_orchestrate(
             &mut placeholder_tracks_existing,
             &mut skipped,
         );
-        if let Some((role_id, was_existing, _)) = &track {
+        if let Some((role_id, was_existing, _, _)) = &track {
             // Tag the just-pushed bucket entry with the placeholder reason.
             let bucket = if *was_existing {
                 &mut placeholder_tracks_existing
@@ -1149,7 +1227,7 @@ pub fn handle_orchestrate(
                 last["reason"] = serde_json::json!(reason);
             }
             // Link under the parent (idempotent edge insert).
-            if let Some((ref parent_id, _, _)) = parent {
+            if let Some((ref parent_id, _, _, _)) = parent {
                 let _ = task_store.link_subbrief(parent_id, role_id);
             }
             // On first creation, record WHY the track is blocked.
@@ -1165,6 +1243,13 @@ pub fn handle_orchestrate(
                 );
             }
         }
+    }
+
+    // Record any placeholder roles dropped by the `max_briefs` cap into
+    // `skipped` too, so the gap is also visible in the persisted run (the
+    // run record stores `skipped`), not only the live response.
+    for omitted in &placeholder_tracks_omitted {
+        skipped.push(omitted.clone());
     }
 
     // Backward-compatible flat views: callers/tests that predate the
@@ -1205,6 +1290,13 @@ pub fn handle_orchestrate(
         next_actions.push(format!(
             "{placeholders} placeholder track(s) await staffing; each becomes executable once \
              its role is active."
+        ));
+    }
+    if !placeholder_tracks_omitted.is_empty() {
+        next_actions.push(format!(
+            "{} placeholder role(s) were omitted by the max_briefs cap ({max_briefs}); raise \
+             max_briefs to surface every staffing gap.",
+            placeholder_tracks_omitted.len()
         ));
     }
 
@@ -1257,6 +1349,7 @@ pub fn handle_orchestrate(
         "role_tracks_existing": role_tracks_existing,
         "placeholder_tracks_created": placeholder_tracks_created,
         "placeholder_tracks_existing": placeholder_tracks_existing,
+        "placeholder_tracks_omitted": placeholder_tracks_omitted,
         "subject_briefs_created": subject_briefs_created,
         "subject_briefs_existing": subject_briefs_existing,
         "assigned_briefs": assigned_briefs,
@@ -4092,6 +4185,268 @@ mod tests {
         );
         // Tree: parent + role track + subject = 3 (no duplicate role track).
         assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), 3);
+    }
+
+    // ── Role-keyed pending-clearance placeholders ───────────────
+
+    /// Set up a Mandate with a pending hire for `role` that is gated by a
+    /// pending spawn Clearance. Returns `(mandate_id, hire_id, clearance_id)`.
+    fn mandate_with_pending_clearance(
+        agents: &AgentStore,
+        spine: &SpineStore,
+        role: &str,
+    ) -> (String, String, String) {
+        let m = approved_mandate(spine);
+        let hire = agents
+            .request_hire(
+                "W", role, "W", "eng", "eng", "prime", "subj-clr", "medium", "default",
+            )
+            .unwrap();
+        let cid = agents
+            .create_spawn_clearance(&hire, "subj-clr", "spawn", &[], "default")
+            .unwrap();
+        spine
+            .record_team_plan(&crate::nodes::coordinator::spine::store::TeamPlanRecord {
+                tenant_id: "default",
+                mandate_id: &m,
+                actor_id: "operator",
+                description: "x",
+                proposed_roles_json: "[]",
+                pending_hires_json: &format!("[{{\"role\":\"{role}\",\"agent_id\":\"{hire}\"}}]"),
+                clearance_ids_json: &format!("[\"{cid}\"]"),
+                denials_json: "[]",
+                next_steps_json: "[]",
+                status: "awaiting_clearance",
+            })
+            .unwrap();
+        (m, hire, cid)
+    }
+
+    #[test]
+    fn orchestrate_pending_clearance_creates_placeholder() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, _hire, cid) = mandate_with_pending_clearance(&agents, &spine, "engineer");
+        let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        // One placeholder track for the clearance-blocked role; no subject.
+        assert_eq!(v["placeholder_tracks_created"].as_array().unwrap().len(), 1);
+        let reason = v["placeholder_tracks_created"][0]["reason"]
+            .as_str()
+            .unwrap();
+        assert!(
+            reason.starts_with("pending clearance") && reason.contains(&cid),
+            "reason should name the pending clearance id: {reason}"
+        );
+        assert!(v["subject_briefs_created"].as_array().unwrap().is_empty());
+        assert!(v["assigned_briefs"].as_array().unwrap().is_empty());
+        assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn orchestrate_repeated_pending_clearance_reuses_placeholder() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, _hire, _cid) = mandate_with_pending_clearance(&agents, &spine, "engineer");
+        let first = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        assert_eq!(
+            first["placeholder_tracks_created"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let before = tasks.list_briefs_by_mandate(&m, 50).unwrap().len();
+        let second = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        assert!(
+            second["placeholder_tracks_created"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            second["placeholder_tracks_existing"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), before);
+    }
+
+    #[test]
+    fn orchestrate_clearance_approved_creates_subject_under_same_role_track() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, hire, cid) = mandate_with_pending_clearance(&agents, &spine, "engineer");
+        let first = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        let role_id = first["placeholder_tracks_created"][0]["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Approving the spawn Clearance activates the hire.
+        assert!(matches!(
+            decide(&agents, &cid, "approved"),
+            HandlerOutcome::Ok(_)
+        ));
+        assert_eq!(agents.get_agent(&hire).unwrap().unwrap().status, "active");
+        let second = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        // Same role track reused; a subject Brief now exists + is assigned.
+        assert_eq!(
+            second["role_tracks_existing"][0]["task_id"],
+            serde_json::json!(role_id)
+        );
+        assert!(
+            second["placeholder_tracks_created"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            second["subject_briefs_created"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            second["assigned_briefs"][0]["agent_id"],
+            serde_json::json!(hire)
+        );
+        assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), 3);
+    }
+
+    // ── Placeholder title lifecycle ─────────────────────────────
+
+    #[test]
+    fn orchestrate_auto_placeholder_title_transitions_to_active() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        let pending = agents
+            .request_hire(
+                "W", "engineer", "W", "e", "e", "prime", "subj-rt", "medium", "default",
+            )
+            .unwrap();
+        plan_with_gaps(
+            &spine,
+            &m,
+            "[]",
+            &format!("[{{\"role\":\"engineer\",\"agent_id\":\"{pending}\"}}]"),
+            "[]",
+        );
+        let first = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        let role_id = first["placeholder_tracks_created"][0]["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // The auto placeholder title is the "blocked" form.
+        let t0 = tasks
+            .list_briefs_by_mandate(&m, 50)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.task_id == role_id)
+            .unwrap()
+            .title;
+        assert!(t0.starts_with("Engineering track blocked:"), "got: {t0}");
+        // Activate → rerun promotes the auto title to the active title.
+        agents.approve_hire(&pending).unwrap();
+        let second = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        assert_eq!(
+            second["role_tracks_existing"][0]["task_id"],
+            serde_json::json!(role_id)
+        );
+        let t1 = tasks
+            .list_briefs_by_mandate(&m, 50)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.task_id == role_id)
+            .unwrap()
+            .title;
+        assert!(
+            t1.starts_with("Engineering track:") && !t1.contains("blocked"),
+            "got: {t1}"
+        );
+    }
+
+    #[test]
+    fn orchestrate_user_edited_placeholder_title_is_preserved() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        let pending = agents
+            .request_hire(
+                "W", "engineer", "W", "e", "e", "prime", "subj-rt", "medium", "default",
+            )
+            .unwrap();
+        plan_with_gaps(
+            &spine,
+            &m,
+            "[]",
+            &format!("[{{\"role\":\"engineer\",\"agent_id\":\"{pending}\"}}]"),
+            "[]",
+        );
+        let first = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        let role_id = first["placeholder_tracks_created"][0]["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Operator renames the placeholder track by hand.
+        tasks
+            .set_brief_field(&role_id, "title", "My bespoke engineering plan")
+            .unwrap();
+        // Activate → rerun must NOT clobber the user's title.
+        agents.approve_hire(&pending).unwrap();
+        orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        let title = tasks
+            .list_briefs_by_mandate(&m, 50)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.task_id == role_id)
+            .unwrap()
+            .title;
+        assert_eq!(title, "My bespoke engineering plan");
+    }
+
+    // ── max_briefs overflow visibility ──────────────────────────
+
+    #[test]
+    fn orchestrate_max_briefs_reports_omitted_placeholders() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        // Four missing roles, but max_briefs=3 → parent + 2 role tracks fit,
+        // the remaining 2 placeholders must be reported, not dropped.
+        plan_with_gaps(
+            &spine,
+            &m,
+            "[\"engineer\",\"designer\",\"writer\",\"qa\"]",
+            "[]",
+            "[]",
+        );
+        let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs|3"));
+        let created = v["placeholder_tracks_created"].as_array().unwrap();
+        let omitted = v["placeholder_tracks_omitted"].as_array().unwrap();
+        assert_eq!(
+            created.len(),
+            2,
+            "only 2 placeholders fit under max_briefs=3"
+        );
+        assert_eq!(omitted.len(), 2, "the other 2 are reported omitted");
+        assert!(omitted.iter().all(|o| o["omitted"] == "max_briefs"));
+        // Never more Briefs than max_briefs (parent + 2 = 3).
+        assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), 3);
+        // The omission is also persisted via `skipped`.
+        assert!(
+            v["skipped"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["omitted"] == "max_briefs"),
+            "omitted placeholders must be recorded in skipped: {v}"
+        );
     }
 
     #[test]
