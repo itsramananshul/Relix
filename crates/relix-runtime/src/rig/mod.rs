@@ -206,6 +206,145 @@ impl RigProbe {
             install_hint,
         }
     }
+
+    /// Build a probe with an explicit structured status. The CLI rigs use
+    /// this to report the richer readiness vocabulary (`missing_binary` /
+    /// `not_authenticated` / `unsupported_version` / `interactive_only` /
+    /// `probe_failed`) — anything other than `available` reads as "not
+    /// runnable" by the dispatcher + dashboard.
+    pub fn with_status(
+        status: impl Into<String>,
+        detail: impl Into<String>,
+        install_hint: Option<String>,
+    ) -> Self {
+        Self {
+            status: status.into(),
+            detail: detail.into(),
+            install_hint,
+        }
+    }
+
+    /// True only when the adapter is actually runnable right now.
+    pub fn is_available(&self) -> bool {
+        self.status == "available"
+    }
+}
+
+/// A real, noninteractive readiness check for a CLI adapter. Running the
+/// `probe_args` (e.g. `--version`) against the binary distinguishes
+/// "installed and runs" from "needs login", "wants a TTY", or "broken".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadinessCheck {
+    /// Args for the cheap, noninteractive readiness command (no auth, no
+    /// billable call) — typically `--version`.
+    pub probe_args: Vec<String>,
+    /// What to tell the operator when auth is the blocker.
+    pub login_hint: String,
+}
+
+/// Outcome of running a readiness command — the raw signals the
+/// classifier turns into a structured status. Separated so the
+/// classification logic is a pure, unit-testable function.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReadinessSignals {
+    /// The binary was not found on PATH (no command ran).
+    pub missing_binary: bool,
+    /// The command did not return within the probe timeout.
+    pub timed_out: bool,
+    /// The OS failed to spawn it (other than not-found).
+    pub spawn_error: Option<String>,
+    /// Process exited 0.
+    pub exit_ok: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Classify a readiness probe's raw signals into one of the structured
+/// statuses. Pure + keyword-driven so it is unit-testable with mocked
+/// command outputs. Returns `(status, detail)`.
+pub fn classify_readiness(sig: &ReadinessSignals) -> (&'static str, String) {
+    if sig.missing_binary {
+        return ("missing_binary", "binary not found on PATH".to_string());
+    }
+    if let Some(e) = &sig.spawn_error {
+        return ("probe_failed", format!("could not spawn: {e}"));
+    }
+    if sig.timed_out {
+        return (
+            "interactive_only",
+            "the CLI did not return to a noninteractive probe — it likely \
+             requires a TTY / interactive prompt and cannot run headless"
+                .to_string(),
+        );
+    }
+    let blob = format!("{}\n{}", sig.stdout, sig.stderr).to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| blob.contains(n));
+    // Auth keywords win even on a zero exit (some CLIs print a login
+    // nudge to stderr without failing).
+    if has(&[
+        "not authenticated",
+        "not logged in",
+        "please log in",
+        "please login",
+        "run `claude login`",
+        "run claude login",
+        "run `codex login`",
+        "run codex login",
+        "you are not signed in",
+        "sign in",
+        "unauthorized",
+        "401",
+        "authentication required",
+        "no credentials",
+        "login required",
+    ]) {
+        return (
+            "not_authenticated",
+            "the CLI is installed but not logged in".to_string(),
+        );
+    }
+    if sig.exit_ok {
+        let line = sig
+            .stdout
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        return (
+            "available",
+            if line.is_empty() {
+                "installed and runs noninteractively".to_string()
+            } else {
+                format!("installed: {line}")
+            },
+        );
+    }
+    // Non-zero exit that wasn't an auth error.
+    if has(&[
+        "unknown flag",
+        "unrecognized",
+        "no such subcommand",
+        "invalid option",
+        "unexpected argument",
+        "unknown option",
+    ]) {
+        return (
+            "unsupported_version",
+            "the CLI rejected the probe flags — its version may be \
+             incompatible with this adapter"
+                .to_string(),
+        );
+    }
+    let detail = if !sig.stderr.trim().is_empty() {
+        sig.stderr.trim()
+    } else {
+        sig.stdout.trim()
+    };
+    (
+        "probe_failed",
+        format!("readiness probe failed: {detail}"),
+    )
 }
 
 /// A **Rig** — a pluggable agent backend. The uniform contract
@@ -421,7 +560,16 @@ pub struct ProcessRig {
     /// coordinator's CWD; `Some(dir)` is validated (must be an existing
     /// directory) before spawn. The per-run request can override this.
     working_dir: Option<std::path::PathBuf>,
+    /// Optional noninteractive readiness check (CLI adapters). When set,
+    /// `probe()` actually RUNS the readiness command and classifies the
+    /// result (installed / needs-login / wants-TTY / broken) instead of
+    /// only checking PATH.
+    readiness: Option<ReadinessCheck>,
 }
+
+/// How long a readiness probe command may run before it's treated as
+/// `interactive_only` (it hung waiting for a TTY).
+pub const READINESS_PROBE_TIMEOUT_SECS: u64 = 8;
 
 /// Default stdout cap for a process Rig — generous enough for a real
 /// agent's final answer, bounded enough to stop a firehose.
@@ -445,7 +593,19 @@ impl ProcessRig {
             install_hint: None,
             timeout: std::time::Duration::from_secs(DEFAULT_RIG_TIMEOUT_SECS),
             working_dir: None,
+            readiness: None,
         }
+    }
+
+    /// Configure a noninteractive readiness probe (CLI adapters). The
+    /// `probe_args` (e.g. `["--version"]`) must be cheap, auth-free, and
+    /// noninteractive; `login_hint` is shown when auth is the blocker.
+    pub fn with_readiness(mut self, probe_args: Vec<String>, login_hint: impl Into<String>) -> Self {
+        self.readiness = Some(ReadinessCheck {
+            probe_args,
+            login_hint: login_hint.into(),
+        });
+        self
     }
 
     /// Override the hard run timeout. Clamped to at least 1 second.
@@ -529,14 +689,41 @@ impl Rig for ProcessRig {
     }
 
     fn probe(&self) -> RigProbe {
-        if command_exists(&self.program) {
-            RigProbe::available(format!("{} found on PATH", self.program))
-        } else {
-            RigProbe::missing(
+        // Without a readiness check this is a plain process Rig — a PATH
+        // existence check is all we can honestly assert.
+        let Some(readiness) = &self.readiness else {
+            return if command_exists(&self.program) {
+                RigProbe::available(format!("{} found on PATH", self.program))
+            } else {
+                RigProbe::with_status(
+                    "missing_binary",
+                    format!("{} not found on PATH", self.program),
+                    self.install_hint.clone(),
+                )
+            };
+        };
+        // A CLI adapter: actually run the noninteractive readiness command
+        // and classify the result.
+        if !command_exists(&self.program) {
+            return RigProbe::with_status(
+                "missing_binary",
                 format!("{} not found on PATH", self.program),
                 self.install_hint.clone(),
-            )
+            );
         }
+        let signals = run_readiness_probe(
+            &self.program,
+            &readiness.probe_args,
+            std::time::Duration::from_secs(READINESS_PROBE_TIMEOUT_SECS),
+        );
+        let (status, detail) = classify_readiness(&signals);
+        // Pick the most actionable hint for the resolved status.
+        let hint = match status {
+            "not_authenticated" => Some(readiness.login_hint.clone()),
+            "available" => None,
+            _ => self.install_hint.clone(),
+        };
+        RigProbe::with_status(status, detail, hint)
     }
 
     fn run(&self, req: &RigRunRequest) -> RigOutcome {
@@ -712,6 +899,113 @@ impl ProcessRig {
     }
 }
 
+/// Run a CLI adapter's noninteractive readiness command and collect the
+/// raw [`ReadinessSignals`]. Stdin is closed (`null`) so a CLI that reads
+/// stdin gets immediate EOF instead of hanging; stdout/stderr are
+/// captured with a hard timeout (a hang → `timed_out`, classified as
+/// `interactive_only`). Safe argv only — no shell.
+pub fn run_readiness_probe(
+    program: &str,
+    args: &[String],
+    timeout: std::time::Duration,
+) -> ReadinessSignals {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+
+    if !command_exists(program) {
+        return ReadinessSignals {
+            missing_binary: true,
+            ..Default::default()
+        };
+    }
+    let mut child = match Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ReadinessSignals {
+                spawn_error: Some(e.to_string()),
+                ..Default::default()
+            };
+        }
+    };
+    let out_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let err_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let drain = |pipe: Option<std::process::ChildStdout>, buf: Arc<Mutex<Vec<u8>>>| {
+        pipe.map(|mut p| {
+            std::thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                while let Ok(n) = p.read(&mut tmp) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut b) = buf.lock() {
+                        b.extend_from_slice(&tmp[..n]);
+                    }
+                }
+            })
+        })
+    };
+    let oh = drain(child.stdout.take(), out_buf.clone());
+    let eh = child.stderr.take().map(|mut p| {
+        let buf = err_buf.clone();
+        std::thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            while let Ok(n) = p.read(&mut tmp) {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(mut b) = buf.lock() {
+                    b.extend_from_slice(&tmp[..n]);
+                }
+            }
+        })
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let (timed_out, exit_ok) = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break (false, s.success()),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break (true, false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                break (false, false);
+            }
+        }
+    };
+    let grace = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    for h in [oh, eh].into_iter().flatten() {
+        while !h.is_finished() && std::time::Instant::now() < grace {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    }
+    let stdout = String::from_utf8_lossy(&out_buf.lock().map(|b| b.clone()).unwrap_or_default())
+        .trim()
+        .to_string();
+    let stderr = String::from_utf8_lossy(&err_buf.lock().map(|b| b.clone()).unwrap_or_default())
+        .trim()
+        .to_string();
+    ReadinessSignals {
+        missing_binary: false,
+        timed_out,
+        spawn_error: None,
+        exit_ok,
+        stdout,
+        stderr,
+    }
+}
+
 /// Redact obvious secrets from captured agent output before it is
 /// persisted to the Chronicle / returned to the dashboard. Heuristic but
 /// deliberately conservative: it never leaks the per-run bridge-back
@@ -826,6 +1120,7 @@ pub fn claude_rig() -> ProcessRig {
     .with_structured_output(true)
     .with_billing(RigBilling::subscription("anthropic", "5h/weekly"))
     .with_install_hint("install Claude Code, then run `claude login`")
+    .with_readiness(vec!["--version".to_string()], "run `claude login` to authenticate")
 }
 
 /// Codex on a ChatGPT / Codex subscription. Prompt piped via the
@@ -839,6 +1134,7 @@ pub fn codex_rig() -> ProcessRig {
     .with_structured_output(true)
     .with_billing(RigBilling::subscription("openai", "5h/weekly/credits"))
     .with_install_hint("install Codex CLI, then run `codex login`")
+    .with_readiness(vec!["--version".to_string()], "run `codex login` to authenticate")
 }
 
 /// Gemini CLI on a Google subscription. Prompt piped to stdin.
@@ -846,6 +1142,7 @@ pub fn gemini_rig() -> ProcessRig {
     ProcessRig::new("gemini", "gemini", Vec::new())
         .with_billing(RigBilling::subscription("google", "provider-window"))
         .with_install_hint("install Gemini CLI, then authenticate it")
+        .with_readiness(vec!["--version".to_string()], "authenticate the Gemini CLI")
 }
 
 /// An installed **Hermes** agent, plugged in as a Rig (Pillar 2 —
@@ -1181,12 +1478,112 @@ mod tests {
         )
         .with_install_hint("install the missing adapter");
         let probe = rig.probe();
-        assert_eq!(probe.status, "missing");
+        assert_eq!(probe.status, "missing_binary");
+        assert!(!probe.is_available());
         assert!(probe.detail.contains("definitely-not-installed"));
         assert_eq!(
             probe.install_hint.as_deref(),
             Some("install the missing adapter")
         );
+    }
+
+    // ── Rich CLI readiness classification (mocked command outputs) ──
+
+    fn sig(exit_ok: bool, stdout: &str, stderr: &str) -> ReadinessSignals {
+        ReadinessSignals {
+            missing_binary: false,
+            timed_out: false,
+            spawn_error: None,
+            exit_ok,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    #[test]
+    fn classify_readiness_available_from_clean_version() {
+        let (status, detail) = classify_readiness(&sig(true, "claude 1.2.3 (Claude Code)", ""));
+        assert_eq!(status, "available");
+        assert!(detail.contains("1.2.3"), "got: {detail}");
+    }
+
+    #[test]
+    fn classify_readiness_missing_binary() {
+        let s = ReadinessSignals { missing_binary: true, ..Default::default() };
+        assert_eq!(classify_readiness(&s).0, "missing_binary");
+    }
+
+    #[test]
+    fn classify_readiness_spawn_error_is_probe_failed() {
+        let s = ReadinessSignals {
+            spawn_error: Some("permission denied".into()),
+            ..Default::default()
+        };
+        let (status, detail) = classify_readiness(&s);
+        assert_eq!(status, "probe_failed");
+        assert!(detail.contains("permission denied"));
+    }
+
+    #[test]
+    fn classify_readiness_timeout_is_interactive_only() {
+        let s = ReadinessSignals { timed_out: true, ..Default::default() };
+        assert_eq!(classify_readiness(&s).0, "interactive_only");
+    }
+
+    #[test]
+    fn classify_readiness_auth_keywords_are_not_authenticated() {
+        for (out, err) in [
+            ("", "Error: Not authenticated. Please run `claude login`."),
+            ("", "you are not signed in"),
+            ("error: 401 Unauthorized", ""),
+            ("Please log in to continue", ""),
+            ("", "login required: run `codex login`"),
+        ] {
+            // Auth keywords win even when exit looked ok.
+            assert_eq!(
+                classify_readiness(&sig(true, out, err)).0,
+                "not_authenticated",
+                "out={out:?} err={err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_readiness_unknown_flag_is_unsupported_version() {
+        let (status, _) = classify_readiness(&sig(false, "", "error: unknown flag: --version"));
+        assert_eq!(status, "unsupported_version");
+    }
+
+    #[test]
+    fn classify_readiness_other_failure_is_probe_failed() {
+        let (status, detail) = classify_readiness(&sig(false, "", "segfault in libfoo"));
+        assert_eq!(status, "probe_failed");
+        assert!(detail.contains("segfault"));
+    }
+
+    #[test]
+    fn run_readiness_probe_missing_binary_reports_missing() {
+        let s = run_readiness_probe(
+            "definitely-not-installed-relix-probe-xyzzy",
+            &["--version".to_string()],
+            std::time::Duration::from_secs(2),
+        );
+        assert!(s.missing_binary);
+        assert_eq!(classify_readiness(&s).0, "missing_binary");
+    }
+
+    #[test]
+    fn run_readiness_probe_runs_real_command_and_captures_stdout() {
+        // A real, always-available command echoes a version-like line.
+        let (prog, args) = if cfg!(windows) {
+            ("cmd".to_string(), vec!["/C".to_string(), "echo".to_string(), "probe-ok 9.9".to_string()])
+        } else {
+            ("sh".to_string(), vec!["-c".to_string(), "echo probe-ok 9.9".to_string()])
+        };
+        let s = run_readiness_probe(&prog, &args, std::time::Duration::from_secs(5));
+        assert!(!s.missing_binary && !s.timed_out && s.exit_ok, "signals: {s:?}");
+        assert!(s.stdout.contains("probe-ok"), "stdout: {:?}", s.stdout);
+        assert_eq!(classify_readiness(&s).0, "available");
     }
 
     #[test]
@@ -1252,11 +1649,19 @@ mod tests {
         assert!(claude.structured_output);
         assert_eq!(claude.billing.mode, "subscription");
         assert_eq!(claude.billing.provider.as_deref(), Some("anthropic"));
+        // The CLI probe runs live, so the exact status depends on the host
+        // (installed / needs-login / not present). It must be one of the
+        // structured statuses, and any non-available status carries a hint.
         assert!(matches!(
             claude.probe.status.as_str(),
-            "available" | "missing"
+            "available"
+                | "missing_binary"
+                | "not_authenticated"
+                | "unsupported_version"
+                | "interactive_only"
+                | "probe_failed"
         ));
-        if claude.probe.status == "missing" {
+        if !claude.probe.is_available() {
             assert!(claude.probe.install_hint.is_some());
         }
         // JSON-serialisable for the agent-config UI.
