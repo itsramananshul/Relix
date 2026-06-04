@@ -1567,6 +1567,48 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// GROUP 6 (tenant isolation): the label lookup scoped to `tenant`,
+    /// so a Guild's label search never surfaces another Guild's Briefs.
+    pub fn list_briefs_by_label_for_tenant(
+        &self,
+        label: &str,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let label = label.trim();
+        if label.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, title, board_status, priority,
+                        assignee_agent_id, mandate_id, campaign_id
+                 FROM tasks
+                 WHERE (labels = ?1 OR labels LIKE ?2 OR labels LIKE ?3 OR labels LIKE ?4)
+                   AND COALESCE(tenant_id, 'default') = ?5
+                 ORDER BY updated_at DESC LIMIT ?6",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    label,
+                    format!("{label},%"),
+                    format!("%,{label}"),
+                    format!("%,{label},%"),
+                    norm_tenant(tenant),
+                    lim
+                ],
+                brief_card_from_row,
+            )
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// PHASE 5 (Brief): a Brief's labels (empty when unset).
     /// `NotFound` when the Brief doesn't exist.
     pub fn brief_labels(&self, task_id: &str) -> Result<Vec<String>, CoordinatorError> {
@@ -3275,10 +3317,21 @@ impl TaskStore {
             None,
             Some("companion"),
         )?;
-        // Allocate the human identifier from the per-company counter (§1.2).
+        // Allocate the human identifier from the per-company counter
+        // (§1.2). Fail-SOFT on purpose: the Brief row already exists and
+        // is fully usable without a `REL-N` display id; a counter-
+        // allocation hiccup must not abort an otherwise-valid Brief.
         let _ = self.assign_brief_ref(tenant, &task_id);
-        // Stamp the owning Guild/tenant for row-level isolation.
-        let _ = self.set_task_tenant(&task_id, tenant);
+        // Stamp the owning Guild/tenant for row-level isolation. This is
+        // REQUIRED: a Brief that cannot record its owning Guild must NOT
+        // exist as an unscoped row (it would resolve to the `default`
+        // Guild and leak across tenants). If the stamp fails, roll the
+        // freshly-created row back and surface the error.
+        if let Err(e) = self.set_task_tenant(&task_id, tenant) {
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            let _ = conn.execute("DELETE FROM tasks WHERE task_id = ?1", params![task_id]);
+            return Err(e);
+        }
         // Chronicle the creation distinctly (the activity feed's
         // first entry), then open it on the board.
         let _ = self.append_event(&task_id, "brief.created", title.trim());
@@ -8486,12 +8539,39 @@ fn map_edge_err(method: &str, e: CoordinatorError) -> HandlerOutcome {
     }
 }
 
+/// GROUP 6 (tenant isolation): deny a Brief operation when `task` is not
+/// in the caller's Guild. Returns the SAME not-found outcome a genuinely
+/// missing Brief would produce, so a cross-Guild row is indistinguishable
+/// from a non-existent one (no existence leak across tenants).
+fn deny_cross_tenant(
+    store: &TaskStore,
+    ctx: &InvocationCtx,
+    task: &str,
+    cap: &str,
+) -> Option<HandlerOutcome> {
+    match store.task_in_tenant(task, ctx.tenant_id_or_default()) {
+        Ok(true) => None,
+        Ok(false) => Some(map_edge_err(
+            cap,
+            CoordinatorError::NotFound(task.to_string()),
+        )),
+        Err(e) => Some(map_edge_err(cap, e)),
+    }
+}
+
 /// `brief.subbrief` — link `child` as a Sub-brief of `parent`. Arg `parent|child`.
 fn handle_brief_subbrief(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let (parent, child) = match parse_pair(ctx, "brief.subbrief") {
         Ok(p) => p,
         Err(o) => return o,
     };
+    // Both endpoints of the edge must belong to the caller's Guild.
+    if let Some(out) = deny_cross_tenant(store, ctx, parent, "brief.subbrief") {
+        return out;
+    }
+    if let Some(out) = deny_cross_tenant(store, ctx, child, "brief.subbrief") {
+        return out;
+    }
     match store.link_subbrief(parent, child) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.subbrief", e),
@@ -8505,6 +8585,12 @@ fn handle_brief_unsubbrief(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOut
         Ok(p) => p,
         Err(o) => return o,
     };
+    if let Some(out) = deny_cross_tenant(store, ctx, parent, "brief.unsubbrief") {
+        return out;
+    }
+    if let Some(out) = deny_cross_tenant(store, ctx, child, "brief.unsubbrief") {
+        return out;
+    }
     match store.unlink_subbrief(parent, child) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.unsubbrief", e),
@@ -8574,6 +8660,9 @@ fn handle_brief_set_labels(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOut
     if task.is_empty() {
         return invalid("brief.set_labels: task required (arg shape: task|csv)".to_string());
     }
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.set_labels") {
+        return out;
+    }
     let labels: Vec<&str> = parts
         .get(1)
         .copied()
@@ -8636,7 +8725,7 @@ fn handle_brief_by_label(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutco
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
-    match store.list_briefs_by_label(label, limit) {
+    match store.list_briefs_by_label_for_tenant(label, ctx.tenant_id_or_default(), limit) {
         Ok(rows) => match serde_json::to_vec(&rows) {
             Ok(b) => HandlerOutcome::Ok(b),
             Err(e) => internal(format!("brief.by_label encode: {e}")),
@@ -8660,6 +8749,9 @@ fn handle_brief_set_due(
     let task = parts.first().copied().unwrap_or("").trim();
     if task.is_empty() {
         return invalid("brief.set_due: task required (arg shape: task|epoch)".to_string());
+    }
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.set_due") {
+        return out;
     }
     // Manage gate: setting a due date controls another agent's work.
     if let Err(out) = manage_gate(store, agent_store, ctx, task) {
@@ -8741,6 +8833,9 @@ fn handle_brief_pin(
     if task.is_empty() {
         return invalid("brief.pin: task required (arg shape: task|0|1)".to_string());
     }
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.pin") {
+        return out;
+    }
     // Manage gate: pinning/unpinning controls another agent's work.
     if let Err(out) = manage_gate(store, agent_store, ctx, task) {
         return out;
@@ -8793,6 +8888,9 @@ fn handle_brief_subbrief_progress(store: &TaskStore, ctx: &InvocationCtx) -> Han
         Ok(p) => p,
         Err(o) => return o,
     };
+    if let Some(out) = deny_cross_tenant(store, ctx, parent, "brief.subbrief_progress") {
+        return out;
+    }
     match store.subbrief_progress(parent) {
         Ok(counts) => counts_to_json(counts),
         Err(e) => map_edge_err("brief.subbrief_progress", e),
@@ -8832,6 +8930,9 @@ fn handle_brief_subbriefs(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutc
         Ok(p) => p,
         Err(o) => return o,
     };
+    if let Some(out) = deny_cross_tenant(store, ctx, parent, "brief.subbriefs") {
+        return out;
+    }
     match store.list_subbriefs(parent) {
         Ok(ids) => HandlerOutcome::Ok(ids.join("\n").into_bytes()),
         Err(e) => map_edge_err("brief.subbriefs", e),
@@ -8848,6 +8949,13 @@ fn handle_brief_snag(
         Ok(p) => p,
         Err(o) => return o,
     };
+    // Both the blocked Brief and its blocker must be in the caller's Guild.
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.snag") {
+        return out;
+    }
+    if let Some(out) = deny_cross_tenant(store, ctx, blocker, "brief.snag") {
+        return out;
+    }
     // Manage gate: blocking another agent's Brief controls its work.
     if let Err(out) = manage_gate(store, agent_store, ctx, task) {
         return out;
@@ -8869,6 +8977,12 @@ fn handle_brief_unsnag(
         Ok(p) => p,
         Err(o) => return o,
     };
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.unsnag") {
+        return out;
+    }
+    if let Some(out) = deny_cross_tenant(store, ctx, blocker, "brief.unsnag") {
+        return out;
+    }
     // Manage gate: unblocking another agent's Brief controls its work.
     if let Err(out) = manage_gate(store, agent_store, ctx, task) {
         return out;
@@ -8885,6 +8999,9 @@ fn handle_brief_snags(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome 
         Ok(t) => t,
         Err(o) => return o,
     };
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.snags") {
+        return out;
+    }
     match store.list_snags(task) {
         Ok(ids) => HandlerOutcome::Ok(ids.join("\n").into_bytes()),
         Err(e) => map_edge_err("brief.snags", e),
@@ -8904,6 +9021,9 @@ fn handle_brief_set_snags(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutc
     let task = parts.first().copied().unwrap_or("").trim();
     if task.is_empty() {
         return invalid("brief.set_snags: task required (arg shape: task|b1,b2,…)".to_string());
+    }
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.set_snags") {
+        return out;
     }
     let blockers: Vec<&str> = parts
         .get(1)
@@ -8965,6 +9085,9 @@ fn handle_brief_dossier_add(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOu
     if parts.len() < 3 {
         return invalid("brief.dossier_add: expected `task_id|kind|title|body`".to_string());
     }
+    if let Some(out) = deny_cross_tenant(store, ctx, parts[0].trim(), "brief.dossier_add") {
+        return out;
+    }
     let body = parts.get(3).copied().unwrap_or("");
     match store.add_dossier(parts[0].trim(), parts[1].trim(), parts[2].trim(), body) {
         Ok(id) => HandlerOutcome::Ok(id.into_bytes()),
@@ -8978,6 +9101,9 @@ fn handle_brief_dossiers(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutco
         Ok(t) => t,
         Err(o) => return o,
     };
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.dossiers") {
+        return out;
+    }
     match store.list_dossiers(task) {
         Ok(rows) => match serde_json::to_vec(&rows) {
             Ok(b) => HandlerOutcome::Ok(b),
@@ -9000,6 +9126,9 @@ fn handle_brief_dossier_latest(store: &TaskStore, ctx: &InvocationCtx) -> Handle
     if task.is_empty() || kind.is_empty() {
         return invalid("brief.dossier_latest: expected `task_id|kind`".to_string());
     }
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.dossier_latest") {
+        return out;
+    }
     match store.latest_dossier(task, kind) {
         Ok(Some(d)) => match serde_json::to_vec(&d) {
             Ok(b) => HandlerOutcome::Ok(b),
@@ -9017,9 +9146,15 @@ fn handle_brief_dossier_get(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOu
         Err(o) => return o,
     };
     match store.get_dossier(doc_id) {
-        Ok(Some(d)) => match serde_json::to_vec(&d) {
-            Ok(b) => HandlerOutcome::Ok(b),
-            Err(e) => internal(format!("brief.dossier_get encode: {e}")),
+        // The arg is a doc_id; resolve it to its owning Brief and confirm
+        // that Brief is in the caller's Guild before returning the body.
+        Ok(Some(d)) => match store.task_in_tenant(&d.task_id, ctx.tenant_id_or_default()) {
+            Ok(true) => match serde_json::to_vec(&d) {
+                Ok(b) => HandlerOutcome::Ok(b),
+                Err(e) => internal(format!("brief.dossier_get encode: {e}")),
+            },
+            Ok(false) => invalid(format!("brief.dossier_get: not found: {doc_id}")),
+            Err(e) => map_edge_err("brief.dossier_get", e),
         },
         Ok(None) => invalid(format!("brief.dossier_get: not found: {doc_id}")),
         Err(e) => map_edge_err("brief.dossier_get", e),
@@ -9044,6 +9179,9 @@ fn handle_brief_set(
     }
     let field = parts[1].trim();
     let task_id = parts[0].trim();
+    if let Some(out) = deny_cross_tenant(store, ctx, task_id, "brief.set") {
+        return out;
+    }
     if field == "assignee" {
         // Assign-Key gate (company-model §5.2B / §5.3): setting the
         // assignee is a grant of work — only within the actor's
@@ -15926,6 +16064,215 @@ mod tests {
         ));
         assert!(matches!(
             handle_brief_detail(&s, &ctx_tenant(b.as_bytes(), "acme")),
+            HandlerOutcome::Err(_)
+        ));
+    }
+
+    #[test]
+    fn create_brief_always_stamps_tenant() {
+        // A Brief is always row-level stamped with its owning Guild; it is
+        // never created as an unscoped row that would resolve to `default`.
+        let s = TaskStore::in_memory().unwrap();
+        let id = s
+            .create_brief("acme", "Owned by acme", "subj", None, None, None, None)
+            .unwrap();
+        assert!(s.task_in_tenant(&id, "acme").unwrap());
+        assert!(!s.task_in_tenant(&id, "globex").unwrap());
+        // Crucially NOT visible to the default Guild — proving the stamp
+        // actually ran (a missing stamp would COALESCE to 'default').
+        assert!(!s.task_in_tenant(&id, "default").unwrap());
+        // An empty tenant normalises to the default Guild.
+        let d = s
+            .create_brief("", "Owned by default", "subj", None, None, None, None)
+            .unwrap();
+        assert!(s.task_in_tenant(&d, "default").unwrap());
+        assert!(!s.task_in_tenant(&d, "acme").unwrap());
+    }
+
+    #[test]
+    fn label_lookup_isolates_per_tenant() {
+        let s = TaskStore::in_memory().unwrap();
+        let a = s
+            .create_brief("acme", "Acme labeled", "subj", None, None, None, None)
+            .unwrap();
+        let b = s
+            .create_brief("globex", "Globex labeled", "subj", None, None, None, None)
+            .unwrap();
+        s.set_brief_labels(&a, &["urgent"]).unwrap();
+        s.set_brief_labels(&b, &["urgent"]).unwrap();
+        // Store variant isolates.
+        let acme = s
+            .list_briefs_by_label_for_tenant("urgent", "acme", 50)
+            .unwrap();
+        assert!(acme.iter().any(|c| c.task_id == a) && !acme.iter().any(|c| c.task_id == b));
+        // Handler routes through the caller's tenant.
+        let out = handle_brief_by_label(&s, &ctx_tenant(b"urgent|50", "globex"));
+        let rows: Vec<brief::BriefCard> = match out {
+            HandlerOutcome::Ok(body) => serde_json::from_slice(&body).unwrap(),
+            HandlerOutcome::Err(_) => panic!("by_label errored"),
+        };
+        assert!(rows.iter().any(|c| c.task_id == b) && !rows.iter().any(|c| c.task_id == a));
+    }
+
+    #[test]
+    fn brief_mutations_denied_across_tenant() {
+        let s = TaskStore::in_memory().unwrap();
+        let a = s
+            .create_brief("acme", "Acme work", "subj", None, None, None, None)
+            .unwrap();
+        let a2 = s
+            .create_brief("acme", "Acme blocker", "subj", None, None, None, None)
+            .unwrap();
+        let is_err = |o: HandlerOutcome| matches!(o, HandlerOutcome::Err(_));
+        let is_ok = |o: HandlerOutcome| matches!(o, HandlerOutcome::Ok(_));
+
+        // set_labels
+        assert!(is_err(handle_brief_set_labels(
+            &s,
+            &ctx_tenant(format!("{a}|bug").as_bytes(), "globex")
+        )));
+        assert!(is_ok(handle_brief_set_labels(
+            &s,
+            &ctx_tenant(format!("{a}|bug").as_bytes(), "acme")
+        )));
+        // set_due
+        assert!(is_err(handle_brief_set_due(
+            &s,
+            None,
+            &ctx_tenant(format!("{a}|1000").as_bytes(), "globex")
+        )));
+        assert!(is_ok(handle_brief_set_due(
+            &s,
+            None,
+            &ctx_tenant(format!("{a}|1000").as_bytes(), "acme")
+        )));
+        // pin
+        assert!(is_err(handle_brief_pin(
+            &s,
+            None,
+            &ctx_tenant(format!("{a}|1").as_bytes(), "globex")
+        )));
+        assert!(is_ok(handle_brief_pin(
+            &s,
+            None,
+            &ctx_tenant(format!("{a}|1").as_bytes(), "acme")
+        )));
+        // snag / set_snags (a blocked by a2, both acme)
+        assert!(is_err(handle_brief_snag(
+            &s,
+            None,
+            &ctx_tenant(format!("{a}|{a2}").as_bytes(), "globex")
+        )));
+        assert!(is_ok(handle_brief_snag(
+            &s,
+            None,
+            &ctx_tenant(format!("{a}|{a2}").as_bytes(), "acme")
+        )));
+        assert!(is_err(handle_brief_set_snags(
+            &s,
+            &ctx_tenant(format!("{a}|{a2}").as_bytes(), "globex")
+        )));
+        assert!(is_ok(handle_brief_set_snags(
+            &s,
+            &ctx_tenant(format!("{a}|{a2}").as_bytes(), "acme")
+        )));
+        // brief.set
+        assert!(is_err(handle_brief_set(
+            &s,
+            None,
+            &ctx_tenant(format!("{a}|priority|high").as_bytes(), "globex")
+        )));
+        assert!(is_ok(handle_brief_set(
+            &s,
+            None,
+            &ctx_tenant(format!("{a}|priority|high").as_bytes(), "acme")
+        )));
+    }
+
+    #[test]
+    fn brief_snag_denied_when_blocker_is_wrong_tenant() {
+        // The blocked Brief is acme, but the blocker is globex's — the
+        // edge write must be refused (no cross-Guild dependency).
+        let s = TaskStore::in_memory().unwrap();
+        let a = s
+            .create_brief("acme", "Acme", "subj", None, None, None, None)
+            .unwrap();
+        let b = s
+            .create_brief("globex", "Globex", "subj", None, None, None, None)
+            .unwrap();
+        assert!(matches!(
+            handle_brief_snag(&s, None, &ctx_tenant(format!("{a}|{b}").as_bytes(), "acme")),
+            HandlerOutcome::Err(_)
+        ));
+    }
+
+    #[test]
+    fn brief_dossier_add_and_read_denied_across_tenant() {
+        let s = TaskStore::in_memory().unwrap();
+        let a = s
+            .create_brief("acme", "Acme", "subj", None, None, None, None)
+            .unwrap();
+        // Cross-tenant dossier add is refused.
+        assert!(matches!(
+            handle_brief_dossier_add(
+                &s,
+                &ctx_tenant(format!("{a}|note|T|body").as_bytes(), "globex")
+            ),
+            HandlerOutcome::Err(_)
+        ));
+        // Same-tenant add returns the doc_id.
+        let doc_id = match handle_brief_dossier_add(
+            &s,
+            &ctx_tenant(format!("{a}|note|T|body").as_bytes(), "acme"),
+        ) {
+            HandlerOutcome::Ok(body) => String::from_utf8(body).unwrap(),
+            HandlerOutcome::Err(_) => panic!("dossier_add errored"),
+        };
+        // dossiers list + dossier_get are isolated by the owning Brief's Guild.
+        assert!(matches!(
+            handle_brief_dossiers(&s, &ctx_tenant(a.as_bytes(), "globex")),
+            HandlerOutcome::Err(_)
+        ));
+        assert!(matches!(
+            handle_brief_dossier_get(&s, &ctx_tenant(doc_id.as_bytes(), "globex")),
+            HandlerOutcome::Err(_)
+        ));
+        assert!(matches!(
+            handle_brief_dossier_get(&s, &ctx_tenant(doc_id.as_bytes(), "acme")),
+            HandlerOutcome::Ok(_)
+        ));
+    }
+
+    #[test]
+    fn brief_subbrief_denied_when_either_side_wrong_tenant() {
+        let s = TaskStore::in_memory().unwrap();
+        let a = s
+            .create_brief("acme", "Acme parent", "subj", None, None, None, None)
+            .unwrap();
+        let a2 = s
+            .create_brief("acme", "Acme child", "subj", None, None, None, None)
+            .unwrap();
+        let b = s
+            .create_brief("globex", "Globex", "subj", None, None, None, None)
+            .unwrap();
+        // Both sides acme + caller acme → Ok.
+        assert!(matches!(
+            handle_brief_subbrief(&s, &ctx_tenant(format!("{a}|{a2}").as_bytes(), "acme")),
+            HandlerOutcome::Ok(_)
+        ));
+        // Caller is the wrong Guild for the parent → Err.
+        assert!(matches!(
+            handle_brief_subbrief(&s, &ctx_tenant(format!("{a}|{a2}").as_bytes(), "globex")),
+            HandlerOutcome::Err(_)
+        ));
+        // Child belongs to another Guild → Err.
+        assert!(matches!(
+            handle_brief_subbrief(&s, &ctx_tenant(format!("{a}|{b}").as_bytes(), "acme")),
+            HandlerOutcome::Err(_)
+        ));
+        // unsubbrief is guarded the same way.
+        assert!(matches!(
+            handle_brief_unsubbrief(&s, &ctx_tenant(format!("{a}|{b}").as_bytes(), "acme")),
             HandlerOutcome::Err(_)
         ));
     }
