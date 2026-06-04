@@ -118,6 +118,7 @@ mod config_api;
 mod control_plane;
 mod credentials;
 mod cron;
+mod adapters;
 mod dashboard;
 mod dashboard_auth;
 mod delegate;
@@ -502,6 +503,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/board", get(spine::board_summary))
         .route("/v1/spine/board/:column", get(spine::board_column))
         .route("/v1/spine/roster", get(spine::roster_summary))
+        // Agent adapters (Rigs): which local coding-agent CLIs are
+        // registered + a live availability probe. Backs the dashboard
+        // Settings + Crew adapter panels.
+        .route("/v1/adapters", get(adapters::list))
         .route(
             "/v1/spine/mandates",
             get(spine::mandates).post(spine::create_mandate),

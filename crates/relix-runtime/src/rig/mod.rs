@@ -48,6 +48,10 @@ pub struct RigRunRequest {
     /// Clearance). Empty when no bridge is configured. A Rig injects
     /// it into the agent's environment at run time.
     pub bridge_token: String,
+    /// Optional per-run working directory override. When set it wins
+    /// over the Rig's configured `working_dir`. Validated (must exist +
+    /// be a directory) before spawn.
+    pub working_dir: Option<std::path::PathBuf>,
 }
 
 impl RigRunRequest {
@@ -64,6 +68,7 @@ impl RigRunRequest {
             prompt: prompt.into(),
             context: String::new(),
             bridge_token: String::new(),
+            working_dir: None,
         }
     }
 
@@ -76,6 +81,12 @@ impl RigRunRequest {
     /// Attach a bridge-back token (builder style).
     pub fn with_bridge_token(mut self, token: impl Into<String>) -> Self {
         self.bridge_token = token.into();
+        self
+    }
+
+    /// Pin the working directory for this run (builder style).
+    pub fn with_working_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.working_dir = Some(dir.into());
         self
     }
 }
@@ -403,11 +414,23 @@ pub struct ProcessRig {
     structured_output: bool,
     billing: RigBilling,
     install_hint: Option<String>,
+    /// Hard wall-clock cap on a single run. On expiry the child is
+    /// killed (cancellation) and the run reports a retryable timeout.
+    timeout: std::time::Duration,
+    /// Working directory the child runs in. `None` inherits the
+    /// coordinator's CWD; `Some(dir)` is validated (must be an existing
+    /// directory) before spawn. The per-run request can override this.
+    working_dir: Option<std::path::PathBuf>,
 }
 
 /// Default stdout cap for a process Rig — generous enough for a real
 /// agent's final answer, bounded enough to stop a firehose.
 pub const DEFAULT_RIG_MAX_OUTPUT_BYTES: usize = 256 * 1024;
+
+/// Default hard timeout for a single process-Rig run (10 minutes). A
+/// real coding agent can take minutes; anything past this is a runaway
+/// and gets killed.
+pub const DEFAULT_RIG_TIMEOUT_SECS: u64 = 600;
 
 impl ProcessRig {
     pub fn new(name: impl Into<String>, program: impl Into<String>, args: Vec<String>) -> Self {
@@ -420,7 +443,26 @@ impl ProcessRig {
             structured_output: false,
             billing: RigBilling::none(),
             install_hint: None,
+            timeout: std::time::Duration::from_secs(DEFAULT_RIG_TIMEOUT_SECS),
+            working_dir: None,
         }
+    }
+
+    /// Override the hard run timeout. Clamped to at least 1 second.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout.max(std::time::Duration::from_secs(1));
+        self
+    }
+
+    /// Pin the working directory the child runs in (builder style).
+    pub fn with_working_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.working_dir = Some(dir.into());
+        self
+    }
+
+    /// The configured run timeout.
+    pub fn timeout(&self) -> std::time::Duration {
+        self.timeout
     }
 
     /// Cap the captured stdout to `n` bytes (truncated on a char
@@ -498,8 +540,22 @@ impl Rig for ProcessRig {
     }
 
     fn run(&self, req: &RigRunRequest) -> RigOutcome {
-        use std::io::Write;
+        use std::io::{Read, Write};
         use std::process::{Command, Stdio};
+
+        // Resolve + validate the working directory. A per-run override
+        // wins over the Rig default. A configured-but-missing directory
+        // is a hard (non-retryable) failure — never silently fall back
+        // to the coordinator's CWD.
+        let working_dir = req.working_dir.as_ref().or(self.working_dir.as_ref());
+        if let Some(dir) = working_dir
+            && !dir.is_dir()
+        {
+            return RigOutcome::Failed {
+                reason: format!("working dir does not exist: {}", dir.display()),
+                retryable: false,
+            };
+        }
 
         let mut command = Command::new(&self.program);
         command
@@ -512,6 +568,9 @@ impl Rig for ProcessRig {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(dir) = working_dir {
+            command.current_dir(dir);
+        }
         if !req.bridge_token.is_empty() {
             command.env("RELIX_BRIDGE_TOKEN", &req.bridge_token);
         }
@@ -525,46 +584,198 @@ impl Rig for ProcessRig {
             }
         };
 
+        // Drain stdout/stderr on dedicated threads into shared buffers so
+        // a chatty child cannot deadlock by filling a pipe buffer while we
+        // wait. Buffers are read incrementally so a timeout can snapshot
+        // partial output WITHOUT joining the readers (a killed child's
+        // grandchild can keep the pipe open — joining would hang).
+        use std::sync::{Arc, Mutex};
+        let stdout_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let reader = |pipe: Option<std::process::ChildStdout>, buf: Arc<Mutex<Vec<u8>>>| {
+            pipe.map(|mut p| {
+                std::thread::spawn(move || {
+                    let mut tmp = [0u8; 8192];
+                    loop {
+                        match p.read(&mut tmp) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if let Ok(mut b) = buf.lock() {
+                                    b.extend_from_slice(&tmp[..n]);
+                                }
+                            }
+                        }
+                    }
+                })
+            })
+        };
+        let out_handle = reader(child.stdout.take(), stdout_buf.clone());
+        let err_handle = child.stderr.take().map(|mut p| {
+            let buf = stderr_buf.clone();
+            std::thread::spawn(move || {
+                let mut tmp = [0u8; 8192];
+                loop {
+                    match p.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if let Ok(mut b) = buf.lock() {
+                                b.extend_from_slice(&tmp[..n]);
+                            }
+                        }
+                    }
+                }
+            })
+        });
+
         // Pipe the prompt to the child, then close stdin (EOF).
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(req.prompt.as_bytes());
         }
 
-        let output = match child.wait_with_output() {
-            Ok(o) => o,
-            Err(e) => {
-                return RigOutcome::Failed {
-                    reason: format!("wait {}: {e}", self.program),
-                    retryable: true,
-                };
+        // Wait with a hard deadline. On expiry, KILL the child
+        // (cancellation) and report a retryable timeout.
+        let deadline = std::time::Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break None; // timed out
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    return RigOutcome::Failed {
+                        reason: format!("wait {}: {e}", self.program),
+                        retryable: true,
+                    };
+                }
             }
         };
 
-        let mut stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        // Cap the result so a runaway CLI can't flood context.
-        if stdout.len() > self.max_output_bytes {
-            let mut end = self.max_output_bytes;
-            while end > 0 && !stdout.is_char_boundary(end) {
-                end -= 1;
+        // Give the readers a brief grace to flush, then snapshot whatever
+        // they have — NEVER join unboundedly (a timed-out grandchild may
+        // hold the pipe open). Unfinished reader threads are detached and
+        // exit on their own when the pipe finally closes.
+        let grace = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        for h in [out_handle, err_handle].into_iter().flatten() {
+            while !h.is_finished() && std::time::Instant::now() < grace {
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            stdout.truncate(end);
         }
-        if output.status.success() {
-            RigOutcome::Done { summary: stdout }
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let code = output
-                .status
-                .code()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "signal".to_string());
-            let detail = if stderr.is_empty() { stdout } else { stderr };
-            RigOutcome::Failed {
-                reason: format!("exit {code}: {detail}"),
+        let out_bytes = stdout_buf.lock().map(|b| b.clone()).unwrap_or_default();
+        let err_bytes = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
+        let raw_stdout = String::from_utf8_lossy(&out_bytes).trim().to_string();
+        let raw_stderr = String::from_utf8_lossy(&err_bytes).trim().to_string();
+        // Redact obvious secrets BEFORE anything is persisted/returned.
+        let stdout = self.cap(redact_secrets(&raw_stdout, &req.bridge_token));
+        let stderr = self.cap(redact_secrets(&raw_stderr, &req.bridge_token));
+
+        match status {
+            None => RigOutcome::Failed {
+                reason: format!(
+                    "timed out after {}s (killed)",
+                    self.timeout.as_secs()
+                ),
                 retryable: true,
+            },
+            Some(status) if status.success() => RigOutcome::Done { summary: stdout },
+            Some(status) => {
+                let code = status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string());
+                let detail = if stderr.is_empty() { stdout } else { stderr };
+                RigOutcome::Failed {
+                    reason: format!("exit {code}: {detail}"),
+                    retryable: true,
+                }
             }
         }
     }
+}
+
+impl ProcessRig {
+    /// Truncate captured output to `max_output_bytes` on a char boundary.
+    fn cap(&self, mut s: String) -> String {
+        if s.len() > self.max_output_bytes {
+            let mut end = self.max_output_bytes;
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+        }
+        s
+    }
+}
+
+/// Redact obvious secrets from captured agent output before it is
+/// persisted to the Chronicle / returned to the dashboard. Heuristic but
+/// deliberately conservative: it never leaks the per-run bridge-back
+/// token and masks common API-key / token shapes.
+///
+/// - The literal `bridge_token` value (when non-empty) → `***`.
+/// - Tokens with well-known prefixes (`sk-`, `ghp_`, `gho_`, `xox`,
+///   `AKIA`, …) → `***`.
+/// - Any standalone high-entropy run of ≥ 40 hex/base64url chars → `***`.
+/// - `NAME_(KEY|TOKEN|SECRET|PASSWORD)=value` → keeps the name, masks
+///   the value.
+pub fn redact_secrets(text: &str, bridge_token: &str) -> String {
+    let mut pre = text.to_string();
+    if bridge_token.len() >= 8 {
+        pre = pre.replace(bridge_token, "***");
+    }
+    const PREFIXES: &[&str] = &["sk-", "ghp_", "gho_", "ghu_", "ghs_", "xox", "AKIA", "AIza"];
+    fn looks_secret(tok: &str) -> bool {
+        if PREFIXES.iter().any(|p| tok.starts_with(p)) && tok.len() >= 16 {
+            return true;
+        }
+        tok.len() >= 40
+            && tok
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            && tok.chars().any(|c| c.is_ascii_digit())
+    }
+    fn mask_word(word: &str) -> String {
+        // `NAME_(KEY|TOKEN|SECRET|PASSWORD)=value` → mask only the value.
+        if let Some((name, val)) = word.split_once('=') {
+            let up = name.to_ascii_uppercase();
+            if (up.contains("KEY") || up.contains("TOKEN") || up.contains("SECRET") || up.contains("PASSWORD"))
+                && val.len() >= 6
+            {
+                return format!("{name}=***");
+            }
+        }
+        if looks_secret(word) {
+            "***".to_string()
+        } else {
+            word.to_string()
+        }
+    }
+    // Walk the text emitting separators verbatim so newlines / tabs /
+    // multiple spaces (i.e. the agent's formatting) survive; only the
+    // word runs are inspected + possibly masked.
+    let is_word = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '=' | '.' | '/' | '+');
+    let mut out = String::with_capacity(pre.len());
+    let mut word = String::new();
+    for c in pre.chars() {
+        if is_word(c) {
+            word.push(c);
+        } else {
+            if !word.is_empty() {
+                out.push_str(&mask_word(&word));
+                word.clear();
+            }
+            out.push(c);
+        }
+    }
+    if !word.is_empty() {
+        out.push_str(&mask_word(&word));
+    }
+    out
 }
 
 // ── CLI subscription Rigs ─────────────────────────────────
@@ -753,14 +964,18 @@ mod tests {
     }
 
     #[test]
-    fn process_rig_injects_the_bridge_token_into_the_child_env() {
+    fn process_rig_injects_then_redacts_the_bridge_token() {
+        // The token IS injected into the child env (the child echoes it),
+        // and the captured output REDACTS it so it never reaches the
+        // Chronicle / dashboard. Seeing `***` proves both happened.
         let (prog, args) = echo_env_cmd("RELIX_BRIDGE_TOKEN");
         let rig = ProcessRig::new("test-env", prog, args);
         let req = RigRunRequest::new("brief_1", "agt_a", "g", "ignored")
-            .with_bridge_token("brt_secret123");
+            .with_bridge_token("brt_secret123long_enough");
         match rig.run(&req) {
             RigOutcome::Done { summary } => {
-                assert!(summary.contains("brt_secret123"), "got: {summary:?}")
+                assert!(!summary.contains("brt_secret123long_enough"), "token leaked: {summary:?}");
+                assert!(summary.contains("***"), "token should be redacted: {summary:?}");
             }
             other => panic!("expected Done, got {other:?}"),
         }
@@ -804,6 +1019,105 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn sleep_cmd(secs: u32) -> (String, Vec<String>) {
+        if cfg!(windows) {
+            // `timeout` needs a console; `ping` is the portable sleeper.
+            ("cmd".into(), vec!["/C".into(), format!("ping -n {} 127.0.0.1 >NUL", secs + 1)])
+        } else {
+            ("sh".into(), vec!["-c".into(), format!("sleep {secs}")])
+        }
+    }
+
+    #[test]
+    fn process_rig_times_out_and_kills_the_child() {
+        // A child that sleeps far longer than the timeout must be killed
+        // and reported as a retryable timeout — not hang the worker.
+        let (prog, args) = sleep_cmd(30);
+        let rig = ProcessRig::new("slow", prog, args)
+            .with_timeout(std::time::Duration::from_millis(400));
+        let started = std::time::Instant::now();
+        let outcome = rig.run(&RigRunRequest::new("b", "a", "g", "x"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "should not hang");
+        match outcome {
+            RigOutcome::Failed { retryable, reason } => {
+                assert!(retryable);
+                assert!(reason.contains("timed out"), "got: {reason}");
+            }
+            other => panic!("expected timeout Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_rig_rejects_missing_working_dir_non_retryably() {
+        let rig = ProcessRig::new("p", "echo", vec![]).with_working_dir("/relix/no/such/dir/xyzzy");
+        match rig.run(&RigRunRequest::new("b", "a", "g", "x")) {
+            RigOutcome::Failed { retryable, reason } => {
+                assert!(!retryable, "missing dir is a hard error");
+                assert!(reason.contains("working dir"), "got: {reason}");
+            }
+            other => panic!("expected dir Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_rig_honours_per_run_working_dir() {
+        // pwd-equivalent in the temp dir; the child should run there.
+        let tmp = tempfile::tempdir().unwrap();
+        let canon = std::fs::canonicalize(tmp.path()).unwrap();
+        let (prog, args) = if cfg!(windows) {
+            ("cmd".to_string(), vec!["/C".into(), "cd".into()])
+        } else {
+            ("sh".to_string(), vec!["-c".into(), "pwd".into()])
+        };
+        let rig = ProcessRig::new("cwd", prog, args);
+        let req = RigRunRequest::new("b", "a", "g", "x").with_working_dir(canon.clone());
+        match rig.run(&req) {
+            RigOutcome::Done { summary } => {
+                let leaf = canon.file_name().unwrap().to_string_lossy().to_string();
+                assert!(summary.contains(&leaf), "cwd {summary:?} should contain {leaf}");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_rig_passes_args_literally_no_shell_injection() {
+        // Args with shell metacharacters are passed as one literal argv
+        // entry — never interpreted by a shell. echo prints it verbatim.
+        let payload = "x; rm -rf / && echo pwned `whoami`";
+        let (prog, args) = echo_cmd(payload);
+        // The metacharacters live inside a single argv element, so there
+        // is no shell to act on them: the ProcessRig spawns the program
+        // directly (Command::new + args), not `sh -c <string>`.
+        let rig = ProcessRig::new("safe", prog, args.clone());
+        assert_eq!(rig.args(), args.as_slice());
+        // And running it just echoes the literal (no `pwned`, no deletion).
+        if let RigOutcome::Done { summary } = rig.run(&RigRunRequest::new("b", "a", "g", "x")) {
+            assert!(summary.contains("rm -rf"), "literal text preserved: {summary:?}");
+        }
+    }
+
+    #[test]
+    fn redact_secrets_masks_tokens_and_preserves_formatting() {
+        let bt = "deadbeefdeadbeef00000000";
+        let input = "ok line\nbridge=deadbeefdeadbeef00000000\nkey FAKE_TEST_FIXTURE_REDACTED\nplain word\nOPENAI_API_KEY=supersecretvalue\n";
+        let out = redact_secrets(input, bt);
+        assert!(!out.contains(bt), "bridge token leaked: {out}");
+        assert!(!out.contains("FAKE_TEST_FIXTURE_REDACTED"), "sk- token leaked: {out}");
+        assert!(!out.contains("supersecretvalue"), "env secret leaked: {out}");
+        assert!(out.contains("OPENAI_API_KEY=***"), "env name kept + masked: {out}");
+        // Formatting (newlines, the safe words) survives.
+        assert_eq!(out.lines().count(), input.lines().count());
+        assert!(out.contains("plain word"));
+        assert!(out.contains("ok line"));
+    }
+
+    #[test]
+    fn timeout_clamped_to_at_least_one_second() {
+        let rig = ProcessRig::new("p", "echo", vec![]).with_timeout(std::time::Duration::ZERO);
+        assert!(rig.timeout() >= std::time::Duration::from_secs(1));
     }
 
     #[test]

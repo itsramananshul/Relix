@@ -1353,6 +1353,26 @@ allow_groups = ["chat-users"]
 name = "spine_mandate_team_readiness"
 method = "mandate.team_readiness"
 allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_rig_list"
+method = "rig.list"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_rig_describe"
+method = "rig.describe"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_wakeup"
+method = "brief.wakeup"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_run"
+method = "brief.run"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_runs"
+method = "brief.runs"
+allow_groups = ["chat-users"]
 EOF
 
 # ---- 11. peers.toml ----
