@@ -1571,9 +1571,10 @@ fn command_for(spawn: &Spawnable, args: &[String]) -> std::process::Command {
 // login — **no inference key is injected**. This is the
 // subscription model from `docs/relix-agent-adapters.md`: run heavy
 // agents on a flat-rate Claude Max / ChatGPT (Codex) / Gemini
-// subscription instead of metered API. The flags here are the
-// starting shape; future refinements add availability / login
-// probing and structured-output parsing.
+// subscription instead of metered API. Availability + login probing
+// is implemented (see `ProcessRig::probe`), and Claude's `stream-json`
+// output IS parsed into a clean result (`RigOutputFormat::ClaudeStreamJson`
+// → `parse_claude_stream_json`); Codex/Gemini still return raw stdout.
 
 /// Absolute fallback paths to a real `claude` executable that PATH may
 /// not surface. On Windows, npm installs Claude Code as a `claude.cmd`
