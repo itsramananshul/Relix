@@ -9104,12 +9104,33 @@ fn register_node_type_handlers(
                         let st = st.clone();
                         async move {
                             let cfg = st.run_workspace_config();
+                            // Runtime-mode flags the dashboard surfaces so an
+                            // operator can see HOW runs execute: the unsafe
+                            // `inherit` opt-out + whether the autonomous
+                            // heartbeat loop is on. Read from the same env the
+                            // coordinator uses (stable deployment config).
+                            let inherit = std::env::var("RELIX_RUN_WORKSPACE_MODE")
+                                .map(|v| v.trim().eq_ignore_ascii_case("inherit"))
+                                .unwrap_or(false);
+                            let heartbeat_enabled = std::env::var("RELIX_HEARTBEAT_ENABLED")
+                                .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                                .unwrap_or(false);
+                            let heartbeat_interval_secs = std::env::var(
+                                "RELIX_HEARTBEAT_INTERVAL_SECS",
+                            )
+                            .ok()
+                            .and_then(|v| v.trim().parse::<u64>().ok())
+                            .filter(|n| *n >= 1)
+                            .unwrap_or(10);
                             let body = serde_json::json!({
                                 "context": cfg.context.as_str(),
                                 "project_root": cfg.project_root.to_string_lossy(),
                                 "max_bytes": cfg.max_bytes,
                                 "max_files": cfg.max_files,
                                 "workspace_root": st.run_workspace_root().to_string_lossy(),
+                                "inherit": inherit,
+                                "heartbeat_enabled": heartbeat_enabled,
+                                "heartbeat_interval_secs": heartbeat_interval_secs,
                             });
                             match serde_json::to_vec(&body) {
                                 Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
