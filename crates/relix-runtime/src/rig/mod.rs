@@ -240,6 +240,12 @@ pub struct ReadinessCheck {
     pub probe_args: Vec<String>,
     /// What to tell the operator when auth is the blocker.
     pub login_hint: String,
+    /// Optional SECOND, auth-verifying command (e.g. `auth status --text`).
+    /// When set, `available` additionally requires this command to report
+    /// a logged-in session — so an installed-but-logged-out CLI resolves
+    /// to `not_authenticated` instead of a misleading `available`. The
+    /// command must itself be noninteractive (text output, no prompt).
+    pub auth_args: Option<Vec<String>>,
 }
 
 /// Outcome of running a readiness command — the raw signals the
@@ -345,6 +351,105 @@ pub fn classify_readiness(sig: &ReadinessSignals) -> (&'static str, String) {
         "probe_failed",
         format!("readiness probe failed: {detail}"),
     )
+}
+
+/// Auth-status output that proves the CLI is **logged out**. Checked
+/// first because several of these contain a "logged in" substring
+/// (e.g. "you are not signed in" ⊃ "signed in").
+const AUTH_LOGGED_OUT: &[&str] = &[
+    "not logged in",
+    "not authenticated",
+    "unauthenticated",
+    "logged out",
+    "not signed in",
+    "please log in",
+    "please login",
+    "no credentials",
+    "login required",
+    "you are not",
+    "run `claude auth login`",
+    "run claude auth login",
+    "run `claude login`",
+    "401",
+];
+
+/// Auth-status output that proves the CLI is **logged in**.
+const AUTH_LOGGED_IN: &[&str] = &[
+    "logged in",
+    "authenticated",
+    "signed in",
+    "account",
+    "subscription",
+    "claude max",
+    "credentials found",
+    "active account",
+    "api key",
+];
+
+/// Classify readiness from a `--version` probe PLUS an optional
+/// auth-status probe. The version probe decides install/runs; only when
+/// the binary clearly runs do we consult auth. This is what makes a
+/// logged-in CLI `available` and an installed-but-logged-out CLI
+/// `not_authenticated` (instead of a misleading `available`). Pure +
+/// keyword-driven so it is unit-testable with mocked outputs.
+pub fn classify_readiness_with_auth(
+    version: &ReadinessSignals,
+    auth: Option<&ReadinessSignals>,
+) -> (&'static str, String) {
+    let (vstatus, vdetail) = classify_readiness(version);
+    // If the binary itself isn't cleanly runnable, the version verdict
+    // (missing / interactive_only / unsupported / probe_failed /
+    // not_authenticated-from-version) stands — auth is moot.
+    if vstatus != "available" {
+        return (vstatus, vdetail);
+    }
+    let Some(auth) = auth else {
+        return (vstatus, vdetail);
+    };
+    // The binary runs; interpret the auth-status command.
+    if auth.timed_out {
+        return (
+            "interactive_only",
+            "the auth-status check did not return — the CLI likely needs \
+             an interactive session and cannot confirm login headless"
+                .to_string(),
+        );
+    }
+    if auth.missing_binary || auth.spawn_error.is_some() {
+        // The binary ran for --version but the auth subcommand couldn't
+        // start (e.g. an older CLI without `auth status`). Don't claim
+        // logged-in, but don't block a clearly-installed binary either.
+        return ("available", format!("{vdetail}; auth status unavailable"));
+    }
+    let blob = format!("{}\n{}", auth.stdout, auth.stderr).to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| blob.contains(n));
+    // Logged-out FIRST (its phrases can contain a logged-in substring).
+    if has(AUTH_LOGGED_OUT) {
+        return (
+            "not_authenticated",
+            "installed but not logged in".to_string(),
+        );
+    }
+    if has(AUTH_LOGGED_IN) {
+        let line = auth
+            .stdout
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        return (
+            "available",
+            if line.is_empty() {
+                format!("{vdetail}; logged in")
+            } else {
+                format!("{vdetail}; {line}")
+            },
+        );
+    }
+    // The binary runs but the auth output is unrecognized — don't regress
+    // a working install on an unfamiliar status format; report available
+    // and say so honestly.
+    ("available", format!("{vdetail}; auth status unrecognized"))
 }
 
 /// A **Rig** — a pluggable agent backend. The uniform contract
@@ -565,6 +670,11 @@ pub struct ProcessRig {
     /// result (installed / needs-login / wants-TTY / broken) instead of
     /// only checking PATH.
     readiness: Option<ReadinessCheck>,
+    /// Extra absolute executable candidates tried when `PATH` resolution
+    /// finds no directly-spawnable `.exe` (e.g. Claude's npm-installed
+    /// real `claude.exe` deep under `node_modules`, which isn't on
+    /// `PATH`). See [`resolve_program`].
+    fallback_paths: Vec<std::path::PathBuf>,
 }
 
 /// How long a readiness probe command may run before it's treated as
@@ -594,6 +704,7 @@ impl ProcessRig {
             timeout: std::time::Duration::from_secs(DEFAULT_RIG_TIMEOUT_SECS),
             working_dir: None,
             readiness: None,
+            fallback_paths: Vec::new(),
         }
     }
 
@@ -604,7 +715,28 @@ impl ProcessRig {
         self.readiness = Some(ReadinessCheck {
             probe_args,
             login_hint: login_hint.into(),
+            auth_args: None,
         });
+        self
+    }
+
+    /// Add a SECOND, auth-verifying readiness command (e.g.
+    /// `["auth", "status", "--text"]`) on top of [`Self::with_readiness`].
+    /// With it set, `available` requires both `--version` to run AND this
+    /// command to report a logged-in session — so an installed-but-
+    /// logged-out CLI resolves to `not_authenticated`. No-op if
+    /// `with_readiness` wasn't called first.
+    pub fn with_auth_probe(mut self, auth_args: Vec<String>) -> Self {
+        if let Some(r) = self.readiness.as_mut() {
+            r.auth_args = Some(auth_args);
+        }
+        self
+    }
+
+    /// Add an absolute executable fallback path tried when `PATH` yields
+    /// no directly-spawnable `.exe` (Windows npm-shim resilience).
+    pub fn with_fallback_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.fallback_paths.push(path.into());
         self
     }
 
@@ -689,11 +821,17 @@ impl Rig for ProcessRig {
     }
 
     fn probe(&self) -> RigProbe {
-        // Without a readiness check this is a plain process Rig — a PATH
-        // existence check is all we can honestly assert.
+        // Resolve the program the SAME way `run` spawns it — honoring
+        // PATH+PATHEXT and the npm-shim fallback — so the probe can never
+        // report a binary the runner can't actually launch (the old bug:
+        // a `claude.cmd` shim "existed" but couldn't be spawned directly,
+        // so the probe lied `probe_failed`).
+        let resolved = resolve_program(&self.program, &self.fallback_paths);
+        // Without a readiness check this is a plain process Rig — a
+        // resolution check is all we can honestly assert.
         let Some(readiness) = &self.readiness else {
-            return if command_exists(&self.program) {
-                RigProbe::available(format!("{} found on PATH", self.program))
+            return if resolved.is_some() {
+                RigProbe::available(format!("{} found", self.program))
             } else {
                 RigProbe::with_status(
                     "missing_binary",
@@ -702,21 +840,22 @@ impl Rig for ProcessRig {
                 )
             };
         };
-        // A CLI adapter: actually run the noninteractive readiness command
-        // and classify the result.
-        if !command_exists(&self.program) {
+        // A CLI adapter: run the noninteractive readiness command(s)
+        // against the RESOLVED spawnable and classify the result.
+        let Some(spawn) = resolved else {
             return RigProbe::with_status(
                 "missing_binary",
                 format!("{} not found on PATH", self.program),
                 self.install_hint.clone(),
             );
-        }
-        let signals = run_readiness_probe(
-            &self.program,
-            &readiness.probe_args,
-            std::time::Duration::from_secs(READINESS_PROBE_TIMEOUT_SECS),
-        );
-        let (status, detail) = classify_readiness(&signals);
+        };
+        let timeout = std::time::Duration::from_secs(READINESS_PROBE_TIMEOUT_SECS);
+        let version = run_readiness_probe_spawnable(&spawn, &readiness.probe_args, timeout);
+        let auth = readiness
+            .auth_args
+            .as_ref()
+            .map(|a| run_readiness_probe_spawnable(&spawn, a, timeout));
+        let (status, detail) = classify_readiness_with_auth(&version, auth.as_ref());
         // Pick the most actionable hint for the resolved status.
         let hint = match status {
             "not_authenticated" => Some(readiness.login_hint.clone()),
@@ -728,7 +867,7 @@ impl Rig for ProcessRig {
 
     fn run(&self, req: &RigRunRequest) -> RigOutcome {
         use std::io::{Read, Write};
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
 
         // Resolve + validate the working directory. A per-run override
         // wins over the Rig default. A configured-but-missing directory
@@ -744,9 +883,17 @@ impl Rig for ProcessRig {
             };
         }
 
-        let mut command = Command::new(&self.program);
+        // Resolve the program to a spawnable (PATH+PATHEXT, npm-shim
+        // fallback, `.cmd`/`.bat` → `cmd.exe /C`). A non-resolvable
+        // program is a clear, non-retryable failure (it isn't installed).
+        let Some(spawn) = resolve_program(&self.program, &self.fallback_paths) else {
+            return RigOutcome::Failed {
+                reason: format!("{} not found on PATH", self.program),
+                retryable: false,
+            };
+        };
+        let mut command = command_for(&spawn, &self.args);
         command
-            .args(&self.args)
             // The agent learns its own scope from the environment;
             // the bridge token (when present) is how it calls Relix
             // back, scoped to exactly this Brief + Operative.
@@ -909,18 +1056,32 @@ pub fn run_readiness_probe(
     args: &[String],
     timeout: std::time::Duration,
 ) -> ReadinessSignals {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::sync::{Arc, Mutex};
-
-    if !command_exists(program) {
-        return ReadinessSignals {
+    // Resolve the same way `run` spawns (PATH+PATHEXT, `.cmd` → cmd.exe).
+    // No npm-shim fallbacks here — callers that need them pass a resolved
+    // [`Spawnable`] to [`run_readiness_probe_spawnable`].
+    match resolve_program(program, &[]) {
+        Some(spawn) => run_readiness_probe_spawnable(&spawn, args, timeout),
+        None => ReadinessSignals {
             missing_binary: true,
             ..Default::default()
-        };
+        },
     }
-    let mut child = match Command::new(program)
-        .args(args)
+}
+
+/// Run a readiness command against an already-resolved [`Spawnable`]
+/// (handles the `.cmd`/`.bat` → `cmd.exe /C` wrapping) and collect the
+/// raw [`ReadinessSignals`]. Stdin is closed (`null`); stdout/stderr are
+/// captured with a hard timeout (a hang → `timed_out`). Safe argv only.
+pub fn run_readiness_probe_spawnable(
+    spawn: &Spawnable,
+    args: &[String],
+    timeout: std::time::Duration,
+) -> ReadinessSignals {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+
+    let mut child = match command_for(spawn, args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1074,26 +1235,192 @@ pub fn redact_secrets(text: &str, bridge_token: &str) -> String {
 
 // ── CLI subscription Rigs ─────────────────────────────────
 //
-fn command_exists(program: &str) -> bool {
-    use std::path::Path;
+/// A resolved, spawnable program — *how* to invoke a CLI adapter, not
+/// just *whether* it exists. The distinction matters on Windows, where
+/// `claude` is an npm shim (`claude.cmd`) that `CreateProcess` (Rust's
+/// `Command`) cannot spawn directly: it must run through `cmd.exe /C`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Spawnable {
+    /// A directly-spawnable executable — an `.exe`/`.com` (or an
+    /// extensionless binary) on Windows, or any resolved binary on Unix.
+    /// Spawned via `Command::new(path)`.
+    Direct(std::path::PathBuf),
+    /// A Windows batch shim (`.cmd`/`.bat`). `CreateProcess` can't run
+    /// these directly, so it is spawned via `cmd.exe /C <shim> <args…>`
+    /// with each arg passed as a DISCRETE argv element (never a joined
+    /// shell string), so a Brief's content can't inject a command.
+    BatchShim(std::path::PathBuf),
+}
 
-    let candidate = Path::new(program);
-    if candidate.components().count() > 1 {
-        return candidate.is_file();
+/// The Windows executable extensions this resolver understands, in
+/// preference order (direct-spawnable first). Read from `PATHEXT` when
+/// set, falling back to the conventional default. Lowercased, deduped to
+/// the four we actually support.
+fn windows_exec_exts() -> Vec<String> {
+    let raw = std::env::var("PATHEXT")
+        .or_else(|_| std::env::var("Pathext"))
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let mut out: Vec<String> = Vec::new();
+    for e in raw.split(';') {
+        let e = e.trim().to_ascii_lowercase();
+        if matches!(e.as_str(), ".exe" | ".com" | ".bat" | ".cmd") && !out.contains(&e) {
+            out.push(e);
+        }
     }
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    let suffixes: Vec<&str> = if cfg!(windows) {
-        vec!["", ".exe", ".cmd", ".bat"]
+    if out.is_empty() {
+        out = vec![".com".into(), ".exe".into(), ".bat".into(), ".cmd".into()];
+    }
+    out
+}
+
+/// Classify an existing file path into a [`Spawnable`], or `None` if it
+/// isn't a file we know how to run. On Windows `.exe`/`.com`/(no ext) →
+/// `Direct`, `.cmd`/`.bat` → `BatchShim`. On Unix any existing file →
+/// `Direct`.
+fn classify_file(path: &std::path::Path) -> Option<Spawnable> {
+    if !path.is_file() {
+        return None;
+    }
+    if !cfg!(windows) {
+        return Some(Spawnable::Direct(path.to_path_buf()));
+    }
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("exe") | Some("com") => Some(Spawnable::Direct(path.to_path_buf())),
+        Some("cmd") | Some("bat") => Some(Spawnable::BatchShim(path.to_path_buf())),
+        None => Some(Spawnable::Direct(path.to_path_buf())),
+        _ => None,
+    }
+}
+
+/// Resolve a program name to a [`Spawnable`], honoring `PATH` + `PATHEXT`
+/// on Windows and **preferring a directly-spawnable `.exe`/`.com`** over
+/// a `.cmd`/`.bat` shim. `fallback_paths` are extra absolute candidates
+/// tried when `PATH` yields no direct executable (e.g. Claude's
+/// npm-installed real `claude.exe` deep under `node_modules`, which is
+/// not itself on `PATH`). Resolution order: (1) a `Direct` exe found on
+/// `PATH`, (2) a `Direct` exe from `fallback_paths`, (3) a `BatchShim`
+/// found on `PATH`, (4) any `fallback_paths` candidate (even a shim).
+///
+/// An explicit path (one containing a separator) is resolved as-is (with
+/// `PATHEXT` appended when it has no extension) and never falls back to
+/// `PATH`.
+pub fn resolve_program(program: &str, fallback_paths: &[std::path::PathBuf]) -> Option<Spawnable> {
+    use std::path::Path;
+    let p = Path::new(program);
+    let has_sep = program.contains('/') || program.contains('\\');
+    if has_sep || p.is_absolute() {
+        if let Some(s) = classify_file(p) {
+            return Some(s);
+        }
+        if cfg!(windows) && p.extension().is_none() {
+            for ext in windows_exec_exts() {
+                let cand = std::path::PathBuf::from(format!("{program}{ext}"));
+                if let Some(s) = classify_file(&cand) {
+                    return Some(s);
+                }
+            }
+        }
+        return None;
+    }
+    // Bare name: scan PATH dirs with the PATHEXT extension set.
+    let dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|pe| std::env::split_paths(&pe).collect())
+        .unwrap_or_default();
+    resolve_in_dirs(program, &dirs, &path_search_exts(), fallback_paths)
+}
+
+/// Extension set probed for a bare name, in preference order. On Windows
+/// `""` (an already-suffixed/extensionless match) plus the `PATHEXT`
+/// entries; on Unix just `""`.
+fn path_search_exts() -> Vec<String> {
+    if cfg!(windows) {
+        let mut v = vec![String::new()];
+        v.extend(windows_exec_exts());
+        v
     } else {
-        vec![""]
-    };
-    std::env::split_paths(&path).any(|dir| {
-        suffixes
-            .iter()
-            .any(|suffix| dir.join(format!("{program}{suffix}")).is_file())
-    })
+        vec![String::new()]
+    }
+}
+
+/// Core of [`resolve_program`] for a bare name, with the search dirs +
+/// extensions injected (so it is unit-testable without mutating the
+/// process-global `PATH`). Prefers a `Direct` exe (found anywhere in the
+/// search path, regardless of dir/PATHEXT order) over a `.cmd`/`.bat`
+/// shim, then a `Direct` fallback exe, then a PATH shim, then any
+/// fallback.
+fn resolve_in_dirs(
+    program: &str,
+    dirs: &[std::path::PathBuf],
+    exts: &[String],
+    fallback_paths: &[std::path::PathBuf],
+) -> Option<Spawnable> {
+    let mut shim: Option<Spawnable> = None;
+    for dir in dirs {
+        for ext in exts {
+            let cand = dir.join(format!("{program}{ext}"));
+            match classify_file(&cand) {
+                Some(s @ Spawnable::Direct(_)) => return Some(s),
+                // Remember the first shim, but keep scanning for a real exe.
+                Some(s @ Spawnable::BatchShim(_)) if shim.is_none() => shim = Some(s),
+                _ => {}
+            }
+        }
+    }
+    // No direct exe on PATH — prefer a fallback REAL exe over a PATH shim.
+    for fp in fallback_paths {
+        if let Some(s @ Spawnable::Direct(_)) = classify_file(fp) {
+            return Some(s);
+        }
+    }
+    if let Some(s) = shim {
+        return Some(s);
+    }
+    for fp in fallback_paths {
+        if let Some(s) = classify_file(fp) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// The trusted `cmd.exe` to wrap batch shims with — the one under
+/// `%SystemRoot%\System32`, never a `cmd` picked up from a hijacked
+/// `PATH`. Falls back to the bare name only if `SystemRoot` is unset.
+fn trusted_cmd_exe() -> std::path::PathBuf {
+    if let Some(root) = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("windir")) {
+        let p = std::path::PathBuf::from(root)
+            .join("System32")
+            .join("cmd.exe");
+        if p.is_file() {
+            return p;
+        }
+    }
+    std::path::PathBuf::from("cmd.exe")
+}
+
+/// Build a `Command` for a resolved [`Spawnable`] with safe argv. A
+/// `Direct` exe is invoked straight; a `BatchShim` is run via
+/// `cmd.exe /C <shim> <args…>` with each arg as a discrete element (no
+/// shell-string concatenation — a Brief's content cannot inject).
+fn command_for(spawn: &Spawnable, args: &[String]) -> std::process::Command {
+    use std::process::Command;
+    match spawn {
+        Spawnable::Direct(path) => {
+            let mut c = Command::new(path);
+            c.args(args);
+            c
+        }
+        Spawnable::BatchShim(path) => {
+            let mut c = Command::new(trusted_cmd_exe());
+            c.arg("/C").arg(path).args(args);
+            c
+        }
+    }
 }
 
 // The standard CLI Rigs, as ProcessRigs. Each spawns the operator's
@@ -1105,9 +1432,38 @@ fn command_exists(program: &str) -> bool {
 // starting shape; future refinements add availability / login
 // probing and structured-output parsing.
 
+/// Absolute fallback paths to a real `claude` executable that PATH may
+/// not surface. On Windows, npm installs Claude Code as a `claude.cmd`
+/// shim on PATH but ships the real launcher at
+/// `%APPDATA%\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe`
+/// — a directly-spawnable `.exe` the resolver prefers over the shim.
+fn claude_fallback_paths() -> Vec<std::path::PathBuf> {
+    let mut v = Vec::new();
+    if cfg!(windows)
+        && let Some(appdata) = std::env::var_os("APPDATA")
+    {
+        v.push(
+            std::path::PathBuf::from(appdata)
+                .join("npm")
+                .join("node_modules")
+                .join("@anthropic-ai")
+                .join("claude-code")
+                .join("bin")
+                .join("claude.exe"),
+        );
+    }
+    v
+}
+
 /// Claude Code on a Claude subscription. Prompt piped to stdin.
+///
+/// Readiness is a TWO-step check: `claude --version` (installed + runs)
+/// then `claude auth status --text` (logged in). On Windows the binary
+/// is resolved through PATH+PATHEXT (the `claude.cmd` npm shim) with a
+/// fallback to the real npm `claude.exe`, so a working install is never
+/// misreported as `probe_failed`.
 pub fn claude_rig() -> ProcessRig {
-    ProcessRig::new(
+    let mut rig = ProcessRig::new(
         "claude",
         "claude",
         vec![
@@ -1119,8 +1475,20 @@ pub fn claude_rig() -> ProcessRig {
     )
     .with_structured_output(true)
     .with_billing(RigBilling::subscription("anthropic", "5h/weekly"))
-    .with_install_hint("install Claude Code, then run `claude login`")
-    .with_readiness(vec!["--version".to_string()], "run `claude login` to authenticate")
+    .with_install_hint("install Claude Code (npm i -g @anthropic-ai/claude-code), then `claude auth login`")
+    .with_readiness(
+        vec!["--version".to_string()],
+        "run `claude auth login` to authenticate (check with `claude auth status --text`)",
+    )
+    .with_auth_probe(vec![
+        "auth".to_string(),
+        "status".to_string(),
+        "--text".to_string(),
+    ]);
+    for p in claude_fallback_paths() {
+        rig = rig.with_fallback_path(p);
+    }
+    rig
 }
 
 /// Codex on a ChatGPT / Codex subscription. Prompt piped via the
@@ -1306,16 +1674,19 @@ mod tests {
     }
 
     #[test]
-    fn process_rig_maps_spawn_failure_to_retryable_failed() {
+    fn process_rig_maps_missing_program_to_non_retryable_failed() {
+        // A program that resolves to nothing is detected BEFORE spawn and
+        // reported as a clear, non-retryable "not found" (retrying won't
+        // conjure an uninstalled binary) — not a transient spawn blip.
         let rig = ProcessRig::new("nope", "this-binary-does-not-exist-xyzzy", vec![]);
         let req = RigRunRequest::new("b", "a", "g", "x");
-        assert!(matches!(
-            rig.run(&req),
-            RigOutcome::Failed {
-                retryable: true,
-                ..
+        match rig.run(&req) {
+            RigOutcome::Failed { retryable, reason } => {
+                assert!(!retryable, "a missing binary is not retryable");
+                assert!(reason.contains("not found"), "reason: {reason}");
             }
-        ));
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     fn sleep_cmd(secs: u32) -> (String, Vec<String>) {
@@ -1668,5 +2039,186 @@ mod tests {
         let json = serde_json::to_string(&infos).unwrap();
         assert!(json.contains("box_level"));
         assert!(json.contains("subscription_included"));
+    }
+
+    // ── Windows-safe executable resolution ──────────────────────
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_shim_resolves_and_spawns_via_cmd_exe() {
+        // An npm shim on PATH (no real .exe) — the exact Claude-on-Windows
+        // case. It must resolve to a BatchShim and spawn through cmd.exe.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::File::create(tmp.path().join("claude.cmd")).unwrap();
+        let exts = vec![String::new(), ".exe".into(), ".cmd".into()];
+        let s = resolve_in_dirs("claude", &[tmp.path().to_path_buf()], &exts, &[])
+            .expect("the .cmd shim must resolve");
+        assert!(
+            matches!(&s, Spawnable::BatchShim(p) if p.ends_with("claude.cmd")),
+            "got {s:?}"
+        );
+        // Spawned via `cmd.exe /C <shim> <args…>` with discrete argv.
+        let cmd = command_for(&s, &["--version".to_string()]);
+        let prog = cmd.get_program().to_string_lossy().to_ascii_lowercase();
+        assert!(prog.ends_with("cmd.exe"), "prog={prog}");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[0], "/C");
+        assert!(args[1].to_ascii_lowercase().ends_with("claude.cmd"));
+        assert_eq!(args[2], "--version");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_direct_exe_preferred_over_cmd_shim() {
+        // A dir holding BOTH tool.cmd and tool.exe → the real .exe wins.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::File::create(tmp.path().join("tool.cmd")).unwrap();
+        std::fs::File::create(tmp.path().join("tool.exe")).unwrap();
+        let exts = vec![String::new(), ".exe".into(), ".cmd".into()];
+        let s = resolve_in_dirs("tool", &[tmp.path().to_path_buf()], &exts, &[]).unwrap();
+        assert!(
+            matches!(&s, Spawnable::Direct(p) if p.extension().unwrap() == "exe"),
+            "got {s:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_fallback_exe_beats_path_shim() {
+        // PATH has only the .cmd shim; the npm real claude.exe is the
+        // fallback. The directly-spawnable .exe must be preferred.
+        let path_dir = tempfile::tempdir().unwrap();
+        std::fs::File::create(path_dir.path().join("claude.cmd")).unwrap();
+        let fb_dir = tempfile::tempdir().unwrap();
+        let fb = fb_dir.path().join("claude.exe");
+        std::fs::File::create(&fb).unwrap();
+        let exts = vec![String::new(), ".exe".into(), ".cmd".into()];
+        let s = resolve_in_dirs(
+            "claude",
+            &[path_dir.path().to_path_buf()],
+            &exts,
+            &[fb.clone()],
+        )
+        .unwrap();
+        assert_eq!(s, Spawnable::Direct(fb), "the real .exe fallback should win over the .cmd shim");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_classify_file_by_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("a.exe");
+        std::fs::File::create(&exe).unwrap();
+        let cmd = tmp.path().join("a.cmd");
+        std::fs::File::create(&cmd).unwrap();
+        let bat = tmp.path().join("a.bat");
+        std::fs::File::create(&bat).unwrap();
+        assert!(matches!(classify_file(&exe), Some(Spawnable::Direct(_))));
+        assert!(matches!(classify_file(&cmd), Some(Spawnable::BatchShim(_))));
+        assert!(matches!(classify_file(&bat), Some(Spawnable::BatchShim(_))));
+        assert!(classify_file(&tmp.path().join("missing.exe")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_resolves_bare_name_to_direct() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("mytool");
+        std::fs::File::create(&bin).unwrap();
+        let s = resolve_in_dirs("mytool", &[tmp.path().to_path_buf()], &[String::new()], &[]).unwrap();
+        assert_eq!(s, Spawnable::Direct(bin));
+    }
+
+    // ── Claude two-step (version + auth) readiness classification ──
+
+    #[test]
+    fn claude_logged_in_auth_status_is_available() {
+        let v = sig(true, "2.1.159 (Claude Code)", "");
+        let auth = sig(true, "Logged in\nAccount: a@b.com\nPlan: Claude Max", "");
+        let (status, detail) = classify_readiness_with_auth(&v, Some(&auth));
+        assert_eq!(status, "available", "detail={detail}");
+    }
+
+    #[test]
+    fn claude_logged_out_auth_status_is_not_authenticated() {
+        let v = sig(true, "2.1.159 (Claude Code)", "");
+        for auth in [
+            sig(true, "Not logged in. Run `claude auth login` to sign in.", ""),
+            sig(false, "", "You are not signed in"),
+            sig(true, "unauthenticated", ""),
+        ] {
+            assert_eq!(
+                classify_readiness_with_auth(&v, Some(&auth)).0,
+                "not_authenticated",
+                "auth={auth:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_auth_status_hang_is_interactive_only() {
+        let v = sig(true, "2.1.159 (Claude Code)", "");
+        let auth = ReadinessSignals { timed_out: true, ..Default::default() };
+        assert_eq!(
+            classify_readiness_with_auth(&v, Some(&auth)).0,
+            "interactive_only"
+        );
+    }
+
+    #[test]
+    fn auth_unavailable_or_absent_does_not_block_installed_binary() {
+        let v = sig(true, "2.1.159 (Claude Code)", "");
+        // An older CLI lacking `auth status` (the auth probe can't spawn)
+        // must not block a clearly-installed binary.
+        let auth = ReadinessSignals {
+            spawn_error: Some("not a subcommand".into()),
+            ..Default::default()
+        };
+        assert_eq!(classify_readiness_with_auth(&v, Some(&auth)).0, "available");
+        // No auth probe configured at all → the version verdict stands.
+        assert_eq!(classify_readiness_with_auth(&v, None).0, "available");
+    }
+
+    #[test]
+    fn spawn_failure_is_probe_failed_not_missing_install() {
+        // The ORIGINAL bug: a resolvable-but-unspawnable program looked
+        // like it "could not spawn" and was reported probe_failed — but it
+        // must NEVER be classified missing_binary (which would wrongly
+        // tell the operator to install something already present).
+        let v = ReadinessSignals {
+            spawn_error: Some("program not found".into()),
+            ..Default::default()
+        };
+        let (status, _) = classify_readiness_with_auth(&v, None);
+        assert_eq!(status, "probe_failed");
+        assert_ne!(status, "missing_binary");
+    }
+
+    #[test]
+    fn claude_rig_uses_two_step_readiness_and_windows_fallback() {
+        let rig = claude_rig();
+        let r = rig.readiness.as_ref().expect("claude has a readiness check");
+        assert_eq!(r.probe_args, vec!["--version".to_string()]);
+        assert_eq!(
+            r.auth_args.as_deref(),
+            Some(&["auth".to_string(), "status".to_string(), "--text".to_string()][..])
+        );
+        assert!(r.login_hint.contains("claude auth login"), "hint: {}", r.login_hint);
+        assert!(
+            rig.install_hint.as_deref().unwrap().contains("claude auth login"),
+            "install hint should reference auth login"
+        );
+        if cfg!(windows) {
+            assert!(
+                rig.fallback_paths
+                    .iter()
+                    .any(|p| p.to_string_lossy().contains("claude.exe")),
+                "windows claude should carry an npm claude.exe fallback: {:?}",
+                rig.fallback_paths
+            );
+        }
     }
 }
