@@ -27,6 +27,7 @@ interface RunRecord {
   apply_note?: string;
   applied_files?: number;
   failed_files?: number;
+  trigger?: string;
 }
 
 // One file in a safe-apply plan (`/v1/runs/:id/diff` → plan.items).
@@ -140,6 +141,19 @@ function ctxLabel(r: RunRecord): string {
   return `copy_repo · ${files} files · ${kb} KB`;
 }
 
+// What triggered a run. `heartbeat` = autonomous timer dispatch; `manual` =
+// an operator hit Run. Same ledger, same pipeline — only the source differs.
+const TRIGGER_TONE: Record<string, string> = {
+  manual: "todo",
+  heartbeat: "in_progress",
+  scheduled: "in_progress",
+};
+function triggerLabel(t?: string): string {
+  if (!t || t === "unknown") return "—";
+  if (t === "heartbeat") return "auto";
+  return t;
+}
+
 // Run status → badge tone. `running` is in-flight; the rest are terminal.
 const TONE: Record<string, string> = {
   running: "in_progress",
@@ -173,9 +187,11 @@ function fmtDuration(r: RunRecord): string {
 }
 
 const FILTERS = ["all", "running", "done", "failed", "cancelled", "continued"] as const;
+const TRIGGERS = ["all", "manual", "heartbeat"] as const;
 
 export function Runs() {
   const [filter, setFilter] = useState<(typeof FILTERS)[number]>("all");
+  const [triggerFilter, setTriggerFilter] = useState<(typeof TRIGGERS)[number]>("all");
   const [expanded, setExpanded] = useState<string | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [eventsLoading, setEventsLoading] = useState(false);
@@ -282,10 +298,13 @@ export function Runs() {
   }
 
   const allRuns = data?.runs ?? [];
-  const runs = filter === "all" ? allRuns : allRuns.filter((r) => r.status === filter);
+  const runs = allRuns
+    .filter((r) => filter === "all" || r.status === filter)
+    .filter((r) => triggerFilter === "all" || (r.trigger ?? "manual") === triggerFilter);
   const adaptersAvail = (data?.adapters ?? []).filter((a) => a.probe?.status === "available");
   const activeCount = allRuns.filter((r) => r.status === "running").length;
-  const COLS = 10;
+  const autoCount = allRuns.filter((r) => r.trigger === "heartbeat").length;
+  const COLS = 11;
 
   return (
     <div className="grid">
@@ -303,6 +322,9 @@ export function Runs() {
         {activeCount > 0 && (
           <div className="banner info">{activeCount} run(s) in flight — click a run to follow its transcript; refresh to update.</div>
         )}
+        {autoCount > 0 && (
+          <div className="banner info">{autoCount} autonomous (heartbeat) run(s) — same ledger as manual runs; reviewable + applicable.</div>
+        )}
 
         <div className="card">
           <div className="row" style={{ marginBottom: 8 }}>
@@ -316,6 +338,17 @@ export function Runs() {
                   onClick={() => setFilter(f)}
                 >
                   {f}
+                </button>
+              ))}
+              <span className="muted" style={{ margin: "0 4px" }}>·</span>
+              {TRIGGERS.map((t) => (
+                <button
+                  key={t}
+                  className={"btn sm " + (triggerFilter === t ? "" : "ghost")}
+                  onClick={() => setTriggerFilter(t)}
+                  title="filter by trigger source"
+                >
+                  {t === "heartbeat" ? "auto" : t}
                 </button>
               ))}
             </div>
@@ -334,6 +367,7 @@ export function Runs() {
                 <tr>
                   <th></th>
                   <th>Status</th>
+                  <th>Trigger</th>
                   <th>Adapter</th>
                   <th>Brief</th>
                   <th>Operative</th>
@@ -357,6 +391,11 @@ export function Runs() {
                           {r.status === "done" && r.review && r.review !== "pending_review" && (
                             <span className={"badge " + (r.review === "accepted" ? "done" : "blocked")} style={{ fontSize: 9, marginLeft: 4 }} title={"review: " + r.review}>{r.review === "accepted" ? "✓" : "✕"}</span>
                           )}
+                        </td>
+                        <td>
+                          <span className={"badge " + (TRIGGER_TONE[r.trigger ?? ""] ?? "todo")} style={{ fontSize: 9 }} title={"trigger: " + (r.trigger ?? "unknown")}>
+                            {triggerLabel(r.trigger)}
+                          </span>
                         </td>
                         <td className="muted">{r.rig || "—"}</td>
                         <td className="mono">{(r.brief_id ?? "").slice(0, 12)}</td>
