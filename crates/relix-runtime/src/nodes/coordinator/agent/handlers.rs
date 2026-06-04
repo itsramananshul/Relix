@@ -840,76 +840,100 @@ pub fn handle_orchestrate(
         .take(max_briefs.saturating_sub(1).max(1))
         .collect();
 
-    // Existing Briefs under this Mandate, by title (idempotency key).
-    let existing = task_store
-        .list_briefs_by_mandate(mandate_id, 500)
-        .unwrap_or_default();
-    let mut by_title: std::collections::HashMap<String, (String, Option<String>)> = existing
-        .into_iter()
-        .map(|c| (c.title.clone(), (c.task_id, c.assignee_agent_id)))
-        .collect();
-
     let create_allowed = ready && !dry_run && matches!(mode, "create_briefs" | "assign_ready");
     let assign_allowed = ready && !dry_run && mode == "assign_ready";
     let owner_subject = ctx.caller.subject_id.to_string();
     let parent_title = format!("Execute Mandate: {}", mandate.title);
 
-    // All planned titles (parent + children) → the input signature.
-    let mut all_titles: Vec<String> = vec![parent_title.clone()];
-    for (role, _) in &track_list {
-        all_titles.push(role_track_title(role, &mandate.title));
-    }
+    // ── Stable source markers (company-model §4.6) ───────────────
+    // Idempotency keys are derived from the Mandate id + role key, NOT
+    // from title text — so a Mandate rename or a manual Brief-title edit
+    // never causes a rerun to lose track of the existing tree.
+    let parent_marker = format!("mandate:{mandate_id}:parent");
+    // (display role, active agent, child marker, child title)
+    let child_plan: Vec<(Option<String>, String, String)> = track_list
+        .iter()
+        .map(|(role, agent)| {
+            let role_key = role.trim().to_ascii_lowercase();
+            let marker = format!("mandate:{mandate_id}:role:{role_key}");
+            let title = role_track_title(role, &mandate.title);
+            (agent.clone(), marker, title)
+        })
+        .collect();
+
+    // The input signature is built from the *markers* (rename-stable),
+    // the mode and the plan id — not the mutable title text.
+    let mut all_markers: Vec<String> = vec![parent_marker.clone()];
+    all_markers.extend(child_plan.iter().map(|(_, m, _)| m.clone()));
     let plan_id = view
         .plan
         .as_ref()
         .map(|p| p.plan_id.clone())
         .unwrap_or_default();
-    let signature = orchestration_signature(mandate_id, mode, &plan_id, &all_titles);
+    let signature = orchestration_signature(mandate_id, mode, &plan_id, &all_markers);
+    // The marker keys this run reasoned about (persisted for debugging).
+    let mut markers_used: Vec<String> = Vec::with_capacity(all_markers.len());
 
-    // Helper: get-or-create a Brief by title under the Mandate.
-    // Returns (task_id, was_existing) or None when creation is not
-    // allowed and it does not exist (dry_run/plan_only/blocked).
-    let mut ensure_brief = |title: &str,
-                            created: &mut Vec<serde_json::Value>,
-                            existing_out: &mut Vec<serde_json::Value>,
-                            skipped_out: &mut Vec<serde_json::Value>|
+    // Helper: get-or-create a Brief by its stable source marker.
+    // Returns (task_id, was_existing, current_assignee) or None when
+    // creation is not allowed and it does not yet exist. Reuse is by
+    // marker only; a reused Brief's title is left untouched so manual
+    // user edits are never clobbered.
+    let ensure_marked = |marker: &str,
+                         title: &str,
+                         created: &mut Vec<serde_json::Value>,
+                         existing_out: &mut Vec<serde_json::Value>,
+                         skipped_out: &mut Vec<serde_json::Value>|
      -> Option<(String, bool, Option<String>)> {
-        if let Some((id, assignee)) = by_title.get(title).cloned() {
-            existing_out.push(serde_json::json!({"task_id": id, "title": title}));
-            return Some((id, true, assignee));
+        match task_store.get_brief_by_source_marker(marker) {
+            Ok(Some(card)) => {
+                existing_out.push(serde_json::json!({
+                    "task_id": card.task_id, "title": card.title, "marker": marker,
+                }));
+                return Some((card.task_id, true, card.assignee_agent_id));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                skipped_out
+                    .push(serde_json::json!({"marker": marker, "reason": format!("lookup: {e}")}));
+                return None;
+            }
         }
         if !create_allowed {
             skipped_out.push(serde_json::json!({
                 "title": title,
+                "marker": marker,
                 "reason": if dry_run { "dry_run: would create" }
                           else if !ready { "team not ready" }
                           else { "plan_only: not created" },
             }));
             return None;
         }
-        match task_store.create_brief(
+        match task_store.create_brief_with_marker(
             tenant,
             title,
             &owner_subject,
-            None,
             Some(mandate_id),
-            None,
-            None,
+            "mandate_orchestration",
+            marker,
         ) {
             Ok(id) => {
-                created.push(serde_json::json!({"task_id": id, "title": title}));
-                by_title.insert(title.to_string(), (id.clone(), None));
+                created.push(serde_json::json!({"task_id": id, "title": title, "marker": marker}));
                 Some((id, false, None))
             }
             Err(e) => {
-                skipped_out.push(serde_json::json!({"title": title, "reason": e.to_string()}));
+                skipped_out.push(
+                    serde_json::json!({"title": title, "marker": marker, "reason": e.to_string()}),
+                );
                 None
             }
         }
     };
 
-    // Parent Brief.
-    let parent = ensure_brief(
+    // Parent Brief (marker `mandate:{id}:parent`).
+    markers_used.push(parent_marker.clone());
+    let parent = ensure_marked(
+        &parent_marker,
         &parent_title,
         &mut created_briefs,
         &mut existing_briefs,
@@ -931,11 +955,12 @@ pub fn handle_orchestrate(
         let _ = task_store.add_dossier(parent_id, "orchestration", "Orchestration plan", &body);
     }
 
-    // Child Briefs per role track.
-    for (role, active_agent) in &track_list {
-        let title = role_track_title(role, &mandate.title);
-        let child = ensure_brief(
-            &title,
+    // Child Briefs per role track (marker `mandate:{id}:role:{role_key}`).
+    for (active_agent, marker, title) in &child_plan {
+        markers_used.push(marker.clone());
+        let child = ensure_marked(
+            marker,
+            title,
             &mut created_briefs,
             &mut existing_briefs,
             &mut skipped,
@@ -1007,6 +1032,7 @@ pub fn handle_orchestrate(
     let to_json =
         |v: &[serde_json::Value]| serde_json::to_string(&v).unwrap_or_else(|_| "[]".into());
     let actions_json = serde_json::to_string(&next_actions).unwrap_or_else(|_| "[]".into());
+    let markers_json = serde_json::to_string(&markers_used).unwrap_or_else(|_| "[]".into());
     let run_id = match spine_store.record_orchestration_run(&OrchestrationRunRecord {
         tenant_id: tenant,
         mandate_id,
@@ -1015,7 +1041,10 @@ pub fn handle_orchestrate(
         input_signature: &signature,
         status,
         created_brief_ids_json: &to_json(&created_briefs),
+        existing_brief_ids_json: &to_json(&existing_briefs),
         assigned_brief_ids_json: &to_json(&assigned_briefs),
+        skipped_json: &to_json(&skipped),
+        source_markers_json: &markers_json,
         blockers_json: &to_json(&blockers),
         next_actions_json: &actions_json,
     }) {
@@ -1039,6 +1068,7 @@ pub fn handle_orchestrate(
         "assigned_briefs": assigned_briefs,
         "existing_briefs": existing_briefs,
         "skipped": skipped,
+        "source_markers": markers_used,
         "next_actions": next_actions,
     });
     match serde_json::to_vec(&body) {
@@ -3264,6 +3294,166 @@ mod tests {
         );
         // Same inputs → same signature.
         assert_eq!(first["input_signature"], second["input_signature"]);
+        // Stable source markers were recorded for the run.
+        let markers = second["source_markers"].as_array().unwrap();
+        assert!(
+            markers
+                .iter()
+                .any(|mk| mk.as_str().unwrap_or("").ends_with(":parent")),
+            "the parent marker must be present: {second}"
+        );
+        assert!(
+            markers
+                .iter()
+                .any(|mk| mk.as_str().unwrap_or("").contains(":role:engineer")),
+            "the engineer child marker must be present: {second}"
+        );
+        let latest = spine
+            .latest_orchestration_run("default", &m)
+            .unwrap()
+            .unwrap();
+        // The run record distinguishes reused from created.
+        assert_eq!(
+            latest.to_json()["created_brief_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            latest.to_json()["existing_brief_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn orchestrate_reuses_marked_tree_after_mandate_rename() {
+        // A Mandate rename must NOT cause a rerun to duplicate the tree:
+        // dedup is by stable source marker, not by title text.
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, _agent) = ready_team(&agents, &spine, "engineer");
+        let first = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        assert_eq!(first["created_briefs"].as_array().unwrap().len(), 2);
+        let before = tasks.list_briefs_by_mandate(&m, 50).unwrap().len();
+        // Rename the Mandate (changes the would-be Brief titles).
+        spine
+            .update_mandate_field(&m, "title", "Totally Different Name")
+            .unwrap();
+        let second = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        assert!(
+            second["created_briefs"].as_array().unwrap().is_empty(),
+            "a rename must not duplicate the tree"
+        );
+        assert_eq!(second["existing_briefs"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            tasks.list_briefs_by_mandate(&m, 50).unwrap().len(),
+            before,
+            "no duplicate Briefs after a Mandate rename"
+        );
+    }
+
+    #[test]
+    fn orchestrate_reuses_marked_tree_after_manual_brief_title_edit() {
+        // A manual Brief-title edit must NOT defeat dedup either.
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, _agent) = ready_team(&agents, &spine, "engineer");
+        orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        let cards = tasks.list_briefs_by_mandate(&m, 50).unwrap();
+        assert_eq!(cards.len(), 2);
+        // An operator renames every Brief by hand.
+        for c in &cards {
+            tasks
+                .set_brief_field(&c.task_id, "title", &format!("Hand-edited {}", c.task_id))
+                .unwrap();
+        }
+        let second = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        assert!(
+            second["created_briefs"].as_array().unwrap().is_empty(),
+            "manual title edits must not duplicate the tree"
+        );
+        assert_eq!(second["existing_briefs"].as_array().unwrap().len(), 2);
+        // The user's hand-edited titles are preserved (not clobbered).
+        let after = tasks.list_briefs_by_mandate(&m, 50).unwrap();
+        assert_eq!(after.len(), 2);
+        assert!(
+            after.iter().all(|c| c.title.starts_with("Hand-edited ")),
+            "a reused Brief's title must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn orchestrate_recovers_from_partial_crash_parent_only() {
+        // Simulate a crash after the parent was created+marked but before
+        // any children: a rerun must create only the missing children.
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, _agent) = ready_team(&agents, &spine, "engineer");
+        // Hand-create just the parent with its stable marker.
+        let parent_marker = format!("mandate:{m}:parent");
+        let parent_id = tasks
+            .create_brief_with_marker(
+                "default",
+                "Execute Mandate: Ship",
+                "operator",
+                Some(&m),
+                "mandate_orchestration",
+                &parent_marker,
+            )
+            .unwrap();
+        // Rerun: parent is reused, the engineering child is created.
+        let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        let created = v["created_briefs"].as_array().unwrap();
+        let existing = v["existing_briefs"].as_array().unwrap();
+        assert_eq!(created.len(), 1, "only the missing child is created");
+        assert_eq!(existing.len(), 1, "the pre-existing parent is reused");
+        assert_eq!(existing[0]["task_id"], parent_id);
+        assert_eq!(
+            tasks.list_briefs_by_mandate(&m, 50).unwrap().len(),
+            2,
+            "no duplicate parent"
+        );
+    }
+
+    #[test]
+    fn orchestrate_reuses_child_with_different_title() {
+        // A child that already exists under its marker but with a
+        // different title is reused, not recreated.
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, _agent) = ready_team(&agents, &spine, "engineer");
+        // Pre-seed the engineering child with a bespoke title + marker.
+        let child_marker = format!("mandate:{m}:role:engineer");
+        let child_id = tasks
+            .create_brief_with_marker(
+                "default",
+                "A completely bespoke child title",
+                "operator",
+                Some(&m),
+                "mandate_orchestration",
+                &child_marker,
+            )
+            .unwrap();
+        let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        // The parent is new; the child is reused by marker despite its
+        // unrelated title.
+        assert_eq!(v["created_briefs"].as_array().unwrap().len(), 1);
+        let existing = v["existing_briefs"].as_array().unwrap();
+        assert!(
+            existing
+                .iter()
+                .any(|b| b["task_id"] == serde_json::json!(child_id)),
+            "the marked child must be reused: {v}"
+        );
+        assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), 2);
     }
 
     #[test]

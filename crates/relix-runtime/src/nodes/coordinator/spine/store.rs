@@ -191,8 +191,16 @@ pub struct OrchestrationRun {
     pub status: String,
     /// JSON array of created Brief task_ids.
     pub created_brief_ids: String,
+    /// JSON array of **reused** (already-marked) Brief task_ids — Briefs
+    /// the run recognized by source marker instead of recreating.
+    pub existing_brief_ids: String,
     /// JSON array of assigned Brief task_ids.
     pub assigned_brief_ids: String,
+    /// JSON array of skipped-role objects (role + reason) the run could
+    /// not act on (e.g. no ready agent).
+    pub skipped: String,
+    /// JSON array of the stable source-marker keys the run touched.
+    pub source_markers: String,
     /// JSON array of blocker objects.
     pub blockers: String,
     /// JSON array of next-action strings.
@@ -214,7 +222,10 @@ impl OrchestrationRun {
             "input_signature": self.input_signature,
             "status": self.status,
             "created_brief_ids": arr(&self.created_brief_ids),
+            "existing_brief_ids": arr(&self.existing_brief_ids),
             "assigned_brief_ids": arr(&self.assigned_brief_ids),
+            "skipped": arr(&self.skipped),
+            "source_markers": arr(&self.source_markers),
             "blockers": arr(&self.blockers),
             "next_actions": arr(&self.next_actions),
             "created_at": self.created_at,
@@ -232,7 +243,10 @@ pub struct OrchestrationRunRecord<'a> {
     pub input_signature: &'a str,
     pub status: &'a str,
     pub created_brief_ids_json: &'a str,
+    pub existing_brief_ids_json: &'a str,
     pub assigned_brief_ids_json: &'a str,
+    pub skipped_json: &'a str,
+    pub source_markers_json: &'a str,
     pub blockers_json: &'a str,
     pub next_actions_json: &'a str,
 }
@@ -548,9 +562,9 @@ impl SpineStore {
         conn.execute(
             "INSERT INTO mandate_orchestration_runs (
                  run_id, tenant_id, mandate_id, mode, dry_run, input_signature,
-                 status, created_brief_ids, assigned_brief_ids, blockers,
-                 next_actions, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 status, created_brief_ids, existing_brief_ids, assigned_brief_ids,
+                 skipped, source_markers, blockers, next_actions, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 run_id,
                 tenant,
@@ -560,7 +574,10 @@ impl SpineStore {
                 rec.input_signature,
                 rec.status,
                 rec.created_brief_ids_json,
+                rec.existing_brief_ids_json,
                 rec.assigned_brief_ids_json,
+                rec.skipped_json,
+                rec.source_markers_json,
                 rec.blockers_json,
                 rec.next_actions_json,
                 now,
@@ -582,8 +599,8 @@ impl SpineStore {
         let row = conn
             .query_row(
                 "SELECT run_id, tenant_id, mandate_id, mode, dry_run, input_signature,
-                        status, created_brief_ids, assigned_brief_ids, blockers,
-                        next_actions, created_at
+                        status, created_brief_ids, existing_brief_ids, assigned_brief_ids,
+                        skipped, source_markers, blockers, next_actions, created_at
                  FROM mandate_orchestration_runs
                  WHERE tenant_id = ?1 AND mandate_id = ?2
                  ORDER BY created_at DESC, rowid DESC
@@ -608,8 +625,8 @@ impl SpineStore {
         let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
         let mut stmt = conn.prepare(
             "SELECT run_id, tenant_id, mandate_id, mode, dry_run, input_signature,
-                    status, created_brief_ids, assigned_brief_ids, blockers,
-                    next_actions, created_at
+                    status, created_brief_ids, existing_brief_ids, assigned_brief_ids,
+                    skipped, source_markers, blockers, next_actions, created_at
              FROM mandate_orchestration_runs
              WHERE tenant_id = ?1 AND mandate_id = ?2
              ORDER BY created_at DESC, rowid DESC
@@ -1211,7 +1228,10 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              input_signature   TEXT NOT NULL DEFAULT '',
              status            TEXT NOT NULL DEFAULT 'planned',
              created_brief_ids TEXT NOT NULL DEFAULT '[]',
+             existing_brief_ids TEXT NOT NULL DEFAULT '[]',
              assigned_brief_ids TEXT NOT NULL DEFAULT '[]',
+             skipped           TEXT NOT NULL DEFAULT '[]',
+             source_markers    TEXT NOT NULL DEFAULT '[]',
              blockers          TEXT NOT NULL DEFAULT '[]',
              next_actions      TEXT NOT NULL DEFAULT '[]',
              created_at        INTEGER NOT NULL
@@ -1225,6 +1245,18 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         "ALTER TABLE guilds ADD COLUMN monthly_allowance_cents INTEGER",
         [],
     );
+    // Defensive additive columns on orchestration runs — tolerate a table
+    // created before stable source markers existed (company-model §4.6).
+    // Each runs independently so a pre-existing column on one does not
+    // abort the rest; the run row reader supplies '[]' for any that are
+    // still absent via the column DEFAULT.
+    for alter in [
+        "ALTER TABLE mandate_orchestration_runs ADD COLUMN existing_brief_ids TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE mandate_orchestration_runs ADD COLUMN skipped TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE mandate_orchestration_runs ADD COLUMN source_markers TEXT NOT NULL DEFAULT '[]'",
+    ] {
+        let _ = conn.execute(alter, []);
+    }
     Ok(())
 }
 
@@ -1373,10 +1405,13 @@ fn row_to_orchestration_run(r: &rusqlite::Row) -> rusqlite::Result<Orchestration
         input_signature: r.get(5)?,
         status: r.get(6)?,
         created_brief_ids: r.get(7)?,
-        assigned_brief_ids: r.get(8)?,
-        blockers: r.get(9)?,
-        next_actions: r.get(10)?,
-        created_at: r.get(11)?,
+        existing_brief_ids: r.get(8)?,
+        assigned_brief_ids: r.get(9)?,
+        skipped: r.get(10)?,
+        source_markers: r.get(11)?,
+        blockers: r.get(12)?,
+        next_actions: r.get(13)?,
+        created_at: r.get(14)?,
     })
 }
 
@@ -1831,7 +1866,10 @@ mod tests {
             input_signature: "sig-1",
             status,
             created_brief_ids_json: "[\"t1\",\"t2\"]",
+            existing_brief_ids_json: "[\"t0\"]",
             assigned_brief_ids_json: "[\"t2\"]",
+            skipped_json: "[]",
+            source_markers_json: "[\"mandate:m:parent\"]",
             blockers_json: "[]",
             next_actions_json: "[\"review\"]",
         }
@@ -1859,6 +1897,16 @@ mod tests {
         assert_eq!(
             latest.to_json()["assigned_brief_ids"],
             serde_json::json!(["t2"])
+        );
+        // Reused/existing, skipped and source markers round-trip too.
+        assert_eq!(
+            latest.to_json()["existing_brief_ids"],
+            serde_json::json!(["t0"])
+        );
+        assert_eq!(latest.to_json()["skipped"], serde_json::json!([]));
+        assert_eq!(
+            latest.to_json()["source_markers"],
+            serde_json::json!(["mandate:m:parent"])
         );
         // Tenant B cannot read tenant A's run.
         assert!(s.latest_orchestration_run("b", &m).unwrap().is_none());

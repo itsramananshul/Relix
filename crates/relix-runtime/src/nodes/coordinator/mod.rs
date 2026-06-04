@@ -1568,6 +1568,16 @@ impl TaskStore {
             return Err(CoordinatorError::NotFound(task_id.to_string()));
         }
         let changed = match field {
+            "title" => {
+                let v = value.trim();
+                if v.is_empty() {
+                    return Err(CoordinatorError::Invalid("title required".into()));
+                }
+                conn.execute(
+                    "UPDATE tasks SET title=?1, updated_at=?2 WHERE task_id=?3",
+                    params![v, now, task_id],
+                )
+            }
             "priority" => {
                 let v = value.trim();
                 if !brief::is_priority(v) {
@@ -1595,7 +1605,7 @@ impl TaskStore {
             }
             other => {
                 return Err(CoordinatorError::Invalid(format!(
-                    "unknown brief field '{other}' (assignee/reviewer/priority/mandate/campaign)"
+                    "unknown brief field '{other}' (title/assignee/reviewer/priority/mandate/campaign)"
                 )));
             }
         }
@@ -8736,8 +8746,8 @@ fn handle_brief_dossier_get(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOu
 }
 
 /// `brief.set` — set a Brief spine field. Arg `task_id|field|value`
-/// (field = assignee/priority/mandate/campaign; empty value clears
-/// assignee/mandate/campaign).
+/// (field = title/assignee/priority/mandate/campaign; empty value clears
+/// assignee/mandate/campaign; title must be non-empty).
 fn handle_brief_set(
     store: &TaskStore,
     agent_store: Option<&agent::AgentStore>,
