@@ -1028,6 +1028,37 @@ impl TaskStore {
         }))
     }
 
+    /// True when `task` exists AND belongs to `tenant` (a NULL/legacy
+    /// `tenant_id` resolves to the `default` Guild). The isolation
+    /// predicate behind the tenant-scoped detail read.
+    pub fn task_in_tenant(&self, task: &str, tenant: &str) -> Result<bool, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT COALESCE(tenant_id, 'default') FROM tasks WHERE task_id = ?1",
+                params![task],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        Ok(v.as_deref() == Some(norm_tenant(tenant)))
+    }
+
+    /// GROUP 6 (tenant isolation): the Brief detail ONLY when the Brief
+    /// belongs to `tenant`; a known id from another Guild reads as
+    /// `Ok(None)` (not-found), so the spine detail path cannot leak a
+    /// cross-Guild Brief.
+    pub fn brief_detail_for_tenant(
+        &self,
+        task: &str,
+        tenant: &str,
+    ) -> Result<Option<brief::BriefDetail>, CoordinatorError> {
+        if !self.task_in_tenant(task, tenant)? {
+            return Ok(None);
+        }
+        self.brief_detail(task)
+    }
+
     /// PHASE 1 (Brief): attach a **Dossier** (durable artifact) to
     /// a Brief. Append-only; returns the new `doc_id`. `kind` and
     /// `title` are required; the Brief must exist.
@@ -1271,6 +1302,45 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// GROUP 6 (tenant isolation): title search scoped to `tenant`.
+    pub fn search_briefs_for_tenant(
+        &self,
+        query: &str,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let escaped = q
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, title, board_status, priority,
+                        assignee_agent_id, mandate_id, campaign_id
+                 FROM tasks
+                 WHERE title LIKE ?1 ESCAPE '\\'
+                   AND COALESCE(tenant_id, 'default') = ?2
+                 ORDER BY updated_at DESC LIMIT ?3",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(
+                params![pattern, norm_tenant(tenant), lim],
+                brief_card_from_row,
+            )
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// PHASE 5 (Brief): set or clear a Brief's due date (unix secs;
     /// `None` clears). The Brief must exist.
     pub fn set_brief_due(
@@ -1337,6 +1407,34 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// GROUP 6 (tenant isolation): overdue Briefs scoped to `tenant`.
+    pub fn list_overdue_briefs_for_tenant(
+        &self,
+        now: i64,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, title, board_status, priority,
+                        assignee_agent_id, mandate_id, campaign_id
+                 FROM tasks
+                 WHERE due_at IS NOT NULL AND due_at < ?1
+                   AND board_status IN ('todo','in_progress','in_review','blocked')
+                   AND COALESCE(tenant_id, 'default') = ?2
+                 ORDER BY due_at ASC LIMIT ?3",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![now, norm_tenant(tenant), lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// Desk/Inbox: Briefs in an active column (`todo` / `in_progress`
     /// / `in_review` / `blocked`) with **no assignee** — work that
     /// needs staffing. Newest-updated first, bounded by `limit`.
@@ -1358,6 +1456,34 @@ impl TaskStore {
             .map_err(CoordinatorError::Db)?;
         let rows = stmt
             .query_map(params![lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
+    /// GROUP 6 (tenant isolation): unassigned active Briefs scoped to
+    /// `tenant`.
+    pub fn list_unassigned_briefs_for_tenant(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, title, board_status, priority,
+                        assignee_agent_id, mandate_id, campaign_id
+                 FROM tasks
+                 WHERE assignee_agent_id IS NULL
+                   AND board_status IN ('todo','in_progress','in_review','blocked')
+                   AND COALESCE(tenant_id, 'default') = ?1
+                 ORDER BY updated_at DESC LIMIT ?2",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![norm_tenant(tenant), lim], brief_card_from_row)
             .map_err(CoordinatorError::Db)?
             .collect::<rusqlite::Result<_>>()
             .map_err(CoordinatorError::Db)?;
@@ -1736,6 +1862,55 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// GROUP 6 (tenant isolation): the board column read scoped to
+    /// `tenant`; a NULL/legacy `tenant_id` resolves to the `default`
+    /// Guild.
+    pub fn list_briefs_by_board_for_tenant(
+        &self,
+        board: Option<&str>,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        if let Some(b) = board
+            && !brief::is_board_status(b)
+        {
+            return Err(CoordinatorError::Invalid(format!(
+                "unknown board status '{b}'"
+            )));
+        }
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let t = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let cols =
+            "task_id, title, board_status, priority, assignee_agent_id, mandate_id, campaign_id";
+        let rows: Vec<brief::BriefCard> = match board {
+            Some(b) => {
+                let sql = format!(
+                    "SELECT {cols} FROM tasks \
+                     WHERE board_status = ?1 AND COALESCE(tenant_id, 'default') = ?2 \
+                     ORDER BY pinned DESC, updated_at DESC LIMIT ?3"
+                );
+                let mut stmt = conn.prepare(&sql).map_err(CoordinatorError::Db)?;
+                stmt.query_map(params![b, t, lim], brief_card_from_row)
+                    .map_err(CoordinatorError::Db)?
+                    .collect::<rusqlite::Result<_>>()
+                    .map_err(CoordinatorError::Db)?
+            }
+            None => {
+                let sql = format!(
+                    "SELECT {cols} FROM tasks WHERE COALESCE(tenant_id, 'default') = ?1 \
+                     ORDER BY pinned DESC, updated_at DESC LIMIT ?2"
+                );
+                let mut stmt = conn.prepare(&sql).map_err(CoordinatorError::Db)?;
+                stmt.query_map(params![t, lim], brief_card_from_row)
+                    .map_err(CoordinatorError::Db)?
+                    .collect::<rusqlite::Result<_>>()
+                    .map_err(CoordinatorError::Db)?
+            }
+        };
+        Ok(rows)
+    }
+
     /// PHASE 5 (Desk): an Operative's personal Desk — their in-flight
     /// Briefs (board_status in todo/in_progress/in_review/blocked),
     /// priority-ordered then oldest-first. Excludes
@@ -1860,6 +2035,36 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// GROUP 6 (tenant isolation): blocked Briefs scoped to `tenant`
+    /// (the blocked Brief's own Guild).
+    pub fn list_blocked_briefs_for_tenant(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT t.task_id, t.title, t.board_status, t.priority,
+                        t.assignee_agent_id, t.mandate_id, t.campaign_id
+                 FROM tasks t
+                 JOIN task_edges e ON e.task_id = t.task_id AND e.edge_type = 'blocked_on'
+                 JOIN tasks b ON b.task_id = e.related_task_id
+                 WHERE b.board_status != 'done'
+                   AND t.board_status NOT IN ('done', 'cancelled')
+                   AND COALESCE(t.tenant_id, 'default') = ?1
+                 ORDER BY t.updated_at DESC LIMIT ?2",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![norm_tenant(tenant), lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// PHASE 2 (Desk): Briefs that look stale — in an active column
     /// (todo / in_progress / in_review) with no update for at least
     /// `idle_secs`. Most-stale first. The "stuck work" the Desk
@@ -1884,6 +2089,38 @@ impl TaskStore {
             .map_err(CoordinatorError::Db)?;
         let rows = stmt
             .query_map(params![cutoff, lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
+    /// GROUP 6 (tenant isolation): stale Briefs scoped to `tenant`.
+    pub fn list_stale_briefs_for_tenant(
+        &self,
+        idle_secs: i64,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let cutoff = unix_secs().saturating_sub(idle_secs.max(0));
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, title, board_status, priority,
+                        assignee_agent_id, mandate_id, campaign_id
+                 FROM tasks
+                 WHERE board_status IN ('todo', 'in_progress', 'in_review')
+                   AND updated_at < ?1
+                   AND COALESCE(tenant_id, 'default') = ?2
+                 ORDER BY updated_at ASC LIMIT ?3",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(
+                params![cutoff, norm_tenant(tenant), lim],
+                brief_card_from_row,
+            )
             .map_err(CoordinatorError::Db)?
             .collect::<rusqlite::Result<_>>()
             .map_err(CoordinatorError::Db)?;
@@ -2734,6 +2971,30 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// GROUP 6 (tenant isolation): board column counts scoped to
+    /// `tenant`, so a Guild's summary never counts another Guild's Briefs.
+    pub fn board_summary_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<(String, i64)>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT board_status, COUNT(*) FROM tasks
+                 WHERE COALESCE(tenant_id, 'default') = ?1
+                 GROUP BY board_status ORDER BY board_status",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![norm_tenant(tenant)], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// PHASE 1/5: the Briefs linked to a Mandate (as cards).
     pub fn list_briefs_by_mandate(
         &self,
@@ -2963,6 +3224,24 @@ impl TaskStore {
         Ok(href)
     }
 
+    /// Stamp (or clear) the owning Guild/tenant on a Task row. Empty
+    /// tenant normalises to `default`. Used by the Brief-creation path so
+    /// the tenant-scoped board/inbox/detail reads can isolate per Guild.
+    pub fn set_task_tenant(&self, task_id: &str, tenant: &str) -> Result<(), CoordinatorError> {
+        let t = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let changed = conn
+            .execute(
+                "UPDATE tasks SET tenant_id = ?1 WHERE task_id = ?2",
+                params![t, task_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+        if changed == 0 {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_brief(
         &self,
@@ -2998,6 +3277,8 @@ impl TaskStore {
         )?;
         // Allocate the human identifier from the per-company counter (§1.2).
         let _ = self.assign_brief_ref(tenant, &task_id);
+        // Stamp the owning Guild/tenant for row-level isolation.
+        let _ = self.set_task_tenant(&task_id, tenant);
         // Chronicle the creation distinctly (the activity feed's
         // first entry), then open it on the board.
         let _ = self.append_event(&task_id, "brief.created", title.trim());
@@ -8327,7 +8608,7 @@ fn handle_brief_search(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
-    match store.search_briefs(query, limit) {
+    match store.search_briefs_for_tenant(query, ctx.tenant_id_or_default(), limit) {
         Ok(rows) => match serde_json::to_vec(&rows) {
             Ok(b) => HandlerOutcome::Ok(b),
             Err(e) => internal(format!("brief.search encode: {e}")),
@@ -8435,7 +8716,7 @@ fn handle_brief_overdue(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcom
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
-    match store.list_overdue_briefs(now, limit) {
+    match store.list_overdue_briefs_for_tenant(now, ctx.tenant_id_or_default(), limit) {
         Ok(rows) => match serde_json::to_vec(&rows) {
             Ok(b) => HandlerOutcome::Ok(b),
             Err(e) => internal(format!("brief.overdue encode: {e}")),
@@ -8494,7 +8775,7 @@ fn handle_brief_detail(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome
         Ok(t) => t,
         Err(o) => return o,
     };
-    match store.brief_detail(task) {
+    match store.brief_detail_for_tenant(task, ctx.tenant_id_or_default()) {
         Ok(Some(d)) => match serde_json::to_vec(&d) {
             Ok(b) => HandlerOutcome::Ok(b),
             Err(e) => internal(format!("brief.detail encode: {e}")),
@@ -8823,7 +9104,7 @@ fn handle_brief_board(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome 
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
-    match store.list_briefs_by_board(board, limit) {
+    match store.list_briefs_by_board_for_tenant(board, ctx.tenant_id_or_default(), limit) {
         Ok(rows) => match serde_json::to_vec(&rows) {
             Ok(b) => HandlerOutcome::Ok(b),
             Err(e) => internal(format!("brief.board encode: {e}")),
@@ -8844,7 +9125,7 @@ fn handle_brief_blocked_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerO
     } else {
         raw.parse().unwrap_or(50)
     };
-    match store.list_blocked_briefs(limit) {
+    match store.list_blocked_briefs_for_tenant(ctx.tenant_id_or_default(), limit) {
         Ok(rows) => match serde_json::to_vec(&rows) {
             Ok(b) => HandlerOutcome::Ok(b),
             Err(e) => internal(format!("brief.blocked_list encode: {e}")),
@@ -8866,7 +9147,7 @@ fn handle_brief_unassigned(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOut
     } else {
         raw.parse().unwrap_or(50)
     };
-    match store.list_unassigned_briefs(limit) {
+    match store.list_unassigned_briefs_for_tenant(ctx.tenant_id_or_default(), limit) {
         Ok(rows) => match serde_json::to_vec(&rows) {
             Ok(b) => HandlerOutcome::Ok(b),
             Err(e) => internal(format!("brief.unassigned encode: {e}")),
@@ -8966,7 +9247,7 @@ fn handle_brief_stale_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOut
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
-    match store.list_stale_briefs(idle, limit) {
+    match store.list_stale_briefs_for_tenant(idle, ctx.tenant_id_or_default(), limit) {
         Ok(rows) => match serde_json::to_vec(&rows) {
             Ok(b) => HandlerOutcome::Ok(b),
             Err(e) => internal(format!("brief.stale_list encode: {e}")),
@@ -9338,8 +9619,8 @@ fn handle_mandate_progress(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOut
 /// `brief.board_summary` — Brief counts across all board columns (+
 /// `total`). No args. The board-at-a-glance for the companion /
 /// dashboard.
-fn handle_brief_board_summary(store: &TaskStore, _ctx: &InvocationCtx) -> HandlerOutcome {
-    match store.board_summary() {
+fn handle_brief_board_summary(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    match store.board_summary_for_tenant(ctx.tenant_id_or_default()) {
         Ok(counts) => counts_to_json(counts),
         Err(e) => map_edge_err("brief.board_summary", e),
     }
@@ -11138,6 +11419,13 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         // duplicate. NULL for Briefs created by a human/agent directly.
         "ALTER TABLE tasks ADD COLUMN source_kind TEXT",
         "ALTER TABLE tasks ADD COLUMN source_marker TEXT",
+        // TENANT ISOLATION (Guild): the owning Guild/tenant for a Brief.
+        // Product-spine Briefs are stamped at creation (`create_brief`);
+        // legacy rows and non-Brief Tasks are NULL and resolve to the
+        // `default` tenant via COALESCE in the tenant-scoped reads, so the
+        // default Guild and single-tenant deployments keep seeing every
+        // existing row while a *named* Guild sees only its own.
+        "ALTER TABLE tasks ADD COLUMN tenant_id TEXT",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the
@@ -11150,6 +11438,13 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
     // so the column exists; idempotent.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS tasks_source_marker ON tasks(source_marker)",
+        [],
+    )
+    .map_err(CoordinatorError::Db)?;
+    // Index the tenant so the tenant-scoped board/inbox/detail reads stay
+    // cheap. Runs after the ALTER so the column exists; idempotent.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS tasks_tenant ON tasks(tenant_id)",
         [],
     )
     .map_err(CoordinatorError::Db)?;
@@ -11323,6 +11618,14 @@ fn new_task_id() -> String {
     let mut bytes = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+/// Normalise a tenant/Guild id for the tasks store: empty/whitespace
+/// resolves to the `default` Guild, matching the `COALESCE(tenant_id,
+/// 'default')` predicate used by the tenant-scoped reads.
+fn norm_tenant(tenant: &str) -> &str {
+    let t = tenant.trim();
+    if t.is_empty() { "default" } else { t }
 }
 
 fn new_doc_id() -> String {
@@ -14628,6 +14931,105 @@ mod tests {
     }
 
     #[test]
+    fn tenant_scoped_reads_isolate_briefs_across_guilds() {
+        // GROUP 6 / tenant isolation: a Brief created under Guild "acme"
+        // must not surface through the board / inbox / detail / search
+        // reads scoped to Guild "globex", and vice-versa.
+        let s = store();
+        let a = s
+            .create_brief(
+                "acme",
+                "Quarterly board item",
+                "subj",
+                None,
+                Some("m_a"),
+                None,
+                None,
+            )
+            .unwrap();
+        let b = s
+            .create_brief(
+                "globex",
+                "Quarterly board item",
+                "subj",
+                None,
+                Some("m_b"),
+                None,
+                None,
+            )
+            .unwrap();
+        // A legacy Task with NULL tenant_id resolves to the `default` Guild.
+        let legacy = s
+            .create(
+                "legacy",
+                "f",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        s.set_board_status(&legacy, "todo").unwrap();
+
+        // Board column (todo): each Guild sees only its own Brief.
+        let acme_todo = s
+            .list_briefs_by_board_for_tenant(Some("todo"), "acme", 50)
+            .unwrap();
+        assert!(acme_todo.iter().any(|c| c.task_id == a));
+        assert!(!acme_todo.iter().any(|c| c.task_id == b));
+        assert!(!acme_todo.iter().any(|c| c.task_id == legacy));
+        let globex_todo = s
+            .list_briefs_by_board_for_tenant(Some("todo"), "globex", 50)
+            .unwrap();
+        assert!(globex_todo.iter().any(|c| c.task_id == b));
+        assert!(!globex_todo.iter().any(|c| c.task_id == a));
+        // The legacy NULL-tenant row is visible to the default Guild only.
+        let default_todo = s
+            .list_briefs_by_board_for_tenant(Some("todo"), "default", 50)
+            .unwrap();
+        assert!(default_todo.iter().any(|c| c.task_id == legacy));
+        assert!(
+            !default_todo
+                .iter()
+                .any(|c| c.task_id == a || c.task_id == b)
+        );
+
+        // Inbox surfaces: unassigned isolates per Guild.
+        let acme_un = s.list_unassigned_briefs_for_tenant("acme", 50).unwrap();
+        assert!(acme_un.iter().any(|c| c.task_id == a) && !acme_un.iter().any(|c| c.task_id == b));
+
+        // Detail: a cross-Guild id reads as not-found (None).
+        assert!(s.brief_detail_for_tenant(&a, "acme").unwrap().is_some());
+        assert!(s.brief_detail_for_tenant(&a, "globex").unwrap().is_none());
+        assert!(s.brief_detail_for_tenant(&b, "acme").unwrap().is_none());
+        assert!(!s.task_in_tenant(&a, "globex").unwrap());
+
+        // Search: the identical title is found once per Guild.
+        assert_eq!(
+            s.search_briefs_for_tenant("board item", "acme", 50)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            s.search_briefs_for_tenant("board item", "globex", 50)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Board summary counts never cross Guilds.
+        let acme_counts: std::collections::HashMap<String, i64> = s
+            .board_summary_for_tenant("acme")
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(acme_counts.get("todo").copied().unwrap_or(0), 1);
+    }
+
+    #[test]
     fn phase2_desk_surfaces_blocked_and_stale_briefs() {
         let s = store();
         let mk = |t: &str| {
@@ -15475,6 +15877,57 @@ mod tests {
             args: args.to_vec(),
             tenant_id: None,
         }
+    }
+
+    fn ctx_tenant(args: &[u8], tenant: &str) -> InvocationCtx {
+        let mut c = ctx(args);
+        c.tenant_id = Some(tenant.to_string());
+        c
+    }
+
+    #[test]
+    fn spine_handlers_isolate_briefs_per_tenant() {
+        // The board / unassigned / detail capability handlers must scope
+        // to the caller's Guild, so a cross-Guild Brief id is invisible.
+        let s = TaskStore::in_memory().unwrap();
+        let a = s
+            .create_brief("acme", "Board card", "subj", None, Some("m_a"), None, None)
+            .unwrap();
+        let b = s
+            .create_brief(
+                "globex",
+                "Board card",
+                "subj",
+                None,
+                Some("m_b"),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let cards = |out: HandlerOutcome| -> Vec<brief::BriefCard> {
+            match out {
+                HandlerOutcome::Ok(body) => serde_json::from_slice(&body).unwrap(),
+                HandlerOutcome::Err(_) => panic!("handler returned an error"),
+            }
+        };
+        // brief.board (todo) for acme shows a, not b.
+        let acme_board = cards(handle_brief_board(&s, &ctx_tenant(b"todo|50", "acme")));
+        assert!(acme_board.iter().any(|c| c.task_id == a));
+        assert!(!acme_board.iter().any(|c| c.task_id == b));
+        // brief.unassigned for globex shows b, not a.
+        let globex_un = cards(handle_brief_unassigned(&s, &ctx_tenant(b"50", "globex")));
+        assert!(globex_un.iter().any(|c| c.task_id == b));
+        assert!(!globex_un.iter().any(|c| c.task_id == a));
+        // brief.detail: acme can read a but NOT globex's b (not-found Err).
+        assert!(matches!(
+            handle_brief_detail(&s, &ctx_tenant(a.as_bytes(), "acme")),
+            HandlerOutcome::Ok(_)
+        ));
+        assert!(matches!(
+            handle_brief_detail(&s, &ctx_tenant(b.as_bytes(), "acme")),
+            HandlerOutcome::Err(_)
+        ));
     }
 
     #[test]
