@@ -20,6 +20,24 @@ interface Operative {
   rig?: string | null;
 }
 
+interface Adapter {
+  name?: string;
+  probe?: { status?: string };
+}
+
+// One run record from the shared ledger (`/v1/runs`).
+interface RunRow {
+  run_id?: string;
+  brief_id?: string;
+  status?: string;
+  trigger?: string;
+  rig?: string;
+  started_at?: number;
+  review?: string;
+  apply_status?: string;
+  applied_files?: number;
+}
+
 interface RunReport {
   brief_id: string;
   status: string;
@@ -32,9 +50,6 @@ interface RunReport {
   workspace_files?: number | null;
 }
 
-// Human labels for the run states. `running` = accepted + executing in
-// the background; the rest are pre-run refusals (no command spawned) or
-// terminal outcomes.
 const REFUSALS: Record<string, string> = {
   running: "run started — executing in the background",
   unassigned: "assign an Operative first",
@@ -57,9 +72,30 @@ const COLUMN_LABEL: Record<string, string> = {
   in_review: "In review",
   done: "Done",
 };
+const RUN_TONE: Record<string, string> = {
+  running: "in_progress",
+  done: "done",
+  failed: "blocked",
+  cancelled: "blocked",
+  continued: "todo",
+};
 
 function cardId(c: Card): string {
   return c.task_id ?? c.id ?? "";
+}
+
+// The product state a Brief's latest run is in — drives the small status
+// chip + the "what next" hint on the card.
+function runOutcome(r: RunRow): { label: string; tone: string } | null {
+  if (r.apply_status === "applied") return { label: "applied", tone: "done" };
+  if (r.apply_status === "conflicted") return { label: "apply conflicted", tone: "blocked" };
+  if (r.apply_status === "failed") return { label: "apply failed", tone: "blocked" };
+  if (r.status === "done" && r.review === "pending_review") return { label: "needs review", tone: "in_progress" };
+  if (r.status === "done" && r.review === "accepted") return { label: "ready to apply", tone: "todo" };
+  if (r.status === "done" && r.review === "rejected") return { label: "rejected", tone: "blocked" };
+  if (r.status === "failed") return { label: "failed", tone: "blocked" };
+  if (r.status === "running") return { label: "running", tone: "in_progress" };
+  return null;
 }
 
 export function Briefs() {
@@ -68,20 +104,39 @@ export function Briefs() {
   const [priority, setPriority] = useState("normal");
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
 
-  const { data, loading, reload } = useAsync(async () => {
+  const { data, loading, error, reload } = useAsync(async () => {
     const byCol: Record<string, Card[]> = {};
-    const [, ops] = await Promise.all([
+    const [, ops, adapters, runs] = await Promise.all([
       Promise.all(
         COLUMNS.map(async (col) => {
           byCol[col] = asArray<Card>(await tryGet<Card[]>(`/v1/spine/board/${col}?limit=50`, []));
         }),
       ),
       tryGet<Operative[]>("/v1/spine/operatives", []),
+      tryGet<Adapter[]>("/v1/adapters", []),
+      tryGet<RunRow[]>("/v1/runs", []),
     ]);
-    return { board: byCol, operatives: Array.isArray(ops) ? ops : [] };
+    return {
+      board: byCol,
+      operatives: Array.isArray(ops) ? ops : [],
+      adapters: Array.isArray(adapters) ? adapters : [],
+      runs: Array.isArray(runs) ? runs : [],
+    };
   }, []);
 
   const operatives = data?.operatives ?? [];
+  const adapters = data?.adapters ?? [];
+  const runs = data?.runs ?? [];
+
+  const opById = new Map(operatives.map((o) => [o.agent_id ?? "", o]));
+  const adapterStatus = new Map(adapters.map((a) => [a.name ?? "", a.probe?.status ?? "unknown"]));
+  const availCount = adapters.filter((a) => a.probe?.status === "available").length;
+  // `/v1/runs` is newest-first → the FIRST run we see per Brief is its latest.
+  const latestRun = new Map<string, RunRow>();
+  for (const r of runs) {
+    const b = r.brief_id ?? "";
+    if (b && !latestRun.has(b)) latestRun.set(b, r);
+  }
 
   async function assign(c: Card, agentId: string) {
     setBanner(null);
@@ -121,26 +176,18 @@ export function Briefs() {
     }
   }
 
-  // Run a Brief NOW through its Operative's agent adapter. Surfaces the
-  // structured RunReport — real outcomes AND clear adapter-unavailable
-  // refusals (never a faked run).
   async function run(c: Card) {
     setBanner({ kind: "info", msg: `Running ${c.title ?? "brief"}…` });
     try {
       const r = await api.post<RunReport>(`/v1/spine/briefs/${encodeURIComponent(cardId(c))}/run`, {});
-      // `running` = accepted, executing in the background (async dispatch).
       const accepted = r.status === "running" || r.status === "done";
       const refusal = ["unassigned", "no_adapter", "adapter_unavailable", "already_running", "not_found"].includes(r.status);
-      // workspace_error is a real failure to set up a safe sandbox.
       const kind = accepted ? "ok" : refusal ? "info" : "err";
       const label = REFUSALS[r.status] ?? r.status;
       let msg = `${c.title ?? "Brief"}: ${label}`;
       if (r.rig) msg += ` · adapter ${r.rig}`;
       if (r.summary && r.status !== "running") msg += ` — ${r.summary}`;
       if (r.install_hint) msg += ` (${r.install_hint})`;
-      if (r.workspace) msg += ` · workspace ${r.workspace}`;
-      if (r.workspace_context === "copy_repo") msg += ` · context: copied ${r.workspace_files ?? 0} file(s)`;
-      else if (r.workspace_context === "empty") msg += " · context: empty";
       if (r.status === "running") msg += " — see Active Runs";
       setBanner({ kind, msg });
       reload();
@@ -148,6 +195,20 @@ export function Briefs() {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Run failed" });
     }
   }
+
+  // Why a Brief cannot run right now (null = it can). Used to disable the
+  // Run button with a helpful reason rather than letting it silently refuse.
+  function runBlock(c: Card): string | null {
+    const op = c.assignee_agent_id ? opById.get(c.assignee_agent_id) : undefined;
+    if (!c.assignee_agent_id) return "Assign an Operative first";
+    if (!op?.rig) return "Operative has no adapter — set one on the Crew page";
+    if (adapterStatus.get(op.rig) && adapterStatus.get(op.rig) !== "available")
+      return `Adapter "${op.rig}" is not available — see Settings`;
+    if (latestRun.get(cardId(c))?.status === "running") return "Already running";
+    return null;
+  }
+
+  const initialized = operatives.length > 0;
 
   return (
     <div className="grid">
@@ -159,12 +220,21 @@ export function Briefs() {
           </button>
         }
       >
+        {error && (
+          <div className="banner err">Could not load the board: {error}. <span className="link" onClick={reload}>Retry</span></div>
+        )}
         {banner && <div className={"banner " + banner.kind}>{banner.msg}</div>}
 
-        {!loading && operatives.length === 0 && (
-          <div className="banner info">
-            No Operatives yet — you can create Briefs, but to assign + run them{" "}
-            <Link to="/agents">initialize your company</Link> to create the Founder first.
+        {!loading && !initialized && (
+          <div className="banner info banner-action">
+            <span>No Operatives yet — create Briefs now, but to assign + run them you need a Founder.</span>
+            <Link to="/agents" className="banner-cta">Initialize company →</Link>
+          </div>
+        )}
+        {!loading && initialized && availCount === 0 && (
+          <div className="banner info banner-action">
+            <span>No agent adapter is available — Briefs can be assigned but a Run needs an installed + authenticated adapter (echo always works).</span>
+            <Link to="/settings" className="banner-cta">Open Settings →</Link>
           </div>
         )}
 
@@ -174,7 +244,7 @@ export function Briefs() {
               <input
                 className="input"
                 style={{ flex: 3, minWidth: 240 }}
-                placeholder="Brief title…"
+                placeholder="Brief title — what needs doing?"
                 value={title}
                 autoFocus
                 onChange={(e) => setTitle(e.target.value)}
@@ -193,6 +263,11 @@ export function Briefs() {
 
         {loading ? (
           <div className="loading">Loading board…</div>
+        ) : COLUMNS.every((c) => (data?.board?.[c] ?? []).length === 0) ? (
+          <div className="empty">
+            No Briefs yet. Click <strong>+ New Brief</strong> to create your first unit of work,
+            then assign it to an Operative and run it.
+          </div>
         ) : (
           <div className="board">
             {COLUMNS.map((col) => {
@@ -202,52 +277,80 @@ export function Briefs() {
                   <h4>
                     {COLUMN_LABEL[col]} <span className="muted">{cards.length}</span>
                   </h4>
-                  {cards.map((c) => (
-                    <div className="board-card" key={cardId(c)}>
-                      <div className="t">{c.title ?? "(untitled)"}</div>
-                      <div className="m">
-                        {c.priority && <span>{c.priority}</span>}
-                        {c.assignee_agent_id && <span>· {c.assignee_agent_id.slice(0, 8)}</span>}
+                  {cards.map((c) => {
+                    const op = c.assignee_agent_id ? opById.get(c.assignee_agent_id) : undefined;
+                    const lr = latestRun.get(cardId(c));
+                    const outcome = lr ? runOutcome(lr) : null;
+                    const block = runBlock(c);
+                    return (
+                      <div className="board-card" key={cardId(c)}>
+                        <div className="t">{c.title ?? "(untitled)"}</div>
+                        <div className="m">
+                          {c.priority && <span>{c.priority}</span>}
+                          {op ? (
+                            <span title={c.assignee_agent_id ?? ""}>
+                              · {op.name ?? "operative"}
+                              {op.role === "founder" ? " (Founder)" : ""}
+                              {op.rig ? ` · ${op.rig}` : " · no adapter"}
+                            </span>
+                          ) : c.assignee_agent_id ? (
+                            <span className="mono">· {c.assignee_agent_id.slice(0, 8)}</span>
+                          ) : (
+                            <span className="muted">· unassigned</span>
+                          )}
+                        </div>
+
+                        {lr && (
+                          <div className="card-run">
+                            <span className={"badge " + (RUN_TONE[lr.status ?? ""] ?? "todo")}>{lr.status ?? "—"}</span>
+                            <span className="muted" style={{ fontSize: 10 }}>{lr.trigger === "heartbeat" ? "auto" : lr.trigger ?? "manual"}</span>
+                            {outcome && <span className={"badge " + outcome.tone} style={{ fontSize: 10 }}>{outcome.label}</span>}
+                            {(lr.applied_files ?? 0) > 0 && <span className="muted" style={{ fontSize: 10 }}>{lr.applied_files} applied</span>}
+                            <Link to="/runs" className="link" style={{ fontSize: 11, marginLeft: "auto" }}>view →</Link>
+                          </div>
+                        )}
+
+                        <label className="row" style={{ marginTop: 8 }}>
+                          <select
+                            className="select"
+                            style={{ fontSize: 11, padding: "3px 6px", width: "100%" }}
+                            value={c.assignee_agent_id ?? ""}
+                            onChange={(e) => assign(c, e.target.value)}
+                            title="Assign an Operative"
+                          >
+                            <option value="">— unassigned —</option>
+                            {operatives.map((o) => (
+                              <option key={o.agent_id} value={o.agent_id}>
+                                {o.name}{o.role === "founder" ? " (Founder)" : ""}{o.rig ? ` · ${o.rig}` : ""}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <div className="row" style={{ marginTop: 6, gap: 6 }}>
+                          <select
+                            className="select"
+                            style={{ fontSize: 11, padding: "3px 6px", flex: 1 }}
+                            value={col}
+                            onChange={(e) => move(c, e.target.value)}
+                            title="Move to a board column"
+                          >
+                            {COLUMNS.map((s) => (
+                              <option key={s} value={s}>→ {COLUMN_LABEL[s]}</option>
+                            ))}
+                          </select>
+                          <button
+                            className="btn sm"
+                            disabled={!!block}
+                            title={block ?? "Run this Brief through its Operative's adapter now"}
+                            onClick={() => run(c)}
+                          >
+                            Run
+                          </button>
+                        </div>
+                        {block && <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>⚠ {block}</div>}
                       </div>
-                      <label className="row" style={{ marginTop: 8 }}>
-                        <select
-                          className="select"
-                          style={{ fontSize: 11, padding: "3px 6px", width: "100%" }}
-                          value={c.assignee_agent_id ?? ""}
-                          onChange={(e) => assign(c, e.target.value)}
-                          title="Assign an Operative"
-                        >
-                          <option value="">— unassigned —</option>
-                          {operatives.map((o) => (
-                            <option key={o.agent_id} value={o.agent_id}>
-                              {o.name}{o.role === "founder" ? " (Founder)" : ""}{o.rig ? ` · ${o.rig}` : ""}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                      <div className="row" style={{ marginTop: 6, gap: 6 }}>
-                        <select
-                          className="select"
-                          style={{ fontSize: 11, padding: "3px 6px", flex: 1 }}
-                          value={col}
-                          onChange={(e) => move(c, e.target.value)}
-                        >
-                          {COLUMNS.map((s) => (
-                            <option key={s} value={s}>
-                              → {COLUMN_LABEL[s]}
-                            </option>
-                          ))}
-                        </select>
-                        <button
-                          className="btn sm"
-                          title="Run this Brief through its Operative's agent adapter now"
-                          onClick={() => run(c)}
-                        >
-                          Run
-                        </button>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                   {cards.length === 0 && <div className="muted" style={{ fontSize: 12, padding: 6 }}>empty</div>}
                 </div>
               );
