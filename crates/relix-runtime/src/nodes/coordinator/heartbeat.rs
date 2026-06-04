@@ -42,6 +42,30 @@ pub const BRIDGE_BACK_SHIFT_METHODS: &[&str] = &[
     "brief.clearance_request",
 ];
 
+/// What triggered a Brief execution. Manual and autonomous runs go
+/// through the SAME pipeline ([`prepare_claimed_run`] → [`execute_ready`])
+/// and the same `brief_runs` ledger; the trigger is the only thing that
+/// distinguishes them, surfaced in the run record + dashboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunTrigger {
+    /// Dashboard "Run" / `brief.run` — an operator started it.
+    Manual,
+    /// Autonomous heartbeat/timer dispatch.
+    Heartbeat,
+    /// A scheduled trigger (reserved / future).
+    Scheduled,
+}
+
+impl RunTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunTrigger::Manual => "manual",
+            RunTrigger::Heartbeat => "heartbeat",
+            RunTrigger::Scheduled => "scheduled",
+        }
+    }
+}
+
 /// Run one selection-and-claim tick over the ready Briefs.
 ///
 /// For each Brief ready to work, atomically claim it for its
@@ -252,118 +276,117 @@ where
             });
             continue;
         }
-        let record = match resolve_rig(&card) {
-            Some(rig) => {
-                // Work starts: todo → in_progress.
-                if card.board_status == "todo" {
-                    store.set_board_status(&card.task_id, "in_progress")?;
-                }
-                let assignee = card.assignee_agent_id.clone().unwrap_or_default();
-                // Mint a scoped bridge-back token for this Shift so the
-                // agent can call Relix back; it dies with the Shift.
-                let token = bridge_tokens
-                    .map(|bt| {
-                        bt.mint_scoped(
-                            &card.task_id,
-                            &assignee,
-                            "",
-                            lease_secs,
-                            BRIDGE_BACK_SHIFT_METHODS
-                                .iter()
-                                .map(|m| (*m).to_string())
-                                .collect(),
-                        )
-                    })
-                    .unwrap_or_default();
-                let req =
-                    RigRunRequest::new(&card.task_id, assignee, String::new(), build_prompt(&card))
-                        .with_bridge_token(&token)
-                        .with_context(brief_context(&card));
-                let outcome = rig.run(&req);
-                if let Some(bt) = bridge_tokens
-                    && !token.is_empty()
-                {
-                    bt.revoke(&token);
-                }
-                // Advance the board by outcome. The Brief is now
-                // `in_progress` (we either moved it or it already
-                // was), so both transitions below are legal.
-                match &outcome {
-                    // Done → review for a human / supervisor, and
-                    // chronicle the result summary so the reviewer
-                    // sees what the Shift produced.
-                    RigOutcome::Done { summary } => {
-                        match store.set_board_status(&card.task_id, "in_review") {
-                            Ok(_) => {
-                                let _ = store.finish_wakeup(&wakeup_id, "completed", Some(summary));
-                                let _ =
-                                    store.append_event(&card.task_id, "brief.shift_done", summary);
-                            }
-                            Err(CoordinatorError::Invalid(reason))
-                                if reason.contains("reviewer required") =>
-                            {
-                                store.set_board_status(&card.task_id, "blocked")?;
-                                let _ = store.finish_wakeup(&wakeup_id, "failed", Some(&reason));
-                                let _ = store.append_event(
-                                    &card.task_id,
-                                    "brief.dispatch_failed",
-                                    &format!("reviewer required before review: {summary}"),
-                                );
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    // Unrecoverable failure → park in `blocked` for
-                    // attention rather than re-dispatching it forever,
-                    // and chronicle WHY so the Desk shows the reason.
-                    RigOutcome::Failed {
-                        retryable: false,
-                        reason,
-                    } => {
-                        store.set_board_status(&card.task_id, "blocked")?;
-                        let _ = store.finish_wakeup(&wakeup_id, "failed", Some(reason));
-                        let _ = store.append_event(&card.task_id, "brief.dispatch_failed", reason);
-                    }
-                    // Durable yield → stay `in_progress` and
-                    // chronicle the note so the NEXT Shift resumes
-                    // with the continuation context.
-                    RigOutcome::Continue { note } => {
-                        let _ = store.finish_wakeup(&wakeup_id, "continued", Some(note));
-                        let _ = store.append_event(&card.task_id, "brief.continued", note);
-                    }
-                    // Retryable failure → leave it `in_progress`; the
-                    // next tick picks it back up.
-                    RigOutcome::Failed {
-                        retryable: true,
-                        reason,
-                    } => {
-                        let _ = store.finish_wakeup(&wakeup_id, "failed", Some(reason));
-                    }
-                }
-                DispatchRecord {
-                    brief_id: card.task_id.clone(),
-                    rig: rig.name().to_string(),
-                    outcome,
-                }
+        let assignee = card.assignee_agent_id.clone().unwrap_or_default();
+        // Resolve the assignee's adapter. No Rig → a clear refusal (NO run
+        // row, board untouched); the Desk surfaces it next tick.
+        let Some(rig) = resolve_rig(&card) else {
+            let reason = "no Rig configured and no Guild default".to_string();
+            let _ = store.finish_wakeup(&wakeup_id, "failed", Some(&reason));
+            let _ = store.append_event(&card.task_id, "brief.dispatch_failed", &reason);
+            if !assignee.is_empty() {
+                store.release_claim(&card.task_id, &assignee)?;
             }
-            None => {
-                let reason = "no Rig configured and no Guild default".to_string();
-                let _ = store.finish_wakeup(&wakeup_id, "failed", Some(&reason));
-                DispatchRecord {
+            records.push(DispatchRecord {
+                brief_id: card.task_id.clone(),
+                rig: String::new(),
+                outcome: RigOutcome::Failed {
+                    reason,
+                    retryable: false,
+                },
+            });
+            continue;
+        };
+        // Same readiness gate as a manual run: NEVER spawn an adapter that
+        // isn't available. A refusal records NO run row (matches manual
+        // pre-flight semantics) — it's a refusal, not an execution failure.
+        let probe = rig.probe();
+        if probe.status != "available" {
+            let reason = format!("adapter `{}` unavailable: {}", rig.name(), probe.detail);
+            let _ = store.finish_wakeup(&wakeup_id, "failed", Some(&reason));
+            let _ = store.append_event(&card.task_id, "brief.dispatch_failed", &reason);
+            if !assignee.is_empty() {
+                store.release_claim(&card.task_id, &assignee)?;
+            }
+            records.push(DispatchRecord {
+                brief_id: card.task_id.clone(),
+                rig: rig.name().to_string(),
+                outcome: RigOutcome::Failed {
+                    reason,
+                    retryable: false,
+                },
+            });
+            continue;
+        }
+        // Commit + execute through the SHARED pipeline — the SAME path a
+        // manual dashboard run takes — so an autonomous run produces the
+        // identical durable output: ledger row, transcript, artifacts,
+        // review state, apply eligibility. The only difference is the
+        // `heartbeat` trigger stamped on the run record.
+        let rig_name = rig.name().to_string();
+        let run_id = format!("run_{}", uuid::Uuid::new_v4());
+        let prompt = build_prompt(&card);
+        match prepare_claimed_run(
+            store,
+            bridge_tokens,
+            lease_secs,
+            &card,
+            &assignee,
+            rig,
+            &run_id,
+            prompt,
+            RunTrigger::Heartbeat,
+        )? {
+            // Workspace prep refused → no run row opened, board untouched.
+            Err(refusal) => {
+                let _ = store.finish_wakeup(&wakeup_id, "failed", Some(&refusal.summary));
+                let _ =
+                    store.append_event(&card.task_id, "brief.dispatch_failed", &refusal.summary);
+                if !assignee.is_empty() {
+                    store.release_claim(&card.task_id, &assignee)?;
+                }
+                records.push(DispatchRecord {
                     brief_id: card.task_id.clone(),
-                    rig: String::new(),
+                    rig: rig_name,
                     outcome: RigOutcome::Failed {
-                        reason,
+                        reason: refusal.summary,
                         retryable: false,
                     },
-                }
+                });
             }
-        };
-        // Always release the Claim after the tick.
-        if let Some(assignee) = card.assignee_agent_id.as_deref() {
-            store.release_claim(&card.task_id, assignee)?;
+            // Committed → run it. `execute_ready_inner` advances the board,
+            // chronicles, scans artifacts, sets review state, closes the run
+            // row, AND releases the Claim. We only finish the wakeup here.
+            Ok(ready) => {
+                let (report, outcome) = execute_ready_inner(store, bridge_tokens, ready);
+                let wakeup_status = match report.status.as_str() {
+                    "done" => "completed",
+                    "continued" => "continued",
+                    "cancelled" => "cancelled",
+                    _ => "failed",
+                };
+                let _ = store.finish_wakeup(&wakeup_id, wakeup_status, Some(&report.summary));
+                // Rebuild the dispatch outcome from the run result, keeping
+                // the raw `retryable` distinction for a genuine failure.
+                let record_outcome = match report.status.as_str() {
+                    "done" => RigOutcome::Done {
+                        summary: report.summary.clone(),
+                    },
+                    "continued" => RigOutcome::Continue {
+                        note: report.summary.clone(),
+                    },
+                    "cancelled" => RigOutcome::Failed {
+                        retryable: false,
+                        reason: report.summary.clone(),
+                    },
+                    _ => outcome,
+                };
+                records.push(DispatchRecord {
+                    brief_id: card.task_id.clone(),
+                    rig: rig_name,
+                    outcome: record_outcome,
+                });
+            }
         }
-        records.push(record);
     }
     Ok(records)
 }
@@ -1557,15 +1580,61 @@ pub fn preflight_run(
             workspace_bytes: None,
         }));
     }
+    // Commit the run through the SHARED pipeline (workspace, ledger row,
+    // transcript, token, baseline). A workspace-prep refusal releases the
+    // just-won Claim (no phantom run, no repo-wide fallback).
+    match prepare_claimed_run(
+        store,
+        bridge_tokens,
+        lease_secs,
+        &card,
+        &assignee,
+        rig,
+        &run_id,
+        prompt,
+        RunTrigger::Manual,
+    )? {
+        Ok(ready) => Ok(Preflight::Ready(Box::new(ready))),
+        Err(report) => {
+            let _ = store.release_claim(&card.task_id, &assignee);
+            Ok(Preflight::Refused(report))
+        }
+    }
+}
+
+/// Commit an already-CLAIMED Brief into a [`ReadyRun`]: prepare the scoped
+/// workspace, advance the board, open the durable `brief_runs` ledger row
+/// (stamped with `trigger`), register cancellation, write the lifecycle
+/// transcript events, mint the scoped bridge-back token, and snapshot the
+/// pre-run workspace baseline. This is the ONE place a run is committed —
+/// BOTH the manual path ([`preflight_run`]) and the autonomous heartbeat
+/// dispatch call it, so every execution produces the same durable output.
+///
+/// The caller must already hold the Brief's Claim and have confirmed the
+/// adapter is available. Returns:
+///   - `Ok(Ok(ReadyRun))` — committed; hand to [`execute_ready`];
+///   - `Ok(Err(RunReport))` — a workspace-prep refusal (NO ledger row was
+///     opened, board untouched). The caller cleans up its Claim / wakeup.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_claimed_run(
+    store: &TaskStore,
+    bridge_tokens: Option<&BridgeTokenStore>,
+    lease_secs: i64,
+    card: &brief::BriefCard,
+    assignee: &str,
+    rig: std::sync::Arc<dyn Rig>,
+    run_id: &str,
+    prompt: String,
+    trigger: RunTrigger,
+) -> Result<Result<ReadyRun, RunReport>, CoordinatorError> {
     let rig_name = rig.name().to_string();
     // Scoped per-run workspace — the Rig executes HERE, not in the
     // coordinator/repo CWD, unless `inherit` mode is explicitly set. The
     // path is derived only from `run_id` (a prompt can't choose it). With
     // `copy_repo` context a capped, filtered project snapshot is copied in.
-    // ANY prep failure refuses cleanly WITHOUT opening a run record and
-    // releases the just-won Claim (no phantom run, no repo-wide fallback):
-    // a basic-creation failure → `workspace_error`, a context/cap failure
-    // → `workspace_context_error`.
+    // ANY prep failure refuses cleanly WITHOUT opening a run record (no
+    // phantom run, no repo-wide fallback): a basic-creation failure →
+    // `workspace_error`, a context/cap failure → `workspace_context_error`.
     let mut workspace: Option<String> = None;
     let mut workspace_context: Option<String> = None;
     let mut workspace_files: Option<i64> = None;
@@ -1573,10 +1642,10 @@ pub fn preflight_run(
     if !workspace_mode_is_inherit() {
         match prepare_run_workspace(
             store.run_workspace_root(),
-            &run_id,
+            run_id,
             &card.task_id,
             &card.title,
-            &brief_context(&card),
+            &brief_context(card),
             store.run_workspace_config(),
         ) {
             Ok(prepared) => {
@@ -1586,9 +1655,8 @@ pub fn preflight_run(
                 workspace_bytes = Some(prepared.copied_bytes as i64);
             }
             Err(e) => {
-                let _ = store.release_claim(&card.task_id, &assignee);
-                return Ok(Preflight::Refused(RunReport {
-                    brief_id: brief_id.to_string(),
+                return Ok(Err(RunReport {
+                    brief_id: card.task_id.clone(),
                     status: e.status().to_string(),
                     rig: rig_name,
                     summary: format!("could not prepare a run workspace: {}", e.message()),
@@ -1607,10 +1675,11 @@ pub fn preflight_run(
     }
     // Durable run record (status `running`) — the dashboard polls this.
     let _ = store.record_run_start(
-        &run_id,
+        run_id,
         &card.task_id,
-        &assignee,
+        assignee,
         &rig_name,
+        trigger.as_str(),
         &crate::nodes::coordinator::RunWorkspaceInfo {
             path: workspace.as_deref(),
             context: workspace_context.as_deref(),
@@ -1620,12 +1689,15 @@ pub fn preflight_run(
     );
     // Register the run as cancellable + open its transcript with the
     // lifecycle events an operator needs to follow the run.
-    crate::rig::CancelRegistry::global().register(&run_id);
+    crate::rig::CancelRegistry::global().register(run_id);
     let _ = store.append_run_event(
-        &run_id,
+        run_id,
         "accepted",
         "relix",
-        &format!("run accepted on adapter `{rig_name}`"),
+        &format!(
+            "run accepted on adapter `{rig_name}` ({} trigger)",
+            trigger.as_str()
+        ),
         None,
         false,
     );
@@ -1637,18 +1709,18 @@ pub fn preflight_run(
         ),
         None => "running in the coordinator working directory (inherit mode)".to_string(),
     };
-    let _ = store.append_run_event(&run_id, "workspace_prepared", "relix", &ws_msg, None, false);
+    let _ = store.append_run_event(run_id, "workspace_prepared", "relix", &ws_msg, None, false);
     let _ = store.append_event(
         &card.task_id,
         "brief.run_started",
-        &format!("[{rig_name}] run {run_id}"),
+        &format!("[{rig_name}] {} run {run_id}", trigger.as_str()),
     );
     // Scoped per-run bridge-back token (dies with the run).
     let token = bridge_tokens
         .map(|bt| {
             bt.mint_scoped(
                 &card.task_id,
-                &assignee,
+                assignee,
                 "",
                 lease_secs,
                 BRIDGE_BACK_SHIFT_METHODS
@@ -1658,10 +1730,10 @@ pub fn preflight_run(
             )
         })
         .unwrap_or_default();
-    let mut req = RigRunRequest::new(&card.task_id, &assignee, String::new(), prompt)
-        .with_run_id(&run_id)
+    let mut req = RigRunRequest::new(&card.task_id, assignee, String::new(), prompt)
+        .with_run_id(run_id)
         .with_bridge_token(&token)
-        .with_context(brief_context(&card));
+        .with_context(brief_context(card));
     // Pin the child's working directory to the scoped workspace.
     if let Some(ws) = &workspace {
         req = req.with_working_dir(std::path::PathBuf::from(ws));
@@ -1672,10 +1744,10 @@ pub fn preflight_run(
         Some(ws) => scan_workspace_manifest(std::path::Path::new(ws)),
         None => WorkspaceManifest::default(),
     };
-    Ok(Preflight::Ready(Box::new(ReadyRun {
-        brief_id: card.task_id,
-        assignee,
-        run_id,
+    Ok(Ok(ReadyRun {
+        brief_id: card.task_id.clone(),
+        assignee: assignee.to_string(),
+        run_id: run_id.to_string(),
         rig_name,
         workspace,
         workspace_context,
@@ -1685,7 +1757,7 @@ pub fn preflight_run(
         rig,
         req,
         token,
-    })))
+    }))
 }
 
 /// Execute a [`ReadyRun`]: run the Rig (blocking), advance the board,
@@ -1697,6 +1769,17 @@ pub fn execute_ready(
     bridge_tokens: Option<&BridgeTokenStore>,
     ready: ReadyRun,
 ) -> RunReport {
+    execute_ready_inner(store, bridge_tokens, ready).0
+}
+
+/// Like [`execute_ready`] but also returns the terminal [`RigOutcome`] so
+/// the autonomous dispatcher can build an accurate `DispatchRecord`
+/// (preserving the `retryable` distinction the `RunReport` status flattens).
+fn execute_ready_inner(
+    store: &TaskStore,
+    bridge_tokens: Option<&BridgeTokenStore>,
+    ready: ReadyRun,
+) -> (RunReport, RigOutcome) {
     let ReadyRun {
         brief_id,
         assignee,
@@ -1862,18 +1945,21 @@ pub fn execute_ready(
     let _ = store.append_run_event(&run_id, term_kind, "relix", &summary, None, true);
     let _ = store.record_run_finish(&run_id, status, &summary);
     let _ = store.release_claim(&brief_id, &assignee);
-    RunReport {
-        brief_id,
-        status: status.to_string(),
-        rig: rig_name,
-        summary,
-        install_hint: None,
-        run_id: Some(run_id),
-        workspace,
-        workspace_context,
-        workspace_files,
-        workspace_bytes,
-    }
+    (
+        RunReport {
+            brief_id,
+            status: status.to_string(),
+            rig: rig_name,
+            summary,
+            install_hint: None,
+            run_id: Some(run_id),
+            workspace,
+            workspace_context,
+            workspace_files,
+            workspace_bytes,
+        },
+        outcome,
+    )
 }
 
 /// Build the opaque `context` string handed to the Rig: where the
@@ -2018,7 +2104,7 @@ mod tests {
     #[test]
     fn dispatch_batch_runs_each_brief_on_its_rig_and_advances_the_board() {
         use crate::rig::RigRegistry;
-        let s = store();
+        let (s, _tmp) = store_ws();
         let reg = RigRegistry::with_builtins();
         let a = ready_brief(&s, "write docs", "agt_a"); // starts in todo
 
@@ -2099,7 +2185,7 @@ mod tests {
     #[test]
     fn dispatch_policy_honors_per_agent_concurrency_cap() {
         use crate::rig::RigRegistry;
-        let s = store();
+        let (s, _tmp) = store_ws();
         let reg = RigRegistry::with_builtins();
         let a = ready_brief(&s, "a", "agt_a");
         let b = ready_brief(&s, "b", "agt_a");
@@ -2162,7 +2248,7 @@ mod tests {
     #[test]
     fn over_budget_operative_is_refused_parked_and_chronicled() {
         use crate::rig::RigRegistry;
-        let s = store();
+        let (s, _tmp) = store_ws();
         let reg = RigRegistry::with_builtins();
         let refused = ready_brief(&s, "refused work", "agt_broke");
         let allowed = ready_brief(&s, "allowed work", "agt_ok");
@@ -2269,7 +2355,7 @@ mod tests {
                 }
             }
         }
-        let s = store();
+        let (s, _tmp) = store_ws();
         let a = ready_brief(&s, "x", "agt_a"); // todo
         let rig: Arc<dyn Rig> = Arc::new(DeadRig);
 
@@ -2306,7 +2392,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].payload, "boom");
+        // Unified pipeline chronicles the adapter-tagged reason.
+        assert_eq!(events[0].payload, "[dead] boom");
     }
 
     #[test]
@@ -2323,7 +2410,7 @@ mod tests {
                 }
             }
         }
-        let s = store();
+        let (s, _tmp) = store_ws();
         let a = ready_brief(&s, "x", "agt_a"); // todo
         let rig: Arc<dyn Rig> = Arc::new(FlakyRig);
         dispatch_batch(
@@ -2352,7 +2439,7 @@ mod tests {
                 }
             }
         }
-        let s = store();
+        let (s, _tmp) = store_ws();
         let a = ready_brief(&s, "a", "agt_a"); // todo
         let rig: Arc<dyn Rig> = Arc::new(YieldRig);
         dispatch_batch(
@@ -2377,7 +2464,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].payload, "waiting on review");
+        // Unified pipeline chronicles the adapter-tagged note.
+        assert_eq!(events[0].payload, "[yield] waiting on review");
     }
 
     #[test]
@@ -2397,7 +2485,7 @@ mod tests {
             }
         }
 
-        let s = store();
+        let (s, _tmp) = store_ws();
         let a = ready_brief(&s, "a", "agt_a");
         s.set_brief_field(&a, "priority", "high").unwrap();
         s.set_brief_field(&a, "mandate", "mandate_x").unwrap();
@@ -2456,7 +2544,7 @@ mod tests {
             }
         }
 
-        let s = store();
+        let (s, _tmp) = store_ws();
         let _a = ready_brief(&s, "a", "agt_a");
         let tokens = BridgeTokenStore::new();
         let seen = Arc::new(Mutex::new(String::new()));
@@ -2493,6 +2581,247 @@ mod tests {
         );
         // …and revoked when the Shift ended.
         assert!(tokens.is_empty(), "token should be revoked after the run");
+    }
+
+    // ── Autonomous/manual unification: one ledger, one pipeline ──
+    //
+    // An autonomous heartbeat run must produce the SAME durable output as a
+    // manual dashboard run — a `brief_runs` row, a transcript, artifacts,
+    // and review state — distinguished only by the `heartbeat` trigger.
+
+    /// One autonomous heartbeat tick over the ready Briefs with a given Rig
+    /// — the test analog of the live timer dispatch (`dispatch_batch`).
+    fn heartbeat_tick(
+        s: &TaskStore,
+        rig: Option<Arc<dyn Rig>>,
+        tokens: Option<&BridgeTokenStore>,
+    ) -> Vec<DispatchRecord> {
+        dispatch_batch(
+            s,
+            50,
+            300,
+            tokens,
+            move |_: &brief::BriefCard| rig.clone(),
+            |c: &brief::BriefCard| c.title.clone(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn heartbeat_run_produces_a_ledger_row_transcript_and_review_state() {
+        let (s, _tmp) = store_ws();
+        let reg = crate::rig::RigRegistry::with_builtins();
+        let a = ready_brief(&s, "auto docs", "agt_a");
+
+        let records = heartbeat_tick(&s, reg.get("echo"), None);
+        assert_eq!(records.len(), 1);
+
+        // A durable run row exists in the SAME ledger the dashboard polls.
+        let runs = s.list_runs(50).unwrap();
+        let run = runs
+            .iter()
+            .find(|r| r.brief_id == a)
+            .expect("autonomous run must open a brief_runs row");
+        assert_eq!(run.status, "done");
+        assert_eq!(run.trigger.as_deref(), Some("heartbeat"));
+        // A `done` autonomous run enters review, exactly like a manual one.
+        assert_eq!(run.review.as_deref(), Some("pending_review"));
+
+        // Transcript events were recorded for the autonomous run.
+        let kinds: Vec<String> = s
+            .list_run_events(&run.run_id, 200)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(kinds.contains(&"accepted".to_string()));
+        assert!(kinds.contains(&"process_started".to_string()));
+        assert!(kinds.contains(&"result".to_string()));
+    }
+
+    #[test]
+    fn heartbeat_run_records_artifacts_for_a_file_writing_rig() {
+        let (s, _tmp) = store_ws();
+        let reg = file_creating_rig("auto_note.txt", "hi");
+        let a = ready_brief(&s, "auto file", "agt_a");
+
+        heartbeat_tick(&s, reg.get("mk"), None);
+        let run = s
+            .list_runs(50)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.brief_id == a)
+            .expect("autonomous run row");
+        assert_eq!(run.trigger.as_deref(), Some("heartbeat"));
+        let arts = s.list_run_artifacts(&run.run_id).unwrap();
+        assert!(
+            arts.iter().any(|x| x.rel_path == "auto_note.txt" && x.kind == "created"),
+            "heartbeat run must record the file it created: {arts:?}"
+        );
+    }
+
+    #[test]
+    fn run_trigger_is_manual_for_dashboard_and_heartbeat_for_timer() {
+        let (s, _tmp) = store_ws();
+        // Manual run via the dashboard "Start" path.
+        let m = ready_brief(&s, "manual one", "agt_m");
+        let report =
+            run_brief_now(&s, &echo_registry(), None, 300, &m, Some("echo"), "x".into()).unwrap();
+        let mrun = s.get_run(&report.run_id.unwrap()).unwrap().unwrap();
+        assert_eq!(mrun.trigger.as_deref(), Some("manual"));
+
+        // Autonomous run via a heartbeat tick.
+        let reg = crate::rig::RigRegistry::with_builtins();
+        let h = ready_brief(&s, "auto one", "agt_h");
+        heartbeat_tick(&s, reg.get("echo"), None);
+        let hrun = s
+            .list_runs(50)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.brief_id == h)
+            .unwrap();
+        assert_eq!(hrun.trigger.as_deref(), Some("heartbeat"));
+    }
+
+    #[test]
+    fn heartbeat_failed_run_records_a_failed_run_row_and_event() {
+        struct DeadRig;
+        impl Rig for DeadRig {
+            fn name(&self) -> &str {
+                "dead"
+            }
+            fn run(&self, _req: &RigRunRequest) -> RigOutcome {
+                RigOutcome::Failed {
+                    reason: "boom".to_string(),
+                    retryable: false,
+                }
+            }
+        }
+        let (s, _tmp) = store_ws();
+        let a = ready_brief(&s, "auto fail", "agt_a");
+        let rig: Arc<dyn Rig> = Arc::new(DeadRig);
+
+        heartbeat_tick(&s, Some(rig), None);
+        let run = s
+            .list_runs(50)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.brief_id == a)
+            .expect("a failed autonomous execution still opens a run row");
+        assert_eq!(run.status, "failed");
+        assert_eq!(run.trigger.as_deref(), Some("heartbeat"));
+        // Non-retryable → parked in blocked (not re-dispatched forever).
+        assert_eq!(s.board_status(&a).unwrap().as_deref(), Some("blocked"));
+        let kinds: Vec<String> = s
+            .list_run_events(&run.run_id, 200)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(kinds.contains(&"failed".to_string()));
+    }
+
+    #[test]
+    fn heartbeat_adapter_unavailable_refuses_without_spawning_or_a_run_row() {
+        struct DownRig;
+        impl Rig for DownRig {
+            fn name(&self) -> &str {
+                "down"
+            }
+            fn probe(&self) -> crate::rig::RigProbe {
+                crate::rig::RigProbe::missing("not installed", Some("install it".to_string()))
+            }
+            fn run(&self, _req: &RigRunRequest) -> RigOutcome {
+                panic!("must NOT spawn an unavailable adapter");
+            }
+        }
+        let (s, _tmp) = store_ws();
+        let a = ready_brief(&s, "auto down", "agt_a");
+        let rig: Arc<dyn Rig> = Arc::new(DownRig);
+
+        let records = heartbeat_tick(&s, Some(rig), None);
+        // Refused at the readiness gate: NO run row opened (matches manual
+        // pre-flight semantics — a refusal is not an execution).
+        assert!(
+            s.list_runs(50).unwrap().iter().all(|r| r.brief_id != a),
+            "an unavailable adapter must not open a run row"
+        );
+        assert!(records.iter().any(|r| r.brief_id == a
+            && matches!(
+                r.outcome,
+                RigOutcome::Failed {
+                    retryable: false,
+                    ..
+                }
+            )));
+        // The Claim is released, so the Brief can retry once the adapter is up.
+        assert!(s.claim_holder(&a).unwrap().is_none());
+    }
+
+    #[test]
+    fn heartbeat_run_does_not_auto_apply() {
+        let (s, _tmp) = store_ws();
+        let reg = file_creating_rig("auto_note.txt", "hi");
+        let a = ready_brief(&s, "auto file", "agt_a");
+
+        heartbeat_tick(&s, reg.get("mk"), None);
+        let run = s
+            .list_runs(50)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.brief_id == a)
+            .unwrap();
+        // Autonomous runs are review-gated exactly like manual runs — no
+        // apply happens automatically.
+        assert!(run.apply_status.is_none(), "autonomous run must NOT auto-apply");
+        assert_eq!(run.review.as_deref(), Some("pending_review"));
+        assert!(
+            run_apply_eligibility(&run).is_err(),
+            "an unreviewed autonomous run is not apply-eligible"
+        );
+    }
+
+    #[test]
+    fn a_live_claim_prevents_a_duplicate_autonomous_run() {
+        let (s, _tmp) = store_ws();
+        let reg = crate::rig::RigRegistry::with_builtins();
+        let a = ready_brief(&s, "contended", "agt_a");
+        // Another worker already holds a live Claim on the Brief.
+        assert!(s
+            .claim_brief_for_run(&a, "other_agent", 300, Some("other_run"))
+            .unwrap());
+
+        // A heartbeat tick must NOT start a second concurrent run on it.
+        let records = heartbeat_tick(&s, reg.get("echo"), None);
+        assert!(
+            records.iter().all(|r| r.brief_id != a),
+            "a live-claimed Brief must not double-run"
+        );
+        assert!(
+            s.list_runs(50).unwrap().is_empty(),
+            "the heartbeat opened no run row for the claimed Brief"
+        );
+    }
+
+    #[test]
+    fn heartbeat_run_row_is_tenant_scoped() {
+        let (s, _tmp) = store_ws();
+        let reg = crate::rig::RigRegistry::with_builtins();
+        let a = ready_brief(&s, "auto scoped", "agt_a");
+        s.set_task_tenant(&a, "guild-a").unwrap();
+
+        heartbeat_tick(&s, reg.get("echo"), None);
+        let run = s
+            .list_runs(50)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.brief_id == a)
+            .unwrap();
+        assert!(s.run_belongs_to_tenant(&run.run_id, "guild-a").unwrap());
+        assert!(
+            !s.run_belongs_to_tenant(&run.run_id, "guild-b").unwrap(),
+            "another Guild cannot see the autonomous run"
+        );
     }
 
     // ── Synchronous run_brief_now (the dashboard "Start") ────────
@@ -3192,6 +3521,7 @@ mod tests {
             &id,
             "agt",
             "echo",
+            "manual",
             &crate::nodes::coordinator::RunWorkspaceInfo::default(),
         )
         .unwrap();
@@ -3236,7 +3566,7 @@ mod tests {
             files: None,
             bytes: None,
         };
-        s.record_run_start(&run_id, &brief, "agt", "echo", &info).unwrap();
+        s.record_run_start(&run_id, &brief, "agt", "echo", "manual", &info).unwrap();
         s.record_run_finish(&run_id, "done", "ok").unwrap();
         s.set_run_review(&run_id, "accepted", "").unwrap();
         (run_id, brief)
@@ -3282,7 +3612,7 @@ mod tests {
             files: None,
             bytes: None,
         };
-        s.record_run_start("r1", &brief, "a", "echo", &info).unwrap();
+        s.record_run_start("r1", &brief, "a", "echo", "manual", &info).unwrap();
         // running → ineligible
         assert!(run_apply_eligibility(&s.get_run("r1").unwrap().unwrap()).is_err());
         // done but pending_review → ineligible
@@ -3295,7 +3625,7 @@ mod tests {
         s.set_run_review("r1", "rejected", "nah").unwrap();
         assert!(run_apply_eligibility(&s.get_run("r1").unwrap().unwrap()).is_err());
         // inherit-mode (no scoped workspace) done+accepted → ineligible
-        s.record_run_start("r2", &brief, "a", "echo", &crate::nodes::coordinator::RunWorkspaceInfo::default())
+        s.record_run_start("r2", &brief, "a", "echo", "manual", &crate::nodes::coordinator::RunWorkspaceInfo::default())
             .unwrap();
         s.record_run_finish("r2", "done", "ok").unwrap();
         s.set_run_review("r2", "accepted", "").unwrap();
@@ -3537,7 +3867,7 @@ mod tests {
             .create("t", "f", "{}", "subj", RetryPolicy::None, 0, None, None)
             .unwrap();
         s.set_task_tenant(&brief, "guild-a").unwrap();
-        s.record_run_start("rA", &brief, "a", "echo", &crate::nodes::coordinator::RunWorkspaceInfo::default())
+        s.record_run_start("rA", &brief, "a", "echo", "manual", &crate::nodes::coordinator::RunWorkspaceInfo::default())
             .unwrap();
         // The diff/apply capabilities gate on this exact check.
         assert!(s.run_belongs_to_tenant("rA", "guild-a").unwrap());

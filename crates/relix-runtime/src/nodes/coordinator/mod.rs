@@ -2465,6 +2465,7 @@ impl TaskStore {
         brief_id: &str,
         agent_id: &str,
         rig: &str,
+        trigger: &str,
         workspace: &RunWorkspaceInfo<'_>,
     ) -> Result<(), CoordinatorError> {
         let now = unix_secs();
@@ -2472,8 +2473,8 @@ impl TaskStore {
         conn.execute(
             "INSERT OR IGNORE INTO brief_runs
                  (run_id, brief_id, agent_id, rig, status, started_at, summary,
-                  workspace, workspace_context, workspace_files, workspace_bytes)
-             VALUES (?1, ?2, ?3, ?4, 'running', ?5, '', ?6, ?7, ?8, ?9)",
+                  workspace, workspace_context, workspace_files, workspace_bytes, trigger)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, '', ?6, ?7, ?8, ?9, ?10)",
             params![
                 run_id,
                 brief_id,
@@ -2484,6 +2485,7 @@ impl TaskStore {
                 workspace.context,
                 workspace.files,
                 workspace.bytes,
+                trigger,
             ],
         )
         .map_err(CoordinatorError::Db)?;
@@ -2716,7 +2718,8 @@ impl TaskStore {
                 "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary,
                         workspace, workspace_context, workspace_files, workspace_bytes,
                         review, review_note, reviewed_at,
-                        apply_status, applied_at, apply_note, applied_files, failed_files
+                        apply_status, applied_at, apply_note, applied_files, failed_files,
+                        trigger
                  FROM brief_runs
                  ORDER BY started_at DESC, rowid DESC
                  LIMIT ?1",
@@ -2746,7 +2749,8 @@ impl TaskStore {
                 "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary,
                         workspace, workspace_context, workspace_files, workspace_bytes,
                         review, review_note, reviewed_at,
-                        apply_status, applied_at, apply_note, applied_files, failed_files
+                        apply_status, applied_at, apply_note, applied_files, failed_files,
+                        trigger
                  FROM brief_runs
                  WHERE brief_id = ?1
                  ORDER BY started_at DESC, rowid DESC
@@ -2771,7 +2775,8 @@ impl TaskStore {
                 "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary,
                         workspace, workspace_context, workspace_files, workspace_bytes,
                         review, review_note, reviewed_at,
-                        apply_status, applied_at, apply_note, applied_files, failed_files
+                        apply_status, applied_at, apply_note, applied_files, failed_files,
+                        trigger
                  FROM brief_runs WHERE run_id = ?1",
                 params![run_id],
                 RunRecord::from_row,
@@ -7479,6 +7484,10 @@ pub struct RunRecord {
     pub applied_files: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_files: Option<i64>,
+    /// What triggered this run: `manual` / `heartbeat` / `scheduled` /
+    /// `unknown`. `None` for legacy rows (pre-unification).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
 }
 
 /// One reviewable run artifact (`run_artifacts`) — metadata about a file
@@ -7606,6 +7615,7 @@ impl RunRecord {
             apply_note: r.get(17)?,
             applied_files: r.get(18)?,
             failed_files: r.get(19)?,
+            trigger: r.get(20)?,
         })
     }
 }
@@ -12204,6 +12214,12 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             apply_note    TEXT,
             applied_files INTEGER,
             failed_files  INTEGER,
+            -- What triggered this execution: `manual` (dashboard Run /
+            -- `brief.run`), `heartbeat` (autonomous timer dispatch),
+            -- `scheduled` (future), or `unknown` (legacy rows). Manual and
+            -- autonomous runs share this one ledger — the trigger is the
+            -- only thing that distinguishes them.
+            trigger       TEXT,
             FOREIGN KEY (brief_id) REFERENCES tasks(task_id)
         );
         CREATE INDEX IF NOT EXISTS brief_runs_by_brief
@@ -12427,6 +12443,9 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         "ALTER TABLE brief_runs ADD COLUMN failed_files INTEGER",
         // BEFORE-run hash on each artifact (safe-apply conflict detection).
         "ALTER TABLE run_artifacts ADD COLUMN baseline_hash TEXT",
+        // Execution trigger (manual / heartbeat / scheduled) — unify the
+        // manual + autonomous run ledger under one stream.
+        "ALTER TABLE brief_runs ADD COLUMN trigger TEXT",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the
