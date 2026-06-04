@@ -555,6 +555,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Product-spine dashboard write actions.
         .route("/v1/spine/briefs", post(spine::create_brief))
         .route("/v1/spine/briefs/:id/move", post(spine::move_brief))
+        // Run a Brief now through its Operative's agent adapter (Rig).
+        .route("/v1/spine/briefs/:id/run", post(spine::run_brief))
         .route("/v1/spine/briefs/:id/pin", post(spine::pin_brief))
         .route("/v1/spine/briefs/:id/comment", post(spine::comment_brief))
         .route("/v1/spine/briefs/:id/due", post(spine::set_due))

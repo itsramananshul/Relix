@@ -1901,6 +1901,23 @@ impl TaskStore {
     /// when set, narrows to one column (validated); `None` returns
     /// all. Newest-updated first, capped at the store's max_list.
     /// The core read behind the board view.
+    /// The single Brief card for `task_id` (the dispatch/run view's
+    /// fields), or `None` when the Brief does not exist.
+    pub fn brief_card(&self, task_id: &str) -> Result<Option<brief::BriefCard>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        match conn.query_row(
+            "SELECT task_id, title, board_status, priority,
+                    assignee_agent_id, mandate_id, campaign_id
+             FROM tasks WHERE task_id = ?1",
+            params![task_id],
+            brief_card_from_row,
+        ) {
+            Ok(card) => Ok(Some(card)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(CoordinatorError::Db(e)),
+        }
+    }
+
     pub fn list_briefs_by_board(
         &self,
         board: Option<&str>,

@@ -368,6 +368,182 @@ where
     Ok(records)
 }
 
+/// Structured result of a manual, synchronous **run** of one Brief —
+/// the dashboard "Start / Run" path (`brief.run`). Unlike the timer
+/// loop, this runs immediately and reports a clear outcome, including
+/// the adapter-unavailable states (so the UI never fakes a run).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RunReport {
+    pub brief_id: String,
+    /// `done` / `failed` / `continued` — real run outcomes; or
+    /// `not_found` / `unassigned` / `no_adapter` / `adapter_unavailable`
+    /// / `already_running` — pre-run refusals (no command was spawned).
+    pub status: String,
+    /// The adapter (Rig) that ran it, empty when none resolved.
+    pub rig: String,
+    /// Result summary (Done) or reason (Failed / refusal). Already
+    /// secret-redacted by the Rig before it reaches here.
+    pub summary: String,
+    /// Install hint when the adapter is missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_hint: Option<String>,
+}
+
+impl RunReport {
+    fn refuse(brief_id: &str, status: &str, summary: impl Into<String>) -> Self {
+        Self {
+            brief_id: brief_id.to_string(),
+            status: status.to_string(),
+            rig: String::new(),
+            summary: summary.into(),
+            install_hint: None,
+        }
+    }
+}
+
+/// Run ONE Brief synchronously through its Operative's Rig — the manual
+/// "Start" action. Resolves the adapter, refuses clearly when it is
+/// unavailable (never spawns), claims the Brief to block a duplicate
+/// concurrent run, runs the Rig, advances the board, and chronicles the
+/// result (tagged with the adapter name) exactly like the timer loop.
+#[allow(clippy::too_many_arguments)]
+pub fn run_brief_now(
+    store: &TaskStore,
+    registry: &crate::rig::RigRegistry,
+    bridge_tokens: Option<&BridgeTokenStore>,
+    lease_secs: i64,
+    brief_id: &str,
+    preferred_rig: Option<&str>,
+    prompt: String,
+) -> Result<RunReport, CoordinatorError> {
+    let Some(card) = store.brief_card(brief_id)? else {
+        return Ok(RunReport::refuse(brief_id, "not_found", "brief not found"));
+    };
+    let Some(assignee) = card.assignee_agent_id.clone() else {
+        return Ok(RunReport::refuse(
+            brief_id,
+            "unassigned",
+            "assign an Operative before running",
+        ));
+    };
+    let Some(rig) = registry.resolve(preferred_rig) else {
+        return Ok(RunReport::refuse(
+            brief_id,
+            "no_adapter",
+            "the Operative has no Rig and no Guild default is configured",
+        ));
+    };
+    // Live availability probe — never spawn an adapter that isn't there.
+    let probe = rig.probe();
+    if probe.status != "available" {
+        return Ok(RunReport {
+            brief_id: brief_id.to_string(),
+            status: "adapter_unavailable".to_string(),
+            rig: rig.name().to_string(),
+            summary: probe.detail,
+            install_hint: probe.install_hint,
+        });
+    }
+    // Single-owner: claim the Brief so a duplicate concurrent run can't
+    // start. A live claim by another run → refuse.
+    let run_id = format!("run_{}", uuid::Uuid::new_v4());
+    if !store.claim_brief_for_run(&card.task_id, &assignee, lease_secs, Some(&run_id))? {
+        return Ok(RunReport {
+            brief_id: brief_id.to_string(),
+            status: "already_running".to_string(),
+            rig: rig.name().to_string(),
+            summary: "another run holds the Claim on this Brief".to_string(),
+            install_hint: None,
+        });
+    }
+    let rig_name = rig.name().to_string();
+    if card.board_status == "todo" {
+        store.set_board_status(&card.task_id, "in_progress")?;
+    }
+    let _ = store.append_event(
+        &card.task_id,
+        "brief.run_started",
+        &format!("[{rig_name}] run {run_id}"),
+    );
+    // Scoped per-run bridge-back token (dies with the run).
+    let token = bridge_tokens
+        .map(|bt| {
+            bt.mint_scoped(
+                &card.task_id,
+                &assignee,
+                "",
+                lease_secs,
+                BRIDGE_BACK_SHIFT_METHODS
+                    .iter()
+                    .map(|m| (*m).to_string())
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
+    let req = RigRunRequest::new(&card.task_id, &assignee, String::new(), prompt)
+        .with_bridge_token(&token)
+        .with_context(brief_context(&card));
+    let outcome = rig.run(&req);
+    if let Some(bt) = bridge_tokens
+        && !token.is_empty()
+    {
+        bt.revoke(&token);
+    }
+    let (status, summary) = match &outcome {
+        RigOutcome::Done { summary } => {
+            // Done → in_review (best-effort; a missing reviewer parks it).
+            if store.set_board_status(&card.task_id, "in_review").is_err() {
+                let _ = store.set_board_status(&card.task_id, "blocked");
+            }
+            let _ = store.append_event(
+                &card.task_id,
+                "brief.shift_done",
+                &format!("[{rig_name}] {summary}"),
+            );
+            ("done", summary.clone())
+        }
+        RigOutcome::Failed {
+            retryable: false,
+            reason,
+        } => {
+            let _ = store.set_board_status(&card.task_id, "blocked");
+            let _ = store.append_event(
+                &card.task_id,
+                "brief.dispatch_failed",
+                &format!("[{rig_name}] {reason}"),
+            );
+            ("failed", reason.clone())
+        }
+        RigOutcome::Failed {
+            retryable: true,
+            reason,
+        } => {
+            let _ = store.append_event(
+                &card.task_id,
+                "brief.dispatch_failed",
+                &format!("[{rig_name}] {reason}"),
+            );
+            ("failed", reason.clone())
+        }
+        RigOutcome::Continue { note } => {
+            let _ = store.append_event(
+                &card.task_id,
+                "brief.continued",
+                &format!("[{rig_name}] {note}"),
+            );
+            ("continued", note.clone())
+        }
+    };
+    let _ = store.release_claim(&card.task_id, &assignee);
+    Ok(RunReport {
+        brief_id: card.task_id,
+        status: status.to_string(),
+        rig: rig_name,
+        summary,
+        install_hint: None,
+    })
+}
+
 /// Build the opaque `context` string handed to the Rig: where the
 /// Brief sits on the spine (priority + Mandate/Campaign links), so
 /// the agent backend knows the work's place in the company without
@@ -975,5 +1151,86 @@ mod tests {
         );
         // …and revoked when the Shift ended.
         assert!(tokens.is_empty(), "token should be revoked after the run");
+    }
+
+    // ── Synchronous run_brief_now (the dashboard "Start") ────────
+
+    fn echo_registry() -> crate::rig::RigRegistry {
+        crate::rig::RigRegistry::with_builtins().with_default("echo")
+    }
+
+    #[test]
+    fn run_brief_now_runs_on_echo_and_moves_to_review() {
+        let s = store();
+        let id = ready_brief(&s, "Write the readme", "agt_a");
+        let reg = echo_registry();
+        let report =
+            run_brief_now(&s, &reg, None, 300, &id, Some("echo"), "do the work".into()).unwrap();
+        assert_eq!(report.status, "done", "got: {report:?}");
+        assert_eq!(report.rig, "echo");
+        assert!(report.summary.contains("echo:"));
+        // The board advanced to review and the run was chronicled.
+        assert_eq!(s.board_status(&id).unwrap().as_deref(), Some("in_review"));
+        let kinds: Vec<String> = s
+            .list_events_after(&id, 0, 100)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.event_type)
+            .collect();
+        assert!(kinds.iter().any(|k| k == "brief.run_started"));
+        assert!(kinds.iter().any(|k| k == "brief.shift_done"));
+        // The Claim is released after the run.
+        assert!(s.claim_holder(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn run_brief_now_refuses_unassigned() {
+        let s = store();
+        let id = s
+            .create("u", "f", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .unwrap();
+        let report = run_brief_now(&s, &echo_registry(), None, 300, &id, Some("echo"), "x".into())
+            .unwrap();
+        assert_eq!(report.status, "unassigned");
+    }
+
+    #[test]
+    fn run_brief_now_reports_no_adapter_when_none_resolves() {
+        let s = store();
+        let id = ready_brief(&s, "t", "agt_a");
+        let empty = crate::rig::RigRegistry::new(); // no default, no rigs
+        let report = run_brief_now(&s, &empty, None, 300, &id, None, "x".into()).unwrap();
+        assert_eq!(report.status, "no_adapter");
+    }
+
+    #[test]
+    fn run_brief_now_reports_adapter_unavailable_without_spawning() {
+        let s = store();
+        let id = ready_brief(&s, "t", "agt_a");
+        let mut reg = crate::rig::RigRegistry::new();
+        reg.register(std::sync::Arc::new(
+            crate::rig::ProcessRig::new(
+                "ghost",
+                "definitely-not-installed-relix-adapter-xyzzy",
+                vec![],
+            )
+            .with_install_hint("install the ghost adapter"),
+        ));
+        reg.set_default(Some("ghost".to_string()));
+        let report = run_brief_now(&s, &reg, None, 300, &id, None, "x".into()).unwrap();
+        assert_eq!(report.status, "adapter_unavailable", "got: {report:?}");
+        assert_eq!(report.rig, "ghost");
+        assert_eq!(report.install_hint.as_deref(), Some("install the ghost adapter"));
+        // It must NOT have moved the board (no run happened).
+        assert_eq!(s.board_status(&id).unwrap().as_deref(), Some("todo"));
+    }
+
+    #[test]
+    fn run_brief_now_reports_not_found_for_unknown_brief() {
+        let s = store();
+        let report =
+            run_brief_now(&s, &echo_registry(), None, 300, "nope", Some("echo"), "x".into())
+                .unwrap();
+        assert_eq!(report.status, "not_found");
     }
 }

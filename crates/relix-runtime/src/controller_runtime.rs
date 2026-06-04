@@ -8878,6 +8878,85 @@ fn register_node_type_handlers(
                 )),
             );
         }
+        {
+            // `brief.run` — synchronous, on-demand execution of one Brief
+            // through its Operative's Rig (the dashboard "Start" action).
+            // Works regardless of the heartbeat loop; returns a structured
+            // RunReport (real outcome OR a clear adapter-unavailable
+            // refusal, never a faked run).
+            let reg = rig_registry.clone();
+            let st = store.clone();
+            let ags = agent_store.clone();
+            bridge.register(
+                "brief.run",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let reg = reg.clone();
+                        let st = st.clone();
+                        let ags = ags.clone();
+                        async move {
+                            let brief_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
+                            if brief_id.is_empty() {
+                                return crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                        cause: "brief.run: brief_id required".into(),
+                                        retry_hint: 0,
+                                        retry_after: None,
+                                    },
+                                );
+                            }
+                            // Resolve the assignee's preferred Rig + charter,
+                            // and compose the prompt the Rig will execute.
+                            let (preferred, charter) = match st.brief_card(&brief_id) {
+                                Ok(Some(card)) => {
+                                    let agent = card
+                                        .assignee_agent_id
+                                        .as_deref()
+                                        .and_then(|a| ags.get_agent(a).ok().flatten());
+                                    (
+                                        agent.as_ref().and_then(|a| a.rig.clone()),
+                                        agent
+                                            .map(|a| a.instruction_bundle)
+                                            .filter(|c| !c.trim().is_empty()),
+                                    )
+                                }
+                                _ => (None, None),
+                            };
+                            let prompt = st
+                                .compose_brief_prompt_with_charter(&brief_id, 10, charter.as_deref());
+                            let bridge_tokens = crate::rig::bridge::BridgeTokenStore::global();
+                            let report = crate::nodes::coordinator::heartbeat::run_brief_now(
+                                &st,
+                                &reg,
+                                Some(&bridge_tokens),
+                                300,
+                                &brief_id,
+                                preferred.as_deref(),
+                                prompt,
+                            );
+                            let internal = |cause: String| {
+                                crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                        cause,
+                                        retry_hint: 1,
+                                        retry_after: None,
+                                    },
+                                )
+                            };
+                            match report {
+                                Ok(r) => match serde_json::to_vec(&r) {
+                                    Ok(body) => crate::dispatch::HandlerOutcome::Ok(body),
+                                    Err(e) => internal(format!("brief.run encode: {e}")),
+                                },
+                                Err(e) => internal(format!("brief.run: {e}")),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
         // PHASE 3 (heartbeat loop): the live dispatch tick. Opt-in
         // via RELIX_HEARTBEAT_ENABLED (off by default so it never
         // surprises an operator). When on, a timer polls the ready
