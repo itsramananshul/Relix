@@ -1,0 +1,79 @@
+import { useState, type FormEvent } from "react";
+import { useAuth } from "../auth";
+
+export function Login() {
+  const { status, login, setup } = useAuth();
+  const isSetup = status?.needs_setup ?? false;
+  const [username, setUsername] = useState("admin");
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    setErr(null);
+    if (isSetup && password !== confirm) {
+      setErr("Passwords do not match");
+      return;
+    }
+    setBusy(true);
+    try {
+      if (isSetup) await setup(username.trim(), password);
+      else await login(username.trim(), password);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Authentication failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="auth-wrap">
+      <form className="auth-card" onSubmit={submit}>
+        <div className="logo">R</div>
+        <h2>{isSetup ? "Set up Relix" : "Sign in"}</h2>
+        <p className="sub">
+          {isSetup
+            ? "Create the operator admin account for this bridge."
+            : "Operator console for your Relix mesh."}
+        </p>
+        {err && <div className="banner err">{err}</div>}
+        <label className="field">
+          <span>Username</span>
+          <input
+            className="input"
+            value={username}
+            autoComplete="username"
+            onChange={(e) => setUsername(e.target.value)}
+          />
+        </label>
+        <label className="field">
+          <span>Password</span>
+          <input
+            className="input"
+            type="password"
+            value={password}
+            autoComplete={isSetup ? "new-password" : "current-password"}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+        </label>
+        {isSetup && (
+          <label className="field">
+            <span>Confirm password (min 8 chars)</span>
+            <input
+              className="input"
+              type="password"
+              value={confirm}
+              autoComplete="new-password"
+              onChange={(e) => setConfirm(e.target.value)}
+            />
+          </label>
+        )}
+        <button className="btn" style={{ width: "100%", marginTop: 6 }} disabled={busy}>
+          {busy ? "…" : isSetup ? "Create admin & continue" : "Sign in"}
+        </button>
+      </form>
+    </div>
+  );
+}

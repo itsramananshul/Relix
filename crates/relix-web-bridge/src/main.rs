@@ -1213,7 +1213,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Operator dashboard. Single-page static HTML; consumes
         // the existing /v1/tasks* endpoints. No server-side
         // state introduced. See docs/bridge-invariants.md.
-        .route("/dashboard", get(dashboard::page))
+        // Operator dashboard. The real React SPA (apps/dashboard, built
+        // to crates/relix-web-bridge/dashboard-dist) when a bundle is
+        // present; otherwise the legacy single-file HTML page. Both mount
+        // at /dashboard and are public-allowlisted in the auth middleware.
+        .merge(dashboard::dashboard_router())
         // The dashboard ships as a single self-contained HTML
         // file (CSS + JS inline) under a per-route CSP that
         // allows inline scripts. The historical

@@ -131,6 +131,59 @@ pub async fn page() -> Response {
     }
 }
 
+/// Resolve the built dashboard SPA bundle directory. The real app is a
+/// Vite + React + TypeScript project under `apps/dashboard`; its
+/// `npm run build` emits to `crates/relix-web-bridge/dashboard-dist`,
+/// which is what this serves. Operators can override the location with
+/// `RELIX_DASHBOARD_DIST`. Returns `None` when no built bundle is
+/// present (a source-only checkout that hasn't run the frontend build),
+/// in which case the bridge falls back to the legacy single-file page.
+pub fn resolve_spa_dir() -> Option<std::path::PathBuf> {
+    let has_index = |p: &std::path::Path| p.join("index.html").is_file();
+    if let Ok(p) = std::env::var("RELIX_DASHBOARD_DIST") {
+        let pb = std::path::PathBuf::from(p);
+        if has_index(&pb) {
+            return Some(pb);
+        }
+        tracing::warn!(path = %pb.display(), "dashboard: RELIX_DASHBOARD_DIST has no index.html");
+    }
+    let default = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("dashboard-dist");
+    if has_index(&default) {
+        Some(default)
+    } else {
+        None
+    }
+}
+
+/// Build the `/dashboard` router: the real React SPA when a built bundle
+/// exists (served as static assets with an SPA history fallback to
+/// `index.html`), otherwise the legacy single-file HTML page so a
+/// source-only checkout still has a working operator console.
+///
+/// The SPA is built with Vite `base: '/dashboard/'`, so its asset URLs
+/// are absolute (`/dashboard/assets/…`) and load cleanly under the
+/// bridge's strict default CSP (`script-src 'self'`, no inline scripts).
+pub fn dashboard_router<S>() -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    use axum::routing::get;
+    match resolve_spa_dir() {
+        Some(dir) => {
+            tracing::info!(path = %dir.display(), "dashboard: serving built SPA bundle");
+            let index = dir.join("index.html");
+            let serve = tower_http::services::ServeDir::new(&dir)
+                .append_index_html_on_directories(true)
+                .fallback(tower_http::services::ServeFile::new(index));
+            axum::Router::new().nest_service("/dashboard", serve)
+        }
+        None => {
+            tracing::info!("dashboard: no built SPA bundle found — serving legacy HTML page");
+            axum::Router::new().route("/dashboard", get(page))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,5 +692,41 @@ mod tests {
         let _ = std::fs::remove_file(&bogus);
         let out = resolve_dashboard_source(Some(bogus.to_str().unwrap()));
         assert_eq!(out, DASHBOARD_HTML_EMBEDDED);
+    }
+
+    /// When the React SPA bundle is present (committed under the crate's
+    /// `dashboard-dist`), `dashboard_router` serves `index.html` at
+    /// `/dashboard/`. When it is absent the router falls back to the
+    /// legacy single-file page at `/dashboard`. This test asserts
+    /// whichever applies in this checkout, so the serving wiring is
+    /// covered in both modes.
+    #[tokio::test]
+    async fn dashboard_router_serves_dashboard() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app: axum::Router<()> = dashboard_router();
+        if resolve_spa_dir().is_some() {
+            // SPA mode: the bundle is served at /dashboard/ as text/html.
+            let resp = app
+                .oneshot(Request::builder().uri("/dashboard/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let ctype = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert!(ctype.starts_with("text/html"), "spa index content-type: {ctype:?}");
+        } else {
+            // Legacy mode: the embedded HTML page is served at /dashboard.
+            let resp = app
+                .oneshot(Request::builder().uri("/dashboard").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
     }
 }
