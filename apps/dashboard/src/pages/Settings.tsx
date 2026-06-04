@@ -26,6 +26,9 @@ interface RunConfig {
   workspace_root?: string;
   max_bytes?: number;
   max_files?: number;
+  inherit?: boolean;
+  heartbeat_enabled?: boolean;
+  heartbeat_interval_secs?: number;
 }
 
 function extractProviders(v: unknown): Provider[] {
@@ -137,6 +140,13 @@ export function Settings() {
           Every Brief run executes in a dedicated scoped workspace, never in the coordinator/repo
           working directory (that stays explicit + opt-in only, for safety).
         </p>
+        {runConfig.inherit && (
+          <div className="banner err" style={{ fontSize: 12 }}>
+            ⚠ INHERIT mode is active — runs execute in the coordinator working directory, NOT a
+            scoped sandbox. An agent can touch real files. Unset <span className="mono">RELIX_RUN_WORKSPACE_MODE</span> to
+            return to safe scoped workspaces (empty / copy_repo).
+          </div>
+        )}
         <table className="table">
           <tbody>
             <tr>
@@ -175,6 +185,46 @@ export function Settings() {
           <span className="mono">RELIX_RUN_WORKSPACE_MAX_FILES</span>,{" "}
           <span className="mono">RELIX_RUN_WORKSPACE_MAX_BYTES</span>. Excludes .git / build caches /
           node_modules / dev-data / secrets.
+        </p>
+      </div>
+
+      <div className="card" style={{ gridColumn: "1 / -1" }}>
+        <h3>Autonomous execution (heartbeat)</h3>
+        <p className="muted" style={{ marginTop: -6, marginBottom: 12 }}>
+          When the heartbeat is on, a timer auto-runs ready Briefs through their Operative's adapter —
+          same pipeline, ledger, transcript, artifacts, and review as a manual run (autonomous runs
+          are stamped <span className="mono">heartbeat</span> and never auto-apply). When off, runs are
+          operator-triggered only.
+        </p>
+        <table className="table">
+          <tbody>
+            <tr>
+              <td className="muted">Status</td>
+              <td>
+                <span className={"badge " + (runConfig.heartbeat_enabled ? "done" : "backlog")}>
+                  {runConfig.heartbeat_enabled ? "enabled" : "disabled"}
+                </span>
+                {runConfig.heartbeat_enabled && (
+                  <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>
+                    polling every {runConfig.heartbeat_interval_secs ?? 10}s
+                  </span>
+                )}
+              </td>
+            </tr>
+            <tr>
+              <td className="muted">Mode</td>
+              <td className="muted" style={{ fontSize: 12 }}>
+                {runConfig.heartbeat_enabled
+                  ? "autonomous — ready + assigned Briefs run without an operator click"
+                  : "manual — a Brief runs only when you click Run on the board"}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p className="muted" style={{ fontSize: 11, marginTop: 8 }}>
+          Toggle via <span className="mono">RELIX_HEARTBEAT_ENABLED</span> (off by default); pacing via{" "}
+          <span className="mono">RELIX_HEARTBEAT_INTERVAL_SECS</span>. Autonomous runs still honor adapter
+          readiness, per-Operative wake/concurrency caps, and budget hard-stops.
         </p>
       </div>
 

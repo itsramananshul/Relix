@@ -362,6 +362,7 @@ export function Runs() {
                 : `No ${filter} runs.`}
             </Empty>
           ) : (
+            <div className="table-scroll">
             <table className="table">
               <thead>
                 <tr>
@@ -539,6 +540,7 @@ export function Runs() {
                 })}
               </tbody>
             </table>
+            </div>
           )}
         </div>
       </Section>

@@ -75,6 +75,9 @@ button { font-family: inherit; }
 .cols-3 { grid-template-columns: repeat(3, 1fr); }
 .cols-4 { grid-template-columns: repeat(4, 1fr); }
 @media (max-width: 1100px) { .cols-3, .cols-4 { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 760px) {
+  .cols-2, .cols-3, .cols-4 { grid-template-columns: 1fr; }
+}
 
 .card { background: var(--bg-raised); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
 .card h3 { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.4px; }
@@ -156,3 +159,32 @@ label.field span { display: block; font-size: 12px; color: var(--text-dim); marg
 .auth-card p.sub { text-align: center; color: var(--text-faint); margin: 0 0 20px; font-size: 13px; }
 .center-spinner { display: grid; place-items: center; height: 100vh; color: var(--text-faint); }
 .loading { color: var(--text-faint); padding: 20px; }
+
+/* ── Overview / Command Center ─────────────────────────── */
+.link { color: var(--info); cursor: pointer; }
+.link:hover { text-decoration: underline; }
+
+/* Actionable warning banners: message left, CTA right. */
+.banner-action { display: flex; align-items: center; gap: 12px; margin-bottom: 0; }
+.banner-action > span:first-child { flex: 1; }
+.banner-cta { white-space: nowrap; font-weight: 600; color: inherit; text-decoration: underline; cursor: pointer; }
+
+/* First-run setup — a calm panel, NOT a hero. */
+.setup-card { border-left: 3px solid var(--info); }
+.setup-step { font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--info); font-weight: 600; }
+.next-steps { margin: 0; padding-left: 18px; color: var(--text-dim); line-height: 1.8; }
+
+/* Key/value rows inside a card. */
+.kv { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--border-soft); }
+.kv:last-child { border-bottom: none; }
+.kv > .muted:first-child { flex: 0 0 auto; }
+.kv > span:last-child { text-align: right; }
+
+/* Stat cards get a subtle hover affordance when they link somewhere. */
+a > .stat-card:hover { border-color: var(--text-faint); }
+
+/* A denser table variant for compact lists in cards. */
+.table.compact td { padding: 5px 8px; }
+
+/* Keep wide tables usable on small screens. */
+.table-scroll { overflow-x: auto; }
