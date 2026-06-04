@@ -1274,9 +1274,14 @@ fn windows_exec_exts() -> Vec<String> {
 }
 
 /// Classify an existing file path into a [`Spawnable`], or `None` if it
-/// isn't a file we know how to run. On Windows `.exe`/`.com`/(no ext) →
-/// `Direct`, `.cmd`/`.bat` → `BatchShim`. On Unix any existing file →
-/// `Direct`.
+/// isn't a file we know how to run. On Windows `.exe`/`.com` → `Direct`,
+/// `.cmd`/`.bat` → `BatchShim`, and **any other extension (including
+/// none) → `None`** — Windows `CreateProcess` cannot run an extensionless
+/// or non-PE file, so an npm `claude` *sh* shim (a 300-byte script that
+/// shares the PATH dir with `claude.cmd`) must NOT be treated as a direct
+/// executable (doing so spawns it and fails `os error 193`). On Unix any
+/// existing file → `Direct` (executability is enforced by the OS at
+/// spawn; Unix binaries carry no extension).
 fn classify_file(path: &std::path::Path) -> Option<Spawnable> {
     if !path.is_file() {
         return None;
@@ -1292,7 +1297,6 @@ fn classify_file(path: &std::path::Path) -> Option<Spawnable> {
     {
         Some("exe") | Some("com") => Some(Spawnable::Direct(path.to_path_buf())),
         Some("cmd") | Some("bat") => Some(Spawnable::BatchShim(path.to_path_buf())),
-        None => Some(Spawnable::Direct(path.to_path_buf())),
         _ => None,
     }
 }
@@ -2116,10 +2120,34 @@ mod tests {
         std::fs::File::create(&cmd).unwrap();
         let bat = tmp.path().join("a.bat");
         std::fs::File::create(&bat).unwrap();
+        // The npm-shim trap: an EXTENSIONLESS file (the `claude` sh shim
+        // that lives next to `claude.cmd`) is NOT a Windows executable and
+        // must classify as None — spawning it directly is `os error 193`.
+        let noext = tmp.path().join("claude");
+        std::fs::File::create(&noext).unwrap();
         assert!(matches!(classify_file(&exe), Some(Spawnable::Direct(_))));
         assert!(matches!(classify_file(&cmd), Some(Spawnable::BatchShim(_))));
         assert!(matches!(classify_file(&bat), Some(Spawnable::BatchShim(_))));
+        assert!(classify_file(&noext).is_none(), "extensionless sh shim must not be Direct");
         assert!(classify_file(&tmp.path().join("missing.exe")).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_skips_extensionless_shim_and_uses_real_exe() {
+        // The exact failing layout: a PATH dir with the `claude` sh shim +
+        // `claude.cmd`, and the real npm `claude.exe` as a fallback. The
+        // resolver must skip the sh shim and pick the real .exe.
+        let path_dir = tempfile::tempdir().unwrap();
+        std::fs::File::create(path_dir.path().join("claude")).unwrap(); // sh shim
+        std::fs::File::create(path_dir.path().join("claude.cmd")).unwrap();
+        let fb_dir = tempfile::tempdir().unwrap();
+        let real = fb_dir.path().join("claude.exe");
+        std::fs::File::create(&real).unwrap();
+        let exts = path_search_exts();
+        let s = resolve_in_dirs("claude", &[path_dir.path().to_path_buf()], &exts, &[real.clone()])
+            .unwrap();
+        assert_eq!(s, Spawnable::Direct(real), "must skip the sh shim and use the real .exe");
     }
 
     #[cfg(unix)]
