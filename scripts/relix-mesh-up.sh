@@ -1377,6 +1377,18 @@ allow_groups = ["chat-users"]
 name = "spine_brief_runs"
 method = "brief.runs"
 allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_company_status"
+method = "company.status"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_company_bootstrap_founder"
+method = "company.bootstrap_founder"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_agent_operatives"
+method = "agent.operatives"
+allow_groups = ["chat-users"]
 EOF
 
 # ---- 11. peers.toml ----

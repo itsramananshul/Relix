@@ -3123,6 +3123,41 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // First-run owner/Founder bootstrap (company-model: the Founder is
+    // the apex Operative). `company.status` is a read; `company.
+    // bootstrap_founder` is the owner-gated, idempotent first-run action
+    // that stands up the single Founder; `agent.operatives` is the
+    // tenant-scoped Crew roster (excludes the infra operator-console).
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "company.status",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_company_status(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "company.bootstrap_founder",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_bootstrap_founder(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.operatives",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_operatives(&s, &ctx) }
+            })),
+        );
+    }
     // PHASE 4 (hire flow): the gated creation path (pending → approve).
     {
         let s = agent_store.clone();
@@ -8818,6 +8853,24 @@ fn register_node_type_handlers(
                         subject_id = %op_subject,
                         error = %e,
                         "coordinator: failed to provision operator-console agent profile"
+                    ),
+                }
+                // First-run owner authority: grant the console identity
+                // the full Org/Work Keys so the dashboard owner can stand
+                // up + assign the first team (idempotent, self-healing).
+                match agent_store.grant_console_authority(&op_subject, "default") {
+                    Ok(true) => tracing::info!(
+                        subject_id = %op_subject,
+                        "coordinator: granted operator-console owner authority (assign/manage/spawn/configure)"
+                    ),
+                    Ok(false) => tracing::debug!(
+                        subject_id = %op_subject,
+                        "coordinator: operator-console owner authority already present or no console profile"
+                    ),
+                    Err(e) => tracing::warn!(
+                        subject_id = %op_subject,
+                        error = %e,
+                        "coordinator: failed to grant operator-console owner authority"
                     ),
                 }
             }

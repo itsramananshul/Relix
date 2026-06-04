@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { api, tryGet } from "../api";
-import { asArray, extractList, Section, useAsync } from "../components/common";
+import { asArray, Section, useAsync } from "../components/common";
 
 interface Card { task_id?: string; id?: string; title?: string; assignee_agent_id?: string | null }
 interface Agent { agent_id?: string; id?: string; name?: string; display_name?: string; role?: string }
@@ -11,15 +12,15 @@ export function Assign() {
   const [agent, setAgent] = useState("");
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
 
-  // The assignable Operative list is /v1/agents/access ({agents:[…]}).
+  // The assignable Operatives are the real roster (/v1/spine/operatives).
   const { data, loading, reload } = useAsync(async () => {
-    const [inbox, agentsRes] = await Promise.all([
+    const [inbox, ops] = await Promise.all([
       tryGet<Inbox>("/v1/spine/inbox?limit=100", {}),
-      tryGet<unknown>("/v1/agents/access", {}),
+      tryGet<Agent[]>("/v1/spine/operatives", []),
     ]);
     return {
       unassigned: asArray<Card>(inbox.unassigned),
-      agents: extractList<Agent>(agentsRes, ["agents", "operatives"]),
+      agents: Array.isArray(ops) ? ops : [],
     };
   }, []);
 
@@ -52,6 +53,11 @@ export function Assign() {
         <div className="card" style={{ maxWidth: 560 }}>
           {loading ? (
             <div className="loading">Loading…</div>
+          ) : agents.length === 0 ? (
+            <div className="empty">
+              No Operatives yet. <Link to="/agents">Initialize your company</Link> to create the
+              Founder, then come back to assign work.
+            </div>
           ) : (
             <>
               <label className="field">

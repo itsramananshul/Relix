@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { api, tryGet } from "../api";
 import { asArray, Section, useAsync } from "../components/common";
 
@@ -10,6 +11,13 @@ interface Card {
   priority?: string;
   assignee_agent_id?: string | null;
   mandate_id?: string | null;
+}
+
+interface Operative {
+  agent_id?: string;
+  name?: string;
+  role?: string;
+  rig?: string | null;
 }
 
 interface RunReport {
@@ -57,13 +65,32 @@ export function Briefs() {
 
   const { data, loading, reload } = useAsync(async () => {
     const byCol: Record<string, Card[]> = {};
-    await Promise.all(
-      COLUMNS.map(async (col) => {
-        byCol[col] = asArray<Card>(await tryGet<Card[]>(`/v1/spine/board/${col}?limit=50`, []));
-      }),
-    );
-    return byCol;
+    const [, ops] = await Promise.all([
+      Promise.all(
+        COLUMNS.map(async (col) => {
+          byCol[col] = asArray<Card>(await tryGet<Card[]>(`/v1/spine/board/${col}?limit=50`, []));
+        }),
+      ),
+      tryGet<Operative[]>("/v1/spine/operatives", []),
+    ]);
+    return { board: byCol, operatives: Array.isArray(ops) ? ops : [] };
   }, []);
+
+  const operatives = data?.operatives ?? [];
+
+  async function assign(c: Card, agentId: string) {
+    setBanner(null);
+    try {
+      await api.post(`/v1/spine/briefs/${encodeURIComponent(cardId(c))}/set`, {
+        field: "assignee",
+        value: agentId,
+      });
+      setBanner({ kind: "ok", msg: agentId ? "Operative assigned." : "Operative cleared." });
+      reload();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Assign failed" });
+    }
+  }
 
   async function create() {
     if (!title.trim()) return;
@@ -125,6 +152,13 @@ export function Briefs() {
       >
         {banner && <div className={"banner " + banner.kind}>{banner.msg}</div>}
 
+        {!loading && operatives.length === 0 && (
+          <div className="banner info">
+            No Operatives yet — you can create Briefs, but to assign + run them{" "}
+            <Link to="/agents">initialize your company</Link> to create the Founder first.
+          </div>
+        )}
+
         {creating && (
           <div className="card" style={{ marginBottom: 14 }}>
             <div className="row wrap">
@@ -153,7 +187,7 @@ export function Briefs() {
         ) : (
           <div className="board">
             {COLUMNS.map((col) => {
-              const cards = data?.[col] ?? [];
+              const cards = data?.board?.[col] ?? [];
               return (
                 <div className="board-col" key={col}>
                   <h4>
@@ -166,7 +200,23 @@ export function Briefs() {
                         {c.priority && <span>{c.priority}</span>}
                         {c.assignee_agent_id && <span>· {c.assignee_agent_id.slice(0, 8)}</span>}
                       </div>
-                      <div className="row" style={{ marginTop: 8, gap: 6 }}>
+                      <label className="row" style={{ marginTop: 8 }}>
+                        <select
+                          className="select"
+                          style={{ fontSize: 11, padding: "3px 6px", width: "100%" }}
+                          value={c.assignee_agent_id ?? ""}
+                          onChange={(e) => assign(c, e.target.value)}
+                          title="Assign an Operative"
+                        >
+                          <option value="">— unassigned —</option>
+                          {operatives.map((o) => (
+                            <option key={o.agent_id} value={o.agent_id}>
+                              {o.name}{o.role === "founder" ? " (Founder)" : ""}{o.rig ? ` · ${o.rig}` : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <div className="row" style={{ marginTop: 6, gap: 6 }}>
                         <select
                           className="select"
                           style={{ fontSize: 11, padding: "3px 6px", flex: 1 }}

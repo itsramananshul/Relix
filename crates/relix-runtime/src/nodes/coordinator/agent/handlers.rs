@@ -15,7 +15,7 @@ use crate::nodes::coordinator::agent::keys::{
     KeyVerdict, assign_verdict, configure_verdict, manage_verdict, spawn_verdict,
 };
 use crate::nodes::coordinator::agent::store::{
-    AgentStore, AgentStoreError, ApprovalStatus, StandingApprovalCreate,
+    AgentProfile, AgentStore, AgentStoreError, ApprovalStatus, StandingApprovalCreate,
     default_approval_categories,
 };
 use crate::nodes::coordinator::spine::SpineStore;
@@ -64,6 +64,130 @@ pub fn handle_create(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome 
         Ok(id) => HandlerOutcome::Ok(format!("{id}\n").into_bytes()),
         Err(AgentStoreError::BadInput(m)) => invalid(m),
         Err(e) => internal(format!("agent.create: {e}")),
+    }
+}
+
+// ── company.* (first-run owner/Founder bootstrap) ────────
+
+/// A compact JSON view of an Operative for the dashboard Crew + the
+/// company-status read. Trusted, operator-facing fields only.
+fn operative_json(p: &AgentProfile) -> serde_json::Value {
+    serde_json::json!({
+        "agent_id": p.agent_id,
+        "name": p.name,
+        "role": p.role,
+        "title": p.title,
+        "department": p.department,
+        "team": p.team,
+        "status": p.status,
+        "rig": p.rig,
+        "reports_to": p.reports_to,
+        "can_spawn_agents": p.can_spawn_agents,
+        "can_assign_work": p.can_assign_work,
+        "can_manage_work": p.can_manage_work,
+        "can_configure_agents": p.can_configure_agents,
+        "created_at": p.created_at,
+    })
+}
+
+/// First-run owner gate: the caller may bootstrap the company iff it is
+/// a real operator/admin (AIC role) OR it carries the boot-seeded
+/// operator-console (`allow-all`) profile in this Guild — i.e. it IS the
+/// trusted dashboard/bridge owner identity. A normal Operative (or an
+/// unknown caller with no profile) is refused, so bootstrap can never be
+/// triggered by an arbitrary actor.
+fn caller_is_owner(store: &AgentStore, ctx: &InvocationCtx) -> bool {
+    if caller_is_operator(ctx) {
+        return true;
+    }
+    let tenant = ctx.tenant_id_or_default();
+    let subject = ctx.caller.subject_id.to_string();
+    matches!(
+        store.get_by_subject_for_tenant(&subject, tenant),
+        Ok(Some(p)) if p.profile.as_deref() == Some("allow-all")
+    )
+}
+
+/// `company.status` — first-run read (no args). Reports whether the
+/// Guild has been initialised (a Founder exists), the Founder profile,
+/// and the count of real Operatives. The dashboard uses this to show
+/// the "Initialize Company" first-run state vs the normal Crew.
+pub fn handle_company_status(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let tenant = ctx.tenant_id_or_default();
+    let founder = match store.find_founder(tenant) {
+        Ok(f) => f,
+        Err(e) => return internal(format!("company.status founder: {e}")),
+    };
+    let operatives = match store.list_operatives_for_tenant(tenant) {
+        Ok(v) => v,
+        Err(e) => return internal(format!("company.status roster: {e}")),
+    };
+    let body = serde_json::json!({
+        "initialized": founder.is_some(),
+        "founder": founder.as_ref().map(operative_json),
+        "operative_count": operatives.len(),
+    });
+    match serde_json::to_vec(&body) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => internal(format!("company.status encode: {e}")),
+    }
+}
+
+/// `company.bootstrap_founder` — first-run owner action. Wire arg:
+/// `name|rig` (both optional; defaults `Founder` + `echo`). Creates the
+/// single Founder Operative for the Guild if absent, idempotently
+/// (a repeat call returns the existing Founder, never a duplicate).
+/// Owner-gated (operator/admin or the console identity); a normal
+/// Operative is refused. Returns `{founder, created}`.
+pub fn handle_bootstrap_founder(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    if !caller_is_owner(store, ctx) {
+        return security_denied(
+            "company.bootstrap_founder is owner-only (dashboard admin / operator)".to_string(),
+        );
+    }
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("company.bootstrap_founder utf8: {e}")),
+    };
+    let mut parts = s.splitn(2, '|');
+    let name = parts.next().unwrap_or("").trim();
+    let rig = parts.next().unwrap_or("").trim();
+    let tenant = ctx.tenant_id_or_default();
+    let created_by = ctx.caller.subject_id.to_string();
+    let (agent_id, created) = match store.ensure_founder(name, rig, &created_by, tenant) {
+        Ok(r) => r,
+        Err(AgentStoreError::BadInput(m)) => return invalid(m),
+        Err(e) => return internal(format!("company.bootstrap_founder: {e}")),
+    };
+    let founder = match store.get_agent_for_tenant(&agent_id, tenant) {
+        Ok(Some(p)) => p,
+        Ok(None) => return internal("company.bootstrap_founder: founder vanished".into()),
+        Err(e) => return internal(format!("company.bootstrap_founder read: {e}")),
+    };
+    let body = serde_json::json!({
+        "founder": operative_json(&founder),
+        "created": created,
+    });
+    match serde_json::to_vec(&body) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => internal(format!("company.bootstrap_founder encode: {e}")),
+    }
+}
+
+/// `agent.operatives` — the Crew roster (no args): every real Operative
+/// in the Guild (excludes the infra operator-console). Tenant-scoped.
+/// Returns a JSON array of compact Operative views (with `rig`).
+pub fn handle_operatives(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let tenant = ctx.tenant_id_or_default();
+    match store.list_operatives_for_tenant(tenant) {
+        Ok(rows) => {
+            let arr: Vec<serde_json::Value> = rows.iter().map(operative_json).collect();
+            match serde_json::to_vec(&arr) {
+                Ok(b) => HandlerOutcome::Ok(b),
+                Err(e) => internal(format!("agent.operatives encode: {e}")),
+            }
+        }
+        Err(e) => internal(format!("agent.operatives: {e}")),
     }
 }
 
@@ -3046,6 +3170,92 @@ mod tests {
         let s = store();
         let out = handle_create(&s, &fake_ctx(b"too|few|fields"));
         assert_eq!(err_kind(out), error_kinds::INVALID_ARGS);
+    }
+
+    #[test]
+    fn bootstrap_founder_creates_one_then_is_idempotent() {
+        let s = store();
+        // First run: operator owner creates the Founder.
+        let first = ok_body(handle_bootstrap_founder(&s, &fake_ctx(b"Ada|echo")));
+        assert!(first.contains("\"created\":true"), "got {first}");
+        assert!(first.contains("\"role\":\"founder\""));
+        assert!(first.contains("\"name\":\"Ada\""));
+        assert!(first.contains("\"rig\":\"echo\""));
+        // Exactly one founder exists.
+        assert!(s.find_founder("default").unwrap().is_some());
+        let ops = s.list_operatives_for_tenant("default").unwrap();
+        assert_eq!(ops.len(), 1);
+        // Second run: no duplicate — returns the existing Founder.
+        let second = ok_body(handle_bootstrap_founder(&s, &fake_ctx(b"Other|echo")));
+        assert!(second.contains("\"created\":false"), "got {second}");
+        // Still exactly one (name unchanged — the first Founder).
+        assert_eq!(s.list_operatives_for_tenant("default").unwrap().len(), 1);
+        assert_eq!(s.find_founder("default").unwrap().unwrap().name, "Ada");
+    }
+
+    #[test]
+    fn bootstrap_founder_has_full_owner_keys() {
+        let s = store();
+        ok_body(handle_bootstrap_founder(&s, &fake_ctx(b"Ada|echo")));
+        let f = s.find_founder("default").unwrap().unwrap();
+        assert!(f.can_spawn_agents);
+        assert!(f.can_assign_work && f.assign_scope == "any");
+        assert!(f.can_manage_work && f.manage_scope == "any");
+        assert!(f.can_configure_agents && f.configure_scope == "any");
+        assert_eq!(f.status, "active");
+        assert!(f.reports_to.is_none(), "the Founder is the apex");
+    }
+
+    #[test]
+    fn bootstrap_founder_refused_for_non_owner_caller() {
+        let s = store();
+        // A non-operator caller with NO console/operator profile is refused.
+        let ctx = fake_ctx_with_role(b"Mallory|echo", "agent", b"stranger");
+        assert_eq!(
+            err_kind(handle_bootstrap_founder(&s, &ctx)),
+            error_kinds::SECURITY_DENIED
+        );
+        // Nothing was created.
+        assert!(s.find_founder("default").unwrap().is_none());
+    }
+
+    #[test]
+    fn bootstrap_founder_allowed_for_console_owner_identity() {
+        let s = store();
+        // The dashboard/bridge owner is a non-operator AIC role that
+        // carries the boot-seeded allow-all console profile.
+        let ctx = fake_ctx_with_role(b"Ada|echo", "service", b"bridge-owner");
+        let subject = ctx.caller.subject_id.to_string();
+        s.ensure_operator_console_profile(&subject, "default").unwrap();
+        let out = ok_body(handle_bootstrap_founder(&s, &ctx));
+        assert!(out.contains("\"created\":true"), "got {out}");
+    }
+
+    #[test]
+    fn company_status_reports_initialized_after_bootstrap() {
+        let s = store();
+        let before = ok_body(handle_company_status(&s, &fake_ctx(b"")));
+        assert!(before.contains("\"initialized\":false"), "got {before}");
+        assert!(before.contains("\"operative_count\":0"));
+        ok_body(handle_bootstrap_founder(&s, &fake_ctx(b"Ada|echo")));
+        let after = ok_body(handle_company_status(&s, &fake_ctx(b"")));
+        assert!(after.contains("\"initialized\":true"), "got {after}");
+        assert!(after.contains("\"operative_count\":1"));
+        assert!(after.contains("\"role\":\"founder\""));
+    }
+
+    #[test]
+    fn operatives_roster_excludes_the_infra_console() {
+        let s = store();
+        // Seed an operator-console (infra) profile + a Founder.
+        s.ensure_operator_console_profile("console-subj", "default").unwrap();
+        ok_body(handle_bootstrap_founder(&s, &fake_ctx(b"Ada|echo")));
+        let roster = ok_body(handle_operatives(&s, &fake_ctx(b"")));
+        assert!(roster.contains("\"role\":\"founder\""), "got {roster}");
+        assert!(
+            !roster.contains("operator-console"),
+            "infra console must not appear in the Crew roster: {roster}"
+        );
     }
 
     #[test]

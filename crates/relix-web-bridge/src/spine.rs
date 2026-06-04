@@ -769,6 +769,63 @@ pub async fn brief_runs(
     json_passthrough(call_peer(&state, "brief.runs", id.as_bytes()).await?)
 }
 
+/// `GET /v1/spine/company` — first-run status: whether the Guild has a
+/// Founder yet, the Founder profile, and the Operative count. The
+/// dashboard reads this to show the "Initialize Company" first-run state.
+pub async fn company_status(
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "company.status", b"").await?)
+}
+
+/// `GET /v1/spine/operatives` — the Crew roster (real Operatives in the
+/// Guild, with their adapter/rig). Excludes the infra operator-console.
+pub async fn operatives(
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "agent.operatives", b"").await?)
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CompanyInitRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub rig: Option<String>,
+}
+
+/// `POST /v1/spine/company/init` — first-run owner action: create the
+/// Guild's single Founder Operative (idempotent — a repeat returns the
+/// existing Founder, never a duplicate). **Owner-gated at the bridge**:
+/// requires a logged-in dashboard session (the admin set up on first
+/// run), NOT merely a bearer token, so only the dashboard owner can
+/// initialise the company. The runtime capability *also* gates on the
+/// console/operator identity, so this is defence-in-depth.
+pub async fn company_init(
+    State(state): State<AppState>,
+    headers: header::HeaderMap,
+    Json(req): Json<CompanyInitRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let session_ok = crate::dashboard_auth::session_cookie_from_headers(&headers)
+        .and_then(|sid| state.dashboard_auth.validate_session(&sid))
+        .is_some();
+    if !session_ok {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError {
+                error: "initializing the company requires a logged-in dashboard session".into(),
+            }),
+        ));
+    }
+    let name = req.name.unwrap_or_default();
+    let rig = req.rig.unwrap_or_default();
+    if name.contains('|') || rig.contains('|') {
+        return Err(bad("name / rig must not contain `|`"));
+    }
+    let arg = format!("{name}|{rig}");
+    json_passthrough(call_peer(&state, "company.bootstrap_founder", arg.as_bytes()).await?)
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct PinRequest {
     #[serde(default)]

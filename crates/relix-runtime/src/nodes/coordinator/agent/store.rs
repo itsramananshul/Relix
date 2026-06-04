@@ -739,6 +739,145 @@ impl AgentStore {
         Ok(true)
     }
 
+    /// First-run owner bootstrap: grant the seeded operator-console
+    /// profile the full Org/Work Keys (assign/manage/spawn/configure =
+    /// `any`) so the dashboard owner — the Founder/Board acting through
+    /// the console identity — can assign Briefs to Operatives, manage
+    /// their work, and spawn the first team. Idempotent + self-healing:
+    /// run every boot, it UPDATEs only the console profile (matched by
+    /// `subject_id` AND the `allow-all` infra profile) so it never
+    /// touches a normal Operative. No-op (Ok(false)) when no console
+    /// profile exists for the subject. This does NOT weaken the
+    /// admission gate — those Keys are a separate enforcement axis and
+    /// only ever apply to the trusted boot-seeded console identity.
+    pub fn grant_console_authority(
+        &self,
+        subject_id: &str,
+        tenant_id: &str,
+    ) -> Result<bool, AgentStoreError> {
+        if subject_id.trim().is_empty() {
+            return Err(AgentStoreError::BadInput("subject_id required".into()));
+        }
+        let tenant = norm_tenant(tenant_id);
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let changed = conn.execute(
+            "UPDATE agent_profiles
+             SET can_spawn_agents = 1, spawn_route = 'direct',
+                 can_assign_work = 1, assign_scope = 'any',
+                 can_manage_work = 1, manage_scope = 'any',
+                 can_configure_agents = 1, configure_scope = 'any',
+                 updated_at = ?3
+             WHERE subject_id = ?1 AND tenant_id = ?2 AND profile = 'allow-all'",
+            params![subject_id, tenant, now],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// First-run company bootstrap (company-model: the Founder is the
+    /// apex Operative). Idempotently ensure exactly **one** Founder
+    /// Operative exists in `tenant`. Atomic: the existence check and the
+    /// insert happen under one connection lock, so two concurrent
+    /// bootstrap calls cannot both create a Founder. Returns
+    /// `(agent_id, created)` — `created=false` when a Founder already
+    /// existed (no duplicate). The Founder is `active`, carries the full
+    /// Org/Work Keys (so it can stand up the first team), reports to
+    /// nobody (the apex), and runs on `rig` (defaulting to `echo`).
+    pub fn ensure_founder(
+        &self,
+        name: &str,
+        rig: &str,
+        created_by: &str,
+        tenant_id: &str,
+    ) -> Result<(String, bool), AgentStoreError> {
+        let name = {
+            let n = name.trim();
+            if n.is_empty() { "Founder" } else { n }
+        };
+        let rig = {
+            let r = rig.trim();
+            if r.is_empty() { "echo" } else { r }
+        };
+        let created_by = {
+            let c = created_by.trim();
+            if c.is_empty() { "relix-boot" } else { c }
+        };
+        let tenant = norm_tenant(tenant_id).to_string();
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        // Atomic existence check under the same lock as the insert.
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT agent_id FROM agent_profiles
+                 WHERE role = 'founder' AND tenant_id = ?1
+                 ORDER BY created_at ASC LIMIT 1",
+                params![tenant],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            return Ok((id, false));
+        }
+        let agent_id = new_agent_id("founder");
+        let subject_id = format!("founder-{}", new_agent_id("subject"));
+        conn.execute(
+            "INSERT INTO agent_profiles (
+                 agent_id, name, role, title, department, team,
+                 created_by, status, subject_id, risk_ceiling,
+                 created_at, updated_at, tenant_id, rig,
+                 can_spawn_agents, spawn_route,
+                 can_assign_work, assign_scope,
+                 can_manage_work, manage_scope,
+                 can_configure_agents, configure_scope
+             ) VALUES (?1, ?2, 'founder', 'Founder', 'Company', 'Leadership',
+                       ?3, 'active', ?4, 'high', ?5, ?5, ?6, ?7,
+                       1, 'direct', 1, 'any', 1, 'any', 1, 'any')",
+            params![agent_id, name, created_by, subject_id, now, tenant, rig],
+        )?;
+        Ok((agent_id, true))
+    }
+
+    /// First-run status read: the tenant's Founder, or `None` if the
+    /// company has not been initialised yet.
+    pub fn find_founder(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<AgentProfile>, AgentStoreError> {
+        let tenant = norm_tenant(tenant_id);
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let row = conn
+            .query_row(
+                &format!(
+                    "{} AND role = 'founder' ORDER BY created_at ASC LIMIT 1",
+                    SELECT_AGENTS_BY_TENANT
+                ),
+                params![tenant],
+                row_to_agent,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// The Crew roster: every real Operative in `tenant`, newest first.
+    /// **Excludes** the infra operator-console profile (`allow-all`) so
+    /// the dashboard Crew shows only assignable Operatives (the Founder
+    /// + hires), never the hidden console identity.
+    pub fn list_operatives_for_tenant(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<AgentProfile>, AgentStoreError> {
+        let tenant = norm_tenant(tenant_id);
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt = conn.prepare(&format!(
+            "{} AND COALESCE(profile, '') != 'allow-all' ORDER BY created_at DESC",
+            SELECT_AGENTS_BY_TENANT
+        ))?;
+        let rows: Vec<AgentProfile> = stmt
+            .query_map(params![tenant], row_to_agent)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// GROUP 6: tenant-scoped lookup by AIC subject — returns the
     /// profile ONLY when it belongs to `tenant`, so a caller
     /// scoped to tenant A cannot read tenant B's agent profile.
@@ -2575,6 +2714,25 @@ const SELECT_AGENT_FOR_TENANT: &str = "SELECT agent_id, name, role, title, depar
         manage_scope, manage_allowed_agents, configure_allowed_agents
  FROM agent_profiles WHERE agent_id = ?1 AND tenant_id = ?2";
 
+/// Full-profile column list scoped to a tenant, with an **open**
+/// trailing predicate the caller appends to (`AND role = …` /
+/// `AND COALESCE(profile,'') != …` / `ORDER BY …`). Same columns/order
+/// as [`SELECT_AGENT`] so [`row_to_agent`] maps it. The single bound
+/// parameter is the tenant id.
+const SELECT_AGENTS_BY_TENANT: &str = "SELECT agent_id, name, role, title, department, team,
+        created_by, status, subject_id, surface_allowlist,
+        risk_ceiling, allow_categories, deny_categories,
+        allow_sensitivity_tags, deny_sensitivity_tags,
+        approval_required_categories, authorized_approvers,
+        approval_timeout_secs,
+        created_at, updated_at, profile, reports_to, rig, monthly_allowance_cents,
+        max_concurrent_runs, wake_on_timer, wake_on_demand,
+        can_spawn_agents, spawn_route, can_assign_work, assign_scope,
+        assign_allowed_agents, can_manage_work, can_configure_agents,
+        configure_scope, secret_allowlist, instruction_bundle,
+        manage_scope, manage_allowed_agents, configure_allowed_agents
+ FROM agent_profiles WHERE tenant_id = ?1";
+
 const SELECT_APPROVAL: &str =
     "SELECT approval_id, agent_id, subject_id, method, capability_category,
         args_redacted_hash, reason, approver_groups,
@@ -3242,6 +3400,71 @@ mod tests {
 
     fn store() -> AgentStore {
         AgentStore::in_memory().unwrap()
+    }
+
+    // ── First-run Founder bootstrap ──────────────────────
+
+    #[test]
+    fn ensure_founder_is_idempotent_and_never_duplicates() {
+        let s = store();
+        let (id1, created1) = s.ensure_founder("Ada", "echo", "owner", "default").unwrap();
+        assert!(created1);
+        // Second call (different name) returns the SAME founder, created=false.
+        let (id2, created2) = s.ensure_founder("Other", "claude", "owner", "default").unwrap();
+        assert!(!created2);
+        assert_eq!(id1, id2);
+        // Exactly one founder; the original name/rig are preserved.
+        let f = s.find_founder("default").unwrap().unwrap();
+        assert_eq!(f.name, "Ada");
+        assert_eq!(f.rig.as_deref(), Some("echo"));
+        assert_eq!(f.role, "founder");
+        assert_eq!(s.list_operatives_for_tenant("default").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ensure_founder_defaults_name_and_rig() {
+        let s = store();
+        let (id, _) = s.ensure_founder("  ", "  ", "  ", "default").unwrap();
+        let f = s.get_agent(&id).unwrap().unwrap();
+        assert_eq!(f.name, "Founder");
+        assert_eq!(f.rig.as_deref(), Some("echo"));
+    }
+
+    #[test]
+    fn founder_is_per_tenant() {
+        let s = store();
+        s.ensure_founder("Ada", "echo", "owner", "guild-a").unwrap();
+        // Another Guild has no founder until its own bootstrap.
+        assert!(s.find_founder("guild-b").unwrap().is_none());
+        let (_, created) = s.ensure_founder("Bo", "echo", "owner", "guild-b").unwrap();
+        assert!(created);
+        assert_eq!(s.find_founder("guild-a").unwrap().unwrap().name, "Ada");
+        assert_eq!(s.find_founder("guild-b").unwrap().unwrap().name, "Bo");
+    }
+
+    #[test]
+    fn grant_console_authority_upgrades_only_the_console_profile() {
+        let s = store();
+        s.ensure_operator_console_profile("console-subj", "default").unwrap();
+        // A normal Operative that must NOT be touched by the grant.
+        let normal = s
+            .create_agent(
+                "Eng", "engineer", "Engineer", "eng", "core", "owner", "eng-subj", "medium",
+                "default",
+            )
+            .unwrap();
+        let granted = s.grant_console_authority("console-subj", "default").unwrap();
+        assert!(granted);
+        let console = s.get_by_subject("console-subj").unwrap().unwrap();
+        assert!(console.can_assign_work && console.assign_scope == "any");
+        assert!(console.can_manage_work && console.manage_scope == "any");
+        assert!(console.can_spawn_agents && console.can_configure_agents);
+        // The normal Operative's Keys are unchanged (still default-deny).
+        let eng = s.get_agent(&normal).unwrap().unwrap();
+        assert!(!eng.can_assign_work);
+        assert!(!eng.can_manage_work);
+        // No console profile for an unknown subject → no-op.
+        assert!(!s.grant_console_authority("nobody", "default").unwrap());
     }
 
     // ── PHASE 0: org tree (reports_to) ───────────────────

@@ -239,7 +239,14 @@ impl DashboardAuth {
 
 /// Pull the `relix_session` value out of the request `Cookie` header.
 pub fn session_cookie_value(req: &Request) -> Option<String> {
-    let raw = req.headers().get(header::COOKIE)?.to_str().ok()?;
+    session_cookie_from_headers(req.headers())
+}
+
+/// Pull the `relix_session` value out of a raw header map — the
+/// header-only variant used by handlers that also consume the body
+/// (`Json` extractor) and so cannot take the whole `Request`.
+pub fn session_cookie_from_headers(headers: &header::HeaderMap) -> Option<String> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
     for pair in raw.split(';') {
         let pair = pair.trim();
         if let Some(v) = pair.strip_prefix(&format!("{SESSION_COOKIE}=")) {
@@ -447,5 +454,23 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         assert!(session_cookie_value(&req).is_none());
+    }
+
+    #[test]
+    fn session_cookie_from_headers_matches_request_variant() {
+        // The header-only variant (used by the company-init handler that
+        // also consumes a JSON body) parses the same cookie.
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            header::HeaderValue::from_static("x=1; relix_session=sess-xyz; y=2"),
+        );
+        assert_eq!(
+            session_cookie_from_headers(&headers).as_deref(),
+            Some("sess-xyz")
+        );
+        // No cookie header → None (an unauthenticated caller is rejected).
+        let empty = header::HeaderMap::new();
+        assert!(session_cookie_from_headers(&empty).is_none());
     }
 }
