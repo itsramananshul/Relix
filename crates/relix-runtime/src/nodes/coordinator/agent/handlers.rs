@@ -675,11 +675,11 @@ fn orchestration_mode(s: Option<&&str>) -> &'static str {
     }
 }
 
-/// Deterministic, role-aware work title for a child Brief. Known roles
-/// get a named track; anything else gets a generic "Execute {role}
-/// track" title.
-fn role_track_title(role: &str, mandate_title: &str) -> String {
-    let track = match role.trim().to_ascii_lowercase().as_str() {
+/// Canonical display label for a known role, or `None` for an unknown
+/// role (callers fall back to the raw role string). Shared by every
+/// orchestration title helper so the role→label map lives in one place.
+fn role_label(role: &str) -> Option<&'static str> {
+    Some(match role.trim().to_ascii_lowercase().as_str() {
         "engineer" | "engineering" | "swe" | "developer" | "dev" => "Engineering",
         "designer" | "design" | "ux" | "ui" => "Design",
         "researcher" | "research" => "Research",
@@ -690,29 +690,37 @@ fn role_track_title(role: &str, mandate_title: &str) -> String {
         "data" | "analyst" | "analytics" | "scientist" => "Data",
         "security" | "sec" | "appsec" => "Security",
         "marketing" | "growth" => "Marketing",
-        _ => return format!("Execute {} track for {mandate_title}", role.trim()),
-    };
-    format!("{track} track: {mandate_title}")
+        _ => return None,
+    })
+}
+
+/// Deterministic, role-aware work title for a role-track Brief. Known
+/// roles get a named track; anything else gets a generic "Execute {role}
+/// track" title.
+fn role_track_title(role: &str, mandate_title: &str) -> String {
+    match role_label(role) {
+        Some(label) => format!("{label} track: {mandate_title}"),
+        None => format!("Execute {} track for {mandate_title}", role.trim()),
+    }
 }
 
 /// Title for a subject **execution** Brief — the per-agent work item that
-/// hangs under a role-track Brief. Uses the same role display map as
-/// [`role_track_title`]; falls back to the raw role for unknown roles.
+/// hangs under a role-track Brief.
 fn subject_exec_title(role: &str, agent_id: &str) -> String {
-    let label = match role.trim().to_ascii_lowercase().as_str() {
-        "engineer" | "engineering" | "swe" | "developer" | "dev" => "Engineering",
-        "designer" | "design" | "ux" | "ui" => "Design",
-        "researcher" | "research" => "Research",
-        "writer" | "writing" | "content" | "copywriter" => "Content",
-        "planner" | "pm" | "product" | "prime" => "Planning",
-        "qa" | "test" | "tester" | "quality" => "QA",
-        "ops" | "devops" | "sre" | "operations" => "Operations",
-        "data" | "analyst" | "analytics" | "scientist" => "Data",
-        "security" | "sec" | "appsec" => "Security",
-        "marketing" | "growth" => "Marketing",
-        other => return format!("{other} execution: {agent_id}"),
-    };
-    format!("{label} execution: {agent_id}")
+    match role_label(role) {
+        Some(label) => format!("{label} execution: {agent_id}"),
+        None => format!("{} execution: {agent_id}", role.trim()),
+    }
+}
+
+/// Title for a **placeholder** role-track Brief — a durable work object
+/// for a role that is missing / pending / blocked, so a staffing gap is
+/// visible in the tree without an executable Brief under it.
+fn placeholder_track_title(role: &str, reason: &str) -> String {
+    match role_label(role) {
+        Some(label) => format!("{label} track blocked: {reason}"),
+        None => format!("{} track blocked: {reason}", role.trim()),
+    }
 }
 
 /// Stable signature of the orchestration inputs (deterministic across
@@ -794,10 +802,13 @@ pub fn handle_orchestrate(
     let mut skipped: Vec<serde_json::Value> = Vec::new();
     let mut next_actions: Vec<String> = Vec::new();
 
-    // Gate 1: the Mandate strategy must be approved.
+    // Gate 1: the Mandate strategy must be approved. Without it we
+    // materialise nothing at all (not even placeholder tracks).
+    let mut strategy_ok = true;
     match spine_store.strategy_approved(tenant, mandate_id) {
         Ok(true) => {}
         Ok(false) => {
+            strategy_ok = false;
             blockers.push(serde_json::json!({
                 "reason": "strategy_not_approved",
                 "detail": "approve the Mandate strategy before orchestrating",
@@ -840,62 +851,109 @@ pub fn handle_orchestrate(
 
     let ready = blockers.is_empty() && view.is_ready();
 
-    // Build the deterministic role-track plan (sorted by role).
-    let mut tracks: std::collections::BTreeMap<String, (String, Option<String>)> =
+    // Build the deterministic plan: ACTIVE role tracks (each with a
+    // staffed agent) and GAP role tracks (placeholders for missing /
+    // pending / blocked roles). Both are sorted + deduped by role key; a
+    // role with ANY active agent is treated as active (never placeholder).
+    let mut active: std::collections::BTreeMap<String, (String, String)> =
         std::collections::BTreeMap::new();
-    let mut note_role = |role: &str, agent: Option<&str>| {
+    for (role, agent_id) in &view.active_agents {
         let key = role.trim().to_ascii_lowercase();
         if key.is_empty() {
-            return;
+            continue;
         }
-        let entry = tracks
+        active
             .entry(key)
-            .or_insert_with(|| (role.trim().to_string(), None));
-        if let Some(a) = agent {
-            entry.1 = Some(a.to_string());
-        }
-    };
-    for (role, agent_id) in &view.active_agents {
-        note_role(role, Some(agent_id));
+            .or_insert_with(|| (role.trim().to_string(), agent_id.clone()));
     }
-    // (pending/missing roles are blockers, not staffed tracks, but we
-    // still list them so a `create_briefs` run lays down the work track.)
-    let track_list: Vec<(String, Option<String>)> = tracks
+    let active_role_keys: std::collections::BTreeSet<String> = active.keys().cloned().collect();
+
+    // Gap roles → a human reason for the placeholder track. Missing,
+    // pending-hire, and denied/blocked roles all qualify; active roles
+    // never do.
+    let mut gap: std::collections::BTreeMap<String, (String, String)> =
+        std::collections::BTreeMap::new();
+    {
+        let mut note_gap = |role: &str, reason: &str| {
+            let key = role.trim().to_ascii_lowercase();
+            if key.is_empty() || active_role_keys.contains(&key) {
+                return;
+            }
+            gap.entry(key)
+                .or_insert_with(|| (role.trim().to_string(), reason.to_string()));
+        };
+        for r in &view.missing_roles {
+            note_gap(r, "crew not ready");
+        }
+        for h in &view.pending_hires {
+            if let Some(r) = h.get("role").and_then(|v| v.as_str()) {
+                note_gap(r, "pending hire");
+            }
+        }
+        for b in &view.blocked_roles {
+            if let Some(r) = b.get("role").and_then(|v| v.as_str()) {
+                let reason = b
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("blocked");
+                note_gap(r, reason);
+            }
+        }
+    }
+
+    // Cap total role tracks at `max_briefs - 1` (the parent is one Brief);
+    // active tracks take priority over placeholders.
+    let cap = max_briefs.saturating_sub(1).max(1);
+    let active_plan: Vec<(String, String)> = active.into_values().take(cap).collect();
+    let gap_plan: Vec<(String, String)> = gap
         .into_values()
-        .take(max_briefs.saturating_sub(1).max(1))
+        .take(cap.saturating_sub(active_plan.len()))
         .collect();
 
-    let create_allowed = ready && !dry_run && matches!(mode, "create_briefs" | "assign_ready");
-    let assign_allowed = ready && !dry_run && mode == "assign_ready";
+    // Materialisation gate. We create the parent + role tracks (active and
+    // placeholder) whenever the strategy is approved and the mode wants to
+    // build (not dry_run / plan_only). Subject execution Briefs and
+    // assignment are PER-ROLE: only an active role gets them — a gap role
+    // never gets an executable Brief or an assignee. The whole-team
+    // `ready` flag still drives the reported status / next actions.
+    let materialize = strategy_ok && !dry_run && matches!(mode, "create_briefs" | "assign_ready");
+    let assign_mode = mode == "assign_ready";
+    let not_materialized_reason: &str = if !strategy_ok {
+        "strategy not approved"
+    } else if dry_run {
+        "dry_run: would create"
+    } else {
+        "plan_only: not created"
+    };
     let owner_subject = ctx.caller.subject_id.to_string();
     let parent_title = format!("Execute Mandate: {}", mandate.title);
 
     // ── Stable source markers (company-model §4.6) ───────────────
     // Idempotency keys are derived from the Mandate id + role key, NOT
     // from title text — so a Mandate rename or a manual Brief-title edit
-    // never causes a rerun to lose track of the existing tree.
+    // never causes a rerun to lose track of the existing tree. A
+    // placeholder track shares the role marker, so when the role later
+    // becomes active the SAME role track is reused (and gains a subject).
     let parent_marker = format!("mandate:{mandate_id}:parent");
-    // (role display, active agent, role-track marker, role-track title)
-    let child_plan: Vec<(String, Option<String>, String, String)> = track_list
-        .iter()
-        .map(|(role, agent)| {
-            let role_key = role.trim().to_ascii_lowercase();
-            let marker = format!("mandate:{mandate_id}:role:{role_key}");
-            let title = role_track_title(role, &mandate.title);
-            (role.clone(), agent.clone(), marker, title)
-        })
-        .collect();
+    let role_marker = |role: &str| {
+        format!(
+            "mandate:{mandate_id}:role:{}",
+            role.trim().to_ascii_lowercase()
+        )
+    };
 
     // The input signature is built from the *markers* (rename-stable),
     // the mode and the plan id — not the mutable title text. Subject
-    // markers (per active agent) are folded in too so a staffing change
-    // is reflected in the signature.
+    // markers (per active agent) and placeholder role markers are folded
+    // in so a staffing change is reflected in the signature.
     let mut all_markers: Vec<String> = vec![parent_marker.clone()];
-    for (_, agent, marker, _) in &child_plan {
-        all_markers.push(marker.clone());
-        if let Some(agent_id) = agent {
-            all_markers.push(format!("{marker}:subject:{agent_id}"));
-        }
+    for (role, agent_id) in &active_plan {
+        let m = role_marker(role);
+        all_markers.push(format!("{m}:subject:{agent_id}"));
+        all_markers.push(m);
+    }
+    for (role, _reason) in &gap_plan {
+        all_markers.push(role_marker(role));
     }
     let plan_id = view
         .plan
@@ -914,6 +972,8 @@ pub fn handle_orchestrate(
     let mut role_tracks_existing: Vec<serde_json::Value> = Vec::new();
     let mut subject_briefs_created: Vec<serde_json::Value> = Vec::new();
     let mut subject_briefs_existing: Vec<serde_json::Value> = Vec::new();
+    let mut placeholder_tracks_created: Vec<serde_json::Value> = Vec::new();
+    let mut placeholder_tracks_existing: Vec<serde_json::Value> = Vec::new();
 
     // Helper: get-or-create a Brief by its stable source marker.
     // Returns (task_id, was_existing, current_assignee) or None when
@@ -940,13 +1000,11 @@ pub fn handle_orchestrate(
                 return None;
             }
         }
-        if !create_allowed {
+        if !materialize {
             skipped_out.push(serde_json::json!({
                 "title": title,
                 "marker": marker,
-                "reason": if dry_run { "dry_run: would create" }
-                          else if !ready { "team not ready" }
-                          else { "plan_only: not created" },
+                "reason": not_materialized_reason,
             }));
             return None;
         }
@@ -984,27 +1042,26 @@ pub fn handle_orchestrate(
         && !was_existing
     {
         // Newly created parent: drop a durable orchestration Dossier.
+        let mut roles: Vec<&str> = active_plan.iter().map(|(r, _)| r.as_str()).collect();
+        roles.extend(gap_plan.iter().map(|(r, _)| r.as_str()));
         let body = format!(
             "Orchestration of Mandate '{}' ({mandate_id}). Roles: {}",
             mandate.title,
-            track_list
-                .iter()
-                .map(|(r, _)| r.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            roles.join(", ")
         );
         let _ = task_store.add_dossier(parent_id, "orchestration", "Orchestration plan", &body);
     }
 
-    // Role-track Briefs under the parent (marker
+    // Active role-track Briefs under the parent (marker
     // `mandate:{id}:role:{role_key}`), then a per-agent subject execution
-    // Brief under each role track. Role tracks stay unassigned; the
-    // subject Brief is the one that gets the assignment.
-    for (role, active_agent, role_marker, role_title) in &child_plan {
-        markers_used.push(role_marker.clone());
+    // Brief under each. Role tracks stay unassigned; the subject Brief is
+    // the one that gets the assignment.
+    for (role, agent_id) in &active_plan {
+        let rm = role_marker(role);
+        markers_used.push(rm.clone());
         let role_track = ensure_marked(
-            role_marker,
-            role_title,
+            &rm,
+            &role_track_title(role, &mandate.title),
             &mut role_tracks_created,
             &mut role_tracks_existing,
             &mut skipped,
@@ -1017,13 +1074,10 @@ pub fn handle_orchestrate(
             let _ = task_store.link_subbrief(parent_id, &role_id);
         }
 
-        // Subject execution Brief — only when an active agent staffs the
-        // role. A different agent later → a different subject marker →
-        // a new subject Brief, while the role track above is reused.
-        let Some(agent_id) = active_agent else {
-            continue;
-        };
-        let subject_marker = format!("{role_marker}:subject:{agent_id}");
+        // Subject execution Brief. A different agent later → a different
+        // subject marker → a new subject Brief, while the role track above
+        // is reused.
+        let subject_marker = format!("{rm}:subject:{agent_id}");
         markers_used.push(subject_marker.clone());
         let subject = ensure_marked(
             &subject_marker,
@@ -1040,8 +1094,8 @@ pub fn handle_orchestrate(
 
         // Assignment lands on the subject Brief (assign_ready only); the
         // role track above stays unassigned. Always assign-Key gated.
-        if !assign_allowed {
-            if ready && mode == "create_briefs" {
+        if !assign_mode {
+            if mode == "create_briefs" {
                 skipped.push(serde_json::json!({
                     "task_id": subject_id, "reason": "not assigned (mode=create_briefs)",
                 }));
@@ -1068,14 +1122,61 @@ pub fn handle_orchestrate(
         }
     }
 
+    // Placeholder role tracks for gap roles (missing / pending / blocked).
+    // Same role marker as an active track — so the SAME Brief is reused
+    // when the role later becomes active — but with NO subject Brief and
+    // NO assignment. Each created entry is tagged `placeholder` + `reason`
+    // so the persisted run and the dashboard can render the gap.
+    for (role, reason) in &gap_plan {
+        let rm = role_marker(role);
+        markers_used.push(rm.clone());
+        let track = ensure_marked(
+            &rm,
+            &placeholder_track_title(role, reason),
+            &mut placeholder_tracks_created,
+            &mut placeholder_tracks_existing,
+            &mut skipped,
+        );
+        if let Some((role_id, was_existing, _)) = &track {
+            // Tag the just-pushed bucket entry with the placeholder reason.
+            let bucket = if *was_existing {
+                &mut placeholder_tracks_existing
+            } else {
+                &mut placeholder_tracks_created
+            };
+            if let Some(last) = bucket.last_mut() {
+                last["placeholder"] = serde_json::json!(true);
+                last["reason"] = serde_json::json!(reason);
+            }
+            // Link under the parent (idempotent edge insert).
+            if let Some((ref parent_id, _, _)) = parent {
+                let _ = task_store.link_subbrief(parent_id, role_id);
+            }
+            // On first creation, record WHY the track is blocked.
+            if !was_existing {
+                let _ = task_store.add_dossier(
+                    role_id,
+                    "blocker",
+                    "Placeholder track",
+                    &format!(
+                        "Role '{role}' is not ready ({reason}). No execution Brief is \
+                         created until the role is staffed and active."
+                    ),
+                );
+            }
+        }
+    }
+
     // Backward-compatible flat views: callers/tests that predate the
     // tiered shape still read `created_briefs` / `existing_briefs`.
     created_briefs.extend(parent_created.iter().cloned());
     created_briefs.extend(role_tracks_created.iter().cloned());
     created_briefs.extend(subject_briefs_created.iter().cloned());
+    created_briefs.extend(placeholder_tracks_created.iter().cloned());
     existing_briefs.extend(parent_existing.iter().cloned());
     existing_briefs.extend(role_tracks_existing.iter().cloned());
     existing_briefs.extend(subject_briefs_existing.iter().cloned());
+    existing_briefs.extend(placeholder_tracks_existing.iter().cloned());
 
     // Status + next actions.
     let status = if !ready {
@@ -1098,6 +1199,13 @@ pub fn handle_orchestrate(
     } else {
         next_actions
             .push("Briefs created and assigned — the heartbeat will dispatch them.".to_string());
+    }
+    let placeholders = placeholder_tracks_created.len() + placeholder_tracks_existing.len();
+    if placeholders > 0 {
+        next_actions.push(format!(
+            "{placeholders} placeholder track(s) await staffing; each becomes executable once \
+             its role is active."
+        ));
     }
 
     // Persist the run (best-effort: a record failure must not lose the
@@ -1142,10 +1250,13 @@ pub fn handle_orchestrate(
         "status": status,
         "input_signature": signature,
         "blockers": blockers,
-        // Tiered view (parent → role track → subject execution).
+        // Tiered view (parent → role track → subject execution), plus
+        // placeholder tracks for missing / pending / blocked roles.
         "parent_brief": parent_brief,
         "role_tracks_created": role_tracks_created,
         "role_tracks_existing": role_tracks_existing,
+        "placeholder_tracks_created": placeholder_tracks_created,
+        "placeholder_tracks_existing": placeholder_tracks_existing,
         "subject_briefs_created": subject_briefs_created,
         "subject_briefs_existing": subject_briefs_existing,
         "assigned_briefs": assigned_briefs,
@@ -3294,9 +3405,24 @@ mod tests {
         assert_eq!(v["ready"], false);
         assert_eq!(v["status"], "blocked");
         assert!(!v["blockers"].as_array().unwrap().is_empty());
-        // No work is created for a non-ready team.
-        assert!(v["created_briefs"].as_array().unwrap().is_empty());
-        assert!(tasks.list_briefs_by_mandate(&m, 50).unwrap().is_empty());
+        // A non-ready team gets a parent + a PLACEHOLDER role track for the
+        // pending-hire role — but no executable subject Brief and no
+        // assignment.
+        assert_eq!(v["placeholder_tracks_created"].as_array().unwrap().len(), 1);
+        assert!(v["subject_briefs_created"].as_array().unwrap().is_empty());
+        assert!(v["assigned_briefs"].as_array().unwrap().is_empty());
+        // The placeholder entry is tagged with a reason.
+        let ph = &v["placeholder_tracks_created"][0];
+        assert_eq!(ph["placeholder"], true);
+        assert_eq!(ph["reason"], "pending hire");
+        // Durable: parent + one placeholder track exist under the Mandate.
+        let cards = tasks.list_briefs_by_mandate(&m, 50).unwrap();
+        assert_eq!(cards.len(), 2);
+        // The placeholder track carries no assignee.
+        let ph_id = ph["task_id"].as_str().unwrap();
+        let ph_card = cards.iter().find(|c| c.task_id == ph_id).unwrap();
+        assert!(ph_card.assignee_agent_id.is_none());
+        assert!(ph_card.title.contains("blocked"));
     }
 
     #[test]
@@ -3763,6 +3889,208 @@ mod tests {
             .collect();
         assert!(existing_ids.contains(&parent_id.as_str()));
         assert!(existing_ids.contains(&role_id.as_str()));
+        assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), 3);
+    }
+
+    // ── Placeholder role-track tests (company-model §4.6) ────────
+
+    /// Record a Team Plan for `m` with explicit role-gap inputs.
+    fn plan_with_gaps(
+        spine: &SpineStore,
+        m: &str,
+        proposed_roles_json: &str,
+        pending_hires_json: &str,
+        denials_json: &str,
+    ) {
+        spine
+            .record_team_plan(&crate::nodes::coordinator::spine::store::TeamPlanRecord {
+                tenant_id: "default",
+                mandate_id: m,
+                actor_id: "operator",
+                description: "x",
+                proposed_roles_json,
+                pending_hires_json,
+                clearance_ids_json: "[]",
+                denials_json,
+                next_steps_json: "[]",
+                status: "staffing",
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn orchestrate_missing_role_creates_one_placeholder_track() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        plan_with_gaps(&spine, &m, "[\"designer\"]", "[]", "[]");
+        let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        assert_eq!(v["status"], "blocked");
+        // Parent + one placeholder track; no executable subject Brief.
+        assert_eq!(v["placeholder_tracks_created"].as_array().unwrap().len(), 1);
+        assert!(v["subject_briefs_created"].as_array().unwrap().is_empty());
+        assert!(v["role_tracks_created"].as_array().unwrap().is_empty());
+        let ph = &v["placeholder_tracks_created"][0];
+        assert_eq!(ph["placeholder"], true);
+        assert_eq!(ph["reason"], "crew not ready");
+        assert!(
+            ph["title"]
+                .as_str()
+                .unwrap()
+                .starts_with("Design track blocked:")
+        );
+        assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn orchestrate_repeated_missing_role_reuses_placeholder() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        plan_with_gaps(&spine, &m, "[\"designer\"]", "[]", "[]");
+        let first = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        assert_eq!(
+            first["placeholder_tracks_created"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let before = tasks.list_briefs_by_mandate(&m, 50).unwrap().len();
+        let second = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        assert!(
+            second["placeholder_tracks_created"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            second["placeholder_tracks_existing"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            tasks.list_briefs_by_mandate(&m, 50).unwrap().len(),
+            before,
+            "the placeholder is reused, not duplicated"
+        );
+    }
+
+    #[test]
+    fn orchestrate_pending_hire_creates_placeholder_no_subject() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        let pending = agents
+            .request_hire(
+                "P", "engineer", "P", "e", "e", "prime", "subj-p", "medium", "default",
+            )
+            .unwrap();
+        plan_with_gaps(
+            &spine,
+            &m,
+            "[]",
+            &format!("[{{\"role\":\"engineer\",\"agent_id\":\"{pending}\"}}]"),
+            "[]",
+        );
+        let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        assert_eq!(v["placeholder_tracks_created"].as_array().unwrap().len(), 1);
+        assert_eq!(v["placeholder_tracks_created"][0]["reason"], "pending hire");
+        assert!(v["subject_briefs_created"].as_array().unwrap().is_empty());
+        assert!(v["assigned_briefs"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn orchestrate_denied_role_creates_placeholder_no_subject() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        plan_with_gaps(
+            &spine,
+            &m,
+            "[]",
+            "[]",
+            "[{\"role\":\"security\",\"reason\":\"charter denied\"}]",
+        );
+        let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        assert_eq!(v["placeholder_tracks_created"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            v["placeholder_tracks_created"][0]["reason"],
+            "charter denied"
+        );
+        assert!(v["subject_briefs_created"].as_array().unwrap().is_empty());
+        assert!(v["assigned_briefs"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn orchestrate_placeholder_becomes_active_reuses_role_track() {
+        // A pending-hire role gets a placeholder; once the hire activates,
+        // a rerun reuses the SAME role track and creates the subject Brief
+        // under it (the placeholder→active transition).
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        let pending = agents
+            .request_hire(
+                "W", "engineer", "W", "e", "e", "prime", "subj-rt", "medium", "default",
+            )
+            .unwrap();
+        plan_with_gaps(
+            &spine,
+            &m,
+            "[]",
+            &format!("[{{\"role\":\"engineer\",\"agent_id\":\"{pending}\"}}]"),
+            "[]",
+        );
+        let first = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        let role_id = first["placeholder_tracks_created"][0]["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            first["subject_briefs_created"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        // Activate the hire → engineer is now active.
+        agents.approve_hire(&pending).unwrap();
+        let second = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        // The role is no longer a gap; the same role track is reused.
+        assert!(
+            second["placeholder_tracks_created"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            second["placeholder_tracks_existing"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(second["role_tracks_existing"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            second["role_tracks_existing"][0]["task_id"],
+            serde_json::json!(role_id)
+        );
+        // A subject execution Brief is now created + assigned under it.
+        assert_eq!(
+            second["subject_briefs_created"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            second["assigned_briefs"][0]["agent_id"],
+            serde_json::json!(pending)
+        );
+        // Tree: parent + role track + subject = 3 (no duplicate role track).
         assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), 3);
     }
 

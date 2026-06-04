@@ -599,14 +599,17 @@ function renderOrchestration(host, run) {
   box.append(node("strong",{textContent:"Orchestration: "+(run.status||"")+" ("+(run.mode||"")+(run.dry_run?", dry-run":"")+")"}));
   const ids = a => (a||[]).map(x => (x.task_id||x)).join(", ") || "none";
   // Classify each Brief by the tier encoded in its stable source marker
-  // (works for both the persisted run and the live response).
-  const tier = mk => { mk = mk||""; if (mk.endsWith(":parent")) return "parent"; if (mk.indexOf(":subject:")>=0) return "subject"; if (mk.indexOf(":role:")>=0) return "role"; return "other"; };
-  const split = arr => { const g={parent:[],role:[],subject:[],other:[]}; (arr||[]).forEach(x => g[x && x.marker ? tier(x.marker) : "other"].push(x)); return g; };
+  // (works for both the persisted run and the live response). A
+  // placeholder role track is tagged `placeholder:true` on its entry.
+  const tier = x => { if (x && x.placeholder) return "placeholder"; const mk = (x && x.marker)||""; if (mk.endsWith(":parent")) return "parent"; if (mk.indexOf(":subject:")>=0) return "subject"; if (mk.indexOf(":role:")>=0) return "role"; return "other"; };
+  const split = arr => { const g={parent:[],role:[],subject:[],placeholder:[],other:[]}; (arr||[]).forEach(x => g[tier(x)].push(x)); return g; };
+  const phLabel = a => (a||[]).map(x => (x.task_id||x)+(x.reason?" ("+x.reason+")":"")).join(", ") || "none";
   const created = split(run.created_brief_ids), existing = split(run.existing_brief_ids);
   const parent = created.parent[0] || existing.parent[0];
   box.append(node("div",{textContent:"Parent: "+(parent ? (parent.task_id||parent) : "none")}));
   box.append(node("div",{textContent:"Role tracks — created: "+ids(created.role)+" · reused: "+ids(existing.role)}));
   box.append(node("div",{textContent:"Subject execution — created: "+ids(created.subject)+" · reused: "+ids(existing.subject)}));
+  if (created.placeholder.length || existing.placeholder.length) box.append(node("div",{className:"err",textContent:"Placeholder / blocked tracks — created: "+phLabel(created.placeholder)+" · reused: "+phLabel(existing.placeholder)}));
   box.append(node("div",{textContent:"Assigned: "+ids(run.assigned_brief_ids)}));
   if ((run.skipped||[]).length) box.append(node("div",{className:"muted",textContent:"Skipped: "+run.skipped.map(s=>s.reason||JSON.stringify(s)).join(", ")}));
   if ((run.blockers||[]).length) box.append(node("div",{className:"err",textContent:"Blockers: "+run.blockers.map(b=>b.reason||JSON.stringify(b)).join(", ")}));
