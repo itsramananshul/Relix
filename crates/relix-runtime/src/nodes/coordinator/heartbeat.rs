@@ -3491,6 +3491,46 @@ mod tests {
     }
 
     #[test]
+    fn apply_end_to_end_from_a_real_run_into_a_disposable_root() {
+        // Capstone: a REAL run (real scoped workspace + real adapter process
+        // writing a file) → artifacts with baseline → accept → plan → apply
+        // into a DISPOSABLE temp project root (never the repo) → re-apply
+        // proves idempotency. The deterministic equivalent of the live smoke.
+        let (s, _tmp) = store_ws();
+        let id = ready_brief(&s, "write a note", "agt_a");
+        let report =
+            run_brief_now(&s, &file_creating_rig("applied_note.txt", "hello"), None, 300, &id, None, "x".into())
+                .unwrap();
+        let run_id = report.run_id.unwrap();
+        // The run produced a real created artifact in its scoped workspace.
+        let arts = s.list_run_artifacts(&run_id).unwrap();
+        assert!(arts.iter().any(|a| a.rel_path == "applied_note.txt" && a.kind == "created"));
+
+        // Accept it, then apply into a disposable project root.
+        s.set_run_review(&run_id, "accepted", "ok").unwrap();
+        assert!(run_apply_eligibility(&s.get_run(&run_id).unwrap().unwrap()).is_ok());
+        let proj = tempfile::tempdir().unwrap();
+
+        let plan = build_apply_plan(proj.path(), &arts).unwrap();
+        assert!(plan.applicable, "a clean created file must be applicable: {plan:?}");
+        assert!(plan.changes >= 1);
+
+        let out = apply_run(proj.path(), &arts).unwrap();
+        assert_eq!(out.status, "applied");
+        assert!(out.applied_files >= 1);
+        let landed = proj.path().join("applied_note.txt");
+        assert!(landed.exists(), "the file must land in the disposable project root");
+        let body = std::fs::read(&landed).unwrap();
+        assert!(!body.is_empty());
+
+        // Re-apply: target now identical → all noop, 0 writes (idempotent).
+        let out2 = apply_run(proj.path(), &arts).unwrap();
+        assert_eq!(out2.status, "applied");
+        assert_eq!(out2.applied_files, 0);
+        assert_eq!(std::fs::read(&landed).unwrap(), body, "idempotent re-apply must not corrupt");
+    }
+
+    #[test]
     fn apply_plan_is_tenant_scoped() {
         let s = store();
         let brief = s
