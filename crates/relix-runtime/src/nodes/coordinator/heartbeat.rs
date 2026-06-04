@@ -396,6 +396,15 @@ pub struct RunReport {
     /// sees WHERE the run happened. `None` for a refusal / `inherit` mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// Workspace context mode (`empty` / `copy_repo`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_context: Option<String>,
+    /// Files copied into the workspace (`copy_repo`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_files: Option<i64>,
+    /// Bytes copied into the workspace (`copy_repo`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_bytes: Option<i64>,
 }
 
 impl RunReport {
@@ -408,6 +417,9 @@ impl RunReport {
             install_hint: None,
             run_id: None,
             workspace: None,
+            workspace_context: None,
+            workspace_files: None,
+            workspace_bytes: None,
         }
     }
 }
@@ -425,6 +437,11 @@ pub struct ReadyRun {
     /// The scoped per-run workspace the Rig will execute in (`None` in
     /// `inherit` mode — legacy coordinator-CWD execution).
     pub workspace: Option<String>,
+    /// Workspace context mode (`empty` / `copy_repo`) + copy stats, carried
+    /// through to the terminal RunReport.
+    pub workspace_context: Option<String>,
+    pub workspace_files: Option<i64>,
+    pub workspace_bytes: Option<i64>,
     rig: std::sync::Arc<dyn Rig>,
     req: RigRunRequest,
     token: String,
@@ -466,30 +483,332 @@ fn absolute_clean(p: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-/// Create the scoped per-run workspace `<root>/<run_id>` and drop a small
-/// trusted `BRIEF.md` instruction file in it. Returns the absolute
-/// workspace path. The path is derived ONLY from the validated `run_id`
-/// and the configured root — NEVER from Brief content — so a prompt can't
-/// choose where work lands, and traversal is impossible.
+/// How much project context a run workspace receives. Default `Empty`
+/// (the safest: only `BRIEF.md`). `CopyRepo` copies a capped, filtered
+/// snapshot of the project so real coding work can happen WITHOUT going
+/// back to dangerous repo-CWD execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum WorkspaceContext {
+    #[default]
+    Empty,
+    CopyRepo,
+}
+
+impl WorkspaceContext {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkspaceContext::Empty => "empty",
+            WorkspaceContext::CopyRepo => "copy_repo",
+        }
+    }
+}
+
+/// Resolved run-workspace context configuration. Read from env at store
+/// open; injectable in tests. The Brief prompt NEVER influences any of
+/// these — the project root + caps are operator config only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceConfig {
+    pub context: WorkspaceContext,
+    /// The directory `copy_repo` snapshots from. Defaults to the
+    /// coordinator's CWD; overridable via `RELIX_RUN_PROJECT_ROOT`.
+    pub project_root: std::path::PathBuf,
+    /// Hard cap on total copied bytes (`copy_repo`).
+    pub max_bytes: u64,
+    /// Hard cap on total copied file count (`copy_repo`).
+    pub max_files: usize,
+}
+
+/// Conservative defaults — small enough that an accidental `copy_repo` of
+/// a huge tree fails fast instead of bloating disk (we've had a 150GB
+/// local-bloat incident; `copy_repo` is explicit, capped, observable).
+pub const DEFAULT_WORKSPACE_MAX_BYTES: u64 = 32 * 1024 * 1024; // 32 MiB
+pub const DEFAULT_WORKSPACE_MAX_FILES: usize = 2_000;
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            context: WorkspaceContext::Empty,
+            project_root: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            max_bytes: DEFAULT_WORKSPACE_MAX_BYTES,
+            max_files: DEFAULT_WORKSPACE_MAX_FILES,
+        }
+    }
+}
+
+/// Resolve the run-workspace context config from env. Unknown / unset
+/// context → `Empty` (safe default).
+pub fn resolve_workspace_config() -> WorkspaceConfig {
+    let context = match std::env::var("RELIX_RUN_WORKSPACE_CONTEXT")
+        .ok()
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("copy_repo") | Some("copy-repo") => WorkspaceContext::CopyRepo,
+        _ => WorkspaceContext::Empty,
+    };
+    let project_root = std::env::var_os("RELIX_RUN_PROJECT_ROOT")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        });
+    let max_bytes = std::env::var("RELIX_RUN_WORKSPACE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&n: &u64| n > 0)
+        .unwrap_or(DEFAULT_WORKSPACE_MAX_BYTES);
+    let max_files = std::env::var("RELIX_RUN_WORKSPACE_MAX_FILES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(DEFAULT_WORKSPACE_MAX_FILES);
+    WorkspaceConfig {
+        context,
+        project_root,
+        max_bytes,
+        max_files,
+    }
+}
+
+/// Directory names NEVER copied by `copy_repo` (any depth): VCS, build
+/// caches, dependency trees, generated data, and the run-workspace tree
+/// itself (so a copy can't recurse into its own output). Case-insensitive.
+const EXCLUDED_DIR_NAMES: &[&str] = &[
+    ".git",
+    "target",
+    "target-audit",
+    "node_modules",
+    "dev-data",
+    "workspaces",
+    "worktrees", // covers .claude/worktrees
+    "dev-keys",
+    "references",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".cargo",
+    "dist",
+];
+
+/// A file is excluded from `copy_repo` when its name is dotenv or carries
+/// obvious secret/key material — never copy credentials into a sandbox.
+fn is_excluded_file(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == ".env"
+        || n.starts_with(".env.")
+        || n.ends_with(".key")
+        || n.ends_with(".pem")
+        || n.ends_with(".p12")
+        || n.ends_with(".pfx")
+        || n.ends_with(".pub")
+        || n.ends_with(".aic")
+        || n.ends_with(".keystore")
+        || n.starts_with("id_rsa")
+        || n.starts_with("id_ed25519")
+        || n.starts_with("id_ecdsa")
+        || n == "bridge-token"
+        || n == "dashboard-admin.json"
+        || n.contains("secret")
+        || n.contains("credential")
+        || n.contains("password")
+}
+
+fn is_excluded_dir(name: &str) -> bool {
+    EXCLUDED_DIR_NAMES.iter().any(|d| d.eq_ignore_ascii_case(name))
+}
+
+/// Best-effort `.gitignore` "respect where practical": read the project
+/// root's top-level `.gitignore` and collect the bare names it ignores
+/// (stripping leading/trailing `/`, dropping globs / negations / nested
+/// paths). The hardcoded [`EXCLUDED_DIR_NAMES`] remain the real safety
+/// net; this just honors common project ignores like a tracked
+/// `references/` or `coverage/`.
+fn gitignore_names(project_root: &std::path::Path) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    let Ok(text) = std::fs::read_to_string(project_root.join(".gitignore")) else {
+        return set;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+            continue;
+        }
+        let name = line.trim_matches('/');
+        // Only honor simple single-segment names without globs.
+        if !name.is_empty()
+            && !name.contains('/')
+            && !name.contains('*')
+            && !name.contains('?')
+            && !name.contains('[')
+        {
+            set.insert(name.to_string());
+        }
+    }
+    set
+}
+
+/// Validate the configured project root is a safe directory to snapshot.
+/// Rejects a missing/non-dir path and a filesystem/drive root (no parent),
+/// so `copy_repo` can never walk `/` or `C:\`. The root is operator config,
+/// never Brief-derived.
+fn validate_project_root(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    if !root.is_dir() {
+        return Err(format!(
+            "project root is not a directory: {}",
+            root.display()
+        ));
+    }
+    let abs = std::fs::canonicalize(root)
+        .map_err(|e| format!("cannot resolve project root {}: {e}", root.display()))?;
+    if abs.parent().is_none() {
+        return Err(format!(
+            "refusing to snapshot a filesystem root: {}",
+            abs.display()
+        ));
+    }
+    Ok(abs)
+}
+
+/// Copy a capped, filtered snapshot of `src_root` into `dst`. Skips
+/// symlinks (no escaping the root, no loops), excluded dirs/files, and
+/// `.gitignore` names. Enforces file-count + byte caps, aborting with a
+/// clear error the moment a cap is exceeded. Returns `(files, bytes)`.
+fn copy_repo_into(
+    src_root: &std::path::Path,
+    dst: &std::path::Path,
+    cfg: &WorkspaceConfig,
+) -> Result<(usize, u64), String> {
+    let gitignore = gitignore_names(src_root);
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let mut stack = vec![src_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| format!("read {}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("entry: {e}"))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let ft = entry
+                .file_type()
+                .map_err(|e| format!("file type {name}: {e}"))?;
+            // Symlinks are never followed — they could escape the root or
+            // form cycles.
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                if is_excluded_dir(&name) || gitignore.contains(&name) {
+                    continue;
+                }
+                stack.push(entry.path());
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            if is_excluded_file(&name) || gitignore.contains(&name) {
+                continue;
+            }
+            let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            files += 1;
+            bytes = bytes.saturating_add(sz);
+            if files > cfg.max_files {
+                return Err(format!(
+                    "file-count cap exceeded ({} > {} files) — raise RELIX_RUN_WORKSPACE_MAX_FILES or narrow the project root",
+                    files, cfg.max_files
+                ));
+            }
+            if bytes > cfg.max_bytes {
+                return Err(format!(
+                    "size cap exceeded ({} > {} bytes) — raise RELIX_RUN_WORKSPACE_MAX_BYTES or narrow the project root",
+                    bytes, cfg.max_bytes
+                ));
+            }
+            let rel = entry
+                .path()
+                .strip_prefix(src_root)
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|_| std::path::PathBuf::from(&name));
+            let target = dst.join(&rel);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+            }
+            std::fs::copy(entry.path(), &target)
+                .map_err(|e| format!("copy {}: {e}", rel.display()))?;
+        }
+    }
+    Ok((files, bytes))
+}
+
+/// A run workspace that has been prepared (created + context applied).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedWorkspace {
+    pub path: std::path::PathBuf,
+    pub context: WorkspaceContext,
+    pub copied_files: usize,
+    pub copied_bytes: u64,
+}
+
+/// Why workspace prep failed — distinguishes the basic-creation refusal
+/// (`workspace_error`) from a context-copy / cap refusal
+/// (`workspace_context_error`).
+#[derive(Debug)]
+pub enum WorkspacePrepError {
+    Create(String),
+    Context(String),
+}
+
+impl WorkspacePrepError {
+    pub fn status(&self) -> &'static str {
+        match self {
+            WorkspacePrepError::Create(_) => "workspace_error",
+            WorkspacePrepError::Context(_) => "workspace_context_error",
+        }
+    }
+    pub fn message(&self) -> &str {
+        match self {
+            WorkspacePrepError::Create(m) | WorkspacePrepError::Context(m) => m,
+        }
+    }
+}
+
+/// Create the scoped per-run workspace `<root>/<run_id>`, drop a small
+/// trusted `BRIEF.md`, and apply the configured context (`empty` →
+/// nothing; `copy_repo` → a capped, filtered project snapshot). Returns
+/// the prepared workspace (path + mode + copy stats). The path is derived
+/// ONLY from the validated `run_id` + the configured root — NEVER from
+/// Brief content — so a prompt can't choose where work lands, and
+/// traversal is impossible. On a context-copy failure the partial
+/// workspace is removed so no half-copied tree lingers.
 pub fn prepare_run_workspace(
     root: &std::path::Path,
     run_id: &str,
     brief_id: &str,
     title: &str,
     context: &str,
-) -> Result<std::path::PathBuf, String> {
+    cfg: &WorkspaceConfig,
+) -> Result<PreparedWorkspace, WorkspacePrepError> {
     if !run_id_is_safe(run_id) {
-        return Err(format!("unsafe run id for workspace: {run_id:?}"));
+        return Err(WorkspacePrepError::Create(format!(
+            "unsafe run id for workspace: {run_id:?}"
+        )));
     }
-    std::fs::create_dir_all(root).map_err(|e| format!("create workspace root: {e}"))?;
+    std::fs::create_dir_all(root)
+        .map_err(|e| WorkspacePrepError::Create(format!("create workspace root: {e}")))?;
     let root = absolute_clean(root);
     let ws = root.join(run_id);
     // Belt-and-suspenders traversal guard: with a validated single-segment
     // run_id the workspace is always a DIRECT child of root.
     if ws.parent() != Some(root.as_path()) {
-        return Err(format!("workspace path escapes its root: {}", ws.display()));
+        return Err(WorkspacePrepError::Create(format!(
+            "workspace path escapes its root: {}",
+            ws.display()
+        )));
     }
-    std::fs::create_dir_all(&ws).map_err(|e| format!("create workspace: {e}"))?;
+    std::fs::create_dir_all(&ws)
+        .map_err(|e| WorkspacePrepError::Create(format!("create workspace: {e}")))?;
     // A small, trusted instruction file — no secrets, no prompt-chosen
     // path. Best-effort: a write failure does not fail the run.
     let brief_md = format!(
@@ -497,12 +816,37 @@ pub fn prepare_run_workspace(
          - brief_id: {brief_id}\n\
          - run_id: {run_id}\n\
          - title: {title}\n\
-         - context: {context}\n\n\
+         - context: {context}\n\
+         - workspace_context: {ctx_mode}\n\n\
          This folder is the scoped sandbox for one Brief run. Keep all work \
-         for this Brief inside it.\n"
+         for this Brief inside it.\n",
+        ctx_mode = cfg.context.as_str(),
     );
     let _ = std::fs::write(ws.join("BRIEF.md"), brief_md);
-    Ok(ws)
+
+    let (copied_files, copied_bytes) = match cfg.context {
+        WorkspaceContext::Empty => (0, 0),
+        WorkspaceContext::CopyRepo => {
+            let src = validate_project_root(&cfg.project_root).map_err(|e| {
+                let _ = std::fs::remove_dir_all(&ws);
+                WorkspacePrepError::Context(format!("invalid project root: {e}"))
+            })?;
+            match copy_repo_into(&src, &ws, cfg) {
+                Ok(stats) => stats,
+                Err(e) => {
+                    // Remove the partial copy so no half-snapshot lingers.
+                    let _ = std::fs::remove_dir_all(&ws);
+                    return Err(WorkspacePrepError::Context(e));
+                }
+            }
+        }
+    };
+    Ok(PreparedWorkspace {
+        path: ws,
+        context: cfg.context,
+        copied_files,
+        copied_bytes,
+    })
 }
 
 /// Outcome of [`preflight_run`]: either a clear refusal (no command was
@@ -589,6 +933,9 @@ pub fn preflight_run(
             install_hint: probe.install_hint,
             run_id: None,
             workspace: None,
+            workspace_context: None,
+            workspace_files: None,
+            workspace_bytes: None,
         }));
     }
     // Single-owner: claim the Brief so a duplicate concurrent run can't
@@ -603,39 +950,56 @@ pub fn preflight_run(
             install_hint: None,
             run_id: None,
             workspace: None,
+            workspace_context: None,
+            workspace_files: None,
+            workspace_bytes: None,
         }));
     }
     let rig_name = rig.name().to_string();
     // Scoped per-run workspace — the Rig executes HERE, not in the
     // coordinator/repo CWD, unless `inherit` mode is explicitly set. The
-    // path is derived only from `run_id` (a prompt can't choose it). A
-    // creation failure refuses cleanly WITHOUT opening a run record and
-    // releases the just-won Claim (no phantom run, no repo-wide fallback).
-    let workspace: Option<String> = if workspace_mode_is_inherit() {
-        None
-    } else {
+    // path is derived only from `run_id` (a prompt can't choose it). With
+    // `copy_repo` context a capped, filtered project snapshot is copied in.
+    // ANY prep failure refuses cleanly WITHOUT opening a run record and
+    // releases the just-won Claim (no phantom run, no repo-wide fallback):
+    // a basic-creation failure → `workspace_error`, a context/cap failure
+    // → `workspace_context_error`.
+    let mut workspace: Option<String> = None;
+    let mut workspace_context: Option<String> = None;
+    let mut workspace_files: Option<i64> = None;
+    let mut workspace_bytes: Option<i64> = None;
+    if !workspace_mode_is_inherit() {
         match prepare_run_workspace(
             store.run_workspace_root(),
             &run_id,
             &card.task_id,
             &card.title,
             &brief_context(&card),
+            store.run_workspace_config(),
         ) {
-            Ok(ws) => Some(ws.to_string_lossy().into_owned()),
+            Ok(prepared) => {
+                workspace = Some(prepared.path.to_string_lossy().into_owned());
+                workspace_context = Some(prepared.context.as_str().to_string());
+                workspace_files = Some(prepared.copied_files as i64);
+                workspace_bytes = Some(prepared.copied_bytes as i64);
+            }
             Err(e) => {
                 let _ = store.release_claim(&card.task_id, &assignee);
                 return Ok(Preflight::Refused(RunReport {
                     brief_id: brief_id.to_string(),
-                    status: "workspace_error".to_string(),
+                    status: e.status().to_string(),
                     rig: rig_name,
-                    summary: format!("could not prepare a run workspace: {e}"),
+                    summary: format!("could not prepare a run workspace: {}", e.message()),
                     install_hint: None,
                     run_id: None,
                     workspace: None,
+                    workspace_context: None,
+                    workspace_files: None,
+                    workspace_bytes: None,
                 }));
             }
         }
-    };
+    }
     if card.board_status == "todo" {
         store.set_board_status(&card.task_id, "in_progress")?;
     }
@@ -645,7 +1009,12 @@ pub fn preflight_run(
         &card.task_id,
         &assignee,
         &rig_name,
-        workspace.as_deref(),
+        &crate::nodes::coordinator::RunWorkspaceInfo {
+            path: workspace.as_deref(),
+            context: workspace_context.as_deref(),
+            files: workspace_files,
+            bytes: workspace_bytes,
+        },
     );
     let _ = store.append_event(
         &card.task_id,
@@ -680,6 +1049,9 @@ pub fn preflight_run(
         run_id,
         rig_name,
         workspace,
+        workspace_context,
+        workspace_files,
+        workspace_bytes,
         rig,
         req,
         token,
@@ -701,6 +1073,9 @@ pub fn execute_ready(
         run_id,
         rig_name,
         workspace,
+        workspace_context,
+        workspace_files,
+        workspace_bytes,
         rig,
         req,
         token,
@@ -766,6 +1141,9 @@ pub fn execute_ready(
         install_hint: None,
         run_id: Some(run_id),
         workspace,
+        workspace_context,
+        workspace_files,
+        workspace_bytes,
     }
 }
 
@@ -1551,22 +1929,163 @@ mod tests {
 
     // ── Scoped per-run workspaces ───────────────────────────────
 
-    #[test]
-    fn prepare_run_workspace_creates_dir_and_brief_file() {
+    fn empty_cfg() -> WorkspaceConfig {
+        WorkspaceConfig::default() // context = Empty
+    }
+
+    /// Build a tiny temp "project" with a few files + dangerous dirs/files
+    /// that `copy_repo` must exclude. Returns the project root tempdir.
+    fn fake_project() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
-        let ws = prepare_run_workspace(
+        let p = tmp.path();
+        std::fs::write(p.join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(p.join("README.md"), "hello").unwrap();
+        std::fs::create_dir_all(p.join("src")).unwrap();
+        std::fs::write(p.join("src").join("lib.rs"), "pub fn x() {}").unwrap();
+        // Dangerous / excluded entries:
+        std::fs::create_dir_all(p.join(".git")).unwrap();
+        std::fs::write(p.join(".git").join("HEAD"), "ref: x").unwrap();
+        std::fs::create_dir_all(p.join("target")).unwrap();
+        std::fs::write(p.join("target").join("huge.bin"), vec![0u8; 1024]).unwrap();
+        std::fs::create_dir_all(p.join(".claude").join("worktrees")).unwrap();
+        std::fs::write(p.join(".claude").join("worktrees").join("stale"), "x").unwrap();
+        std::fs::create_dir_all(p.join("node_modules")).unwrap();
+        std::fs::write(p.join("node_modules").join("dep.js"), "x").unwrap();
+        std::fs::create_dir_all(p.join("dev-data")).unwrap();
+        std::fs::write(p.join("dev-data").join("tasks.db"), "x").unwrap();
+        std::fs::write(p.join(".env"), "SECRET=1").unwrap();
+        std::fs::write(p.join("api.key"), "abc").unwrap();
+        tmp
+    }
+
+    fn copy_repo_cfg(root: &std::path::Path) -> WorkspaceConfig {
+        WorkspaceConfig {
+            context: WorkspaceContext::CopyRepo,
+            project_root: root.to_path_buf(),
+            max_bytes: DEFAULT_WORKSPACE_MAX_BYTES,
+            max_files: DEFAULT_WORKSPACE_MAX_FILES,
+        }
+    }
+
+    #[test]
+    fn empty_mode_creates_only_brief_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prepared = prepare_run_workspace(
             &tmp.path().join("runs"),
             "run_abc123",
             "brief_1",
             "Ship it",
             "priority=normal",
+            &empty_cfg(),
         )
         .unwrap();
-        assert!(ws.is_dir(), "workspace dir created");
-        assert!(ws.ends_with("run_abc123"));
-        let brief_md = std::fs::read_to_string(ws.join("BRIEF.md")).unwrap();
-        assert!(brief_md.contains("brief_1"));
-        assert!(brief_md.contains("Ship it"));
+        assert!(prepared.path.is_dir(), "workspace dir created");
+        assert!(prepared.path.ends_with("run_abc123"));
+        assert_eq!(prepared.context, WorkspaceContext::Empty);
+        assert_eq!(prepared.copied_files, 0);
+        // Only BRIEF.md present.
+        let names: Vec<String> = std::fs::read_dir(&prepared.path)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["BRIEF.md".to_string()]);
+        let brief_md = std::fs::read_to_string(prepared.path.join("BRIEF.md")).unwrap();
+        assert!(brief_md.contains("brief_1") && brief_md.contains("Ship it"));
+        assert!(brief_md.contains("workspace_context: empty"));
+    }
+
+    #[test]
+    fn copy_repo_copies_normal_files_and_excludes_dangerous() {
+        let proj = fake_project();
+        let dst_root = tempfile::tempdir().unwrap();
+        let prepared = prepare_run_workspace(
+            &dst_root.path().join("runs"),
+            "run_copy1",
+            "b",
+            "t",
+            "c",
+            &copy_repo_cfg(proj.path()),
+        )
+        .unwrap();
+        assert_eq!(prepared.context, WorkspaceContext::CopyRepo);
+        let ws = &prepared.path;
+        // Normal files copied (+ BRIEF.md).
+        assert!(ws.join("main.rs").is_file());
+        assert!(ws.join("README.md").is_file());
+        assert!(ws.join("src").join("lib.rs").is_file());
+        assert!(ws.join("BRIEF.md").is_file());
+        // Dangerous / excluded entries NOT copied.
+        assert!(!ws.join(".git").exists(), ".git must be excluded");
+        assert!(!ws.join("target").exists(), "target must be excluded");
+        assert!(
+            !ws.join(".claude").join("worktrees").exists(),
+            ".claude/worktrees must be excluded"
+        );
+        assert!(!ws.join("node_modules").exists(), "node_modules excluded");
+        assert!(!ws.join("dev-data").exists(), "dev-data excluded");
+        assert!(!ws.join(".env").exists(), ".env (secret) excluded");
+        assert!(!ws.join("api.key").exists(), "*.key (secret) excluded");
+        // Stats reflect ONLY the copied project files (3: main.rs, README.md, src/lib.rs).
+        assert_eq!(prepared.copied_files, 3, "only the 3 safe files");
+        assert!(prepared.copied_bytes > 0);
+    }
+
+    #[test]
+    fn copy_repo_refuses_when_file_cap_exceeded() {
+        let proj = fake_project();
+        let dst_root = tempfile::tempdir().unwrap();
+        let mut cfg = copy_repo_cfg(proj.path());
+        cfg.max_files = 1; // the project has 3 copyable files
+        let err = prepare_run_workspace(
+            &dst_root.path().join("runs"),
+            "run_cap1",
+            "b",
+            "t",
+            "c",
+            &cfg,
+        )
+        .unwrap_err();
+        assert_eq!(err.status(), "workspace_context_error");
+        assert!(err.message().contains("file-count cap"), "got: {}", err.message());
+        // The partial workspace was cleaned up (no half-copied tree).
+        assert!(!dst_root.path().join("runs").join("run_cap1").exists());
+    }
+
+    #[test]
+    fn copy_repo_refuses_when_byte_cap_exceeded() {
+        let proj = fake_project();
+        let dst_root = tempfile::tempdir().unwrap();
+        let mut cfg = copy_repo_cfg(proj.path());
+        cfg.max_bytes = 4; // smaller than any real file
+        let err = prepare_run_workspace(
+            &dst_root.path().join("runs"),
+            "run_cap2",
+            "b",
+            "t",
+            "c",
+            &cfg,
+        )
+        .unwrap_err();
+        assert_eq!(err.status(), "workspace_context_error");
+        assert!(err.message().contains("size cap"), "got: {}", err.message());
+    }
+
+    #[test]
+    fn copy_repo_rejects_unsafe_project_root() {
+        let dst_root = tempfile::tempdir().unwrap();
+        let mut cfg = copy_repo_cfg(std::path::Path::new("/definitely/not/a/real/dir/xyzzy"));
+        cfg.context = WorkspaceContext::CopyRepo;
+        let err = prepare_run_workspace(
+            &dst_root.path().join("runs"),
+            "run_badroot",
+            "b",
+            "t",
+            "c",
+            &cfg,
+        )
+        .unwrap_err();
+        assert_eq!(err.status(), "workspace_context_error");
+        assert!(err.message().contains("project root"), "got: {}", err.message());
     }
 
     #[test]
@@ -1578,8 +2097,10 @@ mod tests {
         // And prepare refuses an unsafe id (never touches the filesystem
         // outside its single validated segment).
         let tmp = tempfile::tempdir().unwrap();
-        let err = prepare_run_workspace(tmp.path(), "../escape", "b", "t", "c").unwrap_err();
-        assert!(err.contains("unsafe run id"), "got: {err}");
+        let err = prepare_run_workspace(tmp.path(), "../escape", "b", "t", "c", &empty_cfg())
+            .unwrap_err();
+        assert_eq!(err.status(), "workspace_error");
+        assert!(err.message().contains("unsafe run id"), "got: {}", err.message());
     }
 
     #[test]
@@ -1622,6 +2143,41 @@ mod tests {
             "cwd {:?} should sit under the workspace root {ws_parent}",
             report.summary
         );
+    }
+
+    #[test]
+    fn copy_repo_run_executes_with_copied_context_as_cwd() {
+        // End-to-end: a run with copy_repo context lists its cwd and sees
+        // the copied project files + BRIEF.md; the ledger records the mode
+        // + copied stats.
+        let proj = fake_project();
+        let (mut s, _tmp) = store_ws();
+        s.set_run_workspace_config(copy_repo_cfg(proj.path()));
+        let id = ready_brief(&s, "ls my workspace", "agt_a");
+        let (prog, args) = if cfg!(windows) {
+            ("cmd".to_string(), vec!["/C".to_string(), "dir".to_string(), "/b".to_string()])
+        } else {
+            ("sh".to_string(), vec!["-c".to_string(), "ls".to_string()])
+        };
+        let mut reg = crate::rig::RigRegistry::new();
+        reg.register(std::sync::Arc::new(crate::rig::ProcessRig::new(
+            "ls", prog, args,
+        )));
+        reg.set_default(Some("ls".to_string()));
+
+        let report = run_brief_now(&s, &reg, None, 300, &id, None, "x".into()).unwrap();
+        assert_eq!(report.status, "done", "got: {report:?}");
+        // The cwd listing shows the copied files (proving copy + cwd).
+        assert!(report.summary.contains("main.rs"), "ls {:?}", report.summary);
+        assert!(report.summary.contains("BRIEF.md"), "ls {:?}", report.summary);
+        assert!(!report.summary.contains(".git"), "excluded dirs not present");
+        // Ledger + report carry the context mode + copy stats.
+        assert_eq!(report.workspace_context.as_deref(), Some("copy_repo"));
+        assert_eq!(report.workspace_files, Some(3));
+        let runs = s.runs_for_brief(&id, 5).unwrap();
+        assert_eq!(runs[0].workspace_context.as_deref(), Some("copy_repo"));
+        assert_eq!(runs[0].workspace_files, Some(3));
+        assert!(runs[0].workspace_bytes.unwrap() > 0);
     }
 
     #[test]

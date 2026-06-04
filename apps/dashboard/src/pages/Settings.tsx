@@ -20,6 +20,14 @@ const STATUS_LABEL: Record<string, string> = {
   probe_failed: "probe failed",
 };
 
+interface RunConfig {
+  context?: string;
+  project_root?: string;
+  workspace_root?: string;
+  max_bytes?: number;
+  max_files?: number;
+}
+
 function extractProviders(v: unknown): Provider[] {
   if (Array.isArray(v)) return v as Provider[];
   if (v && typeof v === "object") {
@@ -32,17 +40,24 @@ function extractProviders(v: unknown): Provider[] {
 export function Settings() {
   const { status, logout } = useAuth();
   const { data, loading, reload } = useAsync(async () => {
-    const [info, providers, adapters] = await Promise.all([
+    const [info, providers, adapters, runConfig] = await Promise.all([
       tryGet<Record<string, unknown>>("/v1/info", {}),
       tryGet<unknown>("/v1/config/providers", {}),
       tryGet<Adapter[]>("/v1/adapters", []),
+      tryGet<RunConfig>("/v1/spine/run-config", {}),
     ]);
-    return { info, providers: extractProviders(providers), adapters: Array.isArray(adapters) ? adapters : [] };
+    return {
+      info,
+      providers: extractProviders(providers),
+      adapters: Array.isArray(adapters) ? adapters : [],
+      runConfig: runConfig ?? {},
+    };
   }, []);
 
   const info = data?.info ?? {};
   const providers = data?.providers ?? [];
   const adapters = data?.adapters ?? [];
+  const runConfig = data?.runConfig ?? {};
 
   return (
     <div className="grid cols-2">
@@ -114,6 +129,53 @@ export function Settings() {
             </tbody>
           </table>
         )}
+      </div>
+
+      <div className="card" style={{ gridColumn: "1 / -1" }}>
+        <h3>Run execution sandbox</h3>
+        <p className="muted" style={{ marginTop: -6, marginBottom: 12 }}>
+          Every Brief run executes in a dedicated scoped workspace, never in the coordinator/repo
+          working directory (that stays explicit + opt-in only, for safety).
+        </p>
+        <table className="table">
+          <tbody>
+            <tr>
+              <td className="muted">Context mode</td>
+              <td>
+                <span className={"badge " + (runConfig.context === "copy_repo" ? "todo" : "done")}>
+                  {runConfig.context ?? "empty"}
+                </span>
+                <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>
+                  {runConfig.context === "copy_repo"
+                    ? "a capped, filtered project snapshot is copied into each run workspace"
+                    : "workspaces start empty (only BRIEF.md) — the safest default"}
+                </span>
+              </td>
+            </tr>
+            <tr>
+              <td className="muted">Workspace root</td>
+              <td className="mono" style={{ fontSize: 12 }}>{runConfig.workspace_root ?? "—"}</td>
+            </tr>
+            <tr>
+              <td className="muted">Project root (copy_repo)</td>
+              <td className="mono" style={{ fontSize: 12 }}>{runConfig.project_root ?? "—"}</td>
+            </tr>
+            <tr>
+              <td className="muted">Caps</td>
+              <td className="muted" style={{ fontSize: 12 }}>
+                {(runConfig.max_files ?? 0).toLocaleString()} files ·{" "}
+                {Math.round((runConfig.max_bytes ?? 0) / (1024 * 1024))} MB max — a copy exceeding either is refused cleanly
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p className="muted" style={{ fontSize: 11, marginTop: 8 }}>
+          Configure via <span className="mono">RELIX_RUN_WORKSPACE_CONTEXT</span> (empty|copy_repo),{" "}
+          <span className="mono">RELIX_RUN_PROJECT_ROOT</span>,{" "}
+          <span className="mono">RELIX_RUN_WORKSPACE_MAX_FILES</span>,{" "}
+          <span className="mono">RELIX_RUN_WORKSPACE_MAX_BYTES</span>. Excludes .git / build caches /
+          node_modules / dev-data / secrets.
+        </p>
       </div>
 
       <div className="card" style={{ gridColumn: "1 / -1" }}>

@@ -16,6 +16,9 @@ interface RunRecord {
   duration_secs?: number;
   summary?: string;
   workspace?: string;
+  workspace_context?: string;
+  workspace_files?: number;
+  workspace_bytes?: number;
 }
 
 // Short label for the scoped per-run workspace: the leaf folder (the
@@ -25,6 +28,15 @@ function wsLabel(ws?: string): string {
   if (!ws) return "inherited CWD";
   const parts = ws.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] ?? ws;
+}
+
+// Compact "empty" / "copy_repo · 12 files · 34 KB" context badge.
+function ctxLabel(r: RunRecord): string {
+  if (!r.workspace_context) return "—";
+  if (r.workspace_context !== "copy_repo") return r.workspace_context;
+  const files = r.workspace_files ?? 0;
+  const kb = Math.round((r.workspace_bytes ?? 0) / 1024);
+  return `copy_repo · ${files} files · ${kb} KB`;
 }
 
 // Run status → badge tone. `running` is in-flight; the rest are terminal.
@@ -114,6 +126,7 @@ export function Runs() {
                   <th>Brief</th>
                   <th>Operative</th>
                   <th>Workspace</th>
+                  <th>Context</th>
                   <th>Result</th>
                   <th>Duration</th>
                   <th>Started</th>
@@ -127,7 +140,8 @@ export function Runs() {
                     <td className="mono">{(r.brief_id ?? "").slice(0, 12)}</td>
                     <td className="muted">{(r.agent_id ?? "").slice(0, 10) || "—"}</td>
                     <td className="mono" style={{ fontSize: 11 }} title={r.workspace ?? "ran in the coordinator working directory (no scoped workspace)"}>{wsLabel(r.workspace)}</td>
-                    <td className="muted" style={{ maxWidth: 320, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.summary || (r.status === "running" ? "…" : "—")}</td>
+                    <td className="muted" style={{ fontSize: 11 }}>{ctxLabel(r)}</td>
+                    <td className="muted" style={{ maxWidth: 280, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.summary || (r.status === "running" ? "…" : "—")}</td>
                     <td className="muted">{fmtDuration(r)}</td>
                     <td className="muted">{r.started_at ? new Date(r.started_at * 1000).toLocaleTimeString() : ""}</td>
                   </tr>

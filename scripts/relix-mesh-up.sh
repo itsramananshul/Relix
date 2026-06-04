@@ -1389,6 +1389,10 @@ allow_groups = ["chat-users"]
 name = "spine_agent_operatives"
 method = "agent.operatives"
 allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_run_workspace_config"
+method = "run.workspace_config"
+allow_groups = ["chat-users"]
 EOF
 
 # ---- 11. peers.toml ----

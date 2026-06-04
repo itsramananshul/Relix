@@ -9018,6 +9018,9 @@ fn register_node_type_handlers(
                                             install_hint: None,
                                             run_id: Some(ready.run_id.clone()),
                                             workspace: ready.workspace.clone(),
+                                            workspace_context: ready.workspace_context.clone(),
+                                            workspace_files: ready.workspace_files,
+                                            workspace_bytes: ready.workspace_bytes,
                                         };
                                     let st_bg = st.clone();
                                     tokio::task::spawn_blocking(move || {
@@ -9078,6 +9081,42 @@ fn register_node_type_handlers(
                                     relix_core::types::ErrorEnvelope {
                                         kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
                                         cause: format!("brief.runs: {e}"),
+                                        retry_hint: 1,
+                                        retry_after: None,
+                                    },
+                                ),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
+        {
+            // `run.workspace_config` — the resolved run-workspace context
+            // config (mode / project root / caps) so the dashboard Settings
+            // can show how runs are sandboxed. No args. The project root is
+            // operator config (a directory path), not a secret.
+            let st = store.clone();
+            bridge.register(
+                "run.workspace_config",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |_ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            let cfg = st.run_workspace_config();
+                            let body = serde_json::json!({
+                                "context": cfg.context.as_str(),
+                                "project_root": cfg.project_root.to_string_lossy(),
+                                "max_bytes": cfg.max_bytes,
+                                "max_files": cfg.max_files,
+                                "workspace_root": st.run_workspace_root().to_string_lossy(),
+                            });
+                            match serde_json::to_vec(&body) {
+                                Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                Err(e) => crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                        cause: format!("run.workspace_config encode: {e}"),
                                         retry_hint: 1,
                                         retry_after: None,
                                     },

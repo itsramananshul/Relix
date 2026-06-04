@@ -469,6 +469,10 @@ pub struct TaskStore {
     /// per-Brief execution sandbox lives here so a Claude/Codex Shift
     /// never runs repo-wide by accident.
     workspace_root: PathBuf,
+    /// Run-workspace context config (mode / project root / caps), read
+    /// from env at open. Governs whether `copy_repo` snapshots project
+    /// context into each run sandbox.
+    workspace_config: crate::nodes::coordinator::heartbeat::WorkspaceConfig,
 }
 
 /// Resolve the scoped-run workspace base. `RELIX_RUN_WORKSPACE_ROOT`
@@ -506,6 +510,8 @@ impl TaskStore {
             conn: Arc::new(Mutex::new(conn)),
             max_list: cfg.max_list.max(1),
             workspace_root: resolve_workspace_root(&cfg.db_path),
+            workspace_config:
+                crate::nodes::coordinator::heartbeat::resolve_workspace_config(),
         })
     }
 
@@ -521,6 +527,8 @@ impl TaskStore {
             workspace_root: resolve_workspace_root(
                 &std::env::temp_dir().join("relix-run-workspaces").join("tasks.db"),
             ),
+            workspace_config:
+                crate::nodes::coordinator::heartbeat::WorkspaceConfig::default(),
         })
     }
 
@@ -534,6 +542,22 @@ impl TaskStore {
     /// path, or a tempdir in tests).
     pub fn set_run_workspace_root(&mut self, root: impl Into<PathBuf>) {
         self.workspace_root = root.into();
+    }
+
+    /// The resolved run-workspace context config (mode / project root /
+    /// caps). Read by `preflight_run` to decide `empty` vs `copy_repo`.
+    pub fn run_workspace_config(
+        &self,
+    ) -> &crate::nodes::coordinator::heartbeat::WorkspaceConfig {
+        &self.workspace_config
+    }
+
+    /// Override the run-workspace context config (deployment config / tests).
+    pub fn set_run_workspace_config(
+        &mut self,
+        config: crate::nodes::coordinator::heartbeat::WorkspaceConfig,
+    ) {
+        self.workspace_config = config;
     }
 
     /// PHASE 1 (Brief): move a Brief's **board status**, enforcing
@@ -2441,15 +2465,26 @@ impl TaskStore {
         brief_id: &str,
         agent_id: &str,
         rig: &str,
-        workspace: Option<&str>,
+        workspace: &RunWorkspaceInfo<'_>,
     ) -> Result<(), CoordinatorError> {
         let now = unix_secs();
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         conn.execute(
             "INSERT OR IGNORE INTO brief_runs
-                 (run_id, brief_id, agent_id, rig, status, started_at, summary, workspace)
-             VALUES (?1, ?2, ?3, ?4, 'running', ?5, '', ?6)",
-            params![run_id, brief_id, agent_id, rig, now, workspace],
+                 (run_id, brief_id, agent_id, rig, status, started_at, summary,
+                  workspace, workspace_context, workspace_files, workspace_bytes)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, '', ?6, ?7, ?8, ?9)",
+            params![
+                run_id,
+                brief_id,
+                agent_id,
+                rig,
+                now,
+                workspace.path,
+                workspace.context,
+                workspace.files,
+                workspace.bytes,
+            ],
         )
         .map_err(CoordinatorError::Db)?;
         Ok(())
@@ -2483,7 +2518,8 @@ impl TaskStore {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let mut stmt = conn
             .prepare(
-                "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary, workspace
+                "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary,
+                        workspace, workspace_context, workspace_files, workspace_bytes
                  FROM brief_runs
                  ORDER BY started_at DESC, rowid DESC
                  LIMIT ?1",
@@ -2510,7 +2546,8 @@ impl TaskStore {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let mut stmt = conn
             .prepare(
-                "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary, workspace
+                "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary,
+                        workspace, workspace_context, workspace_files, workspace_bytes
                  FROM brief_runs
                  WHERE brief_id = ?1
                  ORDER BY started_at DESC, rowid DESC
@@ -7117,6 +7154,25 @@ pub struct RunRecord {
     /// legacy rows / `inherit` mode (coordinator-CWD execution).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// Workspace context mode (`empty` / `copy_repo`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_context: Option<String>,
+    /// Files copied into the workspace (`copy_repo`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_files: Option<i64>,
+    /// Bytes copied into the workspace (`copy_repo`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_bytes: Option<i64>,
+}
+
+/// The workspace fields stamped on a run record at start. A small struct
+/// so the `record_run_start` arg list stays readable.
+#[derive(Debug, Clone, Default)]
+pub struct RunWorkspaceInfo<'a> {
+    pub path: Option<&'a str>,
+    pub context: Option<&'a str>,
+    pub files: Option<i64>,
+    pub bytes: Option<i64>,
 }
 
 impl RunRecord {
@@ -7134,6 +7190,9 @@ impl RunRecord {
             duration_secs: finished_at.map(|f| (f - started_at).max(0)),
             summary: r.get(7)?,
             workspace: r.get(8)?,
+            workspace_context: r.get(9)?,
+            workspace_files: r.get(10)?,
+            workspace_bytes: r.get(11)?,
         })
     }
 }
@@ -11711,6 +11770,11 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             -- The scoped per-run workspace the Rig executed in. NULL for
             -- legacy rows / `inherit` mode (coordinator-CWD execution).
             workspace   TEXT,
+            -- Workspace context mode (`empty` / `copy_repo`) + how much
+            -- project context was copied in (`copy_repo`). NULL for legacy.
+            workspace_context TEXT,
+            workspace_files   INTEGER,
+            workspace_bytes   INTEGER,
             FOREIGN KEY (brief_id) REFERENCES tasks(task_id)
         );
         CREATE INDEX IF NOT EXISTS brief_runs_by_brief
@@ -11875,6 +11939,10 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         // Scoped per-run workspace path the Rig executed in (run ledger).
         // NULL for legacy rows / `inherit` mode.
         "ALTER TABLE brief_runs ADD COLUMN workspace TEXT",
+        // Workspace context mode + copied-context stats (`copy_repo`).
+        "ALTER TABLE brief_runs ADD COLUMN workspace_context TEXT",
+        "ALTER TABLE brief_runs ADD COLUMN workspace_files INTEGER",
+        "ALTER TABLE brief_runs ADD COLUMN workspace_bytes INTEGER",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the

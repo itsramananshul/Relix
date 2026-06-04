@@ -786,6 +786,15 @@ pub async fn operatives(
     json_passthrough(call_peer(&state, "agent.operatives", b"").await?)
 }
 
+/// `GET /v1/spine/run-config` — the run-workspace context config (mode /
+/// project root / caps) the dashboard Settings shows so an operator sees
+/// how Brief runs are sandboxed.
+pub async fn run_config(
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "run.workspace_config", b"").await?)
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct CompanyInitRequest {
     #[serde(default)]

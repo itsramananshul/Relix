@@ -28,6 +28,8 @@ interface RunReport {
   install_hint?: string | null;
   run_id?: string | null;
   workspace?: string | null;
+  workspace_context?: string | null;
+  workspace_files?: number | null;
 }
 
 // Human labels for the run states. `running` = accepted + executing in
@@ -41,6 +43,7 @@ const REFUSALS: Record<string, string> = {
   already_running: "already running",
   not_found: "brief not found",
   workspace_error: "could not prepare a run workspace",
+  workspace_context_error: "could not copy project context into the workspace",
   done: "run complete",
   failed: "run failed",
   continued: "run continued (more work to do)",
@@ -136,6 +139,8 @@ export function Briefs() {
       if (r.summary && r.status !== "running") msg += ` — ${r.summary}`;
       if (r.install_hint) msg += ` (${r.install_hint})`;
       if (r.workspace) msg += ` · workspace ${r.workspace}`;
+      if (r.workspace_context === "copy_repo") msg += ` · context: copied ${r.workspace_files ?? 0} file(s)`;
+      else if (r.workspace_context === "empty") msg += " · context: empty";
       if (r.status === "running") msg += " — see Active Runs";
       setBanner({ kind, msg });
       reload();

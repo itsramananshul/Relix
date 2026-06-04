@@ -566,6 +566,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/company", get(spine::company_status))
         .route("/v1/spine/company/init", post(spine::company_init))
         .route("/v1/spine/operatives", get(spine::operatives))
+        // Run-workspace context config (mode / project root / caps).
+        .route("/v1/spine/run-config", get(spine::run_config))
         .route("/v1/spine/briefs/:id/pin", post(spine::pin_brief))
         .route("/v1/spine/briefs/:id/comment", post(spine::comment_brief))
         .route("/v1/spine/briefs/:id/due", post(spine::set_due))
