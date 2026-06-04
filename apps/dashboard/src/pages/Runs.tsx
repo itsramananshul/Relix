@@ -19,6 +19,9 @@ interface RunRecord {
   workspace_context?: string;
   workspace_files?: number;
   workspace_bytes?: number;
+  review?: string;
+  review_note?: string;
+  reviewed_at?: number;
 }
 
 // One transcript event (`/v1/runs/:id/events`).
@@ -29,6 +32,39 @@ interface RunEvent {
   source?: string;
   message?: string;
   payload_json?: string;
+}
+
+// One changed file (`/v1/runs/:id/artifacts`).
+interface RunArtifact {
+  artifact_id?: number;
+  rel_path?: string;
+  kind?: string;
+  size?: number;
+  is_text?: boolean;
+  hash?: string;
+}
+
+// Preview response (`/v1/runs/:id/artifacts/:aid/preview`).
+interface ArtifactPreview {
+  rel_path?: string;
+  kind?: string;
+  available?: boolean;
+  truncated?: boolean;
+  content?: string;
+  reason?: string;
+}
+
+const ARTIFACT_TONE: Record<string, string> = {
+  created: "done",
+  modified: "todo",
+  deleted: "blocked",
+};
+
+function fmtBytes(n?: number): string {
+  if (!n) return "0 B";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 // Short label for the scoped per-run workspace: the leaf folder (the
@@ -88,6 +124,8 @@ export function Runs() {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [eventsLoading, setEventsLoading] = useState(false);
+  const [artifacts, setArtifacts] = useState<RunArtifact[]>([]);
+  const [preview, setPreview] = useState<{ id: number; data: ArtifactPreview } | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
 
   const { data, loading, error, reload } = useAsync(async () => {
@@ -111,6 +149,23 @@ export function Runs() {
     }
   }
 
+  async function loadArtifacts(runId: string) {
+    const a = await tryGet<RunArtifact[]>(`/v1/runs/${encodeURIComponent(runId)}/artifacts`, []);
+    setArtifacts(Array.isArray(a) ? a : []);
+  }
+
+  async function showPreview(runId: string, artifactId: number) {
+    if (preview?.id === artifactId) {
+      setPreview(null);
+      return;
+    }
+    const data = await tryGet<ArtifactPreview>(
+      `/v1/runs/${encodeURIComponent(runId)}/artifacts/${artifactId}/preview`,
+      {},
+    );
+    setPreview({ id: artifactId, data: data ?? {} });
+  }
+
   async function toggle(runId: string) {
     if (expanded === runId) {
       setExpanded(null);
@@ -118,7 +173,20 @@ export function Runs() {
     }
     setExpanded(runId);
     setEvents([]);
-    await loadEvents(runId);
+    setArtifacts([]);
+    setPreview(null);
+    await Promise.all([loadEvents(runId), loadArtifacts(runId)]);
+  }
+
+  async function review(runId: string, decision: "accepted" | "rejected") {
+    setBanner(null);
+    try {
+      await api.post(`/v1/runs/${encodeURIComponent(runId)}/review`, { decision, note: "" });
+      setBanner(`Run ${decision}.`);
+      reload();
+    } catch (e) {
+      setBanner(e instanceof Error ? e.message : "Review failed");
+    }
   }
 
   async function cancel(runId: string) {
@@ -207,7 +275,12 @@ export function Runs() {
                     <Fragment key={rid || i}>
                       <tr style={{ cursor: "pointer" }} onClick={() => rid && toggle(rid)}>
                         <td className="muted">{open ? "▾" : "▸"}</td>
-                        <td><span className={"badge " + (TONE[r.status ?? ""] ?? "todo")}>{r.status ?? "—"}</span></td>
+                        <td>
+                          <span className={"badge " + (TONE[r.status ?? ""] ?? "todo")}>{r.status ?? "—"}</span>
+                          {r.status === "done" && r.review && r.review !== "pending_review" && (
+                            <span className={"badge " + (r.review === "accepted" ? "done" : "blocked")} style={{ fontSize: 9, marginLeft: 4 }} title={"review: " + r.review}>{r.review === "accepted" ? "✓" : "✕"}</span>
+                          )}
+                        </td>
                         <td className="muted">{r.rig || "—"}</td>
                         <td className="mono">{(r.brief_id ?? "").slice(0, 12)}</td>
                         <td className="muted">{(r.agent_id ?? "").slice(0, 10) || "—"}</td>
@@ -245,6 +318,57 @@ export function Runs() {
                                     {ev.payload_json && <div className="muted mono" style={{ fontSize: 10, paddingLeft: 14, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{ev.payload_json}</div>}
                                   </div>
                                 ))}
+                              </div>
+                            )}
+
+                            {/* Changes / artifacts */}
+                            <div className="row" style={{ marginTop: 12, marginBottom: 6 }}>
+                              <strong style={{ fontSize: 12 }}>Changes</strong>
+                              <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>{artifacts.length} file(s) the agent touched</span>
+                            </div>
+                            {events.some((e) => e.kind === "artifacts.scan_failed") && (
+                              <div className="banner err" style={{ fontSize: 11 }}>Artifact scan failed — see the transcript above.</div>
+                            )}
+                            {artifacts.length === 0 ? (
+                              <div className="muted" style={{ fontSize: 12 }}>
+                                {r.workspace ? "No files changed in the run workspace." : "No scoped workspace — no change detection."}
+                              </div>
+                            ) : (
+                              <div style={{ fontSize: 12 }}>
+                                {artifacts.map((a, j) => (
+                                  <div key={a.artifact_id ?? j} style={{ padding: "2px 0", borderBottom: "1px solid rgba(0,0,0,0.05)" }}>
+                                    <span className={"badge " + (ARTIFACT_TONE[a.kind ?? ""] ?? "todo")} style={{ fontSize: 10 }}>{a.kind}</span>{" "}
+                                    <span className="mono" style={{ fontSize: 11 }}>{a.rel_path}</span>{" "}
+                                    <span className="muted" style={{ fontSize: 10 }}>{fmtBytes(a.size)}</span>
+                                    {a.is_text && a.kind !== "deleted" && a.artifact_id != null && (
+                                      <button className="btn ghost sm" style={{ marginLeft: 8, fontSize: 10, padding: "1px 6px" }} onClick={(e) => { e.stopPropagation(); showPreview(rid, a.artifact_id!); }}>
+                                        {preview?.id === a.artifact_id ? "hide" : "preview"}
+                                      </button>
+                                    )}
+                                    {preview && preview.id === a.artifact_id && (
+                                      <pre style={{ margin: "4px 0 4px 14px", padding: 8, background: "rgba(0,0,0,0.04)", maxHeight: 220, overflow: "auto", fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                                        {preview.data.available ? (preview.data.content || "(empty)") + (preview.data.truncated ? "\n…[truncated]" : "") : `(no preview: ${preview.data.reason ?? "unavailable"})`}
+                                      </pre>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+
+                            {/* Review */}
+                            {r.status === "done" && (
+                              <div className="row" style={{ marginTop: 12 }}>
+                                <strong style={{ fontSize: 12 }}>Review</strong>
+                                <span className={"badge " + (r.review === "accepted" ? "done" : r.review === "rejected" ? "blocked" : "todo")} style={{ fontSize: 10, marginLeft: 8 }}>
+                                  {r.review ?? "pending_review"}
+                                </span>
+                                <div className="spacer" style={{ flex: 1 }} />
+                                {r.review !== "accepted" && (
+                                  <button className="btn sm" style={{ marginLeft: 6 }} onClick={(e) => { e.stopPropagation(); review(rid, "accepted"); }}>Accept</button>
+                                )}
+                                {r.review !== "rejected" && (
+                                  <button className="btn ghost sm" style={{ marginLeft: 6 }} onClick={(e) => { e.stopPropagation(); review(rid, "rejected"); }}>Reject</button>
+                                )}
                               </div>
                             )}
                           </td>
