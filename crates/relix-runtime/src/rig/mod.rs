@@ -642,6 +642,80 @@ impl Rig for EchoRig {
 /// is drained, which is fine for the modest prompts/outputs of the
 /// dispatch path. Streaming large I/O on separate threads is a
 /// future refinement the real CLI adapters will layer on.
+/// How a process Rig's captured stdout is turned into a [`RigOutcome`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RigOutputFormat {
+    /// Treat stdout verbatim as the result summary (the generic default).
+    #[default]
+    Raw,
+    /// Parse Claude Code's `--output-format stream-json` JSONL: extract
+    /// the terminal `type:"result"` event's `result` text as the summary,
+    /// map `is_error` to a failure, and surface `permission_denials`
+    /// (Relix runs Claude noninteractively, so tool approvals are NOT
+    /// auto-granted — file/command actions are blocked + reported).
+    ClaudeStreamJson,
+}
+
+/// The fields Relix reads from Claude Code's terminal `result` event.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClaudeRunResult {
+    /// The model's final answer (`result.result`).
+    pub text: String,
+    /// `result.is_error` — Claude's own success/failure verdict.
+    pub is_error: bool,
+    /// `result.subtype` (e.g. `success`, `error_max_turns`,
+    /// `error_during_execution`).
+    pub subtype: String,
+    /// Count of `result.permission_denials` — tools Claude wanted to run
+    /// but couldn't (Relix grants no interactive approval).
+    pub permission_denials: usize,
+    /// `result.num_turns` (agentic turns taken).
+    pub num_turns: i64,
+}
+
+/// Parse Claude Code `stream-json` (JSONL) stdout and return the terminal
+/// `result` event's fields. Scans for the LAST `{"type":"result",…}`
+/// line (the authoritative terminal event), ignoring the `system` /
+/// `assistant` / hook noise. Returns `None` when no result event is
+/// present (an interrupted / malformed run), so the caller falls back to
+/// exit-code handling. Pure + line-driven → unit-testable with mocked
+/// JSONL.
+pub fn parse_claude_stream_json(stdout: &str) -> Option<ClaudeRunResult> {
+    let mut found: Option<ClaudeRunResult> = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("result") {
+            continue;
+        }
+        found = Some(ClaudeRunResult {
+            text: v
+                .get("result")
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string(),
+            is_error: v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false),
+            subtype: v
+                .get("subtype")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            permission_denials: v
+                .get("permission_denials")
+                .and_then(|d| d.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0),
+            num_turns: v.get("num_turns").and_then(|n| n.as_i64()).unwrap_or(0),
+        });
+    }
+    found
+}
+
 pub struct ProcessRig {
     name: String,
     program: String,
@@ -649,6 +723,9 @@ pub struct ProcessRig {
     /// Cap on the child's captured stdout (the result summary), so a
     /// runaway CLI can't flood the dispatch path / context.
     max_output_bytes: usize,
+    /// How stdout is interpreted into a [`RigOutcome`] (verbatim, or a
+    /// Claude `stream-json` parse).
+    output_format: RigOutputFormat,
     /// How deeply Relix governs this specific adapter. Defaults to
     /// the conservative `BoxLevel` (a plain stdio process is a black
     /// box). An operator opts *up* to `PerToolCall` only when their
@@ -705,7 +782,15 @@ impl ProcessRig {
             working_dir: None,
             readiness: None,
             fallback_paths: Vec::new(),
+            output_format: RigOutputFormat::Raw,
         }
+    }
+
+    /// Choose how the child's stdout becomes a [`RigOutcome`] (verbatim,
+    /// or a Claude `stream-json` parse). Builder style.
+    pub fn with_output_format(mut self, fmt: RigOutputFormat) -> Self {
+        self.output_format = fmt;
+        self
     }
 
     /// Configure a noninteractive readiness probe (CLI adapters). The
@@ -1016,16 +1101,28 @@ impl Rig for ProcessRig {
                 ),
                 retryable: true,
             },
-            Some(status) if status.success() => RigOutcome::Done { summary: stdout },
             Some(status) => {
-                let code = status
-                    .code()
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "signal".to_string());
-                let detail = if stderr.is_empty() { stdout } else { stderr };
-                RigOutcome::Failed {
-                    reason: format!("exit {code}: {detail}"),
-                    retryable: true,
+                // Claude's terminal `result` event is authoritative — it
+                // can exit 0 with `is_error`, or non-zero while still
+                // carrying a usable result — so parse it FIRST (off the
+                // raw, pre-redaction stdout so the JSON stays valid).
+                if matches!(self.output_format, RigOutputFormat::ClaudeStreamJson)
+                    && let Some(outcome) = self.claude_outcome(&raw_stdout, &req.bridge_token)
+                {
+                    return outcome;
+                }
+                if status.success() {
+                    RigOutcome::Done { summary: stdout }
+                } else {
+                    let code = status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "signal".to_string());
+                    let detail = if stderr.is_empty() { stdout } else { stderr };
+                    RigOutcome::Failed {
+                        reason: format!("exit {code}: {detail}"),
+                        retryable: true,
+                    }
                 }
             }
         }
@@ -1033,6 +1130,48 @@ impl Rig for ProcessRig {
 }
 
 impl ProcessRig {
+    /// Map Claude Code `stream-json` stdout to a [`RigOutcome`]. Parses
+    /// the terminal `result` event (off the raw, pre-redaction stdout so
+    /// the JSON parses), then redacts + caps only the extracted answer:
+    /// - `is_error` → a clear, non-retryable failure (`subtype` + text).
+    /// - otherwise → `Done` with the model's answer; when one or more
+    ///   tool permissions were denied (Relix runs Claude noninteractively,
+    ///   so file/command tool use is NOT auto-approved) the summary leads
+    ///   with an unmissable `⚠ N tool permission(s) denied` caveat so a
+    ///   blocked action is never mistaken for a completed one.
+    ///
+    /// Returns `None` when no terminal `result` event is present, so the
+    /// caller falls back to exit-code handling (the run was interrupted /
+    /// malformed and must report truthfully).
+    fn claude_outcome(&self, raw_stdout: &str, bridge_token: &str) -> Option<RigOutcome> {
+        let parsed = parse_claude_stream_json(raw_stdout)?;
+        let text = self.cap(redact_secrets(parsed.text.trim(), bridge_token));
+        if parsed.is_error {
+            let reason = if text.is_empty() {
+                format!("claude run failed ({})", parsed.subtype)
+            } else {
+                format!("claude {}: {text}", parsed.subtype)
+            };
+            return Some(RigOutcome::Failed {
+                reason,
+                retryable: false,
+            });
+        }
+        let summary = if parsed.permission_denials > 0 {
+            format!(
+                "⚠ {} tool permission(s) denied — Relix runs Claude noninteractively and does \
+                 not auto-approve tool use, so file/command actions were blocked. Model reply: {}",
+                parsed.permission_denials,
+                if text.is_empty() { "(no text)" } else { &text }
+            )
+        } else if text.is_empty() {
+            "claude completed with no text output".to_string()
+        } else {
+            text
+        };
+        Some(RigOutcome::Done { summary })
+    }
+
     /// Truncate captured output to `max_output_bytes` on a char boundary.
     fn cap(&self, mut s: String) -> String {
         if s.len() > self.max_output_bytes {
@@ -1478,6 +1617,7 @@ pub fn claude_rig() -> ProcessRig {
         ],
     )
     .with_structured_output(true)
+    .with_output_format(RigOutputFormat::ClaudeStreamJson)
     .with_billing(RigBilling::subscription("anthropic", "5h/weekly"))
     .with_install_hint("install Claude Code (npm i -g @anthropic-ai/claude-code), then `claude auth login`")
     .with_readiness(
@@ -2223,6 +2363,116 @@ mod tests {
         let (status, _) = classify_readiness_with_auth(&v, None);
         assert_eq!(status, "probe_failed");
         assert_ne!(status, "missing_binary");
+    }
+
+    // ── Claude stream-json result parsing ──────────────────────
+
+    // A representative slice of `claude --print --output-format
+    // stream-json --verbose` stdout: hook/system noise, an assistant
+    // event, then the terminal `result` event (the only one we read).
+    fn claude_jsonl(result_obj: &str) -> String {
+        format!(
+            "{}\n{}\n{}\n",
+            r#"{"type":"system","subtype":"hook_started","hook_name":"SessionStart:startup"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant"}}"#,
+            result_obj,
+        )
+    }
+
+    #[test]
+    fn parse_claude_stream_json_extracts_terminal_result() {
+        let jsonl = claude_jsonl(
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"Relix Claude test passed","permission_denials":[]}"#,
+        );
+        let r = parse_claude_stream_json(&jsonl).expect("a result event");
+        assert_eq!(r.text, "Relix Claude test passed");
+        assert!(!r.is_error);
+        assert_eq!(r.subtype, "success");
+        assert_eq!(r.permission_denials, 0);
+        assert_eq!(r.num_turns, 1);
+    }
+
+    #[test]
+    fn parse_claude_stream_json_reads_permission_denials() {
+        let jsonl = claude_jsonl(
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"Created the note pending approval","permission_denials":[{"tool":"Write"}]}"#,
+        );
+        let r = parse_claude_stream_json(&jsonl).unwrap();
+        assert_eq!(r.permission_denials, 1);
+        assert_eq!(r.num_turns, 2);
+    }
+
+    #[test]
+    fn parse_claude_stream_json_none_without_result_event() {
+        // Interrupted run — system lines only, no terminal result.
+        let jsonl = format!(
+            "{}\n{}\n",
+            r#"{"type":"system","subtype":"hook_started"}"#,
+            r#"{"type":"assistant"}"#,
+        );
+        assert!(parse_claude_stream_json(&jsonl).is_none());
+        // And junk / non-JSON lines are skipped without panicking.
+        assert!(parse_claude_stream_json("not json\n\n{bad").is_none());
+    }
+
+    fn claude_test_rig() -> ProcessRig {
+        ProcessRig::new("claude", "claude", vec![])
+            .with_output_format(RigOutputFormat::ClaudeStreamJson)
+    }
+
+    #[test]
+    fn claude_outcome_success_returns_clean_answer() {
+        let jsonl = claude_jsonl(
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"Relix Claude test passed","permission_denials":[]}"#,
+        );
+        match claude_test_rig().claude_outcome(&jsonl, "") {
+            Some(RigOutcome::Done { summary }) => {
+                assert_eq!(summary, "Relix Claude test passed", "no JSONL noise in the summary");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_outcome_permission_denial_surfaces_warning() {
+        let jsonl = claude_jsonl(
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"Created the note pending approval.","permission_denials":[{"tool":"Write"}]}"#,
+        );
+        match claude_test_rig().claude_outcome(&jsonl, "") {
+            Some(RigOutcome::Done { summary }) => {
+                assert!(summary.contains("permission(s) denied"), "got: {summary}");
+                assert!(summary.contains("Created the note"), "keeps the model reply: {summary}");
+            }
+            other => panic!("expected Done with a denial caveat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_outcome_is_error_is_a_clear_failure() {
+        let jsonl = claude_jsonl(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":3,"result":"something went wrong","permission_denials":[]}"#,
+        );
+        match claude_test_rig().claude_outcome(&jsonl, "") {
+            Some(RigOutcome::Failed { reason, retryable }) => {
+                assert!(!retryable);
+                assert!(reason.contains("error_during_execution"), "reason: {reason}");
+                assert!(reason.contains("something went wrong"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_outcome_none_without_result_falls_through() {
+        // No terminal result → None, so run() falls back to exit-code
+        // handling (never silently claims success).
+        let jsonl = r#"{"type":"system","subtype":"init"}"#;
+        assert!(claude_test_rig().claude_outcome(jsonl, "").is_none());
+    }
+
+    #[test]
+    fn claude_rig_uses_stream_json_parser() {
+        assert_eq!(claude_rig().output_format, RigOutputFormat::ClaudeStreamJson);
     }
 
     #[test]
