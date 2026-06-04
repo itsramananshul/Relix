@@ -2765,6 +2765,105 @@ impl TaskStore {
         Ok(rows)
     }
 
+    // ── ORCHESTRATION: stable source markers (company-model §4.6) ──
+
+    /// Stamp a stable provenance marker on a Brief. `kind` is the
+    /// generator class (e.g. `mandate_orchestration`); `marker` is the
+    /// unique dedup key. Re-stamping is idempotent. Errors `NotFound`
+    /// when the Brief does not exist.
+    pub fn set_brief_source_marker(
+        &self,
+        task_id: &str,
+        kind: &str,
+        marker: &str,
+    ) -> Result<(), CoordinatorError> {
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let changed = conn
+            .execute(
+                "UPDATE tasks SET source_kind = ?1, source_marker = ?2, updated_at = ?3
+                 WHERE task_id = ?4",
+                params![kind, marker, now, task_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+        if changed == 0 {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// The Brief carrying `source_marker`, if any (as a card). The
+    /// marker is unique per generator/Mandate/role, so this is the
+    /// stable dedup lookup — independent of the Brief's (or its
+    /// Mandate's) title. `None` for an empty/unknown marker.
+    ///
+    /// NOTE (tenant scope): the `tasks` table is not row-level
+    /// tenant-scoped; the marker embeds the already tenant-validated
+    /// `mandate_id`, so the marker namespace is what isolates it.
+    pub fn get_brief_by_source_marker(
+        &self,
+        marker: &str,
+    ) -> Result<Option<brief::BriefCard>, CoordinatorError> {
+        if marker.trim().is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        match conn.query_row(
+            "SELECT task_id, title, board_status, priority,
+                    assignee_agent_id, mandate_id, campaign_id
+             FROM tasks WHERE source_marker = ?1 LIMIT 1",
+            params![marker],
+            brief_card_from_row,
+        ) {
+            Ok(card) => Ok(Some(card)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(CoordinatorError::Db(e)),
+        }
+    }
+
+    /// All Briefs with a given `source_kind` (cards), newest-updated
+    /// first. For auditing what a generator has materialised.
+    pub fn list_briefs_by_source_kind(
+        &self,
+        kind: &str,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, title, board_status, priority,
+                        assignee_agent_id, mandate_id, campaign_id
+                 FROM tasks WHERE source_kind = ?1
+                 ORDER BY updated_at DESC LIMIT ?2",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![kind, lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
+    /// Create a Brief and stamp its stable source marker. Wraps
+    /// `create_brief` (mandate link preserved) then
+    /// `set_brief_source_marker`. Returns the new task_id.
+    pub fn create_brief_with_marker(
+        &self,
+        tenant: &str,
+        title: &str,
+        owner_subject_id: &str,
+        mandate: Option<&str>,
+        kind: &str,
+        marker: &str,
+    ) -> Result<String, CoordinatorError> {
+        let task_id =
+            self.create_brief(tenant, title, owner_subject_id, None, mandate, None, None)?;
+        self.set_brief_source_marker(&task_id, kind, marker)?;
+        Ok(task_id)
+    }
+
     /// Insert a new Task. Returns the freshly-minted `task_id`
     /// (32 hex chars). Optional retry / timeout metadata defaults to
     /// "no retry, no timeout" for backwards compatibility with pre-C1
@@ -11021,6 +11120,14 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         // §1.2): the human identifier (e.g. `REL-42`) allocated from
         // the per-company counter. NULL for Tasks that aren't Briefs.
         "ALTER TABLE tasks ADD COLUMN human_ref TEXT",
+        // ORCHESTRATION: a stable provenance marker for system-created
+        // Briefs (company-model §4.6). `source_kind` is the generator
+        // class (e.g. `mandate_orchestration`); `source_marker` is the
+        // unique-per-(generator, mandate, role) key dedup is keyed on,
+        // so a rename of the Brief's title or its Mandate never causes a
+        // duplicate. NULL for Briefs created by a human/agent directly.
+        "ALTER TABLE tasks ADD COLUMN source_kind TEXT",
+        "ALTER TABLE tasks ADD COLUMN source_marker TEXT",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the
@@ -11028,6 +11135,14 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
     // so a typo or a schema bug surfaces immediately instead of
     // being silently swallowed.
     crate::db::apply_additive_migrations(conn, &alters).map_err(CoordinatorError::Db)?;
+    // Index the orchestration source marker so the dedup lookup
+    // (`get_brief_by_source_marker`) is O(log n). Runs after the ALTER
+    // so the column exists; idempotent.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS tasks_source_marker ON tasks(source_marker)",
+        [],
+    )
+    .map_err(CoordinatorError::Db)?;
     // Stamp the highest migration version we know about so the
     // _relix_migrations table reflects current state. Version
     // numbers are arbitrary — we use the count of additive
@@ -12488,6 +12603,78 @@ mod tests {
         ));
         assert!(matches!(
             s.set_brief_labels("nope", &["x"]),
+            Err(CoordinatorError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn source_marker_create_lookup_restamp_and_list() {
+        let s = store();
+        // Create a marked Brief; the marker lookup finds it.
+        let parent = s
+            .create_brief_with_marker(
+                "acme",
+                "Execute Mandate: Ship v1",
+                "subj",
+                Some("mandate_x"),
+                "mandate_orchestration",
+                "mandate:mandate_x:parent",
+            )
+            .unwrap();
+        let found = s
+            .get_brief_by_source_marker("mandate:mandate_x:parent")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.task_id, parent);
+        assert_eq!(found.mandate_id.as_deref(), Some("mandate_x"));
+        // Unknown / empty marker → None.
+        assert!(s.get_brief_by_source_marker("nope").unwrap().is_none());
+        assert!(s.get_brief_by_source_marker("").unwrap().is_none());
+        // The marker is independent of the title: re-stamp a plain Brief
+        // and it becomes findable, regardless of its title text.
+        let plain = s
+            .create(
+                "Some unrelated title",
+                "f",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        s.set_brief_source_marker(
+            &plain,
+            "mandate_orchestration",
+            "mandate:mandate_x:role:engineer",
+        )
+        .unwrap();
+        assert_eq!(
+            s.get_brief_by_source_marker("mandate:mandate_x:role:engineer")
+                .unwrap()
+                .unwrap()
+                .task_id,
+            plain
+        );
+        // list_briefs_by_source_kind returns both.
+        let kind = s
+            .list_briefs_by_source_kind("mandate_orchestration", 50)
+            .unwrap();
+        assert_eq!(kind.len(), 2);
+        // Re-stamping is idempotent (no duplicate row, same marker).
+        s.set_brief_source_marker(&parent, "mandate_orchestration", "mandate:mandate_x:parent")
+            .unwrap();
+        assert_eq!(
+            s.get_brief_by_source_marker("mandate:mandate_x:parent")
+                .unwrap()
+                .unwrap()
+                .task_id,
+            parent
+        );
+        // Marking an unknown Brief → NotFound.
+        assert!(matches!(
+            s.set_brief_source_marker("nope", "k", "m"),
             Err(CoordinatorError::NotFound(_))
         ));
     }
