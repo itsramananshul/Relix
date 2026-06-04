@@ -1,62 +1,59 @@
+import { useState } from "react";
 import { tryGet } from "../api";
-import { Badge, Empty, extractList, Section, useAsync } from "../components/common";
+import { Empty, Section, useAsync } from "../components/common";
 
-interface Task {
-  task_id?: string;
-  id?: string;
-  title?: string;
-  status?: string;
-  board_status?: string;
-  updated_at?: number;
-  assignee_agent_id?: string | null;
-}
-interface EventRow { task_id?: string; event_type?: string; ts?: number; payload?: string }
 interface Adapter { name?: string; display_name?: string; probe?: { status?: string } }
 
-function extractTasks(v: unknown): Task[] {
-  if (Array.isArray(v)) return v as Task[];
-  if (v && typeof v === "object") {
-    const o = v as Record<string, unknown>;
-    for (const k of ["tasks", "items", "results"]) if (Array.isArray(o[k])) return o[k] as Task[];
-  }
-  return [];
+// A durable run record from the `brief_runs` ledger (`/v1/runs`).
+interface RunRecord {
+  run_id?: string;
+  brief_id?: string;
+  agent_id?: string;
+  rig?: string;
+  status?: string;
+  started_at?: number;
+  finished_at?: number;
+  duration_secs?: number;
+  summary?: string;
 }
 
-// Execution-run lifecycle events the dispatcher / brief.run writes.
-const RUN_EVENTS: Record<string, string> = {
-  "brief.run_started": "running",
-  "brief.shift_done": "succeeded",
-  "brief.dispatch_failed": "failed",
-  "brief.continued": "continued",
-  "brief.budget_refused": "over budget",
+// Run status → badge tone. `running` is in-flight; the rest are terminal.
+const TONE: Record<string, string> = {
+  running: "in_progress",
+  done: "done",
+  failed: "blocked",
+  continued: "todo",
 };
 
-// Run events carry `[adapter] detail` in their payload — pull the adapter.
-function parseAdapter(payload?: string): { adapter: string; detail: string } {
-  const m = payload?.match(/^\[([^\]]+)\]\s*([\s\S]*)$/);
-  return m ? { adapter: m[1], detail: m[2] } : { adapter: "", detail: payload ?? "" };
+function fmtDuration(r: RunRecord): string {
+  if (r.status === "running") {
+    const s = Math.max(0, Math.floor(Date.now() / 1000) - (r.started_at ?? 0));
+    return `${s}s…`;
+  }
+  if (typeof r.duration_secs === "number") return `${r.duration_secs}s`;
+  return "—";
 }
 
+const FILTERS = ["all", "running", "done", "failed", "continued"] as const;
+
 export function Runs() {
+  const [filter, setFilter] = useState<(typeof FILTERS)[number]>("all");
+
   const { data, loading, error, reload } = useAsync(async () => {
-    const [tasks, events, stuck, adapters] = await Promise.all([
-      tryGet<unknown>("/v1/tasks?limit=50", []),
-      tryGet<unknown>("/v1/tasks/events/recent?limit=40", {}),
-      tryGet<unknown>("/v1/tasks/stuck?limit=20", {}),
+    const [runs, adapters] = await Promise.all([
+      tryGet<RunRecord[]>("/v1/runs", []),
       tryGet<Adapter[]>("/v1/adapters", []),
     ]);
     return {
-      tasks: extractTasks(tasks),
-      events: extractList<EventRow>(events),
-      stuck: extractTasks(stuck),
+      runs: Array.isArray(runs) ? runs : [],
       adapters: Array.isArray(adapters) ? adapters : [],
     };
   }, []);
 
-  const runEvents = (data?.events ?? []).filter((e) => e.event_type && RUN_EVENTS[e.event_type]);
+  const allRuns = data?.runs ?? [];
+  const runs = filter === "all" ? allRuns : allRuns.filter((r) => r.status === filter);
   const adaptersAvail = (data?.adapters ?? []).filter((a) => a.probe?.status === "available");
-
-  const tasks = data?.tasks ?? [];
+  const activeCount = allRuns.filter((r) => r.status === "running").length;
 
   return (
     <div className="grid">
@@ -70,92 +67,64 @@ export function Runs() {
             ? `${adaptersAvail.length} agent adapter(s) available: ${adaptersAvail.map((a) => a.name).join(", ")}.`
             : "No agent adapters installed — install a coding-agent CLI (Claude, Codex) to execute Briefs. See Settings."}
         </div>
-        {data?.stuck && data.stuck.length > 0 && (
-          <div className="banner info">{data.stuck.length} run(s) look stuck — they may need recovery.</div>
+        {activeCount > 0 && (
+          <div className="banner info">{activeCount} run(s) in flight — runs execute in the background; refresh to watch them finish.</div>
         )}
 
-        <div className="card" style={{ marginBottom: 14 }}>
-          <h3>Recent execution runs</h3>
-          {loading ? (
-            <div className="loading">Loading…</div>
-          ) : runEvents.length === 0 ? (
-            <Empty>No runs yet. Hit “Run” on a Brief to execute it through its adapter.</Empty>
-          ) : (
-            <table className="table">
-              <thead>
-                <tr><th>Status</th><th>Adapter</th><th>Brief</th><th>Detail</th><th>When</th></tr>
-              </thead>
-              <tbody>
-                {runEvents.map((e, i) => {
-                  const { adapter, detail } = parseAdapter(e.payload);
-                  const status = RUN_EVENTS[e.event_type ?? ""] ?? e.event_type;
-                  const tone = status === "succeeded" ? "done" : status === "failed" ? "blocked" : status === "running" ? "in_progress" : "todo";
-                  return (
-                    <tr key={i}>
-                      <td><span className={"badge " + tone}>{status}</span></td>
-                      <td className="muted">{adapter || "—"}</td>
-                      <td className="mono">{(e.task_id ?? "").slice(0, 12)}</td>
-                      <td className="muted" style={{ maxWidth: 360, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{detail}</td>
-                      <td className="muted">{e.ts ? new Date(e.ts * 1000).toLocaleTimeString() : ""}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          )}
-        </div>
-
         <div className="card">
+          <div className="row" style={{ marginBottom: 8 }}>
+            <h3 style={{ margin: 0 }}>Execution runs</h3>
+            <div className="spacer" style={{ flex: 1 }} />
+            <div className="row" style={{ gap: 4 }}>
+              {FILTERS.map((f) => (
+                <button
+                  key={f}
+                  className={"btn sm " + (filter === f ? "" : "ghost")}
+                  onClick={() => setFilter(f)}
+                >
+                  {f}
+                </button>
+              ))}
+            </div>
+          </div>
           {loading ? (
             <div className="loading">Loading runs…</div>
-          ) : tasks.length === 0 ? (
-            <Empty>No runs yet. Start a Brief to kick off execution.</Empty>
+          ) : runs.length === 0 ? (
+            <Empty>
+              {filter === "all"
+                ? "No runs yet. Hit “Run” on a Brief to execute it through its adapter."
+                : `No ${filter} runs.`}
+            </Empty>
           ) : (
             <table className="table">
               <thead>
                 <tr>
-                  <th>Run</th>
                   <th>Status</th>
-                  <th>Assignee</th>
-                  <th>Updated</th>
+                  <th>Adapter</th>
+                  <th>Brief</th>
+                  <th>Operative</th>
+                  <th>Result</th>
+                  <th>Duration</th>
+                  <th>Started</th>
                 </tr>
               </thead>
               <tbody>
-                {tasks.map((t, i) => {
-                  const id = t.task_id ?? t.id ?? "";
-                  return (
-                    <tr key={id || i}>
-                      <td><strong>{t.title ?? id.slice(0, 12)}</strong></td>
-                      <td><Badge status={t.status ?? t.board_status} /></td>
-                      <td className="muted">{t.assignee_agent_id ? t.assignee_agent_id.slice(0, 10) : "—"}</td>
-                      <td className="muted">{t.updated_at ? new Date(t.updated_at * 1000).toLocaleString() : "—"}</td>
-                    </tr>
-                  );
-                })}
+                {runs.map((r, i) => (
+                  <tr key={r.run_id ?? i}>
+                    <td><span className={"badge " + (TONE[r.status ?? ""] ?? "todo")}>{r.status ?? "—"}</span></td>
+                    <td className="muted">{r.rig || "—"}</td>
+                    <td className="mono">{(r.brief_id ?? "").slice(0, 12)}</td>
+                    <td className="muted">{(r.agent_id ?? "").slice(0, 10) || "—"}</td>
+                    <td className="muted" style={{ maxWidth: 360, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.summary || (r.status === "running" ? "…" : "—")}</td>
+                    <td className="muted">{fmtDuration(r)}</td>
+                    <td className="muted">{r.started_at ? new Date(r.started_at * 1000).toLocaleTimeString() : ""}</td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           )}
         </div>
       </Section>
-
-      <div className="card">
-        <h3>Activity stream</h3>
-        {(data?.events ?? []).length === 0 ? (
-          <Empty>No recent events.</Empty>
-        ) : (
-          <table className="table">
-            <tbody>
-              {(data?.events ?? []).map((e, i) => (
-                <tr key={i}>
-                  <td><span className="badge">{e.event_type ?? "event"}</span></td>
-                  <td className="mono">{(e.task_id ?? "").slice(0, 12)}</td>
-                  <td className="muted">{e.ts ? new Date(e.ts * 1000).toLocaleTimeString() : ""}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
     </div>
   );
 }

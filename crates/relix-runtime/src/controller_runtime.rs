@@ -8925,16 +8925,6 @@ fn register_node_type_handlers(
                             };
                             let prompt = st
                                 .compose_brief_prompt_with_charter(&brief_id, 10, charter.as_deref());
-                            let bridge_tokens = crate::rig::bridge::BridgeTokenStore::global();
-                            let report = crate::nodes::coordinator::heartbeat::run_brief_now(
-                                &st,
-                                &reg,
-                                Some(&bridge_tokens),
-                                300,
-                                &brief_id,
-                                preferred.as_deref(),
-                                prompt,
-                            );
                             let internal = |cause: String| {
                                 crate::dispatch::HandlerOutcome::Err(
                                     relix_core::types::ErrorEnvelope {
@@ -8945,12 +8935,99 @@ fn register_node_type_handlers(
                                     },
                                 )
                             };
-                            match report {
-                                Ok(r) => match serde_json::to_vec(&r) {
+                            // Async dispatch: pre-flight synchronously (resolve
+                            // adapter, refuse clearly if unavailable, win the
+                            // Claim, open the run record) — fast — then hand the
+                            // blocking `rig.run` to a background thread so a long
+                            // Claude/Codex Shift never freezes the bridge. The
+                            // handler returns immediately with the run_id +
+                            // status `running`; the dashboard polls `/v1/runs`.
+                            let bridge_tokens = crate::rig::bridge::BridgeTokenStore::global();
+                            let pre = crate::nodes::coordinator::heartbeat::preflight_run(
+                                &st,
+                                &reg,
+                                Some(&bridge_tokens),
+                                300,
+                                &brief_id,
+                                preferred.as_deref(),
+                                prompt,
+                            );
+                            let report = match pre {
+                                Err(e) => return internal(format!("brief.run: {e}")),
+                                Ok(crate::nodes::coordinator::heartbeat::Preflight::Refused(r)) => r,
+                                Ok(crate::nodes::coordinator::heartbeat::Preflight::Ready(ready)) => {
+                                    let accepted =
+                                        crate::nodes::coordinator::heartbeat::RunReport {
+                                            brief_id: ready.brief_id.clone(),
+                                            status: "running".to_string(),
+                                            rig: ready.rig_name.clone(),
+                                            summary: "run started".to_string(),
+                                            install_hint: None,
+                                            run_id: Some(ready.run_id.clone()),
+                                        };
+                                    let st_bg = st.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        let bt =
+                                            crate::rig::bridge::BridgeTokenStore::global();
+                                        let _ = crate::nodes::coordinator::heartbeat::execute_ready(
+                                            &st_bg,
+                                            Some(&bt),
+                                            ready,
+                                        );
+                                    });
+                                    accepted
+                                }
+                            };
+                            match serde_json::to_vec(&report) {
+                                Ok(body) => crate::dispatch::HandlerOutcome::Ok(body),
+                                Err(e) => internal(format!("brief.run encode: {e}")),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
+        {
+            // `brief.runs` — the durable run ledger (`brief_runs`). With a
+            // non-empty arg, the runs for that one Brief (the Shift history
+            // on the Brief card); empty arg → the recent runs across all
+            // Briefs (the Active Runs feed). Stable structured records —
+            // run_id / brief_id / agent_id / rig / status / started_at /
+            // finished_at / duration_secs / summary — so the dashboard no
+            // longer parses event strings.
+            let st = store.clone();
+            bridge.register(
+                "brief.runs",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            let brief_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
+                            let result = if brief_id.is_empty() {
+                                st.list_runs(100)
+                            } else {
+                                st.runs_for_brief(&brief_id, 100)
+                            };
+                            match result {
+                                Ok(runs) => match serde_json::to_vec(&runs) {
                                     Ok(body) => crate::dispatch::HandlerOutcome::Ok(body),
-                                    Err(e) => internal(format!("brief.run encode: {e}")),
+                                    Err(e) => crate::dispatch::HandlerOutcome::Err(
+                                        relix_core::types::ErrorEnvelope {
+                                            kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                            cause: format!("brief.runs encode: {e}"),
+                                            retry_hint: 1,
+                                            retry_after: None,
+                                        },
+                                    ),
                                 },
-                                Err(e) => internal(format!("brief.run: {e}")),
+                                Err(e) => crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                        cause: format!("brief.runs: {e}"),
+                                        retry_hint: 1,
+                                        retry_after: None,
+                                    },
+                                ),
                             }
                         }
                     },

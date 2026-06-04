@@ -557,6 +557,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/briefs/:id/move", post(spine::move_brief))
         // Run a Brief now through its Operative's agent adapter (Rig).
         .route("/v1/spine/briefs/:id/run", post(spine::run_brief))
+        // Execution-run ledger: recent runs (Active Runs feed) + a
+        // Brief's run/Shift history.
+        .route("/v1/runs", get(spine::runs_recent))
+        .route("/v1/spine/briefs/:id/runs", get(spine::brief_runs))
         .route("/v1/spine/briefs/:id/pin", post(spine::pin_brief))
         .route("/v1/spine/briefs/:id/comment", post(spine::comment_brief))
         .route("/v1/spine/briefs/:id/due", post(spine::set_due))

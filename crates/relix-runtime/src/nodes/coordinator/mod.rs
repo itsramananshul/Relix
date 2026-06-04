@@ -2390,6 +2390,103 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Open a run record for a Brief execution (status `running`). One
+    /// durable row per Rig run — the stable run ledger the dashboard
+    /// polls (`/v1/runs`) instead of parsing event strings. Called once
+    /// a run is actually committed (adapter available + Claim won), so a
+    /// pre-flight refusal never leaves a phantom run. Idempotent on
+    /// `run_id` (re-open is a no-op).
+    pub fn record_run_start(
+        &self,
+        run_id: &str,
+        brief_id: &str,
+        agent_id: &str,
+        rig: &str,
+    ) -> Result<(), CoordinatorError> {
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO brief_runs
+                 (run_id, brief_id, agent_id, rig, status, started_at, summary)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, '')",
+            params![run_id, brief_id, agent_id, rig, now],
+        )
+        .map_err(CoordinatorError::Db)?;
+        Ok(())
+    }
+
+    /// Close a run record with its terminal status (`done` / `failed` /
+    /// `continued`) and the Rig's secret-redacted summary. No-op when the
+    /// run_id is unknown.
+    pub fn record_run_finish(
+        &self,
+        run_id: &str,
+        status: &str,
+        summary: &str,
+    ) -> Result<(), CoordinatorError> {
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        conn.execute(
+            "UPDATE brief_runs
+             SET status = ?1, summary = ?2, finished_at = ?3
+             WHERE run_id = ?4",
+            params![status, summary, now, run_id],
+        )
+        .map_err(CoordinatorError::Db)?;
+        Ok(())
+    }
+
+    /// Recent run records across all Briefs, newest first — the Active
+    /// Runs feed. `limit` is clamped to a sane page.
+    pub fn list_runs(&self, limit: i64) -> Result<Vec<RunRecord>, CoordinatorError> {
+        let limit = limit.clamp(1, 500);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary
+                 FROM brief_runs
+                 ORDER BY started_at DESC, rowid DESC
+                 LIMIT ?1",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![limit], RunRecord::from_row)
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(CoordinatorError::Db)?);
+        }
+        Ok(out)
+    }
+
+    /// Run records for a single Brief, newest first — the per-Brief
+    /// Shift history shown on the Brief card.
+    pub fn runs_for_brief(
+        &self,
+        brief_id: &str,
+        limit: i64,
+    ) -> Result<Vec<RunRecord>, CoordinatorError> {
+        let limit = limit.clamp(1, 500);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary
+                 FROM brief_runs
+                 WHERE brief_id = ?1
+                 ORDER BY started_at DESC, rowid DESC
+                 LIMIT ?2",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![brief_id, limit], RunRecord::from_row)
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(CoordinatorError::Db)?);
+        }
+        Ok(out)
+    }
+
     /// PHASE 3 (Claim): **operator force-release** — clear a Brief's
     /// Claim regardless of who holds it (relix-execution-and-issue-
     /// design §1.4). For a stuck/abandoned lock an operator can't
@@ -6954,6 +7051,48 @@ pub struct AttemptView {
     pub failure_class: Option<String>,
 }
 
+/// A durable execution-run record (`brief_runs`) — the stable run model
+/// the dashboard polls (`/v1/runs`) instead of parsing event strings.
+/// One row per Rig execution of a Brief.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RunRecord {
+    pub run_id: String,
+    pub brief_id: String,
+    pub agent_id: String,
+    /// The adapter (Rig) that ran it.
+    pub rig: String,
+    /// `running` while in flight, then terminal `done` / `failed` /
+    /// `continued`.
+    pub status: String,
+    pub started_at: i64,
+    /// `None` while still running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<i64>,
+    /// Wall-clock seconds, present once finished.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<i64>,
+    /// Rig result/reason — already secret-redacted by the Rig.
+    pub summary: String,
+}
+
+impl RunRecord {
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let started_at: i64 = r.get(5)?;
+        let finished_at: Option<i64> = r.get(6)?;
+        Ok(Self {
+            run_id: r.get(0)?,
+            brief_id: r.get(1)?,
+            agent_id: r.get(2)?,
+            rig: r.get(3)?,
+            status: r.get(4)?,
+            started_at,
+            finished_at,
+            duration_secs: finished_at.map(|f| (f - started_at).max(0)),
+            summary: r.get(7)?,
+        })
+    }
+}
+
 /// Aggregate metrics over an execution subtree (M75).
 /// Computed by [`TaskStore::subtree_metrics`] from REAL
 /// per-task state — no synthesis. Status buckets are
@@ -11509,6 +11648,27 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             tenant_id TEXT PRIMARY KEY,
             seq       INTEGER NOT NULL DEFAULT 0
         );
+        -- Execution runs (relix-execution-and-issue-design: the Shift
+        -- ledger). One durable row per Rig execution of a Brief — the
+        -- stable run model the dashboard polls instead of parsing event
+        -- strings. `status` is `running` while in flight, then a terminal
+        -- `done` / `failed` / `continued`. `summary` is the Rig's
+        -- secret-redacted result/reason. Append-on-start, update-on-finish.
+        CREATE TABLE IF NOT EXISTS brief_runs (
+            run_id      TEXT PRIMARY KEY,
+            brief_id    TEXT NOT NULL,
+            agent_id    TEXT NOT NULL,
+            rig         TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            started_at  INTEGER NOT NULL,
+            finished_at INTEGER,
+            summary     TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY (brief_id) REFERENCES tasks(task_id)
+        );
+        CREATE INDEX IF NOT EXISTS brief_runs_by_brief
+            ON brief_runs(brief_id, started_at);
+        CREATE INDEX IF NOT EXISTS brief_runs_recent
+            ON brief_runs(started_at);
         "#,
     )
     .map_err(CoordinatorError::Db)?;

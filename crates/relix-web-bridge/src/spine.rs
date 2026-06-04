@@ -750,6 +750,25 @@ pub async fn run_brief(
     json_passthrough(body)
 }
 
+/// `GET /v1/runs` — the recent execution runs across all Briefs (the
+/// Active Runs feed). Stable structured run records straight from the
+/// `brief_runs` ledger — the dashboard polls this to watch a run move
+/// `running` → `done`/`failed`/`continued` without parsing event text.
+pub async fn runs_recent(
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "brief.runs", b"").await?)
+}
+
+/// `GET /v1/spine/briefs/:id/runs` — the run (Shift) history for one
+/// Brief, newest first.
+pub async fn brief_runs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "brief.runs", id.as_bytes()).await?)
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct PinRequest {
     #[serde(default)]

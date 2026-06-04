@@ -18,10 +18,14 @@ interface RunReport {
   rig: string;
   summary: string;
   install_hint?: string | null;
+  run_id?: string | null;
 }
 
-// Human labels for the pre-run refusal states (no command was spawned).
+// Human labels for the run states. `running` = accepted + executing in
+// the background; the rest are pre-run refusals (no command spawned) or
+// terminal outcomes.
 const REFUSALS: Record<string, string> = {
+  running: "run started — executing in the background",
   unassigned: "assign an Operative first",
   no_adapter: "no adapter configured for this Operative",
   adapter_unavailable: "adapter not installed",
@@ -92,14 +96,16 @@ export function Briefs() {
     setBanner({ kind: "info", msg: `Running ${c.title ?? "brief"}…` });
     try {
       const r = await api.post<RunReport>(`/v1/spine/briefs/${encodeURIComponent(cardId(c))}/run`, {});
-      const done = r.status === "done";
+      // `running` = accepted, executing in the background (async dispatch).
+      const accepted = r.status === "running" || r.status === "done";
       const refusal = ["unassigned", "no_adapter", "adapter_unavailable", "already_running", "not_found"].includes(r.status);
-      const kind = done ? "ok" : refusal ? "info" : "err";
+      const kind = accepted ? "ok" : refusal ? "info" : "err";
       const label = REFUSALS[r.status] ?? r.status;
       let msg = `${c.title ?? "Brief"}: ${label}`;
       if (r.rig) msg += ` · adapter ${r.rig}`;
-      if (r.summary) msg += ` — ${r.summary}`;
+      if (r.summary && r.status !== "running") msg += ` — ${r.summary}`;
       if (r.install_hint) msg += ` (${r.install_hint})`;
+      if (r.status === "running") msg += " — see Active Runs";
       setBanner({ kind, msg });
       reload();
     } catch (e) {

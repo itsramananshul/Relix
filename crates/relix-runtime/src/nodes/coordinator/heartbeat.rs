@@ -387,6 +387,11 @@ pub struct RunReport {
     /// Install hint when the adapter is missing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub install_hint: Option<String>,
+    /// The durable run record id (`brief_runs.run_id`) once a run is
+    /// committed — `None` for a pre-flight refusal that never ran. The
+    /// dashboard polls `/v1/runs` for this id to watch the run finish.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 impl RunReport {
@@ -397,8 +402,31 @@ impl RunReport {
             rig: String::new(),
             summary: summary.into(),
             install_hint: None,
+            run_id: None,
         }
     }
+}
+
+/// A Brief that has cleared pre-flight (assigned, adapter available,
+/// Claim won, run record opened) and is ready to execute on its Rig.
+/// Carries everything [`execute_ready`] needs so the actual `rig.run`
+/// can be moved onto a blocking background thread (async dispatch)
+/// without re-touching the store under the async runtime.
+pub struct ReadyRun {
+    pub brief_id: String,
+    pub assignee: String,
+    pub run_id: String,
+    pub rig_name: String,
+    rig: std::sync::Arc<dyn Rig>,
+    req: RigRunRequest,
+    token: String,
+}
+
+/// Outcome of [`preflight_run`]: either a clear refusal (no command was
+/// spawned) or a committed [`ReadyRun`].
+pub enum Preflight {
+    Refused(RunReport),
+    Ready(ReadyRun),
 }
 
 /// Run ONE Brief synchronously through its Operative's Rig — the manual
@@ -416,50 +444,88 @@ pub fn run_brief_now(
     preferred_rig: Option<&str>,
     prompt: String,
 ) -> Result<RunReport, CoordinatorError> {
+    match preflight_run(
+        store,
+        registry,
+        bridge_tokens,
+        lease_secs,
+        brief_id,
+        preferred_rig,
+        prompt,
+    )? {
+        Preflight::Refused(report) => Ok(report),
+        Preflight::Ready(ready) => Ok(execute_ready(store, bridge_tokens, ready)),
+    }
+}
+
+/// Pre-flight one Brief run: resolve the Operative's Rig, refuse clearly
+/// when it is unavailable (never spawns), and — only once the run is
+/// committed (adapter available + Claim won) — open the durable run
+/// record, advance the board, and mint the scoped bridge-back token.
+/// Returns a [`ReadyRun`] the caller can execute synchronously
+/// ([`run_brief_now`]) or hand to a background thread (async dispatch).
+#[allow(clippy::too_many_arguments)]
+pub fn preflight_run(
+    store: &TaskStore,
+    registry: &crate::rig::RigRegistry,
+    bridge_tokens: Option<&BridgeTokenStore>,
+    lease_secs: i64,
+    brief_id: &str,
+    preferred_rig: Option<&str>,
+    prompt: String,
+) -> Result<Preflight, CoordinatorError> {
     let Some(card) = store.brief_card(brief_id)? else {
-        return Ok(RunReport::refuse(brief_id, "not_found", "brief not found"));
+        return Ok(Preflight::Refused(RunReport::refuse(
+            brief_id,
+            "not_found",
+            "brief not found",
+        )));
     };
     let Some(assignee) = card.assignee_agent_id.clone() else {
-        return Ok(RunReport::refuse(
+        return Ok(Preflight::Refused(RunReport::refuse(
             brief_id,
             "unassigned",
             "assign an Operative before running",
-        ));
+        )));
     };
     let Some(rig) = registry.resolve(preferred_rig) else {
-        return Ok(RunReport::refuse(
+        return Ok(Preflight::Refused(RunReport::refuse(
             brief_id,
             "no_adapter",
             "the Operative has no Rig and no Guild default is configured",
-        ));
+        )));
     };
     // Live availability probe — never spawn an adapter that isn't there.
     let probe = rig.probe();
     if probe.status != "available" {
-        return Ok(RunReport {
+        return Ok(Preflight::Refused(RunReport {
             brief_id: brief_id.to_string(),
             status: "adapter_unavailable".to_string(),
             rig: rig.name().to_string(),
             summary: probe.detail,
             install_hint: probe.install_hint,
-        });
+            run_id: None,
+        }));
     }
     // Single-owner: claim the Brief so a duplicate concurrent run can't
     // start. A live claim by another run → refuse.
     let run_id = format!("run_{}", uuid::Uuid::new_v4());
     if !store.claim_brief_for_run(&card.task_id, &assignee, lease_secs, Some(&run_id))? {
-        return Ok(RunReport {
+        return Ok(Preflight::Refused(RunReport {
             brief_id: brief_id.to_string(),
             status: "already_running".to_string(),
             rig: rig.name().to_string(),
             summary: "another run holds the Claim on this Brief".to_string(),
             install_hint: None,
-        });
+            run_id: None,
+        }));
     }
     let rig_name = rig.name().to_string();
     if card.board_status == "todo" {
         store.set_board_status(&card.task_id, "in_progress")?;
     }
+    // Durable run record (status `running`) — the dashboard polls this.
+    let _ = store.record_run_start(&run_id, &card.task_id, &assignee, &rig_name);
     let _ = store.append_event(
         &card.task_id,
         "brief.run_started",
@@ -483,6 +549,35 @@ pub fn run_brief_now(
     let req = RigRunRequest::new(&card.task_id, &assignee, String::new(), prompt)
         .with_bridge_token(&token)
         .with_context(brief_context(&card));
+    Ok(Preflight::Ready(ReadyRun {
+        brief_id: card.task_id,
+        assignee,
+        run_id,
+        rig_name,
+        rig,
+        req,
+        token,
+    }))
+}
+
+/// Execute a [`ReadyRun`]: run the Rig (blocking), advance the board,
+/// chronicle the result (tagged with the adapter name), close the
+/// durable run record, and release the Claim. The blocking call here is
+/// what async dispatch moves onto a background thread.
+pub fn execute_ready(
+    store: &TaskStore,
+    bridge_tokens: Option<&BridgeTokenStore>,
+    ready: ReadyRun,
+) -> RunReport {
+    let ReadyRun {
+        brief_id,
+        assignee,
+        run_id,
+        rig_name,
+        rig,
+        req,
+        token,
+    } = ready;
     let outcome = rig.run(&req);
     if let Some(bt) = bridge_tokens
         && !token.is_empty()
@@ -492,11 +587,11 @@ pub fn run_brief_now(
     let (status, summary) = match &outcome {
         RigOutcome::Done { summary } => {
             // Done → in_review (best-effort; a missing reviewer parks it).
-            if store.set_board_status(&card.task_id, "in_review").is_err() {
-                let _ = store.set_board_status(&card.task_id, "blocked");
+            if store.set_board_status(&brief_id, "in_review").is_err() {
+                let _ = store.set_board_status(&brief_id, "blocked");
             }
             let _ = store.append_event(
-                &card.task_id,
+                &brief_id,
                 "brief.shift_done",
                 &format!("[{rig_name}] {summary}"),
             );
@@ -506,9 +601,9 @@ pub fn run_brief_now(
             retryable: false,
             reason,
         } => {
-            let _ = store.set_board_status(&card.task_id, "blocked");
+            let _ = store.set_board_status(&brief_id, "blocked");
             let _ = store.append_event(
-                &card.task_id,
+                &brief_id,
                 "brief.dispatch_failed",
                 &format!("[{rig_name}] {reason}"),
             );
@@ -519,7 +614,7 @@ pub fn run_brief_now(
             reason,
         } => {
             let _ = store.append_event(
-                &card.task_id,
+                &brief_id,
                 "brief.dispatch_failed",
                 &format!("[{rig_name}] {reason}"),
             );
@@ -527,21 +622,23 @@ pub fn run_brief_now(
         }
         RigOutcome::Continue { note } => {
             let _ = store.append_event(
-                &card.task_id,
+                &brief_id,
                 "brief.continued",
                 &format!("[{rig_name}] {note}"),
             );
             ("continued", note.clone())
         }
     };
-    let _ = store.release_claim(&card.task_id, &assignee);
-    Ok(RunReport {
-        brief_id: card.task_id,
+    let _ = store.record_run_finish(&run_id, status, &summary);
+    let _ = store.release_claim(&brief_id, &assignee);
+    RunReport {
+        brief_id,
         status: status.to_string(),
         rig: rig_name,
         summary,
         install_hint: None,
-    })
+        run_id: Some(run_id),
+    }
 }
 
 /// Build the opaque `context` string handed to the Rig: where the
@@ -1232,5 +1329,85 @@ mod tests {
             run_brief_now(&s, &echo_registry(), None, 300, "nope", Some("echo"), "x".into())
                 .unwrap();
         assert_eq!(report.status, "not_found");
+    }
+
+    #[test]
+    fn run_brief_now_opens_and_closes_a_durable_run_record() {
+        let s = store();
+        let reg = crate::rig::RigRegistry::with_builtins();
+        let id = ready_brief(&s, "ship it", "agt_a");
+
+        let report =
+            run_brief_now(&s, &reg, None, 300, &id, Some("echo"), "do the work".into()).unwrap();
+        assert_eq!(report.status, "done");
+        let run_id = report.run_id.clone().expect("a committed run has a run_id");
+
+        // The run is in the durable ledger, terminal, with a duration and
+        // the adapter that ran it — no event-string parsing needed.
+        let runs = s.runs_for_brief(&id, 10).unwrap();
+        assert_eq!(runs.len(), 1, "exactly one run recorded");
+        let r = &runs[0];
+        assert_eq!(r.run_id, run_id);
+        assert_eq!(r.brief_id, id);
+        assert_eq!(r.agent_id, "agt_a");
+        assert_eq!(r.rig, "echo");
+        assert_eq!(r.status, "done");
+        assert!(r.finished_at.is_some(), "a finished run has finished_at");
+        assert!(r.duration_secs.is_some());
+        assert!(r.summary.contains("echo:"), "got {:?}", r.summary);
+
+        // It also shows up in the recent-runs feed.
+        let recent = s.list_runs(50).unwrap();
+        assert!(recent.iter().any(|x| x.run_id == run_id));
+    }
+
+    #[test]
+    fn preflight_refusal_records_no_run() {
+        // An unavailable adapter must never leave a phantom run row.
+        let s = store();
+        let id = ready_brief(&s, "t", "agt_a");
+        let mut reg = crate::rig::RigRegistry::new();
+        reg.register(std::sync::Arc::new(crate::rig::ProcessRig::new(
+            "ghost",
+            "definitely-not-installed-relix-adapter-xyzzy",
+            vec![],
+        )));
+        reg.set_default(Some("ghost".to_string()));
+
+        let report = run_brief_now(&s, &reg, None, 300, &id, None, "x".into()).unwrap();
+        assert_eq!(report.status, "adapter_unavailable");
+        assert!(report.run_id.is_none(), "a refusal carries no run_id");
+        assert!(
+            s.runs_for_brief(&id, 10).unwrap().is_empty(),
+            "no run record for a pre-flight refusal"
+        );
+        assert!(s.list_runs(50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn preflight_then_execute_matches_the_synchronous_path() {
+        // The async split (preflight → execute_ready) yields the same
+        // durable run + board outcome as run_brief_now.
+        let s = store();
+        let reg = crate::rig::RigRegistry::with_builtins();
+        let id = ready_brief(&s, "async shift", "agt_a");
+
+        let pre = preflight_run(&s, &reg, None, 300, &id, Some("echo"), "work".into()).unwrap();
+        let ready = match pre {
+            Preflight::Ready(r) => r,
+            Preflight::Refused(r) => panic!("expected ready, got {r:?}"),
+        };
+        // The run is already recorded as `running` before execution.
+        let opened = s.runs_for_brief(&id, 10).unwrap();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].status, "running");
+        assert!(opened[0].finished_at.is_none());
+
+        let report = execute_ready(&s, None, ready);
+        assert_eq!(report.status, "done");
+        let closed = s.runs_for_brief(&id, 10).unwrap();
+        assert_eq!(closed[0].status, "done");
+        assert!(closed[0].finished_at.is_some());
+        assert_eq!(s.board_status(&id).unwrap().as_deref(), Some("in_review"));
     }
 }
