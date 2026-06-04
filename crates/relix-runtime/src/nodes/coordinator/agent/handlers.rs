@@ -695,6 +695,26 @@ fn role_track_title(role: &str, mandate_title: &str) -> String {
     format!("{track} track: {mandate_title}")
 }
 
+/// Title for a subject **execution** Brief — the per-agent work item that
+/// hangs under a role-track Brief. Uses the same role display map as
+/// [`role_track_title`]; falls back to the raw role for unknown roles.
+fn subject_exec_title(role: &str, agent_id: &str) -> String {
+    let label = match role.trim().to_ascii_lowercase().as_str() {
+        "engineer" | "engineering" | "swe" | "developer" | "dev" => "Engineering",
+        "designer" | "design" | "ux" | "ui" => "Design",
+        "researcher" | "research" => "Research",
+        "writer" | "writing" | "content" | "copywriter" => "Content",
+        "planner" | "pm" | "product" | "prime" => "Planning",
+        "qa" | "test" | "tester" | "quality" => "QA",
+        "ops" | "devops" | "sre" | "operations" => "Operations",
+        "data" | "analyst" | "analytics" | "scientist" => "Data",
+        "security" | "sec" | "appsec" => "Security",
+        "marketing" | "growth" => "Marketing",
+        other => return format!("{other} execution: {agent_id}"),
+    };
+    format!("{label} execution: {agent_id}")
+}
+
 /// Stable signature of the orchestration inputs (deterministic across
 /// processes — `DefaultHasher::new()` uses a fixed seed). Lets a run
 /// record show whether two runs had identical inputs.
@@ -724,10 +744,15 @@ fn orchestration_signature(
 ///   (create + assign active team agents).
 /// - `dry_run` (default false) forces report-only regardless of mode.
 ///
-/// Deterministic + idempotent: Briefs are keyed by a stable title, so a
-/// repeated run reuses the existing parent/children rather than
-/// duplicating them (and a crash mid-run is recovered on the next run).
-/// Assignment respects the assign-Key gate (`enforce_assign_key`).
+/// Deterministic + idempotent: Briefs are keyed by stable, Mandate-id-
+/// derived **source markers** (not title text), so a repeated run reuses
+/// the existing tree rather than duplicating it (and a crash mid-run is
+/// recovered on the next run). The tree is three deep:
+/// parent `mandate:{id}:parent` → role track `mandate:{id}:role:{role}`
+/// → subject execution `mandate:{id}:role:{role}:subject:{agent_id}`.
+/// Role-track Briefs stay unassigned; the per-agent subject Brief is the
+/// one assigned (assign-Key gated via `enforce_assign_key`). A changed
+/// active agent yields a new subject Brief while the role track is reused.
 /// Every run is persisted via `record_orchestration_run`.
 #[allow(clippy::too_many_lines)]
 pub fn handle_orchestrate(
@@ -850,21 +875,28 @@ pub fn handle_orchestrate(
     // from title text — so a Mandate rename or a manual Brief-title edit
     // never causes a rerun to lose track of the existing tree.
     let parent_marker = format!("mandate:{mandate_id}:parent");
-    // (display role, active agent, child marker, child title)
-    let child_plan: Vec<(Option<String>, String, String)> = track_list
+    // (role display, active agent, role-track marker, role-track title)
+    let child_plan: Vec<(String, Option<String>, String, String)> = track_list
         .iter()
         .map(|(role, agent)| {
             let role_key = role.trim().to_ascii_lowercase();
             let marker = format!("mandate:{mandate_id}:role:{role_key}");
             let title = role_track_title(role, &mandate.title);
-            (agent.clone(), marker, title)
+            (role.clone(), agent.clone(), marker, title)
         })
         .collect();
 
     // The input signature is built from the *markers* (rename-stable),
-    // the mode and the plan id — not the mutable title text.
+    // the mode and the plan id — not the mutable title text. Subject
+    // markers (per active agent) are folded in too so a staffing change
+    // is reflected in the signature.
     let mut all_markers: Vec<String> = vec![parent_marker.clone()];
-    all_markers.extend(child_plan.iter().map(|(_, m, _)| m.clone()));
+    for (_, agent, marker, _) in &child_plan {
+        all_markers.push(marker.clone());
+        if let Some(agent_id) = agent {
+            all_markers.push(format!("{marker}:subject:{agent_id}"));
+        }
+    }
     let plan_id = view
         .plan
         .as_ref()
@@ -873,6 +905,15 @@ pub fn handle_orchestrate(
     let signature = orchestration_signature(mandate_id, mode, &plan_id, &all_markers);
     // The marker keys this run reasoned about (persisted for debugging).
     let mut markers_used: Vec<String> = Vec::with_capacity(all_markers.len());
+
+    // Per-tier buckets (parent / role-track / subject-execution) so the
+    // response and run record can distinguish what happened at each level.
+    let mut parent_created: Vec<serde_json::Value> = Vec::new();
+    let mut parent_existing: Vec<serde_json::Value> = Vec::new();
+    let mut role_tracks_created: Vec<serde_json::Value> = Vec::new();
+    let mut role_tracks_existing: Vec<serde_json::Value> = Vec::new();
+    let mut subject_briefs_created: Vec<serde_json::Value> = Vec::new();
+    let mut subject_briefs_existing: Vec<serde_json::Value> = Vec::new();
 
     // Helper: get-or-create a Brief by its stable source marker.
     // Returns (task_id, was_existing, current_assignee) or None when
@@ -935,8 +976,8 @@ pub fn handle_orchestrate(
     let parent = ensure_marked(
         &parent_marker,
         &parent_title,
-        &mut created_briefs,
-        &mut existing_briefs,
+        &mut parent_created,
+        &mut parent_existing,
         &mut skipped,
     );
     if let Some((ref parent_id, was_existing, _)) = parent
@@ -955,54 +996,86 @@ pub fn handle_orchestrate(
         let _ = task_store.add_dossier(parent_id, "orchestration", "Orchestration plan", &body);
     }
 
-    // Child Briefs per role track (marker `mandate:{id}:role:{role_key}`).
-    for (active_agent, marker, title) in &child_plan {
-        markers_used.push(marker.clone());
-        let child = ensure_marked(
-            marker,
-            title,
-            &mut created_briefs,
-            &mut existing_briefs,
+    // Role-track Briefs under the parent (marker
+    // `mandate:{id}:role:{role_key}`), then a per-agent subject execution
+    // Brief under each role track. Role tracks stay unassigned; the
+    // subject Brief is the one that gets the assignment.
+    for (role, active_agent, role_marker, role_title) in &child_plan {
+        markers_used.push(role_marker.clone());
+        let role_track = ensure_marked(
+            role_marker,
+            role_title,
+            &mut role_tracks_created,
+            &mut role_tracks_existing,
             &mut skipped,
         );
-        let Some((child_id, _was_existing, current_assignee)) = child else {
+        let Some((role_id, _was, _assignee)) = role_track else {
             continue;
         };
-        // Link to the parent (idempotent edge insert).
+        // Link the role track under the parent (idempotent edge insert).
         if let Some((ref parent_id, _, _)) = parent {
-            let _ = task_store.link_subbrief(parent_id, &child_id);
+            let _ = task_store.link_subbrief(parent_id, &role_id);
         }
-        // Assignment (assign_ready only).
-        if let Some(agent_id) = active_agent {
-            if !assign_allowed {
-                if ready && mode == "create_briefs" {
-                    skipped.push(serde_json::json!({
-                        "task_id": child_id, "reason": "not assigned (mode=create_briefs)",
-                    }));
-                }
-                continue;
+
+        // Subject execution Brief — only when an active agent staffs the
+        // role. A different agent later → a different subject marker →
+        // a new subject Brief, while the role track above is reused.
+        let Some(agent_id) = active_agent else {
+            continue;
+        };
+        let subject_marker = format!("{role_marker}:subject:{agent_id}");
+        markers_used.push(subject_marker.clone());
+        let subject = ensure_marked(
+            &subject_marker,
+            &subject_exec_title(role, agent_id),
+            &mut subject_briefs_created,
+            &mut subject_briefs_existing,
+            &mut skipped,
+        );
+        let Some((subject_id, _sw, subject_assignee)) = subject else {
+            continue;
+        };
+        // Link the subject Brief under its role track.
+        let _ = task_store.link_subbrief(&role_id, &subject_id);
+
+        // Assignment lands on the subject Brief (assign_ready only); the
+        // role track above stays unassigned. Always assign-Key gated.
+        if !assign_allowed {
+            if ready && mode == "create_briefs" {
+                skipped.push(serde_json::json!({
+                    "task_id": subject_id, "reason": "not assigned (mode=create_briefs)",
+                }));
             }
-            if current_assignee.as_deref() == Some(agent_id.as_str()) {
-                // Already assigned to the right Operative — idempotent no-op.
-                assigned_briefs
-                    .push(serde_json::json!({"task_id": child_id, "agent_id": agent_id}));
-                continue;
-            }
-            match enforce_assign_key(agent_store, ctx, agent_id) {
-                Ok(()) => match task_store.set_brief_field(&child_id, "assignee", agent_id) {
-                    Ok(()) => assigned_briefs
-                        .push(serde_json::json!({"task_id": child_id, "agent_id": agent_id})),
-                    Err(e) => skipped.push(
-                        serde_json::json!({"task_id": child_id, "reason": format!("assign: {e}")}),
-                    ),
-                },
-                Err(_) => skipped.push(serde_json::json!({
-                    "task_id": child_id,
-                    "reason": format!("assign denied for `{agent_id}` (assign-Key gate)"),
-                })),
-            }
+            continue;
+        }
+        if subject_assignee.as_deref() == Some(agent_id.as_str()) {
+            // Already assigned to the right Operative — idempotent no-op.
+            assigned_briefs.push(serde_json::json!({"task_id": subject_id, "agent_id": agent_id}));
+            continue;
+        }
+        match enforce_assign_key(agent_store, ctx, agent_id) {
+            Ok(()) => match task_store.set_brief_field(&subject_id, "assignee", agent_id) {
+                Ok(()) => assigned_briefs
+                    .push(serde_json::json!({"task_id": subject_id, "agent_id": agent_id})),
+                Err(e) => skipped.push(
+                    serde_json::json!({"task_id": subject_id, "reason": format!("assign: {e}")}),
+                ),
+            },
+            Err(_) => skipped.push(serde_json::json!({
+                "task_id": subject_id,
+                "reason": format!("assign denied for `{agent_id}` (assign-Key gate)"),
+            })),
         }
     }
+
+    // Backward-compatible flat views: callers/tests that predate the
+    // tiered shape still read `created_briefs` / `existing_briefs`.
+    created_briefs.extend(parent_created.iter().cloned());
+    created_briefs.extend(role_tracks_created.iter().cloned());
+    created_briefs.extend(subject_briefs_created.iter().cloned());
+    existing_briefs.extend(parent_existing.iter().cloned());
+    existing_briefs.extend(role_tracks_existing.iter().cloned());
+    existing_briefs.extend(subject_briefs_existing.iter().cloned());
 
     // Status + next actions.
     let status = if !ready {
@@ -1055,6 +1128,11 @@ pub fn handle_orchestrate(
         }
     };
 
+    let parent_brief = parent_created
+        .first()
+        .or_else(|| parent_existing.first())
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let body = serde_json::json!({
         "mandate_id": mandate_id,
         "run_id": run_id,
@@ -1064,12 +1142,19 @@ pub fn handle_orchestrate(
         "status": status,
         "input_signature": signature,
         "blockers": blockers,
-        "created_briefs": created_briefs,
+        // Tiered view (parent → role track → subject execution).
+        "parent_brief": parent_brief,
+        "role_tracks_created": role_tracks_created,
+        "role_tracks_existing": role_tracks_existing,
+        "subject_briefs_created": subject_briefs_created,
+        "subject_briefs_existing": subject_briefs_existing,
         "assigned_briefs": assigned_briefs,
-        "existing_briefs": existing_briefs,
         "skipped": skipped,
         "source_markers": markers_used,
         "next_actions": next_actions,
+        // Backward-compatible flat views.
+        "created_briefs": created_briefs,
+        "existing_briefs": existing_briefs,
     });
     match serde_json::to_vec(&body) {
         Ok(b) => HandlerOutcome::Ok(b),
@@ -3242,9 +3327,12 @@ mod tests {
         let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
         assert_eq!(v["ready"], true);
         assert_eq!(v["status"], "assigned");
-        // Parent + one engineering child were created.
+        // Three-tier tree: parent → role track → subject execution.
         let created = v["created_briefs"].as_array().unwrap();
-        assert_eq!(created.len(), 2, "parent + 1 role child");
+        assert_eq!(created.len(), 3, "parent + role track + subject execution");
+        assert!(!v["parent_brief"].is_null());
+        assert_eq!(v["role_tracks_created"].as_array().unwrap().len(), 1);
+        assert_eq!(v["subject_briefs_created"].as_array().unwrap().len(), 1);
         assert!(
             created
                 .iter()
@@ -3256,13 +3344,33 @@ mod tests {
                 .unwrap()
                 .starts_with("Engineering track:")
         }));
-        // The child is assigned to the active agent.
+        assert!(created.iter().any(|b| {
+            b["title"]
+                .as_str()
+                .unwrap()
+                .starts_with("Engineering execution:")
+        }));
+        // Assignment lands on the subject Brief, not the role track.
         let assigned = v["assigned_briefs"].as_array().unwrap();
         assert_eq!(assigned.len(), 1);
         assert_eq!(assigned[0]["agent_id"], agent_id);
+        let subject_id = v["subject_briefs_created"][0]["task_id"].as_str().unwrap();
+        assert_eq!(assigned[0]["task_id"].as_str().unwrap(), subject_id);
         // The briefs are durable + linked to the Mandate.
         let cards = tasks.list_briefs_by_mandate(&m, 50).unwrap();
-        assert_eq!(cards.len(), 2);
+        assert_eq!(cards.len(), 3);
+        // The role track is NOT assigned; the subject Brief is.
+        let role_id = v["role_tracks_created"][0]["task_id"].as_str().unwrap();
+        let role_card = cards.iter().find(|c| c.task_id == role_id).unwrap();
+        assert!(
+            role_card.assignee_agent_id.is_none(),
+            "role track stays unassigned"
+        );
+        let subj_card = cards.iter().find(|c| c.task_id == subject_id).unwrap();
+        assert_eq!(
+            subj_card.assignee_agent_id.as_deref(),
+            Some(agent_id.as_str())
+        );
         // The latest run is persisted.
         let latest = spine
             .latest_orchestration_run("default", &m)
@@ -3278,7 +3386,7 @@ mod tests {
         let spine = SpineStore::in_memory().unwrap();
         let (m, _agent) = ready_team(&agents, &spine, "engineer");
         let first = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
-        assert_eq!(first["created_briefs"].as_array().unwrap().len(), 2);
+        assert_eq!(first["created_briefs"].as_array().unwrap().len(), 3);
         let after_first = tasks.list_briefs_by_mandate(&m, 50).unwrap().len();
         // Second run creates nothing new; reuses existing.
         let second = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
@@ -3286,7 +3394,7 @@ mod tests {
             second["created_briefs"].as_array().unwrap().is_empty(),
             "a repeated run must not duplicate Briefs"
         );
-        assert_eq!(second["existing_briefs"].as_array().unwrap().len(), 2);
+        assert_eq!(second["existing_briefs"].as_array().unwrap().len(), 3);
         assert_eq!(
             tasks.list_briefs_by_mandate(&m, 50).unwrap().len(),
             after_first,
@@ -3325,7 +3433,15 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            2
+            3
+        );
+        // The subject marker (per active agent) is recorded too.
+        assert!(
+            markers.iter().any(|mk| mk
+                .as_str()
+                .unwrap_or("")
+                .contains(":role:engineer:subject:")),
+            "the subject marker must be present: {second}"
         );
     }
 
@@ -3338,7 +3454,7 @@ mod tests {
         let spine = SpineStore::in_memory().unwrap();
         let (m, _agent) = ready_team(&agents, &spine, "engineer");
         let first = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
-        assert_eq!(first["created_briefs"].as_array().unwrap().len(), 2);
+        assert_eq!(first["created_briefs"].as_array().unwrap().len(), 3);
         let before = tasks.list_briefs_by_mandate(&m, 50).unwrap().len();
         // Rename the Mandate (changes the would-be Brief titles).
         spine
@@ -3349,7 +3465,7 @@ mod tests {
             second["created_briefs"].as_array().unwrap().is_empty(),
             "a rename must not duplicate the tree"
         );
-        assert_eq!(second["existing_briefs"].as_array().unwrap().len(), 2);
+        assert_eq!(second["existing_briefs"].as_array().unwrap().len(), 3);
         assert_eq!(
             tasks.list_briefs_by_mandate(&m, 50).unwrap().len(),
             before,
@@ -3366,7 +3482,7 @@ mod tests {
         let (m, _agent) = ready_team(&agents, &spine, "engineer");
         orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
         let cards = tasks.list_briefs_by_mandate(&m, 50).unwrap();
-        assert_eq!(cards.len(), 2);
+        assert_eq!(cards.len(), 3);
         // An operator renames every Brief by hand.
         for c in &cards {
             tasks
@@ -3378,10 +3494,10 @@ mod tests {
             second["created_briefs"].as_array().unwrap().is_empty(),
             "manual title edits must not duplicate the tree"
         );
-        assert_eq!(second["existing_briefs"].as_array().unwrap().len(), 2);
+        assert_eq!(second["existing_briefs"].as_array().unwrap().len(), 3);
         // The user's hand-edited titles are preserved (not clobbered).
         let after = tasks.list_briefs_by_mandate(&m, 50).unwrap();
-        assert_eq!(after.len(), 2);
+        assert_eq!(after.len(), 3);
         assert!(
             after.iter().all(|c| c.title.starts_with("Hand-edited ")),
             "a reused Brief's title must not be overwritten"
@@ -3408,29 +3524,37 @@ mod tests {
                 &parent_marker,
             )
             .unwrap();
-        // Rerun: parent is reused, the engineering child is created.
+        // Rerun: parent is reused; the role track + subject Brief are the
+        // only missing tiers created.
         let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
         let created = v["created_briefs"].as_array().unwrap();
         let existing = v["existing_briefs"].as_array().unwrap();
-        assert_eq!(created.len(), 1, "only the missing child is created");
+        assert_eq!(
+            created.len(),
+            2,
+            "only the missing role track + subject are created"
+        );
         assert_eq!(existing.len(), 1, "the pre-existing parent is reused");
         assert_eq!(existing[0]["task_id"], parent_id);
         assert_eq!(
             tasks.list_briefs_by_mandate(&m, 50).unwrap().len(),
-            2,
+            3,
             "no duplicate parent"
         );
     }
 
     #[test]
     fn orchestrate_reuses_child_with_different_title() {
-        // A child that already exists under its marker but with a
-        // different title is reused, not recreated.
+        // A role-only marker that already exists (with a bespoke title) is
+        // reused as the role-track Brief, not recreated. This is also the
+        // back-compat path: the previous slice's role-only child becomes
+        // the role track.
         let tasks = TaskStore::in_memory().unwrap();
         let agents = store();
         let spine = SpineStore::in_memory().unwrap();
         let (m, _agent) = ready_team(&agents, &spine, "engineer");
-        // Pre-seed the engineering child with a bespoke title + marker.
+        // Pre-seed the engineering role-track with a bespoke title + the
+        // legacy role-only marker.
         let child_marker = format!("mandate:{m}:role:engineer");
         let child_id = tasks
             .create_brief_with_marker(
@@ -3443,17 +3567,203 @@ mod tests {
             )
             .unwrap();
         let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
-        // The parent is new; the child is reused by marker despite its
-        // unrelated title.
-        assert_eq!(v["created_briefs"].as_array().unwrap().len(), 1);
+        // Parent + subject Brief are new; the legacy role-only child is
+        // reused as the role track despite its unrelated title.
+        assert_eq!(v["created_briefs"].as_array().unwrap().len(), 2);
         let existing = v["existing_briefs"].as_array().unwrap();
         assert!(
             existing
                 .iter()
                 .any(|b| b["task_id"] == serde_json::json!(child_id)),
-            "the marked child must be reused: {v}"
+            "the legacy role-only child must be reused as the role track: {v}"
         );
-        assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), 2);
+        assert_eq!(v["role_tracks_existing"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            v["role_tracks_existing"][0]["task_id"],
+            serde_json::json!(child_id)
+        );
+        assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), 3);
+    }
+
+    // ── Subject-aware marker tests (company-model §4.6) ──────────
+
+    #[test]
+    fn orchestrate_same_agent_rerun_reuses_subject_brief() {
+        // Same role + same agent on a rerun → no duplicate subject Brief.
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, _agent) = ready_team(&agents, &spine, "engineer");
+        let first = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        assert_eq!(first["subject_briefs_created"].as_array().unwrap().len(), 1);
+        let before = tasks.list_briefs_by_mandate(&m, 50).unwrap().len();
+        let second = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        assert!(
+            second["subject_briefs_created"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            second["subject_briefs_existing"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            tasks.list_briefs_by_mandate(&m, 50).unwrap().len(),
+            before,
+            "the subject Brief is reused, not duplicated"
+        );
+    }
+
+    #[test]
+    fn orchestrate_changed_agent_makes_new_subject_reuses_role_track() {
+        // A different active agent for the same role → a NEW subject Brief
+        // but the SAME role-track Brief is reused.
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, agent_a) = ready_team(&agents, &spine, "engineer");
+        let first = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        let role_id = first["role_tracks_created"][0]["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let subject_a = first["subject_briefs_created"][0]["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Swap the active engineer to a brand-new agent on the same plan.
+        let agent_b = agents
+            .create_agent(
+                "Worker2", "engineer", "W2", "eng", "eng", "prime", "subj-rt2", "medium", "default",
+            )
+            .unwrap();
+        assert_ne!(agent_a, agent_b);
+        let hires = format!("[{{\"role\":\"engineer\",\"agent_id\":\"{agent_b}\"}}]");
+        spine
+            .record_team_plan(&crate::nodes::coordinator::spine::store::TeamPlanRecord {
+                tenant_id: "default",
+                mandate_id: &m,
+                actor_id: "operator",
+                description: "build it",
+                proposed_roles_json: "[]",
+                pending_hires_json: &hires,
+                clearance_ids_json: "[]",
+                denials_json: "[]",
+                next_steps_json: "[]",
+                status: "staffing",
+            })
+            .unwrap();
+        let second = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        // Role track reused (same id); a new subject Brief for agent_b.
+        assert_eq!(second["role_tracks_existing"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            second["role_tracks_existing"][0]["task_id"],
+            serde_json::json!(role_id)
+        );
+        assert_eq!(
+            second["subject_briefs_created"].as_array().unwrap().len(),
+            1
+        );
+        let subject_b = second["subject_briefs_created"][0]["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(
+            subject_a, subject_b,
+            "a changed agent gets its own subject Brief"
+        );
+        // The new subject Brief is assigned to agent_b.
+        assert_eq!(
+            second["assigned_briefs"][0]["agent_id"],
+            serde_json::json!(agent_b)
+        );
+        assert_eq!(
+            second["assigned_briefs"][0]["task_id"],
+            serde_json::json!(subject_b)
+        );
+        // Tree now has parent + role track + 2 subject Briefs.
+        assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn orchestrate_reuses_manually_renamed_subject_brief() {
+        // A hand-renamed subject Brief is still reused by marker.
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, _agent) = ready_team(&agents, &spine, "engineer");
+        let first = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        let subject_id = first["subject_briefs_created"][0]["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        tasks
+            .set_brief_field(&subject_id, "title", "My hand-named execution Brief")
+            .unwrap();
+        let second = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        assert!(
+            second["subject_briefs_created"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            second["subject_briefs_existing"][0]["task_id"],
+            serde_json::json!(subject_id)
+        );
+        // The hand-named title survives the rerun.
+        let card = tasks
+            .list_briefs_by_mandate(&m, 50)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.task_id == subject_id)
+            .unwrap();
+        assert_eq!(card.title, "My hand-named execution Brief");
+    }
+
+    #[test]
+    fn orchestrate_partial_crash_role_track_only_creates_subject() {
+        // Crash left a role-track Brief but no subject Brief: a rerun
+        // creates only the missing subject Brief.
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, _agent) = ready_team(&agents, &spine, "engineer");
+        // Hand-create parent + role track with their stable markers.
+        let parent_id = tasks
+            .create_brief_with_marker(
+                "default",
+                "Execute Mandate: Ship",
+                "operator",
+                Some(&m),
+                "mandate_orchestration",
+                &format!("mandate:{m}:parent"),
+            )
+            .unwrap();
+        let role_id = tasks
+            .create_brief_with_marker(
+                "default",
+                "Engineering track: Ship",
+                "operator",
+                Some(&m),
+                "mandate_orchestration",
+                &format!("mandate:{m}:role:engineer"),
+            )
+            .unwrap();
+        let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
+        // Only the subject Brief is created; parent + role track reused.
+        assert_eq!(v["created_briefs"].as_array().unwrap().len(), 1);
+        assert_eq!(v["subject_briefs_created"].as_array().unwrap().len(), 1);
+        let existing_ids: Vec<&str> = v["existing_briefs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["task_id"].as_str().unwrap())
+            .collect();
+        assert!(existing_ids.contains(&parent_id.as_str()));
+        assert!(existing_ids.contains(&role_id.as_str()));
+        assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), 3);
     }
 
     #[test]
@@ -3489,7 +3799,9 @@ mod tests {
         let (m, _a) = ready_team(&agents, &spine, "engineer");
         let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|create_briefs"));
         assert_eq!(v["status"], "created");
-        assert_eq!(v["created_briefs"].as_array().unwrap().len(), 2);
+        assert_eq!(v["created_briefs"].as_array().unwrap().len(), 3);
+        // The subject Brief is created but left unassigned in this mode.
+        assert_eq!(v["subject_briefs_created"].as_array().unwrap().len(), 1);
         assert!(
             v["assigned_briefs"].as_array().unwrap().is_empty(),
             "create_briefs must not assign"
@@ -3530,7 +3842,7 @@ mod tests {
         ));
         let v: serde_json::Value = serde_json::from_slice(&body.into_bytes()).unwrap();
         // Briefs were created (creation is not assign-gated) ...
-        assert_eq!(v["created_briefs"].as_array().unwrap().len(), 2);
+        assert_eq!(v["created_briefs"].as_array().unwrap().len(), 3);
         // ... but the assignment was refused by the assign-Key gate.
         assert!(v["assigned_briefs"].as_array().unwrap().is_empty());
         assert!(

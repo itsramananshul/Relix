@@ -598,8 +598,15 @@ function renderOrchestration(host, run) {
   const box = node("div",{className:"event",style:"margin-top:8px"});
   box.append(node("strong",{textContent:"Orchestration: "+(run.status||"")+" ("+(run.mode||"")+(run.dry_run?", dry-run":"")+")"}));
   const ids = a => (a||[]).map(x => (x.task_id||x)).join(", ") || "none";
-  box.append(node("div",{textContent:"Created: "+ids(run.created_brief_ids)}));
-  box.append(node("div",{className:"muted",textContent:"Reused (existing): "+ids(run.existing_brief_ids)}));
+  // Classify each Brief by the tier encoded in its stable source marker
+  // (works for both the persisted run and the live response).
+  const tier = mk => { mk = mk||""; if (mk.endsWith(":parent")) return "parent"; if (mk.indexOf(":subject:")>=0) return "subject"; if (mk.indexOf(":role:")>=0) return "role"; return "other"; };
+  const split = arr => { const g={parent:[],role:[],subject:[],other:[]}; (arr||[]).forEach(x => g[x && x.marker ? tier(x.marker) : "other"].push(x)); return g; };
+  const created = split(run.created_brief_ids), existing = split(run.existing_brief_ids);
+  const parent = created.parent[0] || existing.parent[0];
+  box.append(node("div",{textContent:"Parent: "+(parent ? (parent.task_id||parent) : "none")}));
+  box.append(node("div",{textContent:"Role tracks — created: "+ids(created.role)+" · reused: "+ids(existing.role)}));
+  box.append(node("div",{textContent:"Subject execution — created: "+ids(created.subject)+" · reused: "+ids(existing.subject)}));
   box.append(node("div",{textContent:"Assigned: "+ids(run.assigned_brief_ids)}));
   if ((run.skipped||[]).length) box.append(node("div",{className:"muted",textContent:"Skipped: "+run.skipped.map(s=>s.reason||JSON.stringify(s)).join(", ")}));
   if ((run.blockers||[]).length) box.append(node("div",{className:"err",textContent:"Blockers: "+run.blockers.map(b=>b.reason||JSON.stringify(b)).join(", ")}));
@@ -650,7 +657,7 @@ async function teamPlanBlock(mandateId) {
     try {
       const r = await post("/v1/spine/mandates/"+encodeURIComponent(mandateId)+"/orchestrate", {mode});
       oout.className = "event"; oout.textContent = "";
-      renderOrchestration(oout, {status:r.status, mode:r.mode, dry_run:r.dry_run, created_brief_ids:r.created_briefs, existing_brief_ids:r.existing_briefs, assigned_brief_ids:r.assigned_briefs, skipped:r.skipped, blockers:r.blockers, next_actions:r.next_actions});
+      renderOrchestration(oout, {status:r.status, mode:r.mode, dry_run:r.dry_run, created_brief_ids:r.created_briefs, existing_brief_ids:r.existing_briefs, assigned_brief_ids:r.assigned_briefs, skipped:r.skipped, blockers:r.blockers, next_actions:r.next_actions, source_markers:r.source_markers});
       await refresh();        // refresh board/inbox counts
       await openMandate(mandateId);  // re-render the panel (shows persisted run)
     } catch(e) { oout.className = "event err"; oout.textContent = e.message; }
