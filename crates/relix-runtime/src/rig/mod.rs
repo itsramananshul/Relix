@@ -654,6 +654,11 @@ pub enum RigOutputFormat {
     /// (Relix runs Claude noninteractively, so tool approvals are NOT
     /// auto-granted — file/command actions are blocked + reported).
     ClaudeStreamJson,
+    /// Parse Codex CLI `exec --json` JSONL: extract the LAST
+    /// `item.completed` of `item.type == "agent_message"` (the model's
+    /// final answer) as the summary, and map an `error` / `turn.failed` /
+    /// `thread.error` event to a failure.
+    CodexJsonl,
 }
 
 /// The fields Relix reads from Claude Code's terminal `result` event.
@@ -714,6 +719,87 @@ pub fn parse_claude_stream_json(stdout: &str) -> Option<ClaudeRunResult> {
         });
     }
     found
+}
+
+/// The fields Relix reads from a Codex `exec --json` (JSONL) stream.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodexRunResult {
+    /// The model's final answer — the text of the LAST `item.completed`
+    /// whose `item.type == "agent_message"`.
+    pub text: String,
+    /// A run-level error message, if Codex reported one (`error` /
+    /// `turn.failed` / `thread.error` event, or an `error` item). `None`
+    /// on a clean run.
+    pub error: Option<String>,
+    /// Whether a terminal event (`turn.completed` / `turn.failed`) was
+    /// seen — i.e. the JSONL stream really came from Codex exec.
+    pub saw_terminal: bool,
+}
+
+/// Parse Codex CLI `exec --json` (JSONL) stdout. The stream is
+/// `thread.started` → `turn.started` → one or more `item.completed`
+/// (reasoning / command_execution / file_change / **agent_message**) →
+/// `turn.completed`. We take the LAST `agent_message` item's text as the
+/// answer and surface any error/failure event. Returns `None` only when
+/// the output carries no recognizable Codex event (so the caller falls
+/// back to exit-code handling). Pure + line-driven → unit-testable.
+pub fn parse_codex_jsonl(stdout: &str) -> Option<CodexRunResult> {
+    let mut result = CodexRunResult::default();
+    let mut saw_any = false;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(ty) = v.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        saw_any = true;
+        match ty {
+            "item.completed" | "item.updated" => {
+                let item = v.get("item");
+                let item_ty = item
+                    .and_then(|i| i.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                if item_ty == "agent_message" {
+                    if let Some(t) = item.and_then(|i| i.get("text")).and_then(|t| t.as_str()) {
+                        result.text = t.to_string();
+                    }
+                } else if item_ty == "error" {
+                    let msg = item
+                        .and_then(|i| i.get("message").or_else(|| i.get("text")))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("codex item error");
+                    result.error = Some(msg.to_string());
+                }
+            }
+            "error" | "thread.error" | "turn.failed" => {
+                // Pull a human message from common shapes.
+                let msg = v
+                    .get("message")
+                    .or_else(|| v.get("error").and_then(|e| e.get("message")))
+                    .or_else(|| v.get("error"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("codex run failed")
+                    .to_string();
+                result.error = Some(msg);
+                result.saw_terminal = true;
+            }
+            "turn.completed" => {
+                result.saw_terminal = true;
+            }
+            _ => {}
+        }
+    }
+    if saw_any || result.saw_terminal {
+        Some(result)
+    } else {
+        None
+    }
 }
 
 pub struct ProcessRig {
@@ -1111,6 +1197,11 @@ impl Rig for ProcessRig {
                 {
                     return outcome;
                 }
+                if matches!(self.output_format, RigOutputFormat::CodexJsonl)
+                    && let Some(outcome) = self.codex_outcome(&raw_stdout, &req.bridge_token)
+                {
+                    return outcome;
+                }
                 if status.success() {
                     RigOutcome::Done { summary: stdout }
                 } else {
@@ -1166,6 +1257,34 @@ impl ProcessRig {
             )
         } else if text.is_empty() {
             "claude completed with no text output".to_string()
+        } else {
+            text
+        };
+        Some(RigOutcome::Done { summary })
+    }
+
+    /// Map Codex `exec --json` JSONL stdout to a [`RigOutcome`]. Parses
+    /// the stream (off the raw, pre-redaction stdout so the JSON parses),
+    /// then redacts + caps only the extracted answer:
+    /// - an error / `turn.failed` event → a clear, non-retryable failure.
+    /// - otherwise → `Done` with the model's final `agent_message`; when
+    ///   Codex produced no message, a short honest note. Sandbox-blocked
+    ///   commands surface inside Codex's own final message.
+    ///
+    /// Returns `None` when the output has no recognizable Codex event, so
+    /// the caller falls back to exit-code handling (never fakes success).
+    fn codex_outcome(&self, raw_stdout: &str, bridge_token: &str) -> Option<RigOutcome> {
+        let parsed = parse_codex_jsonl(raw_stdout)?;
+        if let Some(err) = parsed.error {
+            let err = self.cap(redact_secrets(err.trim(), bridge_token));
+            return Some(RigOutcome::Failed {
+                reason: format!("codex: {err}"),
+                retryable: false,
+            });
+        }
+        let text = self.cap(redact_secrets(parsed.text.trim(), bridge_token));
+        let summary = if text.is_empty() {
+            "codex completed with no agent message".to_string()
         } else {
             text
         };
@@ -1573,8 +1692,9 @@ fn command_for(spawn: &Spawnable, args: &[String]) -> std::process::Command {
 // agents on a flat-rate Claude Max / ChatGPT (Codex) / Gemini
 // subscription instead of metered API. Availability + login probing
 // is implemented (see `ProcessRig::probe`), and Claude's `stream-json`
-// output IS parsed into a clean result (`RigOutputFormat::ClaudeStreamJson`
-// → `parse_claude_stream_json`); Codex/Gemini still return raw stdout.
+// AND Codex's `exec --json` JSONL are parsed into clean results
+// (`RigOutputFormat::ClaudeStreamJson` / `CodexJsonl`); Gemini still
+// returns raw stdout.
 
 /// Absolute fallback paths to a real `claude` executable that PATH may
 /// not surface. On Windows, npm installs Claude Code as a `claude.cmd`
@@ -1636,18 +1756,42 @@ pub fn claude_rig() -> ProcessRig {
     rig
 }
 
-/// Codex on a ChatGPT / Codex subscription. Prompt piped via the
-/// trailing `-` (read from stdin).
+/// Codex on a ChatGPT / Codex subscription. Runs **noninteractively** via
+/// `codex exec` with the Brief prompt on **stdin** (trailing `-`):
+///
+/// - `--json` → JSONL events on stdout (parsed by `parse_codex_jsonl`).
+/// - `--sandbox workspace-write` → the model's shell commands may write
+///   ONLY within the working directory (Relix pins that to the scoped run
+///   workspace), so real coding work happens **confined to the sandbox**,
+///   never the repo. (Verified live: writes stayed inside the run dir.)
+/// - `--skip-git-repo-check` → a scoped workspace is not a git repo;
+///   without this Codex can refuse to run.
+///
+/// Readiness is two-step: `codex --version` (installed) then
+/// `codex login status` (auth — "Logged in using ChatGPT" → available;
+/// "Not logged in" → `not_authenticated`).
 pub fn codex_rig() -> ProcessRig {
     ProcessRig::new(
         "codex",
         "codex",
-        vec!["exec".to_string(), "--json".to_string(), "-".to_string()],
+        vec![
+            "exec".to_string(),
+            "--json".to_string(),
+            "--sandbox".to_string(),
+            "workspace-write".to_string(),
+            "--skip-git-repo-check".to_string(),
+            "-".to_string(),
+        ],
     )
     .with_structured_output(true)
+    .with_output_format(RigOutputFormat::CodexJsonl)
     .with_billing(RigBilling::subscription("openai", "5h/weekly/credits"))
     .with_install_hint("install Codex CLI, then run `codex login`")
-    .with_readiness(vec!["--version".to_string()], "run `codex login` to authenticate")
+    .with_readiness(
+        vec!["--version".to_string()],
+        "run `codex login` to authenticate (check with `codex login status`)",
+    )
+    .with_auth_probe(vec!["login".to_string(), "status".to_string()])
 }
 
 /// Gemini CLI on a Google subscription. Prompt piped to stdin.
@@ -2499,5 +2643,108 @@ mod tests {
                 rig.fallback_paths
             );
         }
+    }
+
+    // ── Codex exec --json result parsing ────────────────────────
+
+    // A representative `codex exec --json` JSONL stream: thread/turn
+    // bookkeeping, an interim item, the final agent_message, turn done.
+    fn codex_jsonl(agent_message: &str) -> String {
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"item.completed","item":{"id":"i0","type":"reasoning","text":"thinking"}}"#,
+            format!(
+                r#"{{"type":"item.completed","item":{{"id":"i1","type":"agent_message","text":{}}}}}"#,
+                serde_json::to_string(agent_message).unwrap()
+            ),
+            r#"{"type":"turn.completed","usage":{"input_tokens":26335,"output_tokens":21}}"#,
+        )
+    }
+
+    #[test]
+    fn parse_codex_jsonl_extracts_last_agent_message() {
+        let jsonl = codex_jsonl("Relix Codex test passed");
+        let r = parse_codex_jsonl(&jsonl).expect("a codex stream");
+        assert_eq!(r.text, "Relix Codex test passed");
+        assert!(r.error.is_none());
+        assert!(r.saw_terminal, "turn.completed seen");
+    }
+
+    #[test]
+    fn parse_codex_jsonl_surfaces_error_events() {
+        for jsonl in [
+            r#"{"type":"thread.started"}
+{"type":"turn.failed","error":{"message":"model overloaded"}}"#,
+            r#"{"type":"error","message":"sandbox denied write outside workspace"}"#,
+            r#"{"type":"item.completed","item":{"type":"error","message":"command failed"}}"#,
+        ] {
+            let r = parse_codex_jsonl(jsonl).expect("codex stream");
+            assert!(r.error.is_some(), "should carry an error for: {jsonl}");
+        }
+    }
+
+    #[test]
+    fn parse_codex_jsonl_none_without_events() {
+        assert!(parse_codex_jsonl("not json\n\n{bad").is_none());
+        assert!(parse_codex_jsonl("").is_none());
+    }
+
+    fn codex_test_rig() -> ProcessRig {
+        ProcessRig::new("codex", "codex", vec![])
+            .with_output_format(RigOutputFormat::CodexJsonl)
+    }
+
+    #[test]
+    fn codex_outcome_success_returns_clean_answer() {
+        let jsonl = codex_jsonl("Created `codex-note.txt` containing `hello`.");
+        match codex_test_rig().codex_outcome(&jsonl, "") {
+            Some(RigOutcome::Done { summary }) => {
+                assert_eq!(summary, "Created `codex-note.txt` containing `hello`.");
+                assert!(!summary.contains("thread.started"), "no JSONL noise");
+                assert!(!summary.contains("\"type\""), "no raw JSON in the summary");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_outcome_error_is_a_clear_failure() {
+        let jsonl = r#"{"type":"turn.failed","error":{"message":"model overloaded"}}"#;
+        match codex_test_rig().codex_outcome(jsonl, "") {
+            Some(RigOutcome::Failed { reason, retryable }) => {
+                assert!(!retryable);
+                assert!(reason.contains("codex:"), "reason: {reason}");
+                assert!(reason.contains("model overloaded"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_outcome_none_without_events_falls_through() {
+        assert!(codex_test_rig().codex_outcome("plain text, no json", "").is_none());
+    }
+
+    #[test]
+    fn codex_rig_uses_jsonl_parser_safe_sandbox_and_auth_check() {
+        let rig = codex_rig();
+        assert_eq!(rig.output_format, RigOutputFormat::CodexJsonl);
+        // Safe, noninteractive, confined command shape — no shell strings.
+        let args = rig.args();
+        assert_eq!(args.first().map(String::as_str), Some("exec"));
+        assert!(args.iter().any(|a| a == "--json"));
+        assert!(args.iter().any(|a| a == "--sandbox"));
+        assert!(args.iter().any(|a| a == "workspace-write"));
+        assert!(args.iter().any(|a| a == "--skip-git-repo-check"));
+        assert_eq!(args.last().map(String::as_str), Some("-"));
+        // Two-step readiness: --version + `login status`.
+        let r = rig.readiness.as_ref().expect("codex has readiness");
+        assert_eq!(r.probe_args, vec!["--version".to_string()]);
+        assert_eq!(
+            r.auth_args.as_deref(),
+            Some(&["login".to_string(), "status".to_string()][..])
+        );
     }
 }
