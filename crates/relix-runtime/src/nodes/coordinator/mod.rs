@@ -2549,6 +2549,7 @@ impl TaskStore {
         kind: &str,
         size: i64,
         hash: Option<&str>,
+        baseline_hash: Option<&str>,
         is_text: bool,
     ) -> Result<bool, CoordinatorError> {
         let now = unix_secs();
@@ -2565,8 +2566,9 @@ impl TaskStore {
         }
         conn.execute(
             "INSERT INTO run_artifacts
-                 (run_id, brief_id, workspace, rel_path, kind, size, hash, is_text, captured_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (run_id, brief_id, workspace, rel_path, kind, size, hash,
+                  baseline_hash, is_text, captured_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 run_id,
                 brief_id,
@@ -2575,12 +2577,44 @@ impl TaskStore {
                 kind,
                 size,
                 hash,
+                baseline_hash,
                 i64::from(is_text),
                 now
             ],
         )
         .map_err(CoordinatorError::Db)?;
         Ok(true)
+    }
+
+    /// Record the durable outcome of a safe-apply attempt on a run. `status`
+    /// is one of not_applicable / blocked / ready / applied / failed /
+    /// conflicted; `applied_files` / `failed_files` count what the last
+    /// attempt actually wrote. Stamps `applied_at` whenever a terminal
+    /// apply state is recorded.
+    pub fn set_run_apply_status(
+        &self,
+        run_id: &str,
+        status: &str,
+        note: &str,
+        applied_files: i64,
+        failed_files: i64,
+    ) -> Result<(), CoordinatorError> {
+        let now = unix_secs();
+        let note = clamp_bytes(note, MAX_RUN_EVENT_FIELD_BYTES);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let affected = conn
+            .execute(
+                "UPDATE brief_runs
+                 SET apply_status = ?1, apply_note = ?2, applied_at = ?3,
+                     applied_files = ?4, failed_files = ?5
+                 WHERE run_id = ?6",
+                params![status, note, now, applied_files, failed_files, run_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+        if affected == 0 {
+            return Err(CoordinatorError::NotFound(run_id.to_string()));
+        }
+        Ok(())
     }
 
     /// All artifacts for a run (the changed-files list). Ordered by path.
@@ -2592,7 +2626,7 @@ impl TaskStore {
         let mut stmt = conn
             .prepare(
                 "SELECT artifact_id, run_id, brief_id, workspace, rel_path, kind, size, hash,
-                        is_text, captured_at
+                        baseline_hash, is_text, captured_at
                  FROM run_artifacts WHERE run_id = ?1
                  ORDER BY rel_path ASC, artifact_id ASC",
             )
@@ -2618,7 +2652,7 @@ impl TaskStore {
         let row = conn
             .query_row(
                 "SELECT artifact_id, run_id, brief_id, workspace, rel_path, kind, size, hash,
-                        is_text, captured_at
+                        baseline_hash, is_text, captured_at
                  FROM run_artifacts WHERE run_id = ?1 AND artifact_id = ?2",
                 params![run_id, artifact_id],
                 RunArtifact::from_row,
@@ -2681,7 +2715,8 @@ impl TaskStore {
             .prepare(
                 "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary,
                         workspace, workspace_context, workspace_files, workspace_bytes,
-                        review, review_note, reviewed_at
+                        review, review_note, reviewed_at,
+                        apply_status, applied_at, apply_note, applied_files, failed_files
                  FROM brief_runs
                  ORDER BY started_at DESC, rowid DESC
                  LIMIT ?1",
@@ -2710,7 +2745,8 @@ impl TaskStore {
             .prepare(
                 "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary,
                         workspace, workspace_context, workspace_files, workspace_bytes,
-                        review, review_note, reviewed_at
+                        review, review_note, reviewed_at,
+                        apply_status, applied_at, apply_note, applied_files, failed_files
                  FROM brief_runs
                  WHERE brief_id = ?1
                  ORDER BY started_at DESC, rowid DESC
@@ -2734,7 +2770,8 @@ impl TaskStore {
             .query_row(
                 "SELECT run_id, brief_id, agent_id, rig, status, started_at, finished_at, summary,
                         workspace, workspace_context, workspace_files, workspace_bytes,
-                        review, review_note, reviewed_at
+                        review, review_note, reviewed_at,
+                        apply_status, applied_at, apply_note, applied_files, failed_files
                  FROM brief_runs WHERE run_id = ?1",
                 params![run_id],
                 RunRecord::from_row,
@@ -7430,6 +7467,18 @@ pub struct RunRecord {
     pub review_note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reviewed_at: Option<i64>,
+    /// Safe-apply state: not_applicable / blocked / ready / applied /
+    /// failed / conflicted. `None` = never attempted / legacy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apply_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apply_note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_files: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_files: Option<i64>,
 }
 
 /// One reviewable run artifact (`run_artifacts`) — metadata about a file
@@ -7450,6 +7499,11 @@ pub struct RunArtifact {
     pub size: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    /// BEFORE-run content hash (for `modified` / `deleted`) — used by
+    /// safe-apply conflict detection. `None` for `created`, big files,
+    /// or legacy rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_hash: Option<String>,
     pub is_text: bool,
     pub captured_at: i64,
 }
@@ -7465,8 +7519,9 @@ impl RunArtifact {
             kind: r.get(5)?,
             size: r.get(6)?,
             hash: r.get(7)?,
-            is_text: r.get::<_, i64>(8)? != 0,
-            captured_at: r.get(9)?,
+            baseline_hash: r.get(8)?,
+            is_text: r.get::<_, i64>(9)? != 0,
+            captured_at: r.get(10)?,
         })
     }
 }
@@ -7546,6 +7601,11 @@ impl RunRecord {
             review: r.get(12)?,
             review_note: r.get(13)?,
             reviewed_at: r.get(14)?,
+            apply_status: r.get(15)?,
+            applied_at: r.get(16)?,
+            apply_note: r.get(17)?,
+            applied_files: r.get(18)?,
+            failed_files: r.get(19)?,
         })
     }
 }
@@ -12134,6 +12194,16 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             review       TEXT,
             review_note  TEXT,
             reviewed_at  INTEGER,
+            -- Safe-apply ledger (apply an accepted run's changed files back
+            -- into the configured project root). `apply_status` is one of
+            -- not_applicable / blocked / ready / applied / failed /
+            -- conflicted. NULL = never attempted. `applied_files` /
+            -- `failed_files` count what the last apply actually wrote.
+            apply_status  TEXT,
+            applied_at    INTEGER,
+            apply_note    TEXT,
+            applied_files INTEGER,
+            failed_files  INTEGER,
             FOREIGN KEY (brief_id) REFERENCES tasks(task_id)
         );
         CREATE INDEX IF NOT EXISTS brief_runs_by_brief
@@ -12155,6 +12225,11 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             kind         TEXT NOT NULL,   -- created / modified / deleted
             size         INTEGER NOT NULL DEFAULT 0,
             hash         TEXT,
+            -- The BEFORE-run content hash of this path (for `modified` /
+            -- `deleted`), used by safe-apply conflict detection to confirm
+            -- the project-root file still matches what the run started from.
+            -- NULL for `created`, for files too large to hash, or legacy rows.
+            baseline_hash TEXT,
             is_text      INTEGER NOT NULL DEFAULT 0,
             captured_at  INTEGER NOT NULL
         );
@@ -12344,6 +12419,14 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         "ALTER TABLE brief_runs ADD COLUMN review TEXT",
         "ALTER TABLE brief_runs ADD COLUMN review_note TEXT",
         "ALTER TABLE brief_runs ADD COLUMN reviewed_at INTEGER",
+        // Safe-apply ledger (apply accepted run changes to the project root).
+        "ALTER TABLE brief_runs ADD COLUMN apply_status TEXT",
+        "ALTER TABLE brief_runs ADD COLUMN applied_at INTEGER",
+        "ALTER TABLE brief_runs ADD COLUMN apply_note TEXT",
+        "ALTER TABLE brief_runs ADD COLUMN applied_files INTEGER",
+        "ALTER TABLE brief_runs ADD COLUMN failed_files INTEGER",
+        // BEFORE-run hash on each artifact (safe-apply conflict detection).
+        "ALTER TABLE run_artifacts ADD COLUMN baseline_hash TEXT",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the

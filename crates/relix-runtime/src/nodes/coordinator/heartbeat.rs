@@ -974,6 +974,11 @@ pub struct ArtifactChange {
     pub kind: &'static str,
     pub size: u64,
     pub hash: Option<String>,
+    /// BEFORE-run content hash (the baseline) for `modified` / `deleted` —
+    /// `None` for `created` and for files too large to hash. Persisted on
+    /// the artifact so safe-apply can confirm the project-root file still
+    /// matches what the run started from.
+    pub baseline_hash: Option<String>,
     pub is_text: bool,
 }
 
@@ -990,6 +995,7 @@ pub fn diff_manifests(before: &WorkspaceManifest, after: &WorkspaceManifest) -> 
                 kind: "created",
                 size: sig.size,
                 hash: sig.hash.map(|h| format!("{h:016x}")),
+                baseline_hash: None,
                 is_text: sig.is_text,
             }),
             Some(prev) if prev != sig => out.push(ArtifactChange {
@@ -997,6 +1003,7 @@ pub fn diff_manifests(before: &WorkspaceManifest, after: &WorkspaceManifest) -> 
                 kind: "modified",
                 size: sig.size,
                 hash: sig.hash.map(|h| format!("{h:016x}")),
+                baseline_hash: prev.hash.map(|h| format!("{h:016x}")),
                 is_text: sig.is_text,
             }),
             Some(_) => {} // unchanged — not an artifact
@@ -1009,6 +1016,7 @@ pub fn diff_manifests(before: &WorkspaceManifest, after: &WorkspaceManifest) -> 
                 kind: "deleted",
                 size: 0,
                 hash: None,
+                baseline_hash: sig.hash.map(|h| format!("{h:016x}")),
                 is_text: sig.is_text,
             });
         }
@@ -1067,6 +1075,376 @@ pub fn read_artifact_preview(
         content: crate::rig::redact_secrets(&raw, ""),
         truncated,
     }
+}
+
+// ── Safe apply: copy an accepted run's changed files into the project ──
+//
+// (relix-execution-and-issue-design — recovery / result handling.) After an
+// operator ACCEPTS a run, its changed files can be applied back into the
+// configured project root. The design philosophy is conservative: validate
+// every path, compare each target against the run's baseline, and refuse the
+// WHOLE apply if ANYTHING is unsafe — better to refuse than overwrite blindly.
+
+/// Largest file safe-apply will hash to verify a target — mirrors
+/// [`ARTIFACT_HASH_MAX_BYTES`]. A file above this can't be content-verified,
+/// so a `modified`/`deleted` of such a file is refused.
+const APPLY_HASH_MAX_BYTES: u64 = ARTIFACT_HASH_MAX_BYTES;
+
+/// One file's plan in a safe apply — what WOULD happen to its project-root
+/// copy. Pure preview; building it never mutates the filesystem.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ApplyPlanItem {
+    pub rel_path: String,
+    /// The run's change: `created` / `modified` / `deleted`.
+    pub kind: String,
+    /// What apply would do: `create` / `overwrite` / `delete` / `noop`
+    /// (target already in the desired state) / `refuse`.
+    pub action: &'static str,
+    /// True iff safe to apply (a `noop` counts as safe).
+    pub can_apply: bool,
+    /// True iff the target diverged from the run's baseline (a real
+    /// conflict, distinct from a structural refusal like a bad path).
+    pub conflict: bool,
+    pub reason: String,
+    pub source_size: u64,
+    pub target_exists: bool,
+}
+
+/// The full safe-apply plan for a run. `applicable` is true only when EVERY
+/// item is safe; otherwise apply refuses the whole run (no partial apply).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ApplyPlan {
+    pub project_root: String,
+    pub items: Vec<ApplyPlanItem>,
+    pub applicable: bool,
+    /// Items that would actually write or delete (excludes noops).
+    pub changes: usize,
+    /// Items refused because the target diverged from baseline.
+    pub conflicts: usize,
+    /// Items refused for a structural reason (bad path / excluded / source
+    /// missing / unverifiable).
+    pub blocked: usize,
+    pub note: String,
+}
+
+/// Outcome of an apply attempt (plan executed, or refused unchanged).
+#[derive(Clone, Debug)]
+pub struct ApplyOutcome {
+    pub plan: ApplyPlan,
+    /// Durable status: `applied` / `conflicted` / `failed`.
+    pub status: &'static str,
+    pub applied_files: usize,
+    pub failed_files: usize,
+    pub errors: Vec<String>,
+}
+
+/// Is a stored artifact `rel_path` safe to apply? It must be a relative,
+/// forward-only path: non-empty, no drive letter, no UNC, no leading
+/// separator, no `.`/`..`/empty component. (Artifacts are stored with `/`
+/// separators; we re-validate defensively and split on BOTH separators so a
+/// `\`-bearing path can't smuggle traversal.)
+fn apply_rel_path_is_safe(rel_path: &str) -> bool {
+    if rel_path.is_empty() || rel_path.starts_with('/') || rel_path.starts_with('\\') {
+        return false;
+    }
+    let b = rel_path.as_bytes();
+    if b.len() >= 2 && b[1] == b':' {
+        return false; // drive-letter (`C:...`)
+    }
+    rel_path
+        .split(['/', '\\'])
+        .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// Is any directory component an excluded dir, or the final component an
+/// excluded file? Safe-apply never writes into `.git`/`target`/… and never
+/// applies secret/key files — the same filter the workspace copy uses.
+fn apply_path_excluded(rel_path: &str) -> bool {
+    let comps: Vec<&str> = rel_path.split(['/', '\\']).collect();
+    let n = comps.len();
+    comps.iter().enumerate().any(|(i, comp)| {
+        if i + 1 == n {
+            is_excluded_file(comp)
+        } else {
+            is_excluded_dir(comp)
+        }
+    })
+}
+
+/// Hash a file with the SAME scheme as [`file_sig`] so a target's hash is
+/// comparable to an artifact's stored before/after hash. `None` if missing,
+/// unreadable, not a regular file, or larger than the hash cap.
+fn hash_file_hex(path: &std::path::Path) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let md = std::fs::symlink_metadata(path).ok()?;
+    if !md.is_file() || md.len() > APPLY_HASH_MAX_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    Some(format!("{:016x}", h.finish()))
+}
+
+/// Resolve `<root_canon>/<rel_path>` to a target path, refusing anything
+/// that escapes the root or traverses a symlink. Every EXISTING component
+/// (including the final one, so a symlinked target file is caught) must not
+/// be a symlink; the first non-existent component ends the check (it'll be
+/// created). `root_canon` must already be canonicalized.
+fn resolve_apply_target(
+    root_canon: &std::path::Path,
+    rel_path: &str,
+) -> Result<std::path::PathBuf, String> {
+    let mut target = root_canon.to_path_buf();
+    for comp in rel_path.split(['/', '\\']) {
+        target.push(comp);
+    }
+    if !target.starts_with(root_canon) {
+        return Err("path escapes the project root".into());
+    }
+    let mut cur = root_canon.to_path_buf();
+    for comp in rel_path.split(['/', '\\']) {
+        cur.push(comp);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(format!("path crosses a symlink: {comp}"));
+            }
+            Ok(_) => {}
+            Err(_) => break, // doesn't exist yet — will be created
+        }
+    }
+    Ok(target)
+}
+
+/// Decide the apply plan for one artifact against the (canonical) project
+/// root. PURE — reads the filesystem to compare hashes, never writes.
+fn plan_one(root_canon: &std::path::Path, art: &super::RunArtifact) -> ApplyPlanItem {
+    let rel = art.rel_path.clone();
+    let kind = art.kind.clone();
+    let mk = |action: &'static str,
+              can_apply: bool,
+              conflict: bool,
+              reason: String,
+              source_size: u64,
+              target_exists: bool| ApplyPlanItem {
+        rel_path: rel.clone(),
+        kind: kind.clone(),
+        action,
+        can_apply,
+        conflict,
+        reason,
+        source_size,
+        target_exists,
+    };
+
+    if !apply_rel_path_is_safe(&rel) {
+        return mk("refuse", false, false, "unsafe path (absolute / traversal / drive / UNC)".into(), 0, false);
+    }
+    if apply_path_excluded(&rel) {
+        return mk("refuse", false, false, "excluded path (vcs/build/secret) — never applied".into(), 0, false);
+    }
+    let target = match resolve_apply_target(root_canon, &rel) {
+        Ok(t) => t,
+        Err(e) => return mk("refuse", false, false, e, 0, false),
+    };
+    let target_exists = std::fs::symlink_metadata(&target).is_ok();
+    let target_hash = hash_file_hex(&target);
+    let source = std::path::Path::new(&art.workspace).join(&rel);
+    let source_md = std::fs::symlink_metadata(&source).ok();
+    let source_size = source_md.as_ref().map(|m| m.len()).unwrap_or(0);
+    let source_is_file = source_md.as_ref().map(|m| m.is_file()).unwrap_or(false);
+
+    match kind.as_str() {
+        "created" => {
+            if !source_is_file {
+                return mk("refuse", false, false, "source file missing in the run workspace".into(), source_size, target_exists);
+            }
+            if !target_exists {
+                return mk("create", true, false, "new file — will be created".into(), source_size, false);
+            }
+            match (art.hash.as_deref(), target_hash.as_deref()) {
+                (Some(s), Some(t)) if s == t => {
+                    mk("noop", true, false, "already present with identical content".into(), source_size, true)
+                }
+                _ => mk("refuse", false, true, "target already exists with different content".into(), source_size, true),
+            }
+        }
+        "modified" => {
+            if !source_is_file {
+                return mk("refuse", false, false, "source file missing in the run workspace".into(), source_size, target_exists);
+            }
+            let Some(src_hash) = art.hash.as_deref() else {
+                return mk("refuse", false, false, "source too large to verify safely".into(), source_size, target_exists);
+            };
+            if !target_exists {
+                return mk("refuse", false, true, "target missing — cannot safely modify".into(), source_size, false);
+            }
+            let Some(tgt_hash) = target_hash.as_deref() else {
+                return mk("refuse", false, true, "target unreadable / too large to verify".into(), source_size, true);
+            };
+            if tgt_hash == src_hash {
+                return mk("noop", true, false, "already updated (identical content)".into(), source_size, true);
+            }
+            match art.baseline_hash.as_deref() {
+                Some(base) if base == tgt_hash => {
+                    mk("overwrite", true, false, "target matches the run baseline — safe to overwrite".into(), source_size, true)
+                }
+                _ => mk("refuse", false, true, "target changed since the run started (or baseline unverifiable)".into(), source_size, true),
+            }
+        }
+        "deleted" => {
+            if !target_exists {
+                return mk("noop", true, false, "already absent".into(), 0, false);
+            }
+            let Some(tgt_hash) = target_hash.as_deref() else {
+                return mk("refuse", false, true, "target unreadable / too large to verify before delete".into(), 0, true);
+            };
+            match art.baseline_hash.as_deref() {
+                Some(base) if base == tgt_hash => {
+                    mk("delete", true, false, "target matches the run baseline — safe to delete".into(), 0, true)
+                }
+                _ => mk("refuse", false, true, "target differs from the run baseline — refusing to delete".into(), 0, true),
+            }
+        }
+        other => mk("refuse", false, false, format!("unknown change kind: {other}"), source_size, target_exists),
+    }
+}
+
+/// Is a run safe-apply eligible? `Ok(())` when it finished cleanly
+/// (`done`), the operator ACCEPTED it, and it ran in a scoped workspace;
+/// `Err(reason)` otherwise. Inherit-mode / legacy / unreviewed / rejected
+/// runs are all refused here — nothing of theirs is ever applied.
+pub fn run_apply_eligibility(run: &super::RunRecord) -> Result<(), String> {
+    if run.status != "done" {
+        return Err(format!("run is `{}`, not `done`", run.status));
+    }
+    if run.review.as_deref() != Some("accepted") {
+        return Err("run is not accepted — review and accept it before applying".to_string());
+    }
+    if run.workspace.is_none() {
+        return Err(
+            "run has no scoped workspace (inherit-mode / legacy) — nothing to apply".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Build the safe-apply plan for a run's artifacts against the configured
+/// project root. PURE — never writes. Returns an error only when the
+/// project root itself is invalid (missing / drive root).
+pub fn build_apply_plan(
+    project_root: &std::path::Path,
+    artifacts: &[super::RunArtifact],
+) -> Result<ApplyPlan, String> {
+    let root_canon = validate_project_root(project_root)?;
+    let mut items: Vec<ApplyPlanItem> =
+        artifacts.iter().map(|a| plan_one(&root_canon, a)).collect();
+    items.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    let applicable = items.iter().all(|i| i.can_apply);
+    let changes = items
+        .iter()
+        .filter(|i| matches!(i.action, "create" | "overwrite" | "delete"))
+        .count();
+    let conflicts = items.iter().filter(|i| i.conflict).count();
+    let blocked = items.iter().filter(|i| !i.can_apply && !i.conflict).count();
+    let note = if items.is_empty() {
+        "no artifacts — nothing to apply".to_string()
+    } else if applicable {
+        format!("{changes} change(s) ready to apply")
+    } else {
+        format!("refusing apply: {conflicts} conflict(s), {blocked} blocked")
+    };
+    Ok(ApplyPlan {
+        project_root: root_canon.to_string_lossy().into_owned(),
+        items,
+        applicable,
+        changes,
+        conflicts,
+        blocked,
+        note,
+    })
+}
+
+/// Execute a safe apply: build the plan, refuse the WHOLE run if any item is
+/// unsafe (no partial apply), otherwise copy `create`/`overwrite` files and
+/// remove `delete` files. Idempotent — an all-`noop` plan writes nothing.
+/// Never follows symlinks; creates parent dirs as needed.
+pub fn apply_run(
+    project_root: &std::path::Path,
+    artifacts: &[super::RunArtifact],
+) -> Result<ApplyOutcome, String> {
+    let plan = build_apply_plan(project_root, artifacts)?;
+    if !plan.applicable {
+        return Ok(ApplyOutcome {
+            plan,
+            status: "conflicted",
+            applied_files: 0,
+            failed_files: 0,
+            errors: Vec::new(),
+        });
+    }
+    let root_canon = validate_project_root(project_root)?;
+    let mut applied = 0usize;
+    let mut failed = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for item in &plan.items {
+        match item.action {
+            "create" | "overwrite" => {
+                let Some(art) = artifacts.iter().find(|a| a.rel_path == item.rel_path) else {
+                    continue;
+                };
+                let target = match resolve_apply_target(&root_canon, &item.rel_path) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        failed += 1;
+                        errors.push(format!("{}: {e}", item.rel_path));
+                        continue;
+                    }
+                };
+                let source = std::path::Path::new(&art.workspace).join(&item.rel_path);
+                if let Some(parent) = target.parent()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    failed += 1;
+                    errors.push(format!("{}: mkdir: {e}", item.rel_path));
+                    continue;
+                }
+                match std::fs::copy(&source, &target) {
+                    Ok(_) => applied += 1,
+                    Err(e) => {
+                        failed += 1;
+                        errors.push(format!("{}: copy: {e}", item.rel_path));
+                    }
+                }
+            }
+            "delete" => {
+                let target = match resolve_apply_target(&root_canon, &item.rel_path) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        failed += 1;
+                        errors.push(format!("{}: {e}", item.rel_path));
+                        continue;
+                    }
+                };
+                match std::fs::remove_file(&target) {
+                    Ok(_) => applied += 1,
+                    Err(e) => {
+                        failed += 1;
+                        errors.push(format!("{}: delete: {e}", item.rel_path));
+                    }
+                }
+            }
+            _ => {} // noop / refuse (refuse can't occur — plan is applicable)
+        }
+    }
+    let status = if failed > 0 { "failed" } else { "applied" };
+    Ok(ApplyOutcome {
+        plan,
+        status,
+        applied_files: applied,
+        failed_files: failed,
+        errors,
+    })
 }
 
 /// Outcome of [`preflight_run`]: either a clear refusal (no command was
@@ -1388,6 +1766,7 @@ pub fn execute_ready(
                 ch.kind,
                 ch.size as i64,
                 ch.hash.as_deref(),
+                ch.baseline_hash.as_deref(),
                 ch.is_text,
             ) {
                 Ok(true) => recorded += 1,
@@ -2819,5 +3198,309 @@ mod tests {
         assert!(s.run_belongs_to_tenant("run_xyz", "guild-a").unwrap());
         assert!(!s.run_belongs_to_tenant("run_xyz", "guild-b").unwrap(), "no cross-tenant access");
         assert!(!s.run_belongs_to_tenant("run_missing", "guild-a").unwrap(), "missing run = false");
+    }
+
+    // ── Safe-apply tests ───────────────────────────────────────────────
+
+    /// Content hash mirroring [`file_sig`] so a test can pin the exact
+    /// baseline/source hash an artifact would carry.
+    fn content_hash(bytes: &[u8]) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        format!("{:016x}", h.finish())
+    }
+
+    fn make_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link)
+        }
+    }
+
+    /// A `done` + `accepted` run with a scoped workspace at `ws`. Returns
+    /// `(run_id, brief_id)`.
+    fn accepted_run(s: &TaskStore, ws: &std::path::Path) -> (String, String) {
+        let brief = s
+            .create("apply brief", "f", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .unwrap();
+        let run_id = "run_apply".to_string();
+        let wss = ws.to_string_lossy().into_owned();
+        let info = crate::nodes::coordinator::RunWorkspaceInfo {
+            path: Some(&wss),
+            context: Some("copy_repo"),
+            files: None,
+            bytes: None,
+        };
+        s.record_run_start(&run_id, &brief, "agt", "echo", &info).unwrap();
+        s.record_run_finish(&run_id, "done", "ok").unwrap();
+        s.set_run_review(&run_id, "accepted", "").unwrap();
+        (run_id, brief)
+    }
+
+    /// Record one artifact; writes its source file into the workspace when
+    /// `content` is `Some` (created/modified), leaving baseline as given.
+    fn put_artifact(
+        s: &TaskStore,
+        run_id: &str,
+        brief: &str,
+        ws: &std::path::Path,
+        rel: &str,
+        kind: &str,
+        content: Option<&[u8]>,
+        baseline: Option<&str>,
+    ) {
+        if let Some(c) = content {
+            let p = ws.join(rel);
+            if let Some(par) = p.parent() {
+                std::fs::create_dir_all(par).unwrap();
+            }
+            std::fs::write(&p, c).unwrap();
+        }
+        let hash = content.map(content_hash);
+        let size = content.map(|c| c.len() as i64).unwrap_or(0);
+        let wss = ws.to_string_lossy().into_owned();
+        s.record_run_artifact(run_id, brief, &wss, rel, kind, size, hash.as_deref(), baseline, true)
+            .unwrap();
+    }
+
+    #[test]
+    fn apply_eligibility_gates_non_applicable_runs() {
+        let s = store();
+        let ws = tempfile::tempdir().unwrap();
+        let brief = s
+            .create("b", "f", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .unwrap();
+        let wss = ws.path().to_string_lossy().into_owned();
+        let info = crate::nodes::coordinator::RunWorkspaceInfo {
+            path: Some(&wss),
+            context: Some("copy_repo"),
+            files: None,
+            bytes: None,
+        };
+        s.record_run_start("r1", &brief, "a", "echo", &info).unwrap();
+        // running → ineligible
+        assert!(run_apply_eligibility(&s.get_run("r1").unwrap().unwrap()).is_err());
+        // done but pending_review → ineligible
+        s.record_run_finish("r1", "done", "ok").unwrap();
+        assert!(run_apply_eligibility(&s.get_run("r1").unwrap().unwrap()).is_err());
+        // accepted → eligible
+        s.set_run_review("r1", "accepted", "").unwrap();
+        assert!(run_apply_eligibility(&s.get_run("r1").unwrap().unwrap()).is_ok());
+        // rejected → ineligible
+        s.set_run_review("r1", "rejected", "nah").unwrap();
+        assert!(run_apply_eligibility(&s.get_run("r1").unwrap().unwrap()).is_err());
+        // inherit-mode (no scoped workspace) done+accepted → ineligible
+        s.record_run_start("r2", &brief, "a", "echo", &crate::nodes::coordinator::RunWorkspaceInfo::default())
+            .unwrap();
+        s.record_run_finish("r2", "done", "ok").unwrap();
+        s.set_run_review("r2", "accepted", "").unwrap();
+        assert!(
+            run_apply_eligibility(&s.get_run("r2").unwrap().unwrap()).is_err(),
+            "inherit-mode run has no workspace to apply"
+        );
+    }
+
+    #[test]
+    fn empty_artifacts_plan_is_a_clear_noop() {
+        let proj = tempfile::tempdir().unwrap();
+        let plan = build_apply_plan(proj.path(), &[]).unwrap();
+        assert!(plan.applicable);
+        assert_eq!(plan.changes, 0);
+        assert!(plan.note.contains("nothing to apply"));
+    }
+
+    #[test]
+    fn apply_creates_new_file_and_is_idempotent() {
+        let s = store();
+        let ws = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let (run, brief) = accepted_run(&s, ws.path());
+        put_artifact(&s, &run, &brief, ws.path(), "out/new.txt", "created", Some(b"hello"), None);
+        let arts = s.list_run_artifacts(&run).unwrap();
+
+        let plan = build_apply_plan(proj.path(), &arts).unwrap();
+        assert!(plan.applicable);
+        assert_eq!(plan.changes, 1);
+
+        let out = apply_run(proj.path(), &arts).unwrap();
+        assert_eq!(out.status, "applied");
+        assert_eq!(out.applied_files, 1);
+        assert_eq!(std::fs::read_to_string(proj.path().join("out/new.txt")).unwrap(), "hello");
+
+        // Re-apply: target now identical → all noop, nothing rewritten.
+        let out2 = apply_run(proj.path(), &arts).unwrap();
+        assert_eq!(out2.status, "applied");
+        assert_eq!(out2.applied_files, 0);
+        assert_eq!(std::fs::read_to_string(proj.path().join("out/new.txt")).unwrap(), "hello");
+    }
+
+    #[test]
+    fn apply_created_refuses_when_target_differs() {
+        let s = store();
+        let ws = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let (run, brief) = accepted_run(&s, ws.path());
+        put_artifact(&s, &run, &brief, ws.path(), "f.txt", "created", Some(b"new"), None);
+        std::fs::write(proj.path().join("f.txt"), "OLD different").unwrap();
+        let arts = s.list_run_artifacts(&run).unwrap();
+
+        let plan = build_apply_plan(proj.path(), &arts).unwrap();
+        assert!(!plan.applicable);
+        assert_eq!(plan.conflicts, 1);
+
+        // The whole apply is refused; the existing target is untouched.
+        let out = apply_run(proj.path(), &arts).unwrap();
+        assert_eq!(out.status, "conflicted");
+        assert_eq!(out.applied_files, 0);
+        assert_eq!(std::fs::read_to_string(proj.path().join("f.txt")).unwrap(), "OLD different");
+    }
+
+    #[test]
+    fn apply_modified_refuses_when_baseline_unverifiable() {
+        let s = store();
+        let ws = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let (run, brief) = accepted_run(&s, ws.path());
+        std::fs::write(proj.path().join("m.txt"), "old").unwrap();
+        // No baseline hash recorded → cannot prove the target is unchanged.
+        put_artifact(&s, &run, &brief, ws.path(), "m.txt", "modified", Some(b"new"), None);
+        let arts = s.list_run_artifacts(&run).unwrap();
+
+        let plan = build_apply_plan(proj.path(), &arts).unwrap();
+        assert!(!plan.applicable);
+        assert_eq!(plan.conflicts, 1);
+    }
+
+    #[test]
+    fn apply_modified_overwrites_when_baseline_matches() {
+        let s = store();
+        let ws = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let (run, brief) = accepted_run(&s, ws.path());
+        std::fs::write(proj.path().join("m.txt"), "old").unwrap();
+        let base = content_hash(b"old");
+        put_artifact(&s, &run, &brief, ws.path(), "m.txt", "modified", Some(b"new"), Some(&base));
+        let arts = s.list_run_artifacts(&run).unwrap();
+
+        let plan = build_apply_plan(proj.path(), &arts).unwrap();
+        assert!(plan.applicable);
+        assert_eq!(plan.changes, 1);
+
+        let out = apply_run(proj.path(), &arts).unwrap();
+        assert_eq!(out.status, "applied");
+        assert_eq!(std::fs::read_to_string(proj.path().join("m.txt")).unwrap(), "new");
+    }
+
+    #[test]
+    fn apply_deleted_requires_baseline_match() {
+        let s = store();
+        let ws = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let (run, brief) = accepted_run(&s, ws.path());
+        // Target diverged from the run's baseline → refuse to delete.
+        std::fs::write(proj.path().join("d.txt"), "current").unwrap();
+        let base = content_hash(b"original");
+        put_artifact(&s, &run, &brief, ws.path(), "d.txt", "deleted", None, Some(&base));
+        let arts = s.list_run_artifacts(&run).unwrap();
+
+        let plan = build_apply_plan(proj.path(), &arts).unwrap();
+        assert!(!plan.applicable);
+        assert_eq!(plan.conflicts, 1);
+        let out = apply_run(proj.path(), &arts).unwrap();
+        assert_eq!(out.status, "conflicted");
+        assert!(proj.path().join("d.txt").exists(), "target must survive a refused delete");
+    }
+
+    #[test]
+    fn apply_deleted_removes_when_baseline_matches_and_is_idempotent() {
+        let s = store();
+        let ws = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let (run, brief) = accepted_run(&s, ws.path());
+        std::fs::write(proj.path().join("d.txt"), "original").unwrap();
+        let base = content_hash(b"original");
+        put_artifact(&s, &run, &brief, ws.path(), "d.txt", "deleted", None, Some(&base));
+        let arts = s.list_run_artifacts(&run).unwrap();
+
+        let out = apply_run(proj.path(), &arts).unwrap();
+        assert_eq!(out.status, "applied");
+        assert_eq!(out.applied_files, 1);
+        assert!(!proj.path().join("d.txt").exists());
+
+        // Re-apply: already absent → noop, no error.
+        let out2 = apply_run(proj.path(), &arts).unwrap();
+        assert_eq!(out2.status, "applied");
+        assert_eq!(out2.applied_files, 0);
+    }
+
+    #[test]
+    fn apply_refuses_unsafe_and_excluded_paths() {
+        let s = store();
+        let ws = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let (run, brief) = accepted_run(&s, ws.path());
+        let wss = ws.path().to_string_lossy().into_owned();
+        for rel in ["../escape.txt", "C:/windows/x", ".git/config", "node_modules/x.js", ".env"] {
+            s.record_run_artifact(&run, &brief, &wss, rel, "created", 1, Some("dead"), None, true)
+                .unwrap();
+        }
+        let arts = s.list_run_artifacts(&run).unwrap();
+        let plan = build_apply_plan(proj.path(), &arts).unwrap();
+        assert!(!plan.applicable);
+        assert!(plan.items.iter().all(|i| !i.can_apply), "every unsafe/excluded path is refused");
+        assert_eq!(plan.changes, 0);
+    }
+
+    #[test]
+    fn apply_refuses_symlinked_target() {
+        let s = store();
+        let ws = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let (run, brief) = accepted_run(&s, ws.path());
+        let outside = ws.path().join("real.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        let link = proj.path().join("link.txt");
+        if make_symlink(&outside, &link).is_err() {
+            return; // platform can't create symlinks here — skip.
+        }
+        put_artifact(&s, &run, &brief, ws.path(), "link.txt", "created", Some(b"new"), None);
+        let arts = s.list_run_artifacts(&run).unwrap();
+        let plan = build_apply_plan(proj.path(), &arts).unwrap();
+        assert!(!plan.applicable, "must refuse writing through a symlink");
+        // The symlink's real target content is untouched.
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret");
+    }
+
+    #[test]
+    fn apply_status_persists_on_the_run() {
+        let s = store();
+        let ws = tempfile::tempdir().unwrap();
+        let (run, _) = accepted_run(&s, ws.path());
+        s.set_run_apply_status(&run, "applied", "2 applied, 0 failed", 2, 0).unwrap();
+        let r = s.get_run(&run).unwrap().unwrap();
+        assert_eq!(r.apply_status.as_deref(), Some("applied"));
+        assert_eq!(r.applied_files, Some(2));
+        assert_eq!(r.failed_files, Some(0));
+        assert!(r.applied_at.is_some());
+        assert!(s.set_run_apply_status("nope", "applied", "", 0, 0).is_err());
+    }
+
+    #[test]
+    fn apply_plan_is_tenant_scoped() {
+        let s = store();
+        let brief = s
+            .create("t", "f", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .unwrap();
+        s.set_task_tenant(&brief, "guild-a").unwrap();
+        s.record_run_start("rA", &brief, "a", "echo", &crate::nodes::coordinator::RunWorkspaceInfo::default())
+            .unwrap();
+        // The diff/apply capabilities gate on this exact check.
+        assert!(s.run_belongs_to_tenant("rA", "guild-a").unwrap());
+        assert!(!s.run_belongs_to_tenant("rA", "guild-b").unwrap(), "guild-b cannot diff/apply guild-a's run");
     }
 }

@@ -566,6 +566,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/runs/:run_id/artifacts", get(spine::run_artifacts))
         .route("/v1/runs/:run_id/artifacts/:artifact_id/preview", get(spine::run_artifact_preview))
         .route("/v1/runs/:run_id/review", post(spine::run_review))
+        .route("/v1/runs/:run_id/diff", get(spine::run_diff))
+        .route("/v1/runs/:run_id/apply", post(spine::run_apply))
         .route("/v1/spine/briefs/:id/runs", get(spine::brief_runs))
         // First-run company bootstrap: status read, Crew roster, and the
         // owner-gated "Initialize Company" (create the Founder) action.

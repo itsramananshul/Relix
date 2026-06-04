@@ -9441,6 +9441,227 @@ fn register_node_type_handlers(
                 )),
             );
         }
+        {
+            // `run.diff` — the safe-apply PLAN for a run (`GET
+            // /v1/runs/:id/diff`). PURE preview: never mutates files.
+            // Reports per-file action / conflict and whether the run is
+            // apply-eligible (done + accepted + scoped workspace).
+            // Tenant-scoped: another Guild's run reads as not-found.
+            let st = store.clone();
+            bridge.register(
+                "run.diff",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            let run_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
+                            let tenant = ctx.tenant_id_or_default().to_string();
+                            let invalid = |c: String| {
+                                crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                        cause: c,
+                                        retry_hint: 0,
+                                        retry_after: None,
+                                    },
+                                )
+                            };
+                            match st.run_belongs_to_tenant(&run_id, &tenant) {
+                                Ok(true) => {}
+                                Ok(false) => return invalid(format!("run not found: {run_id}")),
+                                Err(e) => return invalid(format!("run.diff: {e}")),
+                            }
+                            let run = match st.get_run(&run_id) {
+                                Ok(Some(r)) => r,
+                                Ok(None) => return invalid(format!("run not found: {run_id}")),
+                                Err(e) => return invalid(format!("run.diff: {e}")),
+                            };
+                            let eligibility =
+                                crate::nodes::coordinator::heartbeat::run_apply_eligibility(&run);
+                            let eligible = eligibility.is_ok();
+                            let reason = match &eligibility {
+                                Ok(()) => "eligible".to_string(),
+                                Err(e) => e.clone(),
+                            };
+                            let artifacts = match st.list_run_artifacts(&run_id) {
+                                Ok(a) => a,
+                                Err(e) => return invalid(format!("run.diff: {e}")),
+                            };
+                            let root = st.run_workspace_config().project_root.clone();
+                            let plan = match crate::nodes::coordinator::heartbeat::build_apply_plan(
+                                &root, &artifacts,
+                            ) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    return invalid(format!("run.diff: invalid project root: {e}"))
+                                }
+                            };
+                            let body = serde_json::json!({
+                                "run_id": run_id,
+                                "status": run.status,
+                                "review": run.review,
+                                "apply_status": run.apply_status,
+                                "eligible": eligible,
+                                "reason": reason,
+                                "plan": plan,
+                            });
+                            match serde_json::to_vec(&body) {
+                                Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                Err(e) => invalid(format!("run.diff encode: {e}")),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
+        {
+            // `run.apply` — apply an accepted run's changed files back into
+            // the configured project root (`POST /v1/runs/:id/apply`).
+            // Refuses the WHOLE apply if ANY file is unsafe / conflicted (no
+            // partial apply, no `force`). Tenant-scoped; only a `done` +
+            // `accepted` + scoped-workspace run applies. Records
+            // apply.plan / apply.started / apply.applied / apply.conflicted
+            // / apply.failed transcript events and a durable apply status.
+            let st = store.clone();
+            bridge.register(
+                "run.apply",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            let run_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
+                            let tenant = ctx.tenant_id_or_default().to_string();
+                            let invalid = |c: String| {
+                                crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                        cause: c,
+                                        retry_hint: 0,
+                                        retry_after: None,
+                                    },
+                                )
+                            };
+                            match st.run_belongs_to_tenant(&run_id, &tenant) {
+                                Ok(true) => {}
+                                Ok(false) => return invalid(format!("run not found: {run_id}")),
+                                Err(e) => return invalid(format!("run.apply: {e}")),
+                            }
+                            let run = match st.get_run(&run_id) {
+                                Ok(Some(r)) => r,
+                                Ok(None) => return invalid(format!("run not found: {run_id}")),
+                                Err(e) => return invalid(format!("run.apply: {e}")),
+                            };
+                            // Eligibility gate — refuse (and record `blocked`)
+                            // for any non-done / unaccepted / inherit run.
+                            if let Err(reason) =
+                                crate::nodes::coordinator::heartbeat::run_apply_eligibility(&run)
+                            {
+                                let _ = st.set_run_apply_status(&run_id, "blocked", &reason, 0, 0);
+                                let _ = st.append_run_event(
+                                    &run_id, "apply.conflicted", "relix",
+                                    &format!("apply refused: {reason}"), None, false,
+                                );
+                                return invalid(format!("apply refused: {reason}"));
+                            }
+                            let artifacts = match st.list_run_artifacts(&run_id) {
+                                Ok(a) => a,
+                                Err(e) => return invalid(format!("run.apply: {e}")),
+                            };
+                            let root = st.run_workspace_config().project_root.clone();
+                            // Zero-artifact run: a clear no-op (nothing to do).
+                            if artifacts.is_empty() {
+                                let _ = st.set_run_apply_status(
+                                    &run_id, "applied", "no artifacts — nothing to apply", 0, 0,
+                                );
+                                let _ = st.append_run_event(
+                                    &run_id, "apply.applied", "relix",
+                                    "no artifacts — nothing to apply", None, false,
+                                );
+                                let body = serde_json::json!({
+                                    "run_id": run_id, "apply_status": "applied",
+                                    "applied_files": 0, "failed_files": 0,
+                                });
+                                return match serde_json::to_vec(&body) {
+                                    Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                    Err(e) => invalid(format!("run.apply encode: {e}")),
+                                };
+                            }
+                            let outcome = match crate::nodes::coordinator::heartbeat::apply_run(
+                                &root, &artifacts,
+                            ) {
+                                Ok(o) => o,
+                                Err(e) => {
+                                    let _ = st.set_run_apply_status(
+                                        &run_id, "failed", &format!("invalid project root: {e}"), 0, 0,
+                                    );
+                                    let _ = st.append_run_event(
+                                        &run_id, "apply.failed", "relix",
+                                        &format!("apply failed: {e}"), None, false,
+                                    );
+                                    return invalid(format!("run.apply: {e}"));
+                                }
+                            };
+                            // Plan event (always recorded — the preview the
+                            // apply acted on).
+                            let _ = st.append_run_event(
+                                &run_id, "apply.plan", "relix", &outcome.plan.note, None, false,
+                            );
+                            if outcome.status == "conflicted" {
+                                // Refused the whole apply — nothing written.
+                                let _ = st.set_run_apply_status(
+                                    &run_id, "conflicted", &outcome.plan.note,
+                                    0, 0,
+                                );
+                                let _ = st.append_run_event(
+                                    &run_id, "apply.conflicted", "relix",
+                                    &format!("apply refused — {}", outcome.plan.note), None, false,
+                                );
+                            } else {
+                                let _ = st.append_run_event(
+                                    &run_id, "apply.started", "relix",
+                                    &format!("applying {} change(s) to {}", outcome.plan.changes, outcome.plan.project_root),
+                                    None, false,
+                                );
+                                let summary = format!(
+                                    "{} applied, {} failed", outcome.applied_files, outcome.failed_files
+                                );
+                                let _ = st.set_run_apply_status(
+                                    &run_id, outcome.status, &summary,
+                                    outcome.applied_files as i64, outcome.failed_files as i64,
+                                );
+                                if outcome.status == "failed" {
+                                    let detail = if outcome.errors.is_empty() {
+                                        summary.clone()
+                                    } else {
+                                        format!("{summary}: {}", outcome.errors.join("; "))
+                                    };
+                                    let _ = st.append_run_event(
+                                        &run_id, "apply.failed", "relix",
+                                        &format!("apply incomplete — {detail}"), None, false,
+                                    );
+                                } else {
+                                    let _ = st.append_run_event(
+                                        &run_id, "apply.applied", "relix",
+                                        &format!("apply complete — {summary}"), None, false,
+                                    );
+                                }
+                            }
+                            let body = serde_json::json!({
+                                "run_id": run_id,
+                                "apply_status": outcome.status,
+                                "applied_files": outcome.applied_files,
+                                "failed_files": outcome.failed_files,
+                                "plan": outcome.plan,
+                            });
+                            match serde_json::to_vec(&body) {
+                                Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                Err(e) => invalid(format!("run.apply encode: {e}")),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
         // PHASE 3 (heartbeat loop): the live dispatch tick. Opt-in
         // via RELIX_HEARTBEAT_ENABLED (off by default so it never
         // surprises an operator). When on, a timer polls the ready

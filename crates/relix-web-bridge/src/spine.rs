@@ -838,6 +838,25 @@ pub async fn run_review(
     json_passthrough(call_peer(&state, "run.review", arg.as_bytes()).await?)
 }
 
+/// `GET /v1/runs/:run_id/diff` — the safe-apply PLAN for a run (per-file
+/// action / conflict + eligibility). Pure preview: never mutates files.
+pub async fn run_diff(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "run.diff", run_id.as_bytes()).await?)
+}
+
+/// `POST /v1/runs/:run_id/apply` — apply an accepted run's changed files
+/// back into the configured project root. Refuses the whole apply if any
+/// file is unsafe / conflicted (no partial apply, no `force`).
+pub async fn run_apply(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "run.apply", run_id.as_bytes()).await?)
+}
+
 /// `GET /v1/spine/company` — first-run status: whether the Guild has a
 /// Founder yet, the Founder profile, and the Operative count. The
 /// dashboard reads this to show the "Initialize Company" first-run state.
