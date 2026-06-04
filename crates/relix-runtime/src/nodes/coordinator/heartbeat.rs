@@ -2658,4 +2658,166 @@ mod tests {
             "a cancelled transcript event is recorded"
         );
     }
+
+    // ── Run artifacts + review ──────────────────────────────────
+
+    /// A ProcessRig that creates a file in its cwd (the run workspace).
+    fn file_creating_rig(name: &str, content: &str) -> crate::rig::RigRegistry {
+        let (prog, args) = if cfg!(windows) {
+            (
+                "cmd".to_string(),
+                vec!["/C".to_string(), format!("echo {content}> {name}")],
+            )
+        } else {
+            (
+                "sh".to_string(),
+                vec!["-c".to_string(), format!("printf '{content}' > {name}")],
+            )
+        };
+        let mut reg = crate::rig::RigRegistry::new();
+        reg.register(std::sync::Arc::new(crate::rig::ProcessRig::new("mk", prog, args)));
+        reg.set_default(Some("mk".to_string()));
+        reg
+    }
+
+    #[test]
+    fn artifact_scan_records_created_file_empty_mode() {
+        let (s, _tmp) = store_ws();
+        let id = ready_brief(&s, "make a file", "agt_a");
+        let report =
+            run_brief_now(&s, &file_creating_rig("note.txt", "hello"), None, 300, &id, None, "x".into())
+                .unwrap();
+        let run_id = report.run_id.unwrap();
+        let arts = s.list_run_artifacts(&run_id).unwrap();
+        // note.txt is recorded as created; BRIEF.md (unchanged) is NOT.
+        assert!(arts.iter().any(|a| a.rel_path == "note.txt" && a.kind == "created"));
+        assert!(!arts.iter().any(|a| a.rel_path == "BRIEF.md"));
+        // The transcript announces the scan + counts.
+        let kinds: Vec<String> = s.list_run_events(&run_id, 200).unwrap().into_iter().map(|e| e.kind).collect();
+        assert!(kinds.contains(&"artifacts.scan_started".to_string()));
+        assert!(kinds.contains(&"artifacts.detected".to_string()));
+    }
+
+    #[test]
+    fn scan_manifest_excludes_dangerous_dirs_and_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        std::fs::write(p.join("keep.txt"), "x").unwrap();
+        std::fs::create_dir_all(p.join("sub")).unwrap();
+        std::fs::write(p.join("sub").join("nested.rs"), "y").unwrap();
+        // Excluded dirs + secret files an agent might leave behind:
+        std::fs::create_dir_all(p.join(".git")).unwrap();
+        std::fs::write(p.join(".git").join("HEAD"), "ref").unwrap();
+        std::fs::create_dir_all(p.join("target")).unwrap();
+        std::fs::write(p.join("target").join("out"), "bin").unwrap();
+        std::fs::create_dir_all(p.join("node_modules")).unwrap();
+        std::fs::write(p.join("node_modules").join("d.js"), "z").unwrap();
+        std::fs::create_dir_all(p.join("dev-data")).unwrap();
+        std::fs::write(p.join("dev-data").join("tasks.db"), "db").unwrap();
+        std::fs::write(p.join(".env"), "SECRET=1").unwrap();
+        std::fs::write(p.join("api.key"), "k").unwrap();
+
+        let m = scan_workspace_manifest(p);
+        let paths: Vec<&String> = m.files.keys().collect();
+        assert!(m.files.contains_key("keep.txt"));
+        assert!(m.files.contains_key("sub/nested.rs"));
+        for bad in [".git/HEAD", "target/out", "node_modules/d.js", "dev-data/tasks.db", ".env", "api.key"] {
+            assert!(!m.files.contains_key(bad), "{bad} should be excluded; got {paths:?}");
+        }
+    }
+
+    #[test]
+    fn diff_manifests_detects_created_modified_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        std::fs::write(p.join("a.txt"), "a").unwrap();
+        std::fs::write(p.join("b.txt"), "b").unwrap();
+        let before = scan_workspace_manifest(p);
+        // mutate: modify a, delete b, create c.
+        std::fs::write(p.join("a.txt"), "a-changed").unwrap();
+        std::fs::remove_file(p.join("b.txt")).unwrap();
+        std::fs::write(p.join("c.txt"), "c").unwrap();
+        let after = scan_workspace_manifest(p);
+        let changes = diff_manifests(&before, &after);
+        let by: std::collections::HashMap<_, _> =
+            changes.iter().map(|c| (c.rel_path.as_str(), c.kind)).collect();
+        assert_eq!(by.get("a.txt"), Some(&"modified"));
+        assert_eq!(by.get("b.txt"), Some(&"deleted"));
+        assert_eq!(by.get("c.txt"), Some(&"created"));
+    }
+
+    #[test]
+    fn artifact_preview_refuses_binary_truncates_and_redacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().into_owned();
+        // text + secret → redacted
+        let secret = "sk-".to_string() + &"a".repeat(40);
+        std::fs::write(tmp.path().join("t.txt"), format!("key {secret} end")).unwrap();
+        match read_artifact_preview(&ws, "t.txt", true, 1024) {
+            PreviewOutcome::Text { content, truncated } => {
+                assert!(!truncated);
+                assert!(!content.contains(&secret), "secret must be redacted");
+            }
+            o => panic!("expected Text, got {o:?}"),
+        }
+        // binary (NUL byte) → refused
+        std::fs::write(tmp.path().join("b.bin"), [0u8, 1, 2, 3]).unwrap();
+        assert_eq!(read_artifact_preview(&ws, "b.bin", false, 1024), PreviewOutcome::Binary);
+        // a flagged-text file that is actually binary → still refused
+        assert_eq!(read_artifact_preview(&ws, "b.bin", true, 1024), PreviewOutcome::Binary);
+        // large text → truncated
+        std::fs::write(tmp.path().join("big.txt"), "x".repeat(5000)).unwrap();
+        match read_artifact_preview(&ws, "big.txt", true, 1000) {
+            PreviewOutcome::Text { content, truncated } => {
+                assert!(truncated);
+                assert!(content.len() <= 1000);
+            }
+            o => panic!("expected truncated Text, got {o:?}"),
+        }
+        // path traversal → Missing/Unsafe, never escaping the workspace
+        assert!(matches!(
+            read_artifact_preview(&ws, "../escape.txt", true, 1024),
+            PreviewOutcome::Missing | PreviewOutcome::Unsafe
+        ));
+    }
+
+    #[test]
+    fn review_only_accepts_done_runs() {
+        let (s, _tmp) = store_ws();
+        let id = ready_brief(&s, "reviewable", "agt_a");
+        let report =
+            run_brief_now(&s, &echo_registry(), None, 300, &id, Some("echo"), "x".into()).unwrap();
+        let run_id = report.run_id.unwrap();
+        // A done run opens pending_review.
+        assert_eq!(s.get_run(&run_id).unwrap().unwrap().review.as_deref(), Some("pending_review"));
+        // accept it.
+        assert_eq!(s.set_run_review(&run_id, "accepted", "looks good").unwrap(), "accepted");
+        let rec = s.get_run(&run_id).unwrap().unwrap();
+        assert_eq!(rec.review.as_deref(), Some("accepted"));
+        assert_eq!(rec.review_note.as_deref(), Some("looks good"));
+        assert!(rec.reviewed_at.is_some());
+        // invalid decision is rejected.
+        assert!(s.set_run_review(&run_id, "maybe", "").is_err());
+    }
+
+    #[test]
+    fn run_belongs_to_tenant_isolates_guilds() {
+        let s = store();
+        // A Brief in guild-a + a run on it.
+        let id = s
+            .create("t", "f", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .unwrap();
+        s.set_task_tenant(&id, "guild-a").unwrap();
+        s.record_run_start(
+            "run_xyz",
+            &id,
+            "agt",
+            "echo",
+            &crate::nodes::coordinator::RunWorkspaceInfo::default(),
+        )
+        .unwrap();
+        assert!(s.run_belongs_to_tenant("run_xyz", "guild-a").unwrap());
+        assert!(!s.run_belongs_to_tenant("run_xyz", "guild-b").unwrap(), "no cross-tenant access");
+        assert!(!s.run_belongs_to_tenant("run_missing", "guild-a").unwrap(), "missing run = false");
+    }
 }
