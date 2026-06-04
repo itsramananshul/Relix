@@ -1,35 +1,25 @@
 import { useMemo, useState } from "react";
 import { api, tryGet } from "../api";
-import { asArray, Section, useAsync } from "../components/common";
+import { asArray, extractList, Section, useAsync } from "../components/common";
 
 interface Card { task_id?: string; id?: string; title?: string; assignee_agent_id?: string | null }
-interface Agent { agent_id?: string; id?: string; name?: string; role?: string }
+interface Agent { agent_id?: string; id?: string; name?: string; display_name?: string; role?: string }
 interface Inbox { unassigned?: Card[] }
-
-function extractAgents(v: unknown): Agent[] {
-  if (Array.isArray(v)) return v as Agent[];
-  if (v && typeof v === "object") {
-    const o = v as Record<string, unknown>;
-    for (const k of ["operatives", "agents", "roster", "members", "active_agents"]) {
-      if (Array.isArray(o[k])) return o[k] as Agent[];
-    }
-  }
-  return [];
-}
 
 export function Assign() {
   const [brief, setBrief] = useState("");
   const [agent, setAgent] = useState("");
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
 
+  // The assignable Operative list is /v1/agents/access ({agents:[…]}).
   const { data, loading, reload } = useAsync(async () => {
-    const [inbox, roster] = await Promise.all([
+    const [inbox, agentsRes] = await Promise.all([
       tryGet<Inbox>("/v1/spine/inbox?limit=100", {}),
-      tryGet<unknown>("/v1/spine/roster", {}),
+      tryGet<unknown>("/v1/agents/access", {}),
     ]);
     return {
       unassigned: asArray<Card>(inbox.unassigned),
-      agents: extractAgents(roster),
+      agents: extractList<Agent>(agentsRes, ["agents", "operatives"]),
     };
   }, []);
 

@@ -56,3 +56,17 @@ export function Empty({ children }: { children: ReactNode }) {
 export function asArray<T = unknown>(v: unknown): T[] {
   return Array.isArray(v) ? (v as T[]) : [];
 }
+
+// Many bridge endpoints wrap their list under a key (`{items:[…]}`,
+// `{agents:[…]}`, `{jobs:[…]}`, …) or return a bare array. Pull the list
+// out regardless of which shape arrived.
+export function extractList<T = unknown>(v: unknown, keys: string[] = []): T[] {
+  if (Array.isArray(v)) return v as T[];
+  if (v && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    for (const k of [...keys, "items", "results", "rows", "list"]) {
+      if (Array.isArray(o[k])) return o[k] as T[];
+    }
+  }
+  return [];
+}

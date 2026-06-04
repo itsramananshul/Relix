@@ -1216,6 +1216,143 @@ allow_groups = ["chat-users"]
 name = "approval_delivery_status"
 method = "approval.delivery_status"
 allow_groups = ["chat-users"]
+
+# Operator dashboard (/dashboard): product-spine Brief board / Mandate /
+# roster capabilities the web bridge calls on the coordinator. Per-agent
+# Key gates still apply inside each capability; this only lifts the mesh
+# default-deny so the operator console reaches the spine.
+[[rules]]
+name = "spine_brief_board_summary"
+method = "brief.board_summary"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_board"
+method = "brief.board"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_unassigned"
+method = "brief.unassigned"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_blocked_list"
+method = "brief.blocked_list"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_stale_list"
+method = "brief.stale_list"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_overdue"
+method = "brief.overdue"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_detail"
+method = "brief.detail"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_search"
+method = "brief.search"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_by_label"
+method = "brief.by_label"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_desk"
+method = "brief.desk"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_claim_holder"
+method = "brief.claim_holder"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_wakeups"
+method = "brief.wakeups"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_create"
+method = "brief.create"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_move"
+method = "brief.move"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_set"
+method = "brief.set"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_set_due"
+method = "brief.set_due"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_pin"
+method = "brief.pin"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_comment"
+method = "brief.comment"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_snag"
+method = "brief.snag"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_unsnag"
+method = "brief.unsnag"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_subbrief"
+method = "brief.subbrief"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_agent_roster_summary"
+method = "agent.roster_summary"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_task_recent_events"
+method = "task.recent_events"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_task_stuck"
+method = "task.stuck"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_task_recent_edges"
+method = "task.recent_edges"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_mandate_search"
+method = "mandate.search"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_mandate_tree"
+method = "mandate.tree"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_mandate_briefs"
+method = "mandate.briefs"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_mandate_list"
+method = "mandate.list"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_mandate_create"
+method = "mandate.create"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_mandate_orchestrate"
+method = "mandate.orchestrate"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_mandate_team_plan"
+method = "mandate.team_plan"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_mandate_team_readiness"
+method = "mandate.team_readiness"
+allow_groups = ["chat-users"]
 EOF
 
 # ---- 11. peers.toml ----

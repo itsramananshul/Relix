@@ -1,5 +1,5 @@
 import { tryGet } from "../api";
-import { asArray, Badge, Empty, Section, useAsync } from "../components/common";
+import { Badge, Empty, extractList, Section, useAsync } from "../components/common";
 
 interface Task {
   task_id?: string;
@@ -25,10 +25,14 @@ export function Runs() {
   const { data, loading, error, reload } = useAsync(async () => {
     const [tasks, events, stuck] = await Promise.all([
       tryGet<unknown>("/v1/tasks?limit=50", []),
-      tryGet<EventRow[]>("/v1/tasks/events/recent?limit=20", []),
-      tryGet<unknown>("/v1/tasks/stuck?limit=20", []),
+      tryGet<unknown>("/v1/tasks/events/recent?limit=20", {}),
+      tryGet<unknown>("/v1/tasks/stuck?limit=20", {}),
     ]);
-    return { tasks: extractTasks(tasks), events: asArray<EventRow>(events), stuck: extractTasks(stuck) };
+    return {
+      tasks: extractTasks(tasks),
+      events: extractList<EventRow>(events),
+      stuck: extractTasks(stuck),
+    };
   }, []);
 
   const tasks = data?.tasks ?? [];
@@ -78,12 +82,12 @@ export function Runs() {
 
       <div className="card">
         <h3>Activity stream</h3>
-        {asArray<EventRow>(data?.events).length === 0 ? (
+        {(data?.events ?? []).length === 0 ? (
           <Empty>No recent events.</Empty>
         ) : (
           <table className="table">
             <tbody>
-              {asArray<EventRow>(data?.events).map((e, i) => (
+              {(data?.events ?? []).map((e, i) => (
                 <tr key={i}>
                   <td><span className="badge">{e.event_type ?? "event"}</span></td>
                   <td className="mono">{(e.task_id ?? "").slice(0, 12)}</td>

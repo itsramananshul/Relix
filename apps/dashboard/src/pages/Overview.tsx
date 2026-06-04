@@ -1,32 +1,35 @@
 import { Link } from "react-router-dom";
 import { tryGet } from "../api";
-import { asArray, Badge, useAsync } from "../components/common";
+import { Badge, extractList, useAsync } from "../components/common";
 
-interface BoardCount { board_status?: string; count?: number }
+// The board summary arrives as an object keyed by board status, e.g.
+// `{ "backlog": 1, "todo": 2, "total": 3 }`.
+type BoardSummary = Record<string, number>;
 interface Card { task_id?: string; id?: string; title?: string; board_status?: string; priority?: string }
-interface Inbox { blocked?: Card[]; overdue?: Card[]; unassigned?: Card[]; in_review?: Card[]; stale?: Card[] }
+interface Inbox { blocked?: Card[]; overdue?: Card[]; unassigned?: Card[]; review?: Card[]; stale?: Card[] }
+interface Roster { active?: number; total?: number }
 interface EventRow { task_id?: string; event_type?: string; ts?: number; payload?: string }
+
+const COLUMNS = ["backlog", "todo", "in_progress", "in_review", "done"];
 
 export function Overview() {
   const { data } = useAsync(async () => {
     const [board, inbox, roster, info, events] = await Promise.all([
-      tryGet<BoardCount[]>("/v1/spine/board", []),
+      tryGet<BoardSummary>("/v1/spine/board", {}),
       tryGet<Inbox>("/v1/spine/inbox?limit=50", {}),
-      tryGet<unknown>("/v1/spine/roster", {}),
+      tryGet<Roster>("/v1/spine/roster", {}),
       tryGet<Record<string, unknown>>("/v1/info", {}),
-      tryGet<EventRow[]>("/v1/tasks/events/recent?limit=12", []),
+      tryGet<unknown>("/v1/tasks/events/recent?limit=12", {}),
     ]);
-    return { board, inbox, roster, info, events };
+    return { board, inbox, roster, info, events: extractList<EventRow>(events) };
   }, []);
 
-  const board = data?.board ?? [];
+  const board = data?.board ?? {};
   const inbox = data?.inbox ?? {};
-  const active = board
-    .filter((c) => ["todo", "in_progress", "in_review"].includes(c.board_status ?? ""))
-    .reduce((n, c) => n + (c.count ?? 0), 0);
-  const done = board.find((c) => c.board_status === "done")?.count ?? 0;
+  const active = (board.todo ?? 0) + (board.in_progress ?? 0) + (board.in_review ?? 0);
+  const done = board.done ?? 0;
   const attention = (inbox.blocked?.length ?? 0) + (inbox.overdue?.length ?? 0) + (inbox.unassigned?.length ?? 0);
-  const crew = countCrew(data?.roster);
+  const crew = data?.roster?.active ?? data?.roster?.total ?? 0;
 
   return (
     <div className="grid">
@@ -48,12 +51,12 @@ export function Overview() {
 
         <div className="card">
           <h3>Recent activity</h3>
-          {asArray<EventRow>(data?.events).length === 0 ? (
+          {(data?.events ?? []).length === 0 ? (
             <div className="empty">No recent runtime events.</div>
           ) : (
             <table className="table">
               <tbody>
-                {asArray<EventRow>(data?.events).map((e, i) => (
+                {(data?.events ?? []).map((e, i) => (
                   <tr key={i}>
                     <td><span className="badge">{e.event_type ?? "event"}</span></td>
                     <td className="mono">{(e.task_id ?? "").slice(0, 10)}</td>
@@ -69,11 +72,13 @@ export function Overview() {
       <div className="card">
         <h3>Board distribution</h3>
         <div className="pill-row">
-          {board.length === 0 && <span className="muted">Spine board empty.</span>}
-          {board.map((c) => (
-            <span key={c.board_status} className="row" style={{ gap: 6 }}>
-              <Badge status={c.board_status} />
-              <strong>{c.count ?? 0}</strong>
+          {COLUMNS.every((c) => (board[c] ?? 0) === 0) && (
+            <span className="muted">Spine board empty.</span>
+          )}
+          {COLUMNS.filter((c) => (board[c] ?? 0) > 0).map((c) => (
+            <span key={c} className="row" style={{ gap: 6 }}>
+              <Badge status={c} />
+              <strong>{board[c]}</strong>
             </span>
           ))}
         </div>
@@ -108,16 +113,4 @@ function AttnList({ label, rows, tone }: { label: string; rows?: Card[]; tone: s
       ))}
     </div>
   );
-}
-
-function countCrew(roster: unknown): number {
-  if (Array.isArray(roster)) return roster.length;
-  if (roster && typeof roster === "object") {
-    const r = roster as Record<string, unknown>;
-    for (const k of ["operatives", "agents", "roster", "members", "active_agents"]) {
-      if (Array.isArray(r[k])) return (r[k] as unknown[]).length;
-    }
-    if (typeof r.count === "number") return r.count;
-  }
-  return 0;
 }

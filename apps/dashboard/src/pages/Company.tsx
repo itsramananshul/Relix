@@ -1,29 +1,27 @@
+import { useState } from "react";
 import { tryGet } from "../api";
-import { asArray, Empty, useAsync } from "../components/common";
+import { Empty, extractList, useAsync } from "../components/common";
 
-interface Agent { agent_id?: string; id?: string; name?: string; role?: string; reports_to?: string }
+interface Agent { agent_id?: string; id?: string; name?: string; display_name?: string; role?: string; reports_to?: string }
 interface Mandate { mandate_id?: string; id?: string; title?: string; status?: string; name?: string }
 
-function extract<T>(v: unknown, keys: string[]): T[] {
-  if (Array.isArray(v)) return v as T[];
-  if (v && typeof v === "object") {
-    const o = v as Record<string, unknown>;
-    for (const k of keys) if (Array.isArray(o[k])) return o[k] as T[];
-  }
-  return [];
-}
-
 export function Company() {
+  const [query, setQuery] = useState("");
+  // The agent *list* lives at /v1/agents/access ({agents:[…]}); /spine/roster
+  // is only a count summary. `mandate.search` requires a non-empty query —
+  // there is no list-all mandates endpoint — so mandates load on search.
   const { data, loading } = useAsync(async () => {
-    const [roster, mandates] = await Promise.all([
-      tryGet<unknown>("/v1/spine/roster", {}),
-      tryGet<unknown>("/v1/spine/mandates/search?q=&limit=50", {}),
-    ]);
-    return {
-      agents: extract<Agent>(roster, ["operatives", "agents", "roster", "members", "active_agents"]),
-      mandates: extract<Mandate>(mandates, ["mandates", "results", "items"]),
-    };
-  }, []);
+    const agentsRes = await tryGet<unknown>("/v1/agents/access", {});
+    let mandates: Mandate[] = [];
+    if (query.trim()) {
+      const m = await tryGet<unknown>(
+        `/v1/spine/mandates/search?q=${encodeURIComponent(query.trim())}&limit=50`,
+        {},
+      );
+      mandates = extractList<Mandate>(m, ["mandates"]);
+    }
+    return { agents: extractList<Agent>(agentsRes, ["agents", "operatives"]), mandates };
+  }, [query]);
 
   const agents = data?.agents ?? [];
   const mandates = data?.mandates ?? [];
@@ -64,14 +62,25 @@ export function Company() {
 
       <div className="card">
         <h3>Mandates (goals)</h3>
-        {loading ? (
+        <input
+          className="input"
+          style={{ marginBottom: 12 }}
+          placeholder="Search mandates by title…"
+          defaultValue={query}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") setQuery((e.target as HTMLInputElement).value);
+          }}
+        />
+        {!query.trim() ? (
+          <Empty>Type a query to search mandates. (No list-all endpoint yet.)</Empty>
+        ) : loading ? (
           <div className="loading">Loading…</div>
         ) : mandates.length === 0 ? (
-          <Empty>No mandates. Goals organize the work tree.</Empty>
+          <Empty>No mandates match “{query}”.</Empty>
         ) : (
           <table className="table">
             <tbody>
-              {asArray<Mandate>(mandates).map((m, i) => (
+              {mandates.map((m, i) => (
                 <tr key={m.mandate_id ?? m.id ?? i}>
                   <td><strong>{m.title ?? m.name ?? "(untitled)"}</strong></td>
                   <td><span className="badge">{m.status ?? "—"}</span></td>

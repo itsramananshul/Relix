@@ -66,20 +66,14 @@ export function Layout({ children }: { children: ReactNode }) {
     let on = true;
     (async () => {
       const inbox = await tryGet<Record<string, unknown[]>>("/v1/spine/inbox?limit=100", {});
-      const board = await tryGet<Array<{ board_status?: string; count?: number }>>(
-        "/v1/spine/board",
-        [],
-      );
+      // The board summary is an object keyed by status, e.g. {todo:2,total:5}.
+      const board = await tryGet<Record<string, number>>("/v1/spine/board", {});
       if (!on) return;
       const needsAttention =
         (inbox.blocked?.length ?? 0) +
         (inbox.overdue?.length ?? 0) +
         (inbox.unassigned?.length ?? 0);
-      const active = Array.isArray(board)
-        ? board
-            .filter((c) => ["todo", "in_progress", "in_review"].includes(c.board_status ?? ""))
-            .reduce((n, c) => n + (c.count ?? 0), 0)
-        : 0;
+      const active = (board.todo ?? 0) + (board.in_progress ?? 0) + (board.in_review ?? 0);
       setCounts({ "/briefs": needsAttention, "/runs": active });
     })();
     return () => {

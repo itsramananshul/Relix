@@ -54,6 +54,28 @@ npm run build    # -> crates/relix-web-bridge/dashboard-dist/
 Then rebuild/boot the bridge as usual. Re-run `npm run build` and commit
 the regenerated `dashboard-dist/` whenever the UI changes.
 
+## Mesh policy
+
+The dashboard's board / inbox / crew / runs pages call the coordinator's
+product-spine capabilities (`brief.*`, `mandate.*`, `agent.roster_summary`,
+`task.recent_events`, `task.stuck`). The mesh runs default-deny, so the
+boot scripts (`scripts/relix-mesh-up.ps1` / `.sh`) grant the `web-bridge`
+caller (`chat-users` group) allow-rules for those methods when they
+generate the run policy. Per-agent Key gates (tenant / manage / assign)
+still apply inside each capability — the policy rule only lifts the mesh
+default-deny so the operator console can reach the spine. If you run a
+custom policy, add the same `[[rules]]` (see the boot script) or the
+spine pages will return 502 (`default_deny`).
+
+## Known backend gaps (UI degrades, not faked)
+
+- **List-all mandates**: there is no list endpoint — only
+  `mandate.search` (requires a non-empty query). The Company page shows a
+  search box and only loads mandates on search.
+- **Crew list when empty**: `/v1/spine/roster` is a count summary
+  (`{active,total}`); the Operative *list* is `/v1/agents/access`. With no
+  hired crew both are empty and the pages show empty states.
+
 ## Stack
 
 - React 18 + react-router-dom 6

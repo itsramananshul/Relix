@@ -1,5 +1,5 @@
 import { tryGet } from "../api";
-import { Badge, Empty, Section, useAsync } from "../components/common";
+import { Badge, Empty, extractList, Section, useAsync } from "../components/common";
 
 interface Agent {
   agent_id?: string;
@@ -12,27 +12,13 @@ interface Agent {
   tier?: string;
 }
 
-// The roster endpoint shape varies; pull the operatives list out of
-// whatever wrapper it comes in.
-function extractAgents(v: unknown): Agent[] {
-  if (Array.isArray(v)) return v as Agent[];
-  if (v && typeof v === "object") {
-    const o = v as Record<string, unknown>;
-    for (const k of ["operatives", "agents", "roster", "members", "active_agents", "crew"]) {
-      if (Array.isArray(o[k])) return o[k] as Agent[];
-    }
-  }
-  return [];
-}
-
 export function Agents() {
-  const { data, loading, error } = useAsync(async () => {
-    let agents = extractAgents(await tryGet<unknown>("/v1/spine/roster", {}));
-    if (agents.length === 0) {
-      agents = extractAgents(await tryGet<unknown>("/v1/agents/access", {}));
-    }
-    return agents;
-  }, []);
+  // The Operative list is /v1/agents/access ({agents:[…]}); /spine/roster
+  // is only a count summary.
+  const { data, loading, error } = useAsync(
+    async () => extractList<Agent>(await tryGet<unknown>("/v1/agents/access", {}), ["agents", "operatives"]),
+    [],
+  );
 
   const agents = data ?? [];
 
