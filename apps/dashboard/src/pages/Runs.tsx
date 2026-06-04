@@ -22,6 +22,44 @@ interface RunRecord {
   review?: string;
   review_note?: string;
   reviewed_at?: number;
+  apply_status?: string;
+  applied_at?: number;
+  apply_note?: string;
+  applied_files?: number;
+  failed_files?: number;
+}
+
+// One file in a safe-apply plan (`/v1/runs/:id/diff` → plan.items).
+interface ApplyPlanItem {
+  rel_path?: string;
+  kind?: string;
+  action?: string; // create / overwrite / delete / noop / refuse
+  can_apply?: boolean;
+  conflict?: boolean;
+  reason?: string;
+  source_size?: number;
+  target_exists?: boolean;
+}
+
+interface ApplyPlan {
+  project_root?: string;
+  items?: ApplyPlanItem[];
+  applicable?: boolean;
+  changes?: number;
+  conflicts?: number;
+  blocked?: number;
+  note?: string;
+}
+
+// Safe-apply preview (`/v1/runs/:id/diff`).
+interface RunDiff {
+  run_id?: string;
+  status?: string;
+  review?: string;
+  apply_status?: string;
+  eligible?: boolean;
+  reason?: string;
+  plan?: ApplyPlan;
 }
 
 // One transcript event (`/v1/runs/:id/events`).
@@ -59,6 +97,23 @@ const ARTIFACT_TONE: Record<string, string> = {
   modified: "todo",
   deleted: "blocked",
 };
+
+const APPLY_STATUS_TONE: Record<string, string> = {
+  applied: "done",
+  ready: "todo",
+  conflicted: "blocked",
+  failed: "blocked",
+  blocked: "blocked",
+  not_applicable: "todo",
+};
+
+// An apply-plan item's badge tone: a refusal is red; a noop is neutral; a
+// safe write/delete is green.
+function applyActionTone(it: ApplyPlanItem): string {
+  if (!it.can_apply) return "blocked";
+  if (it.action === "noop") return "todo";
+  return "done";
+}
 
 function fmtBytes(n?: number): string {
   if (!n) return "0 B";
@@ -126,6 +181,7 @@ export function Runs() {
   const [eventsLoading, setEventsLoading] = useState(false);
   const [artifacts, setArtifacts] = useState<RunArtifact[]>([]);
   const [preview, setPreview] = useState<{ id: number; data: ArtifactPreview } | null>(null);
+  const [diff, setDiff] = useState<RunDiff | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
 
   const { data, loading, error, reload } = useAsync(async () => {
@@ -166,6 +222,11 @@ export function Runs() {
     setPreview({ id: artifactId, data: data ?? {} });
   }
 
+  async function loadDiff(runId: string) {
+    const d = await tryGet<RunDiff | null>(`/v1/runs/${encodeURIComponent(runId)}/diff`, null);
+    setDiff(d ?? null);
+  }
+
   async function toggle(runId: string) {
     if (expanded === runId) {
       setExpanded(null);
@@ -175,7 +236,23 @@ export function Runs() {
     setEvents([]);
     setArtifacts([]);
     setPreview(null);
-    await Promise.all([loadEvents(runId), loadArtifacts(runId)]);
+    setDiff(null);
+    await Promise.all([loadEvents(runId), loadArtifacts(runId), loadDiff(runId)]);
+  }
+
+  async function apply(runId: string) {
+    setBanner(null);
+    try {
+      const r = await api.post<{ apply_status?: string; applied_files?: number; failed_files?: number }>(
+        `/v1/runs/${encodeURIComponent(runId)}/apply`,
+        {},
+      );
+      setBanner(`Apply ${r.apply_status ?? "done"}: ${r.applied_files ?? 0} applied, ${r.failed_files ?? 0} failed.`);
+      reload();
+      await Promise.all([loadDiff(runId), loadEvents(runId)]);
+    } catch (e) {
+      setBanner(e instanceof Error ? e.message : "Apply failed");
+    }
   }
 
   async function review(runId: string, decision: "accepted" | "rejected") {
@@ -368,6 +445,50 @@ export function Runs() {
                                 )}
                                 {r.review !== "rejected" && (
                                   <button className="btn ghost sm" style={{ marginLeft: 6 }} onClick={(e) => { e.stopPropagation(); review(rid, "rejected"); }}>Reject</button>
+                                )}
+                              </div>
+                            )}
+
+                            {/* Apply — copy an accepted run's changes into the project root */}
+                            {r.status === "done" && r.review === "accepted" && (
+                              <div style={{ marginTop: 12 }}>
+                                <div className="row" style={{ marginBottom: 6 }}>
+                                  <strong style={{ fontSize: 12 }}>Apply</strong>
+                                  <span className={"badge " + (APPLY_STATUS_TONE[r.apply_status ?? ""] ?? "todo")} style={{ fontSize: 10, marginLeft: 8 }}>
+                                    {r.apply_status ?? "not applied"}
+                                  </span>
+                                  {diff?.plan?.note && <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>{diff.plan.note}</span>}
+                                  <div className="spacer" style={{ flex: 1 }} />
+                                  <button className="btn ghost sm" onClick={(e) => { e.stopPropagation(); loadDiff(rid); }}>Refresh plan</button>
+                                  {diff?.plan?.applicable && (diff.plan.changes ?? 0) > 0 && (
+                                    <button className="btn sm" style={{ marginLeft: 6 }} onClick={(e) => { e.stopPropagation(); apply(rid); }}>
+                                      Apply {diff.plan.changes} change(s)
+                                    </button>
+                                  )}
+                                </div>
+                                {diff?.plan?.project_root && (
+                                  <div className="muted mono" style={{ fontSize: 11, marginBottom: 6 }}>→ {diff.plan.project_root}</div>
+                                )}
+                                {diff && diff.eligible === false && (
+                                  <div className="banner info" style={{ fontSize: 11 }}>{diff.reason}</div>
+                                )}
+                                {diff?.plan && (diff.plan.items?.length ?? 0) === 0 ? (
+                                  <div className="muted" style={{ fontSize: 12 }}>No artifacts — nothing to apply.</div>
+                                ) : (
+                                  <div style={{ fontSize: 12 }}>
+                                    {(diff?.plan?.items ?? []).map((it, j) => (
+                                      <div key={(it.rel_path ?? "") + j} style={{ padding: "2px 0", borderBottom: "1px solid rgba(0,0,0,0.05)" }}>
+                                        <span className={"badge " + applyActionTone(it)} style={{ fontSize: 10 }}>{it.action}</span>{" "}
+                                        <span className="mono" style={{ fontSize: 11 }}>{it.rel_path}</span>{" "}
+                                        <span className="muted" style={{ fontSize: 10 }}>{it.reason}</span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                                {diff?.plan && diff.plan.applicable === false && (diff.plan.items?.length ?? 0) > 0 && (
+                                  <div className="banner err" style={{ fontSize: 11, marginTop: 6 }}>
+                                    Refusing apply: {diff.plan.conflicts ?? 0} conflict(s), {diff.plan.blocked ?? 0} blocked. Resolve these before applying.
+                                  </div>
                                 )}
                               </div>
                             )}
