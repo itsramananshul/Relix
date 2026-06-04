@@ -425,6 +425,11 @@ pub struct AppState {
     /// `auth_middleware` in `crate::auth`. Read-only on the live
     /// state — rotation requires a bridge restart.
     pub bridge_token: crate::auth::BridgeToken,
+    /// Dashboard operator-login state: the durable Argon2id admin
+    /// credential + the in-memory session table. Backs the
+    /// `/v1/auth/{status,setup,login,logout,me}` endpoints and lets the
+    /// auth middleware admit a request carrying a valid session cookie.
+    pub dashboard_auth: crate::dashboard_auth::DashboardAuth,
     /// SEC PART 3: operator-configured setup token guarding
     /// the `GET /v1/auth/token` bootstrap endpoint. `None`
     /// when neither `[auth] setup_token` is in `bridge.toml`
@@ -617,6 +622,9 @@ impl AppState {
         });
         let bridge_token = crate::auth::BridgeToken::load_or_generate(&token_path)
             .map_err(|e| BridgeError::Config(format!("bridge-token: {e}")))?;
+        // Dashboard operator-login state. The admin credential is stored
+        // next to the bridge token; sessions are in-memory.
+        let dashboard_auth = crate::dashboard_auth::DashboardAuth::from_token_path(&token_path);
 
         // SEC PART 3: resolve the setup token guarding
         // `/v1/auth/token`. `[auth] setup_token` wins; the
@@ -688,6 +696,7 @@ impl AppState {
             intervention_audit,
             mcp_audit: Arc::new(crate::mcp_audit::McpAuditRing::default()),
             bridge_token,
+            dashboard_auth,
             setup_token,
             bridge_host,
             bridge_port,

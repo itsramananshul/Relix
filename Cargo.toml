@@ -130,7 +130,7 @@ tokio-util = { version = "0.7", features = ["compat"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "multipart"] }
 axum    = { version = "0.7", features = ["macros", "ws"] }
 tower   = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 hyper   = "1.4"
 bytes   = "1.7"
 

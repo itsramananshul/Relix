@@ -829,6 +829,7 @@ async fn boot_harness(
             .keys()
             .map(|s| s.to_lowercase())
             .collect(),
+        dashboard_auth: Some(state.dashboard_auth.clone()),
     };
     let tenant_cfg = crate::tenant::TenantConfig::from_auth_section(&state.cfg.auth);
     let app = Router::new()

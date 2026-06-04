@@ -59,6 +59,12 @@ pub struct AuthState {
     /// the bridge token. Populated when
     /// `[auth] tenant_bindings = { … }` is configured.
     pub tenant_binding_prefixes: std::collections::HashSet<String>,
+    /// Dashboard operator-login state. The middleware admits a request
+    /// carrying a valid `relix_session` cookie (a logged-in dashboard
+    /// user) exactly as if it presented the bridge token, so the SPA's
+    /// `fetch` calls authenticate automatically. `None` in the auth-only
+    /// unit tests that don't stand up the dashboard auth state.
+    pub dashboard_auth: Option<crate::dashboard_auth::DashboardAuth>,
 }
 
 /// Bytes of entropy in the bridge token (256 bits → 64 hex chars).
@@ -240,9 +246,17 @@ fn forbidden_csrf() -> Response {
 }
 
 /// Whether the request path is in the always-public allowlist.
+///
+/// The dashboard SPA + its login endpoints are public so an operator can
+/// reach the login screen before they hold any credential:
+/// - `/dashboard` and `/dashboard/*` serve the static SPA bundle.
+/// - `/v1/auth/*` are the login surface; each self-gates (login/setup
+///   verify credentials; me/logout read the session cookie).
 fn is_public_path(path: &str) -> bool {
-    matches!(path, "/health" | "/dashboard" | "/v1/auth/token")
+    matches!(path, "/health" | "/dashboard")
+        || path.starts_with("/dashboard/")
         || path.starts_with("/assets/")
+        || path.starts_with("/v1/auth/")
         || path.starts_with("/v1/bridge-back/")
 }
 
@@ -340,6 +354,17 @@ pub async fn auth_middleware(State(auth): State<AuthState>, req: Request, next: 
     // the Authorization header instead.
     if has_token_query_param(&req) {
         return bad_request_query_token_disallowed();
+    }
+
+    // A logged-in dashboard request rides an HTTP-only `relix_session`
+    // cookie instead of the bearer. Admit it when it resolves to a live
+    // session — this is what lets the SPA's `fetch` calls authenticate
+    // automatically without pasting a token.
+    if let Some(da) = &auth.dashboard_auth
+        && let Some(sid) = crate::dashboard_auth::session_cookie_value(&req)
+        && da.validate_session(&sid).is_some()
+    {
+        return next.run(req).await;
     }
 
     let provided = match extract_bearer(&req) {
@@ -588,6 +613,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 19791,
                 tenant_binding_prefixes: std::collections::HashSet::new(),
+                dashboard_auth: None,
             },
             value,
         )

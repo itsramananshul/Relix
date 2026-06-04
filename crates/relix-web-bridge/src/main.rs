@@ -119,6 +119,7 @@ mod control_plane;
 mod credentials;
 mod cron;
 mod dashboard;
+mod dashboard_auth;
 mod delegate;
 mod discord;
 mod dispatch_stats;
@@ -1225,6 +1226,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // already has an Authorization header, and CSRF-checks
         // the Origin. See `auth.rs`.
         .route("/v1/auth/token", get(auth::bootstrap_token))
+        // Dashboard operator login (username/password + Argon2id, HTTP-
+        // only session cookie). These are public (allowlisted in the auth
+        // middleware) so an operator can reach the login screen before
+        // they hold any credential; each endpoint self-gates.
+        .route("/v1/auth/status", get(dashboard_auth::status))
+        .route("/v1/auth/setup", post(dashboard_auth::setup))
+        .route("/v1/auth/login", post(dashboard_auth::login))
+        .route("/v1/auth/logout", post(dashboard_auth::logout))
+        .route("/v1/auth/me", get(dashboard_auth::me))
         // Per-principal rate-limit middleware. Runs AFTER auth so
         // each principal gets its own bucket. Layered below the
         // auth layer in the source — axum applies layers
@@ -1260,6 +1270,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .keys()
                     .map(|s| s.to_lowercase())
                     .collect(),
+                // Admit logged-in dashboard requests that ride the
+                // `relix_session` cookie (operator login).
+                dashboard_auth: Some(state.dashboard_auth.clone()),
             },
             auth::auth_middleware,
         ))

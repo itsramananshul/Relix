@@ -37,6 +37,9 @@ clap.workspace               = true
 hex.workspace                = true
 tempfile.workspace           = true
 rand.workspace               = true
+# Dashboard operator-login: Argon2id password hashing for the
+# first-run admin credential (PHC-string storage).
+argon2.workspace             = true
 blake3.workspace             = true
 sha2.workspace               = true
 futures.workspace            = true
