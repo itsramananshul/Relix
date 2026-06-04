@@ -599,7 +599,9 @@ function renderOrchestration(host, run) {
   box.append(node("strong",{textContent:"Orchestration: "+(run.status||"")+" ("+(run.mode||"")+(run.dry_run?", dry-run":"")+")"}));
   const ids = a => (a||[]).map(x => (x.task_id||x)).join(", ") || "none";
   box.append(node("div",{textContent:"Created: "+ids(run.created_brief_ids)}));
+  box.append(node("div",{className:"muted",textContent:"Reused (existing): "+ids(run.existing_brief_ids)}));
   box.append(node("div",{textContent:"Assigned: "+ids(run.assigned_brief_ids)}));
+  if ((run.skipped||[]).length) box.append(node("div",{className:"muted",textContent:"Skipped: "+run.skipped.map(s=>s.reason||JSON.stringify(s)).join(", ")}));
   if ((run.blockers||[]).length) box.append(node("div",{className:"err",textContent:"Blockers: "+run.blockers.map(b=>b.reason||JSON.stringify(b)).join(", ")}));
   (run.next_actions||[]).forEach(s => box.append(node("div",{className:"muted",textContent:"→ "+s})));
   host.append(box);
@@ -648,7 +650,7 @@ async function teamPlanBlock(mandateId) {
     try {
       const r = await post("/v1/spine/mandates/"+encodeURIComponent(mandateId)+"/orchestrate", {mode});
       oout.className = "event"; oout.textContent = "";
-      renderOrchestration(oout, {status:r.status, mode:r.mode, dry_run:r.dry_run, created_brief_ids:r.created_briefs, assigned_brief_ids:r.assigned_briefs, blockers:r.blockers, next_actions:r.next_actions});
+      renderOrchestration(oout, {status:r.status, mode:r.mode, dry_run:r.dry_run, created_brief_ids:r.created_briefs, existing_brief_ids:r.existing_briefs, assigned_brief_ids:r.assigned_briefs, skipped:r.skipped, blockers:r.blockers, next_actions:r.next_actions});
       await refresh();        // refresh board/inbox counts
       await openMandate(mandateId);  // re-render the panel (shows persisted run)
     } catch(e) { oout.className = "event err"; oout.textContent = e.message; }
