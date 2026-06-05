@@ -594,10 +594,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/chat/completions", post(openai::chat_completions))
         // Task-native read API (Track 2). Bridge stays translation-only:
         // each route is a thin forwarder to a Coordinator capability.
-        // `/spine` is the legacy interim board. Phase 2 Slice 1: it now
-        // REDIRECTS to the canonical React dashboard (`/dashboard`) so there
-        // is one product surface; the old board is served only under
-        // `RELIX_ENABLE_LEGACY_SPINE=1`. The `/v1/spine/*` JSON routes below
+        // `/spine` is RETIRED (Phase 2 Slice 2): the interim spine board HTML
+        // is deleted and React (`/dashboard`) is the one product surface.
+        // `/spine` now PERMANENTLY (308) redirects to `/dashboard`, kept only
+        // so old bookmarks/docs resolve. The `/v1/spine/*` JSON routes below
         // are the real, supported product-spine API.
         .route("/spine", get(spine::page))
         .route("/v1/spine/companion", post(companion::handle))
