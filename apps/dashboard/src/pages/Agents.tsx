@@ -56,7 +56,15 @@ interface Adapter {
 interface CompanyStatus {
   initialized?: boolean;
   founder?: Agent | null;
+  prime?: Agent | null;
   operative_count?: number;
+  crew?: {
+    total?: number;
+    active?: number;
+    pending?: number;
+    by_status?: Record<string, number>;
+    by_role?: Record<string, number>;
+  };
 }
 interface Card { assignee_agent_id?: string | null }
 interface RunRow { agent_id?: string; status?: string }
@@ -140,7 +148,24 @@ export function Agents() {
   }
 
   const founder = agents.find((a) => a.role === "founder") ?? (company.founder ?? undefined);
-  const crew = agents.filter((a) => a.role !== "founder");
+  // Prime = the planning lead (Founder's right hand). Prefer the server's
+  // resolved Prime, else the operative whose role is `prime`.
+  const prime =
+    agents.find((a) => a.role?.toLowerCase() === "prime") ?? (company.prime ?? undefined);
+  // The rest of the Crew, minus the Founder + Prime (shown as their own cards).
+  const rest = agents.filter(
+    (a) => a.role !== "founder" && a.agent_id !== (prime?.agent_id ?? ""),
+  );
+  // Separate pending hires (awaiting approval/Clearance) from active Crew so a
+  // half-built team reads honestly.
+  const pendingHires = rest.filter((a) => a.status === "pending");
+  const activeCrew = rest.filter((a) => a.status !== "pending");
+  // Resolve a boss agent_id → display name for the reporting line.
+  const nameOf = (id?: string | null) => {
+    if (!id) return null;
+    const a = agents.find((x) => x.agent_id === id);
+    return a?.name ?? id.slice(0, 8);
+  };
 
   async function initCompany() {
     setBanner(null);
@@ -352,7 +377,88 @@ export function Agents() {
         </div>
       )}
 
-      {/* Operatives roster (the rest of the crew). */}
+      {/* Prime — the Founder's planning lead, shown distinctly. */}
+      {prime ? (
+        <div className="card">
+          <h3>Prime</h3>
+          <div className="row wrap" style={{ gap: 18, alignItems: "flex-start" }}>
+            <div>
+              <div className="row" style={{ gap: 8 }}>
+                <strong>{prime.name ?? "Prime"}</strong>
+                <span className="badge in_progress">Prime</span>
+                <Badge status={prime.status ?? "active"} />
+              </div>
+              <div className="mono" style={{ fontSize: 11, marginTop: 4 }}>{(prime.agent_id ?? "").slice(0, 16)}</div>
+              {prime.reports_to && (
+                <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>reports to {nameOf(prime.reports_to)}</div>
+              )}
+            </div>
+            <div>
+              <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>Adapter</div>
+              {rigSelect(prime)}
+            </div>
+            <div>
+              <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>Readiness</div>
+              {rigStatusCell(prime.rig)}
+            </div>
+            <div>
+              <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>Workload</div>
+              <span>{workload.get(prime.agent_id ?? "") ?? 0} open · {running.get(prime.agent_id ?? "") ?? 0} running</span>
+            </div>
+            <div>
+              <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>Keys</div>
+              <button className="btn ghost sm" onClick={() => toggleKeys(prime.agent_id ?? "")}>
+                {keysOpen === prime.agent_id ? "Hide" : "View"}
+              </button>
+            </div>
+          </div>
+          {keysOpen === prime.agent_id && (
+            <div style={{ marginTop: 10 }}>{keysDetail(prime.agent_id ?? "")}</div>
+          )}
+        </div>
+      ) : founder ? (
+        <div className="card" style={{ padding: "10px 14px" }}>
+          <div className="row">
+            <span className="badge backlog">No Prime yet</span>
+            <span className="muted" style={{ fontSize: 12, marginLeft: 8 }}>
+              Hire a Prime (planning lead) to propose Mandate strategy + build the team.
+            </span>
+            <span className="spacer" style={{ flex: 1 }} />
+            <Link to="/mandates" className="link" style={{ fontSize: 12 }}>Mandates →</Link>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Pending hires — operatives awaiting approval / Clearance. */}
+      {pendingHires.length > 0 && (
+        <div className="card">
+          <div className="row" style={{ marginBottom: 8 }}>
+            <h3 style={{ margin: 0 }}>Pending hires</h3>
+            <span className="muted" style={{ fontSize: 12, marginLeft: 8 }}>
+              {pendingHires.length} awaiting approval — greenlight on the Mandates page
+            </span>
+            <span className="spacer" style={{ flex: 1 }} />
+            <Link to="/mandates" className="link" style={{ fontSize: 12 }}>Clearances →</Link>
+          </div>
+          <div className="table-scroll">
+            <table className="table">
+              <thead><tr><th>Operative</th><th>Role</th><th>Reports to</th><th>Status</th></tr></thead>
+              <tbody>
+                {pendingHires.map((a, i) => (
+                  <tr key={a.agent_id ?? i}>
+                    <td><strong>{a.name ?? (a.agent_id ?? "").slice(0, 10)}</strong><div className="mono" style={{ fontSize: 10 }}>{(a.agent_id ?? "").slice(0, 12)}</div></td>
+                    <td className="dim">{a.role ?? a.title ?? "—"}</td>
+                    <td className="muted">{nameOf(a.reports_to) ?? "—"}</td>
+                    <td><Badge status={a.status ?? "pending"} /></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Operatives roster (the active crew). */}
       <div className="card">
         <div className="row" style={{ marginBottom: 10 }}>
           <h3 style={{ margin: 0 }}>Operatives</h3>
@@ -361,8 +467,8 @@ export function Agents() {
         </div>
         {loading ? (
           <div className="loading">Loading crew…</div>
-        ) : crew.length === 0 ? (
-          <Empty>No other Operatives yet — the Founder can hire more as the company grows.</Empty>
+        ) : activeCrew.length === 0 ? (
+          <Empty>No other active Operatives yet — the Founder/Prime can hire more as the company grows.</Empty>
         ) : (
           <div className="table-scroll">
             <table className="table">
@@ -370,6 +476,7 @@ export function Agents() {
                 <tr>
                   <th>Operative</th>
                   <th>Role</th>
+                  <th>Reports to</th>
                   <th>Status</th>
                   <th>Adapter (Rig)</th>
                   <th>Readiness</th>
@@ -379,7 +486,7 @@ export function Agents() {
                 </tr>
               </thead>
               <tbody>
-                {crew.map((a, i) => {
+                {activeCrew.map((a, i) => {
                   const id = a.agent_id ?? "";
                   return (
                     <Fragment key={id || i}>
@@ -389,6 +496,7 @@ export function Agents() {
                         <div className="mono" style={{ fontSize: 10 }}>{id.slice(0, 12)}</div>
                       </td>
                       <td className="dim">{a.role ?? a.title ?? "—"}</td>
+                      <td className="muted">{nameOf(a.reports_to) ?? "—"}</td>
                       <td><Badge status={a.status ?? "active"} /></td>
                       <td>{rigSelect(a)}</td>
                       <td>{rigStatusCell(a.rig)}</td>
@@ -406,7 +514,7 @@ export function Agents() {
                     </tr>
                     {keysOpen === id && (
                       <tr>
-                        <td colSpan={8} style={{ background: "rgba(0,0,0,0.02)" }}>{keysDetail(id)}</td>
+                        <td colSpan={9} style={{ background: "rgba(0,0,0,0.02)" }}>{keysDetail(id)}</td>
                       </tr>
                     )}
                     </Fragment>

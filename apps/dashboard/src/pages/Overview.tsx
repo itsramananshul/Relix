@@ -11,7 +11,13 @@ interface Inbox { blocked?: Card[]; overdue?: Card[]; unassigned?: Card[]; revie
 interface Roster { active?: number; total?: number }
 interface EventRow { task_id?: string; event_type?: string; ts?: number; payload?: string }
 interface Founder { name?: string; rig?: string | null }
-interface CompanyStatus { initialized?: boolean; founder?: Founder | null; operative_count?: number }
+interface CompanyStatus {
+  initialized?: boolean;
+  founder?: Founder | null;
+  prime?: Founder | null;
+  operative_count?: number;
+  crew?: { total?: number; active?: number; pending?: number };
+}
 interface Adapter { name?: string; probe?: { status?: string } }
 interface RunRow {
   run_id?: string;
@@ -248,8 +254,19 @@ export function Overview() {
             </span>
           </div>
           <div className="kv">
+            <span className="muted">Prime</span>
+            <span>
+              {company.prime?.name ?? <span className="muted">not hired yet</span>}
+              {company.prime?.rig && <span className="mono" style={{ marginLeft: 6 }}>{company.prime.rig}</span>}
+            </span>
+          </div>
+          <div className="kv">
             <span className="muted">Crew</span>
-            <span>{crew} Operative{crew === 1 ? "" : "s"} · <Link to="/agents" className="link">manage</Link></span>
+            <span>
+              {crew} Operative{crew === 1 ? "" : "s"}
+              {(company.crew?.pending ?? 0) > 0 && <span className="badge backlog" style={{ fontSize: 9, marginLeft: 6 }}>{company.crew!.pending} pending</span>}
+              {" · "}<Link to="/agents" className="link">manage</Link>
+            </span>
           </div>
           <div className="kv">
             <span className="muted">Adapters</span>

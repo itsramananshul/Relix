@@ -8,10 +8,11 @@ interface Card { task_id?: string; id?: string; title?: string; board_status?: s
 interface Operative { agent_id?: string; name?: string; role?: string; rig?: string | null }
 interface Adapter { name?: string; probe?: { status?: string } }
 interface Strategy { status?: string | null; approved?: boolean }
+interface ActiveAgent { agent_id?: string; name?: string; role?: string; status?: string }
 interface Readiness {
   planned?: boolean; plan_status?: string | null; readiness?: string; next_action?: string;
   missing_roles?: unknown[]; pending_hires?: unknown[]; pending_clearances?: { clearance_id?: string; status?: string }[];
-  active_agents?: unknown[]; blocked_roles?: unknown[];
+  active_agents?: ActiveAgent[]; blocked_roles?: unknown[];
 }
 interface Clearance { approval_id?: string; agent_id?: string; method?: string; reason?: string }
 interface Orchestration {
@@ -292,13 +293,25 @@ export function Mandates() {
                         {rdy?.next_action && <span className="muted" style={{ fontSize: 11 }}>{rdy.next_action}</span>}
                       </div>
                       {rdy?.planned && (
-                        <div className="row wrap" style={{ gap: 6, fontSize: 11 }}>
-                          <span className="badge done">{len(rdy.active_agents)} active</span>
-                          <span className="badge in_progress">{len(rdy.pending_hires)} pending hire(s)</span>
-                          <span className="badge in_progress">{len(rdy.pending_clearances)} pending clearance(s)</span>
-                          <span className="badge backlog">{len(rdy.missing_roles)} missing role(s)</span>
-                          {len(rdy.blocked_roles) > 0 && <span className="badge blocked">{len(rdy.blocked_roles)} blocked</span>}
-                        </div>
+                        <>
+                          <div className="row wrap" style={{ gap: 6, fontSize: 11 }}>
+                            <span className="badge done">{len(rdy.active_agents)} active</span>
+                            <span className="badge in_progress">{len(rdy.pending_hires)} pending hire(s)</span>
+                            <span className="badge in_progress">{len(rdy.pending_clearances)} pending clearance(s)</span>
+                            <span className="badge backlog">{len(rdy.missing_roles)} missing role(s)</span>
+                            {len(rdy.blocked_roles) > 0 && <span className="badge blocked">{len(rdy.blocked_roles)} blocked</span>}
+                          </div>
+                          {len(rdy.active_agents) > 0 && (
+                            <div className="row wrap" style={{ gap: 6, marginTop: 6 }}>
+                              <span className="muted" style={{ fontSize: 11 }}>On the team:</span>
+                              {(rdy.active_agents ?? []).map((ag, i) => (
+                                <span key={ag.agent_id ?? i} className="badge done" style={{ fontSize: 9 }} title={ag.agent_id}>
+                                  {ag.name ?? (ag.agent_id ?? "").slice(0, 8)}{ag.role ? ` · ${ag.role}` : ""}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </>
                       )}
                     </>
                   )}
