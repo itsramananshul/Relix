@@ -2,6 +2,7 @@ import { tryGet } from "../api";
 import { useAuth } from "../auth";
 import { asArray, Empty, useAsync } from "../components/common";
 import { MaintenancePanel } from "../components/MaintenancePanel";
+import { HealthPanel } from "../components/HealthPanel";
 
 interface Provider { name?: string; id?: string; configured?: boolean; enabled?: boolean; model?: string }
 interface Adapter {
@@ -64,7 +65,10 @@ export function Settings() {
   const runConfig = data?.runConfig ?? {};
 
   return (
-    <div className="grid cols-2">
+    <div className="grid">
+      {/* Live diagnostics first — the fastest way to see what's wrong. */}
+      <HealthPanel />
+      <div className="grid cols-2">
       <MaintenancePanel />
 
       <div className="card">
@@ -289,6 +293,7 @@ export function Settings() {
             </tbody>
           </table>
         )}
+      </div>
       </div>
     </div>
   );

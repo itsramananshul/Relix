@@ -9003,7 +9003,19 @@ fn register_node_type_handlers(
                         let st = st.clone();
                         let ags = ags.clone();
                         async move {
-                            let brief_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
+                            // Args are `brief_id` or `brief_id|rig_override`.
+                            // A non-empty rig override forces that Rig (e.g.
+                            // `echo` for the golden-path smoke) instead of the
+                            // assignee's configured Rig; an unknown Rig refuses
+                            // cleanly via the normal `no_adapter` path.
+                            let raw = String::from_utf8_lossy(&ctx.args);
+                            let mut parts = raw.splitn(2, '|');
+                            let brief_id = parts.next().unwrap_or("").trim().to_string();
+                            let rig_override = parts
+                                .next()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string());
                             if brief_id.is_empty() {
                                 return crate::dispatch::HandlerOutcome::Err(
                                     relix_core::types::ErrorEnvelope {
@@ -9051,13 +9063,15 @@ fn register_node_type_handlers(
                             // handler returns immediately with the run_id +
                             // status `running`; the dashboard polls `/v1/runs`.
                             let bridge_tokens = crate::rig::bridge::BridgeTokenStore::global();
+                            // An explicit override wins over the assignee's Rig.
+                            let chosen_rig = rig_override.as_deref().or(preferred.as_deref());
                             let pre = crate::nodes::coordinator::heartbeat::preflight_run(
                                 &st,
                                 &reg,
                                 Some(&bridge_tokens),
                                 300,
                                 &brief_id,
-                                preferred.as_deref(),
+                                chosen_rig,
                                 prompt,
                             );
                             let report = match pre {

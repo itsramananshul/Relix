@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { useAuth } from "../auth";
 
 export function Login() {
-  const { status, login, setup } = useAuth();
+  const { status, login, setup, bridgeDown, bridgeError, refresh } = useAuth();
   const isSetup = status?.needs_setup ?? false;
   const [username, setUsername] = useState("admin");
   const [password, setPassword] = useState("");
@@ -38,6 +38,15 @@ export function Login() {
             ? "Create the operator admin account for this bridge."
             : "Operator console for your Relix mesh."}
         </p>
+        {bridgeDown && (
+          <div className="banner err banner-action" style={{ marginBottom: 8 }}>
+            <span>
+              Can't reach the Relix bridge{bridgeError ? ` (${bridgeError})` : ""}. Start the mesh on
+              the host (<span className="mono">scripts/relix-mesh-up</span>), then retry.
+            </span>
+            <span className="banner-cta" style={{ cursor: "pointer" }} onClick={() => void refresh()}>Retry →</span>
+          </div>
+        )}
         {err && <div className="banner err">{err}</div>}
         <label className="field">
           <span>Username</span>

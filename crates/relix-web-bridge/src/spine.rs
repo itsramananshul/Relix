@@ -802,18 +802,42 @@ pub async fn move_brief(
     ok_json()
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct RunBriefRequest {
+    /// Optional Rig override — forces a specific adapter (e.g. `echo` for the
+    /// golden-path smoke) instead of the assignee's configured Rig. Empty /
+    /// absent uses the Operative's Rig.
+    #[serde(default)]
+    pub rig: Option<String>,
+}
+
 /// `POST /v1/spine/briefs/:id/run` — run a Brief NOW through its
-/// Operative's agent adapter (Rig). Returns the structured RunReport
-/// (`status` = done/failed/continued or a clear unavailable refusal,
-/// plus `rig`, `summary`, optional `install_hint`). The execution
-/// result is also chronicled on the Brief (read back via
-/// `/v1/spine/briefs/:id/events`).
+/// Operative's agent adapter (Rig), or an explicit `{rig}` override.
+/// Returns the structured RunReport (`status` = done/failed/continued or
+/// a clear unavailable refusal, plus `rig`, `summary`, optional
+/// `install_hint`). The execution result is also chronicled on the Brief
+/// (read back via `/v1/spine/briefs/:id/events`).
 pub async fn run_brief(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    body: Option<Json<RunBriefRequest>>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
-    let body = call_peer(&state, "brief.run", id.as_bytes()).await?;
-    json_passthrough(body)
+    let rig = body
+        .and_then(|Json(b)| b.rig)
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty());
+    // The coordinator capability parses `brief_id` or `brief_id|rig`. Reject
+    // a `|` in the brief id so the override delimiter can't be smuggled.
+    if id.contains('|') {
+        return Err(bad("invalid brief id"));
+    }
+    let arg = match rig {
+        Some(r) if !r.contains('|') => format!("{id}|{r}"),
+        Some(_) => return Err(bad("invalid rig override")),
+        None => id,
+    };
+    let resp = call_peer(&state, "brief.run", arg.as_bytes()).await?;
+    json_passthrough(resp)
 }
 
 /// `GET /v1/runs` — the recent execution runs across all Briefs (the

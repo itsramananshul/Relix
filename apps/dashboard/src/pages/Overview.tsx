@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
-import { tryGet } from "../api";
+import { tryGet, tryGetReport } from "../api";
 import { Badge, extractList, useAsync } from "../components/common";
+import { HealthPanel } from "../components/HealthPanel";
 
 // The board summary arrives as an object keyed by board status, e.g.
 // `{ "backlog": 1, "todo": 2, "total": 3 }`.
@@ -50,30 +51,40 @@ interface Warn {
 }
 
 export function Overview() {
-  const { data, loading } = useAsync(async () => {
-    const [board, inbox, roster, company, adapters, runs, runCfg, maint, events] = await Promise.all([
-      tryGet<BoardSummary>("/v1/spine/board", {}),
+  const { data, loading, reload } = useAsync(async () => {
+    // The board + company are the CORE of the Command Center — if they fail
+    // we must say so (not show a blank board). Optional surfaces stay on
+    // `tryGet` so one slow panel doesn't blank the page.
+    const [boardR, companyR, runsR] = await Promise.all([
+      tryGetReport<BoardSummary>("/v1/spine/board", {}),
+      tryGetReport<CompanyStatus>("/v1/spine/company", {}),
+      tryGetReport<RunRow[]>("/v1/runs", []),
+    ]);
+    const [inbox, roster, adapters, runCfg, maint, events] = await Promise.all([
       tryGet<Inbox>("/v1/spine/inbox?limit=50", {}),
       tryGet<Roster>("/v1/spine/roster", {}),
-      tryGet<CompanyStatus>("/v1/spine/company", {}),
       tryGet<Adapter[]>("/v1/adapters", []),
-      tryGet<RunRow[]>("/v1/runs", []),
       tryGet<RunConfig>("/v1/spine/run-config", {}),
       tryGet<MaintSummary | null>("/v1/maintenance/summary", null),
       tryGet<unknown>("/v1/tasks/events/recent?limit=10", {}),
     ]);
     const mandates = await tryGet<unknown>("/v1/spine/mandates?limit=8", {});
+    const coreError =
+      boardR.error || companyR.error || runsR.error
+        ? (boardR.error ?? companyR.error ?? runsR.error)
+        : null;
     return {
-      board,
+      board: boardR.data,
       inbox,
       roster,
-      company: company ?? {},
+      company: companyR.data ?? {},
       adapters: Array.isArray(adapters) ? adapters : [],
-      runs: Array.isArray(runs) ? runs : [],
+      runs: Array.isArray(runsR.data) ? runsR.data : [],
       runCfg: runCfg ?? {},
       maint: maint ?? null,
       mandates: extractList<MandateRow>(mandates, ["mandates"]),
       events: extractList<EventRow>(events),
+      coreError,
     };
   }, []);
 
@@ -150,9 +161,12 @@ export function Overview() {
   }
 
   // First-run: no Founder yet. The single most important next action.
-  if (!loading && !initialized) {
+  // Guard: only treat "no company" as first-run when the core reads actually
+  // SUCCEEDED — otherwise a down coordinator would masquerade as first-run.
+  if (!loading && !initialized && !data?.coreError) {
     return (
       <div className="grid">
+        <HealthPanel compact />
         <div className="card setup-card">
           <div className="setup-step">Step 1 of 2 · First-run setup</div>
           <h2 style={{ margin: "4px 0 8px" }}>Welcome to Relix</h2>
@@ -189,6 +203,14 @@ export function Overview() {
 
   return (
     <div className="grid">
+      {/* Live system health — only loud when a layer is down. */}
+      <HealthPanel compact />
+      {data?.coreError && (
+        <div className="banner err banner-action">
+          <span>Some Command Center data failed to load: {data.coreError}</span>
+          <span className="banner-cta" onClick={reload} style={{ cursor: "pointer" }}>Retry →</span>
+        </div>
+      )}
       {/* Actionable system warnings + next steps */}
       {warnings.length > 0 && (
         <div className="grid" style={{ gap: 8 }}>

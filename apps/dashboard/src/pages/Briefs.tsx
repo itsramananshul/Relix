@@ -189,10 +189,13 @@ export function Briefs() {
     }
   }
 
-  async function run(c: Card) {
-    setBanner({ kind: "info", msg: `Running ${c.title ?? "brief"}…` });
+  async function run(c: Card, rig?: string) {
+    setBanner({ kind: "info", msg: `Running ${c.title ?? "brief"}${rig ? ` (${rig})` : ""}…` });
     try {
-      const r = await api.post<RunReport>(`/v1/spine/briefs/${encodeURIComponent(cardId(c))}/run`, {});
+      const r = await api.post<RunReport>(
+        `/v1/spine/briefs/${encodeURIComponent(cardId(c))}/run`,
+        rig ? { rig } : {},
+      );
       const accepted = r.status === "running" || r.status === "done";
       const refusal = ["unassigned", "no_adapter", "adapter_unavailable", "already_running", "not_found"].includes(r.status);
       const kind = accepted ? "ok" : refusal ? "info" : "err";
@@ -384,8 +387,24 @@ export function Briefs() {
                           >
                             Run
                           </button>
+                          {/* Golden-path smoke: echo always works once a Brief
+                              is assigned — even if the real adapter is missing. */}
+                          <button
+                            className="btn ghost sm"
+                            disabled={!c.assignee_agent_id || latestRun.get(cardId(c))?.status === "running"}
+                            title={
+                              !c.assignee_agent_id
+                                ? "Assign an Operative first"
+                                : latestRun.get(cardId(c))?.status === "running"
+                                  ? "Already running"
+                                  : "Run with the echo Rig (no real adapter needed) — verifies the pipeline end to end"
+                            }
+                            onClick={() => run(c, "echo")}
+                          >
+                            echo
+                          </button>
                         </div>
-                        {block && <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>⚠ {block}</div>}
+                        {block && <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>⚠ {block} — or hit <strong>echo</strong> to smoke the pipeline.</div>}
                       </div>
                     );
                   })}

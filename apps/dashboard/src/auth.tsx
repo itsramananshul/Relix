@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
-import { api } from "./api";
+import { ApiError, api } from "./api";
 
 export interface AuthStatus {
   needs_setup: boolean;
@@ -10,6 +10,11 @@ export interface AuthStatus {
 interface AuthContextValue {
   loading: boolean;
   status: AuthStatus | null;
+  // The auth-status probe couldn't reach the bridge at all (network/DNS/TLS
+  // failure, bridge process down). Distinct from "reached the bridge and it
+  // says you're not logged in" so the UI can explain the right fix.
+  bridgeDown: boolean;
+  bridgeError: string | null;
   refresh: () => Promise<void>;
   login: (username: string, password: string) => Promise<void>;
   setup: (username: string, password: string) => Promise<void>;
@@ -21,12 +26,22 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState<AuthStatus | null>(null);
+  const [bridgeDown, setBridgeDown] = useState(false);
+  const [bridgeError, setBridgeError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
       const s = await api.get<AuthStatus>("/v1/auth/status");
       setStatus(s);
-    } catch {
+      setBridgeDown(false);
+      setBridgeError(null);
+    } catch (e) {
+      // An ApiError means the bridge answered (e.g. 5xx) — still "reachable
+      // but unhealthy". A non-ApiError (TypeError from fetch) means the
+      // request never reached the bridge: treat that as bridge-down.
+      const reached = e instanceof ApiError;
+      setBridgeDown(!reached);
+      setBridgeError(e instanceof Error ? e.message : String(e));
       setStatus({ needs_setup: false, authenticated: false, username: null });
     } finally {
       setLoading(false);
@@ -62,7 +77,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [refresh]);
 
   return (
-    <AuthContext.Provider value={{ loading, status, refresh, login, setup, logout }}>
+    <AuthContext.Provider value={{ loading, status, bridgeDown, bridgeError, refresh, login, setup, logout }}>
       {children}
     </AuthContext.Provider>
   );
