@@ -271,6 +271,10 @@ signed audit record**. No bypass switch.
   Overview panel; the task ledger, cron jobs, policy denials, and
   MCP servers each have their own panel, backed by `/v1/tasks`,
   `/v1/cron/jobs`, `/v1/policy/denials`, and `/v1/mcp/servers`.
+  The **Mandates** page turns a high-level goal into a Brief tree:
+  create a Mandate, then orchestrate it (plan-only / create / create +
+  assign, with a dry-run preview) and watch progress — over the existing
+  `mandate.orchestrate` engine (strategy-gated).
   First sign-in creates a single admin (username + Argon2id password).
   **Forgot the local admin password?** Run
   `scripts/relix-dashboard-admin-reset.ps1` (Windows) or
