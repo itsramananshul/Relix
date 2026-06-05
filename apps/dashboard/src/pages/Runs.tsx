@@ -116,6 +116,24 @@ interface ArtifactPreview {
   reason?: string;
 }
 
+// Unified-diff response (`/v1/runs/:id/artifacts/:aid/diff`).
+interface ArtifactDiff {
+  rel_path?: string;
+  kind?: string;
+  available?: boolean;
+  truncated?: boolean;
+  baseline?: string; // "project_root" | "empty"
+  diff?: string;
+  reason?: string;
+}
+
+// Run-workspace storage summary (`/v1/maintenance/summary`) — just enough to
+// warn when disk usage is high and point at the cleanup panel.
+interface StorageSummary {
+  workspace?: { count?: number; total_bytes?: number };
+  warnings?: { level?: string; message?: string }[];
+}
+
 const ARTIFACT_TONE: Record<string, string> = {
   created: "done",
   modified: "todo",
@@ -128,6 +146,7 @@ const APPLY_STATUS_TONE: Record<string, string> = {
   conflicted: "blocked",
   failed: "blocked",
   blocked: "blocked",
+  discarded: "blocked",
   not_applicable: "todo",
 };
 
@@ -228,6 +247,9 @@ export function Runs() {
   const [eventsLoading, setEventsLoading] = useState(false);
   const [artifacts, setArtifacts] = useState<RunArtifact[]>([]);
   const [preview, setPreview] = useState<{ id: number; data: ArtifactPreview } | null>(null);
+  // Per-file unified diff (workspace output vs baseline), mutually exclusive
+  // with the inline preview.
+  const [diffView, setDiffView] = useState<{ id: number; data: ArtifactDiff } | null>(null);
   const [diff, setDiff] = useState<RunDiff | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -235,13 +257,15 @@ export function Runs() {
   const [liveConn, setLiveConn] = useState<RunEventConn>("connecting");
 
   const { data, loading, error, reload } = useAsync(async () => {
-    const [runs, adapters] = await Promise.all([
+    const [runs, adapters, storage] = await Promise.all([
       tryGet<RunRecord[]>("/v1/runs", []),
       tryGet<Adapter[]>("/v1/adapters", []),
+      tryGet<StorageSummary | null>("/v1/maintenance/summary", null),
     ]);
     return {
       runs: Array.isArray(runs) ? runs : [],
       adapters: Array.isArray(adapters) ? adapters : [],
+      storage: storage ?? null,
     };
   }, []);
 
@@ -265,11 +289,43 @@ export function Runs() {
       setPreview(null);
       return;
     }
+    setDiffView(null);
     const data = await tryGet<ArtifactPreview>(
       `/v1/runs/${encodeURIComponent(runId)}/artifacts/${artifactId}/preview`,
       {},
     );
     setPreview({ id: artifactId, data: data ?? {} });
+  }
+
+  // Toggle the per-file unified diff (workspace output vs the run's baseline).
+  async function showDiff(runId: string, artifactId: number) {
+    if (diffView?.id === artifactId) {
+      setDiffView(null);
+      return;
+    }
+    setPreview(null);
+    const data = await tryGet<ArtifactDiff>(
+      `/v1/runs/${encodeURIComponent(runId)}/artifacts/${artifactId}/diff`,
+      {},
+    );
+    setDiffView({ id: artifactId, data: data ?? {} });
+  }
+
+  // Discard a terminal run's output: rejects it + frees the workspace for the
+  // normal storage cleanup. Does NOT delete files now.
+  async function discard(runId: string) {
+    setBanner(null);
+    try {
+      const r = await api.post<{ apply_status?: string }>(
+        `/v1/runs/${encodeURIComponent(runId)}/discard`,
+        {},
+      );
+      setBanner(`Run discarded (${r.apply_status ?? "discarded"}). Its workspace will be reclaimed by cleanup.`);
+      reload();
+      if (expanded === runId) await Promise.all([loadDiff(runId), loadEvents(runId)]);
+    } catch (e) {
+      setBanner(e instanceof Error ? e.message : "Discard failed");
+    }
   }
 
   async function loadDiff(runId: string) {
@@ -284,6 +340,7 @@ export function Runs() {
     setEvents([]);
     setArtifacts([]);
     setPreview(null);
+    setDiffView(null);
     setDiff(null);
     setCopied(false);
     await Promise.all([loadEvents(runId), loadArtifacts(runId), loadDiff(runId)]);
@@ -417,6 +474,12 @@ export function Runs() {
   const adaptersAvail = (data?.adapters ?? []).filter((a) => a.probe?.status === "available");
   const activeCount = allRuns.filter((r) => r.status === "running").length;
   const autoCount = allRuns.filter((r) => r.trigger === "heartbeat").length;
+  // Storage hygiene: surface the backend's own warn/error workspace warnings
+  // (high disk / too many sandboxes) with a pointer to the cleanup panel.
+  const ws = data?.storage?.workspace ?? null;
+  const storageWarn = (data?.storage?.warnings ?? []).find(
+    (w) => (w.message ?? "").toLowerCase().includes("workspace") && w.level !== "info",
+  );
   const COLS = 11;
 
   return (
@@ -454,6 +517,15 @@ export function Runs() {
         )}
         {autoCount > 0 && (
           <div className="banner info">{autoCount} autonomous (heartbeat) run(s) — same ledger as manual runs; reviewable + applicable.</div>
+        )}
+        {storageWarn && (
+          <div className="banner err banner-action">
+            <span>
+              ⚠ {storageWarn.message}
+              {ws && ws.total_bytes != null && ` (${fmtBytes(ws.total_bytes)} across ${ws.count ?? 0} workspace(s))`}
+            </span>
+            <Link to="/settings" className="banner-cta">Open cleanup →</Link>
+          </div>
         )}
 
         <div className="card">
@@ -553,6 +625,9 @@ export function Runs() {
                               {r.brief_id && <Link to="/briefs" className="link" style={{ fontSize: 11 }} onClick={(e) => e.stopPropagation()}>brief {r.brief_id.slice(0, 8)} ↗</Link>}
                               <div className="spacer" style={{ flex: 1 }} />
                               <button className="btn ghost sm" title="Copy a shareable link to this run" onClick={(e) => { e.stopPropagation(); copyRunLink(rid); }}>{copied ? "✓ copied" : "Copy link"}</button>
+                              {r.status !== "running" && r.apply_status !== "discarded" && r.apply_status !== "applied" && (
+                                <button className="btn ghost sm" title="Discard this run's output — rejects it and frees the workspace for cleanup" onClick={(e) => { e.stopPropagation(); discard(rid); }}>Discard</button>
+                              )}
                               <Link to="/briefs" className="btn ghost sm" onClick={(e) => e.stopPropagation()}>← Briefs</Link>
                             </div>
                             <div className="row" style={{ marginBottom: 6 }}>
@@ -606,10 +681,26 @@ export function Runs() {
                                         {preview?.id === a.artifact_id ? "hide" : "preview"}
                                       </button>
                                     )}
+                                    {a.is_text && a.artifact_id != null && (
+                                      <button className="btn ghost sm" style={{ marginLeft: 4, fontSize: 10, padding: "1px 6px" }} title="unified diff of the run's change vs the baseline" onClick={(e) => { e.stopPropagation(); showDiff(rid, a.artifact_id!); }}>
+                                        {diffView?.id === a.artifact_id ? "hide diff" : "diff"}
+                                      </button>
+                                    )}
                                     {preview && preview.id === a.artifact_id && (
                                       <pre style={{ margin: "4px 0 4px 14px", padding: 8, background: "rgba(0,0,0,0.04)", maxHeight: 220, overflow: "auto", fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
                                         {preview.data.available ? (preview.data.content || "(empty)") + (preview.data.truncated ? "\n…[truncated]" : "") : `(no preview: ${preview.data.reason ?? "unavailable"})`}
                                       </pre>
+                                    )}
+                                    {diffView && diffView.id === a.artifact_id && (
+                                      diffView.data.available ? (
+                                        <pre style={{ margin: "4px 0 4px 14px", padding: 8, background: "rgba(0,0,0,0.04)", maxHeight: 260, overflow: "auto", fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                                          {(diffView.data.diff || "(no textual changes)") + (diffView.data.truncated ? "\n…[truncated]" : "")}
+                                        </pre>
+                                      ) : (
+                                        <div className="banner info" style={{ margin: "4px 0 4px 14px", fontSize: 11 }}>
+                                          Diff unavailable: {diffView.data.reason ?? "no baseline"} — use <em>preview</em> to see the file.
+                                        </div>
+                                      )
                                     )}
                                   </div>
                                 ))}
