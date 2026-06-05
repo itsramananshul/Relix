@@ -821,7 +821,7 @@ mod tests {
         // SEC PART 4: the bridge's `BridgeConfig` type has
         // NO `[providers]` block, NO `api_key` field on any
         // surface, and the only env variables the bridge
-        // reads (`RELIX_SETUP_TOKEN`, `RELIX_DASHBOARD_PATH`,
+        // reads (`RELIX_SETUP_TOKEN`, `RELIX_DASHBOARD_DIST`,
         // …) carry no provider keys. Symbolic check by
         // searching the public surface for forbidden
         // identifiers — keeps a future contributor from

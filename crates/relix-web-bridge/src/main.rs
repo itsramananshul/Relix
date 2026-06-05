@@ -1356,20 +1356,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // init in `main()`. Keep-alive comments every 15s so
         // idle connections survive reverse-proxy timeouts.
         .route("/v1/logs/stream", get(logs::stream))
-        // Operator dashboard. Single-page static HTML; consumes
-        // the existing /v1/tasks* endpoints. No server-side
-        // state introduced. See docs/bridge-invariants.md.
-        // Operator dashboard. The real React SPA (apps/dashboard, built
-        // to crates/relix-web-bridge/dashboard-dist) when a bundle is
-        // present; otherwise the legacy single-file HTML page. Both mount
-        // at /dashboard and are public-allowlisted in the auth middleware.
+        // Operator dashboard. The React SPA (apps/dashboard, built to
+        // crates/relix-web-bridge/dashboard-dist) served at /dashboard with
+        // its assets under /dashboard/assets/*. Phase 2 Slice 3: the legacy
+        // single-file HTML dashboard is RETIRED — there is no HTML fallback.
+        // If the bundle is missing, /dashboard returns an honest 503
+        // missing-bundle notice (run `npm run build`), never an old console.
+        // /dashboard + /dashboard/* are public-allowlisted in the auth
+        // middleware so an operator can reach the login screen.
         .merge(dashboard::dashboard_router())
-        // The dashboard ships as a single self-contained HTML
-        // file (CSS + JS inline) under a per-route CSP that
-        // allows inline scripts. The historical
-        // `/assets/dashboard.js` split was deleted in the
-        // dashboard rebuild — operators load the whole UI in
-        // one round trip now.
         // One-time bootstrap so the dashboard can pick up its
         // bearer token without the operator pasting it manually.
         // Guarded inside the handler: refuses when the caller
