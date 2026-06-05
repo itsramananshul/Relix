@@ -68,6 +68,35 @@ it does **not** do:
 - **`git_worktree` / `git_checkout` workspace context is deferred** — only
   `empty` and the capped/filtered `copy_repo` snapshot ship today.
 
+### The Prime / company flow is governed + rule-based, not an autonomous CEO
+
+Relix models a company — Founder, Prime (planning lead), Crew, Mandates,
+Clearances — and the dashboard drives the whole loop (found the company →
+hire a Prime → propose+approve a Mandate strategy → plan the team →
+greenlight spawn Clearances → orchestrate the Mandate into Briefs →
+execute). The `company.status` summary surfaces the Founder, the Prime, and
+the crew breakdown (active / pending / by role). What it does **not** do:
+
+- **The Prime is rule-based, not an LLM.** Strategy proposal, the team
+  plan, and Mandate→Brief decomposition are deterministic/templated
+  (role-track + per-subject Briefs by canned titles), not authored by a
+  planning model. A Mandate becomes generic role tracks, not a
+  model-reasoned project plan.
+- **A human is in the loop at every gate.** Proposing and approving a
+  strategy, greenlighting each spawn Clearance, and choosing the
+  orchestration mode are all operator actions. There is no auto-pilot that
+  takes a Mandate end-to-end without approvals.
+- **Hiring is request → approve only.** Nothing suggests *who* to hire or
+  *which* adapter to assign; the operator decides.
+- **The autonomous heartbeat only executes**, it does not plan. It runs
+  already-assigned Briefs on a timer — it never authors strategy, staffs a
+  team, or orchestrates a Mandate.
+- **No org-graph visual** beyond a shallow reports-to list.
+
+In short: the *governance rails* of a company are in place and tenant-safe,
+but the *intelligence* that would make it feel like Paperclip (a Prime that
+reasons about strategy + team + work) is still a human + rules, not a model.
+
 ### Bridge persists every chat as a Task (fail-soft)
 
 (Formerly a documented gap; **closed** in commit `<pending>`.)
