@@ -8,7 +8,9 @@
 
 ## 0. The starting point (Relix today vs the target)
 
-**Relix today:** one self-contained `dashboard.html` (CSS + ~8K lines of inline JS, no build step) served by the web-bridge, with **22 flat panels** in five groups (Overview, Tasks, Cron, Chat, Memory, Skills, Sessions, Reasoning, Approvals, Credentials, Identity, Cost, Observability, Denials, Tenant, Planning, Workflows, Email, Plugins, MCP, Config, Logs). It already has a Paperclip-inspired grouped nav and spine-status badges — a real head start — but it's organized **by feature**, so it feels like a control panel.
+> **STATUS (Phase 2 complete):** the React SPA in `apps/dashboard` is now the canonical and ONLY dashboard, served at `/dashboard`. The original self-contained `dashboard.html` console described below has been **deleted** (Phase 2 Slice 3); the interim `/spine` board was deleted in Slice 2 (`/spine` now 308-redirects to `/dashboard`). The text below is kept as the design rationale for that migration — it is historical context, not the current state.
+
+**Relix originally (the starting point this doc reshaped):** one self-contained `dashboard.html` (CSS + ~8K lines of inline JS, no build step) served by the web-bridge, with **22 flat panels** in five groups (Overview, Tasks, Cron, Chat, Memory, Skills, Sessions, Reasoning, Approvals, Credentials, Identity, Cost, Observability, Denials, Tenant, Planning, Workflows, Email, Plugins, MCP, Config, Logs). It already had a Paperclip-inspired grouped nav and spine-status badges — a real head start — but it was organized **by feature**, so it felt like a control panel.
 
 **The target:** a console organized **by work object** — Inbox · Issues (board) · Projects · Goals · Org · Agents · Approvals · Costs · Activity · Chat — where the 22 feature panels become *detail tabs on the object they describe* (memory on an agent, confidence on a run, etc.). Same power, goal-facing shape.
 
@@ -18,7 +20,7 @@
 
 This is the one upfront decision the reshape forces. The target experience — a drag/drop kanban board, an issue rendered as a streaming chat thread, a pan/zoom org chart, surgical realtime updates — is genuinely hard to build well in one hand-written HTML file. Paperclip uses a React + Vite SPA (TanStack Query for data, a custom company-prefix router, an agent-chat runtime) precisely because this class of UI needs it.
 
-**DECIDED: build a real React SPA. The current vanilla `dashboard.html` is retired — not grown.** (React + a query cache + a component library), served by the web-bridge the same way the HTML file is today, so deployment doesn't change. The 22-panel vanilla console is being thrown away, not preserved — it can stay reachable only until the SPA reaches parity, then it's deleted. Paperclip's React app is the proven structural blueprint to mirror (not copy visually — see §12 for the look).
+**DECIDED (now DONE): build a real React SPA. The vanilla `dashboard.html` is retired — not grown.** (React + a query cache + a component library), served by the web-bridge the same way the HTML file was, so deployment doesn't change. The 22-panel vanilla console was thrown away, not preserved — it stayed reachable only until the SPA reached parity, and was **deleted in Phase 2 Slice 3**. Paperclip's React app is the proven structural blueprint to mirror (not copy visually — see §12 for the look).
 
 ---
 

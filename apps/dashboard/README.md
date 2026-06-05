@@ -1,11 +1,21 @@
 # Relix dashboard
 
 The Relix operator console — a Vite + React + TypeScript single-page app
-served by the web bridge at **`/dashboard`**.
+served by the web bridge at **`/dashboard`**. This is the **canonical and
+only** dashboard.
 
-This replaces the legacy single-file `crates/relix-web-bridge/src/dashboard.html`
-debug page. That file is kept only as a fallback for source-only
-checkouts that have not run the frontend build.
+The legacy single-file `crates/relix-web-bridge/src/dashboard.html` console
+was **deleted** (Phase 2 Slice 3). There is no HTML fallback: if the React
+bundle is missing, `/dashboard` returns an honest **HTTP 503 "dashboard not
+built"** notice telling you to run the build — never an old console.
+
+> **Canonical artifact:** the committed `crates/relix-web-bridge/dashboard-dist/`
+> IS the dashboard the bridge ships. Whenever you change anything under
+> `apps/dashboard/src`, you MUST re-run `npm run build` and commit the
+> regenerated `dashboard-dist/` in the same change. A Rust test
+> (`dashboard::committed_react_dist_present_and_index_references_existing_assets`)
+> fails the build if `index.html` points at a bundle asset that isn't
+> committed, so drift is caught in CI/`cargo test`, not in production.
 
 ## How it is served
 
@@ -17,8 +27,8 @@ history fallback to `index.html`. The built bundle is committed, so
 `cargo build` + `relix` boot serve the real app with no extra step.
 
 - Override the bundle location with `RELIX_DASHBOARD_DIST=/path/to/dist`.
-- If no bundle is found, the bridge falls back to the legacy embedded
-  HTML page, so the console always works.
+- If no bundle is found, the bridge serves an honest HTTP 503 notice
+  ("dashboard not built — run `npm run build`"), not a legacy page.
 
 The app is built with Vite `base: "/dashboard/"` and
 `modulePreload.polyfill = false`, so it has **no inline scripts** and
