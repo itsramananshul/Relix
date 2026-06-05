@@ -283,7 +283,10 @@ signed audit record**. No bypass switch.
   `GET /v1/maintenance/summary`) shows run-workspace disk usage + run/log
   counts + warnings. Prune old run workspaces safely with a dry-run preview
   (`POST /v1/maintenance/prune`, dry-run by default — never touches the repo
-  or a running run). Back up local state with
+  or a running run). Every prune is recorded in a durable audit
+  (`GET /v1/maintenance/audit`, shown as *Cleanup history*). Optional
+  scheduled cleanup (`RELIX_MAINTENANCE_AUTOPRUNE_*`, off + dry-run by
+  default) automates it on a timer. Back up / restore local state with
   `scripts/relix-local-backup.ps1` / `.sh`. See `docs/operations.md`.
 
 ## Security model

@@ -61,8 +61,43 @@ curl -s -X POST http://127.0.0.1:19791/v1/maintenance/prune \
 
 Body options (all optional): `dry_run` (default `true`), `older_than_days`
 (default 7), `keep_latest` (default 10), `delete_workspaces` (default true),
-`delete_events` (default false), `delete_artifacts` (default false). A prune
-writes an operator audit line to the bridge/coordinator log.
+`delete_events` (default false), `delete_artifacts` (default false).
+
+## Cleanup history (audit)
+
+Every prune attempt — dry-run, refusal, failure, or success — records a
+durable row in `maintenance_audit` (bounded to the last 500). The dashboard
+*Maintenance & storage* panel shows a **Cleanup history** table; the API is:
+
+```sh
+curl -s 'http://127.0.0.1:19791/v1/maintenance/audit?limit=50' -b "relix_session=<cookie>"
+```
+
+Each row has: `ts`, `action`, `trigger` (manual / scheduled), `dry_run`,
+`deleted_workspaces`, `deleted_bytes`, `pruned_events`, `pruned_artifacts`,
+`status` (ok / refused / failed), and a short `note`. No secrets are stored.
+
+## Scheduled (autonomous) cleanup
+
+Off by default. When enabled, a coordinator timer runs the same safe prune
+periodically and audits every tick. **Even when enabled it defaults to
+dry-run** — you must explicitly opt into a real delete.
+
+| env var | default | meaning |
+|---|---|---|
+| `RELIX_MAINTENANCE_AUTOPRUNE_ENABLED` | `false` | turn the timer on |
+| `RELIX_MAINTENANCE_AUTOPRUNE_DRY_RUN` | `true` | preview-only unless set false |
+| `RELIX_MAINTENANCE_AUTOPRUNE_INTERVAL_SECS` | `86400` | tick interval (min 60) |
+| `RELIX_MAINTENANCE_AUTOPRUNE_OLDER_THAN_DAYS` | `7` | age threshold |
+| `RELIX_MAINTENANCE_AUTOPRUNE_KEEP_LATEST` | `10` | newest kept |
+| `RELIX_MAINTENANCE_AUTOPRUNE_DELETE_WORKSPACES` | `true` | remove workspace dirs |
+| `RELIX_MAINTENANCE_AUTOPRUNE_DELETE_EVENTS` | `false` | also prune transcript rows |
+| `RELIX_MAINTENANCE_AUTOPRUNE_DELETE_ARTIFACTS` | `false` | also prune artifact rows |
+
+The same safety rules apply (never a running run, never an unsafe root,
+never the repo). The maintenance summary + dashboard show whether scheduled
+cleanup is enabled and in dry-run vs real-delete mode, and warn loudly if it
+is set to real-delete.
 
 ## Back up local state
 
@@ -81,7 +116,41 @@ writes an operator audit line to the bridge/coordinator log.
 
 For a **consistent DB backup**, stop the mesh first
 (`.\scripts\relix-mesh-down.ps1`) so the SQLite files aren't mid-write. The
-archive never leaves your machine.
+archive never leaves your machine. Add `-ListContents` / `--list-contents`
+to print what went in.
+
+**Not backed up by default:** run workspaces (regenerable sandboxes), build
+output, `.git`, logs, and secrets (`bridge-token`, `dashboard-admin.json`,
+`*.key`, `*.aic`, `.env*`, `dev-keys`). Pass `-IncludeWorkspaces` /
+`--include-workspaces` or `-IncludeSecrets` / `--include-secrets` to add them
+intentionally.
+
+## Restore from a backup
+
+Restore is **manual** (the scripts never auto-overwrite — destructive
+restore is yours to run deliberately). Stop the mesh, then expand the
+archive back over the data directory:
+
+```powershell
+# Windows PowerShell:
+.\scripts\relix-mesh-down.ps1
+# inspect first (safe):
+Expand-Archive .\backups\relix-backup-<stamp>.zip -DestinationPath restore-preview
+# then restore in place (overwrites dev-data in the current directory):
+Expand-Archive .\backups\relix-backup-<stamp>.zip -DestinationPath . -Force
+.\scripts\relix-mesh-up.ps1
+```
+
+```sh
+# macOS / Linux:
+./scripts/relix-mesh-down.sh
+tar -tzf backups/relix-backup-<stamp>.tar.gz   # inspect first
+tar -xzf backups/relix-backup-<stamp>.tar.gz   # extract in place
+./scripts/relix-mesh-up.sh
+```
+
+If the backup excluded secrets, your admin/token files won't be restored —
+re-run setup or `scripts/relix-dashboard-admin-reset.ps1` afterward.
 
 ## Forgot the dashboard admin password?
 
@@ -98,7 +167,8 @@ operator-console section of the README.
   concern. Prune operates on disk workspaces (not tenant-labeled on disk).
 - Log-row pruning currently targets the runs whose **workspace** is eligible
   for pruning; it deletes only `run_events` / `run_artifacts` rows, never the
-  `brief_runs` ledger row. A durable maintenance audit table is future work
-  (today the audit is a tracing log line).
+  `brief_runs` ledger row.
+- The maintenance audit is durable (`maintenance_audit`, last 500 rows) but
+  records prune attempts only — `summary` reads aren't audited.
 - The workspace scan is bounded (caps the directory count + files walked);
   for an enormous tree the reported figures are a floor (`truncated:true`).
