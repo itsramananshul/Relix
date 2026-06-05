@@ -135,6 +135,11 @@ pub struct LatestRun {
     /// `failed` / `conflicted`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apply_status: Option<String>,
+    /// When `status == "refused"`: the machine reason a run never started —
+    /// `unassigned` / `no_adapter` / `adapter_unavailable` / `workspace_error`
+    /// / `workspace_context_error`. `None` for runs that actually executed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal_reason: Option<String>,
     /// Changed-file count this run produced.
     pub artifact_count: i64,
     /// Total Shifts (runs) recorded on this Brief.

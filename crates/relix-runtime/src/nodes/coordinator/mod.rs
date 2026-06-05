@@ -1275,6 +1275,7 @@ impl TaskStore {
                     summary,
                     review: r.review,
                     apply_status: r.apply_status,
+                    refusal_reason: r.refusal_reason,
                     artifact_count,
                     total_runs,
                 })
@@ -2653,6 +2654,74 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Refusal reasons that earn a DURABLE `refused` Shift record, so the
+    /// Brief detail + run history can later answer "why didn't it run?".
+    /// EXCLUDES `not_found` (no Brief to attach to) and `already_running`
+    /// (a run is already in flight — recording a refusal on a double-click
+    /// would just be noise; the live run is the answer).
+    pub fn refusal_is_durable(reason: &str) -> bool {
+        matches!(
+            reason,
+            "unassigned"
+                | "no_adapter"
+                | "adapter_unavailable"
+                | "workspace_error"
+                | "workspace_context_error"
+        )
+    }
+
+    /// Phase 3: persist a durable `refused` Shift record for a MANUAL run
+    /// that was refused before any adapter spawned, plus a
+    /// `brief.run_refused` Chronicle note. Returns the new run_id, or `None`
+    /// when nothing is recorded:
+    ///   - the Brief is not in `tenant` (cross-tenant / missing) — NO row is
+    ///     written, so a refusal can never leak a cross-Guild Brief's
+    ///     existence;
+    ///   - the reason isn't durable (`not_found` / `already_running`).
+    /// `agent_id` / `rig` are the resolved assignee / Rig when known (empty
+    /// otherwise). The (static, secret-free) `summary` is length-bounded.
+    pub fn record_manual_refusal_for_tenant(
+        &self,
+        brief_id: &str,
+        tenant: &str,
+        agent_id: &str,
+        rig: &str,
+        reason: &str,
+        summary: &str,
+    ) -> Result<Option<String>, CoordinatorError> {
+        if !Self::refusal_is_durable(reason) {
+            return Ok(None);
+        }
+        // Tenant gate: never write a refusal row for a Brief the caller's
+        // Guild doesn't own (a missing Brief also fails this) — no leak.
+        if !self.task_in_tenant(brief_id, tenant)? {
+            return Ok(None);
+        }
+        let run_id = format!("ref_{}", uuid::Uuid::new_v4());
+        let now = unix_secs();
+        let summary = clamp_bytes(summary, MAX_RUN_EVENT_FIELD_BYTES);
+        {
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            // `finished_at == started_at`: a refusal is instantaneous (no run).
+            conn.execute(
+                "INSERT INTO brief_runs
+                     (run_id, brief_id, agent_id, rig, status, started_at, finished_at,
+                      summary, trigger, refusal_reason)
+                 VALUES (?1, ?2, ?3, ?4, 'refused', ?5, ?5, ?6, 'manual', ?7)",
+                params![run_id, brief_id, agent_id, rig, now, summary, reason],
+            )
+            .map_err(CoordinatorError::Db)?;
+        }
+        // Chronicle the refusal — payload is the static reason + Rig (safe).
+        let note = if rig.trim().is_empty() {
+            format!("run refused: {reason} — {summary}")
+        } else {
+            format!("[{rig}] run refused: {reason} — {summary}")
+        };
+        let _ = self.append_event(brief_id, "brief.run_refused", &note);
+        Ok(Some(run_id))
+    }
+
     /// Close a run record with its terminal status (`done` / `failed` /
     /// `continued`) and the Rig's secret-redacted summary. No-op when the
     /// run_id is unknown.
@@ -3356,7 +3425,7 @@ impl TaskStore {
                         review, review_note, reviewed_at,
                         apply_status, applied_at, apply_note, applied_files, failed_files,
                         trigger, provider, model, input_tokens, output_tokens,
-                        cached_input_tokens, cost_micros, session_id
+                        cached_input_tokens, cost_micros, session_id, refusal_reason
                  FROM brief_runs
                  ORDER BY started_at DESC, rowid DESC
                  LIMIT ?1",
@@ -3388,7 +3457,7 @@ impl TaskStore {
                         review, review_note, reviewed_at,
                         apply_status, applied_at, apply_note, applied_files, failed_files,
                         trigger, provider, model, input_tokens, output_tokens,
-                        cached_input_tokens, cost_micros, session_id
+                        cached_input_tokens, cost_micros, session_id, refusal_reason
                  FROM brief_runs
                  WHERE brief_id = ?1
                  ORDER BY started_at DESC, rowid DESC
@@ -3447,7 +3516,7 @@ impl TaskStore {
                         review, review_note, reviewed_at,
                         apply_status, applied_at, apply_note, applied_files, failed_files,
                         trigger, provider, model, input_tokens, output_tokens,
-                        cached_input_tokens, cost_micros, session_id
+                        cached_input_tokens, cost_micros, session_id, refusal_reason
                  FROM brief_runs WHERE run_id = ?1",
                 params![run_id],
                 RunRecord::from_row,
@@ -8242,6 +8311,13 @@ pub struct RunRecord {
     pub cost_micros: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// When `status == "refused"`: the machine reason a run never started
+    /// (`unassigned` / `no_adapter` / `adapter_unavailable` /
+    /// `workspace_error` / `workspace_context_error`). `None` for runs that
+    /// actually executed (`running` / `done` / `failed` / `continued` /
+    /// `cancelled`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal_reason: Option<String>,
 }
 
 /// One reviewable run artifact (`run_artifacts`) — metadata about a file
@@ -8435,6 +8511,7 @@ impl RunRecord {
             cached_input_tokens: r.get(25)?,
             cost_micros: r.get(26)?,
             session_id: r.get(27)?,
+            refusal_reason: r.get(28)?,
         })
     }
 }
@@ -13167,6 +13244,11 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             cached_input_tokens INTEGER,
             cost_micros   INTEGER,
             session_id    TEXT,
+            -- When `status = 'refused'`: the machine reason a manual run was
+            -- refused before any adapter was spawned (`unassigned`,
+            -- `no_adapter`, `adapter_unavailable`, `workspace_error`,
+            -- `workspace_context_error`). NULL for runs that actually ran.
+            refusal_reason TEXT,
             FOREIGN KEY (brief_id) REFERENCES tasks(task_id)
         );
         CREATE INDEX IF NOT EXISTS brief_runs_by_brief
@@ -13451,6 +13533,8 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         "ALTER TABLE brief_runs ADD COLUMN cached_input_tokens INTEGER",
         "ALTER TABLE brief_runs ADD COLUMN cost_micros INTEGER",
         "ALTER TABLE brief_runs ADD COLUMN session_id TEXT",
+        // Phase 3: durable refused Shift attempts (status='refused').
+        "ALTER TABLE brief_runs ADD COLUMN refusal_reason TEXT",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the
@@ -15890,6 +15974,82 @@ mod tests {
 
         // Cross-tenant: globex can't see acme's Brief OR its run data.
         assert!(s.brief_detail_for_tenant(&task, "globex").unwrap().is_none());
+    }
+
+    /// Phase 3: a refused manual run becomes a durable `refused` Shift —
+    /// surfaced in `latest_run` + per-Brief runs + the Chronicle — while
+    /// noise (`already_running` / `not_found`) and cross-tenant refusals are
+    /// never written (no existence leak).
+    #[test]
+    fn refused_run_is_persisted_and_tenant_scoped() {
+        let s = store();
+        let a = s
+            .create_brief("acme", "needs assignment", "subj", None, None, None, None)
+            .unwrap();
+
+        // A durable refusal (`unassigned`) → one `refused` Shift + Chronicle.
+        let run = s
+            .record_manual_refusal_for_tenant(&a, "acme", "", "", "unassigned", "assign an Operative first")
+            .unwrap();
+        assert!(run.is_some(), "durable refusal recorded");
+
+        // latest_run surfaces it with status=refused + the reason.
+        let d = s.brief_detail_for_tenant(&a, "acme").unwrap().unwrap();
+        let lr = d.latest_run.expect("a run");
+        assert_eq!(lr.status, "refused");
+        assert_eq!(lr.refusal_reason.as_deref(), Some("unassigned"));
+        assert_eq!(lr.total_runs, 1);
+
+        // Per-Brief runs includes the refused row.
+        let runs = s.runs_for_brief(&a, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "refused");
+        assert_eq!(runs[0].refusal_reason.as_deref(), Some("unassigned"));
+
+        // Chronicle carries the brief.run_refused event.
+        let chron = s
+            .query_events(&a, 0, 50, Some("brief.run_refused"), EventOrder::Desc)
+            .unwrap();
+        assert_eq!(chron.len(), 1, "a refused chronicle event");
+
+        // `already_running` / `not_found` are NOT durable → no extra rows.
+        assert!(s
+            .record_manual_refusal_for_tenant(&a, "acme", "", "", "already_running", "x")
+            .unwrap()
+            .is_none());
+        assert!(s
+            .record_manual_refusal_for_tenant(&a, "acme", "", "", "not_found", "x")
+            .unwrap()
+            .is_none());
+        assert_eq!(s.runs_for_brief(&a, 10).unwrap().len(), 1, "noise refusals not persisted");
+
+        // Cross-tenant + missing Brief → no row (no existence leak).
+        assert!(s
+            .record_manual_refusal_for_tenant(&a, "globex", "", "echo", "no_adapter", "x")
+            .unwrap()
+            .is_none());
+        assert!(s
+            .record_manual_refusal_for_tenant("nope", "acme", "", "echo", "no_adapter", "x")
+            .unwrap()
+            .is_none());
+        assert_eq!(s.run_count_for_brief(&a).unwrap(), 1, "cross-tenant refusal not written");
+
+        // A same-tenant adapter-unavailable refusal (with a Rig) IS persisted
+        // and becomes the new latest_run.
+        let r2 = s
+            .record_manual_refusal_for_tenant(&a, "acme", "agt_a", "claude", "adapter_unavailable", "claude not logged in")
+            .unwrap();
+        assert!(r2.is_some());
+        let lr = s
+            .brief_detail_for_tenant(&a, "acme")
+            .unwrap()
+            .unwrap()
+            .latest_run
+            .unwrap();
+        assert_eq!(lr.status, "refused");
+        assert_eq!(lr.refusal_reason.as_deref(), Some("adapter_unavailable"));
+        assert_eq!(lr.rig, "claude");
+        assert_eq!(lr.total_runs, 2);
     }
 
     #[test]

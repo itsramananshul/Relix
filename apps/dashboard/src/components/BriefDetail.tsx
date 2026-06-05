@@ -17,6 +17,7 @@ interface LatestRun {
   summary?: string;
   review?: string;
   apply_status?: string;
+  refusal_reason?: string;
   artifact_count?: number;
   total_runs?: number;
 }
@@ -27,6 +28,7 @@ const RUN_TONE: Record<string, string> = {
   done: "done",
   failed: "blocked",
   cancelled: "blocked",
+  refused: "blocked",
   continued: "todo",
 };
 
@@ -207,6 +209,7 @@ export function BriefDetail({
         <div style={{ fontSize: 12 }}>
           <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
             <span className={"badge " + (RUN_TONE[d.latest_run.status ?? ""] ?? "todo")}>{d.latest_run.status ?? "—"}</span>
+            {d.latest_run.refusal_reason && <span className="badge blocked" style={{ fontSize: 9 }} title="why the run didn't start">{d.latest_run.refusal_reason}</span>}
             {d.latest_run.trigger && <span className="muted" style={{ fontSize: 11 }}>{d.latest_run.trigger === "heartbeat" ? "auto" : d.latest_run.trigger}</span>}
             {d.latest_run.rig && <span className="muted">adapter <span className="mono">{d.latest_run.rig}</span></span>}
             {d.latest_run.review && <span className={"badge " + (d.latest_run.review === "accepted" ? "done" : d.latest_run.review === "rejected" ? "blocked" : "in_progress")} style={{ fontSize: 9 }}>{d.latest_run.review}</span>}

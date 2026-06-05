@@ -35,6 +35,8 @@ interface RunRecord {
   applied_files?: number;
   failed_files?: number;
   trigger?: string;
+  /// When status === "refused": why the run never started.
+  refusal_reason?: string;
 }
 
 // One file in a safe-apply plan (`/v1/runs/:id/diff` → plan.items).
@@ -167,6 +169,7 @@ const TONE: Record<string, string> = {
   done: "done",
   failed: "blocked",
   cancelled: "blocked",
+  refused: "blocked",
   continued: "todo",
 };
 
@@ -193,7 +196,7 @@ function fmtDuration(r: RunRecord): string {
   return "—";
 }
 
-const FILTERS = ["all", "running", "done", "failed", "cancelled", "continued"] as const;
+const FILTERS = ["all", "running", "done", "failed", "refused", "cancelled", "continued"] as const;
 const TRIGGERS = ["all", "manual", "heartbeat"] as const;
 
 export function Runs() {
@@ -457,6 +460,9 @@ export function Runs() {
                         <td className="muted">{open ? "▾" : "▸"}</td>
                         <td>
                           <span className={"badge " + (TONE[r.status ?? ""] ?? "todo")}>{r.status ?? "—"}</span>
+                          {r.status === "refused" && r.refusal_reason && (
+                            <span className="badge blocked" style={{ fontSize: 9, marginLeft: 4 }} title="why the run didn't start">{r.refusal_reason}</span>
+                          )}
                           {r.status === "done" && r.review && r.review !== "pending_review" && (
                             <span className={"badge " + (r.review === "accepted" ? "done" : "blocked")} style={{ fontSize: 9, marginLeft: 4 }} title={"review: " + r.review}>{r.review === "accepted" ? "✓" : "✕"}</span>
                           )}

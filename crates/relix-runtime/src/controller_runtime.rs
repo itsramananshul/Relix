@@ -9028,8 +9028,14 @@ fn register_node_type_handlers(
                             }
                             // Resolve the assignee's preferred Rig + charter,
                             // and compose the prompt the Rig will execute.
-                            let (preferred, charter) = match st.brief_card(&brief_id) {
+                            // `assignee` is also captured so a refused attempt
+                            // can be attributed to the Operative (when one is
+                            // set).
+                            let tenant = ctx.tenant_id_or_default().to_string();
+                            let (preferred, charter, assignee) = match st.brief_card(&brief_id) {
                                 Ok(Some(card)) => {
+                                    let assignee =
+                                        card.assignee_agent_id.clone().unwrap_or_default();
                                     let agent = card
                                         .assignee_agent_id
                                         .as_deref()
@@ -9039,9 +9045,10 @@ fn register_node_type_handlers(
                                         agent
                                             .map(|a| a.instruction_bundle)
                                             .filter(|c| !c.trim().is_empty()),
+                                        assignee,
                                     )
                                 }
-                                _ => (None, None),
+                                _ => (None, None, String::new()),
                             };
                             let prompt = st
                                 .compose_brief_prompt_with_charter(&brief_id, 10, charter.as_deref());
@@ -9076,7 +9083,23 @@ fn register_node_type_handlers(
                             );
                             let report = match pre {
                                 Err(e) => return internal(format!("brief.run: {e}")),
-                                Ok(crate::nodes::coordinator::heartbeat::Preflight::Refused(r)) => r,
+                                Ok(crate::nodes::coordinator::heartbeat::Preflight::Refused(r)) => {
+                                    // Phase 3: persist a durable `refused` Shift
+                                    // for this manual attempt so the Brief
+                                    // detail / run history can later answer
+                                    // "why didn't it run?". Tenant-gated and a
+                                    // no-op for `not_found` / `already_running`
+                                    // (see record_manual_refusal_for_tenant).
+                                    let _ = st.record_manual_refusal_for_tenant(
+                                        &brief_id,
+                                        &tenant,
+                                        &assignee,
+                                        &r.rig,
+                                        &r.status,
+                                        &r.summary,
+                                    );
+                                    r
+                                }
                                 Ok(crate::nodes::coordinator::heartbeat::Preflight::Ready(ready)) => {
                                     let accepted =
                                         crate::nodes::coordinator::heartbeat::RunReport {
