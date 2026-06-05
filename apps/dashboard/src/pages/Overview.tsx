@@ -31,6 +31,7 @@ interface MaintSummary {
   workspace?: { count?: number; total_bytes?: number };
   warnings?: { level?: string; message?: string }[];
 }
+interface MandateRow { mandate_id?: string; id?: string; title?: string; name?: string; status?: string }
 
 const COLUMNS = ["backlog", "todo", "in_progress", "in_review", "done"];
 const RUN_TONE: Record<string, string> = {
@@ -61,6 +62,7 @@ export function Overview() {
       tryGet<MaintSummary | null>("/v1/maintenance/summary", null),
       tryGet<unknown>("/v1/tasks/events/recent?limit=10", {}),
     ]);
+    const mandates = await tryGet<unknown>("/v1/spine/mandates?limit=8", {});
     return {
       board,
       inbox,
@@ -70,6 +72,7 @@ export function Overview() {
       runs: Array.isArray(runs) ? runs : [],
       runCfg: runCfg ?? {},
       maint: maint ?? null,
+      mandates: extractList<MandateRow>(mandates, ["mandates"]),
       events: extractList<EventRow>(events),
     };
   }, []);
@@ -106,7 +109,9 @@ export function Overview() {
         cta: "Open Settings",
       });
     }
-    if (initialized && totalBriefs === 0) {
+    if (initialized && (data?.mandates?.length ?? 0) === 0 && totalBriefs === 0) {
+      warnings.push({ tone: "info", msg: "No Mandates yet — turn a big goal into a Brief tree, or create Briefs by hand.", to: "/mandates", cta: "Create a Mandate" });
+    } else if (initialized && totalBriefs === 0) {
       warnings.push({ tone: "info", msg: "No Briefs yet — create your first unit of work.", to: "/briefs", cta: "Create a Brief" });
     }
     if ((inbox.unassigned?.length ?? 0) > 0) {
@@ -277,6 +282,29 @@ export function Overview() {
             </table>
           )}
         </div>
+      </div>
+
+      <div className="card">
+        <div className="row" style={{ marginBottom: 10 }}>
+          <h3 style={{ margin: 0 }}>Active mandates</h3>
+          <div className="spacer" style={{ flex: 1 }} />
+          <Link to="/mandates" className="link">all mandates →</Link>
+        </div>
+        {(data?.mandates ?? []).length === 0 ? (
+          <div className="empty">No Mandates yet — <Link to="/mandates" className="link">turn a big goal into Briefs</Link>.</div>
+        ) : (
+          <table className="table compact">
+            <tbody>
+              {(data?.mandates ?? []).slice(0, 6).map((m, i) => (
+                <tr key={m.mandate_id ?? m.id ?? i}>
+                  <td><strong style={{ fontSize: 13 }}>{m.title ?? m.name ?? "(untitled)"}</strong></td>
+                  <td><span className={"badge " + (m.status ?? "todo")} style={{ fontSize: 9 }}>{m.status ?? "—"}</span></td>
+                  <td className="mono" style={{ fontSize: 10 }}>{(m.mandate_id ?? m.id ?? "").slice(0, 10)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
 
       <div className="grid cols-2">

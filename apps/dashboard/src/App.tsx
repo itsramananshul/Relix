@@ -4,6 +4,7 @@ import { Login } from "./pages/Login";
 import { Layout } from "./components/Layout";
 import { Overview } from "./pages/Overview";
 import { Briefs } from "./pages/Briefs";
+import { Mandates } from "./pages/Mandates";
 import { Agents } from "./pages/Agents";
 import { Company } from "./pages/Company";
 import { Assign } from "./pages/Assign";
@@ -28,6 +29,7 @@ export function App() {
     <Layout>
       <Routes>
         <Route path="/" element={<Overview />} />
+        <Route path="/mandates" element={<Mandates />} />
         <Route path="/briefs" element={<Briefs />} />
         <Route path="/agents" element={<Agents />} />
         <Route path="/company" element={<Company />} />

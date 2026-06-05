@@ -11,6 +11,7 @@ interface NavEntry {
 
 const PRIMARY: NavEntry[] = [
   { to: "/", label: "Command Center", icon: "◈" },
+  { to: "/mandates", label: "Mandates", icon: "◎" },
   { to: "/briefs", label: "Briefs", icon: "▤" },
   { to: "/runs", label: "Active Runs", icon: "◐" },
   { to: "/chat", label: "Chat", icon: "✦" },
@@ -27,6 +28,7 @@ const SYSTEM: NavEntry[] = [
 
 const TITLES: Record<string, { title: string; sub: string }> = {
   "/": { title: "Command Center", sub: "Mesh overview & what needs attention" },
+  "/mandates": { title: "Mandates", sub: "Turn a big goal into a Brief tree" },
   "/briefs": { title: "Briefs", sub: "The issue board — your unit of work" },
   "/runs": { title: "Active Runs", sub: "Execution & activity status" },
   "/chat": { title: "Chat", sub: "Talk to the company companion" },

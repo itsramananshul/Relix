@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { api, tryGet } from "../api";
-import { asArray, Section, useAsync } from "../components/common";
+import { asArray, extractList, Section, useAsync } from "../components/common";
 
 interface Card {
   task_id?: string;
@@ -110,11 +110,12 @@ export function Briefs() {
   const [creating, setCreating] = useState(false);
   const [title, setTitle] = useState("");
   const [priority, setPriority] = useState("normal");
+  const [mandateFilter, setMandateFilter] = useState("all");
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
 
   const { data, loading, error, reload } = useAsync(async () => {
     const byCol: Record<string, Card[]> = {};
-    const [, ops, adapters, runs] = await Promise.all([
+    const [, ops, adapters, runs, mandates] = await Promise.all([
       Promise.all(
         COLUMNS.map(async (col) => {
           byCol[col] = asArray<Card>(await tryGet<Card[]>(`/v1/spine/board/${col}?limit=50`, []));
@@ -123,18 +124,22 @@ export function Briefs() {
       tryGet<Operative[]>("/v1/spine/operatives", []),
       tryGet<Adapter[]>("/v1/adapters", []),
       tryGet<RunRow[]>("/v1/runs", []),
+      tryGet<unknown>("/v1/spine/mandates?limit=50", {}),
     ]);
     return {
       board: byCol,
       operatives: Array.isArray(ops) ? ops : [],
       adapters: Array.isArray(adapters) ? adapters : [],
       runs: Array.isArray(runs) ? runs : [],
+      mandates: extractList<{ mandate_id?: string; id?: string; title?: string }>(mandates, ["mandates"]),
     };
   }, []);
 
   const operatives = data?.operatives ?? [];
   const adapters = data?.adapters ?? [];
   const runs = data?.runs ?? [];
+  const mandates = data?.mandates ?? [];
+  const mandateTitle = new Map(mandates.map((m) => [m.mandate_id ?? m.id ?? "", m.title ?? ""]));
 
   const opById = new Map(operatives.map((o) => [o.agent_id ?? "", o]));
   const adapterStatus = new Map(adapters.map((a) => [a.name ?? "", a.probe?.status ?? "unknown"]));
@@ -223,9 +228,20 @@ export function Briefs() {
       <Section
         title="Issue board"
         action={
-          <button className="btn" onClick={() => setCreating((v) => !v)}>
-            {creating ? "Cancel" : "+ New Brief"}
-          </button>
+          <div className="row" style={{ gap: 8 }}>
+            {mandates.length > 0 && (
+              <select className="select" style={{ width: 180, fontSize: 12 }} value={mandateFilter} onChange={(e) => setMandateFilter(e.target.value)} title="Filter by Mandate">
+                <option value="all">All mandates</option>
+                <option value="none">— no mandate —</option>
+                {mandates.map((m) => (
+                  <option key={m.mandate_id ?? m.id} value={m.mandate_id ?? m.id}>{m.title ?? (m.mandate_id ?? m.id ?? "").slice(0, 10)}</option>
+                ))}
+              </select>
+            )}
+            <button className="btn" onClick={() => setCreating((v) => !v)}>
+              {creating ? "Cancel" : "+ New Brief"}
+            </button>
+          </div>
         }
       >
         {error && (
@@ -279,7 +295,13 @@ export function Briefs() {
         ) : (
           <div className="board">
             {COLUMNS.map((col) => {
-              const cards = data?.board?.[col] ?? [];
+              const cards = (data?.board?.[col] ?? []).filter((c) =>
+                mandateFilter === "all"
+                  ? true
+                  : mandateFilter === "none"
+                    ? !c.mandate_id
+                    : c.mandate_id === mandateFilter,
+              );
               return (
                 <div className="board-col" key={col}>
                   <h4>
@@ -290,9 +312,13 @@ export function Briefs() {
                     const lr = latestRun.get(cardId(c));
                     const outcome = lr ? runOutcome(lr) : null;
                     const block = runBlock(c);
+                    const mTitle = c.mandate_id ? (mandateTitle.get(c.mandate_id) || c.mandate_id.slice(0, 8)) : null;
                     return (
                       <div className="board-card" key={cardId(c)}>
                         <div className="t">{c.title ?? "(untitled)"}</div>
+                        {mTitle && (
+                          <Link to="/mandates" className="muted" style={{ fontSize: 10, display: "block", marginBottom: 4 }} title={"part of mandate " + c.mandate_id}>◎ {mTitle}</Link>
+                        )}
                         <div className="m">
                           {c.priority && <span>{c.priority}</span>}
                           {op ? (
