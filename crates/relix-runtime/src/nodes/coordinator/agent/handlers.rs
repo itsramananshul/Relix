@@ -112,6 +112,13 @@ fn caller_is_owner(store: &AgentStore, ctx: &InvocationCtx) -> bool {
 /// Guild has been initialised (a Founder exists), the Founder profile,
 /// and the count of real Operatives. The dashboard uses this to show
 /// the "Initialize Company" first-run state vs the normal Crew.
+/// Increment a `{key: count}` tally in a JSON object (empty key → `unknown`).
+fn bump_tally(map: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
+    let key = if key.trim().is_empty() { "unknown" } else { key.trim() };
+    let n = map.get(key).and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+    map.insert(key.to_string(), serde_json::json!(n));
+}
+
 pub fn handle_company_status(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let tenant = ctx.tenant_id_or_default();
     let founder = match store.find_founder(tenant) {
@@ -122,10 +129,40 @@ pub fn handle_company_status(store: &AgentStore, ctx: &InvocationCtx) -> Handler
         Ok(v) => v,
         Err(e) => return internal(format!("company.status roster: {e}")),
     };
+    // Prime = the Founder's right hand (Lexicon) — the Operative whose role is
+    // `prime`, who proposes the strategy + builds the team. `None` until one is
+    // hired, so the dashboard can show "no Prime yet" honestly.
+    let prime = operatives.iter().find(|o| o.role.eq_ignore_ascii_case("prime"));
+    // Crew breakdown by status + role, so the dashboard can show a real company
+    // shape (who's active, who's pending a hire, the role mix) instead of a
+    // bare head-count.
+    let mut by_status = serde_json::Map::new();
+    let mut by_role = serde_json::Map::new();
+    let mut active = 0i64;
+    let mut pending = 0i64;
+    for o in &operatives {
+        let st = o.status.trim();
+        match st {
+            "active" => active += 1,
+            "pending" => pending += 1,
+            _ => {}
+        }
+        bump_tally(&mut by_status, st);
+        bump_tally(&mut by_role, &o.role);
+    }
     let body = serde_json::json!({
         "initialized": founder.is_some(),
         "founder": founder.as_ref().map(operative_json),
+        // The Prime is the company's planning lead; null until hired.
+        "prime": prime.map(operative_json),
         "operative_count": operatives.len(),
+        "crew": {
+            "total": operatives.len(),
+            "active": active,
+            "pending": pending,
+            "by_status": by_status,
+            "by_role": by_role,
+        },
     });
     match serde_json::to_vec(&body) {
         Ok(b) => HandlerOutcome::Ok(b),
@@ -3348,6 +3385,49 @@ mod tests {
         assert!(after.contains("\"initialized\":true"), "got {after}");
         assert!(after.contains("\"operative_count\":1"));
         assert!(after.contains("\"role\":\"founder\""));
+    }
+
+    #[test]
+    fn company_status_surfaces_prime_and_crew_breakdown() {
+        let s = store();
+        // No company yet → no Prime, empty crew.
+        let empty = ok_body(handle_company_status(&s, &fake_ctx(b"")));
+        assert!(empty.contains("\"prime\":null"), "got {empty}");
+        assert!(empty.contains("\"total\":0"), "got {empty}");
+        // Bootstrap the Founder, then hire a Prime + an engineer.
+        ok_body(handle_bootstrap_founder(&s, &fake_ctx(b"Ada|echo")));
+        ok_body(handle_create(
+            &s,
+            &fake_ctx(b"Pat|prime|Planner|plan|plan|Ada|subj-prime|medium"),
+        ));
+        ok_body(handle_create(
+            &s,
+            &fake_ctx(b"Eng|engineer|SWE|eng|eng|Pat|subj-eng|medium"),
+        ));
+        let body = ok_body(handle_company_status(&s, &fake_ctx(b"")));
+        // The Prime is surfaced as a distinct identity (not just in the count).
+        assert!(body.contains("\"prime\":{"), "prime object present: {body}");
+        assert!(body.contains("\"name\":\"Pat\""), "got {body}");
+        // Crew breakdown reflects the real company shape.
+        assert!(body.contains("\"total\":3"), "got {body}");
+        assert!(body.contains("\"founder\":1"), "by_role founder: {body}");
+        assert!(body.contains("\"prime\":1"), "by_role prime: {body}");
+        assert!(body.contains("\"engineer\":1"), "by_role engineer: {body}");
+    }
+
+    #[test]
+    fn company_status_is_tenant_scoped() {
+        let s = store();
+        // Found a company in the `acme` Guild only.
+        ok_body(handle_bootstrap_founder(&s, &fake_ctx_tenant(b"Ada|echo", "acme")));
+        let acme = ok_body(handle_company_status(&s, &fake_ctx_tenant(b"", "acme")));
+        assert!(acme.contains("\"initialized\":true"), "owning Guild sees it: {acme}");
+        // A different Guild sees an EMPTY company — no founder/prime leak.
+        let globex = ok_body(handle_company_status(&s, &fake_ctx_tenant(b"", "globex")));
+        assert!(globex.contains("\"initialized\":false"), "got {globex}");
+        assert!(globex.contains("\"operative_count\":0"), "got {globex}");
+        assert!(globex.contains("\"prime\":null"), "got {globex}");
+        assert!(globex.contains("\"total\":0"), "got {globex}");
     }
 
     #[test]
