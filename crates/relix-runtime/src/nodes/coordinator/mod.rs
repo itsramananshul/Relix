@@ -2549,6 +2549,186 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Persist the per-(tenant, agent, rig, brief) adapter runtime state
+    /// (TG2). Resolves the pairing + tenant from the run row, then UPSERTs:
+    /// latest-wins for session/provider/model/last_*, accumulates token & cost
+    /// totals across runs, and refreshes `runtime_state` (opaque adapter JSON)
+    /// when supplied. `last_error` is set to the most recent run's error
+    /// (cleared to NULL on a successful run — honest latest-error semantics).
+    /// A no-op when the run row can't be resolved. Best-effort; never faked —
+    /// absent usage stays NULL until a run actually reports it.
+    pub fn record_run_runtime_state(
+        &self,
+        run_id: &str,
+        usage: &crate::rig::RunUsage,
+        last_status: &str,
+        last_error: Option<&str>,
+        runtime_state: Option<&str>,
+    ) -> Result<(), CoordinatorError> {
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        // Resolve the (agent, rig, brief, tenant) the run belonged to.
+        let resolved: Option<(String, String, String, String)> = conn
+            .query_row(
+                "SELECT r.agent_id, r.rig, r.brief_id, COALESCE(t.tenant_id, 'default')
+                 FROM brief_runs r LEFT JOIN tasks t ON t.task_id = r.brief_id
+                 WHERE r.run_id = ?1",
+                params![run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        let Some((agent_id, rig, brief_id, tenant)) = resolved else {
+            return Ok(()); // unknown run — nothing to pair against
+        };
+        conn.execute(
+            "INSERT INTO agent_runtime_state
+                 (tenant_id, agent_id, rig, brief_key, session_id, provider, model,
+                  input_tokens, output_tokens, cost_micros, last_run_id, last_status,
+                  last_error, runtime_state, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
+             ON CONFLICT(tenant_id, agent_id, rig, brief_key) DO UPDATE SET
+                 session_id = COALESCE(excluded.session_id, agent_runtime_state.session_id),
+                 provider   = COALESCE(excluded.provider, agent_runtime_state.provider),
+                 model      = COALESCE(excluded.model, agent_runtime_state.model),
+                 input_tokens = CASE
+                     WHEN agent_runtime_state.input_tokens IS NULL AND excluded.input_tokens IS NULL
+                     THEN NULL
+                     ELSE COALESCE(agent_runtime_state.input_tokens, 0) + COALESCE(excluded.input_tokens, 0)
+                 END,
+                 output_tokens = CASE
+                     WHEN agent_runtime_state.output_tokens IS NULL AND excluded.output_tokens IS NULL
+                     THEN NULL
+                     ELSE COALESCE(agent_runtime_state.output_tokens, 0) + COALESCE(excluded.output_tokens, 0)
+                 END,
+                 cost_micros = CASE
+                     WHEN agent_runtime_state.cost_micros IS NULL AND excluded.cost_micros IS NULL
+                     THEN NULL
+                     ELSE COALESCE(agent_runtime_state.cost_micros, 0) + COALESCE(excluded.cost_micros, 0)
+                 END,
+                 last_run_id = excluded.last_run_id,
+                 last_status = excluded.last_status,
+                 last_error  = excluded.last_error,
+                 runtime_state = COALESCE(excluded.runtime_state, agent_runtime_state.runtime_state),
+                 updated_at  = excluded.updated_at",
+            params![
+                tenant,
+                agent_id,
+                rig,
+                brief_id,
+                usage.session_id,
+                usage.provider,
+                usage.model,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cost_micros,
+                run_id,
+                last_status,
+                last_error,
+                runtime_state,
+                now,
+            ],
+        )
+        .map_err(CoordinatorError::Db)?;
+        Ok(())
+    }
+
+    /// All persisted runtime-state rows for one agent within a tenant, newest
+    /// first. Tenant-scoped so one Guild can't read another's adapter state.
+    pub fn list_runtime_state(
+        &self,
+        tenant: &str,
+        agent_id: &str,
+    ) -> Result<Vec<AgentRuntimeState>, CoordinatorError> {
+        let tenant = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {AGENT_RUNTIME_STATE_COLS} FROM agent_runtime_state
+                 WHERE tenant_id = ?1 AND agent_id = ?2
+                 ORDER BY updated_at DESC"
+            ))
+            .map_err(CoordinatorError::Db)?;
+        let mapped = stmt
+            .query_map(params![tenant, agent_id], AgentRuntimeState::from_row)
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::new();
+        for r in mapped {
+            out.push(r.map_err(CoordinatorError::Db)?);
+        }
+        Ok(out)
+    }
+
+    /// One runtime-state row for a precise (tenant, agent, rig, brief) key, or
+    /// None if no run has populated it yet.
+    pub fn get_runtime_state(
+        &self,
+        tenant: &str,
+        agent_id: &str,
+        rig: &str,
+        brief_key: &str,
+    ) -> Result<Option<AgentRuntimeState>, CoordinatorError> {
+        let tenant = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let row = conn
+            .query_row(
+                &format!(
+                    "SELECT {AGENT_RUNTIME_STATE_COLS} FROM agent_runtime_state
+                     WHERE tenant_id = ?1 AND agent_id = ?2 AND rig = ?3 AND brief_key = ?4"
+                ),
+                params![tenant, agent_id, rig, brief_key],
+                AgentRuntimeState::from_row,
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        Ok(row)
+    }
+
+    /// Reset (delete) ALL runtime-state rows for one agent within a tenant —
+    /// e.g. to force a fresh adapter session. Returns the row count removed.
+    pub fn reset_runtime_state(
+        &self,
+        tenant: &str,
+        agent_id: &str,
+    ) -> Result<usize, CoordinatorError> {
+        let tenant = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let n = conn
+            .execute(
+                "DELETE FROM agent_runtime_state WHERE tenant_id = ?1 AND agent_id = ?2",
+                params![tenant, agent_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+        Ok(n)
+    }
+
+    /// Reset (delete) the runtime-state rows for one agent scoped to a single
+    /// brief/task key within a tenant. Returns the row count removed.
+    pub fn reset_runtime_state_for_brief(
+        &self,
+        tenant: &str,
+        agent_id: &str,
+        brief_key: &str,
+    ) -> Result<usize, CoordinatorError> {
+        let tenant = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let n = conn
+            .execute(
+                "DELETE FROM agent_runtime_state
+                 WHERE tenant_id = ?1 AND agent_id = ?2 AND brief_key = ?3",
+                params![tenant, agent_id, brief_key],
+            )
+            .map_err(CoordinatorError::Db)?;
+        Ok(n)
+    }
+
     /// Recover stale `running` runs left behind after a coordinator
     /// crash/restart. Any `brief_runs` row still `running` whose `run_id` is
     /// NOT in `live` (the set of run_ids with a live in-process child handle —
@@ -2557,6 +2737,7 @@ impl TaskStore {
     ///   2. given a `recovered` run-transcript event + a `brief.run_recovered`
     ///      Chronicle note (so the operator sees what happened),
     ///   3. has its Brief Claim released (so the work can be re-dispatched).
+    ///
     /// Terminal runs are NEVER touched, and a genuinely-live run (present in
     /// `live`) is left alone. Returns the recovered run_ids.
     pub fn recover_stale_runs(
@@ -7968,6 +8149,67 @@ impl RunRecord {
     }
 }
 
+/// Persistent adapter runtime/session state for one (tenant, operative,
+/// rig, brief) pairing (TG2): the resumable session + accumulated usage.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentRuntimeState {
+    pub tenant_id: String,
+    pub agent_id: String,
+    pub rig: String,
+    pub brief_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_state: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Shared column list for `agent_runtime_state` SELECTs — order MUST match
+/// [`AgentRuntimeState::from_row`].
+const AGENT_RUNTIME_STATE_COLS: &str = "tenant_id, agent_id, rig, brief_key, \
+     session_id, provider, model, input_tokens, output_tokens, cost_micros, \
+     last_run_id, last_status, last_error, runtime_state, created_at, updated_at";
+
+impl AgentRuntimeState {
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            tenant_id: r.get(0)?,
+            agent_id: r.get(1)?,
+            rig: r.get(2)?,
+            brief_key: r.get(3)?,
+            session_id: r.get(4)?,
+            provider: r.get(5)?,
+            model: r.get(6)?,
+            input_tokens: r.get(7)?,
+            output_tokens: r.get(8)?,
+            cost_micros: r.get(9)?,
+            last_run_id: r.get(10)?,
+            last_status: r.get(11)?,
+            last_error: r.get(12)?,
+            runtime_state: r.get(13)?,
+            created_at: r.get(14)?,
+            updated_at: r.get(15)?,
+        })
+    }
+}
+
 /// Aggregate metrics over an execution subtree (M75).
 /// Computed by [`TaskStore::subtree_metrics`] from REAL
 /// per-task state — no synthesis. Status buckets are
@@ -12651,6 +12893,34 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         );
         CREATE INDEX IF NOT EXISTS maintenance_audit_recent
             ON maintenance_audit(id DESC);
+        -- Persistent adapter runtime/session state (TG2). One row per
+        -- (tenant, operative, rig, brief) so an adapter run can be RESUMED
+        -- (e.g. a Claude/Codex session id) and per-pairing usage tracked.
+        -- `session_id` / `provider` / `model` are the LATEST run's values;
+        -- the token/cost columns ACCUMULATE across runs of the pairing;
+        -- `runtime_state` is opaque adapter JSON. CREATE IF NOT EXISTS keeps
+        -- it migration-safe for existing DBs.
+        CREATE TABLE IF NOT EXISTS agent_runtime_state (
+            tenant_id     TEXT NOT NULL DEFAULT 'default',
+            agent_id      TEXT NOT NULL,
+            rig           TEXT NOT NULL,
+            brief_key     TEXT NOT NULL DEFAULT '',
+            session_id    TEXT,
+            provider      TEXT,
+            model         TEXT,
+            input_tokens  INTEGER,
+            output_tokens INTEGER,
+            cost_micros   INTEGER,
+            last_run_id   TEXT,
+            last_status   TEXT,
+            last_error    TEXT,
+            runtime_state TEXT,
+            created_at    INTEGER NOT NULL,
+            updated_at    INTEGER NOT NULL,
+            PRIMARY KEY (tenant_id, agent_id, rig, brief_key)
+        );
+        CREATE INDEX IF NOT EXISTS agent_runtime_state_by_agent
+            ON agent_runtime_state(tenant_id, agent_id, updated_at DESC);
         "#,
     )
     .map_err(CoordinatorError::Db)?;
@@ -22300,5 +22570,109 @@ mod tests {
         // Empty usage must not clobber the stored values.
         s.set_run_usage("run_u", &crate::rig::RunUsage::default()).unwrap();
         assert_eq!(s.get_run("run_u").unwrap().unwrap().provider.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn runtime_state_upserts_and_accumulates_across_runs() {
+        let s = store();
+        let b = brief(&s, "rt brief");
+        // First run: report a session + usage.
+        running_run(&s, "rt_run1", &b, "agt_rt");
+        let u1 = crate::rig::RunUsage {
+            provider: Some("anthropic".into()),
+            model: Some("claude-x".into()),
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            cost_micros: Some(5_000),
+            session_id: Some("sess-rt".into()),
+            ..Default::default()
+        };
+        s.record_run_runtime_state("rt_run1", &u1, "done", None, Some("{\"k\":1}"))
+            .unwrap();
+
+        let got = s
+            .get_runtime_state("default", "agt_rt", "echo", &b)
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(got.session_id.as_deref(), Some("sess-rt"));
+        assert_eq!(got.provider.as_deref(), Some("anthropic"));
+        assert_eq!(got.input_tokens, Some(100));
+        assert_eq!(got.output_tokens, Some(20));
+        assert_eq!(got.cost_micros, Some(5_000));
+        assert_eq!(got.last_run_id.as_deref(), Some("rt_run1"));
+        assert_eq!(got.last_status.as_deref(), Some("done"));
+        assert_eq!(got.last_error, None);
+        assert_eq!(got.runtime_state.as_deref(), Some("{\"k\":1}"));
+
+        // Second run on the same (agent, rig, brief): accumulate tokens/cost,
+        // latest-wins for status, and record the failure reason.
+        running_run(&s, "rt_run2", &b, "agt_rt");
+        let u2 = crate::rig::RunUsage {
+            input_tokens: Some(50),
+            output_tokens: Some(5),
+            cost_micros: Some(1_000),
+            ..Default::default()
+        };
+        s.record_run_runtime_state("rt_run2", &u2, "failed", Some("boom"), None)
+            .unwrap();
+        let got = s
+            .get_runtime_state("default", "agt_rt", "echo", &b)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.input_tokens, Some(150), "tokens accumulate");
+        assert_eq!(got.output_tokens, Some(25));
+        assert_eq!(got.cost_micros, Some(6_000));
+        assert_eq!(got.last_status.as_deref(), Some("failed"));
+        assert_eq!(got.last_error.as_deref(), Some("boom"));
+        // session + runtime_state preserved (COALESCE on absent fields).
+        assert_eq!(got.session_id.as_deref(), Some("sess-rt"));
+        assert_eq!(got.runtime_state.as_deref(), Some("{\"k\":1}"));
+        assert_eq!(got.provider.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn runtime_state_unknown_run_is_noop() {
+        let s = store();
+        // No such run → resolves to nothing → no row created, no error.
+        s.record_run_runtime_state(
+            "nope",
+            &crate::rig::RunUsage::default(),
+            "done",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(s.list_runtime_state("default", "agt_rt").unwrap().is_empty());
+    }
+
+    #[test]
+    fn runtime_state_reset_scopes_to_agent_and_brief() {
+        let s = store();
+        let b1 = brief(&s, "rt b1");
+        let b2 = brief(&s, "rt b2");
+        running_run(&s, "rs1", &b1, "agt_x");
+        running_run(&s, "rs2", &b2, "agt_x");
+        running_run(&s, "rs3", &b1, "agt_y");
+        let u = crate::rig::RunUsage {
+            session_id: Some("s".into()),
+            ..Default::default()
+        };
+        s.record_run_runtime_state("rs1", &u, "done", None, None).unwrap();
+        s.record_run_runtime_state("rs2", &u, "done", None, None).unwrap();
+        s.record_run_runtime_state("rs3", &u, "done", None, None).unwrap();
+
+        assert_eq!(s.list_runtime_state("default", "agt_x").unwrap().len(), 2);
+        assert_eq!(s.list_runtime_state("default", "agt_y").unwrap().len(), 1);
+
+        // Reset just (agt_x, b1) → leaves agt_x/b2 and agt_y alone.
+        assert_eq!(s.reset_runtime_state_for_brief("default", "agt_x", &b1).unwrap(), 1);
+        assert_eq!(s.list_runtime_state("default", "agt_x").unwrap().len(), 1);
+        assert!(s.get_runtime_state("default", "agt_x", "echo", &b1).unwrap().is_none());
+        assert!(s.get_runtime_state("default", "agt_x", "echo", &b2).unwrap().is_some());
+
+        // Reset all of agt_x → removes the remaining row; agt_y untouched.
+        assert_eq!(s.reset_runtime_state("default", "agt_x").unwrap(), 1);
+        assert!(s.list_runtime_state("default", "agt_x").unwrap().is_empty());
+        assert_eq!(s.list_runtime_state("default", "agt_y").unwrap().len(), 1);
     }
 }

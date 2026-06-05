@@ -9739,6 +9739,118 @@ fn register_node_type_handlers(
             );
         }
         {
+            // `rig.runtime_state.get` — the persisted adapter runtime state
+            // for one agent (`GET /v1/runs/runtime-state?agent_id=...`).
+            // Arg is the agent id (raw string). Tenant-scoped: only the
+            // caller's Guild rows are returned. Returns a JSON array, newest
+            // first (empty if no run has populated state yet).
+            let st = store.clone();
+            bridge.register(
+                "rig.runtime_state.get",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            let agent_id =
+                                String::from_utf8_lossy(&ctx.args).trim().to_string();
+                            let tenant = ctx.tenant_id_or_default().to_string();
+                            let invalid = |c: String| {
+                                crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                        cause: c,
+                                        retry_hint: 0,
+                                        retry_after: None,
+                                    },
+                                )
+                            };
+                            if agent_id.is_empty() {
+                                return invalid("agent_id is required".into());
+                            }
+                            match st.list_runtime_state(&tenant, &agent_id) {
+                                Ok(rows) => match serde_json::to_vec(&rows) {
+                                    Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                    Err(e) => invalid(format!(
+                                        "rig.runtime_state.get encode: {e}"
+                                    )),
+                                },
+                                Err(e) => invalid(format!("rig.runtime_state.get: {e}")),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
+        {
+            // `rig.runtime_state.reset` — forget persisted adapter runtime
+            // state (`POST /v1/runs/runtime-state/reset`). Arg is JSON
+            // `{"agent_id":"...","brief_key":"..."?}`; with `brief_key` the
+            // reset is scoped to that one Brief, otherwise the whole agent.
+            // Tenant-scoped. Returns `{"removed": <count>}`.
+            let st = store.clone();
+            bridge.register(
+                "rig.runtime_state.reset",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            let tenant = ctx.tenant_id_or_default().to_string();
+                            let invalid = |c: String| {
+                                crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                        cause: c,
+                                        retry_hint: 0,
+                                        retry_after: None,
+                                    },
+                                )
+                            };
+                            let v: serde_json::Value =
+                                match serde_json::from_slice(&ctx.args) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        return invalid(format!(
+                                            "rig.runtime_state.reset: invalid JSON: {e}"
+                                        ))
+                                    }
+                                };
+                            let agent_id = v
+                                .get("agent_id")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .trim()
+                                .to_string();
+                            if agent_id.is_empty() {
+                                return invalid("agent_id is required".into());
+                            }
+                            let brief_key = v
+                                .get("brief_key")
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty());
+                            let removed = match brief_key {
+                                Some(bk) => st
+                                    .reset_runtime_state_for_brief(&tenant, &agent_id, bk),
+                                None => st.reset_runtime_state(&tenant, &agent_id),
+                            };
+                            match removed {
+                                Ok(n) => {
+                                    let body = serde_json::json!({ "removed": n });
+                                    match serde_json::to_vec(&body) {
+                                        Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                        Err(e) => invalid(format!(
+                                            "rig.runtime_state.reset encode: {e}"
+                                        )),
+                                    }
+                                }
+                                Err(e) => invalid(format!("rig.runtime_state.reset: {e}")),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
+        {
             // `maintenance.summary` — operator storage + run-ledger overview
             // (`GET /v1/maintenance/summary`). Bounded, symlink-skipping,
             // never scans the repo, handles a missing workspace root. No

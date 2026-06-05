@@ -923,6 +923,51 @@ pub async fn run_apply(
     json_passthrough(call_peer(&state, "run.apply", run_id.as_bytes()).await?)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RuntimeStateQuery {
+    #[serde(default)]
+    pub agent_id: String,
+}
+
+/// `GET /v1/runs/runtime-state?agent_id=...` — the persisted adapter runtime
+/// state rows for one agent (resumable session id, accumulated usage/cost,
+/// last run status). Tenant-scoped; newest first.
+pub async fn runtime_state_get(
+    State(state): State<AppState>,
+    Query(q): Query<RuntimeStateQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let agent_id = q.agent_id.trim();
+    if agent_id.is_empty() {
+        return Err(bad("agent_id query parameter is required"));
+    }
+    json_passthrough(call_peer(&state, "rig.runtime_state.get", agent_id.as_bytes()).await?)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RuntimeStateResetRequest {
+    pub agent_id: String,
+    #[serde(default)]
+    pub brief_key: Option<String>,
+}
+
+/// `POST /v1/runs/runtime-state/reset` — forget persisted adapter runtime
+/// state for one agent (optionally scoped to a single Brief via `brief_key`).
+/// Tenant-scoped. Returns `{"removed": <count>}`.
+pub async fn runtime_state_reset(
+    State(state): State<AppState>,
+    Json(req): Json<RuntimeStateResetRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if req.agent_id.trim().is_empty() {
+        return Err(bad("agent_id is required"));
+    }
+    let mut body = serde_json::json!({ "agent_id": req.agent_id.trim() });
+    if let Some(bk) = req.brief_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        body["brief_key"] = serde_json::Value::String(bk.to_string());
+    }
+    let arg = serde_json::to_vec(&body).map_err(|e| bad(&format!("encode: {e}")))?;
+    json_passthrough(call_peer(&state, "rig.runtime_state.reset", &arg).await?)
+}
+
 /// `GET /v1/spine/company` — first-run status: whether the Guild has a
 /// Founder yet, the Founder profile, and the Operative count. The
 /// dashboard reads this to show the "Initialize Company" first-run state.

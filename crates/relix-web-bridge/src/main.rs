@@ -667,6 +667,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Execution-run ledger: recent runs (Active Runs feed) + a
         // Brief's run/Shift history.
         .route("/v1/runs", get(spine::runs_recent))
+        // Persisted adapter runtime state (TG2). Static paths registered
+        // before `:run_id` so they take routing precedence.
+        .route("/v1/runs/runtime-state", get(spine::runtime_state_get))
+        .route("/v1/runs/runtime-state/reset", post(spine::runtime_state_reset))
         .route("/v1/runs/:run_id", get(spine::run_get))
         .route("/v1/runs/:run_id/events", get(spine::run_events))
         .route("/v1/runs/:run_id/cancel", post(spine::run_cancel))

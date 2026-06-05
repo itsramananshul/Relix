@@ -1947,6 +1947,16 @@ fn execute_ready_inner(
     };
     let _ = store.append_run_event(&run_id, term_kind, "relix", &summary, None, true);
     let _ = store.record_run_finish(&run_id, status, &summary);
+    // Persist per-(tenant, agent, rig, brief) adapter runtime state (TG2): the
+    // resumable session id, accumulated usage/cost, and the latest run status.
+    // `last_error` is the failure reason on a non-success terminal state, else
+    // cleared — honest latest-error semantics. Best-effort.
+    let last_error = if matches!(status, "failed" | "cancelled") {
+        Some(summary.as_str())
+    } else {
+        None
+    };
+    let _ = store.record_run_runtime_state(&run_id, &run.usage, status, last_error, None);
     let _ = store.release_claim(&brief_id, &assignee);
     (
         RunReport {

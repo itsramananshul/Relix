@@ -1454,6 +1454,14 @@ name = "spine_run_apply"
 method = "run.apply"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_runtime_state_get"
+method = "rig.runtime_state.get"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_runtime_state_reset"
+method = "rig.runtime_state.reset"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_maintenance_summary"
 method = "maintenance.summary"
 allow_groups = ["chat-users"]
