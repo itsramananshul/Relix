@@ -12,7 +12,17 @@ interface Summary {
     oldest_run?: number; newest_run?: number;
   };
   policy?: { default_older_than_days?: number; default_keep_latest?: number };
+  autoprune?: {
+    enabled?: boolean; interval_secs?: number; older_than_days?: number; keep_latest?: number;
+    delete_workspaces?: boolean; delete_events?: boolean; delete_artifacts?: boolean; dry_run?: boolean;
+  };
+  last_prune?: AuditRow | null;
   warnings?: Warning[];
+}
+interface AuditRow {
+  id?: number; ts?: number; action?: string; trigger?: string; dry_run?: boolean;
+  deleted_workspaces?: number; deleted_bytes?: number; pruned_events?: number; pruned_artifacts?: number;
+  status?: string; note?: string;
 }
 interface PruneItem { run_id?: string; bytes?: number; age_days?: number }
 interface PruneReport {
@@ -38,10 +48,13 @@ function fmtBytes(n?: number): string {
 }
 
 export function MaintenancePanel() {
-  const { data, loading, reload } = useAsync(
-    async () => tryGet<Summary | null>("/v1/maintenance/summary", null),
-    [],
-  );
+  const { data, loading, reload } = useAsync(async () => {
+    const [summary, audit] = await Promise.all([
+      tryGet<Summary | null>("/v1/maintenance/summary", null),
+      tryGet<AuditRow[]>("/v1/maintenance/audit?limit=15", []),
+    ]);
+    return { summary, audit: Array.isArray(audit) ? audit : [] };
+  }, []);
   const [olderThanDays, setOlderThanDays] = useState(7);
   const [keepLatest, setKeepLatest] = useState(10);
   const [deleteEvents, setDeleteEvents] = useState(false);
@@ -51,10 +64,12 @@ export function MaintenancePanel() {
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
   const [confirm, setConfirm] = useState("");
 
-  const s = data ?? undefined;
+  const s = data?.summary ?? undefined;
   const ws = s?.workspace ?? {};
   const ledger = s?.ledger ?? {};
   const warnings = s?.warnings ?? [];
+  const ap = s?.autoprune;
+  const audit = data?.audit ?? [];
 
   async function prune(dryRun: boolean) {
     setBusy(true);
@@ -125,6 +140,27 @@ export function MaintenancePanel() {
               <span className="badge done">{ledger.applied ?? 0} applied</span>
             </span>
           </div>
+          <div className="kv">
+            <span className="muted">Scheduled cleanup</span>
+            <span style={{ fontSize: 12 }}>
+              <span className={"badge " + (ap?.enabled ? "done" : "backlog")}>{ap?.enabled ? "enabled" : "disabled"}</span>
+              {ap?.enabled && (
+                <>
+                  {" "}<span className={"badge " + (ap.dry_run ? "todo" : "blocked")}>{ap.dry_run ? "dry-run" : "REAL delete"}</span>
+                  <span className="muted" style={{ marginLeft: 8 }}>
+                    every {Math.round((ap.interval_secs ?? 0) / 3600)}h · older than {ap.older_than_days}d · keep {ap.keep_latest}
+                    {ap.delete_events ? " · +events" : ""}{ap.delete_artifacts ? " · +artifacts" : ""}
+                  </span>
+                </>
+              )}
+            </span>
+          </div>
+          {ap?.enabled && !ap.dry_run && ap.delete_workspaces && (
+            <div className="banner err" style={{ fontSize: 11 }}>
+              ⚠ Scheduled cleanup runs in REAL-DELETE mode — old run workspaces are removed automatically on a timer. Set
+              {" "}<span className="mono">RELIX_MAINTENANCE_AUTOPRUNE_DRY_RUN=true</span> to make it preview-only.
+            </div>
+          )}
 
           {/* Cleanup controls */}
           <div style={{ marginTop: 14, borderTop: "1px solid var(--border-soft)", paddingTop: 12 }}>
@@ -178,9 +214,39 @@ export function MaintenancePanel() {
             )}
           </div>
 
+          {/* Cleanup history (durable audit) */}
+          <div style={{ marginTop: 14, borderTop: "1px solid var(--border-soft)", paddingTop: 12 }}>
+            <strong style={{ fontSize: 12 }}>Cleanup history</strong>
+            {audit.length === 0 ? (
+              <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>No cleanup has run yet.</div>
+            ) : (
+              <div className="table-scroll" style={{ marginTop: 6 }}>
+                <table className="table compact">
+                  <thead>
+                    <tr><th>When</th><th>Trigger</th><th>Mode</th><th>Deleted</th><th>Reclaimed</th><th>Status</th><th>Note</th></tr>
+                  </thead>
+                  <tbody>
+                    {audit.map((a, i) => (
+                      <tr key={a.id ?? i}>
+                        <td className="muted" style={{ fontSize: 11 }}>{a.ts ? new Date(a.ts * 1000).toLocaleString() : "—"}</td>
+                        <td><span className="badge todo" style={{ fontSize: 9 }}>{a.trigger}</span></td>
+                        <td className="muted" style={{ fontSize: 11 }}>{a.dry_run ? "dry-run" : "delete"}</td>
+                        <td>{a.deleted_workspaces ?? 0}{(a.pruned_events ?? 0) + (a.pruned_artifacts ?? 0) > 0 ? ` +${(a.pruned_events ?? 0)}e/${(a.pruned_artifacts ?? 0)}a` : ""}</td>
+                        <td className="muted" style={{ fontSize: 11 }}>{fmtBytes(a.deleted_bytes)}</td>
+                        <td><span className={"badge " + (a.status === "ok" ? "done" : "blocked")} style={{ fontSize: 9 }}>{a.status}</span></td>
+                        <td className="muted" style={{ fontSize: 11, maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={a.note}>{a.note}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
           <p className="muted" style={{ fontSize: 11, marginTop: 12 }}>
             Back up local state first with <span className="mono">scripts\relix-local-backup.ps1</span> (Windows) or{" "}
             <span className="mono">./scripts/relix-local-backup.sh</span>. For a consistent DB backup, stop the mesh first.
+            See <span className="mono">docs/operations.md</span> for restore steps.
           </p>
         </>
       )}
