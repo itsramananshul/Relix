@@ -12,10 +12,22 @@ built"** notice telling you to run the build — never an old console.
 > **Canonical artifact:** the committed `crates/relix-web-bridge/dashboard-dist/`
 > IS the dashboard the bridge ships. Whenever you change anything under
 > `apps/dashboard/src`, you MUST re-run `npm run build` and commit the
-> regenerated `dashboard-dist/` in the same change. A Rust test
-> (`dashboard::committed_react_dist_present_and_index_references_existing_assets`)
-> fails the build if `index.html` points at a bundle asset that isn't
-> committed, so drift is caught in CI/`cargo test`, not in production.
+> regenerated `dashboard-dist/` in the same change.
+>
+> **Two guards enforce this:**
+> 1. A Rust test
+>    (`dashboard::committed_react_dist_present_and_index_references_existing_assets`)
+>    fails `cargo test` if `index.html` points at a bundle asset that isn't
+>    committed.
+> 2. A **dist-parity gate** rebuilds the dashboard and fails if the committed
+>    `dashboard-dist/` drifts from a fresh build:
+>    - locally: `pwsh -File scripts/check-dashboard-dist.ps1` (also part of
+>      `scripts/ci-local.ps1`);
+>    - in CI: the `dashboard dist parity` job in `.github/workflows/ci.yml`
+>      (runs on every push to `main` and every PR).
+>
+> So a stale committed bundle is caught before it can serve old UI in
+> production.
 
 ## How it is served
 

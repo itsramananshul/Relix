@@ -36,6 +36,15 @@ $Steps = @(
         Script = { cargo clippy --workspace --all-targets -- -D warnings }
     },
     @{
+        # Dashboard dist parity: the committed React bundle
+        # (crates/relix-web-bridge/dashboard-dist) is the runtime artifact the
+        # web-bridge serves, so it must never drift from apps/dashboard/src.
+        # This rebuilds the dashboard and fails if the committed dist changed.
+        # Non-destructive (only installs deps when node_modules is missing).
+        Name   = 'dashboard dist parity (check-dashboard-dist.ps1)'
+        Script = { & (Join-Path $RepoRoot 'scripts/check-dashboard-dist.ps1') }
+    },
+    @{
         # Serial build/test (CARGO_BUILD_JOBS=1 + --test-threads=1)
         # avoids the Windows target-dir flake where parallel rustc
         # invocations race antivirus file locks and fail the link step

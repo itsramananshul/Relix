@@ -78,6 +78,40 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  dashboard-dist:
+    # The React dashboard (apps/dashboard) is the only dashboard the
+    # web-bridge serves, and it serves the COMMITTED bundle at
+    # crates/relix-web-bridge/dashboard-dist. This job rebuilds the dashboard
+    # and fails if that committed dist drifts from source — so a stale UI can
+    # never land green. Runs on the same push/PR trigger as the rest of CI;
+    # no trigger/policy change.
+    name: dashboard dist parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: apps/dashboard/package-lock.json
+      - name: Install dashboard deps
+        working-directory: apps/dashboard
+        run: npm ci
+      - name: Build dashboard
+        working-directory: apps/dashboard
+        run: npm run build
+      - name: Check committed dist is in sync with source
+        run: |
+          dist=crates/relix-web-bridge/dashboard-dist
+          if [ -n "$(git status --porcelain -- "$dist")" ]; then
+            echo "::error::dashboard-dist is stale — run 'npm run build' in apps/dashboard and commit $dist"
+            git status --porcelain -- "$dist"
+            git --no-pager diff -- "$dist" | head -200
+            exit 1
+          fi
+          echo "dashboard-dist is in sync with apps/dashboard source."
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
