@@ -1248,6 +1248,39 @@ impl TaskStore {
                 agent_id,
                 expires_at,
             });
+        // The Brief's most recent Shift (run), bounded. The Brief is already
+        // tenant-checked, and `brief_runs.brief_id` always equals this Brief's
+        // task_id, so a run of a same-Guild Brief can never leak cross-tenant.
+        let latest_run = match self.latest_run_for_brief(task)? {
+            Some(r) => {
+                let artifact_count = self.run_artifact_count(&r.run_id)?;
+                let total_runs = self.run_count_for_brief(task)?;
+                // Cap the (already secret-redacted) summary to a short snippet
+                // so the detail never embeds a huge run output.
+                const MAX_SUMMARY_CHARS: usize = 280;
+                let summary = if r.summary.chars().count() > MAX_SUMMARY_CHARS {
+                    let cut: String = r.summary.chars().take(MAX_SUMMARY_CHARS).collect();
+                    format!("{cut}…")
+                } else {
+                    r.summary
+                };
+                Some(brief::LatestRun {
+                    run_id: r.run_id,
+                    rig: r.rig,
+                    status: r.status,
+                    trigger: r.trigger,
+                    started_at: r.started_at,
+                    finished_at: r.finished_at,
+                    duration_secs: r.duration_secs,
+                    summary,
+                    review: r.review,
+                    apply_status: r.apply_status,
+                    artifact_count,
+                    total_runs,
+                })
+            }
+            None => None,
+        };
         Ok(Some(brief::BriefDetail {
             title: self.brief_title(task)?.unwrap_or_default(),
             fields,
@@ -1266,6 +1299,7 @@ impl TaskStore {
             claim,
             wakeup_count: self.brief_wakeup_count(task)?,
             chronicle,
+            latest_run,
         }))
     }
 
@@ -3369,6 +3403,38 @@ impl TaskStore {
             out.push(r.map_err(CoordinatorError::Db)?);
         }
         Ok(out)
+    }
+
+    /// The most recent Shift (run) for one Brief, or `None` when it has never
+    /// run. Uses the `brief_runs_by_brief` index + `LIMIT 1`, so it stays
+    /// cheap even on a Brief with a long Shift history.
+    pub fn latest_run_for_brief(
+        &self,
+        brief_id: &str,
+    ) -> Result<Option<RunRecord>, CoordinatorError> {
+        Ok(self.runs_for_brief(brief_id, 1)?.into_iter().next())
+    }
+
+    /// How many Shifts (runs) a Brief has recorded.
+    pub fn run_count_for_brief(&self, brief_id: &str) -> Result<i64, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM brief_runs WHERE brief_id = ?1",
+            params![brief_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(CoordinatorError::Db)
+    }
+
+    /// How many changed-file artifacts a run produced.
+    pub fn run_artifact_count(&self, run_id: &str) -> Result<i64, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM run_artifacts WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(CoordinatorError::Db)
     }
 
     /// One run record by id (the `GET /v1/runs/:id` detail).
@@ -15765,6 +15831,65 @@ mod tests {
         assert!(s.brief_detail_for_tenant(&a, "globex").unwrap().is_none());
         // Missing Brief → not-found.
         assert!(s.brief_detail_for_tenant("nope", "acme").unwrap().is_none());
+    }
+
+    /// The Brief detail surfaces its latest Shift (run): `None` before any
+    /// run, then the newest run's bounded summary; a bounded summary snippet;
+    /// and run data never leaks across tenants.
+    #[test]
+    fn brief_detail_surfaces_latest_run() {
+        let s = store();
+        let task = s
+            .create_brief("acme", "runnable", "subj", None, None, None, None)
+            .unwrap();
+        let ws = RunWorkspaceInfo::default();
+
+        // No run yet → latest_run is None.
+        let d = s.brief_detail_for_tenant(&task, "acme").unwrap().unwrap();
+        assert!(d.latest_run.is_none(), "no run → null latest_run");
+
+        // A finished run shows up with status / rig / summary / counts.
+        s.record_run_start("run_1", &task, "agt_a", "echo", "manual", &ws)
+            .unwrap();
+        s.record_run_finish("run_1", "done", "all good").unwrap();
+        let d = s.brief_detail_for_tenant(&task, "acme").unwrap().unwrap();
+        let lr = d.latest_run.expect("a run");
+        assert_eq!(lr.run_id, "run_1");
+        assert_eq!(lr.rig, "echo");
+        assert_eq!(lr.status, "done");
+        assert_eq!(lr.trigger.as_deref(), Some("manual"));
+        assert_eq!(lr.summary, "all good");
+        assert_eq!(lr.artifact_count, 0);
+        assert_eq!(lr.total_runs, 1);
+        assert!(lr.finished_at.is_some(), "finished run has finished_at");
+
+        // A newer (still running) run becomes the latest; total_runs grows.
+        s.record_run_start("run_2", &task, "agt_a", "echo", "heartbeat", &ws)
+            .unwrap();
+        let d = s.brief_detail_for_tenant(&task, "acme").unwrap().unwrap();
+        let lr = d.latest_run.unwrap();
+        assert_eq!(lr.run_id, "run_2");
+        assert_eq!(lr.status, "running");
+        assert_eq!(lr.trigger.as_deref(), Some("heartbeat"));
+        assert_eq!(lr.total_runs, 2);
+
+        // Summary is bounded to a snippet (never embeds a huge output).
+        let huge = "x".repeat(1000);
+        s.record_run_start("run_3", &task, "agt_a", "echo", "manual", &ws)
+            .unwrap();
+        s.record_run_finish("run_3", "failed", &huge).unwrap();
+        let lr = s
+            .brief_detail_for_tenant(&task, "acme")
+            .unwrap()
+            .unwrap()
+            .latest_run
+            .unwrap();
+        assert_eq!(lr.status, "failed");
+        assert!(lr.summary.chars().count() <= 281, "summary snippet bounded");
+        assert!(lr.summary.ends_with('…'), "truncated summary marked");
+
+        // Cross-tenant: globex can't see acme's Brief OR its run data.
+        assert!(s.brief_detail_for_tenant(&task, "globex").unwrap().is_none());
     }
 
     #[test]

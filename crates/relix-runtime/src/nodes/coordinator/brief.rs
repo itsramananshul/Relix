@@ -103,11 +103,49 @@ pub struct ChronicleSummary {
     pub recent: Vec<ChronicleEntry>,
 }
 
+/// A bounded summary of a Brief's most recent Shift (run), embedded in the
+/// Brief detail so the operator sees the execution state without a second
+/// fetch. The full run record + transcript live on `GET /v1/runs/:id`; the
+/// per-Brief Shift history on `GET /v1/spine/briefs/:id/runs`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatestRun {
+    pub run_id: String,
+    /// The adapter (Rig) that ran it.
+    pub rig: String,
+    /// `running` while in flight, then terminal `done` / `failed` /
+    /// `continued` / `cancelled`. (Pre-run refusals — `unassigned`,
+    /// `no_adapter`, `adapter_unavailable`, … — are NOT persisted as runs,
+    /// so they never appear here; they are returned only by the run call.)
+    pub status: String,
+    /// What triggered it: `manual` / `heartbeat` / `scheduled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    pub started_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<i64>,
+    /// The Rig's result/reason — already secret-redacted, and bounded to a
+    /// short snippet here (full text on the run detail).
+    pub summary: String,
+    /// Operator review: `pending_review` / `accepted` / `rejected`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<String>,
+    /// Safe-apply state: `not_applicable` / `blocked` / `ready` / `applied` /
+    /// `failed` / `conflicted`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apply_status: Option<String>,
+    /// Changed-file count this run produced.
+    pub artifact_count: i64,
+    /// Total Shifts (runs) recorded on this Brief.
+    pub total_runs: i64,
+}
+
 /// The full detail view of a Brief, assembled in one read: its
 /// spine fields, title, both directions of its relation graph (each
 /// tenant-filtered), its Dossiers, labels, due/pinned, blocked flag,
-/// the current Claim holder, a wakeup count, and a Chronicle summary.
-/// Saves the detail pane a fan-out of separate calls.
+/// the current Claim holder, a wakeup count, a Chronicle summary, and the
+/// latest Shift (run) summary. Saves the detail pane a fan-out of calls.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BriefDetail {
     /// The Brief's human-facing title.
@@ -136,6 +174,9 @@ pub struct BriefDetail {
     pub wakeup_count: i64,
     /// Total Chronicle events + the newest few (full timeline on `…/events`).
     pub chronicle: ChronicleSummary,
+    /// The Brief's most recent Shift (run) summary, or `None` when it has
+    /// never run. Full history on `…/runs`; full run on `/v1/runs/:id`.
+    pub latest_run: Option<LatestRun>,
 }
 
 /// The board columns a Brief can sit in.

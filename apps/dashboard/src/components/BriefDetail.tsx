@@ -1,7 +1,34 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { api, tryGetReport } from "../api";
 import { useAuth } from "../auth";
 import { Badge, useAsync } from "./common";
+
+// Bounded summary of the Brief's most recent Shift (run), from
+// `GET /v1/spine/briefs/:id`'s `latest_run`. Full run on /v1/runs/:id.
+interface LatestRun {
+  run_id?: string;
+  rig?: string;
+  status?: string; // running / done / failed / continued / cancelled
+  trigger?: string;
+  started_at?: number;
+  finished_at?: number;
+  duration_secs?: number;
+  summary?: string;
+  review?: string;
+  apply_status?: string;
+  artifact_count?: number;
+  total_runs?: number;
+}
+
+// Run status → badge tone (mirrors the Runs page).
+const RUN_TONE: Record<string, string> = {
+  running: "in_progress",
+  done: "done",
+  failed: "blocked",
+  cancelled: "blocked",
+  continued: "todo",
+};
 
 // The full Brief detail (`GET /v1/spine/briefs/:id`) — the canonical
 // product object for one Brief: its fields, title, relation graph (each
@@ -42,6 +69,7 @@ interface BriefDetailData {
   claim?: ClaimInfo | null;
   wakeup_count?: number;
   chronicle?: { total?: number; recent?: ChronicleEntry[] };
+  latest_run?: LatestRun | null;
 }
 
 // A small color cue per Chronicle event family — no theme change, just dots.
@@ -163,6 +191,44 @@ export function BriefDetail({
           {(d.dossiers?.length ?? 0)} dossier(s) · {(d.wakeup_count ?? 0)} wakeup(s)
         </span>
       </div>
+
+      {/* Latest Shift (run) — the execution lifecycle at a glance. */}
+      <div className="row" style={{ marginTop: 12, marginBottom: 6 }}>
+        <strong style={{ fontSize: 12 }}>Latest Shift</strong>
+        {(d.latest_run?.total_runs ?? 0) > 0 && (
+          <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>{d.latest_run!.total_runs} run(s) total</span>
+        )}
+      </div>
+      {!d.latest_run ? (
+        <div className="muted" style={{ fontSize: 12 }}>
+          No Shift yet — assign an Operative and run this Brief, or hit <strong>echo</strong> on the board.
+        </div>
+      ) : (
+        <div style={{ fontSize: 12 }}>
+          <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+            <span className={"badge " + (RUN_TONE[d.latest_run.status ?? ""] ?? "todo")}>{d.latest_run.status ?? "—"}</span>
+            {d.latest_run.trigger && <span className="muted" style={{ fontSize: 11 }}>{d.latest_run.trigger === "heartbeat" ? "auto" : d.latest_run.trigger}</span>}
+            {d.latest_run.rig && <span className="muted">adapter <span className="mono">{d.latest_run.rig}</span></span>}
+            {d.latest_run.review && <span className={"badge " + (d.latest_run.review === "accepted" ? "done" : d.latest_run.review === "rejected" ? "blocked" : "in_progress")} style={{ fontSize: 9 }}>{d.latest_run.review}</span>}
+            {d.latest_run.apply_status && <span className="badge" style={{ fontSize: 9 }}>apply: {d.latest_run.apply_status}</span>}
+            {(d.latest_run.artifact_count ?? 0) > 0 && <span className="muted" style={{ fontSize: 11 }}>{d.latest_run.artifact_count} changed file(s)</span>}
+            <div className="spacer" style={{ flex: 1 }} />
+            {d.latest_run.run_id && (
+              <Link to={`/runs?run=${encodeURIComponent(d.latest_run.run_id)}`} className="link" style={{ fontSize: 11 }}>
+                Open in Runs →
+              </Link>
+            )}
+          </div>
+          <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+            {d.latest_run.started_at ? `started ${new Date(d.latest_run.started_at * 1000).toLocaleString()}` : ""}
+            {d.latest_run.finished_at ? ` · finished ${new Date(d.latest_run.finished_at * 1000).toLocaleTimeString()}` : (d.latest_run.status === "running" ? " · in flight…" : "")}
+            {typeof d.latest_run.duration_secs === "number" ? ` · ${d.latest_run.duration_secs}s` : ""}
+          </div>
+          {d.latest_run.summary && (
+            <div style={{ marginTop: 4, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{d.latest_run.summary}</div>
+          )}
+        </div>
+      )}
 
       {/* Chronicle — newest entries + total; full timeline on the events route. */}
       <div className="row" style={{ marginTop: 12, marginBottom: 6 }}>
