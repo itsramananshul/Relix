@@ -271,6 +271,14 @@ signed audit record**. No bypass switch.
   Overview panel; the task ledger, cron jobs, policy denials, and
   MCP servers each have their own panel, backed by `/v1/tasks`,
   `/v1/cron/jobs`, `/v1/policy/denials`, and `/v1/mcp/servers`.
+  First sign-in creates a single admin (username + Argon2id password).
+  **Forgot the local admin password?** Run
+  `scripts/relix-dashboard-admin-reset.ps1` (Windows) or
+  `scripts/relix-dashboard-admin-reset.sh` (macOS/Linux) — or
+  `relix-web-bridge reset-admin` directly — then restart the bridge.
+  It rewrites only the admin credential (`~/.relix/dashboard-admin.json`),
+  prints a fresh password, and is **local-only**: there is no
+  remote/unauthenticated reset.
 
 ## Security model
 
