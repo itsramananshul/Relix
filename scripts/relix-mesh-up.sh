@@ -1425,6 +1425,14 @@ allow_groups = ["chat-users"]
 name = "spine_run_apply"
 method = "run.apply"
 allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_maintenance_summary"
+method = "maintenance.summary"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_maintenance_prune"
+method = "maintenance.prune"
+allow_groups = ["chat-users"]
 EOF
 
 # ---- 11. peers.toml ----

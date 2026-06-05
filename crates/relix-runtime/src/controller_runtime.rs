@@ -9683,6 +9683,201 @@ fn register_node_type_handlers(
                 )),
             );
         }
+        {
+            // `maintenance.summary` — operator storage + run-ledger overview
+            // (`GET /v1/maintenance/summary`). Bounded, symlink-skipping,
+            // never scans the repo, handles a missing workspace root. No
+            // secrets. Operator-global (a single bridge admin), so the run
+            // counts are not tenant-scoped — disk/log usage is global.
+            let st = store.clone();
+            bridge.register(
+                "maintenance.summary",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |_ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            use crate::nodes::coordinator::maintenance as mnt;
+                            let cfg = st.run_workspace_config();
+                            let root = st.run_workspace_root().to_path_buf();
+                            let scan = mnt::scan_run_workspaces(&root);
+                            let stats = st.run_ledger_stats().ok();
+                            let inherit = std::env::var("RELIX_RUN_WORKSPACE_MODE")
+                                .map(|v| v.trim().eq_ignore_ascii_case("inherit"))
+                                .unwrap_or(false);
+                            let heartbeat_enabled = std::env::var("RELIX_HEARTBEAT_ENABLED")
+                                .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                                .unwrap_or(false);
+                            // Warning thresholds (operator hygiene).
+                            const BYTES_WARN: u64 = 1024 * 1024 * 1024; // 1 GiB
+                            const COUNT_WARN: usize = 200;
+                            let mut warnings: Vec<serde_json::Value> = Vec::new();
+                            if scan.total_bytes > BYTES_WARN {
+                                warnings.push(serde_json::json!({"level":"warn","message":
+                                    format!("run-workspace storage is large (~{} MiB across {} workspaces) — prune old workspaces", scan.total_bytes / (1024*1024), scan.count)}));
+                            }
+                            if scan.count > COUNT_WARN {
+                                warnings.push(serde_json::json!({"level":"warn","message":
+                                    format!("{} run workspaces on disk — prune old ones to reclaim space", scan.count)}));
+                            }
+                            if inherit {
+                                warnings.push(serde_json::json!({"level":"error","message":
+                                    "INHERIT mode active — runs execute in the coordinator working directory, not a scoped sandbox"}));
+                            }
+                            if cfg.context.as_str() == "copy_repo" && !cfg.project_root.is_dir() {
+                                warnings.push(serde_json::json!({"level":"error","message":
+                                    "copy_repo context is set but the project root does not exist"}));
+                            }
+                            let body = serde_json::json!({
+                                "workspace": {
+                                    "root": scan.root,
+                                    "exists": scan.exists,
+                                    "count": scan.count,
+                                    "total_bytes": scan.total_bytes,
+                                    "oldest": scan.oldest,
+                                    "newest": scan.newest,
+                                    "truncated": scan.truncated,
+                                },
+                                "config": {
+                                    "context": cfg.context.as_str(),
+                                    "project_root": cfg.project_root.to_string_lossy(),
+                                    "inherit": inherit,
+                                    "heartbeat_enabled": heartbeat_enabled,
+                                },
+                                "ledger": stats,
+                                "policy": {
+                                    "default_older_than_days": mnt::DEFAULT_PRUNE_OLDER_THAN_DAYS,
+                                    "default_keep_latest": mnt::DEFAULT_PRUNE_KEEP_LATEST,
+                                },
+                                "warnings": warnings,
+                            });
+                            match serde_json::to_vec(&body) {
+                                Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                Err(e) => crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                        cause: format!("maintenance.summary encode: {e}"),
+                                        retry_hint: 1,
+                                        retry_after: None,
+                                    },
+                                ),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
+        {
+            // `maintenance.prune` — safe prune of OLD run workspaces (and,
+            // optionally, the verbose log rows of pruned runs)
+            // (`POST /v1/maintenance/prune`). Dry-run by default; a real
+            // delete is explicit (`dry_run:false`). Never touches a running
+            // run's workspace, never follows symlinks, refuses an unsafe
+            // root, only operates under the configured workspace root.
+            let st = store.clone();
+            bridge.register(
+                "maintenance.prune",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            use crate::nodes::coordinator::maintenance as mnt;
+                            let invalid = |c: String| {
+                                crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                        cause: c,
+                                        retry_hint: 0,
+                                        retry_after: None,
+                                    },
+                                )
+                            };
+                            // Parse the JSON body (all fields optional).
+                            let v: serde_json::Value = if ctx.args.is_empty() {
+                                serde_json::json!({})
+                            } else {
+                                match serde_json::from_slice(&ctx.args) {
+                                    Ok(v) => v,
+                                    Err(e) => return invalid(format!("maintenance.prune: bad body: {e}")),
+                                }
+                            };
+                            let dry_run = v.get("dry_run").and_then(|x| x.as_bool()).unwrap_or(true);
+                            let older_than_days = v
+                                .get("older_than_days")
+                                .and_then(|x| x.as_u64())
+                                .unwrap_or(mnt::DEFAULT_PRUNE_OLDER_THAN_DAYS);
+                            let keep_latest = v
+                                .get("keep_latest")
+                                .and_then(|x| x.as_u64())
+                                .map(|n| n as usize)
+                                .unwrap_or(mnt::DEFAULT_PRUNE_KEEP_LATEST);
+                            let delete_workspaces =
+                                v.get("delete_workspaces").and_then(|x| x.as_bool()).unwrap_or(true);
+                            let delete_events =
+                                v.get("delete_events").and_then(|x| x.as_bool()).unwrap_or(false);
+                            let delete_artifacts =
+                                v.get("delete_artifacts").and_then(|x| x.as_bool()).unwrap_or(false);
+
+                            let root = st.run_workspace_root().to_path_buf();
+                            let scan = mnt::scan_run_workspaces(&root);
+                            let running = st.running_run_ids().unwrap_or_default();
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            let policy = mnt::PrunePolicy {
+                                older_than_days,
+                                keep_latest,
+                                delete_workspaces,
+                            };
+                            let report = match mnt::prune_run_workspaces(
+                                &root, now, &scan, &running, &policy, dry_run,
+                            ) {
+                                Ok(r) => r,
+                                Err(e) => return invalid(format!("maintenance.prune refused: {e}")),
+                            };
+                            // Optionally prune the verbose log rows of the
+                            // workspaces selected for deletion (never the
+                            // ledger row). Only on a real run.
+                            let (events_deleted, artifacts_deleted) =
+                                if !dry_run && (delete_events || delete_artifacts) {
+                                    let ids: Vec<String> =
+                                        report.to_delete.iter().map(|i| i.run_id.clone()).collect();
+                                    st.prune_run_logs(&ids, delete_events, delete_artifacts)
+                                        .unwrap_or((0, 0))
+                                } else {
+                                    (0, 0)
+                                };
+                            // Operator audit via the tracing log (durable
+                            // maintenance ledger is future work).
+                            if dry_run {
+                                tracing::info!(
+                                    candidates = report.to_delete.len(),
+                                    bytes = report.to_delete_bytes,
+                                    "maintenance.prune dry-run"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    deleted_workspaces = report.deleted_workspaces,
+                                    deleted_bytes = report.deleted_bytes,
+                                    events_deleted,
+                                    artifacts_deleted,
+                                    "maintenance.prune executed"
+                                );
+                            }
+                            let mut body = serde_json::to_value(&report).unwrap_or(serde_json::json!({}));
+                            if let Some(obj) = body.as_object_mut() {
+                                obj.insert("events_deleted".into(), serde_json::json!(events_deleted));
+                                obj.insert("artifacts_deleted".into(), serde_json::json!(artifacts_deleted));
+                            }
+                            match serde_json::to_vec(&body) {
+                                Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                Err(e) => invalid(format!("maintenance.prune encode: {e}")),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
         // PHASE 3 (heartbeat loop): the live dispatch tick. Opt-in
         // via RELIX_HEARTBEAT_ENABLED (off by default so it never
         // surprises an operator). When on, a timer polls the ready

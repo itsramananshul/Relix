@@ -883,6 +883,27 @@ pub async fn run_config(
     json_passthrough(call_peer(&state, "run.workspace_config", b"").await?)
 }
 
+/// `GET /v1/maintenance/summary` — operator storage + run-ledger overview
+/// (workspace count/bytes, run/event/artifact counts, warnings). Bounded,
+/// no secrets. Auth-gated by the bridge middleware like every `/v1/*`.
+pub async fn maintenance_summary(
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "maintenance.summary", b"").await?)
+}
+
+/// `POST /v1/maintenance/prune` — safe prune of OLD run workspaces (and,
+/// optionally, the verbose log rows of pruned runs). Dry-run by default;
+/// a real delete needs `{"dry_run": false}`. The raw JSON body is forwarded
+/// to the runtime, which parses the options + enforces every safety rule.
+pub async fn maintenance_prune(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let bytes = if body.is_empty() { b"{}".to_vec() } else { body.to_vec() };
+    json_passthrough(call_peer(&state, "maintenance.prune", &bytes).await?)
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct CompanyInitRequest {
     #[serde(default)]

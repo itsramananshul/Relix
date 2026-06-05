@@ -149,6 +149,7 @@ pub mod cron;
 pub mod delegate;
 pub mod event_summary;
 pub mod heartbeat;
+pub mod maintenance;
 pub mod messaging;
 pub mod routing;
 pub mod spine;
@@ -2706,6 +2707,99 @@ impl TaskStore {
                 "only a `done` run is reviewable (this run is `{other}`)"
             ))),
         }
+    }
+
+    /// Aggregate run-ledger statistics for the operator maintenance
+    /// summary — cheap COUNT/MIN/MAX queries over `brief_runs` +
+    /// `run_events` + `run_artifacts`. Global (operator-wide), not
+    /// tenant-scoped: disk/log usage is a single-operator concern.
+    pub fn run_ledger_stats(&self) -> Result<RunLedgerStats, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
+        let by_status = |status: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM brief_runs WHERE status = ?1",
+                params![status],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+        };
+        let by_review = |review: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM brief_runs WHERE review = ?1",
+                params![review],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+        };
+        let (oldest_run, newest_run): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT MIN(started_at), MAX(started_at) FROM brief_runs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap_or((None, None));
+        Ok(RunLedgerStats {
+            runs: one("SELECT COUNT(*) FROM brief_runs"),
+            run_events: one("SELECT COUNT(*) FROM run_events"),
+            run_artifacts: one("SELECT COUNT(*) FROM run_artifacts"),
+            oldest_run,
+            newest_run,
+            running: by_status("running"),
+            pending_review: by_review("pending_review"),
+            accepted: by_review("accepted"),
+            rejected: by_review("rejected"),
+            applied: one("SELECT COUNT(*) FROM brief_runs WHERE apply_status = 'applied'"),
+        })
+    }
+
+    /// The set of run_ids whose runs are still `running` — their scoped
+    /// workspaces must NEVER be pruned. Used by the maintenance prune.
+    pub fn running_run_ids(&self) -> Result<std::collections::HashSet<String>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare("SELECT run_id FROM brief_runs WHERE status = 'running'")
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(CoordinatorError::Db)?;
+        let mut set = std::collections::HashSet::new();
+        for r in rows {
+            set.insert(r.map_err(CoordinatorError::Db)?);
+        }
+        Ok(set)
+    }
+
+    /// Prune the VERBOSE log rows (`run_events` / `run_artifacts`) for the
+    /// given runs. Conservative: it deletes only the log rows, never the
+    /// `brief_runs` ledger row itself (the run stays visible in `/v1/runs`,
+    /// just without its transcript / artifact detail). Returns
+    /// `(events_deleted, artifacts_deleted)`.
+    pub fn prune_run_logs(
+        &self,
+        run_ids: &[String],
+        events: bool,
+        artifacts: bool,
+    ) -> Result<(usize, usize), CoordinatorError> {
+        if run_ids.is_empty() || (!events && !artifacts) {
+            return Ok((0, 0));
+        }
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut ev = 0usize;
+        let mut ar = 0usize;
+        for rid in run_ids {
+            if events {
+                ev += conn
+                    .execute("DELETE FROM run_events WHERE run_id = ?1", params![rid])
+                    .unwrap_or(0);
+            }
+            if artifacts {
+                ar += conn
+                    .execute("DELETE FROM run_artifacts WHERE run_id = ?1", params![rid])
+                    .unwrap_or(0);
+            }
+        }
+        Ok((ev, ar))
     }
 
     /// Recent run records across all Briefs, newest first — the Active
@@ -7533,6 +7627,23 @@ impl RunArtifact {
             captured_at: r.get(10)?,
         })
     }
+}
+
+/// Aggregate run-ledger statistics for the operator maintenance summary.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RunLedgerStats {
+    pub runs: i64,
+    pub run_events: i64,
+    pub run_artifacts: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_run: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub newest_run: Option<i64>,
+    pub running: i64,
+    pub pending_review: i64,
+    pub accepted: i64,
+    pub rejected: i64,
+    pub applied: i64,
 }
 
 /// Cap on the number of artifacts recorded per run; beyond it the scan
