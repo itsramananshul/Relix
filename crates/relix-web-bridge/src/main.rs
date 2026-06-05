@@ -219,8 +219,36 @@ use crate::config::{AppState, BridgeConfig};
 )]
 struct Args {
     /// Path to the bridge config TOML (see `configs/web-bridge.toml`).
+    /// Required to RUN the bridge; optional for the `reset-admin` subcommand.
     #[arg(short, long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Local maintenance subcommands. With NO subcommand the binary runs the
+/// bridge server — the default and ONLY network-facing mode.
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Reset the local dashboard admin password — LOCAL operator recovery
+    /// only (there is NO network/unauthenticated path to this). Writes a
+    /// new Argon2id credential to the admin file; restart the bridge for it
+    /// to take effect and to drop existing sessions.
+    ResetAdmin(ResetAdminArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ResetAdminArgs {
+    /// Operate directly on this `dashboard-admin.json` (overrides --config).
+    #[arg(long)]
+    admin_file: Option<PathBuf>,
+    /// New admin username. Defaults to the existing username, else "admin".
+    #[arg(long)]
+    username: Option<String>,
+    /// New admin password (min 8 chars). If omitted, a strong random one is
+    /// generated and printed once.
+    #[arg(long)]
+    password: Option<String>,
 }
 
 /// Bridge-layer errors. Used at startup (config / identity bundle load).
@@ -235,6 +263,71 @@ fn unix_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// A strong, copy-friendly random password for the local admin reset:
+/// `relix-` + 24 hex chars (96 bits of OS entropy).
+fn generate_password() -> String {
+    use rand::RngCore;
+    let mut buf = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    format!("relix-{}", hex::encode(buf))
+}
+
+/// `relix-web-bridge reset-admin` — LOCAL operator recovery for a forgotten
+/// dashboard admin password. Resolves the admin file (explicit `--admin-file`
+/// → `--config`-derived → `~/.relix/dashboard-admin.json`), writes a new
+/// Argon2id credential, and prints the new username (+ generated password
+/// once). Never prints/reads the old secret; never opens a network surface.
+fn run_admin_reset(
+    config: Option<&std::path::Path>,
+    ra: &ResetAdminArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let admin_path: PathBuf = if let Some(p) = &ra.admin_file {
+        p.clone()
+    } else if let Some(cfg_path) = config {
+        let text = std::fs::read_to_string(cfg_path)
+            .map_err(|e| format!("read config {}: {e}", cfg_path.display()))?;
+        let cfg: BridgeConfig = toml::from_str(&text).map_err(|e| format!("parse config: {e}"))?;
+        let token = crate::config::resolve_bridge_token_path(&cfg);
+        crate::dashboard_auth::admin_path_for_token(&token)
+    } else {
+        crate::config::default_admin_path()
+    };
+
+    // Keep the existing username unless one was given; fall back to "admin".
+    let existing = crate::dashboard_auth::read_admin_username(&admin_path);
+    let username = ra
+        .username
+        .clone()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .or_else(|| existing.clone())
+        .unwrap_or_else(|| "admin".to_string());
+
+    let (password, generated) = match &ra.password {
+        Some(p) => (p.clone(), false),
+        None => (generate_password(), true),
+    };
+
+    crate::dashboard_auth::reset_admin_credential(&admin_path, &username, &password)
+        .map_err(|e| format!("reset failed: {e}"))?;
+
+    let was_new = existing.is_none();
+    println!();
+    println!("Relix dashboard admin {} (LOCAL operator recovery).", if was_new { "created" } else { "reset" });
+    println!("  admin file : {}", admin_path.display());
+    println!("  username   : {username}");
+    if generated {
+        println!("  password   : {password}");
+        println!("  (generated — copy it now; only the Argon2id hash is stored, so it is not shown again)");
+    } else {
+        println!("  password   : (the value you passed via --password)");
+    }
+    println!();
+    println!("Restart the bridge for the new credential to take effect and to drop existing sessions.");
+    println!("There is NO remote/unauthenticated reset — this command only runs locally on this machine.");
+    Ok(())
 }
 
 #[tokio::main]
@@ -259,9 +352,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let args = Args::parse();
+    // Local maintenance subcommands run + exit WITHOUT booting the mesh /
+    // server. `reset-admin` is a filesystem operation an operator runs on
+    // their own machine — never a network surface.
+    if let Some(Command::ResetAdmin(ra)) = &args.command {
+        return run_admin_reset(args.config.as_deref(), ra);
+    }
+    let config_path = args
+        .config
+        .clone()
+        .ok_or_else(|| "--config <bridge.toml> is required to run the bridge".to_string())?;
     let cfg: BridgeConfig = {
-        let text = std::fs::read_to_string(&args.config)
-            .map_err(|e| format!("read config {}: {e}", args.config.display()))?;
+        let text = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("read config {}: {e}", config_path.display()))?;
         toml::from_str(&text).map_err(|e| format!("parse config: {e}"))?
     };
     let mut state = AppState::try_new(cfg.clone())?;

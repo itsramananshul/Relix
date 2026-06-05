@@ -501,6 +501,33 @@ pub struct AppState {
         Option<std::sync::Arc<relix_runtime::nodes::memory::schema::LayeredMemoryStore>>,
 }
 
+/// Resolve the bridge auth-token path from config, falling back to
+/// `~/.relix/bridge-token` (the operator's home Relix dir). Shared by the
+/// running bridge and the local admin-reset CLI so both target the SAME
+/// `dashboard-admin.json` (which sits next to this token file).
+pub fn resolve_bridge_token_path(cfg: &BridgeConfig) -> PathBuf {
+    cfg.bridge.token_path.clone().unwrap_or_else(|| {
+        let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        match std::env::var_os(home_var) {
+            Some(h) => PathBuf::from(h).join(".relix").join("bridge-token"),
+            None => PathBuf::from("bridge-token"),
+        }
+    })
+}
+
+/// The default admin-credential path when no bridge config is supplied:
+/// `~/.relix/dashboard-admin.json`. Mirrors [`resolve_bridge_token_path`]'s
+/// fallback so a bare `reset-admin` (no `--config`) targets the same file
+/// the bridge uses by default.
+pub fn default_admin_path() -> PathBuf {
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let token = match std::env::var_os(home_var) {
+        Some(h) => PathBuf::from(h).join(".relix").join("bridge-token"),
+        None => PathBuf::from("bridge-token"),
+    };
+    crate::dashboard_auth::admin_path_for_token(&token)
+}
+
 impl AppState {
     pub fn try_new(cfg: BridgeConfig) -> Result<Self, BridgeError> {
         let bundle_bytes = std::fs::read(&cfg.identity.bundle_path).map_err(|e| {
@@ -613,13 +640,7 @@ impl AppState {
         // `~/.relix/bridge-token` so it sits next to the operator's
         // other Relix state, regardless of which workspace the
         // bridge was launched from.
-        let token_path = cfg.bridge.token_path.clone().unwrap_or_else(|| {
-            let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-            match std::env::var_os(home_var) {
-                Some(h) => PathBuf::from(h).join(".relix").join("bridge-token"),
-                None => PathBuf::from("bridge-token"),
-            }
-        });
+        let token_path = resolve_bridge_token_path(&cfg);
         let bridge_token = crate::auth::BridgeToken::load_or_generate(&token_path)
             .map_err(|e| BridgeError::Config(format!("bridge-token: {e}")))?;
         // Dashboard operator-login state. The admin credential is stored

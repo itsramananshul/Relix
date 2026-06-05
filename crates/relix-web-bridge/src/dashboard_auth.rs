@@ -102,25 +102,7 @@ impl AdminStore {
     /// Create the admin account (first run only). Hashes `password` with
     /// Argon2id and persists the record at restrictive permissions.
     fn create(&self, username: &str, password: &str) -> Result<(), String> {
-        let salt = SaltString::generate(&mut OsRng);
-        let hash = Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
-            .map_err(|e| format!("hash: {e}"))?
-            .to_string();
-        let rec = AdminRecord {
-            username: username.to_string(),
-            hash,
-            created_at: now_secs(),
-        };
-        let body = serde_json::to_vec_pretty(&rec).map_err(|e| format!("encode: {e}"))?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
-        }
-        let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, &body).map_err(|e| format!("write: {e}"))?;
-        let _ = crate::os_secure::restrict_to_current_user(&tmp);
-        std::fs::rename(&tmp, &*self.path).map_err(|e| format!("rename: {e}"))?;
-        let _ = crate::os_secure::restrict_to_current_user(&self.path);
+        let rec = write_admin_record(&self.path, username, password)?;
         if let Ok(mut c) = self.cached.write() {
             *c = Some(rec);
         }
@@ -139,6 +121,78 @@ impl AdminStore {
             .ok()
             .map(|_| rec.username)
     }
+}
+
+/// Where the dashboard admin credential lives, given the bridge-token path:
+/// `dashboard-admin.json` in the SAME directory. Used by both the running
+/// bridge ([`DashboardAuth::from_token_path`]) and the local reset CLI so
+/// they always agree on the file.
+pub fn admin_path_for_token(token_path: &Path) -> PathBuf {
+    token_path
+        .parent()
+        .map(|p| p.join("dashboard-admin.json"))
+        .unwrap_or_else(|| PathBuf::from("dashboard-admin.json"))
+}
+
+/// Hash `password` (Argon2id) + atomically write the admin record at
+/// `path`, restricting it to the current user. Shared by first-run setup
+/// and the local reset path so the on-disk format is identical.
+fn write_admin_record(path: &Path, username: &str, password: &str) -> Result<AdminRecord, String> {
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| format!("hash: {e}"))?
+        .to_string();
+    let rec = AdminRecord {
+        username: username.to_string(),
+        hash,
+        created_at: now_secs(),
+    };
+    let body = serde_json::to_vec_pretty(&rec).map_err(|e| format!("encode: {e}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &body).map_err(|e| format!("write: {e}"))?;
+    let _ = crate::os_secure::restrict_to_current_user(&tmp);
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
+    let _ = crate::os_secure::restrict_to_current_user(path);
+    Ok(rec)
+}
+
+/// The current admin username at `admin_path`, or `None` if no admin exists
+/// yet. Never returns the password hash — callers that reset reuse the
+/// existing username without ever seeing the secret.
+pub fn read_admin_username(admin_path: &Path) -> Option<String> {
+    let bytes = std::fs::read(admin_path).ok()?;
+    serde_json::from_slice::<AdminRecord>(&bytes)
+        .ok()
+        .map(|r| r.username)
+}
+
+/// **Local operator recovery only.** Overwrite the dashboard admin
+/// credential at `admin_path` with a new username + a freshly Argon2id-
+/// hashed password, using the SAME storage format as first-run setup.
+///
+/// There is deliberately NO network path to this — it is a CLI / filesystem
+/// operation an operator runs locally (it requires write access to the
+/// admin file). It does NOT print or read the existing password/hash, does
+/// NOT weaken session auth, and does NOT touch any other state. Existing
+/// in-memory sessions are not invalidated here; restart the bridge to drop
+/// them (a restart also reloads this new credential).
+pub fn reset_admin_credential(
+    admin_path: &Path,
+    username: &str,
+    password: &str,
+) -> Result<(), String> {
+    let username = username.trim();
+    if username.is_empty() {
+        return Err("username required".to_string());
+    }
+    if password.len() < MIN_PASSWORD_LEN {
+        return Err(format!("password too short (min {MIN_PASSWORD_LEN} chars)"));
+    }
+    write_admin_record(admin_path, username, password).map(|_| ())
 }
 
 // ── Sessions (in-memory) ────────────────────────────────────────
@@ -218,10 +272,7 @@ impl DashboardAuth {
     /// same directory (`dashboard-admin.json`) so it sits with the
     /// operator's other Relix state.
     pub fn from_token_path(token_path: &Path) -> Self {
-        let admin_path = token_path
-            .parent()
-            .map(|p| p.join("dashboard-admin.json"))
-            .unwrap_or_else(|| PathBuf::from("dashboard-admin.json"));
+        let admin_path = admin_path_for_token(token_path);
         Self {
             admin: AdminStore::load(&admin_path),
             sessions: SessionStore::new(),
@@ -441,6 +492,63 @@ mod tests {
         let rec = auth.admin.cached.read().unwrap().clone().unwrap();
         assert!(rec.hash.starts_with("$argon2id$"), "got: {}", rec.hash);
         assert!(!rec.hash.contains("hunter2pass"));
+    }
+
+    #[test]
+    fn admin_path_is_next_to_the_token() {
+        let p = admin_path_for_token(Path::new("/x/y/bridge-token"));
+        assert!(p.ends_with("dashboard-admin.json"));
+        assert_eq!(p.parent().unwrap(), Path::new("/x/y"));
+    }
+
+    #[test]
+    fn reset_changes_password_old_fails_new_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let token = tmp.path().join("bridge-token");
+        let admin = admin_path_for_token(&token);
+        // First-run setup, then verify the old password.
+        let a1 = DashboardAuth::from_token_path(&token);
+        a1.admin.create("ops", "oldpassword").unwrap();
+        assert_eq!(a1.admin.verify("ops", "oldpassword").as_deref(), Some("ops"));
+        // Reset keeps the username (read from disk) but sets a new password.
+        let user = read_admin_username(&admin).unwrap();
+        assert_eq!(user, "ops");
+        reset_admin_credential(&admin, &user, "newpassword1").unwrap();
+        // A FRESH handle (simulating a bridge restart) honors ONLY the new
+        // password — the old one is gone.
+        let a2 = DashboardAuth::from_token_path(&token);
+        assert_eq!(a2.admin.verify("ops", "newpassword1").as_deref(), Some("ops"));
+        assert!(
+            a2.admin.verify("ops", "oldpassword").is_none(),
+            "old password must stop working after reset"
+        );
+    }
+
+    #[test]
+    fn reset_can_set_username_and_creates_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let token = tmp.path().join("bridge-token");
+        let admin = admin_path_for_token(&token);
+        // No admin yet → reset CREATES it with the given username.
+        assert!(read_admin_username(&admin).is_none());
+        reset_admin_credential(&admin, "newadmin", "secretpass1").unwrap();
+        assert_eq!(read_admin_username(&admin).as_deref(), Some("newadmin"));
+        let a = DashboardAuth::from_token_path(&token);
+        assert_eq!(a.admin.verify("newadmin", "secretpass1").as_deref(), Some("newadmin"));
+    }
+
+    #[test]
+    fn reset_validates_and_never_stores_plaintext() {
+        let tmp = tempfile::tempdir().unwrap();
+        let admin = tmp.path().join("dashboard-admin.json");
+        // Empty username + short password are refused.
+        assert!(reset_admin_credential(&admin, "  ", "longenough").is_err());
+        assert!(reset_admin_credential(&admin, "ops", "short").is_err());
+        // A valid reset stores an Argon2id PHC hash, never the plaintext.
+        reset_admin_credential(&admin, "ops", "validpassword").unwrap();
+        let raw = std::fs::read_to_string(&admin).unwrap();
+        assert!(raw.contains("$argon2id$"), "got: {raw}");
+        assert!(!raw.contains("validpassword"), "password must not be stored in plaintext");
     }
 
     #[test]
