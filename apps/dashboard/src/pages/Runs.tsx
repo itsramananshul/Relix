@@ -1,7 +1,21 @@
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { api, tryGet } from "../api";
+import { api, tryGet, subscribeRunEvents, type RunEventConn } from "../api";
 import { Empty, Section, useAsync } from "../components/common";
+
+// Live run-event connection → a small honest status chip.
+const LIVE_LABEL: Record<RunEventConn, string> = {
+  connecting: "connecting…",
+  live: "live",
+  reconnecting: "reconnecting…",
+  unavailable: "live updates off",
+};
+const LIVE_TONE: Record<RunEventConn, string> = {
+  connecting: "todo",
+  live: "done",
+  reconnecting: "in_progress",
+  unavailable: "blocked",
+};
 
 // Build the shareable deep link for one run (the SPA is mounted at
 // /dashboard, so include the basename for a copy-paste-able URL).
@@ -170,6 +184,7 @@ const TONE: Record<string, string> = {
   failed: "blocked",
   cancelled: "blocked",
   refused: "blocked",
+  interrupted: "blocked",
   continued: "todo",
 };
 
@@ -196,7 +211,7 @@ function fmtDuration(r: RunRecord): string {
   return "—";
 }
 
-const FILTERS = ["all", "running", "done", "failed", "refused", "cancelled", "continued"] as const;
+const FILTERS = ["all", "running", "done", "failed", "refused", "interrupted", "cancelled", "continued"] as const;
 const TRIGGERS = ["all", "manual", "heartbeat"] as const;
 
 export function Runs() {
@@ -216,6 +231,8 @@ export function Runs() {
   const [diff, setDiff] = useState<RunDiff | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  // Live run-event stream connection state (live / reconnecting / off).
+  const [liveConn, setLiveConn] = useState<RunEventConn>("connecting");
 
   const { data, loading, error, reload } = useAsync(async () => {
     const [runs, adapters] = await Promise.all([
@@ -303,6 +320,37 @@ export function Runs() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deepRun]);
 
+  // Live updates: subscribe ONCE to the execution event stream. On any
+  // transition (start / finish / refuse / recover / move / review / apply),
+  // debounce-refresh the runs list, and refresh the open run's transcript so
+  // an in-flight Shift updates without a manual click. Refs keep the
+  // subscription stable across re-renders (no reconnect churn).
+  const reloadRef = useRef(reload);
+  reloadRef.current = reload;
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
+  const loadEventsRef = useRef(loadEvents);
+  loadEventsRef.current = loadEvents;
+  useEffect(() => {
+    let pending: ReturnType<typeof setTimeout> | null = null;
+    const unsub = subscribeRunEvents(
+      () => {
+        if (pending) clearTimeout(pending);
+        pending = setTimeout(() => {
+          reloadRef.current();
+          const exp = expandedRef.current;
+          if (exp) void loadEventsRef.current(exp);
+        }, 500);
+      },
+      (state) => setLiveConn(state),
+    );
+    return () => {
+      if (pending) clearTimeout(pending);
+      unsub();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function copyRunLink(runId: string) {
     const url = runDeepLink(runId);
     try {
@@ -375,7 +423,18 @@ export function Runs() {
     <div className="grid">
       <Section
         title="Active runs"
-        action={<button className="btn ghost sm" onClick={reload}>Refresh</button>}
+        action={
+          <div className="row" style={{ gap: 8, alignItems: "center" }}>
+            <span
+              className={"badge " + LIVE_TONE[liveConn]}
+              style={{ fontSize: 10 }}
+              title="live run-event stream (auto-refreshes this page)"
+            >
+              ● {LIVE_LABEL[liveConn]}
+            </span>
+            <button className="btn ghost sm" onClick={reload}>Refresh</button>
+          </div>
+        }
       >
         {error && <div className="banner err">{error}</div>}
         {banner && <div className="banner info">{banner}</div>}

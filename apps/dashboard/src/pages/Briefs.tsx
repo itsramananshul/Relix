@@ -79,6 +79,7 @@ const RUN_TONE: Record<string, string> = {
   failed: "blocked",
   cancelled: "blocked",
   refused: "blocked",
+  interrupted: "blocked",
   continued: "todo",
 };
 

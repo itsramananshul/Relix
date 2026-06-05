@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, tryGetReport } from "../api";
+import { api, tryGetReport, subscribeRunEvents } from "../api";
 import { useAuth } from "../auth";
 import { Badge, useAsync } from "./common";
 
@@ -9,7 +9,7 @@ import { Badge, useAsync } from "./common";
 interface LatestRun {
   run_id?: string;
   rig?: string;
-  status?: string; // running / done / failed / continued / cancelled
+  status?: string; // running / done / failed / continued / cancelled / interrupted / refused
   trigger?: string;
   started_at?: number;
   finished_at?: number;
@@ -29,6 +29,7 @@ const RUN_TONE: Record<string, string> = {
   failed: "blocked",
   cancelled: "blocked",
   refused: "blocked",
+  interrupted: "blocked",
   continued: "todo",
 };
 
@@ -102,6 +103,32 @@ export function BriefDetail({
     () => tryGetReport<BriefDetailData>(`/v1/spine/briefs/${encodeURIComponent(briefId)}`, {}),
     [briefId],
   );
+
+  // Live updates: refresh this Brief's detail (latest_run + Chronicle) when an
+  // execution event for THIS Brief arrives on the run-event stream — so the
+  // panel reflects a Shift starting / finishing / being refused without a
+  // manual refresh. Refs keep the single subscription stable across renders.
+  const reloadRef = useRef(reload);
+  reloadRef.current = reload;
+  const briefIdRef = useRef(briefId);
+  briefIdRef.current = briefId;
+  useEffect(() => {
+    let pending: ReturnType<typeof setTimeout> | null = null;
+    const unsub = subscribeRunEvents(
+      (ev) => {
+        // Only react to events for this Brief (or unlabeled frames).
+        if (ev.taskId && ev.taskId !== briefIdRef.current) return;
+        if (pending) clearTimeout(pending);
+        pending = setTimeout(() => reloadRef.current(), 400);
+      },
+      () => {},
+    );
+    return () => {
+      if (pending) clearTimeout(pending);
+      unsub();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const d = data?.data ?? {};
   const f = d.fields ?? {};

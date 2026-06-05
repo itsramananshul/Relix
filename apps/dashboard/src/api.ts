@@ -80,6 +80,92 @@ export async function tryGetReport<T>(path: string, fallback: T): Promise<GetRep
   }
 }
 
+// ── Live run-event stream (SSE) ───────────────────────────────────────────
+// Subscribe to the bridge's `/v1/runs/events/stream` execution feed so the
+// Runs page + Brief detail can refresh the moment a Shift starts, finishes,
+// is refused, recovered, moved, reviewed, or applied — instead of only at
+// fetch time. Cookie auth rides the same-origin EventSource automatically.
+
+export type RunEventConn = "connecting" | "live" | "reconnecting" | "unavailable";
+
+export interface RunStreamEvent {
+  // Normalized SSE event name: run_started | run_finished |
+  // run_cancel_requested | brief_moved | review_changed | apply_changed.
+  name: string;
+  // The Brief (task) id carried by the event, when present.
+  taskId: string | null;
+}
+
+const RUN_EVENT_NAMES = [
+  "run_started",
+  "run_finished",
+  "run_cancel_requested",
+  "brief_moved",
+  "review_changed",
+  "apply_changed",
+];
+
+// Open the stream and call `onEvent` per execution transition + `onConn` on
+// connection-state changes. Manages reconnect with capped backoff and reports
+// honest state (live / reconnecting / unavailable). Returns an unsubscribe fn.
+export function subscribeRunEvents(
+  onEvent: (ev: RunStreamEvent) => void,
+  onConn: (state: RunEventConn) => void,
+): () => void {
+  let es: EventSource | null = null;
+  let closed = false;
+  let attempts = 0;
+  let backoff = 1000;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const handler = (name: string) => (e: MessageEvent) => {
+    let taskId: string | null = null;
+    try {
+      const j = JSON.parse(e.data);
+      if (j && typeof j === "object" && "task_id" in j && j.task_id != null) {
+        taskId = String((j as Record<string, unknown>).task_id);
+      }
+    } catch {
+      /* non-JSON frame — forward with no taskId */
+    }
+    onEvent({ name, taskId });
+  };
+
+  const connect = () => {
+    if (closed) return;
+    onConn(attempts === 0 ? "connecting" : "reconnecting");
+    es = new EventSource("/v1/runs/events/stream", { withCredentials: true });
+    es.onopen = () => {
+      attempts = 0;
+      backoff = 1000;
+      onConn("live");
+    };
+    for (const n of RUN_EVENT_NAMES) {
+      es.addEventListener(n, handler(n) as EventListener);
+    }
+    es.onerror = () => {
+      // The browser would auto-reconnect, but we manage it so we can surface
+      // honest state + cap reconnect storms. Persistent failure → unavailable
+      // (still retrying, so it can recover to live).
+      es?.close();
+      es = null;
+      if (closed) return;
+      attempts += 1;
+      onConn(attempts >= 3 ? "unavailable" : "reconnecting");
+      timer = setTimeout(connect, backoff);
+      backoff = Math.min(backoff * 2, 15000);
+    };
+  };
+
+  connect();
+  return () => {
+    closed = true;
+    if (timer) clearTimeout(timer);
+    es?.close();
+    es = null;
+  };
+}
+
 // Outcome of probing one health dimension. `status` is the HTTP code (null
 // when the request never reached the bridge — a network/DNS/TLS failure).
 export interface Probe {
