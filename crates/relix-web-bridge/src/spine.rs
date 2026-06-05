@@ -519,6 +519,72 @@ pub async fn orchestration_latest(
     )
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct ProposeStrategyRequest {
+    #[serde(default)]
+    pub doc: Option<String>,
+}
+
+/// `GET /v1/spine/mandates/:id/strategy` — the Mandate strategy status
+/// (`proposed`/`approved`/`rejected`/null). Proxies `mandate.strategy.status`.
+pub async fn strategy_status(
+    State(state): State<AppState>,
+    Path(mandate_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if mandate_id.trim().is_empty() {
+        return Err(bad("mandate_id required"));
+    }
+    json_passthrough(call_peer(&state, "mandate.strategy.status", mandate_id.trim().as_bytes()).await?)
+}
+
+/// `POST /v1/spine/mandates/:id/strategy/propose` — set/replace the strategy
+/// to `proposed`. Body `{ "doc"? }` (a default is used if omitted). Proxies
+/// `mandate.strategy.propose`. Does NOT bypass governance — approval is a
+/// separate explicit step.
+pub async fn strategy_propose(
+    State(state): State<AppState>,
+    Path(mandate_id): Path<String>,
+    Json(req): Json<ProposeStrategyRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if mandate_id.trim().is_empty() {
+        return Err(bad("mandate_id required"));
+    }
+    let doc = req
+        .doc
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "Plan and execute this Mandate.".to_string());
+    if doc.contains('|') {
+        return Err(bad("strategy doc must not contain `|`"));
+    }
+    let arg = format!("{}|{doc}", mandate_id.trim());
+    json_passthrough(call_peer(&state, "mandate.strategy.propose", arg.as_bytes()).await?)
+}
+
+/// `POST /v1/spine/mandates/:id/strategy/approve` — approve a proposed
+/// strategy. Proxies `mandate.strategy.approve`.
+pub async fn strategy_approve(
+    State(state): State<AppState>,
+    Path(mandate_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if mandate_id.trim().is_empty() {
+        return Err(bad("mandate_id required"));
+    }
+    json_passthrough(call_peer(&state, "mandate.strategy.approve", mandate_id.trim().as_bytes()).await?)
+}
+
+/// `POST /v1/spine/mandates/:id/strategy/reject` — reject a proposed
+/// strategy. Proxies `mandate.strategy.reject`.
+pub async fn strategy_reject(
+    State(state): State<AppState>,
+    Path(mandate_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if mandate_id.trim().is_empty() {
+        return Err(bad("mandate_id required"));
+    }
+    json_passthrough(call_peer(&state, "mandate.strategy.reject", mandate_id.trim().as_bytes()).await?)
+}
+
 /// Normalise a Clearance decision into the wire value
 /// `coord.approval.decide` expects. Accepts the product verbs
 /// (`approve`/`reject`) and the raw runtime values

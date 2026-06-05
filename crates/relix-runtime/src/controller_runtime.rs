@@ -3202,6 +3202,45 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // PRIME: Mandate strategy gate — propose / approve / reject / status.
+    // These expose the existing strategy store so the dashboard can drive a
+    // Mandate blocked → planned → ready WITHOUT bypassing governance.
+    if let Some(spine) = spine_store.clone() {
+        bridge.register(
+            "mandate.strategy.status",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let spine = spine.clone();
+                async move { handlers::handle_strategy_status(&spine, &ctx) }
+            })),
+        );
+    }
+    if let Some(spine) = spine_store.clone() {
+        bridge.register(
+            "mandate.strategy.propose",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let spine = spine.clone();
+                async move { handlers::handle_strategy_propose(&spine, &ctx) }
+            })),
+        );
+    }
+    if let Some(spine) = spine_store.clone() {
+        bridge.register(
+            "mandate.strategy.approve",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let spine = spine.clone();
+                async move { handlers::handle_strategy_approve(&spine, &ctx) }
+            })),
+        );
+    }
+    if let Some(spine) = spine_store.clone() {
+        bridge.register(
+            "mandate.strategy.reject",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let spine = spine.clone();
+                async move { handlers::handle_strategy_reject(&spine, &ctx) }
+            })),
+        );
+    }
     // PRIME: live team readiness (plan + current hire/Clearance states).
     if let Some(spine) = spine_store.clone() {
         let s = agent_store.clone();

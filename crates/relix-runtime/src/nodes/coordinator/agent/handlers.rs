@@ -569,6 +569,112 @@ pub fn handle_team_plan_latest(spine_store: &SpineStore, ctx: &InvocationCtx) ->
     }
 }
 
+// ── Mandate strategy gate (propose / approve / reject / status) ──────────
+//
+// The store already enforces the strategy gate (`strategy_approved` is the
+// predicate orchestration checks). These thin capabilities expose it to the
+// dashboard so an operator can drive a Mandate blocked → planned → ready
+// WITHOUT bypassing governance.
+
+/// Build the `{mandate_id, status, approved}` body for a Mandate's strategy.
+fn strategy_status_body(spine_store: &SpineStore, tenant: &str, mandate_id: &str) -> HandlerOutcome {
+    match spine_store.strategy_status(tenant, mandate_id) {
+        Ok(status) => {
+            let approved = status.as_deref() == Some("approved");
+            let body = serde_json::json!({
+                "mandate_id": mandate_id,
+                "status": status,
+                "approved": approved,
+            });
+            match serde_json::to_vec(&body) {
+                Ok(b) => HandlerOutcome::Ok(b),
+                Err(e) => internal(format!("mandate.strategy: encode: {e}")),
+            }
+        }
+        Err(SpineStoreError::BadInput(m)) | Err(SpineStoreError::NotFound(m)) => {
+            invalid(format!("mandate.strategy: {m}"))
+        }
+        Err(e) => internal(format!("mandate.strategy: {e}")),
+    }
+}
+
+/// `mandate.strategy.status` — the strategy status
+/// (`proposed`/`approved`/`rejected`/`null`). Arg: `mandate_id`. Tenant-scoped.
+pub fn handle_strategy_status(spine_store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let mandate_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("mandate.strategy.status utf8: {e}")),
+    };
+    if mandate_id.is_empty() {
+        return invalid("mandate.strategy.status: mandate_id required".into());
+    }
+    strategy_status_body(spine_store, ctx.tenant_id_or_default(), mandate_id)
+}
+
+/// `mandate.strategy.propose` — set/replace the strategy to `proposed`.
+/// Arg: `mandate_id|doc`. Tenant-scoped.
+pub fn handle_strategy_propose(spine_store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("mandate.strategy.propose utf8: {e}")),
+    };
+    let mut parts = raw.splitn(2, '|');
+    let mandate_id = parts.next().unwrap_or("").trim();
+    let doc = parts.next().unwrap_or("").trim();
+    if mandate_id.is_empty() {
+        return invalid("mandate.strategy.propose: mandate_id required".into());
+    }
+    if doc.is_empty() {
+        return invalid("mandate.strategy.propose: strategy doc required".into());
+    }
+    let tenant = ctx.tenant_id_or_default();
+    match spine_store.propose_strategy(tenant, mandate_id, doc) {
+        Ok(()) => strategy_status_body(spine_store, tenant, mandate_id),
+        Err(SpineStoreError::BadInput(m)) | Err(SpineStoreError::NotFound(m)) => {
+            invalid(format!("mandate.strategy.propose: {m}"))
+        }
+        Err(e) => internal(format!("mandate.strategy.propose: {e}")),
+    }
+}
+
+/// `mandate.strategy.approve` — approve a proposed strategy. Arg: `mandate_id`.
+pub fn handle_strategy_approve(spine_store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let mandate_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("mandate.strategy.approve utf8: {e}")),
+    };
+    if mandate_id.is_empty() {
+        return invalid("mandate.strategy.approve: mandate_id required".into());
+    }
+    let tenant = ctx.tenant_id_or_default();
+    match spine_store.approve_strategy(tenant, mandate_id) {
+        Ok(()) => strategy_status_body(spine_store, tenant, mandate_id),
+        Err(SpineStoreError::BadInput(m)) | Err(SpineStoreError::NotFound(m)) => {
+            invalid(format!("mandate.strategy.approve: {m}"))
+        }
+        Err(e) => internal(format!("mandate.strategy.approve: {e}")),
+    }
+}
+
+/// `mandate.strategy.reject` — reject a proposed strategy. Arg: `mandate_id`.
+pub fn handle_strategy_reject(spine_store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let mandate_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("mandate.strategy.reject utf8: {e}")),
+    };
+    if mandate_id.is_empty() {
+        return invalid("mandate.strategy.reject: mandate_id required".into());
+    }
+    let tenant = ctx.tenant_id_or_default();
+    match spine_store.reject_strategy(tenant, mandate_id) {
+        Ok(()) => strategy_status_body(spine_store, tenant, mandate_id),
+        Err(SpineStoreError::BadInput(m)) | Err(SpineStoreError::NotFound(m)) => {
+            invalid(format!("mandate.strategy.reject: {m}"))
+        }
+        Err(e) => internal(format!("mandate.strategy.reject: {e}")),
+    }
+}
+
 /// `mandate.team_readiness` — a live summary of how staffed a Mandate
 /// is, combining the latest persisted Team Plan with the *current*
 /// state of its hires and Clearances. Arg: `mandate_id`. Tenant-scoped.
@@ -3372,6 +3478,73 @@ mod tests {
             .unwrap();
         spine.approve_strategy("default", &m).unwrap();
         m
+    }
+
+    fn json(o: HandlerOutcome) -> serde_json::Value {
+        serde_json::from_str(&ok_body(o)).unwrap()
+    }
+
+    #[test]
+    fn strategy_capability_drives_propose_then_approve() {
+        let spine = SpineStore::in_memory().unwrap();
+        let m = spine
+            .create_mandate("default", "Login page", "wire to auth", None, None)
+            .unwrap();
+        // No strategy yet → status null, not approved.
+        let v = json(handle_strategy_status(&spine, &fake_ctx(m.as_bytes())));
+        assert_eq!(v["status"], serde_json::Value::Null);
+        assert_eq!(v["approved"], false);
+        // Propose → proposed (NOT approved — governance unchanged).
+        let v = json(handle_strategy_propose(
+            &spine,
+            &fake_ctx(format!("{m}|hire planner; build login").as_bytes()),
+        ));
+        assert_eq!(v["status"], "proposed");
+        assert_eq!(v["approved"], false);
+        assert!(!spine.strategy_approved("default", &m).unwrap());
+        // Approve → approved (the gate the orchestrator checks).
+        let v = json(handle_strategy_approve(&spine, &fake_ctx(m.as_bytes())));
+        assert_eq!(v["status"], "approved");
+        assert_eq!(v["approved"], true);
+        assert!(spine.strategy_approved("default", &m).unwrap());
+    }
+
+    #[test]
+    fn strategy_capability_reject_blocks_approval() {
+        let spine = SpineStore::in_memory().unwrap();
+        let m = spine.create_mandate("default", "X", "y", None, None).unwrap();
+        handle_strategy_propose(&spine, &fake_ctx(format!("{m}|plan").as_bytes()));
+        let v = json(handle_strategy_reject(&spine, &fake_ctx(m.as_bytes())));
+        assert_eq!(v["status"], "rejected");
+        assert!(!spine.strategy_approved("default", &m).unwrap());
+    }
+
+    #[test]
+    fn strategy_propose_requires_doc_and_id() {
+        let spine = SpineStore::in_memory().unwrap();
+        let m = spine.create_mandate("default", "X", "y", None, None).unwrap();
+        // Empty doc + empty mandate id are both INVALID_ARGS.
+        assert_eq!(
+            err_kind(handle_strategy_propose(&spine, &fake_ctx(format!("{m}|").as_bytes()))),
+            error_kinds::INVALID_ARGS
+        );
+        assert_eq!(
+            err_kind(handle_strategy_status(&spine, &fake_ctx(b""))),
+            error_kinds::INVALID_ARGS
+        );
+    }
+
+    #[test]
+    fn strategy_capability_is_tenant_scoped() {
+        let spine = SpineStore::in_memory().unwrap();
+        let m = spine.create_mandate("tenant-a", "X", "y", None, None).unwrap();
+        // A different tenant cannot propose on tenant-a's Mandate.
+        let kind = err_kind(handle_strategy_propose(
+            &spine,
+            &fake_ctx_tenant(format!("{m}|sneak").as_bytes(), "tenant-b"),
+        ));
+        assert_eq!(kind, error_kinds::INVALID_ARGS);
+        assert!(!spine.strategy_approved("tenant-a", &m).unwrap());
     }
 
     #[test]

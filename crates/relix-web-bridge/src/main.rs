@@ -633,6 +633,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/spine/mandates/:id/orchestration/latest",
             get(spine::orchestration_latest),
         )
+        .route("/v1/spine/mandates/:id/strategy", get(spine::strategy_status))
+        .route("/v1/spine/mandates/:id/strategy/propose", post(spine::strategy_propose))
+        .route("/v1/spine/mandates/:id/strategy/approve", post(spine::strategy_approve))
+        .route("/v1/spine/mandates/:id/strategy/reject", post(spine::strategy_reject))
         .route("/v1/spine/briefs/search", get(spine::brief_search))
         .route("/v1/spine/briefs/:id", get(spine::brief_detail))
         .route("/v1/spine/briefs/:id/wakeups", get(spine::brief_wakeups))

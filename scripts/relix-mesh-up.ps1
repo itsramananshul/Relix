@@ -1429,6 +1429,22 @@ name = "spine_mandate_team_readiness"
 method = "mandate.team_readiness"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_mandate_strategy_status"
+method = "mandate.strategy.status"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_mandate_strategy_propose"
+method = "mandate.strategy.propose"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_mandate_strategy_approve"
+method = "mandate.strategy.approve"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_mandate_strategy_reject"
+method = "mandate.strategy.reject"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_rig_list"
 method = "rig.list"
 allow_groups = ["chat-users"]
