@@ -279,6 +279,12 @@ signed audit record**. No bypass switch.
   It rewrites only the admin credential (`~/.relix/dashboard-admin.json`),
   prints a fresh password, and is **local-only**: there is no
   remote/unauthenticated reset.
+- **Maintenance & storage.** Settings → *Maintenance & storage* (or
+  `GET /v1/maintenance/summary`) shows run-workspace disk usage + run/log
+  counts + warnings. Prune old run workspaces safely with a dry-run preview
+  (`POST /v1/maintenance/prune`, dry-run by default — never touches the repo
+  or a running run). Back up local state with
+  `scripts/relix-local-backup.ps1` / `.sh`. See `docs/operations.md`.
 
 ## Security model
 
