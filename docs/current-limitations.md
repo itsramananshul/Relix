@@ -40,6 +40,34 @@ what, the chronicle of how it went, and the pointer to where the
 per-flow event log lives. Retry decisions are operator-driven via
 `relix-cli task retry`.
 
+### Run-workspace review/apply is inspect-and-copy, not a full VCS workflow
+
+A Brief Shift (run) executes in a scoped sandbox workspace and its
+changed files can be **inspected** (changed-file list, secret-redacted
+text preview, bounded unified diff), **reviewed** (accept/reject),
+**applied** back into the configured project root, or **discarded**. What
+it does **not** do:
+
+- **Diff needs an intact baseline.** The unified diff
+  (`/v1/runs/:id/artifacts/:aid/diff`) reconstructs the "before" side from
+  the live project-root file and only when it still hashes to the run's
+  recorded baseline. If the project file changed since the run, or the run
+  used the `empty` workspace context (no project copy), the diff is
+  honestly reported unavailable and you fall back to the file preview.
+- **Preview/diff are byte-capped** (64 KiB): a very large changed file is
+  truncated, not paged.
+- **Apply is whole-run, all-or-nothing.** There is no per-file or partial
+  apply and no `force`; if *any* file is unsafe or conflicted the whole
+  apply is refused. Conflict resolution is operator-driven (re-run, or fix
+  the project and retry) — there is no three-way merge.
+- **Discard does not free disk immediately.** It marks the run discarded
+  (and non-applyable) and leaves the sandbox for the storage prune /
+  scheduled autoprune to reclaim; it never deletes a `running`
+  workspace. Disk is reclaimed by `maintenance.prune` (dry-run first), not
+  synchronously.
+- **`git_worktree` / `git_checkout` workspace context is deferred** — only
+  `empty` and the capped/filtered `copy_repo` snapshot ship today.
+
 ### Bridge persists every chat as a Task (fail-soft)
 
 (Formerly a documented gap; **closed** in commit `<pending>`.)
