@@ -1350,8 +1350,20 @@ name = "spine_mandate_orchestrate"
 method = "mandate.orchestrate"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_mandate_orchestration_latest"
+method = "mandate.orchestration.latest"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_mandate_orchestration_list"
+method = "mandate.orchestration.list"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_mandate_team_plan"
 method = "mandate.team_plan"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_mandate_team_plan_latest"
+method = "mandate.team_plan.latest"
 allow_groups = ["chat-users"]
 [[rules]]
 name = "spine_mandate_team_readiness"
