@@ -27,6 +27,10 @@ interface RunConfig {
   inherit?: boolean;
   heartbeat_enabled?: boolean;
 }
+interface MaintSummary {
+  workspace?: { count?: number; total_bytes?: number };
+  warnings?: { level?: string; message?: string }[];
+}
 
 const COLUMNS = ["backlog", "todo", "in_progress", "in_review", "done"];
 const RUN_TONE: Record<string, string> = {
@@ -46,7 +50,7 @@ interface Warn {
 
 export function Overview() {
   const { data, loading } = useAsync(async () => {
-    const [board, inbox, roster, company, adapters, runs, runCfg, events] = await Promise.all([
+    const [board, inbox, roster, company, adapters, runs, runCfg, maint, events] = await Promise.all([
       tryGet<BoardSummary>("/v1/spine/board", {}),
       tryGet<Inbox>("/v1/spine/inbox?limit=50", {}),
       tryGet<Roster>("/v1/spine/roster", {}),
@@ -54,6 +58,7 @@ export function Overview() {
       tryGet<Adapter[]>("/v1/adapters", []),
       tryGet<RunRow[]>("/v1/runs", []),
       tryGet<RunConfig>("/v1/spine/run-config", {}),
+      tryGet<MaintSummary | null>("/v1/maintenance/summary", null),
       tryGet<unknown>("/v1/tasks/events/recent?limit=10", {}),
     ]);
     return {
@@ -64,6 +69,7 @@ export function Overview() {
       adapters: Array.isArray(adapters) ? adapters : [],
       runs: Array.isArray(runs) ? runs : [],
       runCfg: runCfg ?? {},
+      maint: maint ?? null,
       events: extractList<EventRow>(events),
     };
   }, []);
@@ -124,6 +130,17 @@ export function Overview() {
     }
     if (runCfg.context === "copy_repo" && !runCfg.project_root) {
       warnings.push({ tone: "err", msg: "copy_repo context is set but no project root is configured — set RELIX_RUN_PROJECT_ROOT.", to: "/settings", cta: "Review runtime" });
+    }
+    // Storage/maintenance warnings (dedupe inherit/project-root already above).
+    const maint = data?.maint ?? null;
+    if (maint) {
+      for (const w of maint.warnings ?? []) {
+        const m = w.message ?? "";
+        if (/inherit|project root/i.test(m)) continue;
+        warnings.push({ tone: w.level === "error" ? "err" : "info", msg: m, to: "/settings", cta: "Maintenance" });
+      }
+    } else {
+      warnings.push({ tone: "info", msg: "Maintenance summary unavailable — storage usage can't be checked right now.", to: "/settings", cta: "Settings" });
     }
   }
 

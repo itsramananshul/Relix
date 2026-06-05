@@ -1,6 +1,7 @@
 import { tryGet } from "../api";
 import { useAuth } from "../auth";
 import { asArray, Empty, useAsync } from "../components/common";
+import { MaintenancePanel } from "../components/MaintenancePanel";
 
 interface Provider { name?: string; id?: string; configured?: boolean; enabled?: boolean; model?: string }
 interface Adapter {
@@ -64,6 +65,8 @@ export function Settings() {
 
   return (
     <div className="grid cols-2">
+      <MaintenancePanel />
+
       <div className="card">
         <h3>Account</h3>
         <div className="row" style={{ marginBottom: 10 }}>
