@@ -73,20 +73,53 @@ pub struct BriefCard {
     pub campaign_id: Option<String>,
 }
 
+/// The current Claim (lease) holder on a Brief — the Operative that
+/// has checked it out for a run, with the lease expiry (unix secs).
+/// `None` on the Brief detail when no live Claim is held.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimInfo {
+    pub agent_id: String,
+    pub expires_at: i64,
+}
+
+/// One Chronicle event in the Brief detail's recent-events tail.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChronicleEntry {
+    pub event_id: i64,
+    pub ts: i64,
+    pub event_type: String,
+    pub payload: String,
+}
+
+/// A compact Chronicle summary embedded in the Brief detail: the
+/// total event count plus the newest few entries. The full,
+/// paginated timeline stays on `GET /v1/spine/briefs/:id/events`
+/// (and the live thread on `…/thread`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChronicleSummary {
+    /// Total Chronicle events recorded on this Brief.
+    pub total: i64,
+    /// The newest `recent` entries (newest first), bounded.
+    pub recent: Vec<ChronicleEntry>,
+}
+
 /// The full detail view of a Brief, assembled in one read: its
-/// spine fields, both directions of its relation graph, its
-/// Dossiers, and whether it's currently blocked. Saves the detail
-/// pane a fan-out of separate calls.
+/// spine fields, title, both directions of its relation graph (each
+/// tenant-filtered), its Dossiers, labels, due/pinned, blocked flag,
+/// the current Claim holder, a wakeup count, and a Chronicle summary.
+/// Saves the detail pane a fan-out of separate calls.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BriefDetail {
+    /// The Brief's human-facing title.
+    pub title: String,
     pub fields: BriefFields,
-    /// Downstream: the Sub-briefs spawned from this Brief.
+    /// Downstream: the Sub-briefs spawned from this Brief (same Guild only).
     pub subbriefs: Vec<String>,
-    /// Downstream: the Snags (blockers) on this Brief.
+    /// Downstream: the Snags (blockers) on this Brief (same Guild only).
     pub snags: Vec<String>,
-    /// Upstream: the Briefs this Brief blocks (who waits on it).
+    /// Upstream: the Briefs this Brief blocks (who waits on it; same Guild).
     pub blocking: Vec<String>,
-    /// Upstream: the parent Briefs that spawned this as a Sub-brief.
+    /// Upstream: the parent Briefs that spawned this as a Sub-brief (same Guild).
     pub parents: Vec<String>,
     pub dossiers: Vec<DossierMeta>,
     /// The Brief's free-form labels.
@@ -97,6 +130,12 @@ pub struct BriefDetail {
     pub due_at: Option<i64>,
     /// True when at least one Snag's blocker isn't `done`.
     pub blocked: bool,
+    /// The current Claim/lease holder, if one is live.
+    pub claim: Option<ClaimInfo>,
+    /// How many wakeup-ledger rows this Brief has (full ledger on `…/wakeups`).
+    pub wakeup_count: i64,
+    /// Total Chronicle events + the newest few (full timeline on `…/events`).
+    pub chronicle: ChronicleSummary,
 }
 
 /// The board columns a Brief can sit in.

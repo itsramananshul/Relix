@@ -1034,6 +1034,37 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// GROUP 6 (tenant isolation): forward-edge read that filters the
+    /// related (`related_task_id`) side to `tenant`'s Guild via a JOIN on
+    /// `tasks`, so a Brief's Sub-briefs / Snags can never leak a cross-Guild
+    /// related Brief id even if a legacy edge crosses tenants.
+    fn list_brief_edges_for_tenant(
+        &self,
+        task_id: &str,
+        edge_type: &str,
+        tenant: &str,
+    ) -> Result<Vec<String>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.related_task_id FROM task_edges e
+                 JOIN tasks t ON t.task_id = e.related_task_id
+                 WHERE e.task_id = ?1 AND e.edge_type = ?2
+                   AND e.related_task_id IS NOT NULL
+                   AND COALESCE(t.tenant_id, 'default') = ?3
+                 ORDER BY e.edge_id ASC",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows: Vec<String> = stmt
+            .query_map(params![task_id, edge_type, norm_tenant(tenant)], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
     /// Shared *reverse* edge lookup: the task_ids that point AT
     /// `target` via `edge_type` (WHERE related_task_id = target).
     fn list_reverse_edges(
@@ -1126,20 +1157,115 @@ impl TaskStore {
     /// Each sub-read locks independently (no nested lock), so this is
     /// a convenience composite, not a single transaction.
     pub fn brief_detail(&self, task: &str) -> Result<Option<brief::BriefDetail>, CoordinatorError> {
+        // Resolve the Brief's OWN Guild so the relation graph is filtered to
+        // that Guild even on this (non-tenant-arg) internal read — a
+        // cross-Guild related id never leaks regardless of caller.
+        let Some(own) = self.task_tenant(task)? else {
+            return Ok(None);
+        };
+        self.assemble_brief_detail(task, &own)
+    }
+
+    /// The Brief's own Guild/tenant (`COALESCE(tenant_id,'default')`), or
+    /// `None` when the Brief doesn't exist.
+    fn task_tenant(&self, task: &str) -> Result<Option<String>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        conn.query_row(
+            "SELECT COALESCE(tenant_id, 'default') FROM tasks WHERE task_id = ?1",
+            params![task],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(CoordinatorError::Db)
+    }
+
+    /// The Brief's title, or `None` when the Brief doesn't exist.
+    fn brief_title(&self, task: &str) -> Result<Option<String>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        conn.query_row(
+            "SELECT title FROM tasks WHERE task_id = ?1",
+            params![task],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(CoordinatorError::Db)
+    }
+
+    /// Total Chronicle (`task_events`) rows for a Brief.
+    fn brief_event_count(&self, task: &str) -> Result<i64, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?1",
+            params![task],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(CoordinatorError::Db)
+    }
+
+    /// Total wakeup-ledger rows for a Brief (full ledger via
+    /// [`Self::list_brief_wakeups`]).
+    fn brief_wakeup_count(&self, task: &str) -> Result<i64, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM brief_wakeup_requests WHERE task_id = ?1",
+            params![task],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(CoordinatorError::Db)
+    }
+
+    /// Assemble the full Brief detail for a Brief KNOWN to belong to
+    /// `tenant`. Every relation read is filtered to `tenant`'s Guild so the
+    /// view can never leak a cross-Guild parent / Sub-brief / blocker /
+    /// blocking Brief. `None` only when the Brief row vanished mid-read.
+    fn assemble_brief_detail(
+        &self,
+        task: &str,
+        tenant: &str,
+    ) -> Result<Option<brief::BriefDetail>, CoordinatorError> {
         let Some(fields) = self.brief_fields(task)? else {
             return Ok(None);
         };
+        let t = norm_tenant(tenant);
+        // Recent Chronicle tail (newest-first), plus the total count.
+        let recent: Vec<brief::ChronicleEntry> = self
+            .query_events(task, 0, 5, None, EventOrder::Desc)?
+            .into_iter()
+            .map(|e| brief::ChronicleEntry {
+                event_id: e.event_id,
+                ts: e.ts,
+                event_type: e.event_type,
+                payload: e.payload,
+            })
+            .collect();
+        let chronicle = brief::ChronicleSummary {
+            total: self.brief_event_count(task)?,
+            recent,
+        };
+        let claim = self
+            .claim_holder(task)?
+            .map(|(agent_id, expires_at)| brief::ClaimInfo {
+                agent_id,
+                expires_at,
+            });
         Ok(Some(brief::BriefDetail {
+            title: self.brief_title(task)?.unwrap_or_default(),
             fields,
-            subbriefs: self.list_subbriefs(task)?,
-            snags: self.list_snags(task)?,
-            blocking: self.list_blocking(task)?,
-            parents: self.parent_briefs(task)?,
+            // Forward + reverse relations, each filtered to the Brief's Guild.
+            subbriefs: self.list_brief_edges_for_tenant(task, "spawned", t)?,
+            snags: self.list_brief_edges_for_tenant(task, "blocked_on", t)?,
+            blocking: self.list_blocking_for_tenant(task, t)?,
+            parents: self.parent_briefs_for_tenant(task, t)?,
+            // Dossiers belong to this Brief's own Task row — already
+            // tenant-scoped by the existence check above.
             dossiers: self.list_dossiers(task)?,
             labels: self.brief_labels(task)?,
             pinned: self.brief_pinned(task)?,
             due_at: self.brief_due(task)?,
             blocked: self.is_blocked(task)?,
+            claim,
+            wakeup_count: self.brief_wakeup_count(task)?,
+            chronicle,
         }))
     }
 
@@ -1171,7 +1297,7 @@ impl TaskStore {
         if !self.task_in_tenant(task, tenant)? {
             return Ok(None);
         }
-        self.brief_detail(task)
+        self.assemble_brief_detail(task, tenant)
     }
 
     /// PHASE 1 (Brief): attach a **Dossier** (durable artifact) to
@@ -15582,6 +15708,7 @@ mod tests {
         s.set_brief_labels(&task, &["bug", "urgent"]).unwrap();
 
         let d = s.brief_detail(&task).unwrap().unwrap();
+        assert_eq!(d.title, "task");
         assert_eq!(d.fields.assignee_agent_id.as_deref(), Some("agt_a"));
         assert_eq!(d.subbriefs, vec![child]);
         assert_eq!(d.snags, vec![blocker]);
@@ -15592,9 +15719,52 @@ mod tests {
         assert!(!d.pinned);
         assert_eq!(d.due_at, None);
         assert!(d.blocked, "blocker isn't done → task is blocked");
+        // New sections: no live Claim, no wakeups, and a non-empty Chronicle
+        // (the brief edits above emitted events).
+        assert!(d.claim.is_none());
+        assert_eq!(d.wakeup_count, 0);
+        assert!(d.chronicle.total > 0, "edits should have chronicled events");
+        assert!(!d.chronicle.recent.is_empty(), "recent chronicle tail present");
+        assert!(d.chronicle.recent.len() <= 5, "recent tail is bounded");
 
         // Unknown Brief → None.
         assert!(s.brief_detail("nope").unwrap().is_none());
+    }
+
+    /// Tenant isolation in the Brief detail: a cross-Guild relationship
+    /// (a parent / Sub-brief / blocker / blocking Brief in ANOTHER tenant)
+    /// is filtered out of the detail, and a cross-tenant or missing read is
+    /// not-found (no existence leak).
+    #[test]
+    fn brief_detail_filters_cross_tenant_relationships() {
+        let s = store();
+        // `a` lives in Guild acme; relate it to Briefs in Guild globex.
+        let a = s
+            .create_brief("acme", "acme brief", "subj", None, None, None, None)
+            .unwrap();
+        let foreign_child = s
+            .create_brief("globex", "globex child", "subj", None, None, None, None)
+            .unwrap();
+        let foreign_blocker = s
+            .create_brief("globex", "globex blocker", "subj", None, None, None, None)
+            .unwrap();
+        // Same-Guild relations that MUST survive the filter.
+        let local_child = s
+            .create_brief("acme", "acme child", "subj", None, None, None, None)
+            .unwrap();
+        s.link_subbrief(&a, &foreign_child).unwrap();
+        s.link_subbrief(&a, &local_child).unwrap();
+        s.add_snag(&a, &foreign_blocker).unwrap();
+
+        // Detail scoped to acme: foreign relations filtered, local kept.
+        let d = s.brief_detail_for_tenant(&a, "acme").unwrap().unwrap();
+        assert_eq!(d.subbriefs, vec![local_child], "cross-tenant Sub-brief filtered");
+        assert!(d.snags.is_empty(), "cross-tenant Snag filtered");
+
+        // Cross-tenant read of `a` from globex → not-found (no leak).
+        assert!(s.brief_detail_for_tenant(&a, "globex").unwrap().is_none());
+        // Missing Brief → not-found.
+        assert!(s.brief_detail_for_tenant("nope", "acme").unwrap().is_none());
     }
 
     #[test]
