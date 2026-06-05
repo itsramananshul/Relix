@@ -9727,6 +9727,19 @@ fn register_node_type_handlers(
                                 warnings.push(serde_json::json!({"level":"error","message":
                                     "copy_repo context is set but the project root does not exist"}));
                             }
+                            // Scheduled-cleanup config + the most recent prune.
+                            let autoprune = mnt::resolve_autoprune_config();
+                            if autoprune.enabled && !autoprune.dry_run && autoprune.delete_workspaces {
+                                warnings.push(serde_json::json!({"level":"warn","message":
+                                    format!("scheduled cleanup is enabled in REAL-DELETE mode (every {}h, older than {}d, keep {}) — old workspaces are removed automatically", autoprune.interval_secs / 3600, autoprune.older_than_days, autoprune.keep_latest)}));
+                            }
+                            let last_prune = st.list_maintenance_audit(1).ok().and_then(|v| v.into_iter().next());
+                            if let Some(lp) = &last_prune {
+                                if lp.status == "refused" || lp.status == "failed" {
+                                    warnings.push(serde_json::json!({"level":"error","message":
+                                        format!("the last cleanup ({}) {}: {}", lp.trigger, lp.status, lp.note.clone().unwrap_or_default())}));
+                                }
+                            }
                             let body = serde_json::json!({
                                 "workspace": {
                                     "root": scan.root,
@@ -9748,6 +9761,8 @@ fn register_node_type_handlers(
                                     "default_older_than_days": mnt::DEFAULT_PRUNE_OLDER_THAN_DAYS,
                                     "default_keep_latest": mnt::DEFAULT_PRUNE_KEEP_LATEST,
                                 },
+                                "autoprune": autoprune,
+                                "last_prune": last_prune,
                                 "warnings": warnings,
                             });
                             match serde_json::to_vec(&body) {
@@ -9817,57 +9832,45 @@ fn register_node_type_handlers(
                             let delete_artifacts =
                                 v.get("delete_artifacts").and_then(|x| x.as_bool()).unwrap_or(false);
 
-                            let root = st.run_workspace_root().to_path_buf();
-                            let scan = mnt::scan_run_workspaces(&root);
-                            let running = st.running_run_ids().unwrap_or_default();
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs() as i64)
-                                .unwrap_or(0);
-                            let policy = mnt::PrunePolicy {
+                            // Run the prune through the SHARED engine, which
+                            // records a durable audit row for EVERY attempt
+                            // (dry-run / refusal / failure / success).
+                            let outcome = match mnt::execute_prune(
+                                &st,
+                                "manual",
                                 older_than_days,
                                 keep_latest,
                                 delete_workspaces,
-                            };
-                            let report = match mnt::prune_run_workspaces(
-                                &root, now, &scan, &running, &policy, dry_run,
+                                delete_events,
+                                delete_artifacts,
+                                dry_run,
                             ) {
-                                Ok(r) => r,
+                                Ok(o) => o,
                                 Err(e) => return invalid(format!("maintenance.prune refused: {e}")),
                             };
-                            // Optionally prune the verbose log rows of the
-                            // workspaces selected for deletion (never the
-                            // ledger row). Only on a real run.
-                            let (events_deleted, artifacts_deleted) =
-                                if !dry_run && (delete_events || delete_artifacts) {
-                                    let ids: Vec<String> =
-                                        report.to_delete.iter().map(|i| i.run_id.clone()).collect();
-                                    st.prune_run_logs(&ids, delete_events, delete_artifacts)
-                                        .unwrap_or((0, 0))
-                                } else {
-                                    (0, 0)
-                                };
-                            // Operator audit via the tracing log (durable
-                            // maintenance ledger is future work).
                             if dry_run {
                                 tracing::info!(
-                                    candidates = report.to_delete.len(),
-                                    bytes = report.to_delete_bytes,
+                                    candidates = outcome.report.to_delete.len(),
+                                    bytes = outcome.report.to_delete_bytes,
+                                    audit_id = outcome.audit_id,
                                     "maintenance.prune dry-run"
                                 );
                             } else {
                                 tracing::warn!(
-                                    deleted_workspaces = report.deleted_workspaces,
-                                    deleted_bytes = report.deleted_bytes,
-                                    events_deleted,
-                                    artifacts_deleted,
+                                    deleted_workspaces = outcome.report.deleted_workspaces,
+                                    deleted_bytes = outcome.report.deleted_bytes,
+                                    events_deleted = outcome.events_deleted,
+                                    artifacts_deleted = outcome.artifacts_deleted,
+                                    audit_id = outcome.audit_id,
                                     "maintenance.prune executed"
                                 );
                             }
-                            let mut body = serde_json::to_value(&report).unwrap_or(serde_json::json!({}));
+                            let mut body =
+                                serde_json::to_value(&outcome.report).unwrap_or(serde_json::json!({}));
                             if let Some(obj) = body.as_object_mut() {
-                                obj.insert("events_deleted".into(), serde_json::json!(events_deleted));
-                                obj.insert("artifacts_deleted".into(), serde_json::json!(artifacts_deleted));
+                                obj.insert("events_deleted".into(), serde_json::json!(outcome.events_deleted));
+                                obj.insert("artifacts_deleted".into(), serde_json::json!(outcome.artifacts_deleted));
+                                obj.insert("audit_id".into(), serde_json::json!(outcome.audit_id));
                             }
                             match serde_json::to_vec(&body) {
                                 Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
@@ -9877,6 +9880,93 @@ fn register_node_type_handlers(
                     },
                 )),
             );
+        }
+        {
+            // `maintenance.audit` — recent maintenance-audit rows, newest
+            // first (`GET /v1/maintenance/audit?limit=N`). Arg = the limit
+            // (defaults to 50). Auth-gated by the bridge middleware.
+            let st = store.clone();
+            bridge.register(
+                "maintenance.audit",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            let limit = String::from_utf8_lossy(&ctx.args)
+                                .trim()
+                                .parse::<i64>()
+                                .unwrap_or(50);
+                            match st.list_maintenance_audit(limit) {
+                                Ok(rows) => match serde_json::to_vec(&rows) {
+                                    Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                    Err(e) => crate::dispatch::HandlerOutcome::Err(
+                                        relix_core::types::ErrorEnvelope {
+                                            kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                            cause: format!("maintenance.audit encode: {e}"),
+                                            retry_hint: 1,
+                                            retry_after: None,
+                                        },
+                                    ),
+                                },
+                                Err(e) => crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                        cause: format!("maintenance.audit: {e}"),
+                                        retry_hint: 1,
+                                        retry_after: None,
+                                    },
+                                ),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
+        // Scheduled cleanup loop (opt-in): when
+        // `RELIX_MAINTENANCE_AUTOPRUNE_ENABLED` is set, a timer periodically
+        // runs `maintenance::autoprune_tick` (trigger `scheduled`), which
+        // honors the same safety rules as the manual prune and records an
+        // audit row every tick. DRY-RUN by default — a real delete needs
+        // `RELIX_MAINTENANCE_AUTOPRUNE_DRY_RUN=false`.
+        {
+            let autoprune = crate::nodes::coordinator::maintenance::resolve_autoprune_config();
+            if autoprune.enabled {
+                let task_store = store.clone();
+                let interval_secs = autoprune.interval_secs;
+                tokio::spawn(async move {
+                    let mut ticker =
+                        tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                    // Skip the immediate first tick so boot isn't a prune.
+                    ticker.tick().await;
+                    loop {
+                        ticker.tick().await;
+                        let ts = task_store.clone();
+                        let outcome = tokio::task::spawn_blocking(move || {
+                            crate::nodes::coordinator::maintenance::autoprune_tick(&ts)
+                        })
+                        .await;
+                        match outcome {
+                            Ok(Ok(Some(o))) => tracing::info!(
+                                dry_run = o.report.dry_run,
+                                deleted = o.report.deleted_workspaces,
+                                bytes = o.report.deleted_bytes,
+                                audit_id = o.audit_id,
+                                "maintenance: scheduled autoprune tick"
+                            ),
+                            Ok(Ok(None)) => {}
+                            Ok(Err(e)) => tracing::warn!(error = %e, "maintenance: autoprune refused"),
+                            Err(e) => tracing::error!(error = %e, "maintenance: autoprune join error"),
+                        }
+                    }
+                });
+                tracing::info!(
+                    interval_secs = autoprune.interval_secs,
+                    dry_run = autoprune.dry_run,
+                    older_than_days = autoprune.older_than_days,
+                    keep_latest = autoprune.keep_latest,
+                    "coordinator startup: scheduled cleanup loop spawned (RELIX_MAINTENANCE_AUTOPRUNE_ENABLED)"
+                );
+            }
         }
         // PHASE 3 (heartbeat loop): the live dispatch tick. Opt-in
         // via RELIX_HEARTBEAT_ENABLED (off by default so it never

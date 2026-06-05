@@ -673,6 +673,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/runs/:run_id/apply", post(spine::run_apply))
         .route("/v1/maintenance/summary", get(spine::maintenance_summary))
         .route("/v1/maintenance/prune", post(spine::maintenance_prune))
+        .route("/v1/maintenance/audit", get(spine::maintenance_audit))
         .route("/v1/spine/briefs/:id/runs", get(spine::brief_runs))
         // First-run company bootstrap: status read, Crew roster, and the
         // owner-gated "Initialize Company" (create the Founder) action.

@@ -904,6 +904,17 @@ pub async fn maintenance_prune(
     json_passthrough(call_peer(&state, "maintenance.prune", &bytes).await?)
 }
 
+/// `GET /v1/maintenance/audit?limit=N` — recent maintenance-audit rows
+/// (newest first): when cleanup ran, what it deleted, the trigger, and the
+/// status. Auth-gated by the bridge middleware.
+pub async fn maintenance_audit(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    json_passthrough(call_peer(&state, "maintenance.audit", limit.to_string().as_bytes()).await?)
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct CompanyInitRequest {
     #[serde(default)]

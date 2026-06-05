@@ -2802,6 +2802,84 @@ impl TaskStore {
         Ok((ev, ar))
     }
 
+    /// Record one operator-maintenance audit row (every prune ATTEMPT —
+    /// dry-run, refusal, failure, or success). Bounded: trims the oldest
+    /// rows past [`MAX_MAINTENANCE_AUDIT`] and clamps the note/payload so a
+    /// pathological caller can't bloat the DB. Returns the new row id.
+    /// Best-effort: a write failure never fails the prune itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_maintenance_audit(
+        &self,
+        action: &str,
+        trigger: &str,
+        dry_run: bool,
+        workspace_root: Option<&str>,
+        deleted_workspaces: i64,
+        deleted_bytes: i64,
+        pruned_events: i64,
+        pruned_artifacts: i64,
+        status: &str,
+        note: Option<&str>,
+        payload_json: Option<&str>,
+    ) -> Result<i64, CoordinatorError> {
+        let now = unix_secs();
+        let note = note.map(|n| clamp_bytes(n, MAX_RUN_EVENT_FIELD_BYTES));
+        let payload = payload_json.map(|p| clamp_bytes(p, MAX_RUN_EVENT_FIELD_BYTES));
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        conn.execute(
+            "INSERT INTO maintenance_audit
+                 (ts, action, trigger, dry_run, workspace_root, deleted_workspaces,
+                  deleted_bytes, pruned_events, pruned_artifacts, status, note, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                now,
+                action,
+                trigger,
+                i64::from(dry_run),
+                workspace_root,
+                deleted_workspaces,
+                deleted_bytes,
+                pruned_events,
+                pruned_artifacts,
+                status,
+                note,
+                payload,
+            ],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let id = conn.last_insert_rowid();
+        // Trim the oldest rows beyond the cap (keep the table bounded).
+        let _ = conn.execute(
+            "DELETE FROM maintenance_audit WHERE id <= ?1",
+            params![id - MAX_MAINTENANCE_AUDIT],
+        );
+        Ok(id)
+    }
+
+    /// Recent maintenance-audit rows, newest first. `limit` is clamped.
+    pub fn list_maintenance_audit(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<MaintenanceAuditRow>, CoordinatorError> {
+        let limit = limit.clamp(1, MAX_MAINTENANCE_AUDIT);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, ts, action, trigger, dry_run, workspace_root, deleted_workspaces,
+                        deleted_bytes, pruned_events, pruned_artifacts, status, note
+                 FROM maintenance_audit ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![limit], MaintenanceAuditRow::from_row)
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(CoordinatorError::Db)?);
+        }
+        Ok(out)
+    }
+
     /// Recent run records across all Briefs, newest first — the Active
     /// Runs feed. `limit` is clamped to a sane page.
     pub fn list_runs(&self, limit: i64) -> Result<Vec<RunRecord>, CoordinatorError> {
@@ -7646,6 +7724,47 @@ pub struct RunLedgerStats {
     pub applied: i64,
 }
 
+/// Cap on the number of maintenance-audit rows retained (oldest trimmed).
+pub const MAX_MAINTENANCE_AUDIT: i64 = 500;
+
+/// One durable maintenance-audit row (a prune attempt + its outcome).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MaintenanceAuditRow {
+    pub id: i64,
+    pub ts: i64,
+    pub action: String,
+    pub trigger: String,
+    pub dry_run: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+    pub deleted_workspaces: i64,
+    pub deleted_bytes: i64,
+    pub pruned_events: i64,
+    pub pruned_artifacts: i64,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl MaintenanceAuditRow {
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: r.get(0)?,
+            ts: r.get(1)?,
+            action: r.get(2)?,
+            trigger: r.get(3)?,
+            dry_run: r.get::<_, i64>(4)? != 0,
+            workspace_root: r.get(5)?,
+            deleted_workspaces: r.get(6)?,
+            deleted_bytes: r.get(7)?,
+            pruned_events: r.get(8)?,
+            pruned_artifacts: r.get(9)?,
+            status: r.get(10)?,
+            note: r.get(11)?,
+        })
+    }
+}
+
 /// Cap on the number of artifacts recorded per run; beyond it the scan
 /// records a truncation note in the transcript and stops.
 pub const MAX_RUN_ARTIFACTS: usize = 1000;
@@ -12380,6 +12499,28 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         );
         CREATE INDEX IF NOT EXISTS run_events_by_run
             ON run_events(run_id, event_id);
+        -- Durable operator-maintenance audit (the "what cleanup ran + what it
+        -- deleted" ledger). One row per prune ATTEMPT — including dry-runs,
+        -- refusals, and failures — plus optional notes. Bounded (oldest rows
+        -- are trimmed past a cap); `payload_json` is length-clamped + holds
+        -- no secrets. `trigger` is manual / scheduled / system.
+        CREATE TABLE IF NOT EXISTS maintenance_audit (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts               INTEGER NOT NULL,
+            action           TEXT NOT NULL,            -- prune / autoprune_tick / ...
+            trigger          TEXT NOT NULL,            -- manual / scheduled / system
+            dry_run          INTEGER NOT NULL DEFAULT 1,
+            workspace_root   TEXT,
+            deleted_workspaces INTEGER NOT NULL DEFAULT 0,
+            deleted_bytes    INTEGER NOT NULL DEFAULT 0,
+            pruned_events    INTEGER NOT NULL DEFAULT 0,
+            pruned_artifacts INTEGER NOT NULL DEFAULT 0,
+            status           TEXT NOT NULL,            -- ok / refused / failed
+            note             TEXT,
+            payload_json     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS maintenance_audit_recent
+            ON maintenance_audit(id DESC);
         "#,
     )
     .map_err(CoordinatorError::Db)?;

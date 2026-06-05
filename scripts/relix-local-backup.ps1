@@ -25,7 +25,8 @@ param(
     [string]$Source = 'dev-data',
     [string]$OutDir = 'backups',
     [switch]$IncludeWorkspaces,
-    [switch]$IncludeSecrets
+    [switch]$IncludeSecrets,
+    [switch]$ListContents
 )
 
 $ErrorActionPreference = 'Stop'
@@ -74,9 +75,28 @@ Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
 
 $size = (Get-Item $zip).Length
 $mb = [Math]::Round($size / 1MB, 2)
+$zipPath = (Resolve-Path $zip).Path
 Write-Host ""
 Write-Host "Backup written (local only):" -ForegroundColor Green
-Write-Host "  path : $((Resolve-Path $zip).Path)"
+Write-Host "  path : $zipPath"
 Write-Host "  size : $mb MB"
 if (-not $IncludeSecrets)    { Write-Host "  note : secrets (tokens/keys) excluded — pass -IncludeSecrets to include them." -ForegroundColor DarkGray }
 if (-not $IncludeWorkspaces) { Write-Host "  note : run workspaces excluded — pass -IncludeWorkspaces to include them." -ForegroundColor DarkGray }
+
+if ($ListContents) {
+    Write-Host ""
+    Write-Host "Contents:" -ForegroundColor Cyan
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+    try { $archive.Entries | ForEach-Object { Write-Host "  $($_.FullName)" } }
+    finally { $archive.Dispose() }
+}
+
+Write-Host ""
+Write-Host "Restore (local) — stop the mesh first, then expand into place:" -ForegroundColor Cyan
+Write-Host "  .\scripts\relix-mesh-down.ps1"
+Write-Host "  # inspect first:  Expand-Archive '$zipPath' -DestinationPath restore-preview"
+Write-Host "  # then move the restored '$Source' folder back where it belongs, or:"
+Write-Host "  Expand-Archive '$zipPath' -DestinationPath . -Force   # overwrites '$Source' in CWD"
+Write-Host "  .\scripts\relix-mesh-up.ps1"
+Write-Host "Note: this script does NOT auto-restore (destructive) — expand the zip yourself. See docs/operations.md."

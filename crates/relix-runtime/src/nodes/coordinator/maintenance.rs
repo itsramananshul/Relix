@@ -283,6 +283,214 @@ fn delete_one_workspace(root_canon: &Path, run_id: &str) -> Result<(), String> {
     std::fs::remove_dir_all(&target).map_err(|e| format!("remove: {e}"))
 }
 
+// ── Scheduled / autonomous cleanup ──────────────────────────────────────
+
+/// Default scheduled-prune interval — once a day.
+pub const DEFAULT_AUTOPRUNE_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+/// Operator-controlled scheduled cleanup config, resolved from env.
+/// DISABLED by default; even when enabled, DRY-RUN by default so an
+/// operator must explicitly opt into a real delete.
+#[derive(Clone, Debug, Serialize)]
+pub struct AutopruneConfig {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub older_than_days: u64,
+    pub keep_latest: usize,
+    pub delete_workspaces: bool,
+    pub delete_events: bool,
+    pub delete_artifacts: bool,
+    pub dry_run: bool,
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Err(_) => default,
+    }
+}
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// Resolve the scheduled-cleanup config from `RELIX_MAINTENANCE_AUTOPRUNE_*`.
+pub fn resolve_autoprune_config() -> AutopruneConfig {
+    AutopruneConfig {
+        enabled: env_bool("RELIX_MAINTENANCE_AUTOPRUNE_ENABLED", false),
+        interval_secs: env_u64(
+            "RELIX_MAINTENANCE_AUTOPRUNE_INTERVAL_SECS",
+            DEFAULT_AUTOPRUNE_INTERVAL_SECS,
+        )
+        .max(60),
+        older_than_days: env_u64(
+            "RELIX_MAINTENANCE_AUTOPRUNE_OLDER_THAN_DAYS",
+            DEFAULT_PRUNE_OLDER_THAN_DAYS,
+        ),
+        keep_latest: env_u64(
+            "RELIX_MAINTENANCE_AUTOPRUNE_KEEP_LATEST",
+            DEFAULT_PRUNE_KEEP_LATEST as u64,
+        ) as usize,
+        delete_workspaces: env_bool("RELIX_MAINTENANCE_AUTOPRUNE_DELETE_WORKSPACES", true),
+        delete_events: env_bool("RELIX_MAINTENANCE_AUTOPRUNE_DELETE_EVENTS", false),
+        delete_artifacts: env_bool("RELIX_MAINTENANCE_AUTOPRUNE_DELETE_ARTIFACTS", false),
+        // Conservative: even when enabled, default to a dry-run.
+        dry_run: env_bool("RELIX_MAINTENANCE_AUTOPRUNE_DRY_RUN", true),
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The full outcome of a prune executed through the store (the report plus
+/// any log-row deletions, the durable status, and the audit row id).
+#[derive(Clone, Debug)]
+pub struct PruneOutcome {
+    pub report: PruneReport,
+    pub events_deleted: usize,
+    pub artifacts_deleted: usize,
+    pub status: &'static str,
+    pub audit_id: i64,
+}
+
+/// Run a prune against the store's configured workspace root AND record a
+/// durable audit row — for EVERY attempt, including dry-runs, refusals, and
+/// failures. This is the single path both the manual API (`trigger="manual"`)
+/// and scheduled cleanup (`trigger="scheduled"`) go through, so the audit is
+/// always complete. The audit payload carries no secrets and is bounded.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_prune(
+    store: &super::TaskStore,
+    trigger: &str,
+    older_than_days: u64,
+    keep_latest: usize,
+    delete_workspaces: bool,
+    delete_events: bool,
+    delete_artifacts: bool,
+    dry_run: bool,
+) -> Result<PruneOutcome, String> {
+    let root = store.run_workspace_root().to_path_buf();
+    let root_str = root.to_string_lossy().into_owned();
+    let now = now_secs();
+    let scan = scan_run_workspaces(&root);
+    let running = store.running_run_ids().unwrap_or_default();
+    let policy = PrunePolicy {
+        older_than_days,
+        keep_latest,
+        delete_workspaces,
+    };
+    let report = match prune_run_workspaces(&root, now, &scan, &running, &policy, dry_run) {
+        Ok(r) => r,
+        Err(e) => {
+            // A refusal is still audited (status=refused).
+            let _ = store.record_maintenance_audit(
+                "prune",
+                trigger,
+                dry_run,
+                Some(&root_str),
+                0,
+                0,
+                0,
+                0,
+                "refused",
+                Some(&e),
+                None,
+            );
+            return Err(e);
+        }
+    };
+    let (events_deleted, artifacts_deleted) = if !dry_run && (delete_events || delete_artifacts) {
+        let ids: Vec<String> = report.to_delete.iter().map(|i| i.run_id.clone()).collect();
+        store.prune_run_logs(&ids, delete_events, delete_artifacts).unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
+    let status = if report.errors.is_empty() { "ok" } else { "failed" };
+    let note = if dry_run {
+        format!(
+            "dry-run: {} candidate(s), {} bytes",
+            report.to_delete.len(),
+            report.to_delete_bytes
+        )
+    } else if report.errors.is_empty() {
+        format!(
+            "deleted {} workspace(s), {} bytes",
+            report.deleted_workspaces, report.deleted_bytes
+        )
+    } else {
+        format!(
+            "deleted {} of {}, {} error(s)",
+            report.deleted_workspaces,
+            report.to_delete.len(),
+            report.errors.len()
+        )
+    };
+    // Compact, secret-free payload (a sample of the run_ids + the keep tallies).
+    let sample: Vec<&str> = report.to_delete.iter().take(50).map(|i| i.run_id.as_str()).collect();
+    let payload = serde_json::json!({
+        "older_than_days": older_than_days,
+        "keep_latest": keep_latest,
+        "delete_workspaces": delete_workspaces,
+        "delete_events": delete_events,
+        "delete_artifacts": delete_artifacts,
+        "to_delete_total": report.to_delete.len(),
+        "to_delete_sample": sample,
+        "kept_running": report.kept_running,
+        "kept_latest": report.kept_latest,
+        "kept_recent": report.kept_recent,
+    })
+    .to_string();
+    let audit_id = store
+        .record_maintenance_audit(
+            "prune",
+            trigger,
+            dry_run,
+            Some(&report.root),
+            report.deleted_workspaces as i64,
+            report.deleted_bytes as i64,
+            events_deleted as i64,
+            artifacts_deleted as i64,
+            status,
+            Some(&note),
+            Some(&payload),
+        )
+        .unwrap_or(0);
+    Ok(PruneOutcome {
+        report,
+        events_deleted,
+        artifacts_deleted,
+        status,
+        audit_id,
+    })
+}
+
+/// One scheduled-cleanup tick: if autoprune is enabled, run a prune via
+/// [`execute_prune`] (trigger `scheduled`) using the env-resolved policy.
+/// Returns `Ok(None)` when disabled. Safe to call on a timer.
+pub fn autoprune_tick(store: &super::TaskStore) -> Result<Option<PruneOutcome>, String> {
+    let cfg = resolve_autoprune_config();
+    if !cfg.enabled {
+        return Ok(None);
+    }
+    execute_prune(
+        store,
+        "scheduled",
+        cfg.older_than_days,
+        cfg.keep_latest,
+        cfg.delete_workspaces,
+        cfg.delete_events,
+        cfg.delete_artifacts,
+        cfg.dry_run,
+    )
+    .map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,5 +613,94 @@ mod tests {
         assert_eq!(report.deleted_workspaces, 1);
         assert!(!root.join("run_o1").exists(), "oldest removed");
         assert!(root.join("run_o3").exists(), "newest kept");
+    }
+
+    // ── execute_prune + audit + autoprune (store-backed) ──
+
+    fn store_with_root(root: &Path) -> crate::nodes::coordinator::TaskStore {
+        let mut s = crate::nodes::coordinator::TaskStore::in_memory().unwrap();
+        s.set_run_workspace_root(root.to_path_buf());
+        s
+    }
+
+    #[test]
+    fn execute_prune_dry_run_audits_and_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws").join("runs");
+        mkfile(&root.join("run_one").join("x"), 10);
+        let store = store_with_root(&root);
+        // older_than_days=0 makes the fresh dir eligible (cutoff == now).
+        let out = execute_prune(&store, "manual", 0, 0, true, false, false, true).unwrap();
+        assert!(out.report.dry_run);
+        assert_eq!(out.report.to_delete.len(), 1);
+        assert_eq!(out.report.deleted_workspaces, 0, "dry-run deletes nothing");
+        assert!(root.join("run_one").exists());
+        let audit = store.list_maintenance_audit(10).unwrap();
+        assert_eq!(audit.len(), 1, "dry-run is still audited");
+        assert!(audit[0].dry_run);
+        assert_eq!(audit[0].status, "ok");
+        assert_eq!(audit[0].trigger, "manual");
+    }
+
+    #[test]
+    fn execute_prune_real_delete_audits_and_removes_eligible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws").join("runs");
+        mkfile(&root.join("run_a").join("x"), 10);
+        mkfile(&root.join("run_b").join("x"), 10);
+        let store = store_with_root(&root);
+        // keep_latest=1 protects one; the other is deleted.
+        let out = execute_prune(&store, "manual", 0, 1, true, false, false, false).unwrap();
+        assert!(!out.report.dry_run);
+        assert_eq!(out.report.deleted_workspaces, 1);
+        let audit = store.list_maintenance_audit(10).unwrap();
+        assert_eq!(audit.len(), 1);
+        assert!(!audit[0].dry_run);
+        assert_eq!(audit[0].deleted_workspaces, 1);
+        assert_eq!(audit[0].status, "ok");
+    }
+
+    #[test]
+    fn execute_prune_refused_root_audits_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_root(&tmp.path().join("does-not-exist"));
+        let res = execute_prune(&store, "manual", 7, 0, true, false, false, true);
+        assert!(res.is_err(), "a missing root is refused");
+        let audit = store.list_maintenance_audit(10).unwrap();
+        assert_eq!(audit.len(), 1, "a refusal is still audited");
+        assert_eq!(audit[0].status, "refused");
+    }
+
+    #[test]
+    fn audit_rows_are_newest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws").join("runs");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = store_with_root(&root);
+        for _ in 0..3 {
+            execute_prune(&store, "manual", 7, 0, true, false, false, true).unwrap();
+        }
+        let audit = store.list_maintenance_audit(10).unwrap();
+        assert_eq!(audit.len(), 3);
+        assert!(audit[0].id > audit[1].id && audit[1].id > audit[2].id, "newest first");
+    }
+
+    #[test]
+    fn autoprune_config_defaults_disabled_and_dry_run() {
+        // With no env set, scheduled cleanup is OFF and dry-run.
+        let cfg = resolve_autoprune_config();
+        assert!(!cfg.enabled, "disabled by default");
+        assert!(cfg.dry_run, "dry-run by default even if it ran");
+        assert!(cfg.delete_workspaces, "default action when a real run happens");
+    }
+
+    #[test]
+    fn autoprune_tick_disabled_returns_none_and_no_audit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws").join("runs");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = store_with_root(&root);
+        assert!(autoprune_tick(&store).unwrap().is_none());
+        assert_eq!(store.list_maintenance_audit(10).unwrap().len(), 0);
     }
 }

@@ -1492,6 +1492,10 @@ allow_groups = ["chat-users"]
 name = "spine_maintenance_prune"
 method = "maintenance.prune"
 allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_maintenance_audit"
+method = "maintenance.audit"
+allow_groups = ["chat-users"]
 "@ | Set-Content -Encoding utf8 $Policy
 
 # 6) Peer alias map consumed by the bridge. Tool entry omitted when -NoTool.

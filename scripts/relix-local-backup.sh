@@ -24,12 +24,14 @@ SOURCE="dev-data"
 OUTDIR="backups"
 INCLUDE_WS=0
 INCLUDE_SECRETS=0
+LIST_CONTENTS=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --source) SOURCE="$2"; shift 2 ;;
         --out-dir) OUTDIR="$2"; shift 2 ;;
         --include-workspaces) INCLUDE_WS=1; shift ;;
         --include-secrets) INCLUDE_SECRETS=1; shift ;;
+        --list-contents) LIST_CONTENTS=1; shift ;;
         -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -65,3 +67,18 @@ echo "  path : $ARCHIVE"
 echo "  size : $SIZE"
 [[ "$INCLUDE_SECRETS" -eq 0 ]] && echo "  note : secrets excluded — pass --include-secrets to include them."
 [[ "$INCLUDE_WS" -eq 0 ]] && echo "  note : run workspaces excluded — pass --include-workspaces to include them."
+
+if [[ "$LIST_CONTENTS" -eq 1 ]]; then
+    echo ""
+    echo "Contents:"
+    tar -tzf "$ARCHIVE" | sed 's/^/  /'
+fi
+
+echo ""
+echo "Restore (local) — stop the mesh first, then extract into place:"
+echo "  ./scripts/relix-mesh-down.sh"
+echo "  # inspect first:  tar -tzf '$ARCHIVE'"
+echo "  # then extract (overwrites '$SOURCE' in CWD):"
+echo "  tar -xzf '$ARCHIVE'"
+echo "  ./scripts/relix-mesh-up.sh"
+echo "Note: this script does NOT auto-restore (destructive) — extract the archive yourself. See docs/operations.md."
