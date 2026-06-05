@@ -3448,6 +3448,52 @@ mod tests {
     }
 
     #[test]
+    fn cancel_registry_request_is_idempotent() {
+        // TG4: requesting cancellation twice is safe — the second request is
+        // a no-op that keeps the run cancelled and still reports the live
+        // handle as active. The bridge's `run.cancel` is therefore safe to
+        // retry without corrupting state.
+        let reg = CancelRegistry::default();
+        reg.register("run_i");
+        assert!(reg.request("run_i"), "first request flips + reports active");
+        assert!(reg.request("run_i"), "second request is safe + still active");
+        assert!(reg.is_cancelled("run_i"));
+        // Even after clear, a stray repeat request is harmless (inactive).
+        reg.clear("run_i");
+        assert!(!reg.request("run_i"), "post-clear request is inactive, not a panic");
+    }
+
+    #[test]
+    fn process_rig_cancel_mid_flight_kills_child_and_reports_non_success() {
+        // TG4: a long-running child cancelled AFTER it starts must be killed
+        // and reported as a NON-retryable `cancelled` Failed — never Done,
+        // never a worker hang. Timeout is set far beyond the cancel delay so
+        // we're proving the cancel path, not the deadline path.
+        let run_id = "tg4-cancel-midflight";
+        CancelRegistry::global().register(run_id);
+        let (prog, args) = sleep_cmd(30);
+        let rig = ProcessRig::new("slow", prog, args)
+            .with_timeout(std::time::Duration::from_secs(20));
+        let req = RigRunRequest::new("b", "a", "g", "x").with_run_id(run_id);
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            CancelRegistry::global().request(run_id)
+        });
+        let started = std::time::Instant::now();
+        let outcome = rig.run(&req);
+        let _ = canceller.join();
+        CancelRegistry::global().clear(run_id);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "must not hang");
+        match outcome {
+            RigOutcome::Failed { retryable, reason } => {
+                assert!(!retryable, "operator cancel is non-retryable");
+                assert!(reason.contains("cancelled"), "got: {reason}");
+            }
+            other => panic!("expected cancelled Failed, never Done; got {other:?}"),
+        }
+    }
+
+    #[test]
     fn raw_rig_run_transcript_emits_output_event() {
         let (prog, args) = echo_cmd("transcript-hello");
         let rig = ProcessRig::new("echo-like", prog, args);

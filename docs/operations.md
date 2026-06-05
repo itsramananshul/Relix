@@ -160,6 +160,60 @@ re-run setup or `scripts/relix-dashboard-admin-reset.ps1` afterward.
 …then restart the bridge. Local operator recovery only — see the
 operator-console section of the README.
 
+## Run reliability: recovery, usage, runtime state, live events
+
+The run/Brief execution spine is built to survive a bridge/coordinator
+restart and to be observable from the operator console.
+
+**Boot recovery (automatic).** On coordinator startup, any `brief_runs`
+row still marked `running` that has no live in-process child (always the
+case after a crash/restart — the in-memory cancel registry starts empty)
+is reconciled: marked terminal `failed` with the reason *"Recovered after
+process restart; no live child process was found."*, given a `recovered`
+transcript event + a `brief.run_recovered` Chronicle note, and its Brief
+Claim released so the work can be re-dispatched. Genuinely live runs and
+already-terminal runs are never touched. No operator action is required;
+the recovery is logged via tracing.
+
+**Per-run usage / cost.** When an adapter emits structured output
+(Claude stream-json, Codex JSONL), each run's tokens / model / cost /
+`session_id` are captured onto the `brief_runs` ledger row and surfaced
+on `GET /v1/runs`. Adapters that emit nothing (echo / raw) leave these
+**null** — the values are never fabricated.
+
+**Persistent adapter runtime state.** Per `(tenant, agent, rig, brief)`
+the coordinator keeps a resumable `session_id`, accumulated token/cost
+totals, and the last run's status/error in an `agent_runtime_state`
+table. Inspect or reset it (tenant-scoped, auth-gated):
+
+```bash
+# read all runtime-state rows for one Operative
+curl -s "http://127.0.0.1:19791/v1/runs/runtime-state?agent_id=<agent_id>" \
+  -H "Authorization: Bearer <token>"
+
+# forget it (force a fresh adapter session) — whole agent, or one Brief
+curl -s -X POST "http://127.0.0.1:19791/v1/runs/runtime-state/reset" \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"agent_id":"<agent_id>"}'                       # whole agent
+  # -d '{"agent_id":"<agent_id>","brief_key":"<brief_id>"}'  # one Brief
+```
+
+Note: the `session_id` is **stored, not yet replayed** into the next
+adapter spawn — resume wiring is future work.
+
+**Live execution event stream (SSE).** A tenant-scoped feed of execution
+transitions (`run_started` / `run_finished` / `run_cancel_requested` /
+`brief_moved` / `review_changed` / `apply_changed`), with keep-alive
+pings:
+
+```bash
+curl -N "http://127.0.0.1:19791/v1/runs/events/stream" \
+  -H "Authorization: Bearer <token>"     # add ?since=<event_id> to resume
+```
+
+It is a ~750ms poll over the Chronicle (not push); fine-grained
+per-transcript events stay on the per-run `GET /v1/runs/:id/events`.
+
 ## Honest limitations
 
 - The maintenance summary + prune are **operator-global** (a single bridge
