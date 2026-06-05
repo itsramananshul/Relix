@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { api, tryGet } from "../api";
 import { asArray, extractList, Section, useAsync } from "../components/common";
+import { BriefDetail } from "../components/BriefDetail";
 
 interface Card {
   task_id?: string;
@@ -112,6 +113,8 @@ export function Briefs() {
   const [priority, setPriority] = useState("normal");
   const [mandateFilter, setMandateFilter] = useState("all");
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
+  // The Brief whose detail/Chronicle panel is open (null = none).
+  const [selected, setSelected] = useState<string | null>(null);
 
   const { data, loading, error, reload } = useAsync(async () => {
     const byCol: Record<string, Card[]> = {};
@@ -252,6 +255,15 @@ export function Briefs() {
         )}
         {banner && <div className={"banner " + banner.kind}>{banner.msg}</div>}
 
+        {/* Brief detail + Chronicle — opens when a card title is clicked. */}
+        {selected && (
+          <BriefDetail
+            briefId={selected}
+            onClose={() => setSelected(null)}
+            onChanged={reload}
+          />
+        )}
+
         {!loading && !initialized && (
           <div className="banner info banner-action">
             <span>No Operatives yet — create Briefs now, but to assign + run them you need a Founder.</span>
@@ -317,8 +329,15 @@ export function Briefs() {
                     const block = runBlock(c);
                     const mTitle = c.mandate_id ? (mandateTitle.get(c.mandate_id) || c.mandate_id.slice(0, 8)) : null;
                     return (
-                      <div className="board-card" key={cardId(c)}>
-                        <div className="t">{c.title ?? "(untitled)"}</div>
+                      <div className={"board-card" + (selected === cardId(c) ? " selected" : "")} key={cardId(c)}>
+                        <div
+                          className="t"
+                          style={{ cursor: "pointer" }}
+                          title="Open Brief detail + Chronicle"
+                          onClick={() => setSelected(selected === cardId(c) ? null : cardId(c))}
+                        >
+                          {c.title ?? "(untitled)"}
+                        </div>
                         {mTitle && (
                           <Link to="/mandates" className="muted" style={{ fontSize: 10, display: "block", marginBottom: 4 }} title={"part of mandate " + c.mandate_id}>◎ {mTitle}</Link>
                         )}

@@ -1,7 +1,43 @@
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, tryGet } from "../api";
 import { asArray, Badge, Empty, Section, useAsync } from "../components/common";
+
+// One Operative's Keys (`/v1/spine/keys/:agent`) — the org/work permissions
+// + execution caps the legacy spine board surfaced. Rendered read-only here
+// (editing Keys stays out of this parity slice).
+interface Keys {
+  can_spawn_agents?: boolean;
+  spawn_route?: string;
+  can_assign_work?: boolean;
+  assign_scope?: string;
+  can_manage_work?: boolean;
+  manage_scope?: string;
+  can_configure_agents?: boolean;
+  configure_scope?: string;
+  max_concurrent_runs?: number;
+  monthly_allowance_cents?: number;
+  wake_on_timer?: boolean;
+  wake_on_demand?: boolean;
+  secret_allowlist?: string[];
+}
+
+// Guild-committed Allowance (`/v1/spine/allowance/committed`). Field name
+// varies; pull the first cents-like number defensively.
+function committedCents(v: unknown): number | null {
+  if (typeof v === "number") return v;
+  if (v && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    for (const k of ["committed_cents", "committed", "allowance_cents", "cents", "total_cents"]) {
+      if (typeof o[k] === "number") return o[k] as number;
+    }
+  }
+  return null;
+}
+function fmtCents(c?: number | null): string {
+  if (c == null) return "—";
+  return "$" + (c / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
 
 interface Agent {
   agent_id?: string;
@@ -42,14 +78,19 @@ export function Agents() {
   const [busy, setBusy] = useState(false);
   const [founderName, setFounderName] = useState("Founder");
   const [founderRig, setFounderRig] = useState("echo");
+  // Per-Operative Keys: which row's Keys are expanded + a small cache so
+  // re-opening is instant. `null` value = loaded but no keys returned.
+  const [keysOpen, setKeysOpen] = useState<string | null>(null);
+  const [keysCache, setKeysCache] = useState<Record<string, Keys | null>>({});
 
   const { data, loading, error, reload } = useAsync(async () => {
     const work: Card[] = [];
-    const [company, ops, adapters, runs] = await Promise.all([
+    const [company, ops, adapters, runs, allowance] = await Promise.all([
       tryGet<CompanyStatus>("/v1/spine/company", {}),
       tryGet<Agent[]>("/v1/spine/operatives", []),
       tryGet<Adapter[]>("/v1/adapters", []),
       tryGet<RunRow[]>("/v1/runs", []),
+      tryGet<unknown>("/v1/spine/allowance/committed", {}),
       Promise.all(
         WORK_COLUMNS.map(async (col) => {
           work.push(...asArray<Card>(await tryGet<Card[]>(`/v1/spine/board/${col}?limit=100`, [])));
@@ -61,9 +102,22 @@ export function Agents() {
       agents: Array.isArray(ops) ? ops : [],
       adapters: Array.isArray(adapters) ? adapters : [],
       runs: Array.isArray(runs) ? runs : [],
+      allowance: committedCents(allowance),
       work,
     };
   }, []);
+
+  async function toggleKeys(agentId: string) {
+    if (keysOpen === agentId) {
+      setKeysOpen(null);
+      return;
+    }
+    setKeysOpen(agentId);
+    if (!(agentId in keysCache)) {
+      const k = await tryGet<Keys | null>(`/v1/spine/keys/${encodeURIComponent(agentId)}`, null);
+      setKeysCache((m) => ({ ...m, [agentId]: k }));
+    }
+  }
 
   const company = data?.company ?? {};
   const agents = data?.agents ?? [];
@@ -142,6 +196,28 @@ export function Agents() {
           <div className="muted" style={{ fontSize: 11, marginTop: 3 }}>{a.probe.install_hint}</div>
         )}
       </span>
+    );
+  }
+
+  // Compact read-only render of one Operative's Keys (org/work permissions +
+  // execution caps). Mirrors the legacy spine board's Keys panel.
+  function keysDetail(agentId: string) {
+    const k = keysCache[agentId];
+    if (!(agentId in keysCache)) return <div className="loading" style={{ fontSize: 12 }}>Loading Keys…</div>;
+    if (!k) return <div className="muted" style={{ fontSize: 12 }}>No Keys recorded for this Operative.</div>;
+    const flag = (on?: boolean, scope?: string) =>
+      on ? <span className="badge done" style={{ fontSize: 9 }}>yes{scope ? ` · ${scope}` : ""}</span> : <span className="badge backlog" style={{ fontSize: 9 }}>no</span>;
+    return (
+      <div className="kv-grid" style={{ fontSize: 12 }}>
+        <div className="kv"><span className="muted">Spawn agents</span><span>{flag(k.can_spawn_agents, k.spawn_route)}</span></div>
+        <div className="kv"><span className="muted">Assign work</span><span>{flag(k.can_assign_work, k.assign_scope)}</span></div>
+        <div className="kv"><span className="muted">Manage work</span><span>{flag(k.can_manage_work, k.manage_scope)}</span></div>
+        <div className="kv"><span className="muted">Configure agents</span><span>{flag(k.can_configure_agents, k.configure_scope)}</span></div>
+        <div className="kv"><span className="muted">Wake</span><span>{k.wake_on_timer ? "timer " : ""}{k.wake_on_demand ? "on-demand" : ""}{!k.wake_on_timer && !k.wake_on_demand ? "—" : ""}</span></div>
+        <div className="kv"><span className="muted">Max concurrent runs</span><span>{k.max_concurrent_runs ?? "—"}</span></div>
+        <div className="kv"><span className="muted">Monthly Allowance</span><span>{k.monthly_allowance_cents != null ? fmtCents(k.monthly_allowance_cents) : "—"}</span></div>
+        <div className="kv"><span className="muted">Secret allowlist</span><span>{(k.secret_allowlist?.length ?? 0) > 0 ? `${k.secret_allowlist!.length} entr${k.secret_allowlist!.length === 1 ? "y" : "ies"}` : "none"}</span></div>
+      </div>
     );
   }
 
@@ -226,6 +302,18 @@ export function Agents() {
         <Link to="/settings" className="banner-cta">Adapters →</Link>
       </div>
 
+      {/* Guild Allowance — the committed monthly budget across the Crew. */}
+      <div className="card" style={{ padding: "10px 14px" }}>
+        <div className="row">
+          <span className="muted">Guild Allowance (committed)</span>
+          <span className="spacer" style={{ flex: 1 }} />
+          <strong>{fmtCents(data?.allowance)}</strong>
+          <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>
+            sum of per-Operative monthly caps · per-Operative limits are in each row's Keys
+          </span>
+        </div>
+      </div>
+
       {/* Founder — shown separately as the org root. */}
       {founder && (
         <div className="card">
@@ -251,7 +339,16 @@ export function Agents() {
               <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>Workload</div>
               <span>{workload.get(founder.agent_id ?? "") ?? 0} open · {running.get(founder.agent_id ?? "") ?? 0} running</span>
             </div>
+            <div>
+              <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>Keys</div>
+              <button className="btn ghost sm" onClick={() => toggleKeys(founder.agent_id ?? "")}>
+                {keysOpen === founder.agent_id ? "Hide" : "View"}
+              </button>
+            </div>
           </div>
+          {keysOpen === founder.agent_id && (
+            <div style={{ marginTop: 10 }}>{keysDetail(founder.agent_id ?? "")}</div>
+          )}
         </div>
       )}
 
@@ -278,13 +375,15 @@ export function Agents() {
                   <th>Readiness</th>
                   <th>Open</th>
                   <th>Running</th>
+                  <th>Keys</th>
                 </tr>
               </thead>
               <tbody>
                 {crew.map((a, i) => {
                   const id = a.agent_id ?? "";
                   return (
-                    <tr key={id || i}>
+                    <Fragment key={id || i}>
+                    <tr>
                       <td>
                         <strong>{a.name ?? id.slice(0, 10) ?? "operative"}</strong>
                         <div className="mono" style={{ fontSize: 10 }}>{id.slice(0, 12)}</div>
@@ -299,7 +398,18 @@ export function Agents() {
                           ? <span className="badge in_progress">{running.get(id)}</span>
                           : <span className="muted">0</span>}
                       </td>
+                      <td>
+                        <button className="btn ghost sm" onClick={() => toggleKeys(id)} title="View this Operative's Keys (permissions + caps)">
+                          {keysOpen === id ? "Hide" : "View"}
+                        </button>
+                      </td>
                     </tr>
+                    {keysOpen === id && (
+                      <tr>
+                        <td colSpan={8} style={{ background: "rgba(0,0,0,0.02)" }}>{keysDetail(id)}</td>
+                      </tr>
+                    )}
+                    </Fragment>
                   );
                 })}
               </tbody>
