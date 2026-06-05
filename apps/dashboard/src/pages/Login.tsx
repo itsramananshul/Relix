@@ -73,6 +73,18 @@ export function Login() {
         <button className="btn" style={{ width: "100%", marginTop: 6 }} disabled={busy}>
           {busy ? "…" : isSetup ? "Create admin & continue" : "Sign in"}
         </button>
+        {!isSetup && (
+          <details className="forgot">
+            <summary>Forgot the local admin password?</summary>
+            <p className="muted" style={{ fontSize: 12, margin: "8px 0 4px" }}>
+              Run this on the machine hosting the bridge, then restart it and sign in with the new password:
+            </p>
+            <pre className="forgot-cmd">scripts\relix-dashboard-admin-reset.ps1   (Windows){"\n"}./scripts/relix-dashboard-admin-reset.sh  (macOS / Linux)</pre>
+            <p className="muted" style={{ fontSize: 11, margin: "4px 0 0" }}>
+              Local operator recovery only — it rewrites just the admin credential, not your data. There is no online reset.
+            </p>
+          </details>
+        )}
       </form>
     </div>
   );

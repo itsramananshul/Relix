@@ -162,6 +162,12 @@ label.field span { display: block; font-size: 12px; color: var(--text-dim); marg
 .center-spinner { display: grid; place-items: center; height: 100vh; color: var(--text-faint); }
 .loading { color: var(--text-faint); padding: 20px; }
 
+/* Login "forgot password" recovery hint — guidance only, no secrets. */
+.forgot { margin-top: 14px; border-top: 1px solid var(--border-soft); padding-top: 12px; }
+.forgot > summary { cursor: pointer; color: var(--text-dim); font-size: 12px; user-select: none; }
+.forgot > summary:hover { color: var(--text); }
+.forgot-cmd { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 11px; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; color: var(--text-dim); overflow-x: auto; white-space: pre; margin: 4px 0; }
+
 /* ── Overview / Command Center ─────────────────────────── */
 .link { color: var(--info); cursor: pointer; }
 .link:hover { text-decoration: underline; }
