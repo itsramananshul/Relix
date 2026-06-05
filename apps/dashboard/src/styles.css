@@ -188,5 +188,8 @@ a > .stat-card:hover { border-color: var(--text-faint); }
 /* A denser table variant for compact lists in cards. */
 .table.compact td { padding: 5px 8px; }
 
+/* Expanded-run header strip (status / trigger / review / apply + actions). */
+.run-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border-soft); }
+
 /* Keep wide tables usable on small screens. */
 .table-scroll { overflow-x: auto; }

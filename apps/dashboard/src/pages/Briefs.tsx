@@ -98,6 +98,14 @@ function runOutcome(r: RunRow): { label: string; tone: string } | null {
   return null;
 }
 
+// The clearest verb for the deep link into a Brief's latest run, based on
+// what the operator would do next there.
+function runAction(r: RunRow): string {
+  if (r.status === "done" && r.review === "pending_review") return "Review run";
+  if (r.status === "done" && r.review === "accepted" && r.apply_status !== "applied") return "Apply run";
+  return "View run";
+}
+
 export function Briefs() {
   const [creating, setCreating] = useState(false);
   const [title, setTitle] = useState("");
@@ -306,7 +314,11 @@ export function Briefs() {
                             <span className="muted" style={{ fontSize: 10 }}>{lr.trigger === "heartbeat" ? "auto" : lr.trigger ?? "manual"}</span>
                             {outcome && <span className={"badge " + outcome.tone} style={{ fontSize: 10 }}>{outcome.label}</span>}
                             {(lr.applied_files ?? 0) > 0 && <span className="muted" style={{ fontSize: 10 }}>{lr.applied_files} applied</span>}
-                            <Link to="/runs" className="link" style={{ fontSize: 11, marginLeft: "auto" }}>view →</Link>
+                            {lr.run_id && (
+                              <Link to={`/runs?run=${encodeURIComponent(lr.run_id)}`} className="link" style={{ fontSize: 11, marginLeft: "auto" }}>
+                                {runAction(lr)} →
+                              </Link>
+                            )}
                           </div>
                         )}
 

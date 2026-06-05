@@ -1,6 +1,13 @@
-import { Fragment, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import { api, tryGet } from "../api";
 import { Empty, Section, useAsync } from "../components/common";
+
+// Build the shareable deep link for one run (the SPA is mounted at
+// /dashboard, so include the basename for a copy-paste-able URL).
+function runDeepLink(runId: string): string {
+  return `${window.location.origin}/dashboard/runs?run=${encodeURIComponent(runId)}`;
+}
 
 interface Adapter { name?: string; display_name?: string; probe?: { status?: string } }
 
@@ -192,6 +199,12 @@ const TRIGGERS = ["all", "manual", "heartbeat"] as const;
 export function Runs() {
   const [filter, setFilter] = useState<(typeof FILTERS)[number]>("all");
   const [triggerFilter, setTriggerFilter] = useState<(typeof TRIGGERS)[number]>("all");
+  // The expanded run is URL-driven (`/runs?run=<run_id>`), so a Brief card
+  // can deep-link straight into a run, refresh preserves it, and
+  // back/forward behave. `expanded` mirrors the param for render.
+  const [searchParams, setSearchParams] = useSearchParams();
+  // Start collapsed; the URL-sync effect below expands (and LOADS) the run
+  // named in `?run=` on mount, so a deep link / refresh loads its data.
   const [expanded, setExpanded] = useState<string | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [eventsLoading, setEventsLoading] = useState(false);
@@ -199,6 +212,7 @@ export function Runs() {
   const [preview, setPreview] = useState<{ id: number; data: ArtifactPreview } | null>(null);
   const [diff, setDiff] = useState<RunDiff | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const { data, loading, error, reload } = useAsync(async () => {
     const [runs, adapters] = await Promise.all([
@@ -243,17 +257,59 @@ export function Runs() {
     setDiff(d ?? null);
   }
 
-  async function toggle(runId: string) {
-    if (expanded === runId) {
-      setExpanded(null);
-      return;
-    }
+  // Expand a run + load its transcript/changes/apply plan. Does NOT touch
+  // the URL (the caller / effect owns that) so it can run on deep-link too.
+  async function openRun(runId: string) {
     setExpanded(runId);
     setEvents([]);
     setArtifacts([]);
     setPreview(null);
     setDiff(null);
+    setCopied(false);
     await Promise.all([loadEvents(runId), loadArtifacts(runId), loadDiff(runId)]);
+  }
+
+  function setRunParam(runId: string | null) {
+    const next = new URLSearchParams(searchParams);
+    if (runId) next.set("run", runId);
+    else next.delete("run");
+    setSearchParams(next, { replace: true });
+  }
+
+  // A row click toggles the run AND mirrors it into the URL.
+  function toggle(runId: string) {
+    if (expanded === runId) {
+      setExpanded(null);
+      setRunParam(null);
+    } else {
+      void openRun(runId);
+      setRunParam(runId);
+    }
+  }
+
+  // Sync expansion FROM the URL — handles deep links, refresh, and
+  // back/forward. Only acts on a genuine mismatch (no double-load on the
+  // same click that set the param).
+  const deepRun = searchParams.get("run");
+  useEffect(() => {
+    if (deepRun && deepRun !== expanded) {
+      void openRun(deepRun);
+    } else if (!deepRun && expanded) {
+      setExpanded(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deepRun]);
+
+  async function copyRunLink(runId: string) {
+    const url = runDeepLink(runId);
+    try {
+      await navigator.clipboard?.writeText(url);
+      setCopied(true);
+      setBanner(null);
+    } catch {
+      // Clipboard blocked — surface the URL so it can be copied manually.
+      setBanner(url);
+    }
   }
 
   async function apply(runId: string) {
@@ -298,9 +354,15 @@ export function Runs() {
   }
 
   const allRuns = data?.runs ?? [];
-  const runs = allRuns
-    .filter((r) => filter === "all" || r.status === filter)
-    .filter((r) => triggerFilter === "all" || (r.trigger ?? "manual") === triggerFilter);
+  // The expanded run is ALWAYS shown (so a deep link survives the filters);
+  // everything else respects the status + trigger filters.
+  const runs = allRuns.filter(
+    (r) =>
+      r.run_id === expanded ||
+      ((filter === "all" || r.status === filter) &&
+        (triggerFilter === "all" || (r.trigger ?? "manual") === triggerFilter)),
+  );
+  const deepNotFound = !loading && !!deepRun && !allRuns.some((r) => r.run_id === deepRun);
   const adaptersAvail = (data?.adapters ?? []).filter((a) => a.probe?.status === "available");
   const activeCount = allRuns.filter((r) => r.status === "running").length;
   const autoCount = allRuns.filter((r) => r.trigger === "heartbeat").length;
@@ -314,6 +376,12 @@ export function Runs() {
       >
         {error && <div className="banner err">{error}</div>}
         {banner && <div className="banner info">{banner}</div>}
+        {deepNotFound && (
+          <div className="banner info banner-action">
+            <span>Run <span className="mono">{deepRun}</span> isn't in the recent list — it may be older or from another Guild.</span>
+            <span className="banner-cta" onClick={() => setRunParam(null)}>Show all runs →</span>
+          </div>
+        )}
         <div className={"banner " + (adaptersAvail.length ? "ok" : "info")}>
           {adaptersAvail.length
             ? `${adaptersAvail.length} agent adapter(s) available: ${adaptersAvail.map((a) => a.name).join(", ")}.`
@@ -410,9 +478,20 @@ export function Runs() {
                       {open && (
                         <tr>
                           <td colSpan={COLS} style={{ background: "rgba(0,0,0,0.02)" }}>
+                            {/* Compact run header — the at-a-glance state. */}
+                            <div className="run-head">
+                              <span className={"badge " + (TONE[r.status ?? ""] ?? "todo")}>{r.status ?? "—"}</span>
+                              <span className={"badge " + (TRIGGER_TONE[r.trigger ?? ""] ?? "todo")} style={{ fontSize: 9 }}>{triggerLabel(r.trigger)}</span>
+                              {r.review && <span className={"badge " + (r.review === "accepted" ? "done" : r.review === "rejected" ? "blocked" : "in_progress")} style={{ fontSize: 9 }}>{r.review}</span>}
+                              {r.apply_status && <span className={"badge " + (APPLY_STATUS_TONE[r.apply_status] ?? "todo")} style={{ fontSize: 9 }}>apply: {r.apply_status}</span>}
+                              <span className="muted mono" style={{ fontSize: 11 }}>{rid}</span>
+                              {r.brief_id && <Link to="/briefs" className="link" style={{ fontSize: 11 }} onClick={(e) => e.stopPropagation()}>brief {r.brief_id.slice(0, 8)} ↗</Link>}
+                              <div className="spacer" style={{ flex: 1 }} />
+                              <button className="btn ghost sm" title="Copy a shareable link to this run" onClick={(e) => { e.stopPropagation(); copyRunLink(rid); }}>{copied ? "✓ copied" : "Copy link"}</button>
+                              <Link to="/briefs" className="btn ghost sm" onClick={(e) => e.stopPropagation()}>← Briefs</Link>
+                            </div>
                             <div className="row" style={{ marginBottom: 6 }}>
                               <strong style={{ fontSize: 12 }}>Transcript</strong>
-                              <span className="muted mono" style={{ fontSize: 11, marginLeft: 8 }}>{rid}</span>
                               <div className="spacer" style={{ flex: 1 }} />
                               <button className="btn ghost sm" onClick={(e) => { e.stopPropagation(); loadEvents(rid); }}>Refresh</button>
                               {r.status === "running" && (
