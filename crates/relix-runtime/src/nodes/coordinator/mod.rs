@@ -3221,6 +3221,70 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Discard a TERMINAL run's output: mark its apply state `discarded` (so
+    /// it can never be applied) and, for a `done` run, reject its review.
+    /// Records a `discarded` run-transcript event + a `brief.run_discarded`
+    /// Chronicle note. Refuses a still-`running` run (cancel it first). Does
+    /// NOT delete the scoped workspace — the normal storage prune reclaims it
+    /// later (discard just makes the run eligible + non-applyable). Tenant
+    /// gating is the caller's responsibility (mirrors `set_run_review` /
+    /// `set_run_apply_status`). Returns the new apply state (`discarded`).
+    pub fn discard_run(&self, run_id: &str) -> Result<String, CoordinatorError> {
+        let now = unix_secs();
+        let (status, brief_id) = {
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            let row: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT status, brief_id FROM brief_runs WHERE run_id = ?1",
+                    params![run_id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(CoordinatorError::Db)?;
+            let (status, brief_id) = match row {
+                None => return Err(CoordinatorError::NotFound(run_id.to_string())),
+                Some(v) => v,
+            };
+            if status == "running" {
+                return Err(CoordinatorError::Invalid(
+                    "cannot discard a running run — cancel it first".into(),
+                ));
+            }
+            // A `done` run's review is rejected (so it is never apply-eligible);
+            // every terminal run gets the `discarded` apply state.
+            let review_sql = if status == "done" {
+                "review = 'rejected', review_note = 'discarded by operator', reviewed_at = ?2,"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "UPDATE brief_runs SET {review_sql}
+                     apply_status = 'discarded', apply_note = 'discarded by operator',
+                     applied_at = ?2
+                 WHERE run_id = ?1"
+            );
+            conn.execute(&sql, params![run_id, now])
+                .map_err(CoordinatorError::Db)?;
+            (status, brief_id)
+        };
+        let _ = status; // (status only drove the review branch above)
+        // Transcript + Chronicle (each takes its own lock — conn dropped).
+        let _ = self.append_run_event(
+            run_id,
+            "discarded",
+            "relix",
+            "operator discarded the run output",
+            None,
+            false,
+        );
+        let _ = self.append_event(
+            &brief_id,
+            "brief.run_discarded",
+            &format!("run {run_id}: output discarded by operator"),
+        );
+        Ok("discarded".to_string())
+    }
+
     /// All artifacts for a run (the changed-files list). Ordered by path.
     pub fn list_run_artifacts(
         &self,

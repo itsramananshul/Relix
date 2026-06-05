@@ -1135,6 +1135,148 @@ pub fn read_artifact_preview(
     }
 }
 
+/// Outcome of building a bounded unified diff for one changed run file.
+pub enum DiffOutcome {
+    /// A bounded unified diff. `baseline` names where the "before" side came
+    /// from: `project_root` (the live file still matches the run's recorded
+    /// baseline hash) or `empty` (a created file — diffed against nothing).
+    Unified {
+        diff: String,
+        truncated: bool,
+        baseline: &'static str,
+    },
+    /// No honest diff is possible — the caller should fall back to the file
+    /// PREVIEW. `reason` explains why (binary / baseline diverged or missing /
+    /// unsafe path / unreadable).
+    Unavailable { reason: String },
+}
+
+/// Read a file as bounded text: refuses a binary file, caps at `max_bytes`,
+/// and reports truncation. Path safety is the caller's responsibility (this
+/// is only ever called on a path already validated under the workspace or the
+/// project root).
+fn read_text_bounded(path: &std::path::Path, max_bytes: usize) -> Result<(String, bool), String> {
+    let bytes = std::fs::read(path).map_err(|_| "file unreadable".to_string())?;
+    if !looks_text(&bytes) {
+        return Err("binary or non-text file — no diff".into());
+    }
+    let truncated = bytes.len() > max_bytes;
+    let slice = &bytes[..bytes.len().min(max_bytes)];
+    Ok((String::from_utf8_lossy(slice).into_owned(), truncated))
+}
+
+/// Build a SAFE, bounded unified diff for ONE changed file of a run.
+///
+/// The "after" side is the file in the run's scoped workspace (read with the
+/// SAME canonicalize-under-workspace guard the preview uses, already
+/// secret-redacted). The "before" side is reconstructed from the LIVE
+/// project-root file — but ONLY when it still hashes to the run's recorded
+/// `baseline_hash`; if the project file moved since the run we return
+/// `Unavailable` (honest — we cannot claim what the run changed against a
+/// moved baseline). `created` diffs against an empty baseline; `deleted` diffs
+/// the baseline against empty. Both sides are byte-bounded BEFORE diffing and
+/// the diff is secret-redacted, so it can never dump a whole repo or a secret.
+pub fn read_artifact_diff(
+    workspace: &str,
+    project_root: &std::path::Path,
+    rel_path: &str,
+    kind: &str,
+    is_text: bool,
+    baseline_hash: Option<&str>,
+    max_bytes: usize,
+) -> DiffOutcome {
+    if !is_text {
+        return DiffOutcome::Unavailable {
+            reason: "binary or non-text file — no diff".into(),
+        };
+    }
+    // Defensive path validation (mirrors apply): never traverse / escape /
+    // touch an excluded (secret/build) path.
+    if !apply_rel_path_is_safe(rel_path) || apply_path_excluded(rel_path) {
+        return DiffOutcome::Unavailable {
+            reason: "path refused".into(),
+        };
+    }
+    // "after" side — the run's workspace output (empty for a deletion).
+    let after = if kind == "deleted" {
+        String::new()
+    } else {
+        match read_artifact_preview(workspace, rel_path, is_text, max_bytes) {
+            PreviewOutcome::Text { content, .. } => content,
+            PreviewOutcome::Binary => {
+                return DiffOutcome::Unavailable {
+                    reason: "binary or non-text file — no diff".into(),
+                }
+            }
+            PreviewOutcome::Missing => {
+                return DiffOutcome::Unavailable {
+                    reason: "file no longer exists in the workspace".into(),
+                }
+            }
+            PreviewOutcome::Unsafe => {
+                return DiffOutcome::Unavailable {
+                    reason: "path refused (outside workspace)".into(),
+                }
+            }
+        }
+    };
+    // "before" side.
+    let (before, baseline_label): (String, &'static str) = match kind {
+        "created" => (String::new(), "empty"),
+        "modified" | "deleted" => {
+            let Some(bh) = baseline_hash else {
+                return DiffOutcome::Unavailable {
+                    reason: "no baseline recorded for this file — preview the run output instead"
+                        .into(),
+                };
+            };
+            let Ok(root_canon) = std::fs::canonicalize(project_root) else {
+                return DiffOutcome::Unavailable {
+                    reason: "project root unavailable".into(),
+                };
+            };
+            let Ok(target) = resolve_apply_target(&root_canon, rel_path) else {
+                return DiffOutcome::Unavailable {
+                    reason: "path refused".into(),
+                };
+            };
+            // The live file is the baseline ONLY if it still matches the hash
+            // the run captured before it started.
+            match hash_file_hex(&target) {
+                Some(h) if h == bh => match read_text_bounded(&target, max_bytes) {
+                    Ok((s, _)) => (crate::rig::redact_secrets(&s, ""), "project_root"),
+                    Err(reason) => return DiffOutcome::Unavailable { reason },
+                },
+                _ => {
+                    return DiffOutcome::Unavailable {
+                        reason: "the project file changed since this run — diff unavailable; \
+                                 preview the run output instead"
+                            .into(),
+                    }
+                }
+            }
+        }
+        other => {
+            return DiffOutcome::Unavailable {
+                reason: format!("unknown change kind: {other}"),
+            }
+        }
+    };
+    // Diff the bounded, redacted sides. `diffy` emits a unified diff.
+    let raw = diffy::create_patch(&before, &after).to_string();
+    let truncated = raw.len() > max_bytes;
+    let bounded = if truncated {
+        String::from_utf8_lossy(&raw.as_bytes()[..max_bytes]).into_owned()
+    } else {
+        raw
+    };
+    DiffOutcome::Unified {
+        diff: crate::rig::redact_secrets(&bounded, ""),
+        truncated,
+        baseline: baseline_label,
+    }
+}
+
 // ── Safe apply: copy an accepted run's changed files into the project ──
 //
 // (relix-execution-and-issue-design — recovery / result handling.) After an
@@ -3558,6 +3700,80 @@ mod tests {
     }
 
     #[test]
+    fn read_artifact_diff_created_modified_deleted_and_safe_refusals() {
+        let ws = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let wss = ws.path().to_string_lossy().into_owned();
+        let max = 64 * 1024;
+
+        // created → diff against an EMPTY baseline (all additions).
+        std::fs::write(ws.path().join("new.txt"), "line1\nline2\n").unwrap();
+        match read_artifact_diff(&wss, proj.path(), "new.txt", "created", true, None, max) {
+            DiffOutcome::Unified { diff, baseline, truncated } => {
+                assert_eq!(baseline, "empty");
+                assert!(!truncated);
+                assert!(diff.contains("+line1"), "diff: {diff}");
+            }
+            DiffOutcome::Unavailable { reason } => panic!("expected diff, got: {reason}"),
+        }
+
+        // modified → diff against the live project file (still == baseline hash).
+        std::fs::write(proj.path().join("m.txt"), "old\n").unwrap();
+        let bh = hash_file_hex(&proj.path().join("m.txt")).unwrap();
+        std::fs::write(ws.path().join("m.txt"), "new\n").unwrap();
+        match read_artifact_diff(&wss, proj.path(), "m.txt", "modified", true, Some(&bh), max) {
+            DiffOutcome::Unified { diff, baseline, .. } => {
+                assert_eq!(baseline, "project_root");
+                assert!(diff.contains("-old"), "diff: {diff}");
+                assert!(diff.contains("+new"), "diff: {diff}");
+            }
+            DiffOutcome::Unavailable { reason } => panic!("expected diff, got: {reason}"),
+        }
+
+        // deleted → baseline vs empty (all removals).
+        std::fs::write(proj.path().join("d.txt"), "gone\n").unwrap();
+        let dh = hash_file_hex(&proj.path().join("d.txt")).unwrap();
+        match read_artifact_diff(&wss, proj.path(), "d.txt", "deleted", true, Some(&dh), max) {
+            DiffOutcome::Unified { diff, baseline, .. } => {
+                assert_eq!(baseline, "project_root");
+                assert!(diff.contains("-gone"), "diff: {diff}");
+            }
+            DiffOutcome::Unavailable { reason } => panic!("expected diff, got: {reason}"),
+        }
+
+        // moved baseline → honest unavailable, NEVER a misleading diff.
+        std::fs::write(proj.path().join("m.txt"), "DIVERGED\n").unwrap();
+        match read_artifact_diff(&wss, proj.path(), "m.txt", "modified", true, Some(&bh), max) {
+            DiffOutcome::Unavailable { reason } => {
+                assert!(reason.contains("changed since this run"), "reason: {reason}")
+            }
+            DiffOutcome::Unified { .. } => panic!("expected unavailable (baseline moved)"),
+        }
+
+        // binary → unavailable (never dumps bytes).
+        match read_artifact_diff(&wss, proj.path(), "new.txt", "created", false, None, max) {
+            DiffOutcome::Unavailable { reason } => assert!(reason.contains("binary")),
+            DiffOutcome::Unified { .. } => panic!("binary must not diff"),
+        }
+
+        // path traversal → refused before any read.
+        match read_artifact_diff(&wss, proj.path(), "../escape.txt", "created", true, None, max) {
+            DiffOutcome::Unavailable { reason } => assert!(reason.contains("path refused")),
+            DiffOutcome::Unified { .. } => panic!("traversal must be refused"),
+        }
+
+        // large output → truncated + bounded.
+        std::fs::write(ws.path().join("big.txt"), "y\n".repeat(50_000)).unwrap();
+        match read_artifact_diff(&wss, proj.path(), "big.txt", "created", true, None, 1000) {
+            DiffOutcome::Unified { diff, truncated, .. } => {
+                assert!(truncated);
+                assert!(diff.len() <= 1000);
+            }
+            DiffOutcome::Unavailable { reason } => panic!("expected bounded diff, got: {reason}"),
+        }
+    }
+
+    #[test]
     fn review_only_accepts_done_runs() {
         let (s, _tmp) = store_ws();
         let id = ready_brief(&s, "reviewable", "agt_a");
@@ -3574,6 +3790,56 @@ mod tests {
         assert!(rec.reviewed_at.is_some());
         // invalid decision is rejected.
         assert!(s.set_run_review(&run_id, "maybe", "").is_err());
+    }
+
+    #[test]
+    fn discard_run_marks_discarded_rejects_review_and_refuses_running() {
+        let (s, _tmp) = store_ws();
+        let id = ready_brief(&s, "discardable", "agt_a");
+        let report =
+            run_brief_now(&s, &echo_registry(), None, 300, &id, Some("echo"), "x".into()).unwrap();
+        let run_id = report.run_id.unwrap();
+
+        // Discard a `done` run → apply_status `discarded` + review `rejected`.
+        assert_eq!(s.discard_run(&run_id).unwrap(), "discarded");
+        let rec = s.get_run(&run_id).unwrap().unwrap();
+        assert_eq!(rec.apply_status.as_deref(), Some("discarded"));
+        assert_eq!(rec.review.as_deref(), Some("rejected"));
+        // …and it can NEVER be applied.
+        assert!(run_apply_eligibility(&rec).is_err());
+
+        // A `discarded` transcript event + a brief.run_discarded Chronicle note.
+        let kinds: Vec<String> = s
+            .list_run_events(&run_id, 50)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(kinds.contains(&"discarded".to_string()), "kinds: {kinds:?}");
+        let chron = s
+            .query_events(
+                &id,
+                0,
+                50,
+                Some("brief.run_discarded"),
+                crate::nodes::coordinator::EventOrder::Desc,
+            )
+            .unwrap();
+        assert_eq!(chron.len(), 1);
+
+        // A RUNNING run cannot be discarded (cancel it first).
+        s.record_run_start(
+            "run_live",
+            &id,
+            "agt_a",
+            "echo",
+            "manual",
+            &crate::nodes::coordinator::RunWorkspaceInfo::default(),
+        )
+        .unwrap();
+        assert!(s.discard_run("run_live").is_err());
+        // Unknown run → error.
+        assert!(s.discard_run("nope").is_err());
     }
 
     #[test]

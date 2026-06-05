@@ -875,6 +875,18 @@ pub async fn run_artifact_preview(
     json_passthrough(call_peer(&state, "run.artifact_preview", arg.as_bytes()).await?)
 }
 
+/// `GET /v1/runs/:run_id/artifacts/:artifact_id/diff` — a safe, bounded
+/// unified diff of one changed file (workspace output vs the run's baseline).
+/// Returns `available:false` + a reason when no honest diff is possible
+/// (binary / moved baseline / unsafe path) so the caller previews instead.
+pub async fn run_artifact_diff(
+    State(state): State<AppState>,
+    Path((run_id, artifact_id)): Path<(String, String)>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let arg = format!("{run_id}|{artifact_id}");
+    json_passthrough(call_peer(&state, "run.artifact_diff", arg.as_bytes()).await?)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ReviewRequest {
     pub decision: String,
@@ -917,6 +929,17 @@ pub async fn run_apply(
     Path(run_id): Path<String>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
     json_passthrough(call_peer(&state, "run.apply", run_id.as_bytes()).await?)
+}
+
+/// `POST /v1/runs/:run_id/discard` — discard a terminal run's output: marks it
+/// `discarded` (rejecting a `done` run's review so it can never be applied),
+/// records a Chronicle + transcript event, and makes its scoped workspace
+/// eligible for the normal storage prune. Does NOT delete files immediately.
+pub async fn run_discard(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "run.discard", run_id.as_bytes()).await?)
 }
 
 #[derive(Debug, Deserialize)]

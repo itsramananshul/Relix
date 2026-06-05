@@ -9510,6 +9510,86 @@ fn register_node_type_handlers(
             );
         }
         {
+            // `run.artifact_diff` — a SAFE, bounded unified diff for ONE
+            // changed file of a run (`GET /v1/runs/:id/artifacts/:aid/diff`).
+            // Arg `run_id|artifact_id`. Tenant-scoped (another Guild's run
+            // reads as not-found). The "after" side is the run's workspace
+            // output; the "before" side is the live project-root file ONLY
+            // when it still matches the run's recorded baseline hash — else an
+            // honest `available:false` ("diff unavailable; preview instead").
+            // Binary / unsafe-path / moved-baseline never dump content.
+            let st = store.clone();
+            bridge.register(
+                "run.artifact_diff",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            let arg = String::from_utf8_lossy(&ctx.args).to_string();
+                            let mut parts = arg.splitn(2, '|');
+                            let run_id = parts.next().unwrap_or("").trim().to_string();
+                            let aid: i64 =
+                                parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(-1);
+                            let tenant = ctx.tenant_id_or_default().to_string();
+                            let invalid = |c: String| {
+                                crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                        cause: c,
+                                        retry_hint: 0,
+                                        retry_after: None,
+                                    },
+                                )
+                            };
+                            match st.run_belongs_to_tenant(&run_id, &tenant) {
+                                Ok(true) => {}
+                                Ok(false) => return invalid(format!("run not found: {run_id}")),
+                                Err(e) => return invalid(format!("run.artifact_diff: {e}")),
+                            }
+                            let art = match st.get_run_artifact(&run_id, aid) {
+                                Ok(Some(a)) => a,
+                                Ok(None) => return invalid(format!("artifact not found: {aid}")),
+                                Err(e) => return invalid(format!("run.artifact_diff: {e}")),
+                            };
+                            use crate::nodes::coordinator::heartbeat::{
+                                read_artifact_diff, DiffOutcome,
+                            };
+                            let root = st.run_workspace_config().project_root.clone();
+                            let max = crate::nodes::coordinator::ARTIFACT_PREVIEW_MAX_BYTES;
+                            let outcome = read_artifact_diff(
+                                &art.workspace,
+                                &root,
+                                &art.rel_path,
+                                &art.kind,
+                                art.is_text,
+                                art.baseline_hash.as_deref(),
+                                max,
+                            );
+                            let body = match outcome {
+                                DiffOutcome::Unified {
+                                    diff,
+                                    truncated,
+                                    baseline,
+                                } => serde_json::json!({
+                                    "rel_path": art.rel_path, "kind": art.kind, "size": art.size,
+                                    "available": true, "truncated": truncated,
+                                    "baseline": baseline, "diff": diff,
+                                }),
+                                DiffOutcome::Unavailable { reason } => serde_json::json!({
+                                    "rel_path": art.rel_path, "kind": art.kind, "size": art.size,
+                                    "available": false, "reason": reason,
+                                }),
+                            };
+                            match serde_json::to_vec(&body) {
+                                Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                Err(e) => invalid(format!("run.artifact_diff encode: {e}")),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
+        {
             // `run.review` — record an operator accept/reject on a run
             // (`POST /v1/runs/:id/review`). Arg `run_id|decision|note`.
             // Tenant-scoped; only a `done` run is reviewable. Records a
@@ -9780,6 +9860,55 @@ fn register_node_type_handlers(
                             match serde_json::to_vec(&body) {
                                 Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
                                 Err(e) => invalid(format!("run.apply encode: {e}")),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
+        {
+            // `run.discard` — discard a terminal run's output
+            // (`POST /v1/runs/:id/discard`). Marks the run `discarded` (and
+            // rejects a `done` run's review so it can never be applied),
+            // records a `discarded` transcript event + a `brief.run_discarded`
+            // Chronicle note, and leaves the scoped workspace for the normal
+            // storage prune (no immediate delete). Tenant-scoped; a running
+            // run is refused (cancel it first).
+            let st = store.clone();
+            bridge.register(
+                "run.discard",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            let run_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
+                            let tenant = ctx.tenant_id_or_default().to_string();
+                            let invalid = |c: String| {
+                                crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                        cause: c,
+                                        retry_hint: 0,
+                                        retry_after: None,
+                                    },
+                                )
+                            };
+                            match st.run_belongs_to_tenant(&run_id, &tenant) {
+                                Ok(true) => {}
+                                Ok(false) => return invalid(format!("run not found: {run_id}")),
+                                Err(e) => return invalid(format!("run.discard: {e}")),
+                            }
+                            match st.discard_run(&run_id) {
+                                Ok(state) => {
+                                    let body = serde_json::json!({
+                                        "run_id": run_id, "apply_status": state,
+                                    });
+                                    match serde_json::to_vec(&body) {
+                                        Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                        Err(e) => invalid(format!("run.discard encode: {e}")),
+                                    }
+                                }
+                                Err(e) => invalid(format!("run.discard: {e}")),
                             }
                         }
                     },

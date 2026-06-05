@@ -1509,6 +1509,10 @@ name = "spine_run_artifact_preview"
 method = "run.artifact_preview"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_run_artifact_diff"
+method = "run.artifact_diff"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_run_review"
 method = "run.review"
 allow_groups = ["chat-users"]
@@ -1519,6 +1523,10 @@ allow_groups = ["chat-users"]
 [[rules]]
 name = "spine_run_apply"
 method = "run.apply"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_run_discard"
+method = "run.discard"
 allow_groups = ["chat-users"]
 [[rules]]
 name = "spine_run_events_recent"

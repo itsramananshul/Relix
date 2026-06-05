@@ -2210,7 +2210,7 @@ fn run_stream_event_name(chronicle_type: &str) -> Option<&'static str> {
         "brief.run_cancel_requested" => Some("run_cancel_requested"),
         "brief.board_moved" => Some("brief_moved"),
         "brief.run_reviewed" => Some("review_changed"),
-        "brief.run_applied" => Some("apply_changed"),
+        "brief.run_applied" | "brief.run_discarded" => Some("apply_changed"),
         _ => None,
     }
 }
@@ -3637,6 +3637,7 @@ mod tests {
         assert_eq!(run_stream_event_name("brief.board_moved"), Some("brief_moved"));
         assert_eq!(run_stream_event_name("brief.run_reviewed"), Some("review_changed"));
         assert_eq!(run_stream_event_name("brief.run_applied"), Some("apply_changed"));
+        assert_eq!(run_stream_event_name("brief.run_discarded"), Some("apply_changed"));
         // Non-execution chronicle types are not forwarded on this stream.
         assert_eq!(run_stream_event_name("brief.comment"), None);
         assert_eq!(run_stream_event_name("brief.created"), None);
