@@ -12,7 +12,7 @@ use axum::{
     body::Body,
     extract::{Path, Query, State},
     http::{HeaderName, HeaderValue, StatusCode, header},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,15 @@ const DEFAULT_PEER: &str = "coordinator";
 /// The self-contained spine board page (inline HTML/JS/CSS, no
 /// bundler / CDN — baked into the binary, same convention as
 /// `/dashboard`). It fetches the `/v1/spine/*` routes below.
+///
+/// QUARANTINED (Phase 2 Slice 1): this interim spine board is NO LONGER a
+/// product surface. `/spine` now redirects to the canonical React dashboard
+/// (`apps/dashboard`, served at `/dashboard`). The HTML is retained ONLY as
+/// an explicit internal/debug fallback, reachable by setting
+/// `RELIX_ENABLE_LEGACY_SPINE=1`. It is safe to delete this file + the
+/// `legacy_page` handler once Phase 2 Slice 2 confirms full React parity for
+/// the spine board (Mandates / Briefs / Crew / Desk). The `/v1/spine/*` JSON
+/// routes below are the real, supported API and stay.
 const SPINE_HTML: &str = include_str!("spine_dashboard.html");
 
 /// Per-route CSP allowing the page's inline `<script>`/`<style>`,
@@ -39,8 +48,34 @@ const SPINE_CSP: &str = "default-src 'self'; \
                          img-src 'self' data:; \
                          connect-src 'self'";
 
-/// `GET /spine` — the product-spine board page.
+/// Whether the quarantined legacy spine board should still be served at
+/// `/spine`. Off by default (Phase 2 Slice 1) so `/spine` redirects to the
+/// canonical React dashboard; flip `RELIX_ENABLE_LEGACY_SPINE=1` only for
+/// internal/debug use of the old board.
+fn legacy_spine_enabled() -> bool {
+    std::env::var("RELIX_ENABLE_LEGACY_SPINE")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// `GET /spine` — Phase 2 Slice 1: the React dashboard is the canonical
+/// product surface. `/spine` now **redirects to `/dashboard`** so an operator
+/// can never accidentally land on the old interim board and think Relix is
+/// broken/old. The legacy board is served ONLY when
+/// `RELIX_ENABLE_LEGACY_SPINE=1` (explicit internal/debug fallback).
 pub async fn page() -> Response {
+    if legacy_spine_enabled() {
+        return legacy_page().await;
+    }
+    // 307 keeps the method (a GET stays a GET) and — unlike 301/308 — is not
+    // permanently cached, so the redirect can evolve as the product does.
+    Redirect::temporary("/dashboard").into_response()
+}
+
+/// The quarantined interim spine board (see [`SPINE_HTML`]). Reachable only
+/// via `RELIX_ENABLE_LEGACY_SPINE=1` (and directly in tests). Not a product
+/// surface — kept as an internal fallback until React parity is proven.
+pub async fn legacy_page() -> Response {
     let xcto = HeaderName::from_static("x-content-type-options");
     match Response::builder()
         .status(StatusCode::OK)
@@ -1443,9 +1478,28 @@ mod tests {
         assert_eq!(parse_event_lines(b""), serde_json::json!([]));
     }
 
+    /// Phase 2 Slice 1: `/spine` redirects to the canonical React dashboard
+    /// by default (no `RELIX_ENABLE_LEGACY_SPINE`), so an operator never lands
+    /// on the old interim board. 307 keeps the method and isn't permanently
+    /// cached.
     #[tokio::test]
-    async fn spine_page_is_html_with_inline_csp() {
+    async fn spine_page_redirects_to_dashboard_by_default() {
+        // The test process does not set RELIX_ENABLE_LEGACY_SPINE.
         let resp = page().await;
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(loc, "/dashboard", "must redirect to the React dashboard");
+    }
+
+    /// The quarantined legacy board still renders as inline-CSP HTML when
+    /// explicitly requested (the `RELIX_ENABLE_LEGACY_SPINE` fallback path).
+    #[tokio::test]
+    async fn spine_legacy_page_is_html_with_inline_csp() {
+        let resp = legacy_page().await;
         assert_eq!(resp.status(), StatusCode::OK);
         let ctype = resp
             .headers()

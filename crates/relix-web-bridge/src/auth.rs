@@ -250,10 +250,14 @@ fn forbidden_csrf() -> Response {
 /// The dashboard SPA + its login endpoints are public so an operator can
 /// reach the login screen before they hold any credential:
 /// - `/dashboard` and `/dashboard/*` serve the static SPA bundle.
+/// - `/spine` is a public redirect to `/dashboard` (Phase 2 Slice 1 — the
+///   legacy board is retired as a product surface; exposing only a redirect
+///   leaks nothing, and keeping it public means an old `/spine` bookmark
+///   lands cleanly on the React dashboard instead of a raw 401).
 /// - `/v1/auth/*` are the login surface; each self-gates (login/setup
 ///   verify credentials; me/logout read the session cookie).
 fn is_public_path(path: &str) -> bool {
-    matches!(path, "/health" | "/dashboard")
+    matches!(path, "/health" | "/dashboard" | "/spine")
         || path.starts_with("/dashboard/")
         || path.starts_with("/assets/")
         || path.starts_with("/v1/auth/")
@@ -529,12 +533,17 @@ mod tests {
     fn is_public_path_only_matches_three_routes_and_assets() {
         assert!(is_public_path("/health"));
         assert!(is_public_path("/dashboard"));
+        // `/spine` is a public redirect to /dashboard (Phase 2 Slice 1).
+        assert!(is_public_path("/spine"));
         assert!(is_public_path("/v1/auth/token"));
         assert!(is_public_path("/assets/main.css"));
         assert!(is_public_path("/v1/bridge-back/briefs/b/comment"));
         assert!(!is_public_path("/chat"));
         assert!(!is_public_path("/v1/tasks"));
+        // The `/v1/spine/*` JSON API stays authenticated — only the bare
+        // `/spine` redirect is public.
         assert!(!is_public_path("/v1/spine/briefs/b/comment"));
+        assert!(!is_public_path("/v1/spine/board"));
         assert!(!is_public_path("/v1/health"));
     }
 

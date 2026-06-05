@@ -729,4 +729,49 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
         }
     }
+
+    /// Phase 2 Slice 1 — generated-dist parity guard. The committed React
+    /// bundle must be present (so `/dashboard` serves React, NEVER the legacy
+    /// HTML fallback) AND its `index.html` must reference only assets that
+    /// actually exist in the bundle. This catches the classic dist-drift bug
+    /// — `index.html` pointing at a stale hashed bundle after a forgotten
+    /// `npm run build` — at test time instead of as a blank page in prod.
+    #[test]
+    fn committed_react_dist_present_and_index_references_existing_assets() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("dashboard-dist");
+        let index = dir.join("index.html");
+        assert!(
+            index.is_file(),
+            "committed React dist missing index.html at {} — run `npm run build` in apps/dashboard",
+            index.display()
+        );
+        let html = std::fs::read_to_string(&index).expect("read dist index.html");
+        // It must be the React shell (Vite mounts into #root), not the
+        // legacy single-file page.
+        assert!(html.contains("id=\"root\""), "dist index.html is not the React shell");
+        // Every `/dashboard/assets/<file>` reference must resolve to a real
+        // file in the bundle.
+        let needle = "/dashboard/assets/";
+        let mut rest = html.as_str();
+        let mut checked = 0;
+        while let Some(i) = rest.find(needle) {
+            rest = &rest[i + needle.len()..];
+            let end = rest.find(['"', '\'']).unwrap_or(rest.len());
+            let asset = &rest[..end];
+            assert!(!asset.is_empty(), "empty asset reference in dist index.html");
+            assert!(
+                dir.join("assets").join(asset).is_file(),
+                "index.html references a missing bundle asset `{asset}` — rebuild apps/dashboard so dashboard-dist is in sync"
+            );
+            checked += 1;
+            rest = &rest[end..];
+        }
+        assert!(checked >= 1, "dist index.html referenced no /dashboard/assets/* bundle — the build looks wrong");
+        // And the resolver must pick this committed bundle up, so the bridge
+        // serves React at /dashboard (not the legacy fallback) in this repo.
+        assert!(
+            resolve_spa_dir().is_some(),
+            "resolve_spa_dir() should find the committed React bundle"
+        );
+    }
 }
