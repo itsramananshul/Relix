@@ -1807,6 +1807,9 @@ fn execute_ready_inner(
     // background thread; the wait loop polls the cancel flag.
     let run = rig.run_transcript(&req);
     let outcome = run.outcome;
+    // Persist the usage/cost/session parsed from the adapter output (TG6);
+    // a no-op when nothing was captured (echo / raw / no usage).
+    let _ = store.set_run_usage(&run_id, &run.usage);
     // Persist the parsed adapter events (already redacted + bounded).
     for ev in &run.events {
         let _ = store.append_run_event(

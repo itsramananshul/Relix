@@ -2517,6 +2517,38 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Persist the usage/cost/session captured from a run's adapter output
+    /// (TG6). A no-op when nothing was captured (echo / raw / no usage), so
+    /// absent fields stay NULL — never faked. Best-effort.
+    pub fn set_run_usage(
+        &self,
+        run_id: &str,
+        usage: &crate::rig::RunUsage,
+    ) -> Result<(), CoordinatorError> {
+        if usage.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        conn.execute(
+            "UPDATE brief_runs
+             SET provider = ?1, model = ?2, input_tokens = ?3, output_tokens = ?4,
+                 cached_input_tokens = ?5, cost_micros = ?6, session_id = ?7
+             WHERE run_id = ?8",
+            params![
+                usage.provider,
+                usage.model,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cached_input_tokens,
+                usage.cost_micros,
+                usage.session_id,
+                run_id
+            ],
+        )
+        .map_err(CoordinatorError::Db)?;
+        Ok(())
+    }
+
     /// Recover stale `running` runs left behind after a coordinator
     /// crash/restart. Any `brief_runs` row still `running` whose `run_id` is
     /// NOT in `live` (the set of run_ids with a live in-process child handle —
@@ -2951,7 +2983,8 @@ impl TaskStore {
                         workspace, workspace_context, workspace_files, workspace_bytes,
                         review, review_note, reviewed_at,
                         apply_status, applied_at, apply_note, applied_files, failed_files,
-                        trigger
+                        trigger, provider, model, input_tokens, output_tokens,
+                        cached_input_tokens, cost_micros, session_id
                  FROM brief_runs
                  ORDER BY started_at DESC, rowid DESC
                  LIMIT ?1",
@@ -2982,7 +3015,8 @@ impl TaskStore {
                         workspace, workspace_context, workspace_files, workspace_bytes,
                         review, review_note, reviewed_at,
                         apply_status, applied_at, apply_note, applied_files, failed_files,
-                        trigger
+                        trigger, provider, model, input_tokens, output_tokens,
+                        cached_input_tokens, cost_micros, session_id
                  FROM brief_runs
                  WHERE brief_id = ?1
                  ORDER BY started_at DESC, rowid DESC
@@ -3008,7 +3042,8 @@ impl TaskStore {
                         workspace, workspace_context, workspace_files, workspace_bytes,
                         review, review_note, reviewed_at,
                         apply_status, applied_at, apply_note, applied_files, failed_files,
-                        trigger
+                        trigger, provider, model, input_tokens, output_tokens,
+                        cached_input_tokens, cost_micros, session_id
                  FROM brief_runs WHERE run_id = ?1",
                 params![run_id],
                 RunRecord::from_row,
@@ -7720,6 +7755,22 @@ pub struct RunRecord {
     /// `unknown`. `None` for legacy rows (pre-unification).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
+    // Usage / cost / session captured from adapter output (TG6); `None`
+    // when the adapter emitted nothing parseable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// One reviewable run artifact (`run_artifacts`) — metadata about a file
@@ -7906,6 +7957,13 @@ impl RunRecord {
             applied_files: r.get(18)?,
             failed_files: r.get(19)?,
             trigger: r.get(20)?,
+            provider: r.get(21)?,
+            model: r.get(22)?,
+            input_tokens: r.get(23)?,
+            output_tokens: r.get(24)?,
+            cached_input_tokens: r.get(25)?,
+            cost_micros: r.get(26)?,
+            session_id: r.get(27)?,
         })
     }
 }
@@ -12510,6 +12568,18 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             -- autonomous runs share this one ledger — the trigger is the
             -- only thing that distinguishes them.
             trigger       TEXT,
+            -- Usage / cost / session captured from the adapter's structured
+            -- output (Claude stream-json / Codex JSONL). NULL when the
+            -- adapter (echo / raw) or run emitted nothing — never faked.
+            -- `cost_micros` is micro-USD; `session_id` is the resumable
+            -- adapter session id when emitted.
+            provider      TEXT,
+            model         TEXT,
+            input_tokens  INTEGER,
+            output_tokens INTEGER,
+            cached_input_tokens INTEGER,
+            cost_micros   INTEGER,
+            session_id    TEXT,
             FOREIGN KEY (brief_id) REFERENCES tasks(task_id)
         );
         CREATE INDEX IF NOT EXISTS brief_runs_by_brief
@@ -12758,6 +12828,14 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         // Execution trigger (manual / heartbeat / scheduled) — unify the
         // manual + autonomous run ledger under one stream.
         "ALTER TABLE brief_runs ADD COLUMN trigger TEXT",
+        // Usage / cost / session capture (TG6).
+        "ALTER TABLE brief_runs ADD COLUMN provider TEXT",
+        "ALTER TABLE brief_runs ADD COLUMN model TEXT",
+        "ALTER TABLE brief_runs ADD COLUMN input_tokens INTEGER",
+        "ALTER TABLE brief_runs ADD COLUMN output_tokens INTEGER",
+        "ALTER TABLE brief_runs ADD COLUMN cached_input_tokens INTEGER",
+        "ALTER TABLE brief_runs ADD COLUMN cost_micros INTEGER",
+        "ALTER TABLE brief_runs ADD COLUMN session_id TEXT",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the
@@ -22194,5 +22272,33 @@ mod tests {
         // Second pass finds nothing (the run is now terminal).
         let second = s.recover_stale_runs(&std::collections::HashSet::new()).unwrap();
         assert!(second.is_empty(), "idempotent: {second:?}");
+    }
+
+    #[test]
+    fn set_run_usage_round_trips_and_empty_is_noop() {
+        let s = store();
+        let b = brief(&s, "usage run");
+        running_run(&s, "run_u", &b, "agt_a");
+        let usage = crate::rig::RunUsage {
+            provider: Some("anthropic".into()),
+            model: Some("claude-x".into()),
+            input_tokens: Some(100),
+            output_tokens: Some(42),
+            cached_input_tokens: Some(7),
+            cost_micros: Some(12_300),
+            session_id: Some("sess-1".into()),
+        };
+        s.set_run_usage("run_u", &usage).unwrap();
+        let run = s.get_run("run_u").unwrap().unwrap();
+        assert_eq!(run.provider.as_deref(), Some("anthropic"));
+        assert_eq!(run.model.as_deref(), Some("claude-x"));
+        assert_eq!(run.input_tokens, Some(100));
+        assert_eq!(run.output_tokens, Some(42));
+        assert_eq!(run.cached_input_tokens, Some(7));
+        assert_eq!(run.cost_micros, Some(12_300));
+        assert_eq!(run.session_id.as_deref(), Some("sess-1"));
+        // Empty usage must not clobber the stored values.
+        s.set_run_usage("run_u", &crate::rig::RunUsage::default()).unwrap();
+        assert_eq!(s.get_run("run_u").unwrap().unwrap().provider.as_deref(), Some("anthropic"));
     }
 }

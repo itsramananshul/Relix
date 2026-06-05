@@ -161,6 +161,9 @@ impl RigEvent {
 pub struct RigRun {
     pub outcome: RigOutcome,
     pub events: Vec<RigEvent>,
+    /// Usage / cost / session parsed from the adapter's structured output.
+    /// Empty for the default (echo / raw) path.
+    pub usage: RunUsage,
 }
 
 /// Process-global registry of in-flight, cancellable runs. A run
@@ -619,6 +622,7 @@ pub trait Rig: Send + Sync {
         RigRun {
             outcome: self.run(req),
             events: Vec::new(),
+            usage: RunUsage::default(),
         }
     }
 }
@@ -929,6 +933,139 @@ pub fn parse_codex_jsonl(stdout: &str) -> Option<CodexRunResult> {
     } else {
         None
     }
+}
+
+/// Usage / cost / session captured from a CLI adapter's structured output.
+/// EVERY field is optional — absent or unparseable data stays `None` and is
+/// stored as NULL on the run ledger (never faked).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunUsage {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    /// Cost in micro-USD (1e-6 USD), derived from the adapter's reported
+    /// cost when present.
+    pub cost_micros: Option<i64>,
+    pub session_id: Option<String>,
+}
+
+impl RunUsage {
+    /// True when nothing was captured (no column should be written).
+    pub fn is_empty(&self) -> bool {
+        self.provider.is_none()
+            && self.model.is_none()
+            && self.input_tokens.is_none()
+            && self.output_tokens.is_none()
+            && self.cached_input_tokens.is_none()
+            && self.cost_micros.is_none()
+            && self.session_id.is_none()
+    }
+}
+
+/// Extract usage/cost/model/session from Claude Code `stream-json` stdout:
+/// the terminal `result` event's `usage` + `total_cost_usd` + `session_id`,
+/// plus the model from a `system`/assistant event. Robust to malformed lines
+/// (skipped) — returns an empty [`RunUsage`] when nothing parses (never
+/// panics, never fakes a value).
+pub fn parse_claude_usage(stdout: &str) -> RunUsage {
+    let mut u = RunUsage::default();
+    let mut model: Option<String> = None;
+    let mut saw_result = false;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if model.is_none() {
+            if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
+                model = Some(m.to_string());
+            } else if let Some(m) = v
+                .get("message")
+                .and_then(|x| x.get("model"))
+                .and_then(|m| m.as_str())
+            {
+                model = Some(m.to_string());
+            }
+        }
+        if v.get("type").and_then(|t| t.as_str()) != Some("result") {
+            continue;
+        }
+        saw_result = true;
+        if let Some(usage) = v.get("usage") {
+            u.input_tokens = usage.get("input_tokens").and_then(|x| x.as_i64());
+            u.output_tokens = usage.get("output_tokens").and_then(|x| x.as_i64());
+            u.cached_input_tokens = usage.get("cache_read_input_tokens").and_then(|x| x.as_i64());
+        }
+        if let Some(cost) = v.get("total_cost_usd").and_then(|c| c.as_f64()) {
+            u.cost_micros = Some((cost * 1_000_000.0).round() as i64);
+        }
+        if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
+            u.session_id = Some(sid.to_string());
+        }
+    }
+    if saw_result {
+        u.provider = Some("anthropic".to_string());
+        u.model = model;
+    }
+    u
+}
+
+/// Extract usage/model/session from Codex `exec --json` (JSONL) stdout:
+/// `turn.completed.usage` (input/output/cached tokens) + the resumable
+/// thread id (`thread.started`). Codex does not emit a per-run cost, so
+/// `cost_micros` stays `None`. Robust to malformed lines; never panics.
+pub fn parse_codex_usage(stdout: &str) -> RunUsage {
+    let mut u = RunUsage::default();
+    let mut saw_codex = false;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if matches!(ty, "thread.started" | "turn.started" | "turn.completed")
+            || ty.starts_with("item.")
+        {
+            saw_codex = true;
+        }
+        if u.session_id.is_none() {
+            if let Some(tid) = v.get("thread_id").and_then(|t| t.as_str()) {
+                u.session_id = Some(tid.to_string());
+            } else if let Some(tid) = v
+                .get("thread")
+                .and_then(|t| t.get("id"))
+                .and_then(|t| t.as_str())
+            {
+                u.session_id = Some(tid.to_string());
+            }
+        }
+        if u.model.is_none()
+            && let Some(m) = v.get("model").and_then(|m| m.as_str())
+        {
+            u.model = Some(m.to_string());
+        }
+        if ty == "turn.completed"
+            && let Some(usage) = v.get("usage")
+        {
+            u.input_tokens = usage.get("input_tokens").and_then(|x| x.as_i64());
+            u.output_tokens = usage.get("output_tokens").and_then(|x| x.as_i64());
+            u.cached_input_tokens = usage.get("cached_input_tokens").and_then(|x| x.as_i64());
+        }
+    }
+    if saw_codex {
+        u.provider = Some("openai".to_string());
+    } else {
+        u = RunUsage::default();
+    }
+    u
 }
 
 /// Max bytes for a single transcript-event message / payload before it is
@@ -1359,8 +1496,8 @@ impl Rig for ProcessRig {
     }
 
     fn run_transcript(&self, req: &RigRunRequest) -> RigRun {
-        let (outcome, events) = self.execute(req);
-        RigRun { outcome, events }
+        let (outcome, events, usage) = self.execute(req);
+        RigRun { outcome, events, usage }
     }
 }
 
@@ -1369,7 +1506,7 @@ impl ProcessRig {
     /// output, poll the [`CancelRegistry`] (kill on cancel), and — for CLI
     /// adapters — parse the JSONL into BOTH a clean outcome AND transcript
     /// events. `run` / `run_transcript` are thin wrappers over this.
-    fn execute(&self, req: &RigRunRequest) -> (RigOutcome, Vec<RigEvent>) {
+    fn execute(&self, req: &RigRunRequest) -> (RigOutcome, Vec<RigEvent>, RunUsage) {
         use std::io::{Read, Write};
         use std::process::Stdio;
 
@@ -1387,6 +1524,7 @@ impl ProcessRig {
                     retryable: false,
                 },
                 Vec::new(),
+                RunUsage::default(),
             );
         }
 
@@ -1400,6 +1538,7 @@ impl ProcessRig {
                     retryable: false,
                 },
                 Vec::new(),
+                RunUsage::default(),
             );
         };
         let mut command = command_for(&spawn, &self.args);
@@ -1427,6 +1566,7 @@ impl ProcessRig {
                         retryable: true,
                     },
                     Vec::new(),
+                    RunUsage::default(),
                 );
             }
         };
@@ -1516,6 +1656,7 @@ impl ProcessRig {
                             retryable: true,
                         },
                         Vec::new(),
+                        RunUsage::default(),
                     );
                 }
             }
@@ -1541,6 +1682,14 @@ impl ProcessRig {
         // Build the transcript events from the captured output (already
         // bounded + redacted inside the extractors).
         let events = self.transcript_events(&raw_stdout, &stdout, &stderr, &req.bridge_token);
+        // Usage/cost/session from the structured output (empty for raw/echo
+        // or when the adapter emitted nothing parseable). Captured even on a
+        // cancel/timeout/non-zero exit — a partial run still consumed tokens.
+        let usage = match self.output_format {
+            RigOutputFormat::ClaudeStreamJson => parse_claude_usage(&raw_stdout),
+            RigOutputFormat::CodexJsonl => parse_codex_usage(&raw_stdout),
+            RigOutputFormat::Raw => RunUsage::default(),
+        };
 
         match end {
             End::Cancelled => (
@@ -1549,6 +1698,7 @@ impl ProcessRig {
                     retryable: false,
                 },
                 events,
+                usage,
             ),
             End::TimedOut => (
                 RigOutcome::Failed {
@@ -1556,6 +1706,7 @@ impl ProcessRig {
                     retryable: true,
                 },
                 events,
+                usage,
             ),
             End::Exited(status) => {
                 // Claude's terminal `result` event is authoritative — it
@@ -1565,15 +1716,15 @@ impl ProcessRig {
                 if matches!(self.output_format, RigOutputFormat::ClaudeStreamJson)
                     && let Some(outcome) = self.claude_outcome(&raw_stdout, &req.bridge_token)
                 {
-                    return (outcome, events);
+                    return (outcome, events, usage);
                 }
                 if matches!(self.output_format, RigOutputFormat::CodexJsonl)
                     && let Some(outcome) = self.codex_outcome(&raw_stdout, &req.bridge_token)
                 {
-                    return (outcome, events);
+                    return (outcome, events, usage);
                 }
                 if status.success() {
-                    (RigOutcome::Done { summary: stdout }, events)
+                    (RigOutcome::Done { summary: stdout }, events, usage)
                 } else {
                     let code = status
                         .code()
@@ -1586,6 +1737,7 @@ impl ProcessRig {
                             retryable: true,
                         },
                         events,
+                        usage,
                     )
                 }
             }
@@ -3089,6 +3241,71 @@ mod tests {
     fn parse_codex_jsonl_none_without_events() {
         assert!(parse_codex_jsonl("not json\n\n{bad").is_none());
         assert!(parse_codex_jsonl("").is_none());
+    }
+
+    // ── Usage / cost / session capture (TG6) ──────────────────────
+
+    #[test]
+    fn parse_claude_usage_extracts_tokens_cost_model_session() {
+        let stdout = concat!(
+            r#"{"type":"system","subtype":"init","model":"claude-sonnet-4"}"#,
+            "\n",
+            r#"{"type":"result","is_error":false,"result":"done","session_id":"sess-abc","total_cost_usd":0.0123,"usage":{"input_tokens":100,"output_tokens":42,"cache_read_input_tokens":7}}"#,
+            "\n",
+        );
+        let u = parse_claude_usage(stdout);
+        assert_eq!(u.provider.as_deref(), Some("anthropic"));
+        assert_eq!(u.model.as_deref(), Some("claude-sonnet-4"));
+        assert_eq!(u.input_tokens, Some(100));
+        assert_eq!(u.output_tokens, Some(42));
+        assert_eq!(u.cached_input_tokens, Some(7));
+        assert_eq!(u.cost_micros, Some(12_300)); // 0.0123 USD -> micros
+        assert_eq!(u.session_id.as_deref(), Some("sess-abc"));
+        assert!(!u.is_empty());
+    }
+
+    #[test]
+    fn parse_claude_usage_none_without_result_event() {
+        let u = parse_claude_usage(r#"{"type":"system","subtype":"init","model":"x"}"#);
+        assert!(u.is_empty(), "no terminal result -> empty (never faked)");
+    }
+
+    #[test]
+    fn parse_usage_tolerates_malformed_lines() {
+        // A non-JSON line + a result with garbage usage/cost must not panic
+        // and must leave the unparseable fields null.
+        let stdout = concat!(
+            "not json at all\n",
+            r#"{"type":"result","usage":"garbage","total_cost_usd":"oops"}"#,
+            "\n",
+        );
+        let u = parse_claude_usage(stdout);
+        assert_eq!(u.provider.as_deref(), Some("anthropic")); // a result was seen
+        assert!(u.input_tokens.is_none());
+        assert!(u.cost_micros.is_none());
+    }
+
+    #[test]
+    fn parse_codex_usage_extracts_tokens_and_session_no_cost() {
+        let stdout = concat!(
+            r#"{"type":"thread.started","thread_id":"th-1"}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":26335,"output_tokens":21,"cached_input_tokens":10}}"#,
+            "\n",
+        );
+        let u = parse_codex_usage(stdout);
+        assert_eq!(u.provider.as_deref(), Some("openai"));
+        assert_eq!(u.input_tokens, Some(26335));
+        assert_eq!(u.output_tokens, Some(21));
+        assert_eq!(u.cached_input_tokens, Some(10));
+        assert_eq!(u.session_id.as_deref(), Some("th-1"));
+        assert!(u.cost_micros.is_none(), "codex emits no per-run cost");
+    }
+
+    #[test]
+    fn parse_codex_usage_empty_for_non_codex() {
+        assert!(parse_codex_usage("hello world\n{}").is_empty());
+        assert!(parse_codex_usage("").is_empty());
     }
 
     fn codex_test_rig() -> ProcessRig {
