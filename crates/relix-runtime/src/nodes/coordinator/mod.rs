@@ -2517,6 +2517,66 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Recover stale `running` runs left behind after a coordinator
+    /// crash/restart. Any `brief_runs` row still `running` whose `run_id` is
+    /// NOT in `live` (the set of run_ids with a live in-process child handle —
+    /// EMPTY on a fresh boot, so every leftover `running` row is stale) is:
+    ///   1. marked terminal `failed` with a clear, honest reason,
+    ///   2. given a `recovered` run-transcript event + a `brief.run_recovered`
+    ///      Chronicle note (so the operator sees what happened),
+    ///   3. has its Brief Claim released (so the work can be re-dispatched).
+    /// Terminal runs are NEVER touched, and a genuinely-live run (present in
+    /// `live`) is left alone. Returns the recovered run_ids.
+    pub fn recover_stale_runs(
+        &self,
+        live: &std::collections::HashSet<String>,
+    ) -> Result<Vec<String>, CoordinatorError> {
+        const REASON: &str =
+            "Recovered after process restart; no live child process was found.";
+        // Snapshot the running rows under one lock, then mutate through the
+        // existing methods (each takes its own lock) to avoid re-entrancy.
+        let rows: Vec<(String, String, String)> = {
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT run_id, brief_id, agent_id FROM brief_runs WHERE status = 'running'",
+                )
+                .map_err(CoordinatorError::Db)?;
+            let mapped = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(CoordinatorError::Db)?;
+            let mut out = Vec::new();
+            for r in mapped {
+                out.push(r.map_err(CoordinatorError::Db)?);
+            }
+            out
+        };
+        let mut recovered = Vec::new();
+        for (run_id, brief_id, agent_id) in rows {
+            if live.contains(&run_id) {
+                continue; // genuinely live — never mark a live run stale
+            }
+            self.record_run_finish(&run_id, "failed", REASON)?;
+            let _ = self.append_run_event(&run_id, "recovered", "relix", REASON, None, false);
+            let _ = self.append_event(
+                &brief_id,
+                "brief.run_recovered",
+                &format!("run {run_id}: {REASON}"),
+            );
+            if !agent_id.trim().is_empty() {
+                let _ = self.release_claim(&brief_id, &agent_id);
+            }
+            recovered.push(run_id);
+        }
+        Ok(recovered)
+    }
+
     /// True iff `run_id`'s Brief belongs to `tenant` (so a caller scoped to
     /// one Guild can't read another's run artifacts/preview/review). A
     /// missing run / cross-tenant run both return false — no existence leak.
@@ -22050,5 +22110,89 @@ mod tests {
             payload.contains("drift_detected=false"),
             "payload: {payload}"
         );
+    }
+
+    // ── Boot recovery for stale running runs (TG3) ──────────────────
+
+    fn brief(s: &TaskStore, title: &str) -> String {
+        s.create(title, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .unwrap()
+    }
+    fn running_run(s: &TaskStore, run_id: &str, brief_id: &str, agent: &str) {
+        s.record_run_start(
+            run_id,
+            brief_id,
+            agent,
+            "echo",
+            "manual",
+            &RunWorkspaceInfo::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn recover_stale_runs_fails_releases_claim_and_records_event() {
+        let s = store();
+        let b = brief(&s, "stale work");
+        // Claim the Brief + open a running run (simulating a crashed run).
+        assert!(s.claim_brief_for_run(&b, "agt_a", 300, Some("run_x")).unwrap());
+        running_run(&s, "run_x", &b, "agt_a");
+        assert!(s.claim_holder(&b).unwrap().is_some(), "claim held before recovery");
+
+        // Fresh boot → empty live set → the run is stale.
+        let recovered = s.recover_stale_runs(&std::collections::HashSet::new()).unwrap();
+        assert_eq!(recovered, vec!["run_x".to_string()]);
+
+        // The run is now terminally failed with an honest reason.
+        let run = s.get_run("run_x").unwrap().unwrap();
+        assert_eq!(run.status, "failed");
+        assert!(run.summary.contains("Recovered after process restart"), "got: {}", run.summary);
+        assert!(run.finished_at.is_some());
+
+        // The Brief Claim is released (re-dispatchable).
+        assert!(s.claim_holder(&b).unwrap().is_none(), "claim released after recovery");
+
+        // A `recovered` run-transcript event + a Chronicle note were recorded.
+        let kinds: Vec<String> = s
+            .list_run_events("run_x", 50)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(kinds.contains(&"recovered".to_string()), "kinds: {kinds:?}");
+        let chron = s
+            .query_events(&b, 0, 50, Some("brief.run_recovered"), EventOrder::Desc)
+            .unwrap();
+        assert_eq!(chron.len(), 1, "one recovery chronicle note");
+    }
+
+    #[test]
+    fn recover_stale_runs_leaves_live_and_terminal_runs_alone() {
+        let s = store();
+        let b = brief(&s, "mixed runs");
+        running_run(&s, "run_live", &b, "agt_a"); // still running, but in `live`
+        running_run(&s, "run_done", &b, "agt_a");
+        s.record_run_finish("run_done", "done", "ok").unwrap(); // terminal
+
+        let mut live = std::collections::HashSet::new();
+        live.insert("run_live".to_string());
+        let recovered = s.recover_stale_runs(&live).unwrap();
+        assert!(recovered.is_empty(), "nothing stale: {recovered:?}");
+
+        // Live run untouched; terminal run untouched.
+        assert_eq!(s.get_run("run_live").unwrap().unwrap().status, "running");
+        assert_eq!(s.get_run("run_done").unwrap().unwrap().status, "done");
+    }
+
+    #[test]
+    fn recover_stale_runs_is_idempotent() {
+        let s = store();
+        let b = brief(&s, "double recover");
+        running_run(&s, "run_y", &b, "agt_a");
+        let first = s.recover_stale_runs(&std::collections::HashSet::new()).unwrap();
+        assert_eq!(first.len(), 1);
+        // Second pass finds nothing (the run is now terminal).
+        let second = s.recover_stale_runs(&std::collections::HashSet::new()).unwrap();
+        assert!(second.is_empty(), "idempotent: {second:?}");
     }
 }

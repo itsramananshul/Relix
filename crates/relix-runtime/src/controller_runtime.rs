@@ -7454,6 +7454,22 @@ fn register_node_type_handlers(
                 Ok(_) => tracing::info!("coordinator startup: recovery scan found no stale tasks"),
                 Err(e) => tracing::error!(error = %e, "coordinator startup: recovery scan failed"),
             }
+            // Run-ledger recovery: every `brief_runs` row still `running` at
+            // boot is stale — its child process died with the previous
+            // coordinator (the in-memory handle is gone). Mark it `failed`,
+            // record a `recovered` event, and release its Brief Claim so the
+            // work can be re-dispatched. The live set is empty on a fresh
+            // boot, so this reconciles all leftover running runs.
+            match store.recover_stale_runs(&std::collections::HashSet::new()) {
+                Ok(ids) if !ids.is_empty() => tracing::warn!(
+                    recovered = ids.len(),
+                    "coordinator startup: recovered stale `running` brief runs (no live child process)"
+                ),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "coordinator startup: run-ledger recovery failed")
+                }
+            }
         }
         // Background chronicle retention. Only spawns when
         // `[coordinator.retention] enabled = true`; the dry-run
