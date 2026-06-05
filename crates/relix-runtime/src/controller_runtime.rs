@@ -9314,6 +9314,16 @@ fn register_node_type_handlers(
                                 None,
                                 false,
                             );
+                            // Surface the cancel request on the Brief's
+                            // chronicle so the execution event stream
+                            // (`run_cancel_requested`) sees it.
+                            if let Some(rec) = record.as_ref() {
+                                let _ = st.append_event(
+                                    &rec.brief_id,
+                                    "brief.run_cancel_requested",
+                                    &format!("run {run_id}: cancel requested (active={active})"),
+                                );
+                            }
                             let body = serde_json::json!({
                                 "run_id": run_id,
                                 "requested": true,

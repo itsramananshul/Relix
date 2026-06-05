@@ -2890,6 +2890,23 @@ impl TaskStore {
         if affected == 0 {
             return Err(CoordinatorError::NotFound(run_id.to_string()));
         }
+        // Surface the apply outcome on the Brief's chronicle so the execution
+        // event stream (`apply_changed`) sees it. Best-effort.
+        if let Ok(brief_id) = conn.query_row(
+            "SELECT brief_id FROM brief_runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get::<_, String>(0),
+        ) {
+            let _ = conn.execute(
+                "INSERT INTO task_events (task_id, ts, event_type, payload)
+                 VALUES (?1, ?2, 'brief.run_applied', ?3)",
+                params![
+                    brief_id,
+                    now,
+                    format!("run {run_id}: apply {status} (applied={applied_files}, failed={failed_files})")
+                ],
+            );
+        }
         Ok(())
     }
 
@@ -2974,6 +2991,20 @@ impl TaskStore {
                     params![decision, note, now, run_id],
                 )
                 .map_err(CoordinatorError::Db)?;
+                // Surface the review decision on the Brief's chronicle so the
+                // execution event stream (`review_changed`) sees it. The run
+                // always has a brief_id; skip silently if the lookup fails.
+                if let Ok(brief_id) = conn.query_row(
+                    "SELECT brief_id FROM brief_runs WHERE run_id = ?1",
+                    params![run_id],
+                    |r| r.get::<_, String>(0),
+                ) {
+                    let _ = conn.execute(
+                        "INSERT INTO task_events (task_id, ts, event_type, payload)
+                         VALUES (?1, ?2, 'brief.run_reviewed', ?3)",
+                        params![brief_id, now, format!("run {run_id}: {decision}")],
+                    );
+                }
                 Ok(decision.to_string())
             }
             Some(other) => Err(CoordinatorError::Invalid(format!(
@@ -5649,6 +5680,73 @@ impl TaskStore {
                     out.push(r.map_err(CoordinatorError::Db)?);
                 }
             }
+        }
+        Ok(out)
+    }
+
+    /// TG5 — the TENANT-SCOPED execution event firehose backing the
+    /// `GET /v1/runs/events/stream` SSE endpoint. Unlike
+    /// [`Self::recent_events_cross_task`] (the tenant-blind global tail),
+    /// this JOINs `task_events` to `tasks` so a Guild only ever sees its
+    /// own Briefs' execution transitions, and it filters to the
+    /// run/Brief lifecycle event types in [`RUN_STREAM_EVENT_TYPES`]
+    /// (run start/finish/recover, board move, cancel request, review,
+    /// apply). Newest-first by `event_id`; `since_event_id` is an
+    /// exclusive cursor for resumable polling.
+    pub fn recent_run_events(
+        &self,
+        tenant: &str,
+        since_event_id: i64,
+        limit: usize,
+    ) -> Result<Vec<(String, TaskEvent)>, CoordinatorError> {
+        let tenant = norm_tenant(tenant);
+        let cap = limit.clamp(1, self.max_list);
+        // Build the IN (...) list of execution event types as bound
+        // params so the set is the single source of truth.
+        let placeholders = RUN_STREAM_EVENT_TYPES
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 4))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT e.task_id, e.event_id, e.ts, e.event_type, e.payload,
+                    e.schema_version, e.attempt_id, e.trace_id, e.payload_json
+             FROM task_events e
+             JOIN tasks t ON t.task_id = e.task_id
+             WHERE e.event_id > ?1
+               AND COALESCE(t.tenant_id, 'default') = ?2
+               AND e.event_type IN ({placeholders})
+             ORDER BY e.event_id DESC LIMIT ?3"
+        );
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn.prepare(&sql).map_err(CoordinatorError::Db)?;
+        let cap_i64 = cap as i64;
+        let mut bind: Vec<&dyn rusqlite::types::ToSql> =
+            vec![&since_event_id, &tenant, &cap_i64];
+        for t in RUN_STREAM_EVENT_TYPES {
+            bind.push(t);
+        }
+        let rows = stmt
+            .query_map(bind.as_slice(), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    TaskEvent {
+                        event_id: r.get(1)?,
+                        ts: r.get(2)?,
+                        event_type: r.get(3)?,
+                        payload: r.get(4)?,
+                        schema_version: r.get(5)?,
+                        attempt_id: r.get(6)?,
+                        trace_id: r.get(7)?,
+                        payload_json: r.get(8)?,
+                    },
+                ))
+            })
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::with_capacity(cap);
+        for r in rows {
+            out.push(r.map_err(CoordinatorError::Db)?);
         }
         Ok(out)
     }
@@ -9282,6 +9380,16 @@ pub fn register(
     {
         let s = store.clone();
         bridge.register(
+            "run.events.recent",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_run_recent_events(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
             "task.interruption_check",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -11979,6 +12087,51 @@ fn handle_recent_events(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcom
     }
 }
 
+/// `run.events.recent` (TG5) — the TENANT-SCOPED execution event
+/// firehose backing the `GET /v1/runs/events/stream` SSE endpoint.
+/// Args: `since_event_id|limit` (both optional). Same JSON-lines shape
+/// as `task.recent_events` (one `{"task_id":...}` object per line,
+/// newest-first) but filtered to the run/Brief lifecycle event types
+/// and scoped to the caller's tenant so one Guild can't tail another's
+/// execution.
+fn handle_run_recent_events(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("run.events.recent utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(2, '|').collect();
+    let since: i64 = parts
+        .first()
+        .copied()
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let limit: usize = parts
+        .get(1)
+        .copied()
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+    let tenant = ctx.tenant_id_or_default().to_string();
+    match store.recent_run_events(&tenant, since, limit) {
+        Ok(rows) => {
+            let mut buf = String::new();
+            for (task_id, ev) in &rows {
+                let line = render_event_json(ev);
+                if let Some(rest) = line.strip_prefix('{') {
+                    buf.push_str(&format!(r#"{{"task_id":"{}","#, json_escape(task_id)));
+                    buf.push_str(rest);
+                } else {
+                    buf.push_str(&line);
+                }
+                buf.push('\n');
+            }
+            HandlerOutcome::Ok(buf.into_bytes())
+        }
+        Err(e) => internal(format!("run.events.recent: {e}")),
+    }
+}
+
 /// `task.lineage` — BFS execution lineage from a root task
 /// (M66). Args: `task_id|max_depth`. max_depth defaults to 4,
 /// clamped to `[1, 16]`. Returns a multi-line tab-delimited
@@ -13167,6 +13320,24 @@ fn brief_wakeup_from_row(r: &rusqlite::Row) -> rusqlite::Result<BriefWakeupRow> 
         finished_at: r.get(11)?,
     })
 }
+
+/// TG5 — the chronicle event types the run/Brief execution event stream
+/// (`GET /v1/runs/events/stream`) surfaces. Each maps to a normalized SSE
+/// event name in the bridge (`run_started`, `run_finished`, `brief_moved`,
+/// `run_cancel_requested`, `review_changed`, `apply_changed`). Keeping the
+/// set here makes the coordinator query and the bridge mapping agree on one
+/// vocabulary.
+pub const RUN_STREAM_EVENT_TYPES: &[&str] = &[
+    "brief.run_started",
+    "brief.shift_done",
+    "brief.dispatch_failed",
+    "brief.continued",
+    "brief.run_recovered",
+    "brief.board_moved",
+    "brief.run_cancel_requested",
+    "brief.run_reviewed",
+    "brief.run_applied",
+];
 
 fn self_unresolved_blockers_in_conn(
     conn: &Connection,
@@ -22674,5 +22845,47 @@ mod tests {
         assert_eq!(s.reset_runtime_state("default", "agt_x").unwrap(), 1);
         assert!(s.list_runtime_state("default", "agt_x").unwrap().is_empty());
         assert_eq!(s.list_runtime_state("default", "agt_y").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recent_run_events_filters_types_and_isolates_tenants() {
+        let s = store();
+        // Two Briefs in different Guilds.
+        let acme = s
+            .create_brief("acme", "acme brief", "subj", None, None, None, None)
+            .unwrap();
+        let globex = s
+            .create_brief("globex", "globex brief", "subj", None, None, None, None)
+            .unwrap();
+        // Execution-lifecycle events on each + a non-execution event that
+        // must be filtered out of the run stream.
+        s.append_event(&acme, "brief.run_started", "a start").unwrap();
+        s.append_event(&acme, "brief.shift_done", "a done").unwrap();
+        s.append_event(&acme, "brief.comment", "not execution").unwrap();
+        s.append_event(&globex, "brief.run_started", "g start").unwrap();
+
+        // acme sees ONLY its own execution events — not the comment, not
+        // globex. (Creating + placing a Brief also emits a `brief.board_moved`
+        // backlog->todo event, itself a valid execution transition.)
+        let acme_rows = s.recent_run_events("acme", 0, 100).unwrap();
+        assert!(acme_rows.iter().all(|(tid, _)| tid == &acme));
+        let types: Vec<&str> = acme_rows
+            .iter()
+            .map(|(_, e)| e.event_type.as_str())
+            .collect();
+        assert!(types.contains(&"brief.run_started"));
+        assert!(types.contains(&"brief.shift_done"));
+        assert!(!types.contains(&"brief.comment"), "comment must be filtered");
+
+        // Tenant isolation: globex never sees any of acme's events.
+        let globex_rows = s.recent_run_events("globex", 0, 100).unwrap();
+        assert!(!globex_rows.is_empty());
+        assert!(globex_rows.iter().all(|(tid, _)| tid == &globex));
+        assert!(globex_rows.iter().all(|(_, e)| e.event_type != "brief.shift_done"));
+
+        // Cursor: resume after the newest acme execution event → nothing newer.
+        let newest = acme_rows.iter().map(|(_, e)| e.event_id).max().unwrap();
+        let after = s.recent_run_events("acme", newest, 100).unwrap();
+        assert!(after.is_empty(), "cursor advanced: {after:?}");
     }
 }

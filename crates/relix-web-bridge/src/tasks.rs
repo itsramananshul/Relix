@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use crate::activity::{TaskControlActivity, append_task_control_activity};
 use crate::config::AppState;
 use crate::intervention_audit::new_correlation_id;
-use crate::tenant::{DEFAULT_TENANT, current_subject, current_tenant};
+use crate::tenant::{CURRENT_TENANT, DEFAULT_TENANT, current_subject, current_tenant};
 
 /// Compact task line returned by `GET /v1/tasks`.
 #[derive(Debug, Serialize)]
@@ -2196,6 +2196,114 @@ pub async fn events_stream_global(
     Ok(Sse::new(s).keep_alive(KeepAlive::default()))
 }
 
+/// TG5 — map a chronicle event `type` to the normalized SSE event
+/// name the run/Brief execution stream emits. Returns `None` for any
+/// type that isn't an execution transition (so the stream stays
+/// run-focused). The set agrees with
+/// `relix_runtime::nodes::coordinator::RUN_STREAM_EVENT_TYPES` — the
+/// coordinator already filters to these, this just relabels.
+fn run_stream_event_name(chronicle_type: &str) -> Option<&'static str> {
+    match chronicle_type {
+        "brief.run_started" => Some("run_started"),
+        "brief.shift_done" | "brief.dispatch_failed" | "brief.continued"
+        | "brief.run_recovered" => Some("run_finished"),
+        "brief.run_cancel_requested" => Some("run_cancel_requested"),
+        "brief.board_moved" => Some("brief_moved"),
+        "brief.run_reviewed" => Some("review_changed"),
+        "brief.run_applied" => Some("apply_changed"),
+        _ => None,
+    }
+}
+
+/// `GET /v1/runs/events/stream?since=N` — the run/Brief EXECUTION
+/// event stream (TG5) as a long-lived SSE connection. Polls the
+/// tenant-scoped `run.events.recent` coord capability and emits one
+/// SSE frame per execution transition, with the frame's `event:`
+/// field set to the normalized name (`run_started`, `run_finished`,
+/// `run_cancel_requested`, `brief_moved`, `review_changed`,
+/// `apply_changed`). Auth + tenant are enforced by the `/v1/*`
+/// middleware; the resolved tenant is captured here and re-applied on
+/// every poll so a long-lived stream stays scoped to the caller's
+/// Guild (the body is polled outside the middleware's task-local
+/// scope). `keep_alive` emits periodic comment pings so idle streams
+/// and proxies stay open.
+///
+/// Cursor recovery: `?since=N` resumes strictly after `event_id` N.
+pub async fn runs_events_stream(
+    State(state): State<AppState>,
+    Query(q): Query<RecentEventsQuery>,
+) -> Result<
+    Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, Json<ApiError>),
+> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    let rec = rec.clone();
+    let initial_since = q.since.unwrap_or(0);
+    // Capture the resolved tenant NOW (inside the middleware scope) so
+    // the stream body — polled later, outside that scope — re-applies it
+    // on each coord call. `default` in single-tenant mode.
+    let tenant_scope = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    const STREAM_PAGE_LIMIT: usize = 500;
+    let opened_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let stream_guard = state
+        .stream_metrics
+        .open("__run_events__".to_string(), opened_at);
+    let s = stream! {
+        let _live_guard = stream_guard;
+        let mut since = initial_since;
+        loop {
+            // Re-establish the tenant task-local for this poll so the
+            // outbound envelope carries the caller's tenant.
+            let fetch = CURRENT_TENANT.scope(
+                tenant_scope.clone(),
+                rec.run_events_recent(since, STREAM_PAGE_LIMIT),
+            );
+            match fetch.await {
+                Ok(body) => {
+                    // Coord returns newest-first; emit oldest-first.
+                    let mut lines: Vec<&str> = body
+                        .lines()
+                        .filter(|l| !l.is_empty())
+                        .collect();
+                    lines.reverse();
+                    let mut newest_in_page = since;
+                    for line in lines {
+                        if let Some(id_field) = extract_event_id_prefix(line)
+                            && id_field > newest_in_page
+                        {
+                            newest_in_page = id_field;
+                        }
+                        // Only forward recognized execution transitions,
+                        // labeled with the normalized SSE event name.
+                        let ev_type = serde_json::from_str::<serde_json::Value>(line)
+                            .ok()
+                            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string));
+                        if let Some(t) = ev_type
+                            && let Some(name) = run_stream_event_name(&t)
+                        {
+                            let enriched = enrich_stream_line_with_summary(line);
+                            yield Ok(Event::default().event(name).data(enriched));
+                        }
+                    }
+                    if newest_in_page > since {
+                        since = newest_in_page;
+                    }
+                }
+                Err(e) => {
+                    yield Ok(Event::default().event("error").data(e));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(750)).await;
+        }
+    };
+    Ok(Sse::new(s).keep_alive(KeepAlive::default().text("ping")))
+}
+
 /// H2: add a `summary` field to an event line emitted by coord
 /// before forwarding it through the SSE stream. If the line is
 /// non-JSON or missing fields, it passes through unchanged so the
@@ -3511,5 +3619,26 @@ mod tests {
         // does — see relix-runtime coordinator tests).
         let q: CompactQuery = serde_json::from_str(r#"{"max_age_secs":-1}"#).unwrap();
         assert_eq!(q.max_age_secs, Some(-1));
+    }
+
+    #[test]
+    fn run_stream_event_name_maps_execution_types_and_ignores_others() {
+        // Each execution chronicle type maps to its normalized SSE name.
+        assert_eq!(run_stream_event_name("brief.run_started"), Some("run_started"));
+        assert_eq!(run_stream_event_name("brief.shift_done"), Some("run_finished"));
+        assert_eq!(run_stream_event_name("brief.dispatch_failed"), Some("run_finished"));
+        assert_eq!(run_stream_event_name("brief.continued"), Some("run_finished"));
+        assert_eq!(run_stream_event_name("brief.run_recovered"), Some("run_finished"));
+        assert_eq!(
+            run_stream_event_name("brief.run_cancel_requested"),
+            Some("run_cancel_requested")
+        );
+        assert_eq!(run_stream_event_name("brief.board_moved"), Some("brief_moved"));
+        assert_eq!(run_stream_event_name("brief.run_reviewed"), Some("review_changed"));
+        assert_eq!(run_stream_event_name("brief.run_applied"), Some("apply_changed"));
+        // Non-execution chronicle types are not forwarded on this stream.
+        assert_eq!(run_stream_event_name("brief.comment"), None);
+        assert_eq!(run_stream_event_name("brief.created"), None);
+        assert_eq!(run_stream_event_name("task.attempt_started"), None);
     }
 }

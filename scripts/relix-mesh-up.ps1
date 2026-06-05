@@ -1513,6 +1513,10 @@ name = "spine_run_apply"
 method = "run.apply"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_run_events_recent"
+method = "run.events.recent"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_runtime_state_get"
 method = "rig.runtime_state.get"
 allow_groups = ["chat-users"]

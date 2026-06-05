@@ -361,6 +361,21 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.recent_events utf8: {e}"))
     }
 
+    /// TG5 — the tenant-scoped execution event firehose backing the
+    /// `GET /v1/runs/events/stream` SSE endpoint. Args:
+    /// `since_event_id|limit`. Returns the coord body verbatim (one JSON
+    /// object per line, newest-first); the SSE handler parses + re-labels.
+    /// Tenant is propagated via the task-local on the outbound envelope.
+    pub async fn run_events_recent(
+        &self,
+        since_event_id: i64,
+        limit: usize,
+    ) -> Result<String, String> {
+        let arg = format!("{since_event_id}|{limit}");
+        let bytes = self.call("run.events.recent", arg.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("run.events.recent utf8: {e}"))
+    }
+
     /// Execution-lineage walk from a root task (M66). Args:
     /// task_id + max_depth (defaulted client-side to 4 when
     /// 0). Returns the coord body verbatim — the bridge
