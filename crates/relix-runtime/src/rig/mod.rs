@@ -2611,10 +2611,16 @@ mod tests {
     #[test]
     fn redact_secrets_masks_tokens_and_preserves_formatting() {
         let bt = "deadbeefdeadbeef00000000";
-        let input = "ok line\nbridge=deadbeefdeadbeef00000000\nkey FAKE_TEST_FIXTURE_REDACTED\nplain word\nOPENAI_API_KEY=supersecretvalue\n";
-        let out = redact_secrets(input, bt);
+        // Assemble the fake secret-shaped token at runtime so no full
+        // provider-key-shaped literal sits in source (avoids GitHub
+        // secret-scanning flagging a fake fixture).
+        let fake_key = ["sk", "-ABCDEFGHIJKLMNOPQRSTUV"].concat();
+        let input = format!(
+            "ok line\nbridge=deadbeefdeadbeef00000000\nkey {fake_key}\nplain word\nOPENAI_API_KEY=supersecretvalue\n"
+        );
+        let out = redact_secrets(&input, bt);
         assert!(!out.contains(bt), "bridge token leaked: {out}");
-        assert!(!out.contains("FAKE_TEST_FIXTURE_REDACTED"), "sk- token leaked: {out}");
+        assert!(!out.contains(&fake_key), "sk- token leaked: {out}");
         assert!(!out.contains("supersecretvalue"), "env secret leaked: {out}");
         assert!(out.contains("OPENAI_API_KEY=***"), "env name kept + masked: {out}");
         // Formatting (newlines, the safe words) survives.

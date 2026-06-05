@@ -406,12 +406,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("intervention.jsonl");
         let a = InterventionAudit::new(Some(path.clone()));
+        // Assemble the fake secret-shaped token at runtime so no full
+        // provider-key-shaped literal sits in source.
+        let fake_key = ["sk", "-abcdef0123456789ABCDEF0123456789AAAA"].concat();
         a.record(
             "anon",
             "provider_test",
             "openai",
             "ok",
-            "tried FAKE_TEST_FIXTURE_REDACTED",
+            &format!("tried {fake_key}"),
         );
         let snap = a.snapshot();
         assert!(

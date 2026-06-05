@@ -580,12 +580,13 @@ mod tests {
     fn p3_log_line_with_api_key_sk_pattern_is_redacted_before_streaming() {
         // P3 test: "A log line containing an API key matching
         // sk- pattern is redacted before streaming."
-        let line = line_with("dispatched call with key FAKE_TEST_FIXTURE_REDACTED");
+        // Assemble the fake secret-shaped token at runtime so no full
+        // provider-key-shaped literal sits in source.
+        let fake_key = ["sk", "-abc123def456ghi789jkl012mno345pqr"].concat();
+        let line = line_with(&format!("dispatched call with key {fake_key}"));
         let safe = redact_line(&line, true);
         assert!(
-            !safe
-                .message
-                .contains("FAKE_TEST_FIXTURE_REDACTED"),
+            !safe.message.contains(&fake_key),
             "API key leaked: {}",
             safe.message
         );
