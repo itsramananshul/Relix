@@ -227,6 +227,16 @@ impl CancelRegistry {
             m.remove(run_id);
         }
     }
+
+    /// The run_ids currently registered as in-flight (a live child process is
+    /// being tracked). Used by the stale-run recovery sweep as the "genuinely
+    /// live" set so a real, long-running Shift is never mistaken for stale.
+    pub fn live_ids(&self) -> std::collections::HashSet<String> {
+        self.map
+            .lock()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
+    }
 }
 
 /// How much Relix can govern *inside* a Rig. Rich Rigs expose every

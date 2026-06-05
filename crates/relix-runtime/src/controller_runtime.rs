@@ -7456,11 +7456,12 @@ fn register_node_type_handlers(
             }
             // Run-ledger recovery: every `brief_runs` row still `running` at
             // boot is stale — its child process died with the previous
-            // coordinator (the in-memory handle is gone). Mark it `failed`,
-            // record a `recovered` event, and release its Brief Claim so the
-            // work can be re-dispatched. The live set is empty on a fresh
-            // boot, so this reconciles all leftover running runs.
-            match store.recover_stale_runs(&std::collections::HashSet::new()) {
+            // coordinator (the in-memory handle is gone). Mark it
+            // `interrupted`, record a `recovered` event, and release its Brief
+            // Claim so the work can be re-dispatched. The live set is empty on
+            // a fresh boot and `min_age_secs = 0`, so this reconciles ALL
+            // leftover running runs.
+            match store.recover_stale_runs(&std::collections::HashSet::new(), 0) {
                 Ok(ids) if !ids.is_empty() => tracing::warn!(
                     recovered = ids.len(),
                     "coordinator startup: recovered stale `running` brief runs (no live child process)"
@@ -10370,6 +10371,29 @@ fn register_node_type_handlers(
                             tracing::error!(error = %e, "heartbeat: dispatch task join error")
                         }
                     }
+                    // Periodic stale-run sweep: recover any `running` Shift
+                    // whose child is gone (a dead run thread that never closed
+                    // its row) once it is older than its lease + grace, while
+                    // leaving genuinely in-flight runs alone — those are either
+                    // registered as live in the CancelRegistry or younger than
+                    // the threshold. Marks each `interrupted` and frees its
+                    // Claim (only if still owned by that run).
+                    let sweep_store = task_store.clone();
+                    let sweep_threshold = lease_secs + 60;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let live = crate::rig::CancelRegistry::global().live_ids();
+                        match sweep_store.recover_stale_runs(&live, sweep_threshold) {
+                            Ok(ids) if !ids.is_empty() => tracing::warn!(
+                                recovered = ids.len(),
+                                "heartbeat: recovered stale `running` brief runs as `interrupted`"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(error = %e, "heartbeat: stale-run sweep failed")
+                            }
+                        }
+                    })
+                    .await;
                     // Defensive hygiene: reap any bridge tokens that
                     // outlived their Shift (e.g. a panicked dispatch
                     // that never reached its revoke).

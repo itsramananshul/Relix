@@ -262,6 +262,16 @@ where
             }
             store.set_board_status(&card.task_id, "blocked")?;
             let _ = store.append_event(&card.task_id, "brief.budget_refused", &reason);
+            // Durable refused Shift so latest_run / run history explain WHY the
+            // autonomous run didn't happen (no Rig resolved yet → empty).
+            let _ = store.record_refused_run(
+                &card.task_id,
+                card.assignee_agent_id.as_deref().unwrap_or(""),
+                "",
+                "over_allowance",
+                &reason,
+                "heartbeat",
+            );
             let _ = store.finish_wakeup(&wakeup_id, "failed", Some(&reason));
             if let Some(assignee) = card.assignee_agent_id.as_deref() {
                 store.release_claim(&card.task_id, assignee)?;
@@ -283,6 +293,14 @@ where
             let reason = "no Rig configured and no Guild default".to_string();
             let _ = store.finish_wakeup(&wakeup_id, "failed", Some(&reason));
             let _ = store.append_event(&card.task_id, "brief.dispatch_failed", &reason);
+            let _ = store.record_refused_run(
+                &card.task_id,
+                &assignee,
+                "",
+                "no_adapter",
+                &reason,
+                "heartbeat",
+            );
             if !assignee.is_empty() {
                 store.release_claim(&card.task_id, &assignee)?;
             }
@@ -304,6 +322,14 @@ where
             let reason = format!("adapter `{}` unavailable: {}", rig.name(), probe.detail);
             let _ = store.finish_wakeup(&wakeup_id, "failed", Some(&reason));
             let _ = store.append_event(&card.task_id, "brief.dispatch_failed", &reason);
+            let _ = store.record_refused_run(
+                &card.task_id,
+                &assignee,
+                rig.name(),
+                "adapter_unavailable",
+                &reason,
+                "heartbeat",
+            );
             if !assignee.is_empty() {
                 store.release_claim(&card.task_id, &assignee)?;
             }
@@ -341,6 +367,15 @@ where
                 let _ = store.finish_wakeup(&wakeup_id, "failed", Some(&refusal.summary));
                 let _ =
                     store.append_event(&card.task_id, "brief.dispatch_failed", &refusal.summary);
+                // `refusal.status` is `workspace_error` / `workspace_context_error`.
+                let _ = store.record_refused_run(
+                    &card.task_id,
+                    &assignee,
+                    &rig_name,
+                    &refusal.status,
+                    &refusal.summary,
+                    "heartbeat",
+                );
                 if !assignee.is_empty() {
                     store.release_claim(&card.task_id, &assignee)?;
                 }
@@ -2351,6 +2386,13 @@ mod tests {
         // Nothing ran → board untouched (still todo); Claim released.
         assert_eq!(s.board_status(&a).unwrap().as_deref(), Some("todo"));
         assert!(s.claim_holder(&a).unwrap().is_none());
+        // …but the refusal is durable: a `refused` Shift (no_adapter, heartbeat)
+        // so the operator can later see WHY the autonomous run never happened.
+        let runs = s.runs_for_brief(&a, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "refused");
+        assert_eq!(runs[0].refusal_reason.as_deref(), Some("no_adapter"));
+        assert_eq!(runs[0].trigger.as_deref(), Some("heartbeat"));
     }
 
     #[test]
@@ -2735,7 +2777,7 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_adapter_unavailable_refuses_without_spawning_or_a_run_row() {
+    fn heartbeat_adapter_unavailable_refuses_with_durable_refused_run() {
         struct DownRig;
         impl Rig for DownRig {
             fn name(&self) -> &str {
@@ -2753,11 +2795,24 @@ mod tests {
         let rig: Arc<dyn Rig> = Arc::new(DownRig);
 
         let records = heartbeat_tick(&s, Some(rig), None);
-        // Refused at the readiness gate: NO run row opened (matches manual
-        // pre-flight semantics — a refusal is not an execution).
+        // Refused at the readiness gate: the adapter is NEVER spawned (the
+        // `run` panic above proves it), but the refusal is now a durable
+        // `refused` Shift so the operator can later see WHY it didn't run.
+        let rows: Vec<_> = s
+            .list_runs(50)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.brief_id == a)
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one (refused) row");
+        assert_eq!(rows[0].status, "refused");
+        assert_eq!(rows[0].refusal_reason.as_deref(), Some("adapter_unavailable"));
+        assert_eq!(rows[0].trigger.as_deref(), Some("heartbeat"));
+        assert_eq!(rows[0].rig, "down");
+        // No executed run exists (refused is not an execution).
         assert!(
-            s.list_runs(50).unwrap().iter().all(|r| r.brief_id != a),
-            "an unavailable adapter must not open a run row"
+            !s.list_runs(50).unwrap().iter().any(|r| r.brief_id == a && r.status == "running"),
+            "an unavailable adapter must not open a running run row"
         );
         assert!(records.iter().any(|r| r.brief_id == a
             && matches!(

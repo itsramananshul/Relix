@@ -112,10 +112,9 @@ pub struct LatestRun {
     pub run_id: String,
     /// The adapter (Rig) that ran it.
     pub rig: String,
-    /// `running` while in flight, then terminal `done` / `failed` /
-    /// `continued` / `cancelled`. (Pre-run refusals — `unassigned`,
-    /// `no_adapter`, `adapter_unavailable`, … — are NOT persisted as runs,
-    /// so they never appear here; they are returned only by the run call.)
+    /// `running` while in flight, then a terminal state: `done` / `failed` /
+    /// `continued` / `cancelled` / `interrupted` (stale-run recovery), or
+    /// `refused` (a durable pre-run refusal — see `refusal_reason`).
     pub status: String,
     /// What triggered it: `manual` / `heartbeat` / `scheduled`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,7 +136,8 @@ pub struct LatestRun {
     pub apply_status: Option<String>,
     /// When `status == "refused"`: the machine reason a run never started —
     /// `unassigned` / `no_adapter` / `adapter_unavailable` / `workspace_error`
-    /// / `workspace_context_error`. `None` for runs that actually executed.
+    /// / `workspace_context_error` / `over_allowance` (autonomous Allowance
+    /// hard-stop). `None` for runs that actually executed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal_reason: Option<String>,
     /// Changed-file count this run produced.

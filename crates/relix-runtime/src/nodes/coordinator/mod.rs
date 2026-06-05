@@ -2615,6 +2615,39 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Release a Brief's Claim ONLY if it still belongs to `run_id` (its
+    /// checkout/execution run pointer matches). Used by stale-run recovery so
+    /// it never clears a Claim that a NEWER run has already re-acquired.
+    /// Returns whether the Claim was released.
+    pub fn release_claim_for_run(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        run_id: &str,
+    ) -> Result<bool, CoordinatorError> {
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let changed = conn
+            .execute(
+                "UPDATE tasks
+             SET claimed_by = NULL,
+                 claim_expires_at = NULL,
+                 checkout_run_id = NULL,
+                 execution_run_id = NULL,
+                 claim_agent_id = NULL,
+                 claim_locked_at = NULL,
+                 updated_at = ?1
+             WHERE task_id = ?2 AND claim_agent_id = ?3
+               AND (execution_run_id = ?4 OR checkout_run_id = ?4)",
+                params![now, task_id, agent_id.trim(), run_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+        if changed == 1 {
+            let _ = promote_oldest_deferred_wakeup_in_conn(&conn, task_id, now)?;
+        }
+        Ok(changed == 1)
+    }
+
     /// Open a run record for a Brief execution (status `running`). One
     /// durable row per Rig run — the stable run ledger the dashboard
     /// polls (`/v1/runs`) instead of parsing event strings. Called once
@@ -2658,7 +2691,8 @@ impl TaskStore {
     /// Brief detail + run history can later answer "why didn't it run?".
     /// EXCLUDES `not_found` (no Brief to attach to) and `already_running`
     /// (a run is already in flight — recording a refusal on a double-click
-    /// would just be noise; the live run is the answer).
+    /// would just be noise; the live run is the answer). `over_allowance`
+    /// covers the autonomous (heartbeat) Allowance hard-stop.
     pub fn refusal_is_durable(reason: &str) -> bool {
         matches!(
             reason,
@@ -2667,19 +2701,71 @@ impl TaskStore {
                 | "adapter_unavailable"
                 | "workspace_error"
                 | "workspace_context_error"
+                | "over_allowance"
         )
     }
 
-    /// Phase 3: persist a durable `refused` Shift record for a MANUAL run
-    /// that was refused before any adapter spawned, plus a
-    /// `brief.run_refused` Chronicle note. Returns the new run_id, or `None`
-    /// when nothing is recorded:
-    ///   - the Brief is not in `tenant` (cross-tenant / missing) — NO row is
-    ///     written, so a refusal can never leak a cross-Guild Brief's
-    ///     existence;
-    ///   - the reason isn't durable (`not_found` / `already_running`).
-    /// `agent_id` / `rig` are the resolved assignee / Rig when known (empty
-    /// otherwise). The (static, secret-free) `summary` is length-bounded.
+    /// Phase 3: persist a durable `refused` Shift record for a Brief that was
+    /// refused before any adapter spawned, with the given `trigger` (`manual`
+    /// or `heartbeat`), plus a `brief.run_refused` Chronicle note. Returns the
+    /// new run_id, or `None` when nothing is recorded:
+    ///   - the reason isn't durable (`not_found` / `already_running`);
+    ///   - the Brief no longer exists (the INSERT is guarded by an existence
+    ///     check, so a vanished/missing Brief never gets a row — no leak).
+    ///
+    /// Tenant-safe: the row links to the Brief's own Task row; callers that
+    /// serve a remote principal must gate on tenant first (see
+    /// [`Self::record_manual_refusal_for_tenant`]). `agent_id` / `rig` are the
+    /// resolved assignee / Rig when known (empty otherwise). The (static,
+    /// secret-free) `summary` is length-bounded.
+    pub fn record_refused_run(
+        &self,
+        brief_id: &str,
+        agent_id: &str,
+        rig: &str,
+        reason: &str,
+        summary: &str,
+        trigger: &str,
+    ) -> Result<Option<String>, CoordinatorError> {
+        if !Self::refusal_is_durable(reason) {
+            return Ok(None);
+        }
+        let run_id = format!("ref_{}", uuid::Uuid::new_v4());
+        let now = unix_secs();
+        let summary = clamp_bytes(summary, MAX_RUN_EVENT_FIELD_BYTES);
+        {
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            // `finished_at == started_at`: a refusal is instantaneous (no run).
+            // The `WHERE EXISTS` guards Brief existence so a missing Brief
+            // never gets a row (belt-and-suspenders no-leak).
+            let n = conn
+                .execute(
+                    "INSERT INTO brief_runs
+                         (run_id, brief_id, agent_id, rig, status, started_at, finished_at,
+                          summary, trigger, refusal_reason)
+                     SELECT ?1, ?2, ?3, ?4, 'refused', ?5, ?5, ?6, ?7, ?8
+                     WHERE EXISTS (SELECT 1 FROM tasks WHERE task_id = ?2)",
+                    params![run_id, brief_id, agent_id, rig, now, summary, trigger, reason],
+                )
+                .map_err(CoordinatorError::Db)?;
+            if n == 0 {
+                return Ok(None); // Brief vanished — nothing written
+            }
+        }
+        // Chronicle the refusal — payload is the static reason + Rig (safe).
+        let note = if rig.trim().is_empty() {
+            format!("run refused: {reason} — {summary}")
+        } else {
+            format!("[{rig}] run refused: {reason} — {summary}")
+        };
+        let _ = self.append_event(brief_id, "brief.run_refused", &note);
+        Ok(Some(run_id))
+    }
+
+    /// Phase 3: persist a durable `refused` Shift for a MANUAL run, gated on
+    /// the caller's Guild — a cross-Guild or missing Brief gets NO row, so a
+    /// refusal can never leak a cross-Guild Brief's existence. Delegates to
+    /// [`Self::record_refused_run`] with `trigger = "manual"`.
     pub fn record_manual_refusal_for_tenant(
         &self,
         brief_id: &str,
@@ -2692,34 +2778,10 @@ impl TaskStore {
         if !Self::refusal_is_durable(reason) {
             return Ok(None);
         }
-        // Tenant gate: never write a refusal row for a Brief the caller's
-        // Guild doesn't own (a missing Brief also fails this) — no leak.
         if !self.task_in_tenant(brief_id, tenant)? {
             return Ok(None);
         }
-        let run_id = format!("ref_{}", uuid::Uuid::new_v4());
-        let now = unix_secs();
-        let summary = clamp_bytes(summary, MAX_RUN_EVENT_FIELD_BYTES);
-        {
-            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
-            // `finished_at == started_at`: a refusal is instantaneous (no run).
-            conn.execute(
-                "INSERT INTO brief_runs
-                     (run_id, brief_id, agent_id, rig, status, started_at, finished_at,
-                      summary, trigger, refusal_reason)
-                 VALUES (?1, ?2, ?3, ?4, 'refused', ?5, ?5, ?6, 'manual', ?7)",
-                params![run_id, brief_id, agent_id, rig, now, summary, reason],
-            )
-            .map_err(CoordinatorError::Db)?;
-        }
-        // Chronicle the refusal — payload is the static reason + Rig (safe).
-        let note = if rig.trim().is_empty() {
-            format!("run refused: {reason} — {summary}")
-        } else {
-            format!("[{rig}] run refused: {reason} — {summary}")
-        };
-        let _ = self.append_event(brief_id, "brief.run_refused", &note);
-        Ok(Some(run_id))
+        self.record_refused_run(brief_id, agent_id, rig, reason, summary, "manual")
     }
 
     /// Close a run record with its terminal status (`done` / `failed` /
@@ -2958,30 +3020,42 @@ impl TaskStore {
         Ok(n)
     }
 
-    /// Recover stale `running` runs left behind after a coordinator
-    /// crash/restart. Any `brief_runs` row still `running` whose `run_id` is
-    /// NOT in `live` (the set of run_ids with a live in-process child handle —
-    /// EMPTY on a fresh boot, so every leftover `running` row is stale) is:
-    ///   1. marked terminal `failed` with a clear, honest reason,
+    /// Recover stale `running` runs whose executing process is gone. A
+    /// `brief_runs` row still `running` is stale when its `run_id` is NOT in
+    /// `live` (the set of run_ids with a live in-process child handle — EMPTY
+    /// on a fresh boot, so every leftover row qualifies) AND, when
+    /// `min_age_secs > 0`, it is older than that threshold (past its lease +
+    /// grace). Boot recovery passes `min_age_secs = 0` (reconcile everything);
+    /// a periodic in-operation sweep passes the lease so a genuinely
+    /// in-flight, long-running Shift is never mistaken for stale. Each stale
+    /// run is:
+    ///   1. marked terminal `interrupted` (honest — matches the task-level
+    ///      `interrupted` recovery convention; NOT `failed`, which means the
+    ///      run actually ran and errored),
     ///   2. given a `recovered` run-transcript event + a `brief.run_recovered`
-    ///      Chronicle note (so the operator sees what happened),
-    ///   3. has its Brief Claim released (so the work can be re-dispatched).
+    ///      Chronicle note (surfaces in latest_run as `interrupted`),
+    ///   3. has its Brief Claim released ONLY if the Claim still points to THIS
+    ///      run (a newer run that already re-claimed the Brief is left alone).
     ///
     /// Terminal runs are NEVER touched, and a genuinely-live run (present in
     /// `live`) is left alone. Returns the recovered run_ids.
     pub fn recover_stale_runs(
         &self,
         live: &std::collections::HashSet<String>,
+        min_age_secs: i64,
     ) -> Result<Vec<String>, CoordinatorError> {
-        const REASON: &str =
-            "Recovered after process restart; no live child process was found.";
-        // Snapshot the running rows under one lock, then mutate through the
-        // existing methods (each takes its own lock) to avoid re-entrancy.
-        let rows: Vec<(String, String, String)> = {
+        const REASON: &str = "Run interrupted: the executing process is gone \
+             (coordinator restart or a dead run thread); no live child was found.";
+        let now = unix_secs();
+        // Snapshot the running rows (+ started_at) under one lock, then mutate
+        // through the existing methods (each takes its own lock) to avoid
+        // re-entrancy.
+        let rows: Vec<(String, String, String, i64)> = {
             let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT run_id, brief_id, agent_id FROM brief_runs WHERE status = 'running'",
+                    "SELECT run_id, brief_id, agent_id, started_at
+                     FROM brief_runs WHERE status = 'running'",
                 )
                 .map_err(CoordinatorError::Db)?;
             let mapped = stmt
@@ -2990,6 +3064,7 @@ impl TaskStore {
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
                         r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
                     ))
                 })
                 .map_err(CoordinatorError::Db)?;
@@ -3000,19 +3075,26 @@ impl TaskStore {
             out
         };
         let mut recovered = Vec::new();
-        for (run_id, brief_id, agent_id) in rows {
+        for (run_id, brief_id, agent_id, started_at) in rows {
             if live.contains(&run_id) {
                 continue; // genuinely live — never mark a live run stale
             }
-            self.record_run_finish(&run_id, "failed", REASON)?;
+            // Age gate: during a periodic sweep (`min_age_secs > 0`) only a run
+            // older than the threshold is stale. Boot recovery passes 0 → every
+            // leftover `running` row qualifies.
+            if min_age_secs > 0 && started_at > now.saturating_sub(min_age_secs) {
+                continue;
+            }
+            self.record_run_finish(&run_id, "interrupted", REASON)?;
             let _ = self.append_run_event(&run_id, "recovered", "relix", REASON, None, false);
             let _ = self.append_event(
                 &brief_id,
                 "brief.run_recovered",
                 &format!("run {run_id}: {REASON}"),
             );
+            // Release the Claim ONLY if it still belongs to THIS run.
             if !agent_id.trim().is_empty() {
-                let _ = self.release_claim(&brief_id, &agent_id);
+                let _ = self.release_claim_for_run(&brief_id, &agent_id, &run_id);
             }
             recovered.push(run_id);
         }
@@ -16053,6 +16135,43 @@ mod tests {
     }
 
     #[test]
+    fn record_refused_run_stamps_trigger_and_guards_missing_brief() {
+        let s = store();
+        let b = s
+            .create_brief("acme", "autonomous refusal", "subj", None, None, None, None)
+            .unwrap();
+
+        // An autonomous (heartbeat) refusal persists a durable refused Shift
+        // stamped with the `heartbeat` trigger + the machine reason.
+        let run = s
+            .record_refused_run(&b, "agt_a", "claude", "over_allowance", "operative over budget", "heartbeat")
+            .unwrap();
+        assert!(run.is_some(), "durable heartbeat refusal recorded");
+        let lr = s.latest_run_for_brief(&b).unwrap().expect("a run");
+        assert_eq!(lr.status, "refused");
+        assert_eq!(lr.refusal_reason.as_deref(), Some("over_allowance"));
+        let runs = s.runs_for_brief(&b, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].trigger.as_deref(), Some("heartbeat"));
+        let chron = s
+            .query_events(&b, 0, 50, Some("brief.run_refused"), EventOrder::Desc)
+            .unwrap();
+        assert_eq!(chron.len(), 1);
+
+        // Non-durable reason → nothing written.
+        assert!(s
+            .record_refused_run(&b, "agt_a", "claude", "already_running", "x", "heartbeat")
+            .unwrap()
+            .is_none());
+        // Missing Brief → guarded by WHERE EXISTS → no row (no leak).
+        assert!(s
+            .record_refused_run("nope", "agt_a", "claude", "no_adapter", "x", "heartbeat")
+            .unwrap()
+            .is_none());
+        assert_eq!(s.run_count_for_brief(&b).unwrap(), 1, "only the durable refusal persisted");
+    }
+
+    #[test]
     fn subbrief_progress_counts_children_by_column() {
         let s = store();
         let mk = |t: &str| {
@@ -23117,7 +23236,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_stale_runs_fails_releases_claim_and_records_event() {
+    fn recover_stale_runs_interrupts_releases_claim_and_records_event() {
         let s = store();
         let b = brief(&s, "stale work");
         // Claim the Brief + open a running run (simulating a crashed run).
@@ -23125,14 +23244,15 @@ mod tests {
         running_run(&s, "run_x", &b, "agt_a");
         assert!(s.claim_holder(&b).unwrap().is_some(), "claim held before recovery");
 
-        // Fresh boot → empty live set → the run is stale.
-        let recovered = s.recover_stale_runs(&std::collections::HashSet::new()).unwrap();
+        // Fresh boot → empty live set, no age threshold → the run is stale.
+        let recovered = s.recover_stale_runs(&std::collections::HashSet::new(), 0).unwrap();
         assert_eq!(recovered, vec!["run_x".to_string()]);
 
-        // The run is now terminally failed with an honest reason.
+        // The run is now terminally `interrupted` (NOT `failed`) with an
+        // honest reason.
         let run = s.get_run("run_x").unwrap().unwrap();
-        assert_eq!(run.status, "failed");
-        assert!(run.summary.contains("Recovered after process restart"), "got: {}", run.summary);
+        assert_eq!(run.status, "interrupted");
+        assert!(run.summary.contains("Run interrupted"), "got: {}", run.summary);
         assert!(run.finished_at.is_some());
 
         // The Brief Claim is released (re-dispatchable).
@@ -23162,7 +23282,7 @@ mod tests {
 
         let mut live = std::collections::HashSet::new();
         live.insert("run_live".to_string());
-        let recovered = s.recover_stale_runs(&live).unwrap();
+        let recovered = s.recover_stale_runs(&live, 0).unwrap();
         assert!(recovered.is_empty(), "nothing stale: {recovered:?}");
 
         // Live run untouched; terminal run untouched.
@@ -23175,11 +23295,61 @@ mod tests {
         let s = store();
         let b = brief(&s, "double recover");
         running_run(&s, "run_y", &b, "agt_a");
-        let first = s.recover_stale_runs(&std::collections::HashSet::new()).unwrap();
+        let first = s.recover_stale_runs(&std::collections::HashSet::new(), 0).unwrap();
         assert_eq!(first.len(), 1);
         // Second pass finds nothing (the run is now terminal).
-        let second = s.recover_stale_runs(&std::collections::HashSet::new()).unwrap();
+        let second = s.recover_stale_runs(&std::collections::HashSet::new(), 0).unwrap();
         assert!(second.is_empty(), "idempotent: {second:?}");
+    }
+
+    #[test]
+    fn recover_stale_runs_age_threshold_skips_young_runs() {
+        // A periodic sweep (min_age_secs > 0) must NOT recover a run that just
+        // started — only one older than the threshold.
+        let s = store();
+        let b = brief(&s, "young run");
+        running_run(&s, "run_fresh", &b, "agt_a"); // started_at = now
+        // Threshold of 300s: the just-started run is too young → left alone.
+        let recovered = s
+            .recover_stale_runs(&std::collections::HashSet::new(), 300)
+            .unwrap();
+        assert!(recovered.is_empty(), "young run not stale: {recovered:?}");
+        assert_eq!(s.get_run("run_fresh").unwrap().unwrap().status, "running");
+
+        // Backdate started_at past the threshold → now it IS stale.
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE brief_runs SET started_at = started_at - 1000 WHERE run_id = 'run_fresh'",
+                [],
+            )
+            .unwrap();
+        }
+        let recovered = s
+            .recover_stale_runs(&std::collections::HashSet::new(), 300)
+            .unwrap();
+        assert_eq!(recovered, vec!["run_fresh".to_string()]);
+        assert_eq!(s.get_run("run_fresh").unwrap().unwrap().status, "interrupted");
+    }
+
+    #[test]
+    fn recover_stale_runs_releases_claim_only_when_it_belongs_to_the_stale_run() {
+        // The stale run's Claim must NOT be cleared if the Brief has since been
+        // re-claimed by a NEWER run.
+        let s = store();
+        let b = brief(&s, "re-claimed brief");
+        running_run(&s, "run_old", &b, "agt_a");
+        // A newer run re-claims the Brief (Claim now points to run_new). Only
+        // the stale `running` row (run_old) is iterated by recovery.
+        assert!(s.claim_brief_for_run(&b, "agt_a", 300, Some("run_new")).unwrap());
+
+        let recovered = s.recover_stale_runs(&std::collections::HashSet::new(), 0).unwrap();
+        assert!(recovered.contains(&"run_old".to_string()), "got: {recovered:?}");
+
+        // The Claim still belongs to run_new → recovering run_old must NOT have
+        // released it.
+        let holder = s.claim_holder(&b).unwrap();
+        assert!(holder.is_some(), "claim for the newer run must survive run_old recovery");
     }
 
     #[test]
