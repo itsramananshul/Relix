@@ -189,6 +189,10 @@ export const runControls = {
 export interface SuggestChild {
   title: string;
   priority?: string | null;
+  // Optional intra-proposal dependency: the 0-based index of an earlier
+  // sibling this child depends on (§1.6). On accept it becomes a Snag
+  // (blocked_on) — the referenced sibling must reach `done` first.
+  after?: number | null;
 }
 
 // The bounded proposal a `suggest_tasks` card carries.

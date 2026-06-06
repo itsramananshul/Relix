@@ -750,18 +750,36 @@ export function BriefDetail({
                 <div style={{ fontSize: 13, margin: "5px 0 6px", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
                   {it.proposal?.summary || it.prompt}
                 </div>
-                <ul style={{ margin: "0 0 8px", paddingLeft: 18, fontSize: 12 }}>
-                  {children.map((c, i) => (
-                    <li key={i} style={{ wordBreak: "break-word" }}>
-                      {c.title}
-                      {c.priority ? (
-                        <span className="muted" style={{ fontSize: 10, marginLeft: 6 }}>
-                          {c.priority}
-                        </span>
-                      ) : null}
-                    </li>
-                  ))}
-                </ul>
+                <ol style={{ margin: "0 0 8px", paddingLeft: 18, fontSize: 12 }}>
+                  {children.map((c, i) => {
+                    // A valid `after` references an earlier sibling (0-based);
+                    // surface the order so the operator sees the dependency
+                    // before accepting (it materializes as a Snag on accept).
+                    const dep =
+                      typeof c.after === "number" && c.after >= 0 && c.after < children.length
+                        ? children[c.after]
+                        : null;
+                    return (
+                      <li key={i} style={{ wordBreak: "break-word" }}>
+                        {c.title}
+                        {c.priority ? (
+                          <span className="muted" style={{ fontSize: 10, marginLeft: 6 }}>
+                            {c.priority}
+                          </span>
+                        ) : null}
+                        {dep ? (
+                          <span
+                            className="muted"
+                            style={{ fontSize: 10, marginLeft: 6 }}
+                            title={`Blocked until #${(c.after as number) + 1} (${dep.title}) is done`}
+                          >
+                            ↳ after #{(c.after as number) + 1}: {dep.title}
+                          </span>
+                        ) : null}
+                      </li>
+                    );
+                  })}
+                </ol>
                 <div className="row wrap" style={{ gap: 6 }}>
                   <button
                     className="btn sm"

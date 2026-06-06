@@ -634,7 +634,7 @@ addr = "{addr}"
                 "summary": "Break the epic down",
                 "children": [
                     { "title": "Design the API" },
-                    { "title": "Wire the store", "priority": "high" }
+                    { "title": "Wire the store", "priority": "high", "after": 0 }
                 ]
             }))
             .send(),
@@ -655,6 +655,12 @@ addr = "{addr}"
     assert_eq!(
         seen.get("children").and_then(Value::as_array).map(|a| a.len()),
         Some(2)
+    );
+    // The optional `after` dependency rides through the JSON wire arg.
+    assert_eq!(
+        seen["children"][1].get("after").and_then(Value::as_u64),
+        Some(0),
+        "the `after` dependency index must pass through to the coordinator"
     );
 
     // ─── list → the suggest_tasks card with its proposal passes through ───

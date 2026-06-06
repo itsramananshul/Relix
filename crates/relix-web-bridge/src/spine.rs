@@ -1704,6 +1704,11 @@ pub struct SuggestChild {
     pub title: String,
     #[serde(default)]
     pub priority: Option<String>,
+    /// Optional intra-proposal dependency: the 0-based index of an earlier
+    /// sibling this child depends on (§1.6). The coordinator validates +
+    /// remaps it at open time; the bridge just forwards it.
+    #[serde(default)]
+    pub after: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1740,6 +1745,7 @@ pub async fn open_suggestion(
             serde_json::json!({
                 "title": c.title,
                 "priority": c.priority,
+                "after": c.after,
             })
         })
         .collect();

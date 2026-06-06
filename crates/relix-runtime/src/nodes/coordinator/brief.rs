@@ -81,16 +81,27 @@ pub struct Interaction {
 }
 
 /// One proposed child Brief inside a `suggest_tasks` interaction (§1.9):
-/// a title and, optionally, a priority. The first slice intentionally
-/// carries no assignee or dependency order — accepting it creates plain
-/// Sub-briefs (the dependency-order / assignment of the proposal stays
-/// deferred; see the divergence ledger).
+/// a title, optionally a priority, and an optional simple **dependency
+/// order** (`after`). Accepting the proposal materializes each child as a
+/// real Sub-brief that inherits the parent's safe spine context
+/// (Mandate/Campaign/reviewer; see [`super::TaskStore::respond_suggestion`]);
+/// assignment still stays deferred (it runs governance gating).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildSpec {
     pub title: String,
     /// `low` | `normal` | `high` | `urgent`; `None` opens at the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
+    /// Optional intra-proposal dependency: the **0-based index of an
+    /// earlier sibling** (§1.6 — a backward-only edge, so the graph is
+    /// acyclic by construction) that this child depends on. On accept it
+    /// becomes a Snag (`blocked_on`): the referenced sibling must reach
+    /// `done` before this child is unblocked. [`normalize_proposal`]
+    /// remaps it across any dropped (empty-title) children and refuses a
+    /// forward / self / out-of-range / dropped-target reference at open
+    /// time, so accept never has to fail half-way. `None` = no dependency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<usize>,
 }
 
 /// The bounded, sanitized proposal an Operative attaches to a
@@ -122,32 +133,66 @@ pub const MAX_PROPOSAL_SUMMARY_LEN: usize = 500;
 /// - a child priority, when present, must be a valid Brief priority
 ///   (an invalid one is a hard error — it would otherwise be silently
 ///   dropped at create time);
+/// - an `after` dependency (§1.6), when present, must reference an
+///   **earlier kept sibling** by its original index. It is remapped to
+///   the post-drop position; a forward / self / out-of-range / dropped-
+///   target reference is a hard error here (rejected at open time so the
+///   accept path never half-creates an order it can't honour);
 /// - the proposal must have at least one child and **no more than**
 ///   [`MAX_SUGGESTED_CHILDREN`] (over-cap is refused, never silently
 ///   truncated — the operator must see the full set they accept).
 pub fn normalize_proposal(summary: &str, children: &[ChildSpec]) -> Result<Proposal, String> {
     let summary: String = summary.trim().chars().take(MAX_PROPOSAL_SUMMARY_LEN).collect();
-    let mut norm: Vec<ChildSpec> = Vec::new();
+    // Pass 1: trim titles + drop empties, remembering the original→kept
+    // index mapping so an `after` (which names an *original* sibling
+    // position) can be re-pointed after drops.
+    let mut old_to_new: Vec<Option<usize>> = Vec::with_capacity(children.len());
+    let mut kept: Vec<ChildSpec> = Vec::new();
     for c in children {
         let title: String = c.title.trim().chars().take(MAX_CHILD_TITLE_LEN).collect();
         if title.is_empty() {
-            continue; // drop empties
+            old_to_new.push(None); // dropped — nothing maps here
+            continue;
         }
         let priority = match c.priority.as_deref().map(str::trim) {
             None | Some("") => None,
             Some(p) if is_priority(p) => Some(p.to_string()),
             Some(p) => return Err(format!("priority '{p}' not in low/normal/high/urgent")),
         };
-        norm.push(ChildSpec { title, priority });
+        old_to_new.push(Some(kept.len()));
+        // `after` is carried through pass 1 untouched (still an *original*
+        // index); pass 2 validates + remaps it once all positions are known.
+        kept.push(ChildSpec { title, priority, after: c.after });
     }
-    if norm.is_empty() {
+    if kept.is_empty() {
         return Err("a suggestion needs at least one child task".to_string());
     }
-    if norm.len() > MAX_SUGGESTED_CHILDREN {
+    if kept.len() > MAX_SUGGESTED_CHILDREN {
         return Err(format!(
             "too many proposed tasks ({}); the limit is {MAX_SUGGESTED_CHILDREN}",
-            norm.len()
+            kept.len()
         ));
+    }
+    // Pass 2: validate + remap each `after` to a backward-only kept index.
+    let mut norm: Vec<ChildSpec> = Vec::with_capacity(kept.len());
+    for (new_idx, mut spec) in kept.into_iter().enumerate() {
+        if let Some(orig) = spec.after {
+            if orig >= old_to_new.len() {
+                return Err(format!(
+                    "task #{new_idx} depends on out-of-range task #{orig}"
+                ));
+            }
+            let mapped = old_to_new[orig].ok_or_else(|| {
+                format!("task #{new_idx} depends on a dropped (empty) task #{orig}")
+            })?;
+            if mapped >= new_idx {
+                return Err(format!(
+                    "task #{new_idx} must depend on an earlier task (got #{mapped})"
+                ));
+            }
+            spec.after = Some(mapped);
+        }
+        norm.push(spec);
     }
     Ok(Proposal { summary, children: norm })
 }
@@ -450,7 +495,7 @@ mod tests {
     }
 
     fn child(title: &str) -> ChildSpec {
-        ChildSpec { title: title.into(), priority: None }
+        ChildSpec { title: title.into(), priority: None, after: None }
     }
 
     #[test]
@@ -489,14 +534,14 @@ mod tests {
         assert!(
             normalize_proposal(
                 "s",
-                &[ChildSpec { title: "t".into(), priority: Some("urgent".into()) }]
+                &[ChildSpec { title: "t".into(), priority: Some("urgent".into()), after: None }]
             )
             .is_ok()
         );
         assert!(
             normalize_proposal(
                 "s",
-                &[ChildSpec { title: "t".into(), priority: Some("meh".into()) }]
+                &[ChildSpec { title: "t".into(), priority: Some("meh".into()), after: None }]
             )
             .is_err()
         );
@@ -505,5 +550,77 @@ mod tests {
         let p = normalize_proposal(&long_summary, &[child(&long_title)]).expect("valid");
         assert_eq!(p.summary.chars().count(), MAX_PROPOSAL_SUMMARY_LEN);
         assert_eq!(p.children[0].title.chars().count(), MAX_CHILD_TITLE_LEN);
+    }
+
+    fn child_after(title: &str, after: Option<usize>) -> ChildSpec {
+        ChildSpec { title: title.into(), priority: None, after }
+    }
+
+    #[test]
+    fn proposal_keeps_a_valid_backward_after() {
+        // child #1 depends on #0 — a legal backward edge.
+        let p = normalize_proposal(
+            "Plan",
+            &[child_after("First", None), child_after("Second", Some(0))],
+        )
+        .expect("valid backward dependency");
+        assert_eq!(p.children[0].after, None);
+        assert_eq!(p.children[1].after, Some(0));
+    }
+
+    #[test]
+    fn proposal_rejects_forward_self_and_out_of_range_after() {
+        // Forward reference (#0 → #1) is refused.
+        assert!(
+            normalize_proposal(
+                "p",
+                &[child_after("A", Some(1)), child_after("B", None)]
+            )
+            .is_err()
+        );
+        // Self reference (#0 → #0) is refused.
+        assert!(normalize_proposal("p", &[child_after("A", Some(0))]).is_err());
+        // Out-of-range reference is refused.
+        assert!(
+            normalize_proposal(
+                "p",
+                &[child_after("A", None), child_after("B", Some(9))]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn proposal_after_remaps_across_dropped_children() {
+        // Original indices: 0=A, 1="" (dropped), 2=C(after=0). After the
+        // drop A→0, C→1, and `after=0` still points at A — a valid edge.
+        let p = normalize_proposal(
+            "p",
+            &[
+                child_after("A", None),
+                child_after("   ", None),
+                child_after("C", Some(0)),
+            ],
+        )
+        .expect("after remaps over the dropped child");
+        assert_eq!(p.children.len(), 2);
+        assert_eq!(p.children[1].title, "C");
+        assert_eq!(p.children[1].after, Some(0));
+    }
+
+    #[test]
+    fn proposal_rejects_after_pointing_at_a_dropped_child() {
+        // #2 (C) depends on original #1, which is dropped (empty) — refused.
+        assert!(
+            normalize_proposal(
+                "p",
+                &[
+                    child_after("A", None),
+                    child_after("   ", None),
+                    child_after("C", Some(1)),
+                ]
+            )
+            .is_err()
+        );
     }
 }

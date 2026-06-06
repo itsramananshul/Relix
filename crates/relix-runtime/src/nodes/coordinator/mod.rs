@@ -1824,8 +1824,17 @@ impl TaskStore {
     ///   duplicate/concurrent accept is refused (`Invalid`) and **never
     ///   double-creates Briefs** — then materializes each proposed child as
     ///   a real Sub-brief via [`create_brief`] + [`link_subbrief`] (tenant-
-    ///   stamped, owner-attributed), records the created ids on the card's
-    ///   `response`, and Chronicles `brief.suggestion_materialized` with the
+    ///   stamped, owner-attributed). Each child **inherits the parent's safe
+    ///   spine context** so the children stay company-consistent: the
+    ///   parent's `mandate_id` / `campaign_id` (passed at create) and its
+    ///   `reviewer_agent_id` (set best-effort after create). The **assignee
+    ///   is intentionally NOT inherited** — assignment runs governance
+    ///   gating, so it stays deferred. Where a child carries an `after`
+    ///   dependency (§1.6, validated + remapped at open time) it is wired as
+    ///   a Snag (`blocked_on`) on the referenced earlier sibling — both
+    ///   already exist because children are created in order. Records the
+    ///   created ids on the card's `response` and Chronicles
+    ///   `brief.suggestion_materialized` with the inherited-context summary +
     ///   child ids. Returns the created child task_ids (empty on reject).
     ///
     /// The card must be an `open` `suggest_tasks` card belonging to
@@ -1906,19 +1915,46 @@ impl TaskStore {
             .as_deref()
             .and_then(|p| serde_json::from_str(p).ok())
             .ok_or_else(|| CoordinatorError::Invalid("suggestion proposal missing".to_string()))?;
+        // Read the parent's spine context once, so each child inherits the
+        // SAFE links (Mandate/Campaign/reviewer) and stays company-
+        // consistent. Assignee is deliberately NOT inherited (it runs
+        // governance gating). A vanished parent (it can't, the card lives on
+        // it) degrades to no inheritance rather than aborting.
+        let (inh_mandate, inh_campaign, inh_reviewer) = match self.brief_fields(task_id)? {
+            Some(f) => (f.mandate_id, f.campaign_id, f.reviewer_agent_id),
+            None => (None, None, None),
+        };
         let mut created: Vec<String> = Vec::new();
         for c in &proposal.children {
             let child = self.create_brief(
                 tenant,
                 &c.title,
                 owner_subject_id,
-                None,
-                None,
-                None,
+                None, // assignee — deferred (governance-gated)
+                inh_mandate.as_deref(),
+                inh_campaign.as_deref(),
                 c.priority.as_deref(),
             )?;
             self.link_subbrief(task_id, &child)?;
+            // Inherit the parent's reviewer best-effort: a fresh child has
+            // none, and carrying the parent's keeps the review chain intact.
+            // Fail-soft — a reviewer hiccup must not abort an otherwise-valid
+            // materialization (the child Brief already exists and is usable).
+            if let Some(rv) = inh_reviewer.as_deref() {
+                let _ = self.set_brief_field(&child, "reviewer", rv);
+            }
             created.push(child);
+        }
+        // Materialize the intra-proposal dependency edges (§1.6): a child
+        // with `after = Some(j)` (j strictly earlier, validated + remapped at
+        // open time) is `blocked_on` its earlier sibling — both already
+        // exist. `add_snag` re-checks existence/self/cycle and is idempotent.
+        let mut dep_edges = 0usize;
+        for (i, c) in proposal.children.iter().enumerate() {
+            if let Some(j) = c.after {
+                self.add_snag(&created[i], &created[j])?;
+                dep_edges += 1;
+            }
         }
 
         // ── 3. Record the created ids on the card + Chronicle. ──
@@ -1926,6 +1962,23 @@ impl TaskStore {
             let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
             let now = unix_secs();
             let joined = created.join(",");
+            // Name the inherited context + dependency edges so the Chronicle
+            // reads as an honest ledger of what materialization did.
+            let mut inherited: Vec<&str> = Vec::new();
+            if inh_mandate.is_some() {
+                inherited.push("mandate");
+            }
+            if inh_campaign.is_some() {
+                inherited.push("campaign");
+            }
+            if inh_reviewer.is_some() {
+                inherited.push("reviewer");
+            }
+            let inherited = if inherited.is_empty() {
+                "none".to_string()
+            } else {
+                inherited.join("+")
+            };
             let _ = conn.execute(
                 "UPDATE brief_interactions SET response = ?1
                  WHERE interaction_id = ?2 AND task_id = ?3",
@@ -1937,7 +1990,10 @@ impl TaskStore {
                 params![
                     task_id,
                     now,
-                    format!("{responder}: created {} — {joined}", created.len())
+                    format!(
+                        "{responder}: created {} (inherited: {inherited}; {dep_edges} dependency edge(s)) — {joined}",
+                        created.len()
+                    )
                 ],
             );
         }
@@ -19578,8 +19634,12 @@ mod tests {
             .create_brief("acme", "Parent epic", "subj", None, None, None, None)
             .unwrap();
         let children = vec![
-            brief::ChildSpec { title: "Design the API".into(), priority: None },
-            brief::ChildSpec { title: "Wire the store".into(), priority: Some("high".into()) },
+            brief::ChildSpec { title: "Design the API".into(), priority: None, after: None },
+            brief::ChildSpec {
+                title: "Wire the store".into(),
+                priority: Some("high".into()),
+                after: None,
+            },
         ];
         let id = s
             .open_suggestion(&parent, "operative-1", "Break this epic down", &children)
@@ -19623,6 +19683,150 @@ mod tests {
         assert_eq!(mat.len(), 1);
     }
 
+    // Accepted children inherit the parent's SAFE spine context
+    // (Mandate/Campaign/reviewer) but NOT its assignee (governance-gated).
+    #[test]
+    fn brief_suggestion_children_inherit_parent_context() {
+        let s = TaskStore::in_memory().unwrap();
+        // Parent carries a full spine context + an assignee.
+        let parent = s
+            .create_brief(
+                "acme",
+                "Parent epic",
+                "subj",
+                Some("agent_assignee"),
+                Some("mandate_x"),
+                Some("campaign_y"),
+                None,
+            )
+            .unwrap();
+        s.set_brief_field(&parent, "reviewer", "agent_reviewer").unwrap();
+
+        let children = vec![
+            brief::ChildSpec { title: "Child one".into(), priority: None, after: None },
+            brief::ChildSpec { title: "Child two".into(), priority: None, after: None },
+        ];
+        let id = s
+            .open_suggestion(&parent, "operative-1", "Break it down", &children)
+            .unwrap();
+        let created = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true)
+            .unwrap();
+        assert_eq!(created.len(), 2);
+        for c in &created {
+            let f = s.brief_fields(c).unwrap().unwrap();
+            assert_eq!(f.mandate_id.as_deref(), Some("mandate_x"), "mandate inherited");
+            assert_eq!(
+                f.campaign_id.as_deref(),
+                Some("campaign_y"),
+                "campaign inherited"
+            );
+            assert_eq!(
+                f.reviewer_agent_id.as_deref(),
+                Some("agent_reviewer"),
+                "reviewer inherited"
+            );
+            // Assignee is NOT inherited — assignment stays governance-gated.
+            assert_eq!(f.assignee_agent_id, None, "assignee must NOT be inherited");
+        }
+        // The materialization Chronicle names the inherited context.
+        let mat = s
+            .query_events(
+                &parent,
+                0,
+                50,
+                Some("brief.suggestion_materialized"),
+                EventOrder::Asc,
+            )
+            .unwrap();
+        assert_eq!(mat.len(), 1);
+        assert!(
+            mat[0].payload.contains("mandate+campaign+reviewer"),
+            "Chronicle must name the inherited context: {}",
+            mat[0].payload
+        );
+    }
+
+    // A valid `after` materializes a dependency (Snag) edge among the
+    // accepted children: the dependent is blocked until its prerequisite
+    // reaches `done`.
+    #[test]
+    fn brief_suggestion_accept_materializes_dependency_edge() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Parent", "subj", None, None, None, None)
+            .unwrap();
+        // child #1 depends on child #0 (a backward edge).
+        let children = vec![
+            brief::ChildSpec { title: "Prerequisite".into(), priority: None, after: None },
+            brief::ChildSpec { title: "Dependent".into(), priority: None, after: Some(0) },
+        ];
+        let id = s
+            .open_suggestion(&parent, "op", "Ordered plan", &children)
+            .unwrap();
+        let created = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true)
+            .unwrap();
+        assert_eq!(created.len(), 2);
+        // The dependent (#1) is blocked_on the prerequisite (#0).
+        let snags = s.list_snags(&created[1]).unwrap();
+        assert_eq!(snags, vec![created[0].clone()], "dependent → prerequisite Snag");
+        assert!(s.is_blocked(&created[1]).unwrap(), "dependent starts blocked");
+        // The prerequisite has no Snag of its own.
+        assert!(s.list_snags(&created[0]).unwrap().is_empty());
+        // The dependency materialization is named in the Chronicle.
+        let mat = s
+            .query_events(
+                &parent,
+                0,
+                50,
+                Some("brief.suggestion_materialized"),
+                EventOrder::Asc,
+            )
+            .unwrap();
+        assert!(
+            mat[0].payload.contains("1 dependency edge"),
+            "Chronicle must name the dependency edge: {}",
+            mat[0].payload
+        );
+        // Only `done` resolves a Snag (the LOCKED rule). Set the
+        // prerequisite to `done` directly — `is_blocked` only inspects the
+        // blocker's `board_status`, and the board-transition guards are out
+        // of scope for this dependency-materialization test.
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE tasks SET board_status = 'done' WHERE task_id = ?1",
+                params![created[0]],
+            )
+            .unwrap();
+        }
+        assert!(
+            !s.is_blocked(&created[1]).unwrap(),
+            "dependent unblocks once the prerequisite is done"
+        );
+    }
+
+    // An invalid `after` (forward reference) is refused at open time and
+    // creates NO card — so accept can never half-create an unhonourable order.
+    #[test]
+    fn brief_suggestion_invalid_dependency_refused_at_open() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Parent", "subj", None, None, None, None)
+            .unwrap();
+        // #0 → #1 is a forward reference: rejected at open.
+        let children = vec![
+            brief::ChildSpec { title: "A".into(), priority: None, after: Some(1) },
+            brief::ChildSpec { title: "B".into(), priority: None, after: None },
+        ];
+        let out = s.open_suggestion(&parent, "op", "Bad order", &children);
+        assert!(matches!(out, Err(CoordinatorError::Invalid(_))));
+        // No card opened, no children, nothing partial.
+        assert!(s.list_interactions(&parent).unwrap().is_empty());
+        assert!(s.list_subbriefs(&parent).unwrap().is_empty());
+    }
+
     // Rejecting a suggestion closes it and creates NO Briefs.
     #[test]
     fn brief_suggestion_reject_creates_no_briefs() {
@@ -19635,7 +19839,7 @@ mod tests {
                 &parent,
                 "operative-1",
                 "Some plan",
-                &[brief::ChildSpec { title: "Do a thing".into(), priority: None }],
+                &[brief::ChildSpec { title: "Do a thing".into(), priority: None, after: None }],
             )
             .unwrap();
         let created = s
@@ -19660,8 +19864,8 @@ mod tests {
                 "op",
                 "Plan",
                 &[
-                    brief::ChildSpec { title: "A".into(), priority: None },
-                    brief::ChildSpec { title: "B".into(), priority: None },
+                    brief::ChildSpec { title: "A".into(), priority: None, after: None },
+                    brief::ChildSpec { title: "B".into(), priority: None, after: None },
                 ],
             )
             .unwrap();
@@ -19691,7 +19895,7 @@ mod tests {
                 &parent,
                 "op",
                 "Plan",
-                &[brief::ChildSpec { title: "A".into(), priority: None }],
+                &[brief::ChildSpec { title: "A".into(), priority: None, after: None }],
             )
             .unwrap();
         let out = s.respond_interaction(&parent, &id, "founder", "resolved", "yes");
