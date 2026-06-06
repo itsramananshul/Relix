@@ -128,6 +128,24 @@ interface BriefDetailData {
   latest_run?: LatestRun | null;
 }
 
+// A comment, extracted from a `brief.comment` Chronicle event. The runtime
+// records the payload as `"{author}: {text}"` (see coordinator
+// `comment_on_brief`), so the author is the prefix up to the first `": "`;
+// anything without that separator renders as a bodied note with no author.
+interface BriefComment {
+  event_id?: number;
+  ts?: number;
+  author: string;
+  body: string;
+}
+function parseComment(e: ChronicleEntry): BriefComment {
+  const text = e.payload ?? "";
+  const idx = text.indexOf(": ");
+  return idx > 0
+    ? { event_id: e.event_id, ts: e.ts, author: text.slice(0, idx), body: text.slice(idx + 2) }
+    : { event_id: e.event_id, ts: e.ts, author: "", body: text };
+}
+
 // A small color cue per Chronicle event family — no theme change, just dots.
 function eventTone(type?: string): string {
   const t = type ?? "";
@@ -211,6 +229,15 @@ export function BriefDetail({
         : [];
   const claim = d.claim ?? null;
   const lr = d.latest_run ?? null;
+  // The Conversation: the Brief's comment thread (human + companion +
+  // Operative), extracted from the same Chronicle events the ledger renders.
+  // Events arrive newest-first; a conversation reads oldest→newest (newest by
+  // the composer). Per the design docs this comment thread *is* the channel —
+  // the full Chronicle ledger stays below as execution history.
+  const comments = events
+    .filter((e) => (e.event_type ?? "") === "brief.comment")
+    .map(parseComment)
+    .reverse();
 
   async function submitComment() {
     const text = comment.trim();
@@ -223,7 +250,7 @@ export function BriefDetail({
         text,
       });
       setComment("");
-      setBanner({ kind: "ok", msg: "Comment added to the Chronicle." });
+      setBanner({ kind: "ok", msg: "Comment posted to the Conversation." });
       reload();
       onChanged?.();
     } catch (e) {
@@ -510,9 +537,61 @@ export function BriefDetail({
         </div>
       )}
 
+      {/* Conversation — the Brief's work thread: every `brief.comment`
+          event (human, companion, Operative) read oldest→newest. This thread
+          IS the communication channel (execution-and-issue-design §0/§1.9);
+          the full Chronicle ledger stays below as execution history. */}
+      <div className="row" style={{ marginTop: 14, marginBottom: 6 }}>
+        <strong style={{ fontSize: 12 }}>Conversation</strong>
+        <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>
+          {comments.length} comment(s)
+        </span>
+      </div>
+      {comments.length === 0 ? (
+        <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+          No comments yet — add the first note to start the conversation. Comments are shared by you, the companion, and the assigned Operative.
+        </div>
+      ) : (
+        <div style={{ maxHeight: 260, overflow: "auto", marginBottom: 8 }}>
+          {comments.map((c, i) => (
+            <div key={c.event_id ?? i} style={{ padding: "5px 0", borderBottom: "1px solid var(--border-soft)" }}>
+              <div className="row" style={{ gap: 6, alignItems: "baseline", flexWrap: "wrap" }}>
+                <span className="mono" style={{ fontSize: 11, fontWeight: 600 }}>{c.author || "—"}</span>
+                {c.ts ? <span className="muted" style={{ fontSize: 10 }}>{new Date(c.ts * 1000).toLocaleString()}</span> : null}
+              </div>
+              <div style={{ fontSize: 12, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{c.body}</div>
+            </div>
+          ))}
+        </div>
+      )}
+      {/* Composer — posts via `brief.comment`; the new comment lands in both
+          the Conversation and the Chronicle after the refetch below. */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <textarea
+          className="input"
+          style={{ width: "100%", minHeight: 56, resize: "vertical", boxSizing: "border-box" }}
+          placeholder="Write a comment…  (Enter to post · Shift+Enter for a new line)"
+          value={comment}
+          onChange={(e) => setComment(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              void submitComment();
+            }
+          }}
+        />
+        <div className="row" style={{ gap: 8 }}>
+          <span className="muted" style={{ fontSize: 11 }}>Posts to the Conversation and the Chronicle.</span>
+          <div className="spacer" style={{ flex: 1 }} />
+          <button className="btn" onClick={submitComment} disabled={busy || !comment.trim()}>
+            {busy ? "…" : "Comment"}
+          </button>
+        </div>
+      </div>
+
       {/* Chronicle — the readable timeline (newest first) from `/events`,
           merging system notes, run lifecycle, board moves, and comments. */}
-      <div className="row" style={{ marginTop: 12, marginBottom: 6 }}>
+      <div className="row" style={{ marginTop: 14, marginBottom: 6 }}>
         <strong style={{ fontSize: 12 }}>Chronicle</strong>
         <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>
           {d.chronicle?.total ?? 0} event(s) total · showing newest {events.length}
@@ -535,21 +614,6 @@ export function BriefDetail({
           ))}
         </div>
       )}
-
-      {/* Comment — appends to the Chronicle as a brief.comment event. */}
-      <div className="row" style={{ marginTop: 12, gap: 8 }}>
-        <input
-          className="input"
-          style={{ flex: 1 }}
-          placeholder="Add a comment to the Chronicle…"
-          value={comment}
-          onChange={(e) => setComment(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && submitComment()}
-        />
-        <button className="btn" onClick={submitComment} disabled={busy || !comment.trim()}>
-          {busy ? "…" : "Comment"}
-        </button>
-      </div>
     </div>
   );
 }
