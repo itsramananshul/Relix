@@ -17,7 +17,10 @@ interface ProposalPlan {
   risks?: string[];
   next_actions?: string[];
   ai_used?: boolean;
+  /** "deterministic_only" | "llm_used" | "fallback" | "unavailable" */
+  ai_mode?: string;
   ai_status?: string;
+  ai_reason?: string;
 }
 interface ProposalResponse { proposal_id?: string; status?: string; proposal?: ProposalPlan }
 interface ApproveResponse {
@@ -128,6 +131,10 @@ export function Chat() {
   ]);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
+  // Opt into the model-assisted Prime planner (company-model §12.5A). Off by
+  // default — the plan stays rule-based unless the operator asks for AI, and
+  // even then it falls back deterministically if no model is reachable.
+  const [useAi, setUseAi] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   function scroll() {
@@ -142,7 +149,8 @@ export function Chat() {
     setLog((l) => [...l, { role: "user", kind: "text", text: message }]);
     setBusy(true);
     try {
-      const res = await api.post<ProposalResponse>("/v1/spine/prime/propose", { message });
+      const body = useAi ? { message, mode: "ai" } : { message };
+      const res = await api.post<ProposalResponse>("/v1/spine/prime/propose", body);
       setLog((l) => [...l, { role: "assistant", kind: "proposal", data: res }]);
     } catch (e) {
       setLog((l) => [
@@ -257,6 +265,14 @@ export function Chat() {
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && plan()}
         />
+        <label
+          className="muted"
+          style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 4, whiteSpace: "nowrap" }}
+          title="Draft the plan with a language model. Validated + crew-matched server-side; falls back to the rule-based plan if no model is reachable."
+        >
+          <input type="checkbox" checked={useAi} onChange={(e) => setUseAi(e.target.checked)} disabled={busy} />
+          Use AI
+        </label>
         <button className="btn" onClick={plan} disabled={busy || !text.trim()} title="Propose a governed plan (creates nothing until you approve)">
           Plan with Prime
         </button>
@@ -318,10 +334,9 @@ function ProposalCard({ entry, onApprove, busy }: { entry: { data: ProposalRespo
           </div>
         )}
 
-        {/* AI honesty */}
-        {p.ai_used === false && (
-          <div className="muted" style={{ fontSize: 10, marginTop: 6, fontStyle: "italic" }}>{p.ai_status}</div>
-        )}
+        {/* AI provenance — compact + honest (full status on hover) */}
+        <AiStatusBadge mode={p.ai_mode} aiUsed={p.ai_used} status={p.ai_status} reason={p.ai_reason} />
+
 
         {/* Actions */}
         <div className="row" style={{ gap: 8, marginTop: 10 }}>
@@ -335,6 +350,28 @@ function ProposalCard({ entry, onApprove, busy }: { entry: { data: ProposalRespo
           <span className="muted" style={{ fontSize: 11 }}>Nothing runs automatically — approve, then <strong>Start the work</strong>.</span>
         </div>
       </div>
+    </div>
+  );
+}
+
+// Compact, honest provenance for a Prime plan. One small badge keyed on the
+// machine `ai_mode`; the full `ai_status` (and any fallback reason) is on hover
+// so the card stays uncluttered.
+function AiStatusBadge({ mode, aiUsed, status, reason }: { mode?: string; aiUsed?: boolean; status?: string; reason?: string }) {
+  const m = mode ?? (aiUsed ? "llm_used" : "deterministic_only");
+  const META: Record<string, { tone: string; label: string }> = {
+    llm_used: { tone: "done", label: "AI-drafted · validated" },
+    fallback: { tone: "backlog", label: "AI rejected → rule-based" },
+    unavailable: { tone: "backlog", label: "AI unavailable → rule-based" },
+    deterministic_only: { tone: "todo", label: "rule-based" },
+  };
+  const meta = META[m] ?? META.deterministic_only;
+  const title = (status ?? "") + (reason ? `\n\nReason: ${reason}` : "");
+  return (
+    <div style={{ marginTop: 6 }}>
+      <span className={"badge " + meta.tone} style={{ fontSize: 9 }} title={title}>
+        {meta.label}
+      </span>
     </div>
   );
 }
