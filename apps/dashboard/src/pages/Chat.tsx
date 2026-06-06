@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, subscribeRunEvents } from "../api";
+import { api, subscribePrimeStatus, type StatusStreamConn } from "../api";
 
 // ── Prime Assistant proposal shapes (from /v1/spine/prime/propose) ──────────
 interface CrewSlot { role?: string; have?: boolean; agent_name?: string }
@@ -423,13 +423,16 @@ function ApprovedCard({ entry, onStart, busy }: { entry: { data: ApproveResponse
 
 // ── Live Shift Room ─────────────────────────────────────────────────────────
 // Given an approved proposal id, render the live status of every created Brief
-// with its latest Shift + a concrete next action. Refreshes the moment a run
-// event arrives over the existing SSE stream; ALSO polls every few seconds
-// while a Shift is running, so it stays live even if SSE is unavailable.
+// with its latest Shift + a concrete next action. PREFERS the dedicated status
+// stream (server pushes the snapshot + every change); FALLS BACK to polling the
+// status snapshot whenever the stream isn't carrying us (connecting / retrying /
+// unsupported). The header badge is honest: it only says "live" when the stream
+// is actually connected.
 function ShiftRoom({ proposalId }: { proposalId: string }) {
   const [status, setStatus] = useState<SessionStatus | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [acting, setActing] = useState<string | null>(null);
+  const [conn, setConn] = useState<StatusStreamConn>("connecting");
 
   const refresh = useCallback(async () => {
     try {
@@ -441,21 +444,37 @@ function ShiftRoom({ proposalId }: { proposalId: string }) {
     }
   }, [proposalId]);
 
+  // One immediate fetch for instant data + a fallback if the stream never
+  // connects (e.g. SSE unsupported behind a proxy).
   useEffect(() => {
     refresh();
   }, [refresh]);
 
-  // Live refresh on any execution-stream event (run started/finished/reviewed/
-  // applied/moved). Reuses the existing bridge SSE — no new event bus.
-  useEffect(() => subscribeRunEvents(() => refresh(), () => {}), [refresh]);
+  // Prefer the dedicated status stream: the server pushes the initial snapshot
+  // and every change. A terminal `not_found` surfaces an honest message.
+  useEffect(
+    () =>
+      subscribePrimeStatus(
+        proposalId,
+        (s) => {
+          setStatus(s as SessionStatus);
+          setErr(null);
+        },
+        (c) => setConn(c),
+        () => setErr("This work session is no longer available."),
+      ),
+    [proposalId],
+  );
 
-  // Poll fallback while a Shift is running (covers SSE-unavailable).
-  const running = status?.counts?.running ?? 0;
+  // Poll fallback ONLY while the stream isn't live — covers connecting,
+  // reconnecting, and SSE-unsupported. When live, the stream carries us and we
+  // don't poll at all.
+  const live = conn === "live";
   useEffect(() => {
-    if (running <= 0) return;
+    if (live) return;
     const t = setInterval(refresh, 4000);
     return () => clearInterval(t);
-  }, [running, refresh]);
+  }, [live, refresh]);
 
   async function runBrief(id: string) {
     setActing(id);
@@ -476,6 +495,18 @@ function ShiftRoom({ proposalId }: { proposalId: string }) {
       <div className="row" style={{ gap: 8, alignItems: "center" }}>
         <strong style={{ fontSize: 13 }}>Shift Room</strong>
         {status?.mandate_title && <span className="muted" style={{ fontSize: 11 }}>· {status.mandate_title}</span>}
+        {/* Honest connection state — only "live" when the stream is connected. */}
+        <span
+          className={"badge " + (live ? "done" : "backlog")}
+          style={{ fontSize: 9 }}
+          title={
+            live
+              ? "Live — pushed by the session status stream"
+              : "Polling — the status stream is unavailable; refreshing every few seconds"
+          }
+        >
+          {live ? "live" : "polling"}
+        </span>
         <div className="spacer" style={{ flex: 1 }} />
         <button className="btn ghost" style={{ fontSize: 11, padding: "2px 8px" }} onClick={refresh}>
           Refresh

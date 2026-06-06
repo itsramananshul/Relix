@@ -166,6 +166,81 @@ export function subscribeRunEvents(
   };
 }
 
+// ── Dedicated Prime Shift-Room status stream (SSE) ─────────────────────────
+// Subscribe to the bridge's dedicated `/v1/spine/prime/proposals/:id/status/
+// stream` feed so the Shift Room renders the live session status pushed by the
+// server (initial snapshot + on every change), instead of polling. Cookie auth
+// rides the same-origin EventSource. Falls back to polling at the call site
+// whenever this never reaches `live`.
+
+export type StatusStreamConn = "connecting" | "live" | "reconnecting" | "unavailable";
+
+// Open the dedicated status stream for one proposal. `onStatus` receives the
+// full session-status JSON on the initial snapshot + every change; `onConn`
+// reports honest connection state; `onGone` fires once when the server emits a
+// terminal `not_found` (the proposal is unknown / cross-Guild). Manages
+// reconnect with capped backoff. Returns an unsubscribe fn.
+export function subscribePrimeStatus(
+  proposalId: string,
+  onStatus: (status: unknown) => void,
+  onConn: (state: StatusStreamConn) => void,
+  onGone?: () => void,
+): () => void {
+  let es: EventSource | null = null;
+  let closed = false;
+  let attempts = 0;
+  let backoff = 1000;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const connect = () => {
+    if (closed) return;
+    onConn(attempts === 0 ? "connecting" : "reconnecting");
+    es = new EventSource(`/v1/spine/prime/proposals/${proposalId}/status/stream`, {
+      withCredentials: true,
+    });
+    es.onopen = () => {
+      attempts = 0;
+      backoff = 1000;
+      onConn("live");
+    };
+    es.addEventListener("status", (e: MessageEvent) => {
+      try {
+        onStatus(JSON.parse(e.data));
+      } catch {
+        /* malformed frame — ignore, the next snapshot corrects it */
+      }
+    });
+    // Terminal: the proposal is gone / cross-Guild. Stop cleanly — no reconnect.
+    es.addEventListener("not_found", () => {
+      closed = true;
+      es?.close();
+      es = null;
+      onConn("unavailable");
+      onGone?.();
+    });
+    // NB: we intentionally do NOT listen for a custom `error` event — the
+    // server's transient `event: error` frames just precede the next snapshot,
+    // and EventSource's own connection `error` is handled by `onerror` below.
+    es.onerror = () => {
+      es?.close();
+      es = null;
+      if (closed) return;
+      attempts += 1;
+      onConn(attempts >= 3 ? "unavailable" : "reconnecting");
+      timer = setTimeout(connect, backoff);
+      backoff = Math.min(backoff * 2, 15000);
+    };
+  };
+
+  connect();
+  return () => {
+    closed = true;
+    if (timer) clearTimeout(timer);
+    es?.close();
+    es = null;
+  };
+}
+
 // Outcome of probing one health dimension. `status` is the HTTP code (null
 // when the request never reached the bridge — a network/DNS/TLS failure).
 export interface Probe {
