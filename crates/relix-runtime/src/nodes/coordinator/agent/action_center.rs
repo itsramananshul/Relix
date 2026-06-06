@@ -32,6 +32,11 @@ pub enum ActionCategory {
     /// A pending Operative awaiting activation that has NO Clearance to decide
     /// (a `route=direct` hire) — it needs an explicit `agent.approve_hire`.
     Hire,
+    /// A spend/budget signal the Board must weigh (company-model §5.4 / §8.2):
+    /// committed Allowance over (or near) the Guild budget, or an active
+    /// Operative hard-stopped by a zero Allowance with work waiting. Computed
+    /// from EXISTING allowance state — never a fabricated spend figure.
+    Budget,
     /// A Shift that failed / was refused / was interrupted — something broke and
     /// needs the operator to inspect or retry.
     FailedOrRefused,
@@ -56,6 +61,7 @@ impl ActionCategory {
         match self {
             ActionCategory::Approval => "approval",
             ActionCategory::Hire => "hire",
+            ActionCategory::Budget => "budget",
             ActionCategory::FailedOrRefused => "failed_or_refused",
             ActionCategory::NeedsReview => "needs_review",
             ActionCategory::ReadyToStart => "ready_to_start",
@@ -68,26 +74,33 @@ impl ActionCategory {
     /// (company-model §8.2 + the pack brief):
     /// - approvals / hire blockers near the top (they unblock the whole
     ///   company),
-    /// - failed/refused before informational stale items,
+    /// - **budget** governance next — a hard-stop blocks ALL of an Operative's
+    ///   work and over-commitment is a Board (§5.4) sovereign-control concern,
+    ///   so it sits with the approval/hire blockers, above a single broken Shift,
+    /// - failed/refused (recovery) before informational stale items,
     /// - ready_to_start before generic blocked items (it can move work forward).
     pub fn rank(self) -> u8 {
         match self {
             ActionCategory::Approval => 0,
             ActionCategory::Hire => 1,
-            ActionCategory::FailedOrRefused => 2,
-            ActionCategory::NeedsReview => 3,
-            ActionCategory::ReadyToStart => 4,
-            ActionCategory::Blocked => 5,
-            ActionCategory::Stale => 6,
+            ActionCategory::Budget => 2,
+            ActionCategory::FailedOrRefused => 3,
+            ActionCategory::NeedsReview => 4,
+            ActionCategory::ReadyToStart => 5,
+            ActionCategory::Blocked => 6,
+            ActionCategory::Stale => 7,
         }
     }
 
-    /// The coarse severity badge for the dashboard.
+    /// The coarse severity badge for the dashboard. NOTE: this is the *category
+    /// default*; individual items may carry a per-item [`ActionItem::severity`]
+    /// (e.g. a *near*-budget warning is Medium while an over-budget item is High).
     pub fn severity(self) -> ActionSeverity {
         match self {
-            ActionCategory::Approval | ActionCategory::Hire | ActionCategory::FailedOrRefused => {
-                ActionSeverity::High
-            }
+            ActionCategory::Approval
+            | ActionCategory::Hire
+            | ActionCategory::Budget
+            | ActionCategory::FailedOrRefused => ActionSeverity::High,
             ActionCategory::NeedsReview
             | ActionCategory::ReadyToStart
             | ActionCategory::Blocked => ActionSeverity::Medium,
@@ -273,6 +286,88 @@ pub fn hire_item(p: &AgentProfile) -> ActionItem {
     }
 }
 
+/// Render a cents amount as `$D.CC` for an operator-facing reason line.
+fn fmt_cents(cents: i64) -> String {
+    let neg = cents < 0;
+    let abs = cents.unsigned_abs();
+    format!("{}${}.{:02}", if neg { "-" } else { "" }, abs / 100, abs % 100)
+}
+
+/// **Budget alert (Part A)** — the Guild's committed Allowance against its
+/// configured budget (company-model §5.4 the Board reads/sets budgets, §8.2 the
+/// Inbox surfaces budget thresholds). `committed` is the sum of active
+/// Operatives' Allowances; `budget` is the Guild's monthly Allowance. Both come
+/// from EXISTING tenant-scoped state — there is no fabricated live-spend figure.
+/// `over = true` means committed already exceeds the budget (High); otherwise it
+/// is *near* the budget (Medium). A single stable id so it never spams.
+pub fn budget_committed_item(committed_cents: i64, budget_cents: i64, over: bool) -> ActionItem {
+    let pct = if budget_cents > 0 {
+        committed_cents.saturating_mul(100) / budget_cents
+    } else {
+        0
+    };
+    let (title, reason, severity) = if over {
+        (
+            "Committed Allowance over the Guild budget".to_string(),
+            format!(
+                "active Operatives commit {} of the {} Guild budget ({pct}%) — over budget; \
+                 trim Allowances or raise the Guild budget",
+                fmt_cents(committed_cents),
+                fmt_cents(budget_cents),
+            ),
+            ActionSeverity::High,
+        )
+    } else {
+        (
+            "Committed Allowance near the Guild budget".to_string(),
+            format!(
+                "active Operatives commit {} of the {} Guild budget ({pct}%) — approaching the cap",
+                fmt_cents(committed_cents),
+                fmt_cents(budget_cents),
+            ),
+            ActionSeverity::Medium,
+        )
+    };
+    ActionItem {
+        id: "budget:committed".to_string(),
+        category: ActionCategory::Budget,
+        severity,
+        title,
+        reason,
+        target_type: Some("company".to_string()),
+        target_id: Some("committed_allowance".to_string()),
+        target_title: None,
+        action_label: "Review Allowances".to_string(),
+        route: Some("/agents".to_string()),
+        created_at: None,
+        updated_at: None,
+    }
+}
+
+/// **Budget alert (Part A)** — an active Operative whose Allowance is `0`/negative
+/// is hard-stopped by the dispatch gate (`heartbeat::allowance_admits`: `c <= 0
+/// ⇒ Refuse`). When such an Operative has runnable/blocked work assigned, surface
+/// it so the Board raises the cap. Config-only and fully honest — no spend ledger.
+pub fn allowance_hardstop_item(p: &AgentProfile) -> ActionItem {
+    ActionItem {
+        id: format!("budget:hardstop:{}", p.agent_id),
+        category: ActionCategory::Budget,
+        severity: ActionSeverity::High,
+        title: format!("Allowance hard-stop — {}", p.name),
+        reason:
+            "this Operative's Allowance is 0 (hard-stopped) but it has runnable or blocked work \
+             assigned — raise the Allowance so it can run"
+                .to_string(),
+        target_type: Some("agent".to_string()),
+        target_id: Some(p.agent_id.clone()),
+        target_title: Some(p.name.clone()),
+        action_label: "Raise the Allowance".to_string(),
+        route: Some("/agents".to_string()),
+        created_at: Some(p.created_at),
+        updated_at: None,
+    }
+}
+
 /// A Mandate whose strategy is `proposed` and awaits the Board's approval
 /// (company-model §5.5 strategy gate).
 pub fn strategy_item(m: &Mandate) -> ActionItem {
@@ -383,33 +478,94 @@ pub fn needs_review_item(r: &RunRecord) -> ActionItem {
     }
 }
 
+/// Map a terminal run state + durable refusal reason to a plain-language root
+/// cause and a **recommended recovery action + route** — the read-only form of
+/// the Inbox recovery-decision card (dashboard-design §5.2 / execution §3.3b).
+///
+/// HONEST SCOPE: there is no diagnosis layer and no failure-class/retry-budget
+/// on a run (only the existing **durable refusal taxonomy** —
+/// `unassigned` / `no_adapter` / `adapter_unavailable` / `over_allowance` /
+/// `workspace_error` / `workspace_context_error`, see `refusal_is_durable`). Each
+/// known cause maps to the EXISTING governed route that fixes it; we mint no new
+/// retry/apply mutation. Returns `(reason, action_label, route)`.
+fn recovery_reco(r: &RunRecord) -> (String, String, String) {
+    let run_route = format!("/runs?run={}", r.run_id);
+    match r.status.as_str() {
+        "refused" => match r.refusal_reason.as_deref().unwrap_or("") {
+            "unassigned" => (
+                "the Shift was refused — no Operative is assigned to this Brief".to_string(),
+                "Assign an Operative".to_string(),
+                "/briefs".to_string(),
+            ),
+            "no_adapter" => (
+                "the Shift was refused — the configured Rig is not installed".to_string(),
+                "Configure the Rig".to_string(),
+                "/settings".to_string(),
+            ),
+            "adapter_unavailable" => (
+                "the Shift was refused — the Rig is installed but not authenticated".to_string(),
+                "Configure the Rig".to_string(),
+                "/settings".to_string(),
+            ),
+            "over_allowance" => (
+                "the Shift was refused — the Operative is over its monthly Allowance".to_string(),
+                "Raise the Allowance".to_string(),
+                "/agents".to_string(),
+            ),
+            "workspace_error" | "workspace_context_error" => (
+                "the Shift was refused — the run workspace could not be prepared".to_string(),
+                "Review runtime settings".to_string(),
+                "/settings".to_string(),
+            ),
+            other if !other.is_empty() => (
+                format!("the Shift was refused: {other}"),
+                "Inspect the run".to_string(),
+                run_route,
+            ),
+            _ => (
+                "the Shift was refused before it ran".to_string(),
+                "Inspect the run".to_string(),
+                run_route,
+            ),
+        },
+        "interrupted" => (
+            "the Shift was interrupted (the executing process is gone) — it will be re-claimed \
+             automatically; inspect if it recurs"
+                .to_string(),
+            "Inspect the run".to_string(),
+            run_route,
+        ),
+        // "failed" (or any other non-refused terminal): the Rig ran and failed,
+        // so the (already secret-redacted) summary is the best available reason.
+        _ => {
+            let why = snippet(&r.summary);
+            let reason = if why.trim().is_empty() {
+                format!("a Shift ended `{}` and needs attention", r.status)
+            } else {
+                why
+            };
+            (reason, "Inspect the run".to_string(), run_route)
+        }
+    }
+}
+
 /// A Shift that failed / was refused / was interrupted and needs operator
-/// attention. `status` is the run's terminal state.
+/// attention — a read-only recovery-decision card (Part B). The reason states
+/// the root cause and the action/route points at the EXISTING governed fix
+/// (assign · configure Rig · raise Allowance · review runtime · inspect).
 pub fn failed_item(r: &RunRecord) -> ActionItem {
-    let why = match r.status.as_str() {
-        "refused" => r
-            .refusal_reason
-            .clone()
-            .map(|x| format!("refused: {x}"))
-            .unwrap_or_else(|| "the Shift was refused before it ran".to_string()),
-        "interrupted" => "the Shift was interrupted (the executing process is gone)".to_string(),
-        _ => snippet(&r.summary),
-    };
+    let (reason, action_label, route) = recovery_reco(r);
     ActionItem {
         id: format!("failed:{}", r.run_id),
         category: ActionCategory::FailedOrRefused,
         severity: ActionCategory::FailedOrRefused.severity(),
         title: format!("Shift {} — {}", r.status, r.rig),
-        reason: if why.trim().is_empty() {
-            format!("a Shift ended `{}` and needs attention", r.status)
-        } else {
-            why
-        },
+        reason,
         target_type: Some("brief".to_string()),
         target_id: Some(r.brief_id.clone()),
         target_title: None,
-        action_label: "Inspect the run".to_string(),
-        route: Some(format!("/runs?run={}", r.run_id)),
+        action_label,
+        route: Some(route),
         created_at: Some(r.started_at),
         updated_at: r.finished_at,
     }
@@ -443,6 +599,7 @@ mod tests {
         let order = [
             ActionCategory::Approval,
             ActionCategory::Hire,
+            ActionCategory::Budget,
             ActionCategory::FailedOrRefused,
             ActionCategory::NeedsReview,
             ActionCategory::ReadyToStart,
@@ -456,14 +613,117 @@ mod tests {
         assert!(ActionCategory::FailedOrRefused.rank() < ActionCategory::Stale.rank());
         assert!(ActionCategory::ReadyToStart.rank() < ActionCategory::Blocked.rank());
         assert!(ActionCategory::Approval.rank() < ActionCategory::FailedOrRefused.rank());
+        // Budget governance sits with the approval/hire blockers, above recovery.
+        assert!(ActionCategory::Hire.rank() < ActionCategory::Budget.rank());
+        assert!(ActionCategory::Budget.rank() < ActionCategory::FailedOrRefused.rank());
     }
 
     #[test]
     fn severity_maps_high_medium_low() {
         assert_eq!(ActionCategory::Approval.severity(), ActionSeverity::High);
+        assert_eq!(ActionCategory::Budget.severity(), ActionSeverity::High);
         assert_eq!(ActionCategory::FailedOrRefused.severity(), ActionSeverity::High);
         assert_eq!(ActionCategory::ReadyToStart.severity(), ActionSeverity::Medium);
         assert_eq!(ActionCategory::Stale.severity(), ActionSeverity::Low);
+    }
+
+    #[test]
+    fn fmt_cents_renders_dollars() {
+        assert_eq!(fmt_cents(0), "$0.00");
+        assert_eq!(fmt_cents(5), "$0.05");
+        assert_eq!(fmt_cents(12_345), "$123.45");
+        assert_eq!(fmt_cents(-200), "-$2.00");
+    }
+
+    #[test]
+    fn budget_committed_over_vs_near_severity_and_dedupe_key() {
+        let over = budget_committed_item(15_000, 10_000, true);
+        assert_eq!(over.category, ActionCategory::Budget);
+        assert_eq!(over.severity, ActionSeverity::High);
+        assert!(over.reason.contains("over budget"));
+        assert!(over.reason.contains("$150.00"));
+        assert!(over.reason.contains("150%"));
+
+        let near = budget_committed_item(9_500, 10_000, false);
+        assert_eq!(near.severity, ActionSeverity::Medium);
+        assert!(near.reason.contains("approaching"));
+        // Both share the singleton id/target so only one can ever survive.
+        assert_eq!(over.id, near.id);
+        assert_eq!(over.dedupe_key(), near.dedupe_key());
+    }
+
+    fn run(status: &str, refusal: Option<&str>, summary: &str) -> RunRecord {
+        RunRecord {
+            run_id: "run-1".into(),
+            brief_id: "brief-1".into(),
+            agent_id: "agt-1".into(),
+            rig: "claude".into(),
+            status: status.into(),
+            started_at: 100,
+            finished_at: Some(200),
+            duration_secs: Some(100),
+            summary: summary.into(),
+            workspace: None,
+            workspace_context: None,
+            workspace_files: None,
+            workspace_bytes: None,
+            review: None,
+            review_note: None,
+            reviewed_at: None,
+            apply_status: None,
+            applied_at: None,
+            apply_note: None,
+            applied_files: None,
+            failed_files: None,
+            trigger: Some("manual".into()),
+            provider: None,
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            cost_micros: None,
+            session_id: None,
+            refusal_reason: refusal.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn recovery_card_maps_refusal_to_stable_action_and_route() {
+        // Each durable refusal reason → a STABLE recommended action + the
+        // existing governed route that fixes it.
+        let cases = [
+            ("unassigned", "Assign an Operative", "/briefs"),
+            ("no_adapter", "Configure the Rig", "/settings"),
+            ("adapter_unavailable", "Configure the Rig", "/settings"),
+            ("over_allowance", "Raise the Allowance", "/agents"),
+            ("workspace_error", "Review runtime settings", "/settings"),
+            ("workspace_context_error", "Review runtime settings", "/settings"),
+        ];
+        for (reason_code, label, route) in cases {
+            let it = failed_item(&run("refused", Some(reason_code), ""));
+            assert_eq!(it.category, ActionCategory::FailedOrRefused);
+            assert_eq!(it.action_label, label, "label for {reason_code}");
+            assert_eq!(it.route.as_deref(), Some(route), "route for {reason_code}");
+            assert!(!it.reason.trim().is_empty(), "reason for {reason_code}");
+        }
+    }
+
+    #[test]
+    fn recovery_card_failed_carries_summary_reason_and_inspect() {
+        let it = failed_item(&run("failed", None, "compiler error: E0277"));
+        assert_eq!(it.action_label, "Inspect the run");
+        assert_eq!(it.route.as_deref(), Some("/runs?run=run-1"));
+        assert!(it.reason.contains("E0277"));
+
+        // Interrupted explains auto-reclaim + inspect.
+        let it = failed_item(&run("interrupted", None, ""));
+        assert!(it.reason.contains("interrupted"));
+        assert_eq!(it.action_label, "Inspect the run");
+
+        // Unknown refusal reason still produces a non-empty reason + inspect.
+        let it = failed_item(&run("refused", Some("mystery"), ""));
+        assert!(it.reason.contains("mystery"));
+        assert_eq!(it.action_label, "Inspect the run");
     }
 
     #[test]

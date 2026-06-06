@@ -1153,17 +1153,19 @@ pub fn handle_company_actions(
 
     // 2. Pending hires — Operatives stuck `pending` (inert until approved). A
     //    hire that already has a spawn Clearance (#1) is collapsed by the
-    //    dedupe in `finalize` (same underlying agent), so it shows once.
-    match agent_store.list_operatives_for_tenant(tenant) {
+    //    dedupe in `finalize` (same underlying agent), so it shows once. The
+    //    roster is also reused below for the Allowance hard-stop budget alert.
+    let operatives = match agent_store.list_operatives_for_tenant(tenant) {
         Ok(ops) => {
             for o in &ops {
                 if o.status.eq_ignore_ascii_case("pending") {
                     items.push(action_center::hire_item(o));
                 }
             }
+            ops
         }
         Err(e) => return internal(format!("company.actions roster: {e}")),
-    }
+    };
 
     // 3. Strategy approvals — Mandates whose strategy is `proposed` (the gate
     //    that must clear before a team can be built). Best-effort: a strategy
@@ -1184,11 +1186,13 @@ pub fn handle_company_actions(
 
     // 4. ready_to_start — Briefs that can run now (assigned-to-active +
     //    unblocked + unclaimed). Surfaced ABOVE generic blocked work because it
-    //    can move the company forward (Part B).
-    if let Ok(cards) = task_store.list_ready_briefs_for_tenant(tenant, ACTION_SRC_CAP) {
-        for c in &cards {
-            items.push(action_center::ready_item(c));
-        }
+    //    can move the company forward (Part B). Kept to cross-reference the
+    //    assignees of waiting work for the Allowance hard-stop alert.
+    let ready_cards = task_store
+        .list_ready_briefs_for_tenant(tenant, ACTION_SRC_CAP)
+        .unwrap_or_default();
+    for c in &ready_cards {
+        items.push(action_center::ready_item(c));
     }
 
     // 5. blocked — unassigned active Briefs (missing assignee) + Briefs blocked
@@ -1198,9 +1202,55 @@ pub fn handle_company_actions(
             items.push(action_center::blocked_item(c, true));
         }
     }
-    if let Ok(cards) = task_store.list_blocked_briefs_for_tenant(tenant, ACTION_SRC_CAP) {
-        for c in &cards {
-            items.push(action_center::blocked_item(c, false));
+    let dep_blocked_cards = task_store
+        .list_blocked_briefs_for_tenant(tenant, ACTION_SRC_CAP)
+        .unwrap_or_default();
+    for c in &dep_blocked_cards {
+        items.push(action_center::blocked_item(c, false));
+    }
+
+    // 5b. Budget alerts (Part A) — allowance-backed, from EXISTING tenant-scoped
+    //     state only (company-model §5.4 the Board reads/sets budgets, §8.2 the
+    //     Inbox surfaces budget thresholds). No live-spend ledger is threaded
+    //     into this read path, so we never fabricate a spend figure.
+    //
+    //     (a) Company commitment vs the Guild budget: the sum of active
+    //         Operatives' Allowances against the Guild's configured monthly
+    //         budget. Only fires when the Guild has a positive budget set.
+    if let Ok(Some(guild)) = spine_store.get_guild(tenant)
+        && let Some(budget) = guild.monthly_allowance_cents
+        && budget > 0
+        && let Ok(committed) = agent_store.committed_allowance_cents_for_tenant(tenant)
+    {
+        if committed > budget {
+            items.push(action_center::budget_committed_item(committed, budget, true));
+        } else if committed.saturating_mul(100) >= budget.saturating_mul(90) {
+            // committed ≥ 90% of budget — approaching the cap.
+            items.push(action_center::budget_committed_item(committed, budget, false));
+        }
+    }
+
+    //     (b) Per-Operative Allowance hard-stop: an active Operative with a
+    //         0/negative Allowance is hard-stopped by the dispatch gate
+    //         (heartbeat::allowance_admits). Surface it only when that Operative
+    //         has runnable or blocked work assigned and waiting.
+    let mut needs_work: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for c in &ready_cards {
+        if let Some(a) = c.assignee_agent_id.as_deref() {
+            needs_work.insert(a);
+        }
+    }
+    for c in &dep_blocked_cards {
+        if let Some(a) = c.assignee_agent_id.as_deref() {
+            needs_work.insert(a);
+        }
+    }
+    for o in &operatives {
+        if o.status.eq_ignore_ascii_case("active")
+            && matches!(o.monthly_allowance_cents, Some(c) if c <= 0)
+            && needs_work.contains(o.agent_id.as_str())
+        {
+            items.push(action_center::allowance_hardstop_item(o));
         }
     }
 
@@ -5702,6 +5752,146 @@ mod tests {
                 .contains("strategy"),
             "{a}"
         );
+    }
+
+    #[test]
+    fn company_actions_budget_alert_when_committed_over_guild_budget() {
+        let (agents, spine, task) = prime_stores();
+        // A small Guild budget and an active Operative committing more than it.
+        spine.set_guild_allowance("default", Some(10_000)).unwrap();
+        let eng = agents
+            .create_agent(
+                "Eng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"eng"), "medium", "default",
+            )
+            .unwrap();
+        agents.update_agent_field(&eng, "allowance", "20000").unwrap();
+
+        let v = json_of(ok_body(handle_company_actions(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(b""),
+        )));
+        let budget = v["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["category"] == "budget" && a["id"] == "budget:committed")
+            .expect("a committed-over-budget alert");
+        assert_eq!(budget["severity"], "high", "{budget}");
+        assert!(
+            budget["reason"].as_str().unwrap().contains("over budget"),
+            "{budget}"
+        );
+        assert_eq!(v["counts"]["by_category"]["budget"], 1, "{v}");
+
+        // Tenant isolation: a different Guild (no budget, no roster) sees NONE of
+        // this — the committed/budget reads are tenant-scoped.
+        let g = json_of(ok_body(handle_company_actions(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx_tenant(b"", "globex"),
+        )));
+        assert!(
+            !g["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["category"] == "budget"),
+            "no cross-tenant budget leak: {g}"
+        );
+    }
+
+    #[test]
+    fn company_actions_no_budget_alert_without_a_guild_budget() {
+        // No Guild budget + an Operative with a positive Allowance and no waiting
+        // work → NO budget item is fabricated (honest: there is no spend source).
+        let (agents, spine, task) = prime_stores();
+        let eng = agents
+            .create_agent(
+                "Eng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"eng"), "medium", "default",
+            )
+            .unwrap();
+        agents.update_agent_field(&eng, "allowance", "20000").unwrap();
+        let v = json_of(ok_body(handle_company_actions(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(b""),
+        )));
+        assert!(
+            !v["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["category"] == "budget"),
+            "no spend source ⇒ no budget alert: {v}"
+        );
+    }
+
+    #[test]
+    fn company_actions_allowance_hardstop_when_zero_allowance_has_ready_work() {
+        let (agents, spine, task) = prime_stores();
+        // An active engineer hard-stopped by a 0 Allowance.
+        let eng = agents
+            .create_agent(
+                "Eng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"eng"), "medium", "default",
+            )
+            .unwrap();
+        agents.update_agent_field(&eng, "allowance", "0").unwrap();
+        // The prime flow gives the engineer a ready, assigned Brief.
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build a web dashboard"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let _ = ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
+        ));
+
+        let v = json_of(ok_body(handle_company_actions(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(b""),
+        )));
+        let hs = v["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| {
+                a["category"] == "budget"
+                    && a["id"]
+                        .as_str()
+                        .map(|s| s.starts_with("budget:hardstop:"))
+                        .unwrap_or(false)
+            })
+            .expect("an Allowance hard-stop alert for the assigned engineer");
+        assert_eq!(hs["target_id"], serde_json::json!(eng), "{hs}");
+        assert_eq!(hs["action_label"], "Raise the Allowance");
+        assert_eq!(hs["severity"], "high");
+
+        // Ordering: the budget governance item sorts ABOVE the ready_to_start item.
+        let cats: Vec<&str> = v["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["category"].as_str().unwrap())
+            .collect();
+        let budget_pos = cats.iter().position(|c| *c == "budget").unwrap();
+        if let Some(ready_pos) = cats.iter().position(|c| *c == "ready_to_start") {
+            assert!(budget_pos < ready_pos, "budget before ready: {cats:?}");
+        }
     }
 
     #[test]
