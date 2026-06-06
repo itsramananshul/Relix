@@ -968,8 +968,88 @@ method = "delegate.list"
 allow_groups = ["chat-users"]
 
 [[rules]]
+name = "agent_create"
+method = "agent.create"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "agent_get"
+method = "agent.get"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "agent_list"
+method = "agent.list"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "agent_update"
+method = "agent.update"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "agent_delete"
+method = "agent.delete"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "agent_effective_capabilities"
+method = "agent.effective_capabilities"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "agent_assign_check"
+method = "agent.assign_check"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "coord_approval_pending"
+method = "coord.approval.pending"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "coord_approval_decide"
+method = "coord.approval.decide"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "standing_approval_create"
+method = "agent.standing_approval.create"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "standing_approval_list"
+method = "agent.standing_approval.list"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "standing_approval_revoke"
+method = "agent.standing_approval.revoke"
+allow_groups = ["chat-users"]
+
+[[rules]]
 name = "msg_send"
 method = "msg.send"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "msg_inbox"
+method = "msg.inbox"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "msg_read"
+method = "msg.read"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "msg_thread"
+method = "msg.thread"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "msg_delete"
+method = "msg.delete"
 allow_groups = ["chat-users"]
 
 [[rules]]
@@ -1222,6 +1302,14 @@ allow_groups = ["chat-users"]
 # Key gates still apply inside each capability; this only lifts the mesh
 # default-deny so the operator console reaches the spine.
 [[rules]]
+name = "spine_guild_counts"
+method = "guild.counts"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_guild_get"
+method = "guild.get"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_brief_board_summary"
 method = "brief.board_summary"
 allow_groups = ["chat-users"]
@@ -1232,6 +1320,10 @@ allow_groups = ["chat-users"]
 [[rules]]
 name = "spine_brief_unassigned"
 method = "brief.unassigned"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_unblocked"
+method = "brief.unblocked"
 allow_groups = ["chat-users"]
 [[rules]]
 name = "spine_brief_blocked_list"
@@ -1306,6 +1398,22 @@ name = "spine_brief_subbrief"
 method = "brief.subbrief"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_brief_dossier_add"
+method = "brief.dossier_add"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_set_snags"
+method = "brief.set_snags"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_clearance_request"
+method = "brief.clearance_request"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_bridge_back_authorize"
+method = "bridge_back.authorize"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_agent_roster_summary"
 method = "agent.roster_summary"
 allow_groups = ["chat-users"]
@@ -1356,6 +1464,30 @@ allow_groups = ["chat-users"]
 [[rules]]
 name = "spine_mandate_orchestration_list"
 method = "mandate.orchestration.list"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_prime_propose"
+method = "prime.propose"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_prime_approve"
+method = "prime.approve"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_prime_start"
+method = "prime.start"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_prime_proposals"
+method = "prime.proposals"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_prime_proposal"
+method = "prime.proposal"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_prime_status"
+method = "prime.status"
 allow_groups = ["chat-users"]
 [[rules]]
 name = "spine_mandate_team_plan"
@@ -1466,6 +1598,10 @@ name = "spine_run_artifact_preview"
 method = "run.artifact_preview"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_run_artifact_diff"
+method = "run.artifact_diff"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_run_review"
 method = "run.review"
 allow_groups = ["chat-users"]
@@ -1476,6 +1612,10 @@ allow_groups = ["chat-users"]
 [[rules]]
 name = "spine_run_apply"
 method = "run.apply"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_run_discard"
+method = "run.discard"
 allow_groups = ["chat-users"]
 [[rules]]
 name = "spine_run_events_recent"

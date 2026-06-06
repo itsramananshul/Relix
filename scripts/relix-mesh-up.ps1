@@ -984,6 +984,11 @@ method = "agent.effective_capabilities"
 allow_groups = ["chat-users"]
 
 [[rules]]
+name = "agent_assign_check"
+method = "agent.assign_check"
+allow_groups = ["chat-users"]
+
+[[rules]]
 name = "coord_approval_pending"
 method = "coord.approval.pending"
 allow_groups = ["chat-users"]
@@ -1291,6 +1296,14 @@ allow_groups = ["chat-users"]
 # (tenant/manage/assign) still apply inside each capability; this only
 # lifts the mesh default-deny so the operator console reaches the spine.
 [[rules]]
+name = "spine_guild_counts"
+method = "guild.counts"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_guild_get"
+method = "guild.get"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_brief_board_summary"
 method = "brief.board_summary"
 allow_groups = ["chat-users"]
@@ -1301,6 +1314,10 @@ allow_groups = ["chat-users"]
 [[rules]]
 name = "spine_brief_unassigned"
 method = "brief.unassigned"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_unblocked"
+method = "brief.unblocked"
 allow_groups = ["chat-users"]
 [[rules]]
 name = "spine_brief_blocked_list"
@@ -1373,6 +1390,22 @@ allow_groups = ["chat-users"]
 [[rules]]
 name = "spine_brief_subbrief"
 method = "brief.subbrief"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_dossier_add"
+method = "brief.dossier_add"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_set_snags"
+method = "brief.set_snags"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_clearance_request"
+method = "brief.clearance_request"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_bridge_back_authorize"
+method = "bridge_back.authorize"
 allow_groups = ["chat-users"]
 [[rules]]
 name = "spine_agent_roster_summary"

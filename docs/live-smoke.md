@@ -135,3 +135,22 @@ owner-gate were added but the **allow rule was not**, so the route returned
 HTTP while the in-process test stayed green. Fixed by adding the
 `spine_company_starter_crew` rule to both boot scripts. When adding a new
 product-spine capability, add its allow rule to **both** boot scripts.
+
+### The guard that makes this drift un-shippable
+
+`scripts/check-boot-policy-coverage.ps1` parses the `method = "..."` allow rules
+out of **both** boot scripts and fails when:
+
+1. **parity** breaks - a capability is admitted in one script but not the other
+   (the class of bug where `.sh` lacked a `run.discard` rule that `.ps1` had); or
+2. **coverage** breaks - a capability in its maintained manifest of live
+   product/bridge routes is missing from one or both scripts (the
+   "added to neither" case, e.g. `company.starter_crew`, `agent.assign_check`).
+
+A parser sanity floor fails loudly if the policy block is renamed/moved so the
+guard can never pass vacuously. It runs locally as the first gate in
+`scripts/ci-local.ps1` and as the `boot-policy coverage` job in CI
+(`.github/workflows/ci.yml`). **When you add a live route that calls a new mesh
+capability, add its `[[rules]]` allow entry to both `relix-mesh-up.ps1` and
+`relix-mesh-up.sh`** (and, for a product/spine route, to the guard's
+`$RequiredCapabilities` manifest) - the guard catches it if you miss either.

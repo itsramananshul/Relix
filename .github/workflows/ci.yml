@@ -7,6 +7,7 @@ name: CI
 #   cargo clippy --all-targets -D warnings   (lints, per OS)
 #   cargo test --workspace                   (tests, per OS)
 #   cargo deny check                         (licenses, bans, sources, advisories)
+#   check-boot-policy-coverage.ps1           (mesh boot-policy parity/coverage)
 #
 # Secret scanning is intentionally not a grep job here: this repo ships a
 # secret-redaction module with real-looking key fixtures and docs, so any
@@ -111,6 +112,23 @@ jobs:
             exit 1
           fi
           echo "dashboard-dist is in sync with apps/dashboard source."
+
+  boot-policy:
+    # The local mesh boot scripts (relix-mesh-up.ps1 / relix-mesh-up.sh) each
+    # generate the fail-closed mesh policy inline. A live bridge route 403s
+    # unless its capability is admitted by BOTH scripts. This job parses the
+    # allow rules out of both and fails on parity drift (a rule in one script
+    # only) or a missing required capability, so a route can never ship without
+    # its policy rule. Pure text parse; pwsh is preinstalled on ubuntu-latest.
+    # Same push/PR trigger as the rest of CI; no trigger/policy change.
+    name: boot-policy coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check boot-policy coverage + parity
+        shell: pwsh
+        run: ./scripts/check-boot-policy-coverage.ps1
 
   deny:
     name: cargo deny

@@ -28,6 +28,14 @@ Set-Location $RepoRoot
 # supply-chain check.
 $Steps = @(
     @{
+        # Boot-policy coverage + parity. Pure text parse (no compile), so it is
+        # the cheapest gate and runs first: it fails fast when a live bridge
+        # route's capability is not admitted by BOTH relix-mesh-up.ps1 and
+        # relix-mesh-up.sh, which would 403 on the live mesh.
+        Name   = 'boot-policy coverage (check-boot-policy-coverage.ps1)'
+        Script = { & (Join-Path $RepoRoot 'scripts/check-boot-policy-coverage.ps1') }
+    },
+    @{
         Name   = 'cargo fmt --all -- --check'
         Script = { cargo fmt --all -- --check }
     },
