@@ -1417,6 +1417,22 @@ name = "spine_mandate_orchestration_list"
 method = "mandate.orchestration.list"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_prime_propose"
+method = "prime.propose"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_prime_approve"
+method = "prime.approve"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_prime_proposals"
+method = "prime.proposals"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_prime_proposal"
+method = "prime.proposal"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_mandate_team_plan"
 method = "mandate.team_plan"
 allow_groups = ["chat-users"]

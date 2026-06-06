@@ -16,6 +16,7 @@
 
 pub mod handlers;
 pub mod keys;
+pub mod prime;
 pub mod store;
 
 pub use keys::{

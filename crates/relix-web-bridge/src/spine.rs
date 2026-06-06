@@ -370,6 +370,63 @@ pub async fn decide_clearance(
     }))
 }
 
+// ── Prime Assistant ("describe what you want → plan") ────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct PrimeProposeRequest {
+    pub message: String,
+}
+
+/// `POST /v1/spine/prime/propose` — interpret a request into a structured,
+/// READ-ONLY plan (creates nothing but the proposal record). Tenant-scoped.
+pub async fn prime_propose(
+    State(state): State<AppState>,
+    Json(req): Json<PrimeProposeRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let msg = req.message.trim();
+    if msg.is_empty() {
+        return Err(bad("message required"));
+    }
+    json_passthrough(call_peer(&state, "prime.propose", msg.as_bytes()).await?)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PrimeApproveRequest {
+    pub proposal_id: String,
+}
+
+/// `POST /v1/spine/prime/approve` — the ONLY path that materializes a Prime
+/// proposal (Mandate + Briefs + assignments + pending hire requests). Never
+/// runs an adapter, applies a workspace, or changes budget. Tenant-scoped.
+pub async fn prime_approve(
+    State(state): State<AppState>,
+    Json(req): Json<PrimeApproveRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let id = req.proposal_id.trim();
+    if id.is_empty() {
+        return Err(bad("proposal_id required"));
+    }
+    json_passthrough(call_peer(&state, "prime.approve", id.as_bytes()).await?)
+}
+
+/// `GET /v1/spine/prime/proposals?limit=N` — recent Prime proposals for the
+/// Guild (the companion history).
+pub async fn prime_proposals(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let arg = q.limit.unwrap_or(20).to_string();
+    json_passthrough(call_peer(&state, "prime.proposals", arg.as_bytes()).await?)
+}
+
+/// `GET /v1/spine/prime/proposals/:id` — one proposal (tenant-scoped).
+pub async fn prime_proposal(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "prime.proposal", id.as_bytes()).await?)
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct TeamPlanRequest {
     /// Optional plain-text goal/team description.

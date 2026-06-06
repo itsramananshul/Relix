@@ -251,6 +251,45 @@ pub struct OrchestrationRunRecord<'a> {
     pub next_actions_json: &'a str,
 }
 
+/// A persisted Prime Assistant proposal (the governed "describe → plan"
+/// record). `mandate_id` / `created_brief_ids` are empty until `prime.approve`
+/// flips `status` to `approved`.
+#[derive(Debug, Clone)]
+pub struct PrimeProposalRow {
+    pub proposal_id: String,
+    pub tenant_id: String,
+    pub proposer_id: String,
+    pub message: String,
+    pub proposal_json: String,
+    /// `proposed` / `approved` / `rejected`.
+    pub status: String,
+    pub mandate_id: String,
+    pub created_brief_ids: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl PrimeProposalRow {
+    /// The full proposal record as JSON for the API. The stored
+    /// `proposal_json` (the structured plan) is inlined under `proposal`.
+    pub fn to_json(&self) -> serde_json::Value {
+        let plan: serde_json::Value =
+            serde_json::from_str(&self.proposal_json).unwrap_or(serde_json::Value::Null);
+        let created: serde_json::Value =
+            serde_json::from_str(&self.created_brief_ids).unwrap_or(serde_json::Value::Null);
+        serde_json::json!({
+            "proposal_id": self.proposal_id,
+            "status": self.status,
+            "message": self.message,
+            "mandate_id": if self.mandate_id.is_empty() { serde_json::Value::Null } else { serde_json::json!(self.mandate_id) },
+            "created_brief_ids": created,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "proposal": plan,
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SpineStoreError {
     #[error("spine store: {0}")]
@@ -634,6 +673,108 @@ impl SpineStore {
         )?;
         let rows = stmt
             .query_map(params![tenant, mandate_id, cap], row_to_orchestration_run)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // ── Prime Assistant proposals ────────────────────────────
+    //
+    // A Prime proposal is the governed "describe what you want → plan"
+    // record: it is written by `prime.propose` (read-only — NOTHING else is
+    // mutated) and later flipped to `approved` by `prime.approve`, which is
+    // the ONLY path that creates the Mandate + Briefs. There is no Mandate at
+    // propose time (mandate_id is empty until approval), so this table does
+    // NOT FK to `mandates`. Tenant-scoped: a proposal from another Guild
+    // reads as `None`, never leaking its existence.
+
+    /// Persist a fresh Prime proposal (status `proposed`). `message` is the
+    /// (already secret-redacted) operator request; `proposal_json` is the
+    /// full structured plan. Returns the new `proposal_id`.
+    pub fn record_prime_proposal(
+        &self,
+        tenant_id: &str,
+        proposer_id: &str,
+        message: &str,
+        proposal_json: &str,
+    ) -> Result<String, SpineStoreError> {
+        let tenant = normalize_tenant(tenant_id);
+        let now = unix_now();
+        let proposal_id = new_proposal_id();
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        conn.execute(
+            "INSERT INTO prime_proposals
+                 (proposal_id, tenant_id, proposer_id, message, proposal_json,
+                  status, mandate_id, created_brief_ids, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'proposed', '', '[]', ?6, ?6)",
+            params![proposal_id, tenant, proposer_id, message, proposal_json, now],
+        )?;
+        Ok(proposal_id)
+    }
+
+    /// One proposal, scoped to `tenant` — `None` for an unknown id OR a
+    /// proposal owned by another Guild (no cross-tenant existence leak).
+    pub fn get_prime_proposal(
+        &self,
+        tenant: &str,
+        proposal_id: &str,
+    ) -> Result<Option<PrimeProposalRow>, SpineStoreError> {
+        let tenant = normalize_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT proposal_id, tenant_id, proposer_id, message, proposal_json,
+                        status, mandate_id, created_brief_ids, created_at, updated_at
+                 FROM prime_proposals
+                 WHERE tenant_id = ?1 AND proposal_id = ?2",
+                params![tenant, proposal_id],
+                row_to_prime_proposal,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Flip a proposal to `approved`, stamping the created Mandate + Brief
+    /// ids. Idempotent at the SQL layer (the caller gates re-approval first).
+    /// Returns whether a row changed (false = unknown id / wrong tenant).
+    pub fn mark_prime_proposal_approved(
+        &self,
+        tenant: &str,
+        proposal_id: &str,
+        mandate_id: &str,
+        created_brief_ids_json: &str,
+    ) -> Result<bool, SpineStoreError> {
+        let tenant = normalize_tenant(tenant);
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let n = conn.execute(
+            "UPDATE prime_proposals
+                 SET status = 'approved', mandate_id = ?3,
+                     created_brief_ids = ?4, updated_at = ?5
+             WHERE tenant_id = ?1 AND proposal_id = ?2 AND status = 'proposed'",
+            params![tenant, proposal_id, mandate_id, created_brief_ids_json, now],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Recent proposals for a Guild, newest first (for the companion history).
+    pub fn list_prime_proposals(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<PrimeProposalRow>, SpineStoreError> {
+        let tenant = normalize_tenant(tenant);
+        let cap = limit.clamp(1, 100) as i64;
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT proposal_id, tenant_id, proposer_id, message, proposal_json,
+                    status, mandate_id, created_brief_ids, created_at, updated_at
+             FROM prime_proposals
+             WHERE tenant_id = ?1
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![tenant, cap], row_to_prime_proposal)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -1237,7 +1378,22 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              created_at        INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS mandate_orchestration_runs_latest
-             ON mandate_orchestration_runs(tenant_id, mandate_id, created_at);",
+             ON mandate_orchestration_runs(tenant_id, mandate_id, created_at);
+
+         CREATE TABLE IF NOT EXISTS prime_proposals (
+             proposal_id       TEXT PRIMARY KEY,
+             tenant_id         TEXT NOT NULL DEFAULT 'default',
+             proposer_id       TEXT NOT NULL DEFAULT '',
+             message           TEXT NOT NULL DEFAULT '',
+             proposal_json     TEXT NOT NULL DEFAULT '{}',
+             status            TEXT NOT NULL DEFAULT 'proposed',
+             mandate_id        TEXT NOT NULL DEFAULT '',
+             created_brief_ids TEXT NOT NULL DEFAULT '[]',
+             created_at        INTEGER NOT NULL,
+             updated_at        INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS prime_proposals_tenant
+             ON prime_proposals(tenant_id, created_at);",
     )?;
     // Defensive additive column: a Guild's monthly Allowance (cents).
     // Tolerates a guilds table created before this column existed.
@@ -1420,6 +1576,28 @@ fn new_campaign_id() -> String {
     let mut bytes = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut bytes);
     format!("camp_{}", hex::encode(bytes))
+}
+
+fn new_proposal_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    format!("prop_{}", hex::encode(bytes))
+}
+
+fn row_to_prime_proposal(r: &rusqlite::Row) -> rusqlite::Result<PrimeProposalRow> {
+    Ok(PrimeProposalRow {
+        proposal_id: r.get(0)?,
+        tenant_id: r.get(1)?,
+        proposer_id: r.get(2)?,
+        message: r.get(3)?,
+        proposal_json: r.get(4)?,
+        status: r.get(5)?,
+        mandate_id: r.get(6)?,
+        created_brief_ids: r.get(7)?,
+        created_at: r.get(8)?,
+        updated_at: r.get(9)?,
+    })
 }
 
 fn unix_now() -> i64 {

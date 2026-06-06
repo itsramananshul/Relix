@@ -3267,6 +3267,53 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // PRIME ASSISTANT: governed "describe what you want → plan" surface.
+    // `prime.propose` is READ-ONLY (writes only the proposal record);
+    // `prime.approve` is the ONLY path that creates the Mandate + Briefs +
+    // pending hire requests. Both tenant-scoped.
+    if let Some(spine) = spine_store.clone() {
+        let s = agent_store.clone();
+        bridge.register(
+            "prime.propose",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let spine = spine.clone();
+                async move { handlers::handle_prime_propose(&s, &spine, &ctx) }
+            })),
+        );
+    }
+    if let Some(spine) = spine_store.clone() {
+        let s = agent_store.clone();
+        let ts = task_store.clone();
+        bridge.register(
+            "prime.approve",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let spine = spine.clone();
+                let ts = ts.clone();
+                async move { handlers::handle_prime_approve(&s, &spine, &ts, &ctx) }
+            })),
+        );
+    }
+    // PRIME ASSISTANT: read the proposal history / one proposal.
+    if let Some(spine) = spine_store.clone() {
+        bridge.register(
+            "prime.proposals",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let spine = spine.clone();
+                async move { handlers::handle_prime_proposals(&spine, &ctx) }
+            })),
+        );
+    }
+    if let Some(spine) = spine_store.clone() {
+        bridge.register(
+            "prime.proposal",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let spine = spine.clone();
+                async move { handlers::handle_prime_proposal_get(&spine, &ctx) }
+            })),
+        );
+    }
     if let Some(spine) = spine_store.clone() {
         bridge.register(
             "mandate.orchestration.latest",

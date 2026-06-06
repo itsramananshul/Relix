@@ -14,6 +14,7 @@ use crate::dispatch::{HandlerOutcome, InvocationCtx};
 use crate::nodes::coordinator::agent::keys::{
     KeyVerdict, assign_verdict, configure_verdict, manage_verdict, spawn_verdict,
 };
+use crate::nodes::coordinator::agent::prime;
 use crate::nodes::coordinator::agent::store::{
     AgentProfile, AgentStore, AgentStoreError, ApprovalStatus, StandingApprovalCreate,
     default_approval_categories,
@@ -225,6 +226,296 @@ pub fn handle_operatives(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutc
             }
         }
         Err(e) => internal(format!("agent.operatives: {e}")),
+    }
+}
+
+// ── Prime Assistant: governed "describe what you want → plan" ─────────
+
+/// `prime.propose` — interpret a free-text request into a structured,
+/// READ-ONLY plan (intent, Mandate, crew roles, suggested hires, Brief
+/// breakdown + deps, risks, next actions). Creates NOTHING except the
+/// proposal record itself. The request is secret-redacted before it is
+/// interpreted or persisted. Tenant-scoped. The plan is rule-based (no LLM is
+/// wired into a coordinator capability) and says so honestly via `ai_status`.
+/// Arg: the raw request message (UTF-8). Returns `{proposal_id, status,
+/// proposal}`.
+pub fn handle_prime_propose(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("prime.propose utf8: {e}")),
+    };
+    if raw.is_empty() {
+        return invalid("prime.propose: a request message is required".into());
+    }
+    // Redact secrets BEFORE the request is interpreted or persisted.
+    let message = crate::rig::redact_secrets(raw, "");
+    let tenant = ctx.tenant_id_or_default();
+    let operatives = match agent_store.list_operatives_for_tenant(tenant) {
+        Ok(v) => v,
+        Err(e) => return internal(format!("prime.propose roster: {e}")),
+    };
+    let crew: Vec<prime::CrewMember> = operatives
+        .iter()
+        .map(|p| prime::CrewMember {
+            agent_id: p.agent_id.clone(),
+            name: p.name.clone(),
+            role: p.role.clone(),
+            status: p.status.clone(),
+        })
+        .collect();
+    let proposal = prime::generate_proposal(&message, &crew);
+    let proposal_json = match serde_json::to_string(&proposal) {
+        Ok(s) => s,
+        Err(e) => return internal(format!("prime.propose plan encode: {e}")),
+    };
+    let proposer = ctx.caller.subject_id.to_string();
+    let proposal_id =
+        match spine_store.record_prime_proposal(tenant, &proposer, &message, &proposal_json) {
+            Ok(id) => id,
+            Err(e) => return internal(format!("prime.propose persist: {e}")),
+        };
+    let body = serde_json::json!({
+        "proposal_id": proposal_id,
+        "status": "proposed",
+        "proposal": proposal,
+    });
+    match serde_json::to_vec(&body) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => internal(format!("prime.propose encode: {e}")),
+    }
+}
+
+/// `prime.approve` — the ONLY path that materializes a Prime proposal.
+/// Tenant-gated (a proposal from another Guild reads as not-found). Creates
+/// the Mandate, the Briefs (idempotent per-key source markers) + their
+/// dependency edges, assigns each track to an EXISTING eligible active
+/// Operative (never a fake agent), and files a `pending` hire request (needs
+/// a separate Clearance to activate) for each missing role. It NEVER runs an
+/// adapter, applies a workspace, or changes budget. Records the approval on
+/// the proposal row + a Team Plan + an Orchestration run + a Chronicle event
+/// on each created Brief. Idempotent: an already-approved proposal returns its
+/// created objects. Arg: the `proposal_id`.
+pub fn handle_prime_approve(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &TaskStore,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let proposal_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("prime.approve utf8: {e}")),
+    };
+    if proposal_id.is_empty() {
+        return invalid("prime.approve: proposal_id required".into());
+    }
+    let tenant = ctx.tenant_id_or_default();
+    let row = match spine_store.get_prime_proposal(tenant, proposal_id) {
+        Ok(Some(r)) => r,
+        // Unknown OR cross-tenant → not found (no existence leak).
+        Ok(None) => return invalid(format!("proposal not found: {proposal_id}")),
+        Err(e) => return internal(format!("prime.approve load: {e}")),
+    };
+    // Idempotent: a re-approve returns the already-created Mandate.
+    if row.status == "approved" {
+        let created: serde_json::Value =
+            serde_json::from_str(&row.created_brief_ids).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({
+            "proposal_id": proposal_id, "status": "approved", "already_approved": true,
+            "mandate_id": row.mandate_id, "created_briefs": created,
+        });
+        return match serde_json::to_vec(&body) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("prime.approve encode: {e}")),
+        };
+    }
+    // The PERSISTED plan is the source of truth — never client input.
+    let plan: prime::PrimeProposal = match serde_json::from_str(&row.proposal_json) {
+        Ok(p) => p,
+        Err(e) => return internal(format!("prime.approve plan parse: {e}")),
+    };
+    let actor = ctx.caller.subject_id.to_string();
+
+    // 1) Mandate.
+    let mandate_id =
+        match spine_store.create_mandate(tenant, &plan.mandate_title, &plan.mandate_brief, None, None)
+        {
+            Ok(id) => id,
+            Err(e) => return internal(format!("prime.approve mandate: {e}")),
+        };
+
+    // 2) Briefs (idempotent per-key markers), mapping proposal key → task_id.
+    let mut key_to_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut created_ids: Vec<String> = Vec::new();
+    for b in &plan.briefs {
+        let marker = format!("prime:{proposal_id}:{}", b.key);
+        let task_id = match task_store.create_brief_with_marker(
+            tenant,
+            &b.title,
+            &actor,
+            Some(&mandate_id),
+            "brief/prime",
+            &marker,
+        ) {
+            Ok(id) => id,
+            Err(e) => return internal(format!("prime.approve brief: {e}")),
+        };
+        key_to_id.insert(b.key.clone(), task_id.clone());
+        created_ids.push(task_id);
+    }
+
+    // 3) Dependency edges (a Brief is blocked on each of its depends_on tracks).
+    for b in &plan.briefs {
+        if let Some(child) = key_to_id.get(&b.key) {
+            for dep in &b.depends_on {
+                if let Some(blocker) = key_to_id.get(dep) {
+                    let _ = task_store.add_snag(child, blocker);
+                }
+            }
+        }
+    }
+
+    // 4) Assignments — ONLY to an existing eligible active Operative whose
+    //    role family matches the track. No match → leave unassigned (the
+    //    matching hire is suggested below, never silently created active).
+    let operatives = agent_store.list_operatives_for_tenant(tenant).unwrap_or_default();
+    let mut assigned: Vec<String> = Vec::new();
+    for b in &plan.briefs {
+        if let Some(task_id) = key_to_id.get(&b.key) {
+            let want = prime::canon_role(&b.role);
+            if let Some(op) = operatives
+                .iter()
+                .find(|o| o.status == "active" && prime::canon_role(&o.role) == want)
+                && task_store.set_brief_field(task_id, "assignee", &op.agent_id).is_ok()
+            {
+                assigned.push(task_id.clone());
+            }
+        }
+    }
+
+    // 5) Hire requests for MISSING roles — `pending` (need a Clearance to
+    //    activate), NOT active agents.
+    let mut hire_agent_ids: Vec<String> = Vec::new();
+    for h in &plan.hires {
+        let subject = format!("prime-hire:{proposal_id}:{}", h.role);
+        let name = format!("{} (proposed)", h.title);
+        // `department` / `team` are required non-empty; the role is a sane
+        // default for a proposed hire.
+        if let Ok(agent_id) = agent_store.request_hire(
+            &name, &h.role, &h.title, &h.role, &h.role, &actor, &subject, "medium", tenant,
+        ) {
+            hire_agent_ids.push(agent_id);
+        }
+    }
+
+    // 6) History — flip the proposal + record on the existing Mandate-history
+    //    surfaces + a Chronicle event on each created Brief.
+    let created_json = serde_json::to_string(&created_ids).unwrap_or_else(|_| "[]".into());
+    let _ = spine_store.mark_prime_proposal_approved(tenant, proposal_id, &mandate_id, &created_json);
+
+    let roles_json = serde_json::to_string(&plan.roles).unwrap_or_else(|_| "[]".into());
+    let pending_hires: Vec<serde_json::Value> = hire_agent_ids
+        .iter()
+        .zip(plan.hires.iter())
+        .map(|(id, h)| serde_json::json!({ "agent_id": id, "role": h.role }))
+        .collect();
+    let pending_hires_json = serde_json::to_string(&pending_hires).unwrap_or_else(|_| "[]".into());
+    let next_steps_json = serde_json::to_string(&plan.next_actions).unwrap_or_else(|_| "[]".into());
+    let _ = spine_store.record_team_plan(&TeamPlanRecord {
+        tenant_id: tenant,
+        mandate_id: &mandate_id,
+        actor_id: &actor,
+        description: &format!("Prime proposal {proposal_id}"),
+        proposed_roles_json: &roles_json,
+        pending_hires_json: &pending_hires_json,
+        clearance_ids_json: "[]",
+        denials_json: "[]",
+        next_steps_json: &next_steps_json,
+        status: if hire_agent_ids.is_empty() {
+            "planned"
+        } else {
+            "staffing"
+        },
+    });
+    let assigned_json = serde_json::to_string(&assigned).unwrap_or_else(|_| "[]".into());
+    let _ = spine_store.record_orchestration_run(&OrchestrationRunRecord {
+        tenant_id: tenant,
+        mandate_id: &mandate_id,
+        mode: "create_briefs",
+        dry_run: false,
+        input_signature: proposal_id,
+        status: "created",
+        created_brief_ids_json: &created_json,
+        existing_brief_ids_json: "[]",
+        assigned_brief_ids_json: &assigned_json,
+        skipped_json: "[]",
+        source_markers_json: "[]",
+        blockers_json: "[]",
+        next_actions_json: &next_steps_json,
+    });
+    for id in &created_ids {
+        let _ = task_store.append_event(
+            id,
+            "prime.brief_created",
+            &format!("from Prime proposal {proposal_id} (mandate {mandate_id})"),
+        );
+    }
+
+    let body = serde_json::json!({
+        "proposal_id": proposal_id,
+        "status": "approved",
+        "mandate_id": mandate_id,
+        "created_briefs": created_ids,
+        "assigned_briefs": assigned,
+        "hire_requests": hire_agent_ids,
+    });
+    match serde_json::to_vec(&body) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => internal(format!("prime.approve encode: {e}")),
+    }
+}
+
+/// `prime.proposals` — recent Prime proposals for the Guild, newest first
+/// (the companion history). Arg: optional limit (default 20). Tenant-scoped.
+pub fn handle_prime_proposals(spine_store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let limit = std::str::from_utf8(&ctx.args)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(20);
+    let tenant = ctx.tenant_id_or_default();
+    match spine_store.list_prime_proposals(tenant, limit) {
+        Ok(rows) => {
+            let arr: Vec<serde_json::Value> = rows.iter().map(|r| r.to_json()).collect();
+            match serde_json::to_vec(&arr) {
+                Ok(b) => HandlerOutcome::Ok(b),
+                Err(e) => internal(format!("prime.proposals encode: {e}")),
+            }
+        }
+        Err(e) => internal(format!("prime.proposals: {e}")),
+    }
+}
+
+/// `prime.proposal` — one proposal by id, tenant-scoped (a proposal from
+/// another Guild reads as not-found). Arg: proposal_id.
+pub fn handle_prime_proposal_get(spine_store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let proposal_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("prime.proposal utf8: {e}")),
+    };
+    if proposal_id.is_empty() {
+        return invalid("prime.proposal: proposal_id required".into());
+    }
+    let tenant = ctx.tenant_id_or_default();
+    match spine_store.get_prime_proposal(tenant, proposal_id) {
+        Ok(Some(r)) => match serde_json::to_vec(&r.to_json()) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("prime.proposal encode: {e}")),
+        },
+        Ok(None) => invalid(format!("proposal not found: {proposal_id}")),
+        Err(e) => internal(format!("prime.proposal: {e}")),
     }
 }
 
@@ -3696,6 +3987,172 @@ mod tests {
             "pending"
         );
         assert!(v["next_steps"].as_array().unwrap().iter().count() >= 1);
+    }
+
+    // ── Prime Assistant (prime.propose / prime.approve) ──────────────
+
+    fn prime_stores() -> (AgentStore, SpineStore, TaskStore) {
+        (
+            store(),
+            SpineStore::in_memory().unwrap(),
+            TaskStore::in_memory().unwrap(),
+        )
+    }
+
+    fn json_of(body: String) -> serde_json::Value {
+        serde_json::from_slice(body.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn prime_propose_is_read_only_and_honest_about_no_llm() {
+        let (agents, spine, _task) = prime_stores();
+        let v = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build me a web dashboard for sales"),
+        )));
+        assert_eq!(v["status"], "proposed");
+        let pid = v["proposal_id"].as_str().unwrap();
+        assert!(pid.starts_with("prop_"));
+        assert_eq!(v["proposal"]["intent"], "build");
+        // AI honesty: never silently claimed as model output.
+        assert_eq!(v["proposal"]["ai_used"], false);
+        assert!(
+            v["proposal"]["ai_status"]
+                .as_str()
+                .unwrap()
+                .contains("deterministic"),
+            "ai_status must be honest: {}",
+            v["proposal"]["ai_status"]
+        );
+        // READ-ONLY: nothing was created — the stored proposal has no Mandate.
+        let row = json_of(ok_body(handle_prime_proposal_get(&spine, &fake_ctx(pid.as_bytes()))));
+        assert_eq!(row["status"], "proposed");
+        assert!(row["mandate_id"].is_null(), "propose must not create a Mandate");
+    }
+
+    #[test]
+    fn prime_approve_creates_mandate_briefs_assigns_existing_and_requests_missing() {
+        let (agents, spine, task) = prime_stores();
+        // One ACTIVE engineer exists; no designer.
+        agents
+            .create_agent(
+                "Eng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"eng"), "medium", "default",
+            )
+            .unwrap();
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build a web dashboard"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let a = json_of(ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        assert_eq!(a["status"], "approved");
+        let mandate_id = a["mandate_id"].as_str().unwrap();
+        assert!(mandate_id.starts_with("mandate_"));
+        // engineer + designer tracks + integration brief.
+        let created = a["created_briefs"].as_array().unwrap();
+        assert!(created.len() >= 3, "got {created:?}");
+        // The engineer track was assigned to the EXISTING active engineer.
+        assert!(
+            !a["assigned_briefs"].as_array().unwrap().is_empty(),
+            "engineer track should assign to existing crew"
+        );
+        // The missing designer became a PENDING hire request — not a fake
+        // active agent.
+        let hires = a["hire_requests"].as_array().unwrap();
+        assert_eq!(hires.len(), 1);
+        let hire = agents.get_agent(hires[0].as_str().unwrap()).unwrap().unwrap();
+        assert_eq!(hire.status, "pending", "a suggested hire is inert until Clearance");
+        assert_eq!(hire.role, "designer");
+        // Chronicle: each created Brief carries a prime.brief_created event.
+        let evs = task
+            .query_events(
+                created[0].as_str().unwrap(),
+                0,
+                50,
+                Some("prime.brief_created"),
+                crate::nodes::coordinator::EventOrder::Desc,
+            )
+            .unwrap();
+        assert_eq!(evs.len(), 1, "Prime approval is chronicled on the Brief");
+    }
+
+    #[test]
+    fn prime_approve_is_idempotent() {
+        let (agents, spine, task) = prime_stores();
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Write the onboarding docs"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let first = json_of(ok_body(handle_prime_approve(
+            &agents, &spine, &task, &fake_ctx(pid.as_bytes()),
+        )));
+        let mandate1 = first["mandate_id"].as_str().unwrap().to_string();
+        // A second approve does NOT create a second Mandate.
+        let second = json_of(ok_body(handle_prime_approve(
+            &agents, &spine, &task, &fake_ctx(pid.as_bytes()),
+        )));
+        assert_eq!(second["already_approved"], true);
+        assert_eq!(second["mandate_id"].as_str().unwrap(), mandate1);
+    }
+
+    #[test]
+    fn prime_proposal_is_tenant_scoped() {
+        let (agents, spine, task) = prime_stores();
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx_tenant(b"Build a dashboard", "acme"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // The owning Guild can read it.
+        let _ = ok_body(handle_prime_proposal_get(
+            &spine,
+            &fake_ctx_tenant(pid.as_bytes(), "acme"),
+        ));
+        // A different Guild can NEITHER read NOR approve it (reads as
+        // not-found — no cross-tenant existence leak).
+        assert_eq!(
+            err_kind(handle_prime_proposal_get(
+                &spine,
+                &fake_ctx_tenant(pid.as_bytes(), "globex"),
+            )),
+            error_kinds::INVALID_ARGS
+        );
+        assert_eq!(
+            err_kind(handle_prime_approve(
+                &agents,
+                &spine,
+                &task,
+                &fake_ctx_tenant(pid.as_bytes(), "globex"),
+            )),
+            error_kinds::INVALID_ARGS
+        );
+    }
+
+    #[test]
+    fn prime_propose_requires_a_message() {
+        let (agents, spine, _task) = prime_stores();
+        assert_eq!(
+            err_kind(handle_prime_propose(&agents, &spine, &fake_ctx(b"   "))),
+            error_kinds::INVALID_ARGS
+        );
     }
 
     #[test]
