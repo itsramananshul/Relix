@@ -558,8 +558,8 @@ export function Agents() {
           <span className="stat-label">Crew total</span>
         </div>
         <div className="roster-tier">
-          <span className="stat">{founder ? 1 : 0}<span className="muted" style={{ fontSize: 13 }}> + {prime ? 1 : 0}</span></span>
-          <span className="stat-label">Founder + Prime (leadership)</span>
+          <span className="stat">{founder ? 1 : 0}{prime ? <span className="muted" style={{ fontSize: 13 }}> + 1</span> : null}</span>
+          <span className="stat-label">{prime ? "Founder + Prime (leadership)" : "Founder (leadership)"}</span>
         </div>
         <div className="roster-tier">
           <span className="stat">{activeCrew.length}</span>
@@ -665,15 +665,26 @@ export function Agents() {
           )}
         </div>
       ) : founder ? (
-        <div className="card" style={{ padding: "10px 14px" }}>
-          <div className="row">
-            <span className="badge backlog">No Prime yet</span>
-            <span className="muted" style={{ fontSize: 12, marginLeft: 8 }}>
-              Hire a Prime (planning lead) to propose Mandate strategy + build the team.
-            </span>
+        // No dedicated `prime`-role Operative exists — and that's expected, not
+        // a missing hire. "Prime" is primarily the planning/orchestration
+        // surface the Founder drives (company-model §12.5: propose → approve →
+        // start); the starter crew is Engineer + Designer, not a Prime
+        // Operative. Present it honestly as a surface, not an unfinished member.
+        // A dedicated Prime Operative (lexicon role `prime`) is optional — when
+        // one is hired, the rich Prime card above replaces this.
+        <div className="card" style={{ padding: "12px 14px" }}>
+          <div className="row" style={{ marginBottom: 4 }}>
+            <h3 style={{ margin: 0 }}>Prime</h3>
+            <span className="badge in_progress" style={{ marginLeft: 8 }}>planning surface</span>
             <span className="spacer" style={{ flex: 1 }} />
-            <Link to="/mandates" className="link" style={{ fontSize: 12 }}>Mandates →</Link>
+            <Link to="/chat" className="link" style={{ fontSize: 12 }}>Ask Prime →</Link>
           </div>
+          <p className="muted" style={{ fontSize: 12, margin: 0 }}>
+            Prime is the company's planning &amp; orchestration surface, driven from Chat by the
+            Founder: describe a goal and Prime proposes a Mandate + Briefs, you approve to create
+            them, then Start the work. A dedicated Prime Operative isn't part of the starter crew
+            and isn't required to plan — hire one only if you want a standing planning lead.
+          </p>
         </div>
       ) : null}
 
