@@ -3157,6 +3157,16 @@ pub fn register_agent_capabilities(
     {
         let s = agent_store.clone();
         bridge.register(
+            "company.starter_crew",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_starter_crew(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
             "agent.operatives",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();

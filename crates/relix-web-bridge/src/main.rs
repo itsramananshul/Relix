@@ -713,6 +713,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // owner-gated "Initialize Company" (create the Founder) action.
         .route("/v1/spine/company", get(spine::company_status))
         .route("/v1/spine/company/init", post(spine::company_init))
+        // First-run safe-local on-ramp: Founder + echo starter crew (§12.6).
+        .route("/v1/spine/company/starter-crew", post(spine::company_starter_crew))
         // Action Center: the operator's next-actions feed (company-model §8.2).
         .route("/v1/spine/company/actions", get(spine::company_actions))
         .route("/v1/spine/operatives", get(spine::operatives))

@@ -266,6 +266,11 @@ export function Overview() {
             To begin, initialize your company by creating the <strong>Founder</strong> — the first
             Operative who can own and run work, and hire the rest of the team.
           </p>
+          <p className="muted" style={{ maxWidth: 560 }}>
+            In a hurry? On the Crew page you can <strong>Set up a starter crew</strong> — the Founder
+            plus a couple of safe, local <em>echo</em> Operatives — so you can Ask Prime to plan and
+            run a real Shift end-to-end without installing any external coding agent.
+          </p>
           <div className="row" style={{ marginTop: 14 }}>
             <Link to="/agents"><button className="btn">Initialize company →</button></Link>
             <span className="muted" style={{ fontSize: 12 }}>
@@ -278,8 +283,8 @@ export function Overview() {
         <div className="card">
           <h3>What you'll do next</h3>
           <ol className="next-steps">
-            <li>Initialize the company (create the Founder).</li>
-            <li>Create a Brief and assign it to an Operative.</li>
+            <li>Initialize the company (create the Founder), or set up a starter crew to skip ahead.</li>
+            <li>Ask Prime to plan, or create a Brief and assign it to an Operative.</li>
             <li>Run it — Relix executes in a scoped sandbox and records a transcript.</li>
             <li>Review the changed files, then accept &amp; apply them.</li>
           </ol>

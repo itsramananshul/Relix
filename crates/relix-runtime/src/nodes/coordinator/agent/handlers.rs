@@ -213,6 +213,122 @@ pub fn handle_bootstrap_founder(store: &AgentStore, ctx: &InvocationCtx) -> Hand
     }
 }
 
+/// Default starter-crew roles (company-model §12.6): the two tracks the
+/// flagship "build" plan uses, so a build proposal becomes fully runnable.
+const STARTER_DEFAULT_ROLES: [&str; 2] = ["engineer", "designer"];
+/// Hard cap on how many starter roles one call provisions (abuse guard).
+const STARTER_MAX_ROLES: usize = 6;
+
+/// Operator-facing display title for a canonical starter role.
+fn starter_role_title(canon: &str) -> &'static str {
+    match canon {
+        "engineer" => "Engineer",
+        "designer" => "Designer",
+        "researcher" => "Researcher",
+        "writer" => "Writer",
+        "qa" => "QA",
+        "ops" => "Ops",
+        _ => "Operative",
+    }
+}
+
+/// `company.starter_crew` — first-run safe-local on-ramp (company-model §12.6).
+/// Wire arg: `rig|roles_csv` (both optional; defaults `echo` + `engineer,designer`).
+/// Owner-gated (operator/admin or the console identity); a normal Operative is
+/// refused. Idempotently ensures the Founder exists, then ensures **one active
+/// safe-local starter Operative per requested role**, bound to `rig` (the
+/// built-in `echo` by default) and clearly labelled local/safe — never a fake
+/// Claude/Codex agent. Direct active creation is acceptable here because it is
+/// the Board's sovereign first-run action (§5.4); it hires no one behind a
+/// Clearance, runs no adapter, and changes no budget. Tenant-scoped; a re-run
+/// never duplicates the Founder or a role's starter. Returns
+/// `{founder, founder_created, rig, safe_local, crew:[{agent_id,role,name,created}]}`.
+pub fn handle_starter_crew(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    if !caller_is_owner(store, ctx) {
+        return security_denied(
+            "company.starter_crew is owner-only (dashboard admin / operator)".to_string(),
+        );
+    }
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("company.starter_crew utf8: {e}")),
+    };
+    let mut parts = s.splitn(2, '|');
+    let rig = {
+        let r = parts.next().unwrap_or("").trim();
+        if r.is_empty() { "echo" } else { r }
+    };
+    let roles_csv = parts.next().unwrap_or("").trim();
+    // Canonicalise + de-duplicate the requested roles, preserving first-seen
+    // order; an empty request uses the default roster.
+    let mut roles: Vec<&'static str> = Vec::new();
+    if roles_csv.is_empty() {
+        roles.extend(STARTER_DEFAULT_ROLES.iter().map(|r| prime::canon_role(r)));
+    } else {
+        for raw in roles_csv.split(',') {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let canon = prime::canon_role(raw);
+            if !roles.contains(&canon) {
+                roles.push(canon);
+            }
+            if roles.len() >= STARTER_MAX_ROLES {
+                break;
+            }
+        }
+        if roles.is_empty() {
+            roles.extend(STARTER_DEFAULT_ROLES.iter().map(|r| prime::canon_role(r)));
+        }
+    }
+    let tenant = ctx.tenant_id_or_default();
+    let created_by = ctx.caller.subject_id.to_string();
+
+    // 1) Ensure the apex Founder (idempotent) so the company is initialised.
+    let (founder_id, founder_created) = match store.ensure_founder("", rig, &created_by, tenant) {
+        Ok(r) => r,
+        Err(AgentStoreError::BadInput(m)) => return invalid(m),
+        Err(e) => return internal(format!("company.starter_crew founder: {e}")),
+    };
+    let founder = match store.get_agent_for_tenant(&founder_id, tenant) {
+        Ok(Some(p)) => p,
+        Ok(None) => return internal("company.starter_crew: founder vanished".into()),
+        Err(e) => return internal(format!("company.starter_crew read: {e}")),
+    };
+
+    // 2) Ensure one safe-local starter Operative per role (idempotent).
+    let mut crew = Vec::new();
+    for canon in &roles {
+        let title = format!("Starter {}", starter_role_title(canon));
+        let name = format!("{title} (local · {rig})");
+        match store.ensure_starter_operative(canon, &name, &title, rig, tenant) {
+            Ok((agent_id, created)) => crew.push(serde_json::json!({
+                "agent_id": agent_id,
+                "role": canon,
+                "name": name,
+                "created": created,
+            })),
+            Err(AgentStoreError::BadInput(m)) => return invalid(m),
+            Err(e) => return internal(format!("company.starter_crew operative: {e}")),
+        }
+    }
+
+    let body = serde_json::json!({
+        "founder": operative_json(&founder),
+        "founder_created": founder_created,
+        "rig": rig,
+        // `safe_local` is only honestly true when the crew runs the local echo
+        // Rig — any other Rig is the operator's explicit, non-default choice.
+        "safe_local": rig == "echo",
+        "crew": crew,
+    });
+    match serde_json::to_vec(&body) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => internal(format!("company.starter_crew encode: {e}")),
+    }
+}
+
 /// `agent.operatives` — the Crew roster (no args): every real Operative
 /// in the Guild (excludes the infra operator-console). Tenant-scoped.
 /// Returns a JSON array of compact Operative views (with `rig`).
@@ -4587,6 +4703,92 @@ mod tests {
         assert!(out.contains("\"created\":true"), "got {out}");
     }
 
+    // ── company.starter_crew (company-model §12.6) ───────────────────────
+
+    #[test]
+    fn starter_crew_creates_founder_plus_default_safe_local_crew() {
+        let s = store();
+        let body = json_of(ok_body(handle_starter_crew(&s, &fake_ctx(b""))));
+        // The Founder is stood up + the default engineer/designer starters.
+        assert_eq!(body["founder_created"], true, "{body}");
+        assert_eq!(body["rig"], "echo");
+        assert_eq!(body["safe_local"], true, "echo crew is safe-local: {body}");
+        let crew = body["crew"].as_array().unwrap();
+        assert_eq!(crew.len(), 2, "default roster is engineer+designer: {body}");
+        let roles: Vec<&str> = crew.iter().map(|c| c["role"].as_str().unwrap()).collect();
+        assert!(roles.contains(&"engineer") && roles.contains(&"designer"), "{body}");
+        // Every starter is created active, on echo, and labelled local — never a
+        // fake Claude/Codex agent.
+        for c in crew {
+            assert_eq!(c["created"], true);
+            let id = c["agent_id"].as_str().unwrap();
+            let p = s.get_agent(id).unwrap().unwrap();
+            assert_eq!(p.status, "active");
+            assert_eq!(p.rig.as_deref(), Some("echo"));
+            assert_eq!(p.created_by, AgentStore::STARTER_CREATED_BY);
+            assert!(p.name.contains("local"), "labelled local: {}", p.name);
+            // A starter is a worker — no org/work Keys.
+            assert!(!p.can_spawn_agents && !p.can_assign_work);
+        }
+        // The company now reads as initialized with 3 Operatives.
+        let status = json_of(ok_body(handle_company_status(&s, &fake_ctx(b""))));
+        assert_eq!(status["initialized"], true);
+        assert_eq!(status["operative_count"], 3);
+    }
+
+    #[test]
+    fn starter_crew_is_idempotent_no_duplicates_on_rerun() {
+        let s = store();
+        let _ = ok_body(handle_starter_crew(&s, &fake_ctx(b"")));
+        let again = json_of(ok_body(handle_starter_crew(&s, &fake_ctx(b""))));
+        // Re-run creates nothing new.
+        assert_eq!(again["founder_created"], false, "{again}");
+        for c in again["crew"].as_array().unwrap() {
+            assert_eq!(c["created"], false, "no duplicate starter: {c}");
+        }
+        // Still exactly Founder + 2 starters.
+        assert_eq!(s.list_operatives_for_tenant("default").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn starter_crew_honors_explicit_roles_and_dedupes() {
+        let s = store();
+        // Free-form, duplicate, and noise roles all canonicalise + de-dup.
+        let body = json_of(ok_body(handle_starter_crew(
+            &s,
+            &fake_ctx(b"echo|backend, frontend, qa, qa"),
+        )));
+        let roles: Vec<&str> = body["crew"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["role"].as_str().unwrap())
+            .collect();
+        // backend+frontend both canon to engineer (one), plus qa.
+        assert_eq!(roles, vec!["engineer", "qa"], "{body}");
+    }
+
+    #[test]
+    fn starter_crew_is_tenant_scoped() {
+        let s = store();
+        let _ = ok_body(handle_starter_crew(&s, &fake_ctx_tenant(b"", "acme")));
+        // acme has its crew; globex is still empty (no cross-tenant leak).
+        assert_eq!(s.list_operatives_for_tenant("acme").unwrap().len(), 3);
+        assert_eq!(s.list_operatives_for_tenant("globex").unwrap().len(), 0);
+        assert!(s.find_founder("globex").unwrap().is_none());
+    }
+
+    #[test]
+    fn starter_crew_refused_for_non_owner_caller() {
+        let s = store();
+        let ctx = fake_ctx_with_role(b"", "agent", b"stranger");
+        assert_eq!(
+            err_kind(handle_starter_crew(&s, &ctx)),
+            error_kinds::SECURITY_DENIED
+        );
+        assert!(s.find_founder("default").unwrap().is_none());
+    }
+
     #[test]
     fn company_status_reports_initialized_after_bootstrap() {
         let s = store();
@@ -5459,6 +5661,52 @@ mod tests {
             + counts["failed"].as_i64().unwrap()
             + counts["refused"].as_i64().unwrap();
         assert!(accounted >= 1, "the started Shift is accounted for: {v}");
+    }
+
+    #[tokio::test]
+    async fn starter_crew_closes_the_positive_local_loop_through_prime_start() {
+        // company-model §12.6 + §12.5B: from an EMPTY company, the owner's
+        // starter-crew bootstrap makes prime.propose → approve → start reach a
+        // real, completed echo Shift — no external coding-agent auth required.
+        let (agents, spine, task) = prime_stores();
+        let task = std::sync::Arc::new(task);
+        let reg = echo_registry();
+        // 1) Empty company → safe-local starter crew (Founder + echo workers).
+        let _ = ok_body(handle_starter_crew(&agents, &fake_ctx(b"")));
+        // 2) Describe → plan (a build, so engineer/designer tracks match the crew).
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build a web dashboard for sales"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // 3) Approve → the tracks assign to the active starter Operatives.
+        let approved = json_of(ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        assert!(
+            !approved["assigned_briefs"].as_array().unwrap().is_empty(),
+            "starter crew gets the tracks assigned: {approved}"
+        );
+        // 4) Start → the ready Briefs become real echo Shifts that complete.
+        let started = json_of(ok_body(handle_prime_start(
+            &agents,
+            &spine,
+            &task,
+            &reg,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        let runs = started["started"].as_array().unwrap();
+        assert!(!runs.is_empty(), "at least one Shift started: {started}");
+        for r in runs {
+            assert!(r["run_id"].is_string(), "a real run_id: {r}");
+            assert_eq!(r["rig"], "echo", "ran on the safe local echo Rig: {r}");
+        }
     }
 
     #[test]

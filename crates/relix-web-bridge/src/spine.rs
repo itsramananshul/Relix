@@ -1517,6 +1517,51 @@ pub async fn company_init(
 }
 
 #[derive(Debug, Deserialize, Default)]
+pub struct StarterCrewRequest {
+    /// Rig the starter crew runs on (default `echo` — the safe local adapter).
+    #[serde(default)]
+    pub rig: Option<String>,
+    /// Optional CSV of roles to provision (default `engineer,designer`).
+    #[serde(default)]
+    pub roles: Option<String>,
+}
+
+/// `POST /v1/spine/company/starter-crew` — first-run safe-local on-ramp
+/// (company-model §12.6). Idempotently ensures the Founder + one safe-local
+/// **echo** starter Operative per role (default `engineer,designer`), so a
+/// fresh company can run a real Shift without any external coding-agent auth.
+/// **Owner-gated at the bridge** (requires a logged-in dashboard session, like
+/// `/v1/spine/company/init`); the runtime capability *also* gates on the
+/// console/operator identity (defence in depth). Creates active starter crew
+/// directly only as the Board's sovereign first-run action — it hires no one
+/// behind a Clearance, runs no adapter, and changes no budget.
+pub async fn company_starter_crew(
+    State(state): State<AppState>,
+    headers: header::HeaderMap,
+    Json(req): Json<StarterCrewRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let session_ok = crate::dashboard_auth::session_cookie_from_headers(&headers)
+        .and_then(|sid| state.dashboard_auth.validate_session(&sid))
+        .is_some();
+    if !session_ok {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError {
+                error: "setting up a starter crew requires a logged-in dashboard session".into(),
+            }),
+        ));
+    }
+    let rig = req.rig.unwrap_or_default();
+    let roles = req.roles.unwrap_or_default();
+    // The wire arg is `rig|roles_csv`; neither field may smuggle the delimiter.
+    if rig.contains('|') || roles.contains('|') {
+        return Err(bad("rig / roles must not contain `|`"));
+    }
+    let arg = format!("{rig}|{roles}");
+    json_passthrough(call_peer(&state, "company.starter_crew", arg.as_bytes()).await?)
+}
+
+#[derive(Debug, Deserialize, Default)]
 pub struct PinRequest {
     #[serde(default)]
     pub pinned: bool,
@@ -1998,6 +2043,7 @@ mod tests {
             // not collide in matchit.
             .route("/v1/spine/company", get(company_status))
             .route("/v1/spine/company/init", post(company_init))
+            .route("/v1/spine/company/starter-crew", post(company_starter_crew))
             .route("/v1/spine/company/actions", get(company_actions))
             // Prime Shift-Room: the dedicated status stream (PART B) registered
             // alongside the polling snapshot — matchit panics here if the two

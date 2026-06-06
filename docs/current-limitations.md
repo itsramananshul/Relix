@@ -115,6 +115,19 @@ when you click Start. What it does **not** do:
   missing and files them as `pending` hire requests on approval, but it does
   not decide *which person/identity* to hire or *which adapter* to assign,
   and a pending hire is inert until a separate Clearance activates it.
+- **The first-run "starter crew" runs safe-local echo work only.** A brand-new
+  company has no work-role Operatives, so `prime.start` would skip every track.
+  `company.starter_crew` (`POST /v1/spine/company/starter-crew`, owner-gated,
+  idempotent, company-model §12.6) closes that gap by provisioning the Founder
+  plus a couple of clearly-labelled **safe-local Operatives on the built-in
+  `echo` Rig** (default engineer + designer) — so the operator can run the full
+  propose → approve → **start** loop and watch a real Shift finish **without
+  installing or logging in to any external coding agent**. It does **not**
+  provision or authenticate Claude/Codex (or any real adapter): reaching real
+  provider-authenticated execution still requires installing + logging in to a
+  coding-agent CLI on the Settings page and switching an Operative's Rig to it.
+  The starter Operatives are plain workers (no spawn/assign Keys) and are
+  created directly only as the Board's sovereign first-run action.
 - **The autonomous heartbeat only executes**, it does not plan. It runs
   already-assigned Briefs on a timer — it never authors strategy, staffs a
   team, or orchestrates a Mandate.

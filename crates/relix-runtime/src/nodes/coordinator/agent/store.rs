@@ -837,6 +837,94 @@ impl AgentStore {
         Ok((agent_id, true))
     }
 
+    /// Marker `created_by` for owner-provisioned safe-local starter crew
+    /// (company-model §12.6). A stable, non-caller value so idempotency and
+    /// audit can recognise a starter Operative regardless of which owner
+    /// identity ran the bootstrap.
+    pub const STARTER_CREATED_BY: &'static str = "relix-starter";
+
+    /// First-run starter crew (company-model §12.6). Idempotently ensure
+    /// **one active** safe-local starter Operative for `role` exists in
+    /// `tenant`, bound to `rig` (the built-in `echo` by default). Atomic: the
+    /// existence check (by the [`Self::STARTER_CREATED_BY`] marker + canonical
+    /// `role`) and the insert happen under one connection lock, so two
+    /// concurrent bootstraps cannot both create the same starter. Returns
+    /// `(agent_id, created)` — `created=false` when a matching starter already
+    /// existed (no duplicate). The starter is a plain **worker**: `active`, low
+    /// risk ceiling, and NO org/work Keys (it cannot spawn or assign) — the
+    /// Board provisions it directly only because this is its sovereign
+    /// first-run action (§5.4). `name`/`title` are the operator-facing labels
+    /// the caller has already marked local/safe.
+    pub fn ensure_starter_operative(
+        &self,
+        role: &str,
+        name: &str,
+        title: &str,
+        rig: &str,
+        tenant_id: &str,
+    ) -> Result<(String, bool), AgentStoreError> {
+        let role = role.trim();
+        let name = name.trim();
+        let title = title.trim();
+        if role.is_empty() || name.is_empty() || title.is_empty() {
+            return Err(AgentStoreError::BadInput(
+                "role / name / title required".into(),
+            ));
+        }
+        let rig = {
+            let r = rig.trim();
+            if r.is_empty() { "echo" } else { r }
+        };
+        let tenant = norm_tenant(tenant_id).to_string();
+        let now = unix_now();
+        let approval_required = serde_json::to_string(&default_approval_categories())
+            .map_err(|e| AgentStoreError::Json(e.to_string()))?;
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        // Atomic existence check under the same lock as the insert: an active
+        // starter for this role already covers it.
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT agent_id FROM agent_profiles
+                 WHERE created_by = ?1 AND role = ?2 AND tenant_id = ?3
+                   AND status = 'active'
+                 ORDER BY created_at ASC LIMIT 1",
+                params![Self::STARTER_CREATED_BY, role, tenant],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            return Ok((id, false));
+        }
+        let agent_id = new_agent_id(role);
+        let subject_id = format!("starter-{}", new_agent_id("subject"));
+        conn.execute(
+            "INSERT INTO agent_profiles (
+                 agent_id, name, role, title, department, team,
+                 created_by, status, subject_id, surface_allowlist,
+                 risk_ceiling, allow_categories, deny_categories,
+                 allow_sensitivity_tags, deny_sensitivity_tags,
+                 approval_required_categories, authorized_approvers,
+                 approval_timeout_secs, created_at, updated_at, tenant_id, rig
+             ) VALUES (?1, ?2, ?3, ?4, 'Starter Crew', 'Local/Safe',
+                       ?5, 'active', ?6, '[]',
+                       'low', '[]', '[]', '[]', '[]', ?7, '[]', 86400,
+                       ?8, ?8, ?9, ?10)",
+            params![
+                agent_id,
+                name,
+                role,
+                title,
+                Self::STARTER_CREATED_BY,
+                subject_id,
+                approval_required,
+                now,
+                tenant,
+                rig,
+            ],
+        )?;
+        Ok((agent_id, true))
+    }
+
     /// First-run status read: the tenant's Founder, or `None` if the
     /// company has not been initialised yet.
     pub fn find_founder(
@@ -3428,6 +3516,35 @@ mod tests {
         let f = s.get_agent(&id).unwrap().unwrap();
         assert_eq!(f.name, "Founder");
         assert_eq!(f.rig.as_deref(), Some("echo"));
+    }
+
+    #[test]
+    fn ensure_starter_operative_is_idempotent_active_and_rigged() {
+        let s = store();
+        let (id1, c1) = s
+            .ensure_starter_operative("engineer", "Starter Engineer (local · echo)", "Starter Engineer", "echo", "default")
+            .unwrap();
+        assert!(c1);
+        let p = s.get_agent(&id1).unwrap().unwrap();
+        assert_eq!(p.status, "active");
+        assert_eq!(p.rig.as_deref(), Some("echo"));
+        assert_eq!(p.created_by, AgentStore::STARTER_CREATED_BY);
+        assert!(!p.can_spawn_agents && !p.can_assign_work, "a starter is a worker");
+        // Re-ensuring the same role returns the same Operative (no duplicate).
+        let (id2, c2) = s
+            .ensure_starter_operative("engineer", "X", "Y", "echo", "default")
+            .unwrap();
+        assert_eq!(id1, id2);
+        assert!(!c2);
+        assert_eq!(s.list_operatives_for_tenant("default").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ensure_starter_operative_is_per_tenant() {
+        let s = store();
+        s.ensure_starter_operative("engineer", "Eng A", "Eng", "echo", "guild-a").unwrap();
+        assert_eq!(s.list_operatives_for_tenant("guild-a").unwrap().len(), 1);
+        assert_eq!(s.list_operatives_for_tenant("guild-b").unwrap().len(), 0);
     }
 
     #[test]

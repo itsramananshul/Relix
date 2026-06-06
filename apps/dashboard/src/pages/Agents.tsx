@@ -189,6 +189,35 @@ export function Agents() {
     }
   }
 
+  // First-run safe-local on-ramp (company-model §12.6): ensure the Founder +
+  // a small echo-backed starter crew so a fresh company can run a real Shift
+  // (propose → approve → start) without any external coding-agent auth.
+  async function starterCrew() {
+    setBanner(null);
+    setBusy(true);
+    try {
+      const r = await api.post<{
+        founder?: Agent;
+        founder_created?: boolean;
+        rig?: string;
+        crew?: { role?: string; created?: boolean }[];
+      }>("/v1/spine/company/starter-crew", { rig: "echo" });
+      const made = (r.crew ?? []).filter((c) => c.created).map((c) => c.role).join(", ");
+      const roles = (r.crew ?? []).map((c) => c.role).join(", ");
+      setBanner({
+        kind: "ok",
+        msg: made
+          ? `Starter crew ready — safe local Operatives (${made}) on the echo adapter. Ask Prime to plan, then Start the work.`
+          : `Starter crew already in place (${roles}) on the echo adapter.`,
+      });
+      reload();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Starter crew failed" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function setRig(agentId: string, rig: string) {
     const adapter = byName.get(rig);
     const avail = adapter?.probe?.status === "available";
@@ -306,9 +335,20 @@ export function Agents() {
               ? `${availCount}/${adapters.length} adapter(s) available. echo is recommended to start — switch the Founder to a coding agent once it is installed + logged in.`
               : "echo is recommended to start. Install + log in to a coding-agent CLI (Claude, Codex) on the Settings page to use a real adapter."}
           </p>
-          <button className="btn" onClick={initCompany} disabled={busy}>
-            {busy ? "Initializing…" : "Initialize Company"}
-          </button>
+          <div className="row" style={{ marginTop: 6, gap: 8, flexWrap: "wrap" }}>
+            <button className="btn" onClick={initCompany} disabled={busy}>
+              {busy ? "Working…" : "Initialize Company"}
+            </button>
+            <button className="btn ghost" onClick={starterCrew} disabled={busy}>
+              {busy ? "Working…" : "Set up starter crew (local · echo)"}
+            </button>
+          </div>
+          <p className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+            <strong>Starter crew</strong> also creates a couple of safe, local <em>echo</em> Operatives
+            (an Engineer + a Designer) so you can immediately Ask Prime to plan, then <em>Start the
+            work</em> and watch a real Shift complete — no external coding-agent login needed. These are
+            clearly-labelled local/demo workers, not Claude or Codex.
+          </p>
         </div>
       </Section>
     );

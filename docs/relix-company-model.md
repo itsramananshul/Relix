@@ -589,6 +589,76 @@ runs finish on the board. Every step is a governed gate; nothing runs itself.
 
 ---
 
+## 12.6 First-run company bootstrap + starter crew (the empty-company on-ramp)
+
+**The gap.** A brand-new Guild has no Operatives. The Board can already stand
+up the apex **Founder** (`company.bootstrap_founder` → `POST
+/v1/spine/company/init`), and the Prime loop (§12.5) plans honestly — but on a
+truly empty company every planned Brief lands **unassigned** (no active
+work-role Operative exists), so `prime.start` correctly skips everything and
+the operator never sees a *single* Shift run. That is honest, but it is not a
+satisfying first run: there is no governed path from "empty company" to "at
+least one real Shift completes" without first installing and authenticating an
+external coding-agent CLI.
+
+**The contract — `company.starter_crew`.** A new, governed first-run
+capability (`company.starter_crew` → `POST /v1/spine/company/starter-crew`)
+that turns an empty company into a *minimal, runnable* company **for safe,
+local work only**. It is the Board's sovereign on-ramp (§5.4), not autonomy:
+
+- **Owner-gated.** Same gate as `company.bootstrap_founder`: the caller must be
+  a real operator/admin **or** carry the boot-seeded operator-console
+  (`allow-all`) identity — i.e. it IS the trusted dashboard owner (the Board).
+  A normal Operative is refused. At the bridge it additionally requires a
+  logged-in dashboard session (defence in depth, exactly like
+  `/v1/spine/company/init`).
+- **Direct active creation is acceptable HERE.** Unlike a CEO/Operative spawn
+  (which must mint a `pending`-inert hire behind a Clearance, §4.4/§5.5), the
+  Board provisioning its own starter crew is a sovereign first-run action — the
+  same trust basis under which `ensure_founder` creates an **active** Founder
+  and `agent.create` is operator-only. So `company.starter_crew` may create
+  **active** starter Operatives directly. This is the *only* place direct
+  active creation of a work-role Operative is allowed, and only for the owner.
+- **Safe + local + clearly labelled.** Starter Operatives are bound to the
+  built-in **`echo`** Rig (a local, no-external-call reference adapter) and are
+  named/titled unmistakably as local/safe/demo crew (e.g. *"Starter Engineer
+  (local · echo)"*). They are **never** presented as Claude/Codex or any real
+  provider. Running them costs nothing and reaches no network.
+- **Idempotent.** Re-running ensures (never duplicates) the Founder and one
+  starter Operative per requested role: a starter for a role that already
+  exists is returned, not re-created. Safe to call repeatedly.
+- **Tenant-scoped.** Everything is created in the caller's Guild; a second
+  Guild gets its own independent starter crew, with no cross-tenant leak.
+- **No gate is bypassed.** Key/Allowance/tenant enforcement is unchanged: the
+  starter Operatives are ordinary active Operatives (a worker has no
+  spawn/assign Keys), the single-owner **Claim** still prevents double-work,
+  and the per-Operative Allowance hard-stop still applies on the autonomous
+  heartbeat path. `company.starter_crew` hires no one behind the Board's back,
+  runs no adapter, and changes no budget — it only *provisions* the crew.
+- **Default roster.** By default it ensures an **engineer** and a **designer**
+  (the two tracks the flagship "build" plan uses), so a "build …" proposal's
+  tracks + the integrate Brief all become assignable and runnable. The role
+  set is overridable by the owner; roles are canonicalised and de-duplicated
+  and the count is capped.
+
+**The positive local loop (no external auth required):**
+*Initialize / starter crew* (`company.starter_crew` — Founder + safe local
+echo Operatives) → describe in Chat → `prime.propose` → **Approve & create**
+(`prime.approve` assigns the tracks to the active starter Operatives) →
+**Start the work** (`prime.start` runs the ready Briefs through the echo Rig) →
+each Shift reaches `done` and opens review on the board / Action Center. Every
+step is still a governed gate; the only thing `company.starter_crew` adds is a
+governed way to *populate* the crew with safe local workers so the loop can
+actually close on a fresh company.
+
+**Remaining gap (honest).** This closes the loop for **safe local** work only.
+Real Claude/Codex-authenticated execution still requires the operator to
+install + log in to a coding-agent CLI (Settings) and switch an Operative's Rig
+to it — `company.starter_crew` deliberately does **not** provision or
+authenticate any external adapter.
+
+---
+
 ## 13. Glossary
 
 - **Company** — your organization; the top-level container (a tenant, product-faced).
