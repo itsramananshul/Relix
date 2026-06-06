@@ -312,6 +312,9 @@ async fn legacy_token_full_stack_real_controller_real_bridge_real_http() {
         300,
         clock.clone(),
         descriptor_cache,
+        // Metrics disabled for this legacy stack test — no live-spend ledger,
+        // so the Action Center budget alerts fall back to allowance-only.
+        None,
     );
     let bridge = Arc::new(bridge);
 
