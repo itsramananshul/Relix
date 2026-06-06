@@ -81,16 +81,27 @@ The **Prime Assistant** (`POST /v1/spine/prime/propose` → `…/approve` →
 governed plan that creates nothing until approved, then starts the ready work
 when you click Start. What it does **not** do:
 
-- **The Prime is rule-based, not an LLM** (request-aware, but still
-  deterministic). The plan now *reflects the request* — intent shapes the
-  breakdown (a `fix` is a reproduce → fix → verify chain, `research` is
-  investigate → synthesize, `build` is role tracks + integrate), and each
-  Brief title carries the extracted deliverable — so two different requests no
-  longer collapse to one shape (company-model §12.5A). But this is rule-based
-  pattern-matching, not a language model: no model is wired into a coordinator
-  capability, and the response says so honestly (`ai_used:false` + an
-  `ai_status` string), never faking model output. It cannot reason about
-  ambiguous or novel requests the way a model would.
+- **The Prime is rule-based by default; a model can draft the plan opt-in,
+  but the coordinator never calls a model itself.** The default plan is
+  deterministic and request-aware — intent shapes the breakdown (a `fix` is a
+  reproduce → fix → verify chain, `research` is investigate → synthesize,
+  `build` is role tracks + integrate), and each Brief title carries the
+  extracted deliverable, so two different requests no longer collapse to one
+  shape (company-model §12.5A). **Model-assisted planning is now available but
+  opt-in** (the Chat "Use AI" toggle → `mode:"ai"`): the *bridge* drafts a plan
+  with the `ai` peer, then the *coordinator* validates + sanitizes +
+  secret-redacts it server-side (`prime_plan::validate_model_plan`) before it is
+  ever stored, and computes crew/hires/governance from the live roster — a model
+  can shape only the interpretation. The coordinator handler still **never calls
+  an LLM synchronously** (the AI node is a separate mesh peer); the response is
+  honest about provenance via `ai_mode` (`deterministic_only` / `llm_used` /
+  `fallback` / `unavailable`) + `ai_used` + `ai_status`, and **any** model
+  failure (unreachable / oversized / malformed / invalid) degrades to the
+  deterministic plan with an honest reason — never faked model output. What is
+  **not** done: the live bridge→model→coordinator round trip is not
+  integration-tested in CI (it needs a real provider; the validator + fallback
+  that bound it are fully tested with fake output), and there is no
+  conversational refinement — one message → one proposal.
 - **A human is in the loop at every gate.** Prime PROPOSES; the operator must
   click **Approve & create** to create anything, greenlight each spawn
   Clearance, and click **Start the work** to run it. `prime.start`
@@ -124,10 +135,12 @@ when you click Start. What it does **not** do:
 
 In short: the *governance rails* of a company are in place and tenant-safe,
 the Shift Room makes the post-start loop legible (what ran / finished / is
-blocked / needs review, with the next action one click away), but the
-*intelligence* that would make it feel like Paperclip (a Prime that reasons
-about strategy + team + work) is still a human + rules, not a model — and the
-room is poll/SSE-refreshed, not a dedicated realtime session stream.
+blocked / needs review, with the next action one click away), and a model can
+now draft the plan **opt-in** behind a server-authoritative validator — but the
+default Prime is still rules, the model only shapes the *interpretation* (never
+crew/governance), there is no autonomous driver that reasons about strategy +
+team + work end to end, and the room is poll/SSE-refreshed, not a dedicated
+realtime session stream.
 
 ### Bridge persists every chat as a Task (fail-soft)
 
