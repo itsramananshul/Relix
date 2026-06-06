@@ -213,6 +213,13 @@ export function Overview() {
     <div className="grid">
       {/* Live system health — only loud when a layer is down. */}
       <HealthPanel compact />
+      {/* Start-work entry point: describe a goal → Prime proposes a plan. */}
+      {initialized && (
+        <div className="banner ok banner-action">
+          <span><strong>Start work</strong> — describe a goal and Prime proposes a governed plan (Mandate + Briefs + crew) for you to approve.</span>
+          <Link to="/chat" className="banner-cta">Plan with Prime →</Link>
+        </div>
+      )}
       {data?.coreError && (
         <div className="banner err banner-action">
           <span>Some Command Center data failed to load: {data.coreError}</span>
