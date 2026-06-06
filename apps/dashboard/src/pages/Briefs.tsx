@@ -317,15 +317,6 @@ export function Briefs() {
         )}
         {banner && <div className={"banner " + banner.kind}>{banner.msg}</div>}
 
-        {/* Brief detail + Chronicle — opens when a card title is clicked. */}
-        {selected && (
-          <BriefDetail
-            briefId={selected}
-            onClose={() => setSelected(null)}
-            onChanged={reload}
-          />
-        )}
-
         {!loading && !initialized && (
           <div className="banner info banner-action">
             <span>No Operatives yet — create Briefs now, but to assign + run them you need a Founder.</span>
@@ -362,6 +353,12 @@ export function Briefs() {
           </div>
         )}
 
+        {/* Split workspace (design §2/§7): the board on the left, the selected
+            Brief's detail in a stable contextual panel on the right. The
+            `split-*` classes apply ONLY while a Brief is open, so with nothing
+            selected the board keeps full width and the panel slides away. */}
+        <div className={selected ? "split-workspace" : undefined}>
+          <div className={selected ? "split-main" : undefined}>
         {loading ? (
           <div className="loading">Loading board…</div>
         ) : COLUMNS.every((c) => (data?.board?.[c] ?? []).length === 0) ? (
@@ -570,6 +567,22 @@ export function Briefs() {
             </div>
           </>
         )}
+          </div>
+          {/* The contextual properties panel — real BriefDetail data
+              (status / assignee / reviewer / relations / Latest Shift controls
+              / Requests / Conversation / Chronicle). Deep-linked via `?brief=`;
+              `.context-panel` is a layout wrapper, not a card, so the detail
+              card isn't nested. On mobile it stacks below the board. */}
+          {selected && (
+            <div className="context-panel">
+              <BriefDetail
+                briefId={selected}
+                onClose={() => setSelected(null)}
+                onChanged={reload}
+              />
+            </div>
+          )}
+        </div>
       </Section>
     </div>
   );
