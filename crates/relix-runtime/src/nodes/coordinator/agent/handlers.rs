@@ -539,6 +539,21 @@ pub fn handle_prime_approve(
         };
 
     // 2) Briefs (idempotent per-key markers), mapping proposal key → task_id.
+    //    Each Brief is stamped with the company's reviewer up front: the
+    //    Founder/Board — the sovereign reviewer of completed Shifts in the
+    //    first-run local loop (company-model §5.4 / §12.6). The Founder is a
+    //    same-tenant Operative (`find_founder` is tenant-scoped + deterministic:
+    //    oldest `role='founder'` row), never a cross-Guild or arbitrary agent.
+    //    With a reviewer in place a finished Shift can move in_progress →
+    //    in_review instead of parking in `blocked` for want of a reviewer
+    //    (execution-and-issue §1.3; heartbeat's "missing reviewer parks it").
+    //    No Founder (company not bootstrapped) → leave it unset and the honest
+    //    "parks in blocked until a reviewer is set" fallback still holds.
+    let reviewer_agent_id: Option<String> = agent_store
+        .find_founder(tenant)
+        .ok()
+        .flatten()
+        .map(|f| f.agent_id);
     let mut key_to_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut created_ids: Vec<String> = Vec::new();
     for b in &plan.briefs {
@@ -554,6 +569,13 @@ pub fn handle_prime_approve(
             Ok(id) => id,
             Err(e) => return internal(format!("prime.approve brief: {e}")),
         };
+        // Stamp the Founder/Board as reviewer so a completed Shift lands in
+        // `in_review`, not `blocked` (company-model §12.6). This covers the
+        // role tracks AND the dependent `integrate` Brief — every materialized
+        // Brief gets the same reviewer-aware lifecycle.
+        if let Some(rev) = reviewer_agent_id.as_deref() {
+            let _ = task_store.set_brief_field(&task_id, "reviewer", rev);
+        }
         key_to_id.insert(b.key.clone(), task_id.clone());
         created_ids.push(task_id);
     }
@@ -5338,6 +5360,192 @@ mod tests {
             )
             .unwrap();
         assert_eq!(evs.len(), 1, "Prime approval is chronicled on the Brief");
+    }
+
+    #[test]
+    fn prime_approve_stamps_same_tenant_founder_as_reviewer() {
+        // company-model §5.4/§12.6: a Prime-materialized Brief is stamped with
+        // the Founder/Board as its reviewer up front, so a completed Shift can
+        // move to `in_review` instead of parking in `blocked`. The reviewer is
+        // the SAME-tenant Founder, deterministically (oldest `role='founder'`).
+        let (agents, spine, task) = prime_stores();
+        // Found the company (creates the single Founder Operative).
+        ok_body(handle_bootstrap_founder(&agents, &fake_ctx(b"Ada|echo")));
+        let founder_id = agents.find_founder("default").unwrap().unwrap().agent_id;
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build a web dashboard"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let a = json_of(ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        let created = a["created_briefs"].as_array().unwrap();
+        assert!(created.len() >= 3, "engineer + designer tracks + integrate: {created:?}");
+        // EVERY created Brief — the role tracks AND the dependent `integrate`
+        // Brief — carries the Founder as reviewer, with a Chronicle event.
+        for b in created {
+            let id = b.as_str().unwrap();
+            assert_eq!(
+                task.brief_fields(id).unwrap().unwrap().reviewer_agent_id.as_deref(),
+                Some(founder_id.as_str()),
+                "Brief {id} should be stamped with the Founder reviewer"
+            );
+            let evs = task
+                .query_events(
+                    id,
+                    0,
+                    50,
+                    Some("brief.reviewer_assigned"),
+                    crate::nodes::coordinator::EventOrder::Desc,
+                )
+                .unwrap();
+            assert_eq!(evs.len(), 1, "reviewer assignment is chronicled on Brief {id}");
+        }
+        // The dependent `integrate` Brief specifically follows the same rule.
+        let integrate = task
+            .get_brief_by_source_marker(&format!("prime:{pid}:integrate"))
+            .unwrap()
+            .expect("integrate brief")
+            .task_id;
+        assert_eq!(
+            task.brief_fields(&integrate).unwrap().unwrap().reviewer_agent_id.as_deref(),
+            Some(founder_id.as_str()),
+            "the dependent integrate Brief is reviewer-aware too"
+        );
+    }
+
+    #[test]
+    fn prime_approve_no_founder_leaves_reviewer_unset() {
+        // Honest fallback: with no Founder (company never bootstrapped) there is
+        // no legitimate same-tenant reviewer, so the reviewer is left unset and
+        // the old "parks in blocked until a reviewer is set" behaviour holds. We
+        // never fabricate or borrow an arbitrary reviewer.
+        let (agents, spine, task) = prime_stores();
+        assert!(agents.find_founder("default").unwrap().is_none());
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build a web dashboard"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let a = json_of(ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        for b in a["created_briefs"].as_array().unwrap() {
+            let id = b.as_str().unwrap();
+            assert!(
+                task.brief_fields(id).unwrap().unwrap().reviewer_agent_id.is_none(),
+                "no Founder → Brief {id} carries no reviewer (honest fallback)"
+            );
+        }
+    }
+
+    #[test]
+    fn prime_approve_reviewer_is_never_cross_tenant() {
+        // Tenant isolation: a Founder in Guild `acme` must NEVER be stamped as a
+        // reviewer on Briefs materialized in Guild `globex`. `globex` has no
+        // Founder, so its Briefs stay reviewer-less rather than borrowing acme's.
+        let (agents, spine, task) = prime_stores();
+        // A Founder exists ONLY in `acme`.
+        ok_body(handle_bootstrap_founder(&agents, &fake_ctx_tenant(b"Ada|echo", "acme")));
+        assert!(agents.find_founder("acme").unwrap().is_some());
+        assert!(agents.find_founder("globex").unwrap().is_none());
+        // Approve a proposal in `globex`.
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx_tenant(b"Build a web dashboard", "globex"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let a = json_of(ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx_tenant(pid.as_bytes(), "globex"),
+        )));
+        for b in a["created_briefs"].as_array().unwrap() {
+            let id = b.as_str().unwrap();
+            assert!(
+                task.brief_fields(id).unwrap().unwrap().reviewer_agent_id.is_none(),
+                "globex Brief {id} must NOT borrow acme's Founder as reviewer"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_shift_with_founder_reviewer_reaches_in_review_not_blocked() {
+        // company-model §12.6 + execution-and-issue §1.3: with the Founder
+        // stamped as reviewer at approval, a completed echo Shift's board lands
+        // in `in_review` (review-ready) instead of `blocked` (which read as a
+        // failure). The heartbeat's best-effort `Done → in_review` now succeeds.
+        let (agents, spine, task) = prime_stores();
+        let task = std::sync::Arc::new(task);
+        let reg = echo_registry();
+        // Empty company → starter crew (creates the Founder + echo workers).
+        let _ = ok_body(handle_starter_crew(&agents, &fake_ctx(b"")));
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build a web dashboard for sales"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let _ = json_of(ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        let started = json_of(ok_body(handle_prime_start(
+            &agents,
+            &spine,
+            &task,
+            &reg,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        let runs = started["started"].as_array().unwrap().clone();
+        assert!(!runs.is_empty(), "at least one track Shift started: {started}");
+        // Wait for every started Shift to reach its terminal `done` run state.
+        let run_ids: Vec<String> = runs
+            .iter()
+            .map(|r| r["run_id"].as_str().unwrap().to_string())
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let all_done = run_ids.iter().all(|id| {
+                matches!(task.get_run(id).unwrap().map(|r| r.status), Some(ref s) if s == "done")
+            });
+            if all_done {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "Shifts never reached done");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Each completed track sits in `in_review` — NOT `blocked` — because it
+        // carries a reviewer. This is the fix: review-ready work reads correctly.
+        for r in &runs {
+            let brief_id = r["brief_id"].as_str().unwrap();
+            assert_eq!(
+                task.board_status(brief_id).unwrap().as_deref(),
+                Some("in_review"),
+                "a completed reviewer-stamped Shift lands in in_review, not blocked"
+            );
+        }
     }
 
     #[test]
