@@ -92,8 +92,8 @@ unassigned; the operator greenlights the hire and `prime.start` then
 #   POST /v1/spine/prime/propose   {message:"Build a web app with test coverage"}
 #   POST /v1/spine/prime/approve   {proposal_id}  -> hire_requests:[<qa agent_id>]
 #   POST /v1/spine/prime/start     {proposal_id}  -> qa track skipped "no Operative ..."
-#   POST /v1/agents/<qa agent_id>/approve-hire     -> pending -> active (governed; owner-gated)
-#   PATCH /v1/agents/<qa agent_id> {rig:"echo"}    -> the operator configures the new hire's Rig
+#   POST /v1/agents/<qa agent_id>/approve-hire  {rig:"echo"}
+#         -> {runnable:true,rig:"echo",rig_set:true,needs_rig:false} — active AND rigged in one call
 #   POST /v1/spine/prime/start     {proposal_id}  -> assigned:[<qa track>], started:[{run_id,rig:"echo"}]
 ```
 
@@ -102,9 +102,17 @@ unassigned; the operator greenlights the hire and `prime.start` then
   Prime/`route=direct` pending hire carries no spawn Clearance, so it is
   activated here (not via `/v1/approvals/.../decide`). Its boot-policy allow
   rule is `agent_approve_hire` / `agent_reject_hire`.
-- A freshly-filed hire has **no Rig**, so it is not runnable until the operator
-  configures one (`PATCH /v1/agents/:id {rig}`) — exactly the §12.6
-  "switch an Operative's Rig" step; for the safe-local loop that Rig is `echo`.
+- A freshly-filed hire has **no Rig**, so to make it *immediately runnable* the
+  approval call now accepts an **optional `{rig}`** body (company-model §12.6):
+  the Rig is validated against the known-Rig allowlist and bound **atomically at
+  approval**, so the same one call activates *and* rigs the Operative — no
+  separate `PATCH /v1/agents/:id {rig}` step. For the safe-local loop that Rig
+  is `echo`; `echo` is always accepted, an unknown Rig is refused, and a
+  duplicate/conflicting approval never clobbers the bound Rig. Omitting `rig`
+  preserves the old behaviour and the response's `needs_rig:true` flags that a
+  Rig must still be configured (e.g. `PATCH /v1/agents/:id {rig}`) before the
+  Operative can run. The Action Center hire card carries the machine-actionable
+  `action_api` (`POST /v1/agents/<id>/approve-hire`) + `suggested_rig:"echo"`.
 - The full dependent-unblock tail (every blocking track reviewed to board
   `done` → the `integrate` Brief unblocks and runs) is pinned by the
   in-process test `prime_start_reconciles_a_greenlit_hire_so_dependent_work_unblocks`.

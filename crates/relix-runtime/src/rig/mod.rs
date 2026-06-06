@@ -637,6 +637,29 @@ pub trait Rig: Send + Sync {
     }
 }
 
+/// The canonical names of the Rigs Relix ships out of the box: the
+/// safe-local built-in [`EchoRig`] plus the standard subscription CLI
+/// Rigs ([`register_cli_rigs`]). This is the **narrow allowlist** a
+/// governed onboarding point (e.g. `agent.approve_hire`) validates an
+/// explicitly-requested Rig against, without needing a live
+/// [`RigRegistry`] in hand. `echo` is the only safe-local entry; the
+/// rest spawn external CLIs and are an operator's explicit, non-default
+/// choice. Kept in sync with the builtins + [`register_cli_rigs`] by
+/// `known_rig_names_match_the_registry` below.
+pub const KNOWN_RIG_NAMES: &[&str] = &["echo", "claude", "codex", "gemini", "hermes"];
+
+/// `echo` — the only Rig that runs **safe, local, no-network** work and
+/// is therefore the one a first-run on-ramp may suggest/assign.
+pub const SAFE_LOCAL_RIG: &str = "echo";
+
+/// Whether `name` is one of the [`KNOWN_RIG_NAMES`] Relix ships. Used to
+/// reject a typo'd / unknown Rig at a governed assignment point before it
+/// is stored (the dispatcher would otherwise silently fall back to the
+/// Guild default for an unknown name).
+pub fn is_known_rig(name: &str) -> bool {
+    KNOWN_RIG_NAMES.contains(&name.trim())
+}
+
 /// A registry of Rigs, keyed by [`Rig::name`]. Built-ins are
 /// registered at startup; operator / third-party Rigs register the
 /// same way, so "plug in any agent" is open-ended. Last writer wins
@@ -2397,6 +2420,26 @@ pub fn register_cli_rigs(registry: &mut RigRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_rig_names_match_the_registry() {
+        // The narrow allowlist `KNOWN_RIG_NAMES` (used to validate a Rig at a
+        // governed assignment point without a live registry) must stay in lock-
+        // step with the actual builtins + CLI subscription Rigs, or the gate
+        // would reject a Rig the dispatcher can really run (or vice-versa).
+        let mut reg = RigRegistry::with_builtins();
+        register_cli_rigs(&mut reg);
+        let mut shipped = reg.names();
+        shipped.sort();
+        let mut allowlist: Vec<String> = KNOWN_RIG_NAMES.iter().map(|s| s.to_string()).collect();
+        allowlist.sort();
+        assert_eq!(shipped, allowlist, "KNOWN_RIG_NAMES drifted from the registry");
+        assert!(is_known_rig("echo"));
+        assert!(is_known_rig("  echo  "), "trims before checking");
+        assert!(!is_known_rig("bogus"));
+        assert!(!is_known_rig(""));
+        assert_eq!(SAFE_LOCAL_RIG, "echo");
+    }
 
     #[test]
     fn echo_rig_runs_and_reports_done() {

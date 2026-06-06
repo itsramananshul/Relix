@@ -455,6 +455,19 @@ pub enum AgentStoreError {
 
 // ── Store ─────────────────────────────────────────────────
 
+/// The result of [`AgentStore::approve_hire_with_rig`]: what Rig the
+/// now-active Operative ends up bound to (if any), and whether *this*
+/// call set it. A `rig: None` outcome means the Operative is active but
+/// still **un-runnable** until a Rig is configured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApproveHireOutcome {
+    /// `true` when this approval call wrote the Rig (vs. it was already set
+    /// or left unset).
+    pub rig_set: bool,
+    /// The Rig bound to the Operative after approval, if any.
+    pub rig: Option<String>,
+}
+
 pub struct AgentStore {
     conn: Arc<Mutex<Connection>>,
 }
@@ -1886,6 +1899,97 @@ impl AgentStore {
             return Err(AgentStoreError::NotFound(agent_id.into()));
         }
         Ok(())
+    }
+
+    /// Approve a pending hire **and** (optionally) bind its Rig in one
+    /// atomic, tenant-scoped step (company-model §12.6). This is what lets
+    /// `agent.approve_hire` produce an *immediately runnable* Operative: a
+    /// freshly-filed Prime hire has no Rig, so without setting one here the
+    /// approved Operative would activate un-runnable (the dispatcher resolves
+    /// an empty Rig to the Guild default, which is unset by default) and need a
+    /// separate `agent.update {rig}` PATCH.
+    ///
+    /// Semantics:
+    /// - **Tenant-scoped, no existence leak.** A hire that does not exist *in
+    ///   `tenant`* (absent or another Guild's) returns `NotFound` — identical
+    ///   to a truly-missing id, so a cross-tenant caller cannot probe.
+    /// - **Pending-only.** An already-active (or disabled) Operative returns
+    ///   `BadInput` and is left untouched — a duplicate approval is safe and
+    ///   **never clobbers** an existing Rig (the second call refuses before any
+    ///   write). Mirrors [`Self::approve_hire`].
+    /// - **No-clobber.** A `rig` is written only when one is supplied *and* the
+    ///   Operative currently has none; an already-set Rig is preserved (the
+    ///   explicit Rig-change path is `agent.update {rig}`, gated separately).
+    /// - **Atomic.** The status flip and the Rig write happen under the same
+    ///   connection lock in a single `UPDATE` guarded by `status='pending'`, so
+    ///   there is no window where the Operative is active-but-unrigged because
+    ///   of this call.
+    ///
+    /// The caller is responsible for validating `rig` against the known-Rig
+    /// allowlist *before* calling (see `rig::is_known_rig`); this method stores
+    /// whatever non-empty name it is given.
+    pub fn approve_hire_with_rig(
+        &self,
+        agent_id: &str,
+        rig: Option<&str>,
+        tenant: &str,
+    ) -> Result<ApproveHireOutcome, AgentStoreError> {
+        let now = unix_now();
+        let t = norm_tenant(tenant).to_string();
+        let rig = rig.map(str::trim).filter(|s| !s.is_empty());
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        // Tenant-scoped read of the current status + Rig. A row outside the
+        // caller's Guild reads as absent (no existence leak).
+        let row: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT status, rig FROM agent_profiles
+                 WHERE agent_id = ?1 AND tenant_id = ?2",
+                params![agent_id, t],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let (status, existing_rig) = match row {
+            Some(v) => v,
+            None => return Err(AgentStoreError::NotFound(agent_id.into())),
+        };
+        if status != "pending" {
+            return Err(AgentStoreError::BadInput(format!(
+                "hire is not pending (status={status}); duplicate approval is a no-op"
+            )));
+        }
+        let existing_rig = existing_rig.filter(|s| !s.trim().is_empty());
+        // Set the Rig only when supplied AND none is already bound (no clobber).
+        let rig_to_set: Option<&str> = match (rig, existing_rig.as_deref()) {
+            (Some(r), None) => Some(r),
+            _ => None,
+        };
+        let changed = if let Some(r) = rig_to_set {
+            conn.execute(
+                "UPDATE agent_profiles SET status='active', rig=?1, updated_at=?2
+                 WHERE agent_id=?3 AND tenant_id=?4 AND status='pending'",
+                params![r, now, agent_id, t],
+            )?
+        } else {
+            conn.execute(
+                "UPDATE agent_profiles SET status='active', updated_at=?1
+                 WHERE agent_id=?2 AND tenant_id=?3 AND status='pending'",
+                params![now, agent_id, t],
+            )?
+        };
+        if changed == 0 {
+            // Lost the pending→active race (concurrent approval) — treat as a
+            // safe duplicate, never a partial write.
+            return Err(AgentStoreError::BadInput(
+                "hire is no longer pending; duplicate approval is a no-op".into(),
+            ));
+        }
+        let final_rig = rig_to_set
+            .map(|s| s.to_string())
+            .or(existing_rig);
+        Ok(ApproveHireOutcome {
+            rig_set: rig_to_set.is_some(),
+            rig: final_rig,
+        })
     }
 
     /// Reject a pending hire (pending → disabled, terminal).
@@ -3977,6 +4081,75 @@ mod tests {
         assert_eq!(s.get_agent(&id2).unwrap().unwrap().status, "disabled");
         // Rejecting a non-pending agent errors.
         assert!(s.reject_hire(&id).is_err());
+    }
+
+    #[test]
+    fn approve_hire_with_rig_activates_runnable_and_is_no_clobber() {
+        let s = store();
+        let req = |subj: &str| {
+            s.request_hire("Q", "qa", "QA", "qa", "qa", "ceo", subj, "low", "default")
+                .unwrap()
+        };
+
+        // (a) Approve WITH a Rig → active + Rig bound in one atomic step. The
+        // approved Operative is immediately runnable (no separate PATCH).
+        let id = req("subj-a");
+        let out = s
+            .approve_hire_with_rig(&id, Some("echo"), "default")
+            .unwrap();
+        assert!(out.rig_set, "this call set the Rig");
+        assert_eq!(out.rig.as_deref(), Some("echo"));
+        let p = s.get_agent(&id).unwrap().unwrap();
+        assert_eq!(p.status, "active");
+        assert_eq!(p.rig.as_deref(), Some("echo"), "Rig bound at approval");
+
+        // (b) Duplicate approval (same Rig) is a safe no-op — it refuses
+        // (already active) and never clobbers the Rig.
+        let dup = s.approve_hire_with_rig(&id, Some("echo"), "default");
+        assert!(matches!(dup, Err(AgentStoreError::BadInput(_))));
+        assert_eq!(
+            s.get_agent(&id).unwrap().unwrap().rig.as_deref(),
+            Some("echo"),
+            "duplicate approval left the Rig intact"
+        );
+
+        // (c) Duplicate approval with a CONFLICTING Rig also refuses and does
+        // NOT silently clobber the existing Rig.
+        let conflict = s.approve_hire_with_rig(&id, Some("claude"), "default");
+        assert!(matches!(conflict, Err(AgentStoreError::BadInput(_))));
+        assert_eq!(
+            s.get_agent(&id).unwrap().unwrap().rig.as_deref(),
+            Some("echo"),
+            "conflicting re-approval must not clobber the bound Rig"
+        );
+
+        // (d) Approve WITHOUT a Rig → active but un-runnable (no Rig); the
+        // outcome reports that honestly.
+        let id2 = req("subj-d");
+        let out2 = s.approve_hire_with_rig(&id2, None, "default").unwrap();
+        assert!(!out2.rig_set);
+        assert_eq!(out2.rig, None, "no Rig bound → not runnable");
+        let p2 = s.get_agent(&id2).unwrap().unwrap();
+        assert_eq!(p2.status, "active");
+        assert_eq!(p2.rig, None);
+    }
+
+    #[test]
+    fn approve_hire_with_rig_is_tenant_scoped_no_existence_leak() {
+        let s = store();
+        // A pending hire in the `acme` Guild.
+        let id = s
+            .request_hire("Q", "qa", "QA", "qa", "qa", "ceo", "subj-x", "low", "acme")
+            .unwrap();
+        // A caller in a DIFFERENT Guild cannot approve it — and the error is
+        // `NotFound` (identical to a truly-missing id), so existence never leaks.
+        let cross = s.approve_hire_with_rig(&id, Some("echo"), "other");
+        assert!(matches!(cross, Err(AgentStoreError::NotFound(_))));
+        // The hire is untouched (still pending) in its own Guild.
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().status, "pending");
+        // The owning Guild approves it normally.
+        s.approve_hire_with_rig(&id, Some("echo"), "acme").unwrap();
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().status, "active");
     }
 
     // ── PILLAR 2: Rig (agent backend) ────────────────────

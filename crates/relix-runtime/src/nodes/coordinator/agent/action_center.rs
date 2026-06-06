@@ -157,6 +157,18 @@ pub struct ActionItem {
     pub created_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<i64>,
+    /// A machine-actionable API endpoint the client can call directly to act on
+    /// this item (vs. the human dashboard `route`). Today only the `hire` card
+    /// sets it — `POST /v1/agents/:id/approve-hire` — so a client can approve
+    /// the hire programmatically. Omitted for items with no direct API verb.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_api: Option<String>,
+    /// The safe-local Rig a client should pass when acting on this item (the
+    /// `hire` card suggests `echo` so the approved Operative is immediately
+    /// runnable, company-model §12.6). Never a paid/interactive CLI; never a
+    /// secret. Omitted when there is nothing safe to suggest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_rig: Option<String>,
 }
 
 impl ActionItem {
@@ -264,6 +276,8 @@ pub fn approval_item(a: &ApprovalRecord) -> ActionItem {
         route,
         created_at: Some(a.requested_at),
         updated_at: None,
+        action_api: None,
+        suggested_rig: None,
     }
 }
 
@@ -275,7 +289,12 @@ pub fn hire_item(p: &AgentProfile) -> ActionItem {
         category: ActionCategory::Hire,
         severity: ActionCategory::Hire.severity(),
         title: format!("Approve hire — {}", p.name),
-        reason: format!("a pending {} hire is inert until approved", p.role),
+        reason: format!(
+            "a pending {} hire is inert until approved — approve it with the safe-local `{}` Rig \
+             to make it immediately runnable",
+            p.role,
+            crate::rig::SAFE_LOCAL_RIG,
+        ),
         target_type: Some("agent".to_string()),
         target_id: Some(p.agent_id.clone()),
         target_title: Some(p.name.clone()),
@@ -283,6 +302,11 @@ pub fn hire_item(p: &AgentProfile) -> ActionItem {
         route: Some("/agents".to_string()),
         created_at: Some(p.created_at),
         updated_at: None,
+        // Machine-actionable: a client can POST here with the suggested Rig to
+        // approve + make the Operative runnable in one call (company-model §12.6).
+        // No secret — just the safe-local Rig name and the public route shape.
+        action_api: Some(format!("POST /v1/agents/{}/approve-hire", p.agent_id)),
+        suggested_rig: Some(crate::rig::SAFE_LOCAL_RIG.to_string()),
     }
 }
 
@@ -361,6 +385,8 @@ pub fn budget_committed_item(committed_cents: i64, budget_cents: i64, over: bool
         route: Some("/agents".to_string()),
         created_at: None,
         updated_at: None,
+        action_api: None,
+        suggested_rig: None,
     }
 }
 
@@ -385,6 +411,8 @@ pub fn allowance_hardstop_item(p: &AgentProfile) -> ActionItem {
         route: Some("/agents".to_string()),
         created_at: Some(p.created_at),
         updated_at: None,
+        action_api: None,
+        suggested_rig: None,
     }
 }
 
@@ -463,6 +491,8 @@ pub fn operative_spend_item(
         route: Some("/agents".to_string()),
         created_at: Some(p.created_at),
         updated_at: None,
+        action_api: None,
+        suggested_rig: None,
     }
 }
 
@@ -516,6 +546,8 @@ pub fn company_spend_item(spend_micros: u64, budget_cents: i64, over: bool) -> A
         route: Some("/agents".to_string()),
         created_at: None,
         updated_at: None,
+        action_api: None,
+        suggested_rig: None,
     }
 }
 
@@ -536,6 +568,8 @@ pub fn strategy_item(m: &Mandate) -> ActionItem {
         route: Some("/mandates".to_string()),
         created_at: Some(m.created_at),
         updated_at: Some(m.updated_at),
+        action_api: None,
+        suggested_rig: None,
     }
 }
 
@@ -554,6 +588,8 @@ pub fn ready_item(c: &BriefCard) -> ActionItem {
         route: Some("/briefs".to_string()),
         created_at: None,
         updated_at: None,
+        action_api: None,
+        suggested_rig: None,
     }
 }
 
@@ -586,6 +622,8 @@ pub fn blocked_item(c: &BriefCard, unassigned: bool) -> ActionItem {
         route,
         created_at: None,
         updated_at: None,
+        action_api: None,
+        suggested_rig: None,
     }
 }
 
@@ -607,6 +645,8 @@ pub fn stale_item(c: &BriefCard) -> ActionItem {
         route: Some("/briefs".to_string()),
         created_at: None,
         updated_at: None,
+        action_api: None,
+        suggested_rig: None,
     }
 }
 
@@ -626,6 +666,8 @@ pub fn needs_review_item(r: &RunRecord) -> ActionItem {
         route: Some(format!("/runs?run={}", r.run_id)),
         created_at: Some(r.started_at),
         updated_at: r.finished_at,
+        action_api: None,
+        suggested_rig: None,
     }
 }
 
@@ -719,6 +761,8 @@ pub fn failed_item(r: &RunRecord) -> ActionItem {
         route: Some(route),
         created_at: Some(r.started_at),
         updated_at: r.finished_at,
+        action_api: None,
+        suggested_rig: None,
     }
 }
 
@@ -740,6 +784,8 @@ mod tests {
             route: None,
             created_at: created,
             updated_at: None,
+            action_api: None,
+            suggested_rig: None,
         }
     }
 

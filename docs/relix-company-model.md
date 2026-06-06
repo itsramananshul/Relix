@@ -678,11 +678,29 @@ step is still a governed gate; the only thing `company.starter_crew` adds is a
 governed way to *populate* the crew with safe local workers so the loop can
 actually close on a fresh company.
 
+**Runnable on approval (the missing-role hire path).** A freshly-filed Prime
+hire (the `pending` role-track Operative `prime.approve` files) carries **no
+Rig**, so activating it alone would leave it active-but-un-runnable until a Rig
+is configured. `agent.approve_hire` (`POST /v1/agents/:id/approve-hire`)
+therefore accepts an **optional `rig`** and binds it **atomically at approval**:
+one governed call activates *and* rigs the Operative so `prime.start` can run
+its track immediately — no separate "switch the Rig" step. The Rig is validated
+against the known-Rig allowlist (so a typo can't activate onto a Rig the
+dispatcher would silently fall back from); `echo` (the safe-local built-in) is
+always accepted. This is **not** a silent assignment of a paid/interactive CLI:
+the operator passes the Rig explicitly (the Action Center hire card *suggests*
+the safe-local `echo` and carries the machine-actionable approval target), a
+duplicate/conflicting approval never clobbers an already-bound Rig, and omitting
+`rig` preserves the prior behaviour with the response flagging `needs_rig` so
+the operator knows a Rig is still required.
+
 **Remaining gap (honest).** This closes the loop for **safe local** work only.
 Real Claude/Codex-authenticated execution still requires the operator to
-install + log in to a coding-agent CLI (Settings) and switch an Operative's Rig
-to it — `company.starter_crew` deliberately does **not** provision or
-authenticate any external adapter.
+install + log in to a coding-agent CLI (Settings) and choose that Rig for the
+Operative (at approval, or later via `agent.update {rig}`) — neither
+`company.starter_crew` nor `agent.approve_hire` provisions or authenticates any
+external adapter; they only ever bind the safe-local `echo` unless the operator
+explicitly names another installed Rig.
 
 ---
 

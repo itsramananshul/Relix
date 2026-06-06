@@ -113,8 +113,16 @@ when you click Start. What it does **not** do:
   → run) on its own.
 - **Hiring is request → approve only.** Prime suggests *which roles* are
   missing and files them as `pending` hire requests on approval, but it does
-  not decide *which person/identity* to hire or *which adapter* to assign,
-  and a pending hire is inert until a separate Clearance activates it.
+  not decide *which person/identity* to hire, and a pending hire is inert until
+  the operator greenlights it. The operator does choose the **adapter**: the
+  governed `agent.approve_hire` (`POST /v1/agents/:id/approve-hire`) accepts an
+  optional `{rig}` and binds it atomically at approval (company-model §12.6), so
+  a greenlit hire is *immediately runnable* in one call — for the safe-local
+  loop that Rig is the built-in `echo` (validated against the known-Rig
+  allowlist; a duplicate/conflicting approval never clobbers an already-bound
+  Rig). Approving without a `rig` still works and the response's `needs_rig`
+  flag says a Rig must be configured before the Operative can run. It never
+  *silently* assigns a paid/interactive CLI — the operator names the Rig.
 - **The first-run "starter crew" runs safe-local echo work only.** A brand-new
   company has no work-role Operatives, so `prime.start` would skip every track.
   `company.starter_crew` (`POST /v1/spine/company/starter-crew`, owner-gated,

@@ -17,6 +17,7 @@
 
 use axum::{
     Json,
+    body::Bytes,
     extract::{Path, Query, State},
     http::StatusCode,
 };
@@ -444,23 +445,104 @@ pub async fn delete_agent(
     }))
 }
 
+/// Optional JSON body for `POST /v1/agents/:agent_id/approve-hire`. The
+/// body (and `rig`) are optional — an empty request keeps the legacy
+/// "approve, no Rig" behaviour; supplying `rig` makes the approved
+/// Operative immediately runnable (company-model §12.6). For the
+/// safe-local first-run path that Rig is `echo`.
+#[derive(Debug, Deserialize, Default)]
+pub struct ApproveHireRequest {
+    #[serde(default)]
+    pub rig: Option<String>,
+}
+
+/// The coordinator's `agent.approve_hire` JSON result.
+#[derive(Debug, Deserialize)]
+struct ApproveHireWire {
+    #[serde(default)]
+    rig: Option<String>,
+    #[serde(default)]
+    rig_set: bool,
+    #[serde(default)]
+    runnable: bool,
+    #[serde(default)]
+    needs_rig: bool,
+}
+
+/// Response for `POST /v1/agents/:agent_id/approve-hire`. Tells the client
+/// whether the now-active Operative is runnable, and — when it is not —
+/// makes the required follow-up machine-actionable (`needs_rig`).
+#[derive(Debug, Serialize)]
+pub struct ApproveHireResponse {
+    pub ok: bool,
+    pub agent_id: String,
+    /// The Rig bound to the Operative after approval (omitted when none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rig: Option<String>,
+    /// Did this approval assign the Rig?
+    pub rig_set: bool,
+    /// Can a Shift dispatch to this Operative now?
+    pub runnable: bool,
+    /// The Operative still needs a Rig configured before it can run.
+    pub needs_rig: bool,
+}
+
 /// `POST /v1/agents/:agent_id/approve-hire` — greenlight a `pending` hire
 /// (pending → active), the governed affordance the Action Center's "Approve
 /// the hire" item points at (a `route=direct`/Prime pending hire carries no
 /// spawn Clearance, so it is activated here rather than via
 /// `/v1/approvals/.../decide`). Forwards to the coordinator's owner-gated
 /// `agent.approve_hire`; the runtime enforces the gate + the pending-only
-/// transition. This is what lets a Prime plan's missing-role track become
-/// runnable once the operator says yes.
+/// transition.
+///
+/// Accepts an **optional** JSON body `{"rig":"echo"}`: when present, the Rig
+/// is validated + bound atomically at approval so the approved Operative is
+/// **immediately runnable** without a separate `PATCH /v1/agents/:id {rig}`
+/// (company-model §12.6). With no body / no `rig`, behaviour is unchanged and
+/// the response's `needs_rig` flag tells the client a Rig must still be
+/// configured. The request body must be empty or valid JSON.
 pub async fn approve_hire(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
-) -> Result<Json<OkResponse>, (StatusCode, Json<ApiError>)> {
-    let _ = call_peer_string(&state, DEFAULT_PEER, "agent.approve_hire", agent_id.as_bytes()).await?;
-    Ok(Json(OkResponse {
+    body: Bytes,
+) -> Result<Json<ApproveHireResponse>, (StatusCode, Json<ApiError>)> {
+    // The body is optional: empty ⇒ legacy "approve, no Rig". Only parse when
+    // bytes are present so no-body callers keep working.
+    let req: ApproveHireRequest = if body.is_empty() {
+        ApproveHireRequest::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| bad(format!("invalid JSON body: {e}")))?
+    };
+    let rig = req.rig.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(r) = rig
+        && r.contains('|')
+    {
+        return Err(bad("rig must not contain `|`".into()));
+    }
+    // Wire arg: `agent_id` or `agent_id|rig` (the runtime validates the Rig
+    // against the known-Rig allowlist + enforces the pending-only transition).
+    let arg = match rig {
+        Some(r) => format!("{agent_id}|{r}"),
+        None => agent_id.clone(),
+    };
+    let resp =
+        call_peer_string(&state, DEFAULT_PEER, "agent.approve_hire", arg.as_bytes()).await?;
+    let wire: ApproveHireWire = serde_json::from_str(resp.trim()).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(ApiError {
+                error: format!("agent.approve_hire returned an unparseable body: {resp:?} ({e})"),
+            }),
+        )
+    })?;
+    Ok(Json(ApproveHireResponse {
         ok: true,
-        task_id: None,
-        run_id: None,
+        agent_id,
+        rig: wire.rig,
+        rig_set: wire.rig_set,
+        runnable: wire.runnable,
+        needs_rig: wire.needs_rig,
     }))
 }
 

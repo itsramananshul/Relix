@@ -3222,21 +3222,71 @@ pub fn handle_brief_clearance_request(
     HandlerOutcome::Ok(format!("{approval_id}\n").into_bytes())
 }
 
-/// `agent.approve_hire` — approve a pending hire (pending → active).
-/// Arg: agent_id.
+/// `agent.approve_hire` — approve a pending hire (pending → active) and,
+/// optionally, bind the Rig that makes it **immediately runnable**
+/// (company-model §12.6). Wire arg: `agent_id` or `agent_id|rig` (the Rig
+/// is optional). Tenant-scoped; owner-gating is enforced by the boot
+/// policy allow rule + the bridge session, same as the other governed
+/// company actions.
+///
+/// When a `rig` is supplied it is validated against the known-Rig
+/// allowlist ([`rig::is_known_rig`]) so a typo can't activate an Operative
+/// onto a Rig the dispatcher would silently fall back from — `echo` (the
+/// safe-local built-in) is always accepted. Approval + Rig assignment are
+/// atomic in the store: the Operative never ends up active-but-unrigged
+/// because of this call. With no `rig`, behaviour is unchanged except the
+/// JSON response now tells the client whether the Operative still needs a
+/// Rig before it can run.
+///
+/// Returns JSON: `{status, agent_id, rig, rig_set, runnable, needs_rig}`.
 pub fn handle_approve_hire(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
-    let id = match std::str::from_utf8(&ctx.args) {
-        Ok(s) => s.trim(),
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
         Err(e) => return invalid(format!("agent.approve_hire utf8: {e}")),
     };
+    let mut parts = s.splitn(2, '|');
+    let id = parts.next().unwrap_or("").trim();
+    let rig = parts.next().map(str::trim).filter(|r| !r.is_empty());
     if id.is_empty() {
         return invalid("agent.approve_hire: agent_id required".into());
     }
-    match store.approve_hire(id) {
-        Ok(()) => HandlerOutcome::Ok(b"approved\n".to_vec()),
-        Err(AgentStoreError::NotFound(m)) => {
-            invalid(format!("agent.approve_hire: not pending: {m}"))
+    if let Some(r) = rig
+        && !crate::rig::is_known_rig(r)
+    {
+        return invalid(format!(
+            "agent.approve_hire: unknown rig '{r}' (known: {})",
+            crate::rig::KNOWN_RIG_NAMES.join(", ")
+        ));
+    }
+    match store.approve_hire_with_rig(id, rig, ctx.tenant_id_or_default()) {
+        Ok(outcome) => {
+            let runnable = outcome.rig.is_some();
+            let body = serde_json::json!({
+                "status": "approved",
+                "agent_id": id,
+                // The Rig bound after approval (null when none — then the
+                // Operative is active but not yet runnable).
+                "rig": outcome.rig,
+                // Did THIS call assign the Rig (vs. it was already set / left
+                // unset)?
+                "rig_set": outcome.rig_set,
+                // Can a Shift dispatch to this Operative now?
+                "runnable": runnable,
+                // The client should configure a Rig (e.g. PATCH /v1/agents/:id
+                // {rig:"echo"}) before the Operative can run.
+                "needs_rig": !runnable,
+            });
+            match serde_json::to_vec(&body) {
+                Ok(b) => HandlerOutcome::Ok(b),
+                Err(e) => internal(format!("agent.approve_hire encode: {e}")),
+            }
         }
+        // Absent / cross-tenant read identically as "no pending hire" — no
+        // existence leak.
+        Err(AgentStoreError::NotFound(_)) => {
+            invalid(format!("agent.approve_hire: no pending hire {id} in this Guild"))
+        }
+        Err(AgentStoreError::BadInput(m)) => invalid(format!("agent.approve_hire: {m}")),
         Err(e) => internal(format!("agent.approve_hire: {e}")),
     }
 }
@@ -4695,6 +4745,95 @@ mod tests {
             HandlerOutcome::Ok(_) => panic!("expected Err"),
             HandlerOutcome::Err(e) => e.kind,
         }
+    }
+
+    // ── agent.approve_hire wire contract (company-model §12.6) ───────────────
+
+    /// Spawn a `pending` qa hire in `tenant` and return its agent_id.
+    #[cfg(test)]
+    fn pending_qa_hire(s: &AgentStore, subj: &str, tenant: &str) -> String {
+        s.request_hire("QA", "qa", "QA", "qa", "qa", "ceo", subj, "low", tenant)
+            .unwrap()
+    }
+
+    #[test]
+    fn approve_hire_with_echo_yields_a_runnable_operative() {
+        let s = store();
+        let id = pending_qa_hire(&s, "subj-rig", "default");
+        // One call, explicit safe-local Rig → active + runnable, no PATCH.
+        let arg = format!("{id}|echo");
+        let v = json_of(ok_body(handle_approve_hire(&s, &fake_ctx(arg.as_bytes()))));
+        assert_eq!(v["status"], "approved");
+        assert_eq!(v["rig"], "echo");
+        assert_eq!(v["rig_set"], true);
+        assert_eq!(v["runnable"], true);
+        assert_eq!(v["needs_rig"], false);
+        let p = s.get_agent(&id).unwrap().unwrap();
+        assert_eq!(p.status, "active");
+        assert_eq!(p.rig.as_deref(), Some("echo"));
+    }
+
+    #[test]
+    fn approve_hire_without_rig_activates_but_flags_needs_rig() {
+        let s = store();
+        let id = pending_qa_hire(&s, "subj-norig", "default");
+        // No Rig in the arg → legacy behaviour (active) but the response is
+        // explicit that a Rig is still required before it can run.
+        let v = json_of(ok_body(handle_approve_hire(&s, &fake_ctx(id.as_bytes()))));
+        assert_eq!(v["status"], "approved");
+        assert_eq!(v["rig"], serde_json::Value::Null);
+        assert_eq!(v["rig_set"], false);
+        assert_eq!(v["runnable"], false);
+        assert_eq!(v["needs_rig"], true);
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().status, "active");
+    }
+
+    #[test]
+    fn approve_hire_rejects_an_unknown_rig() {
+        let s = store();
+        let id = pending_qa_hire(&s, "subj-bad", "default");
+        let arg = format!("{id}|definitely-not-a-rig");
+        let out = handle_approve_hire(&s, &fake_ctx(arg.as_bytes()));
+        assert_eq!(err_kind(out), error_kinds::INVALID_ARGS);
+        // The hire is untouched — still pending (no misleading partial state).
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().status, "pending");
+    }
+
+    #[test]
+    fn approve_hire_duplicate_is_safe_and_no_clobber() {
+        let s = store();
+        let id = pending_qa_hire(&s, "subj-dup", "default");
+        let arg = format!("{id}|echo");
+        ok_body(handle_approve_hire(&s, &fake_ctx(arg.as_bytes())));
+        // A second approval (even with a conflicting Rig) is refused and must
+        // not clobber the bound Rig.
+        let arg2 = format!("{id}|claude");
+        let out = handle_approve_hire(&s, &fake_ctx(arg2.as_bytes()));
+        assert_eq!(err_kind(out), error_kinds::INVALID_ARGS);
+        assert_eq!(
+            s.get_agent(&id).unwrap().unwrap().rig.as_deref(),
+            Some("echo"),
+            "duplicate/conflicting approval left the Rig intact"
+        );
+    }
+
+    #[test]
+    fn approve_hire_is_tenant_scoped_and_does_not_leak() {
+        let s = store();
+        let id = pending_qa_hire(&s, "subj-acme", "acme");
+        // A caller in another Guild cannot approve it; the refusal is generic
+        // (no existence leak) and the hire stays pending in its own Guild.
+        let arg = format!("{id}|echo");
+        let out = handle_approve_hire(&s, &fake_ctx_tenant(arg.as_bytes(), "other"));
+        assert_eq!(err_kind(out), error_kinds::INVALID_ARGS);
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().status, "pending");
+        // The owning Guild approves it normally, with the Rig bound.
+        let v = json_of(ok_body(handle_approve_hire(
+            &s,
+            &fake_ctx_tenant(arg.as_bytes(), "acme"),
+        )));
+        assert_eq!(v["runnable"], true);
+        assert_eq!(v["rig"], "echo");
     }
 
     #[test]
@@ -6479,6 +6618,23 @@ mod tests {
         assert!(cats.contains(&"hire"), "a pending designer hire: {v}");
         assert!(cats.contains(&"ready_to_start"), "engineer track ready: {v}");
         assert!(cats.contains(&"blocked"), "integration blocked: {v}");
+        // The hire card is machine-actionable: it names the approval API target
+        // and the safe-local Rig a client should pass to make the Operative
+        // runnable in one call (company-model §12.6). No secret in the payload.
+        let hire = actions
+            .iter()
+            .find(|a| a["category"] == serde_json::json!("hire"))
+            .expect("a hire card");
+        let agent_id = hire["target_id"].as_str().unwrap();
+        assert_eq!(
+            hire["action_api"].as_str().unwrap(),
+            format!("POST /v1/agents/{agent_id}/approve-hire"),
+            "hire card carries the approval API target: {hire}"
+        );
+        assert_eq!(
+            hire["suggested_rig"], "echo",
+            "hire card suggests the safe-local Rig: {hire}"
+        );
         // Part B ordering: hire (high) before ready_to_start (medium) before
         // blocked (medium, but ranked after ready so work can move forward).
         let hire_pos = cats.iter().position(|c| *c == "hire").unwrap();
