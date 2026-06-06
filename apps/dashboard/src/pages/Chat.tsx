@@ -365,12 +365,12 @@ function AiStatusBadge({ mode, aiUsed, status, reason }: { mode?: string; aiUsed
   };
   const meta = META[m] ?? META.deterministic_only;
   const title = (status ?? "") + (reason ? `\n\nReason: ${reason}` : "");
+  // Rendered inline in the proposal's .panel-head flex row, so it must be an
+  // inline badge (no block wrapper / top margin) to stay aligned + right-anchored.
   return (
-    <div style={{ marginTop: 6 }}>
-      <span className={"badge " + meta.tone} style={{ fontSize: 9 }} title={title}>
-        {meta.label}
-      </span>
-    </div>
+    <span className={"badge " + meta.tone} style={{ fontSize: 9 }} title={title}>
+      {meta.label}
+    </span>
   );
 }
 
