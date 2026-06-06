@@ -969,6 +969,16 @@ method = "agent.delete"
 allow_groups = ["chat-users"]
 
 [[rules]]
+name = "agent_approve_hire"
+method = "agent.approve_hire"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "agent_reject_hire"
+method = "agent.reject_hire"
+allow_groups = ["chat-users"]
+
+[[rules]]
 name = "agent_effective_capabilities"
 method = "agent.effective_capabilities"
 allow_groups = ["chat-users"]

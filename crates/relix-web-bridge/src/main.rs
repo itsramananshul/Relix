@@ -1293,6 +1293,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .patch(agent::update_agent)
                 .delete(agent::delete_agent),
         )
+        .route(
+            "/v1/agents/:agent_id/approve-hire",
+            post(agent::approve_hire),
+        )
+        .route("/v1/agents/:agent_id/reject-hire", post(agent::reject_hire))
         .route("/v1/approvals", get(agent::pending_approvals))
         .route(
             "/v1/approvals/:approval_id/decide",

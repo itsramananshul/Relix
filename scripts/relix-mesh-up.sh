@@ -1434,6 +1434,14 @@ name = "spine_agent_allowance_committed"
 method = "agent.allowance_committed"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "agent_approve_hire"
+method = "agent.approve_hire"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "agent_reject_hire"
+method = "agent.reject_hire"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_run_workspace_config"
 method = "run.workspace_config"
 allow_groups = ["chat-users"]

@@ -558,6 +558,24 @@ manual `brief.run` and the autonomous heartbeat already use
   started is returned with an **honest reason** (unassigned / blocked /
   already complete / cancelled / not currently startable), so the operator
   can see exactly what still needs a Clearance or a dependency.
+- **Completes greenlit assignments (reconciliation).** `prime.approve`
+  assigns each track only to the Operatives that were **active then**, and
+  files the missing roles as `pending` hires. When the operator later
+  **greenlights** one of those hires (pending → active via
+  `agent.approve_hire`), its planned role-track Brief is still unassigned — so
+  without this it would skip as *unassigned* forever and any dependent Brief
+  (the *integrate* track that depends on every track) would never unblock. So
+  before it reads the ready set, `prime.start` **completes the assignment
+  `prime.approve` already planned**: for any still-unassigned planned track
+  whose role now has an active Operative, it assigns that Operative — using the
+  **identical role match** `prime.approve` used. This is the operator's
+  sovereign completion of the approved plan (the whole flow is
+  operator-initiated): it **never clobbers an existing assignee**, and it
+  assigns nothing the operator did not already greenlight as a hire for that
+  role. The reconciled Briefs are returned in `assigned` and each gets a
+  `prime.assigned` Chronicle event. This is what lets the loop *not stop at
+  hire* — greenlight the hire, Start the work, and the freshly-staffed track
+  runs in the same call.
 - **Real Shifts, same gates.** Each started Brief goes through the existing
   pre-flight: the assignee's Rig is resolved and **probed** (an unavailable
   adapter refuses cleanly and records a durable refused Shift — never a
@@ -577,15 +595,24 @@ manual `brief.run` and the autonomous heartbeat already use
   *what Prime suggested → what was approved → what was actually run* trail is
   complete.
 - **It is not autonomy.** `prime.start` still requires the operator to click
-  start; it does not propose, approve, staff, or loop on its own. It is the
-  governed trigger that lets the heartbeat/assignment loop (§6.1) begin for a
-  planned Mandate in one step instead of Brief-by-Brief.
+  start; it does not propose hires, approve hires, or loop on its own. The
+  assignment reconciliation above is **not** autonomous staffing — it only
+  completes assignments the operator already authorised by *approving the
+  hire*; `prime.start` hires/approves/creates no one. It is the governed
+  trigger that lets the heartbeat/assignment loop (§6.1) begin for a planned
+  Mandate in one step instead of Brief-by-Brief.
 
 **The closed loop:** describe in Chat → `prime.propose` (a request-aware
 plan, nothing created) → **Approve & create** (`prime.approve` — Mandate +
-Briefs + assignments + pending hires) → greenlight any Clearances → **Start
-the work** (`prime.start` — the ready Briefs become real Shifts) → watch the
-runs finish on the board. Every step is a governed gate; nothing runs itself.
+Briefs + assignments + pending hires) → **greenlight the hires** (approve the
+pending hire / any spawn Clearance — the missing-role Operatives go active) →
+**Start the work** (`prime.start` — reconciles the now-active hires onto their
+waiting tracks, then runs every ready Brief) → review each Shift to board
+`done` → its dependents (e.g. the *integrate* track) unblock and run on a
+repeat **Start the work**. Every step is a governed gate; nothing runs itself.
+(A dependent Brief unblocks only when *every* blocking track reaches board
+`done`, which is the operator's review-to-done — a finished Shift opens its
+*run* review but does not move the Brief to `done` on its own.)
 
 ---
 

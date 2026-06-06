@@ -444,6 +444,40 @@ pub async fn delete_agent(
     }))
 }
 
+/// `POST /v1/agents/:agent_id/approve-hire` — greenlight a `pending` hire
+/// (pending → active), the governed affordance the Action Center's "Approve
+/// the hire" item points at (a `route=direct`/Prime pending hire carries no
+/// spawn Clearance, so it is activated here rather than via
+/// `/v1/approvals/.../decide`). Forwards to the coordinator's owner-gated
+/// `agent.approve_hire`; the runtime enforces the gate + the pending-only
+/// transition. This is what lets a Prime plan's missing-role track become
+/// runnable once the operator says yes.
+pub async fn approve_hire(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<OkResponse>, (StatusCode, Json<ApiError>)> {
+    let _ = call_peer_string(&state, DEFAULT_PEER, "agent.approve_hire", agent_id.as_bytes()).await?;
+    Ok(Json(OkResponse {
+        ok: true,
+        task_id: None,
+        run_id: None,
+    }))
+}
+
+/// `POST /v1/agents/:agent_id/reject-hire` — decline a `pending` hire
+/// (pending → disabled). Forwards to the owner-gated `agent.reject_hire`.
+pub async fn reject_hire(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<OkResponse>, (StatusCode, Json<ApiError>)> {
+    let _ = call_peer_string(&state, DEFAULT_PEER, "agent.reject_hire", agent_id.as_bytes()).await?;
+    Ok(Json(OkResponse {
+        ok: true,
+        task_id: None,
+        run_id: None,
+    }))
+}
+
 // ── Approvals ────────────────────────────────────────────
 
 #[derive(Debug, Serialize, PartialEq, Eq)]

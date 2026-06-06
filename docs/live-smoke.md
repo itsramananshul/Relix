@@ -79,6 +79,36 @@ Expected first-Shift outcome: two tracks run on echo and reach `done` /
 `pending_review`; the dependent "integrate" Brief is correctly **skipped /
 blocked** on its dependency.
 
+## Variant: the governed hiring path completes (a missing-role track runs)
+
+Proves the loop does **not stop at a hire** (company-model §12.5B). When a
+build plan infers a role with no active Operative (e.g. *qa* from "test
+coverage"), `prime.approve` files it as a `pending` hire and leaves that track
+unassigned; the operator greenlights the hire and `prime.start` then
+**reconciles** the now-active Operative onto its waiting track and runs it.
+
+```
+#   POST /v1/spine/company/starter-crew  {rig:"echo",roles:"engineer,designer"}
+#   POST /v1/spine/prime/propose   {message:"Build a web app with test coverage"}
+#   POST /v1/spine/prime/approve   {proposal_id}  -> hire_requests:[<qa agent_id>]
+#   POST /v1/spine/prime/start     {proposal_id}  -> qa track skipped "no Operative ..."
+#   POST /v1/agents/<qa agent_id>/approve-hire     -> pending -> active (governed; owner-gated)
+#   PATCH /v1/agents/<qa agent_id> {rig:"echo"}    -> the operator configures the new hire's Rig
+#   POST /v1/spine/prime/start     {proposal_id}  -> assigned:[<qa track>], started:[{run_id,rig:"echo"}]
+```
+
+- `POST /v1/agents/:id/approve-hire` (+ `.../reject-hire`) is the governed
+  affordance the Action Center's **"Approve the hire"** item points at — a
+  Prime/`route=direct` pending hire carries no spawn Clearance, so it is
+  activated here (not via `/v1/approvals/.../decide`). Its boot-policy allow
+  rule is `agent_approve_hire` / `agent_reject_hire`.
+- A freshly-filed hire has **no Rig**, so it is not runnable until the operator
+  configures one (`PATCH /v1/agents/:id {rig}`) — exactly the §12.6
+  "switch an Operative's Rig" step; for the safe-local loop that Rig is `echo`.
+- The full dependent-unblock tail (every blocking track reviewed to board
+  `done` → the `integrate` Brief unblocks and runs) is pinned by the
+  in-process test `prime_start_reconciles_a_greenlit_hire_so_dependent_work_unblocks`.
+
 ## Caveat that the live smoke caught
 
 Every `/v1/spine/*` capability the bridge forwards is mesh-default-denied unless

@@ -777,6 +777,55 @@ pub fn handle_prime_start(
         };
     }
 
+    // ── Governed assignment reconciliation (company-model §12.5B) ──────────
+    // `prime.approve` assigned each track only to the Operatives that were
+    // ACTIVE then, and filed the missing roles as `pending` hires. When the
+    // operator SINCE greenlights one of those hires (pending → active via
+    // `agent.approve_hire`), its planned role-track Brief is still unassigned —
+    // so it would skip as `Unassigned` forever and any dependent Brief (e.g. the
+    // `integrate` track that depends on every track) would never unblock. This
+    // pass COMPLETES the assignment `prime.approve` already planned, using the
+    // IDENTICAL role match, for any now-active Operative. It is the operator's
+    // sovereign completion of the approved plan (this whole flow is operator-
+    // initiated): it hires/approves/creates no one, never clobbers an existing
+    // assignee, and assigns nothing the operator did not already greenlight as a
+    // hire for that role. Runs BEFORE the readiness set is read so the freshly
+    // staffed track is seen as ready in this same call.
+    let mut late_assigned: Vec<String> = Vec::new();
+    if let Ok(plan) = serde_json::from_str::<prime::PrimeProposal>(&row.proposal_json) {
+        let operatives = agent_store.list_operatives_for_tenant(tenant).unwrap_or_default();
+        for b in &plan.briefs {
+            let marker = format!("prime:{proposal_id}:{}", b.key);
+            let card = match task_store.get_brief_by_source_marker(&marker) {
+                Ok(Some(c)) => c,
+                _ => continue,
+            };
+            // Only fill a STILL-unassigned track — never clobber an existing
+            // (prime.approve or operator) assignment.
+            if !card.assignee_agent_id.as_deref().unwrap_or("").is_empty() {
+                continue;
+            }
+            let want = prime::canon_role(&b.role);
+            if let Some(op) = operatives
+                .iter()
+                .find(|o| o.status == "active" && prime::canon_role(&o.role) == want)
+                && task_store
+                    .set_brief_field(&card.task_id, "assignee", &op.agent_id)
+                    .is_ok()
+            {
+                let _ = task_store.append_event(
+                    &card.task_id,
+                    "prime.assigned",
+                    &format!(
+                        "Prime assigned now-active {want} `{}` (hire greenlit since approval) from proposal {proposal_id}",
+                        op.agent_id
+                    ),
+                );
+                late_assigned.push(card.task_id.clone());
+            }
+        }
+    }
+
     // Canonical readiness set: assigned to an active Operative, unblocked, not
     // already claimed/running (a generous batch so we see all the ready Briefs).
     let ready_ids: std::collections::HashSet<String> = task_store
@@ -916,6 +965,8 @@ pub fn handle_prime_start(
     let body = serde_json::json!({
         "proposal_id": proposal_id,
         "mandate_id": row.mandate_id,
+        // Tracks this call staffed from hires the operator greenlit since approval.
+        "assigned": late_assigned,
         "started": started,
         "skipped": skipped,
     });
@@ -5777,6 +5828,214 @@ mod tests {
             run.apply_status.as_deref(),
             Some("applied"),
             "the Shift's durable terminal is `applied`: {run:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prime_start_reconciles_a_greenlit_hire_so_dependent_work_unblocks() {
+        // company-model §12.5B: the governed loop must NOT stop at hire. When a
+        // build plan infers a role with no active Operative, `prime.approve`
+        // files a `pending` hire and leaves that role-track Brief unassigned.
+        // Until now the track stayed `Unassigned` forever even after the operator
+        // approved the hire — so the dependent `integrate` track (blocked on every
+        // track) never unblocked. `prime.start` now reconciles: it staffs the
+        // greenlit hire's waiting track, runs it, and once the tracks reach `done`
+        // the dependent Brief unblocks and runs too.
+        let (agents, spine, task) = prime_stores();
+        let task = std::sync::Arc::new(task);
+        let reg = echo_registry();
+
+        // Empty company → safe-local starter crew (Founder + echo engineer +
+        // echo designer). NO qa Operative exists.
+        let _ = ok_body(handle_starter_crew(&agents, &fake_ctx(b"")));
+
+        // A build needing test coverage → engineer + designer + qa tracks, plus
+        // an `integrate` Brief that depends on all three.
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build a web app with test coverage"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Approve → engineer/designer (and the engineer-owned integrate) get
+        // assigned; the missing qa role becomes a SINGLE `pending` hire.
+        let approved = json_of(ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        let hires = approved["hire_requests"].as_array().unwrap();
+        assert_eq!(hires.len(), 1, "exactly the missing qa role is a hire: {approved}");
+        let qa_hire_id = hires[0].as_str().unwrap().to_string();
+
+        // Resolve the Brief ids by their stable Prime source markers.
+        let qa_track = task
+            .get_brief_by_source_marker(&format!("prime:{pid}:track:qa"))
+            .unwrap()
+            .expect("qa track brief")
+            .task_id;
+        let integrate = task
+            .get_brief_by_source_marker(&format!("prime:{pid}:integrate"))
+            .unwrap()
+            .expect("integrate brief")
+            .task_id;
+        // The qa track is unassigned (its hire is still pending).
+        assert!(
+            task.brief_card(&qa_track)
+                .unwrap()
+                .unwrap()
+                .assignee_agent_id
+                .as_deref()
+                .unwrap_or("")
+                .is_empty(),
+            "qa track is unassigned before the hire is greenlit"
+        );
+
+        let started_runs = |v: &serde_json::Value| -> Vec<String> {
+            v["started"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["run_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let mut run_ids: Vec<String> = Vec::new();
+
+        // Start #1 (hire NOT yet approved): the qa track skips honestly, the
+        // integrate track is blocked, the staffed tracks run.
+        let s1 = json_of(ok_body(handle_prime_start(
+            &agents,
+            &spine,
+            &task,
+            &reg,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        assert!(
+            s1["assigned"].as_array().unwrap().is_empty(),
+            "nothing greenlit yet → no late assignment: {s1}"
+        );
+        let qa_skip = s1["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["brief_id"] == serde_json::json!(qa_track))
+            .expect("qa track is reported skipped");
+        assert!(
+            qa_skip["reason"].as_str().unwrap().contains("no Operative"),
+            "qa track skipped because no Operative is assigned yet: {qa_skip}"
+        );
+        run_ids.extend(started_runs(&s1));
+        assert!(!run_ids.is_empty(), "engineer/designer tracks started: {s1}");
+
+        // The operator greenlights the qa hire (pending → active) — the GOVERNED
+        // hire-approval path.
+        let _ = ok_body(handle_approve_hire(&agents, &fake_ctx(qa_hire_id.as_bytes())));
+
+        // Start #2: prime.start now RECONCILES — it staffs the qa track to the
+        // now-active hire and starts it (where before it skipped forever).
+        let s2 = json_of(ok_body(handle_prime_start(
+            &agents,
+            &spine,
+            &task,
+            &reg,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        assert!(
+            s2["assigned"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|id| id == &serde_json::json!(qa_track)),
+            "the greenlit qa hire's track is reconciled/assigned: {s2}"
+        );
+        assert_eq!(
+            task.brief_card(&qa_track)
+                .unwrap()
+                .unwrap()
+                .assignee_agent_id
+                .as_deref(),
+            Some(qa_hire_id.as_str()),
+            "the qa track is now assigned to the activated hire"
+        );
+        let qa_run = s2["started"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["brief_id"] == serde_json::json!(qa_track))
+            .expect("the qa track started a real Shift");
+        assert_eq!(qa_run["rig"], "echo", "ran on the safe local echo Rig: {qa_run}");
+        run_ids.extend(started_runs(&s2));
+
+        // Wait for every started track Shift to reach its terminal echo state, so
+        // the board is stable and the Claim released before the operator reviews.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let all_done = run_ids.iter().all(|id| {
+                matches!(
+                    task.get_run(id).unwrap().map(|r| r.status),
+                    Some(ref s) if s == "done"
+                )
+            });
+            if all_done {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "track Shifts never reached done"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // The dependent integrate Brief is still blocked — a blocker clears only
+        // when the blocking Brief reaches board `done`, and the tracks are not
+        // there yet (a finished Shift opens its run review; the Brief still needs
+        // the operator's accept to move to done).
+        assert!(
+            task.is_blocked(&integrate).unwrap(),
+            "integrate stays blocked until its tracks reach done"
+        );
+
+        // The operator reviews each track to board `done` (the governed
+        // review path: set a reviewer → in_progress → in_review → done). This
+        // resolves the integrate Brief's blockers.
+        for marker in ["track:engineer", "track:designer", "track:qa"] {
+            let card = task
+                .get_brief_by_source_marker(&format!("prime:{pid}:{marker}"))
+                .unwrap()
+                .unwrap();
+            let id = &card.task_id;
+            let reviewer = card.assignee_agent_id.as_deref().unwrap_or_default();
+            task.set_brief_field(id, "reviewer", reviewer).unwrap();
+            task.set_board_status(id, "in_progress").unwrap();
+            task.set_board_status(id, "in_review").unwrap();
+            task.set_board_status(id, "done").unwrap();
+        }
+        assert!(
+            !task.is_blocked(&integrate).unwrap(),
+            "with every track done, the dependent integrate Brief unblocks"
+        );
+
+        // Start #3: the previously-blocked dependent Brief now runs — dependent
+        // work unblocked end to end, all through governed gates.
+        let s3 = json_of(ok_body(handle_prime_start(
+            &agents,
+            &spine,
+            &task,
+            &reg,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        assert!(
+            s3["started"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["brief_id"] == serde_json::json!(integrate)
+                    && r["run_id"].is_string()),
+            "the dependent integrate Brief starts a real Shift once unblocked: {s3}"
         );
     }
 
