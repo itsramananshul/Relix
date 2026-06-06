@@ -29,12 +29,23 @@ interface ApproveResponse {
   already_approved?: boolean;
 }
 interface CompanionResponse { action?: string; reply?: string; result?: unknown }
+// Start-to-Shift (POST /v1/spine/prime/start).
+interface StartedShift { brief_id?: string; run_id?: string; rig?: string; status?: string }
+interface SkippedBrief { brief_id?: string; reason?: string }
+interface StartResponse {
+  proposal_id?: string;
+  mandate_id?: string;
+  started?: StartedShift[];
+  skipped?: SkippedBrief[];
+}
 
-// A chat-log entry is plain text, a Prime proposal card, or an approval result.
+// A chat-log entry is plain text, a Prime proposal card, an approval result,
+// or a Start-to-Shift result.
 type Entry =
   | { role: "user" | "assistant"; kind: "text"; text: string }
   | { role: "assistant"; kind: "proposal"; data: ProposalResponse; done?: boolean }
-  | { role: "assistant"; kind: "approved"; data: ApproveResponse };
+  | { role: "assistant"; kind: "approved"; data: ApproveResponse; done?: boolean }
+  | { role: "assistant"; kind: "started"; data: StartResponse };
 
 const INTENT_TONE: Record<string, string> = {
   build: "done",
@@ -104,6 +115,31 @@ export function Chat() {
     }
   }
 
+  // Start the work — turn the approved Mandate's READY Briefs into real Shifts
+  // (the same governed run path as a manual Brief run). Nothing here is
+  // created; it only RUNS Briefs that are already assigned + ready.
+  async function start(proposalId: string, idx: number) {
+    setBusy(true);
+    try {
+      const res = await api.post<StartResponse>("/v1/spine/prime/start", { proposal_id: proposalId });
+      setLog((l) => {
+        const next = [...l];
+        const p = next[idx];
+        if (p && p.kind === "approved") next[idx] = { ...p, done: true };
+        next.push({ role: "assistant", kind: "started", data: res });
+        return next;
+      });
+    } catch (e) {
+      setLog((l) => [
+        ...l,
+        { role: "assistant", kind: "text", text: "⚠ " + (e instanceof Error ? e.message : "start failed") },
+      ]);
+    } finally {
+      setBusy(false);
+      scroll();
+    }
+  }
+
   // Quick companion command (the rule-based single-action path).
   async function send() {
     const message = text.trim();
@@ -143,7 +179,10 @@ export function Chat() {
           if (m.kind === "proposal") {
             return <ProposalCard key={i} entry={m} onApprove={() => m.data.proposal_id && approve(m.data.proposal_id, i)} busy={busy} />;
           }
-          return <ApprovedCard key={i} data={m.data} />;
+          if (m.kind === "approved") {
+            return <ApprovedCard key={i} entry={m} onStart={() => m.data.proposal_id && start(m.data.proposal_id, i)} busy={busy} />;
+          }
+          return <StartedCard key={i} data={m.data} />;
         })}
         {busy && <div className="msg assistant muted">…thinking</div>}
       </div>
@@ -230,14 +269,16 @@ function ProposalCard({ entry, onApprove, busy }: { entry: { data: ProposalRespo
               Approve &amp; create
             </button>
           )}
-          <span className="muted" style={{ fontSize: 11 }}>Nothing runs automatically — start a Brief from the board when you're ready.</span>
+          <span className="muted" style={{ fontSize: 11 }}>Nothing runs automatically — approve, then <strong>Start the work</strong>.</span>
         </div>
       </div>
     </div>
   );
 }
 
-function ApprovedCard({ data }: { data: ApproveResponse }) {
+function ApprovedCard({ entry, onStart, busy }: { entry: { data: ApproveResponse; done?: boolean }; onStart: () => void; busy: boolean }) {
+  const data = entry.data;
+  const assigned = (data.assigned_briefs ?? []).length;
   return (
     <div className="msg assistant" style={{ maxWidth: "100%" }}>
       <div className="card" style={{ margin: 0 }}>
@@ -247,13 +288,72 @@ function ApprovedCard({ data }: { data: ApproveResponse }) {
         </div>
         <div style={{ fontSize: 12, marginTop: 6 }}>
           <div>Mandate <span className="mono">{(data.mandate_id ?? "").slice(0, 14)}</span> · <Link to="/mandates" className="link">open Mandates →</Link></div>
-          <div style={{ marginTop: 2 }}>{(data.created_briefs ?? []).length} Brief(s) created · {(data.assigned_briefs ?? []).length} assigned to existing crew · <Link to="/briefs" className="link">view board →</Link></div>
+          <div style={{ marginTop: 2 }}>{(data.created_briefs ?? []).length} Brief(s) created · {assigned} assigned to existing crew · <Link to="/briefs" className="link">view board →</Link></div>
           {(data.hire_requests ?? []).length > 0 && (
             <div style={{ marginTop: 2 }}>
               {(data.hire_requests ?? []).length} pending hire request(s) — <Link to="/mandates" className="link">approve Clearances →</Link>
             </div>
           )}
         </div>
+        {/* Start-to-Shift: run the ready Briefs now (same governed path as a
+            manual run). Unassigned / blocked Briefs are reported, not run. */}
+        <div className="row" style={{ gap: 8, marginTop: 10, alignItems: "center" }}>
+          {entry.done ? (
+            <span className="badge done">started ✓</span>
+          ) : (
+            <button className="btn" onClick={onStart} disabled={busy} title="Start the ready Briefs — turns each into a real Shift through the same governed run path as a manual run. Unassigned or blocked Briefs are reported, not run.">
+              Start the work
+            </button>
+          )}
+          <span className="muted" style={{ fontSize: 11 }}>
+            {assigned > 0
+              ? `${assigned} assigned Brief(s) are ready to run.`
+              : "No assigned Briefs yet — greenlight Clearances first, then start."}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StartedCard({ data }: { data: StartResponse }) {
+  const started = data.started ?? [];
+  const skipped = data.skipped ?? [];
+  return (
+    <div className="msg assistant" style={{ maxWidth: "100%" }}>
+      <div className="card" style={{ margin: 0 }}>
+        <div className="row" style={{ gap: 8 }}>
+          <span className={"badge " + (started.length > 0 ? "in_progress" : "todo")}>
+            {started.length > 0 ? "running" : "nothing started"}
+          </span>
+          <strong>{started.length} Shift(s) started</strong>
+        </div>
+
+        {started.length > 0 && (
+          <div style={{ marginTop: 6 }}>
+            {started.map((s, i) => (
+              <div key={i} style={{ fontSize: 12, padding: "1px 0" }}>
+                • Brief <span className="mono">{(s.brief_id ?? "").slice(0, 10)}</span> → Shift{" "}
+                <span className="mono">{(s.run_id ?? "").slice(0, 14)}</span>
+                <span className="muted"> on {s.rig} · {s.status}</span>
+              </div>
+            ))}
+            <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+              Watch them finish on the <Link to="/briefs" className="link">board →</Link>
+            </div>
+          </div>
+        )}
+
+        {skipped.length > 0 && (
+          <div style={{ marginTop: 8 }}>
+            <div className="muted" style={{ fontSize: 11, marginBottom: 2 }}>Not started ({skipped.length})</div>
+            {skipped.map((s, i) => (
+              <div key={i} className="muted" style={{ fontSize: 11 }}>
+                • <span className="mono">{(s.brief_id ?? "").slice(0, 10)}</span> — {s.reason}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
