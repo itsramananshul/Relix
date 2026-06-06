@@ -23,6 +23,15 @@ allow rule**. The live smoke does — see the note at the end.
    in `pending_review` (company-model §12.6 / §12.5B), visible in the Shift
    Room (`prime.status` + the SSE stream), `/v1/runs`, the Brief Chronicle, and
    the Action Center.
+5. The review → apply tail closes the loop: `run.diff` reports the
+   `pending_review` run as **not yet apply-eligible**, `POST /v1/runs/<id>/review`
+   accepts it, `run.diff` then reports it **eligible**, and
+   `POST /v1/runs/<id>/apply` reaches `apply_status: "applied"`. For an echo
+   Shift this is a safe **no-op** apply (echo writes nothing → 0 changed files),
+   so it proves the governed gate + lifecycle terminal without touching the real
+   project root. The in-process loop test
+   (`starter_crew_closes_the_positive_local_loop_through_prime_start`) now
+   asserts the same `done → accept → applied` tail.
 
 ## Isolation (do not touch the operator's real state)
 
@@ -56,6 +65,10 @@ $env:HOME = $env:USERPROFILE
 #   GET  /v1/runs                                          -> echo run status=done
 #   GET  /v1/spine/briefs/<id>/events                      -> run_started + shift_done
 #   GET  /v1/spine/company/actions                         -> "Review a completed Shift"
+#   GET  /v1/runs/<run_id>/diff                            -> eligible:false (pending_review)
+#   POST /v1/runs/<run_id>/review  {decision:"accepted"}   -> accepted
+#   GET  /v1/runs/<run_id>/diff                            -> eligible:true (0 changes, echo no-op)
+#   POST /v1/runs/<run_id>/apply                           -> apply_status:"applied"
 
 # Tear down (stops ONLY the PIDs this run started) + clean the policy file:
 .\scripts\relix-mesh-down.ps1 -Run smoke

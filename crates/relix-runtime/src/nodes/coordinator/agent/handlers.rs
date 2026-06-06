@@ -5707,6 +5707,77 @@ mod tests {
             assert!(r["run_id"].is_string(), "a real run_id: {r}");
             assert_eq!(r["rig"], "echo", "ran on the safe local echo Rig: {r}");
         }
+        let run_id = runs[0]["run_id"].as_str().unwrap().to_string();
+
+        // 5) `prime.start` dispatches the adapter on a background thread, so the
+        //    run is reported `running` immediately and only reaches its terminal
+        //    state once that thread closes the ledger. Wait for `done` +
+        //    `pending_review` (company-model §12.6: "each Shift reaches done and
+        //    opens review").
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(r) = task.get_run(&run_id).unwrap()
+                && r.status == "done"
+                && r.review.as_deref() == Some("pending_review")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "echo Shift never reached done/pending_review"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // 6) Apply is REVIEW-GATED: a `done` run sitting in `pending_review` is
+        //    not yet apply-eligible (no work is applied behind the operator).
+        let run = task.get_run(&run_id).unwrap().expect("the run row");
+        assert!(
+            crate::nodes::coordinator::heartbeat::run_apply_eligibility(&run).is_err(),
+            "a pending_review run must not be apply-eligible yet: {run:?}"
+        );
+
+        // 7) The operator accepts the review → the run becomes apply-eligible
+        //    (the documented review → apply tail of the local loop).
+        task.set_run_review(&run_id, "accepted", "looks good").unwrap();
+        let run = task.get_run(&run_id).unwrap().expect("the run row");
+        assert!(
+            crate::nodes::coordinator::heartbeat::run_apply_eligibility(&run).is_ok(),
+            "an accepted scoped-workspace `done` run is apply-eligible: {run:?}"
+        );
+
+        // 8) Apply the accepted run into a throwaway project root. An echo Shift
+        //    writes nothing, so the apply is a safe `applied` no-op — the loop
+        //    closes WITHOUT the run ever touching a real project root.
+        let project_root = tempfile::TempDir::new().unwrap();
+        let artifacts = task.list_run_artifacts(&run_id).unwrap();
+        let outcome = crate::nodes::coordinator::heartbeat::apply_run(
+            project_root.path(),
+            &artifacts,
+        )
+        .unwrap();
+        assert_eq!(outcome.status, "applied", "echo run applies cleanly: {outcome:?}");
+        assert_eq!(outcome.applied_files, 0, "echo writes nothing — a no-op apply");
+        assert_eq!(outcome.failed_files, 0);
+
+        // 9) Persist the apply result → the Shift's durable lifecycle terminal is
+        //    `applied`, closing the §12.6 positive local loop end to end:
+        //    empty company → starter crew → propose → approve → start → done →
+        //    review → accept → apply.
+        task.set_run_apply_status(
+            &run_id,
+            outcome.status,
+            &outcome.plan.note,
+            outcome.applied_files as i64,
+            outcome.failed_files as i64,
+        )
+        .unwrap();
+        let run = task.get_run(&run_id).unwrap().expect("the run row");
+        assert_eq!(
+            run.apply_status.as_deref(),
+            Some("applied"),
+            "the Shift's durable terminal is `applied`: {run:?}"
+        );
     }
 
     #[test]
