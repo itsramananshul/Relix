@@ -1,7 +1,7 @@
 import { Fragment, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, tryGet } from "../api";
-import { asArray, Badge, Empty, Section, useAsync } from "../components/common";
+import { asArray, Badge, Empty, extractList, Section, useAsync } from "../components/common";
 
 // One Operative's Keys (`/v1/spine/keys/:agent`) — the org/work permissions
 // + execution caps the legacy spine board surfaced. Rendered read-only here
@@ -37,6 +37,51 @@ function committedCents(v: unknown): number | null {
 function fmtCents(c?: number | null): string {
   if (c == null) return "—";
   return "$" + (c / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+// One Operative's governance detail (`/v1/agents/:id`) — the Capability
+// powers half of the §9 permission panel: risk ceiling + the category/secret/
+// surface gates the admission pipeline already enforces. Read-only here.
+interface AgentDetail {
+  risk_ceiling?: string;
+  approval_timeout_secs?: number;
+  surface_allowlist?: string[];
+  allow_categories?: string[];
+  deny_categories?: string[];
+  allow_sensitivity_tags?: string[];
+  deny_sensitivity_tags?: string[];
+  approval_required_categories?: string[];
+}
+
+// One standing approval (`/v1/agents/:id/standing-approvals`) — a pre-granted
+// clearance so a matching action proceeds without a fresh gate, with its scope,
+// expiry, and usage. Rendered read-only (granting/revoking stays out of slice).
+interface Standing {
+  standing_id?: string;
+  match_category?: string;
+  match_path_glob?: string | null;
+  scope_kind?: string;
+  method_prefix?: string | null;
+  workspace_path_glob?: string | null;
+  expires_at?: number;
+  granted_by?: string;
+  max_calls?: number | null;
+  calls_used?: number;
+  note?: string;
+}
+
+// The three governance reads for one Operative, fetched together on expand.
+interface OpDetail {
+  keys: Keys | null;
+  detail: AgentDetail | null;
+  standing: Standing[];
+}
+
+// Render epoch-seconds as a short local date; "—" when absent/zero.
+function fmtWhen(secs?: number): string {
+  if (!secs) return "—";
+  const d = new Date(secs * 1000);
+  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleDateString();
 }
 
 interface Agent {
@@ -86,19 +131,21 @@ export function Agents() {
   const [busy, setBusy] = useState(false);
   const [founderName, setFounderName] = useState("Founder");
   const [founderRig, setFounderRig] = useState("echo");
-  // Per-Operative Keys: which row's Keys are expanded + a small cache so
-  // re-opening is instant. `null` value = loaded but no keys returned.
-  const [keysOpen, setKeysOpen] = useState<string | null>(null);
-  const [keysCache, setKeysCache] = useState<Record<string, Keys | null>>({});
+  // Per-Operative governance panel: which row is expanded + a small cache so
+  // re-opening is instant. An entry present (even with null parts) = loaded.
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [detailCache, setDetailCache] = useState<Record<string, OpDetail>>({});
 
   const { data, loading, error, reload } = useAsync(async () => {
     const work: Card[] = [];
-    const [company, ops, adapters, runs, allowance] = await Promise.all([
+    const [company, ops, adapters, runs, allowance, roster] = await Promise.all([
       tryGet<CompanyStatus>("/v1/spine/company", {}),
       tryGet<Agent[]>("/v1/spine/operatives", []),
       tryGet<Adapter[]>("/v1/adapters", []),
       tryGet<RunRow[]>("/v1/runs", []),
       tryGet<unknown>("/v1/spine/allowance/committed", {}),
+      // Authoritative, tenant-scoped Operative counts by status (+ total).
+      tryGet<Record<string, number>>("/v1/spine/roster", {}),
       Promise.all(
         WORK_COLUMNS.map(async (col) => {
           work.push(...asArray<Card>(await tryGet<Card[]>(`/v1/spine/board/${col}?limit=100`, [])));
@@ -111,19 +158,32 @@ export function Agents() {
       adapters: Array.isArray(adapters) ? adapters : [],
       runs: Array.isArray(runs) ? runs : [],
       allowance: committedCents(allowance),
+      roster: roster && typeof roster === "object" ? roster : {},
       work,
     };
   }, []);
 
-  async function toggleKeys(agentId: string) {
-    if (keysOpen === agentId) {
-      setKeysOpen(null);
+  // Expand one Operative's governance panel, fetching its three reads in
+  // parallel (Keys + capability detail + standing approvals). Each read
+  // degrades to a null/empty fallback so one unavailable surface shows an
+  // honest empty state instead of blanking the panel.
+  async function toggleDetail(agentId: string) {
+    if (openId === agentId) {
+      setOpenId(null);
       return;
     }
-    setKeysOpen(agentId);
-    if (!(agentId in keysCache)) {
-      const k = await tryGet<Keys | null>(`/v1/spine/keys/${encodeURIComponent(agentId)}`, null);
-      setKeysCache((m) => ({ ...m, [agentId]: k }));
+    setOpenId(agentId);
+    if (!(agentId in detailCache)) {
+      const enc = encodeURIComponent(agentId);
+      const [keys, detail, standing] = await Promise.all([
+        tryGet<Keys | null>(`/v1/spine/keys/${enc}`, null),
+        tryGet<AgentDetail | null>(`/v1/agents/${enc}`, null),
+        tryGet<unknown>(`/v1/agents/${enc}/standing-approvals`, {}),
+      ]);
+      setDetailCache((m) => ({
+        ...m,
+        [agentId]: { keys, detail, standing: extractList<Standing>(standing, ["standing"]) },
+      }));
     }
   }
 
@@ -131,6 +191,7 @@ export function Agents() {
   const agents = data?.agents ?? [];
   const adapters = data?.adapters ?? [];
   const runs = data?.runs ?? [];
+  const roster = data?.roster ?? {};
   const work = data?.work ?? [];
   const byName = new Map(adapters.map((a) => [a.name ?? "", a]));
   const availCount = adapters.filter((a) => a.probe?.status === "available").length;
@@ -160,6 +221,17 @@ export function Agents() {
   // half-built team reads honestly.
   const pendingHires = rest.filter((a) => a.status === "pending");
   const activeCrew = rest.filter((a) => a.status !== "pending");
+  // An Operative is runnable when its bound Rig probes available; count it
+  // across the active company (Founder + Prime + Operatives) for the roster
+  // readiness line. A runnable adapter is what lets an Operative execute Briefs.
+  const runnableOf = (a?: Agent) =>
+    !!a?.rig && byName.get(a.rig)?.probe?.status === "available";
+  const activeAll = agents.filter((a) => a.status !== "pending" && a.status !== "disabled");
+  const runnableCount = activeAll.filter(runnableOf).length;
+  // Authoritative status total from the roster summary, falling back to the
+  // live agent list when that endpoint is unavailable.
+  const rosterTotal =
+    typeof roster.total === "number" ? roster.total : agents.length;
   // Resolve a boss agent_id → display name for the reporting line.
   const nameOf = (id?: string | null) => {
     if (!id) return null;
@@ -302,24 +374,86 @@ export function Agents() {
     );
   }
 
-  // Compact read-only render of one Operative's Keys (org/work permissions +
-  // execution caps). Mirrors the legacy spine board's Keys panel.
-  function keysDetail(agentId: string) {
-    const k = keysCache[agentId];
-    if (!(agentId in keysCache)) return <div className="loading" style={{ fontSize: 12 }}>Loading Keys…</div>;
-    if (!k) return <div className="muted" style={{ fontSize: 12 }}>No Keys recorded for this Operative.</div>;
+  // Read-only render of one Operative's governance panel — the §9 per-agent
+  // permission "face on machinery that already exists": Keys (org/work powers +
+  // caps), Capability powers (risk ceiling + category/secret/surface gates the
+  // admission pipeline enforces), and Standing approvals (pre-granted
+  // clearances). Each group degrades to an honest empty state on its own.
+  function operativeDetail(agentId: string) {
+    const d = detailCache[agentId];
+    if (!d) return <div className="loading" style={{ fontSize: 12 }}>Loading permissions…</div>;
+    const { keys: k, detail, standing } = d;
     const flag = (on?: boolean, scope?: string) =>
       on ? <span className="badge done" style={{ fontSize: 9 }}>yes{scope ? ` · ${scope}` : ""}</span> : <span className="badge backlog" style={{ fontSize: 9 }}>no</span>;
+    // Render a category/tag set as small chips, or an em-dash when empty.
+    const chips = (vals?: string[], cls = "backlog") =>
+      vals && vals.length
+        ? <span className="pill-row" style={{ display: "inline-flex" }}>{vals.map((v) => <span key={v} className={"badge " + cls} style={{ fontSize: 9 }}>{v}</span>)}</span>
+        : <span className="muted">—</span>;
     return (
-      <div className="kv-grid" style={{ fontSize: 12 }}>
-        <div className="kv"><span className="muted">Spawn agents</span><span>{flag(k.can_spawn_agents, k.spawn_route)}</span></div>
-        <div className="kv"><span className="muted">Assign work</span><span>{flag(k.can_assign_work, k.assign_scope)}</span></div>
-        <div className="kv"><span className="muted">Manage work</span><span>{flag(k.can_manage_work, k.manage_scope)}</span></div>
-        <div className="kv"><span className="muted">Configure agents</span><span>{flag(k.can_configure_agents, k.configure_scope)}</span></div>
-        <div className="kv"><span className="muted">Wake</span><span>{k.wake_on_timer ? "timer " : ""}{k.wake_on_demand ? "on-demand" : ""}{!k.wake_on_timer && !k.wake_on_demand ? "—" : ""}</span></div>
-        <div className="kv"><span className="muted">Max concurrent runs</span><span>{k.max_concurrent_runs ?? "—"}</span></div>
-        <div className="kv"><span className="muted">Monthly Allowance</span><span>{k.monthly_allowance_cents != null ? fmtCents(k.monthly_allowance_cents) : "—"}</span></div>
-        <div className="kv"><span className="muted">Secret allowlist</span><span>{(k.secret_allowlist?.length ?? 0) > 0 ? `${k.secret_allowlist!.length} entr${k.secret_allowlist!.length === 1 ? "y" : "ies"}` : "none"}</span></div>
+      <div className="op-detail">
+        {/* Org & work powers (Keys). */}
+        <div className="op-group">
+          <div className="op-group-title">Keys — org &amp; work powers</div>
+          {!k ? (
+            <div className="muted" style={{ fontSize: 12 }}>No Keys recorded for this Operative.</div>
+          ) : (
+            <div className="kv-grid" style={{ fontSize: 12 }}>
+              <div className="kv"><span className="muted">Spawn agents</span><span>{flag(k.can_spawn_agents, k.spawn_route)}</span></div>
+              <div className="kv"><span className="muted">Assign work</span><span>{flag(k.can_assign_work, k.assign_scope)}</span></div>
+              <div className="kv"><span className="muted">Manage work</span><span>{flag(k.can_manage_work, k.manage_scope)}</span></div>
+              <div className="kv"><span className="muted">Configure agents</span><span>{flag(k.can_configure_agents, k.configure_scope)}</span></div>
+              <div className="kv"><span className="muted">Wake</span><span>{k.wake_on_timer ? "timer " : ""}{k.wake_on_demand ? "on-demand" : ""}{!k.wake_on_timer && !k.wake_on_demand ? "—" : ""}</span></div>
+              <div className="kv"><span className="muted">Max concurrent runs</span><span>{k.max_concurrent_runs ?? "—"}</span></div>
+              <div className="kv"><span className="muted">Monthly Allowance</span><span>{k.monthly_allowance_cents != null ? fmtCents(k.monthly_allowance_cents) : "—"}</span></div>
+              <div className="kv"><span className="muted">Secret allowlist</span><span>{(k.secret_allowlist?.length ?? 0) > 0 ? `${k.secret_allowlist!.length} entr${k.secret_allowlist!.length === 1 ? "y" : "ies"}` : "none"}</span></div>
+            </div>
+          )}
+        </div>
+
+        {/* Capability powers — the admission-gate inputs (risk/categories/surfaces). */}
+        <div className="op-group">
+          <div className="op-group-title">Capability powers</div>
+          {!detail ? (
+            <div className="muted" style={{ fontSize: 12 }}>Capability detail unavailable for this Operative.</div>
+          ) : (
+            <div className="kv-grid" style={{ fontSize: 12 }}>
+              <div className="kv"><span className="muted">Risk ceiling</span><span>{detail.risk_ceiling ? <span className="badge in_review" style={{ fontSize: 9 }}>{detail.risk_ceiling}</span> : "—"}</span></div>
+              <div className="kv"><span className="muted">Approval timeout</span><span>{detail.approval_timeout_secs ? `${detail.approval_timeout_secs}s` : "—"}</span></div>
+              <div className="kv"><span className="muted">Allowed categories</span><span>{chips(detail.allow_categories, "done")}</span></div>
+              <div className="kv"><span className="muted">Denied categories</span><span>{chips(detail.deny_categories, "blocked")}</span></div>
+              <div className="kv"><span className="muted">Always needs approval</span><span>{chips(detail.approval_required_categories, "in_progress")}</span></div>
+              <div className="kv"><span className="muted">Surface allowlist</span><span>{chips(detail.surface_allowlist)}</span></div>
+              <div className="kv"><span className="muted">Allowed sensitivity</span><span>{chips(detail.allow_sensitivity_tags, "done")}</span></div>
+              <div className="kv"><span className="muted">Denied sensitivity</span><span>{chips(detail.deny_sensitivity_tags, "blocked")}</span></div>
+            </div>
+          )}
+        </div>
+
+        {/* Standing approvals — pre-granted clearances + their usage. */}
+        <div className="op-group">
+          <div className="op-group-title">Standing approvals{standing.length ? ` (${standing.length})` : ""}</div>
+          {standing.length === 0 ? (
+            <div className="muted" style={{ fontSize: 12 }}>No standing approvals — every gated action prompts for a fresh clearance.</div>
+          ) : (
+            <div className="table-scroll">
+              <table className="table" style={{ fontSize: 12 }}>
+                <thead><tr><th>Category</th><th>Scope</th><th>Used</th><th>Expires</th><th>Granted by</th></tr></thead>
+                <tbody>
+                  {standing.map((s, i) => (
+                    <tr key={s.standing_id || i}>
+                      <td>{s.match_category || "—"}{s.method_prefix ? <div className="mono" style={{ fontSize: 10 }}>{s.method_prefix}</div> : null}</td>
+                      <td className="dim">{s.scope_kind || "—"}{s.workspace_path_glob ? <div className="muted" style={{ fontSize: 10 }}>{s.workspace_path_glob}</div> : null}</td>
+                      <td>{s.calls_used ?? 0}{s.max_calls != null ? ` / ${s.max_calls}` : ""}</td>
+                      <td className="muted">{fmtWhen(s.expires_at)}</td>
+                      <td className="muted">{s.granted_by ? s.granted_by.slice(0, 12) : "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
       </div>
     );
   }
@@ -416,6 +550,31 @@ export function Agents() {
         <Link to="/settings" className="banner-cta">Adapters →</Link>
       </div>
 
+      {/* Roster at a glance — the company's shape: leadership tiers, active
+          Operatives, pending hires, and how many are runnable right now. */}
+      <div className="card roster-strip">
+        <div className="roster-tier">
+          <span className="stat">{rosterTotal}</span>
+          <span className="stat-label">Crew total</span>
+        </div>
+        <div className="roster-tier">
+          <span className="stat">{founder ? 1 : 0}<span className="muted" style={{ fontSize: 13 }}> + {prime ? 1 : 0}</span></span>
+          <span className="stat-label">Founder + Prime (leadership)</span>
+        </div>
+        <div className="roster-tier">
+          <span className="stat">{activeCrew.length}</span>
+          <span className="stat-label">Active Operatives</span>
+        </div>
+        <div className="roster-tier">
+          <span className="stat">{pendingHires.length}</span>
+          <span className="stat-label">Pending hires</span>
+        </div>
+        <div className="roster-tier">
+          <span className="stat">{runnableCount}<span className="muted" style={{ fontSize: 13 }}> / {activeAll.length}</span></span>
+          <span className="stat-label">Runnable now</span>
+        </div>
+      </div>
+
       {/* Guild Allowance — the committed monthly budget across the Crew. */}
       <div className="card" style={{ padding: "10px 14px" }}>
         <div className="row">
@@ -423,7 +582,7 @@ export function Agents() {
           <span className="spacer" style={{ flex: 1 }} />
           <strong>{fmtCents(data?.allowance)}</strong>
           <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>
-            sum of per-Operative monthly caps · per-Operative limits are in each row's Keys
+            sum of per-Operative monthly caps · per-Operative limits are in each row's Permissions
           </span>
         </div>
       </div>
@@ -454,14 +613,14 @@ export function Agents() {
               <span>{workload.get(founder.agent_id ?? "") ?? 0} open · {running.get(founder.agent_id ?? "") ?? 0} running</span>
             </div>
             <div>
-              <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>Keys</div>
-              <button className="btn ghost sm" onClick={() => toggleKeys(founder.agent_id ?? "")}>
-                {keysOpen === founder.agent_id ? "Hide" : "View"}
+              <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>Permissions</div>
+              <button className="btn ghost sm" onClick={() => toggleDetail(founder.agent_id ?? "")}>
+                {openId === founder.agent_id ? "Hide" : "View"}
               </button>
             </div>
           </div>
-          {keysOpen === founder.agent_id && (
-            <div style={{ marginTop: 10 }}>{keysDetail(founder.agent_id ?? "")}</div>
+          {openId === founder.agent_id && (
+            <div style={{ marginTop: 10 }}>{operativeDetail(founder.agent_id ?? "")}</div>
           )}
         </div>
       )}
@@ -495,14 +654,14 @@ export function Agents() {
               <span>{workload.get(prime.agent_id ?? "") ?? 0} open · {running.get(prime.agent_id ?? "") ?? 0} running</span>
             </div>
             <div>
-              <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>Keys</div>
-              <button className="btn ghost sm" onClick={() => toggleKeys(prime.agent_id ?? "")}>
-                {keysOpen === prime.agent_id ? "Hide" : "View"}
+              <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>Permissions</div>
+              <button className="btn ghost sm" onClick={() => toggleDetail(prime.agent_id ?? "")}>
+                {openId === prime.agent_id ? "Hide" : "View"}
               </button>
             </div>
           </div>
-          {keysOpen === prime.agent_id && (
-            <div style={{ marginTop: 10 }}>{keysDetail(prime.agent_id ?? "")}</div>
+          {openId === prime.agent_id && (
+            <div style={{ marginTop: 10 }}>{operativeDetail(prime.agent_id ?? "")}</div>
           )}
         </div>
       ) : founder ? (
@@ -593,7 +752,7 @@ export function Agents() {
                   <th>Readiness</th>
                   <th>Open</th>
                   <th>Running</th>
-                  <th>Keys</th>
+                  <th>Permissions</th>
                 </tr>
               </thead>
               <tbody>
@@ -618,14 +777,14 @@ export function Agents() {
                           : <span className="muted">0</span>}
                       </td>
                       <td>
-                        <button className="btn ghost sm" onClick={() => toggleKeys(id)} title="View this Operative's Keys (permissions + caps)">
-                          {keysOpen === id ? "Hide" : "View"}
+                        <button className="btn ghost sm" onClick={() => toggleDetail(id)} title="View this Operative's permissions — Keys, capability powers, standing approvals">
+                          {openId === id ? "Hide" : "View"}
                         </button>
                       </td>
                     </tr>
-                    {keysOpen === id && (
+                    {openId === id && (
                       <tr>
-                        <td colSpan={9} style={{ background: "var(--bg)" }}>{keysDetail(id)}</td>
+                        <td colSpan={9} style={{ background: "var(--bg)" }}>{operativeDetail(id)}</td>
                       </tr>
                     )}
                     </Fragment>
