@@ -125,6 +125,12 @@ when you click Start. What it does **not** do:
   Rig). Approving without a `rig` still works and the response's `needs_rig`
   flag says a Rig must be configured before the Operative can run. It never
   *silently* assigns a paid/interactive CLI — the operator names the Rig.
+  **Crew is reused before it is hired.** `mandate.team_plan` first adopts an
+  already-active, runnable same-role Operative in the Guild (the oldest match,
+  tenant-scoped) and files a `pending` hire only for a role with no such crew —
+  so a build plan staffs the existing engineer/designer instead of duplicating
+  them (company-model §12.5A/§12.5B). It still does not decide *which identity*
+  to hire for a genuinely missing role.
 - **The first-run "starter crew" runs safe-local echo work only.** A brand-new
   company has no work-role Operatives, so `prime.start` would skip every track.
   `company.starter_crew` (`POST /v1/spine/company/starter-crew`, owner-gated,

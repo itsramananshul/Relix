@@ -161,10 +161,14 @@ pub struct CrewMember {
     pub status: String,
 }
 
-/// Collapse a free-form role string into a canonical role family. An unknown
-/// role maps to `engineer` (the safe default work role).
-pub fn canon_role(role: &str) -> &'static str {
-    match role.trim().to_ascii_lowercase().as_str() {
+/// Try to collapse a free-form role string into a canonical **work** role
+/// family. Returns `None` for anything that is not a recognised work track
+/// — leadership (`founder`/`prime`/`planner`) or an unknown string. This is
+/// the distinction `canon_role`'s `engineer` default hides: a caller that
+/// must not treat the apex Founder (role `founder`) as an Operative — e.g.
+/// crew adoption — can tell a real work role from a fallback.
+pub fn try_canon_role(role: &str) -> Option<&'static str> {
+    Some(match role.trim().to_ascii_lowercase().as_str() {
         "engineer" | "engineering" | "swe" | "developer" | "dev" | "backend" | "frontend"
         | "fullstack" => "engineer",
         "designer" | "design" | "ux" | "ui" => "designer",
@@ -172,9 +176,15 @@ pub fn canon_role(role: &str) -> &'static str {
         "writer" | "writing" | "content" | "copywriter" | "docs" => "writer",
         "qa" | "test" | "tester" | "quality" => "qa",
         "ops" | "devops" | "sre" | "operations" => "ops",
-        // Note: `planner`/`prime` are leadership, not a work track.
-        _ => "engineer",
-    }
+        // Note: `planner`/`prime`/`founder` are leadership, not a work track.
+        _ => return None,
+    })
+}
+
+/// Collapse a free-form role string into a canonical role family. An unknown
+/// role maps to `engineer` (the safe default work role).
+pub fn canon_role(role: &str) -> &'static str {
+    try_canon_role(role).unwrap_or("engineer")
 }
 
 /// Human title for a canonical role.
@@ -728,6 +738,24 @@ pub fn partition_start(briefs: &[(String, StartReadiness)]) -> (Vec<String>, Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_canon_role_only_matches_real_work_tracks() {
+        // Recognised work roles canonicalise to their family.
+        assert_eq!(try_canon_role("swe"), Some("engineer"));
+        assert_eq!(try_canon_role("UX"), Some("designer"));
+        assert_eq!(try_canon_role("tester"), Some("qa"));
+        // Leadership / unknown roles are NOT work tracks — so crew adoption
+        // never mistakes the apex Founder for an Operative. `canon_role`'s
+        // `engineer` default hides exactly this case.
+        assert_eq!(try_canon_role("founder"), None);
+        assert_eq!(try_canon_role("prime"), None);
+        assert_eq!(try_canon_role("planner"), None);
+        assert_eq!(try_canon_role("ceo"), None);
+        // The default-bearing wrapper still folds unknowns to engineer.
+        assert_eq!(canon_role("founder"), "engineer");
+        assert_eq!(canon_role("swe"), "engineer");
+    }
 
     fn member(role: &str, status: &str) -> CrewMember {
         CrewMember {

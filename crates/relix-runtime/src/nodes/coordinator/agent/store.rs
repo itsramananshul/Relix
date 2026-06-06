@@ -1224,6 +1224,28 @@ impl AgentStore {
         Ok(rows)
     }
 
+    /// All `active` Operatives in `tenant`, **oldest first** (`created_at`
+    /// then insertion order). Used to adopt an already-active same-role crew
+    /// member before filing a new hire (company-model §12.5A/§12.5B), so the
+    /// Company reuses the crew it already has. Tenant-scoped: it never returns
+    /// another Company's crew. The ordering is deterministic so a caller can
+    /// pick "the oldest match" reproducibly.
+    pub fn list_active_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<AgentProfile>, AgentStoreError> {
+        let t = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let sql = format!(
+            "{SELECT_AGENTS_BY_TENANT} AND status = 'active' ORDER BY created_at ASC, rowid ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![t], row_to_agent)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Tenant-scoped [`Self::list_peers`].
     pub fn list_peers_for_tenant(
         &self,
@@ -3852,6 +3874,34 @@ mod tests {
         let engineers = s.list_by_role("engineer").unwrap();
         assert_eq!(engineers, vec![e1]);
         assert!(s.list_by_role("manager").unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_active_for_tenant_is_oldest_first_active_only_and_isolated() {
+        let s = store();
+        let e1 = s
+            .create_agent("E1", "engineer", "E", "e", "e", "op", "subj-a1", "low", "default")
+            .unwrap();
+        let e2 = s
+            .create_agent("E2", "engineer", "E", "e", "e", "op", "subj-a2", "low", "default")
+            .unwrap();
+        // A pending hire is not active.
+        s.request_hire("E3", "engineer", "E", "e", "e", "op", "subj-a3", "low", "default")
+            .unwrap();
+        // A crew member in another tenant must never appear.
+        s.create_agent("X", "engineer", "E", "e", "e", "op", "subj-x", "low", "tenant-b")
+            .unwrap();
+
+        let ids: Vec<String> = s
+            .list_active_for_tenant("default")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.agent_id)
+            .collect();
+        // Oldest-first (insertion order), active only, tenant-scoped.
+        assert_eq!(ids, vec![e1, e2]);
+        // tenant-b sees only its own active crew.
+        assert_eq!(s.list_active_for_tenant("tenant-b").unwrap().len(), 1);
     }
 
     #[test]

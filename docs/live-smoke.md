@@ -134,26 +134,30 @@ execution-and-issue §1.3).
 
 The gate is real: `mandate.orchestrate` **refuses** to materialise anything
 until the strategy is approved (`blockers: [{reason: "strategy_not_approved"}]`).
-The team is staffed through the **same** governed hire + echo-Rig affordance as
-the Prime variant above, and every orchestrated Brief is stamped with the
+**Existing crew is reused before it is hired (company-model §12.5A/§12.5B):**
+because the starter crew already has an active engineer + designer, a team plan
+that names those roles **adopts** them (no hire filed) and only a genuinely
+**missing** role (e.g. *qa* for "test coverage") is staffed through the governed
+hire + echo-Rig affordance. Every orchestrated Brief is stamped with the
 Founder/Board reviewer up front, so its completed Shift lands in `in_review`
 (not `blocked`) and `run.apply` is the review-to-done.
 
 ```
 #   POST /v1/auth/setup                  {username,password}            -> session cookie
-#   POST /v1/spine/company/starter-crew  {rig:"echo",roles:"engineer,designer"}
+#   POST /v1/spine/company/starter-crew  {rig:"echo",roles:"engineer,designer"}   (active engineer+designer)
 #   POST /v1/spine/mandates              {title,description}            -> mandate_id
 #   GET  /v1/spine/mandates/<id>/strategy                               -> status:null
 #   POST /v1/spine/mandates/<id>/strategy/propose {doc:"..."}           -> status:"proposed"
 #   GET  /v1/spine/company/actions                                      -> approval card target_type:"mandate"
 #   POST /v1/spine/mandates/<id>/orchestrate {mode:"assign_ready"}      -> REFUSED: blockers[strategy_not_approved], no Briefs
 #   POST /v1/spine/mandates/<id>/strategy/approve                       -> status:"approved"
-#   POST /v1/spine/mandates/<id>/team_plan {roles:"engineer:onboard-eng,designer:onboard-design"}
-#                                                                       -> pending_hires:[{agent_id},{agent_id}]
-#   GET  /v1/spine/mandates/<id>/team_readiness                         -> readiness:"staffing"
-#   POST /v1/agents/<hire agent_id>/approve-hire {rig:"echo"}  (each)   -> {runnable:true,rig:"echo"}
-#   GET  /v1/spine/mandates/<id>/team_readiness                         -> readiness:"ready"
-#   POST /v1/spine/mandates/<id>/orchestrate {mode:"assign_ready"}      -> parent + role tracks + subject Briefs, assigned
+#   POST /v1/spine/mandates/<id>/team_plan {roles:"engineer:onboard-eng,designer:onboard-design,qa:onboard-qa"}
+#         -> adopted:[{engineer},{designer}]  pending_hires:[{<qa agent_id>}]   (starter engineer+designer REUSED, only qa hired)
+#   GET  /v1/spine/mandates/<id>/team_readiness                         -> readiness:"staffing"  active_agents:[engineer,designer]  pending_hires:[qa]
+#   GET  /v1/spine/company/actions                                      -> exactly one hire card, for the qa agent (none for adopted roles)
+#   POST /v1/agents/<qa agent_id>/approve-hire {rig:"echo"}             -> {runnable:true,rig:"echo"}
+#   GET  /v1/spine/mandates/<id>/team_readiness                         -> readiness:"ready"  (engineer+designer adopted, qa now active)
+#   POST /v1/spine/mandates/<id>/orchestrate {mode:"assign_ready"}      -> parent + role tracks + subject Briefs, assigned to adopted + hired Operatives
 #   GET  /v1/spine/company/actions                                      -> mandate strategy card GONE; ready_to_start present
 #   GET  /v1/spine/mandates/<id>/briefs                                 -> every Brief carries mandate_id (linkage)
 #   POST /v1/spine/briefs/<subject brief>/run                           -> echo run_id, status done -> pending_review

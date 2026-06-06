@@ -1749,10 +1749,14 @@ pub fn handle_request_hire_for_mandate(
 /// mint the (still pending-inert) hires under the spawn Key.
 ///
 /// Wire arg: `mandate_id|description|roles` where `roles` is a CSV of
-/// `role` or `role:subject_id` entries. A role with a `subject_id`
-/// becomes a real pending hire (through the spawn gate — so a
-/// lead/founder route mints a spawn Clearance); a bare role is only
-/// *proposed* (no fabricated identity).
+/// `role` or `role:subject_id` entries. Crew is reused first
+/// (company-model §12.5A/§12.5B): if the Company already has an active,
+/// runnable same-role Operative, that role is **adopted** onto it (the
+/// oldest match) and no hire is filed — so a build plan staffs the
+/// existing engineer/designer instead of duplicating it. Only when no
+/// such Operative exists does a role with a `subject_id` become a real
+/// pending hire (through the spawn gate — so a lead/founder route mints a
+/// spawn Clearance); a bare unmatched role is only *proposed*.
 ///
 /// Governance:
 /// - the Mandate strategy MUST be approved (else POLICY_DENIED);
@@ -1760,7 +1764,7 @@ pub fn handle_request_hire_for_mandate(
 ///   reported as a readiness flag) — the Founder/Board bypasses.
 ///
 /// Returns a stable JSON plan: `mandate_id`, `strategy_approved`,
-/// `actor`, `description`, `proposed_roles`, `pending_hires`,
+/// `actor`, `description`, `proposed_roles`, `adopted`, `pending_hires`,
 /// `clearances`, `denials`, `next_steps`. The plan itself is NOT yet
 /// persisted as a Mandate Dossier — no Mandate-level document object
 /// exists (documented gap); the caller receives the structured plan.
@@ -1821,6 +1825,7 @@ pub fn handle_team_plan(
     };
 
     let mut proposed_roles: Vec<String> = Vec::new();
+    let mut adopted: Vec<serde_json::Value> = Vec::new();
     let mut pending_hires: Vec<serde_json::Value> = Vec::new();
     let mut clearances: Vec<serde_json::Value> = Vec::new();
     let mut denials: Vec<serde_json::Value> = Vec::new();
@@ -1835,6 +1840,27 @@ pub fn handle_team_plan(
             None => (entry, ""),
         };
         if role.is_empty() {
+            continue;
+        }
+        // Reuse existing crew first (company-model §12.5A/§12.5B): adopt an
+        // active, runnable same-role Operative before filing any hire — so a
+        // real company uses the engineer/designer it already has rather than
+        // duplicating it as a pending hire. Deterministic (oldest runnable
+        // match) + tenant-scoped; takes precedence over both the proposed
+        // and the explicit-hire path.
+        if let Some((canon, agent_id)) = adopt_active_operative(agent_store, role, tenant) {
+            if !adopted
+                .iter()
+                .any(|a| a.get("agent_id").and_then(|v| v.as_str()) == Some(agent_id.as_str()))
+            {
+                adopted.push(serde_json::json!({"role": canon, "agent_id": agent_id}));
+            }
+            // Persist the canonical role as required work; live readiness
+            // re-resolves it to the active Operative each call. No hire is
+            // minted, so the active Operative is never a duplicate pending hire.
+            if !proposed_roles.iter().any(|r| r == canon) {
+                proposed_roles.push(canon.to_string());
+            }
             continue;
         }
         if subject.is_empty() {
@@ -1893,6 +1919,12 @@ pub fn handle_team_plan(
 
     // Honest next steps reflecting what was actually done.
     let mut next_steps: Vec<String> = Vec::new();
+    if !adopted.is_empty() {
+        next_steps.push(format!(
+            "Adopted {} active Operative(s) from existing crew — orchestrate to assign their Briefs (mandate.orchestrate).",
+            adopted.len()
+        ));
+    }
     if !clearances.is_empty() {
         next_steps.push(
             "Greenlight the spawn Clearances to activate the pending hires (coord.approval.decide / the Desk)."
@@ -1973,6 +2005,7 @@ pub fn handle_team_plan(
         "actor": actor_label,
         "description": description,
         "proposed_roles": proposed_roles,
+        "adopted": adopted,
         "pending_hires": pending_hires,
         "clearances": clearances,
         "clearance_ids": clearance_ids,
@@ -2163,6 +2196,30 @@ impl ReadinessView {
     }
 }
 
+/// Adopt an already-active, runnable same-role Operative for `role`
+/// before any new hire is filed (company-model §12.5A: "roles are
+/// matched to active Operatives; a missing role is a `pending` hire
+/// suggestion, never a fake active agent"). Returns the
+/// `(canonical_role, agent_id)` of the **oldest** active Operative in
+/// this Company whose canonical work role matches `role` and that
+/// carries a Rig (is runnable). Tenant-scoped — it never reaches into
+/// another Company's crew. Returns `None` when `role` is not a
+/// recognised work track, or no runnable same-role Operative exists, so
+/// the caller falls back to proposing / hiring the role.
+pub(crate) fn adopt_active_operative(
+    agent_store: &AgentStore,
+    role: &str,
+    tenant: &str,
+) -> Option<(&'static str, String)> {
+    let want = prime::try_canon_role(role)?;
+    let actives = agent_store.list_active_for_tenant(tenant).ok()?;
+    actives
+        .into_iter()
+        .filter(|p| prime::try_canon_role(&p.role) == Some(want))
+        .find(|p| p.rig.as_deref().map(str::trim).is_some_and(|r| !r.is_empty()))
+        .map(|p| (want, p.agent_id))
+}
+
 /// Compute the live team-readiness snapshot for a Mandate, tenant-
 /// scoped. Combines the latest persisted Team Plan with the CURRENT
 /// status of each minted hire and Clearance.
@@ -2203,7 +2260,10 @@ pub(crate) fn compute_readiness(
 
     let mut active_agents: Vec<(String, String)> = Vec::new();
     let mut pending_hires: Vec<serde_json::Value> = Vec::new();
-    let mut missing_roles: Vec<String> = proposed_roles.clone();
+    // A proposed role is resolved live below: adopted onto an existing
+    // active Operative when the Company already has one, else a genuine
+    // staffing gap. (Was: every proposed role counted as missing.)
+    let mut missing_roles: Vec<String> = Vec::new();
     let mut blocked_roles: Vec<serde_json::Value> = denials.clone();
     for h in &pending_hires_raw {
         let role = h.get("role").and_then(|v| v.as_str()).unwrap_or("");
@@ -2229,6 +2289,17 @@ pub(crate) fn compute_readiness(
             other => pending_hires.push(serde_json::json!({
                 "role": role, "agent_id": agent_id, "status": other,
             })),
+        }
+    }
+
+    // Proposed roles carry no minted hire. Adopt an active runnable
+    // same-role Operative when the Company already has one (company-model
+    // §12.5A/§12.5B) — so the starter engineer/designer counts as ready
+    // instead of being re-hired; otherwise it is a genuine staffing gap.
+    for role in &proposed_roles {
+        match adopt_active_operative(agent_store, role, tenant) {
+            Some((canon, agent_id)) => active_agents.push((canon.to_string(), agent_id)),
+            None => missing_roles.push(role.clone()),
         }
     }
 
@@ -7820,6 +7891,244 @@ mod tests {
                 .unwrap_or("")
                 .contains(":role:engineer:subject:")),
             "the subject marker must be present: {second}"
+        );
+    }
+
+    // ── Crew adoption: reuse active same-role Operatives before hiring ──
+    // (company-model §12.5A/§12.5B). A Mandate team plan must staff itself
+    // from the crew the Company already has before it files a hire.
+
+    /// Seed one active, runnable (echo Rig) starter Operative for `role`
+    /// in `tenant`; returns its agent_id.
+    fn seed_active(agents: &AgentStore, role: &str, tenant: &str) -> String {
+        agents
+            .ensure_starter_operative(role, &format!("Starter {role}"), "Operative", "echo", tenant)
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn team_plan_adopts_active_starter_crew_instead_of_hiring() {
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        let eng = seed_active(&agents, "engineer", "default");
+        let des = seed_active(&agents, "designer", "default");
+        // Both roles carry a subject_id (the path that WOULD mint a hire) —
+        // but an active same-role Operative exists, so both are adopted and
+        // ZERO hires are filed.
+        let arg = format!("{m}|build|engineer:subj-e,designer:subj-d");
+        let v = json(handle_team_plan(&agents, &spine, &fake_ctx(arg.as_bytes())));
+        assert!(
+            v["pending_hires"].as_array().unwrap().is_empty(),
+            "no hire is filed when active crew exists: {v}"
+        );
+        assert!(v["clearances"].as_array().unwrap().is_empty());
+        let adopted = v["adopted"].as_array().unwrap();
+        assert_eq!(adopted.len(), 2, "engineer + designer adopted: {v}");
+        let ids: Vec<&str> = adopted
+            .iter()
+            .map(|a| a["agent_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&eng.as_str()) && ids.contains(&des.as_str()));
+        // The Company still has exactly its two active crew members — no
+        // duplicate (pending) engineer/designer was minted.
+        assert_eq!(
+            agents.list_by_role_for_tenant("engineer", "default").unwrap().len(),
+            1
+        );
+        assert_eq!(
+            agents.list_by_role_for_tenant("designer", "default").unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn team_readiness_reports_adopted_crew_as_ready() {
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        let eng = seed_active(&agents, "engineer", "default");
+        ok_body(handle_team_plan(
+            &agents,
+            &spine,
+            &fake_ctx(format!("{m}|build|engineer:subj-e").as_bytes()),
+        ));
+        let v = json(handle_team_readiness(&agents, &spine, &fake_ctx(m.as_bytes())));
+        assert_eq!(v["readiness"], "ready", "adopted crew makes the team ready: {v}");
+        let active = v["active_agents"].as_array().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0]["agent_id"], eng);
+        assert_eq!(active[0]["role"], "engineer");
+        assert!(v["missing_roles"].as_array().unwrap().is_empty());
+        assert!(v["pending_hires"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn team_plan_still_hires_a_genuinely_missing_role() {
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        // Only an engineer exists; qa is genuinely missing.
+        seed_active(&agents, "engineer", "default");
+        let arg = format!("{m}|build|engineer:subj-e,qa:subj-q");
+        let v = json(handle_team_plan(&agents, &spine, &fake_ctx(arg.as_bytes())));
+        assert_eq!(v["adopted"].as_array().unwrap().len(), 1, "engineer adopted: {v}");
+        let hires = v["pending_hires"].as_array().unwrap();
+        assert_eq!(hires.len(), 1, "only the missing qa is hired: {v}");
+        assert_eq!(hires[0]["role"], "qa");
+        // Readiness: engineer ready, qa a pending hire → still staffing.
+        let r = json(handle_team_readiness(&agents, &spine, &fake_ctx(m.as_bytes())));
+        assert_eq!(r["readiness"], "staffing");
+        assert_eq!(r["active_agents"].as_array().unwrap().len(), 1);
+        assert_eq!(r["pending_hires"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn orchestrate_assigns_adopted_operative_and_stamps_reviewer() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        // Founder present so the reviewer resolves (stamping must be preserved
+        // on the adopted path exactly as on the hired path).
+        let (founder, _) = agents.ensure_founder("", "echo", "operator", "default").unwrap();
+        let m = approved_mandate(&spine);
+        let eng = seed_active(&agents, "engineer", "default");
+        ok_body(handle_team_plan(
+            &agents,
+            &spine,
+            &fake_ctx(format!("{m}|build|engineer:subj-e").as_bytes()),
+        ));
+        let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        assert_eq!(v["ready"], true, "adopted crew → ready: {v}");
+        assert_eq!(v["status"], "assigned");
+        let assigned = v["assigned_briefs"].as_array().unwrap();
+        assert_eq!(assigned.len(), 1, "the adopted engineer gets a Brief: {v}");
+        assert_eq!(assigned[0]["agent_id"], eng);
+        // Reviewer stamping is preserved on the adopted subject Brief.
+        let subject_id = v["subject_briefs_created"][0]["task_id"].as_str().unwrap();
+        assert_eq!(
+            tasks
+                .brief_fields(subject_id)
+                .unwrap()
+                .unwrap()
+                .reviewer_agent_id
+                .as_deref(),
+            Some(founder.as_str()),
+            "the adopted Operative's subject Brief carries the Founder reviewer"
+        );
+    }
+
+    #[test]
+    fn team_plan_adoption_is_tenant_isolated() {
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        // An active engineer in tenant-a.
+        seed_active(&agents, "engineer", "tenant-a");
+        // tenant-b plans an engineer with a subject → it must NOT adopt
+        // tenant-a's crew; it files its own pending hire.
+        let m = spine
+            .create_mandate("tenant-b", "Ship", "x", None, None)
+            .unwrap();
+        spine.propose_strategy("tenant-b", &m, "plan").unwrap();
+        spine.approve_strategy("tenant-b", &m).unwrap();
+        let arg = format!("{m}|build|engineer:subj-e");
+        let v = json(handle_team_plan(
+            &agents,
+            &spine,
+            &fake_ctx_tenant(arg.as_bytes(), "tenant-b"),
+        ));
+        assert!(
+            v["adopted"].as_array().unwrap().is_empty(),
+            "tenant-b must not adopt tenant-a's crew: {v}"
+        );
+        assert_eq!(v["pending_hires"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn team_plan_adopts_oldest_active_same_role_operative() {
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        // Two active runnable engineers; the OLDEST (first inserted) wins.
+        let first = seed_active(&agents, "engineer", "default");
+        let second = agents
+            .create_agent(
+                "Second", "engineer", "E", "eng", "eng", "founder", "subj-2", "medium", "default",
+            )
+            .unwrap();
+        agents.update_agent_field(&second, "rig", "echo").unwrap();
+        // A bare role still adopts when active crew exists.
+        let v = json(handle_team_plan(
+            &agents,
+            &spine,
+            &fake_ctx(format!("{m}|build|engineer").as_bytes()),
+        ));
+        let adopted = v["adopted"].as_array().unwrap();
+        assert_eq!(adopted.len(), 1);
+        assert_eq!(
+            adopted[0]["agent_id"], first,
+            "the oldest active engineer is adopted deterministically: {v}"
+        );
+    }
+
+    #[test]
+    fn team_plan_does_not_adopt_unrunnable_operative() {
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        // An ACTIVE engineer with NO Rig is not runnable → not adopted; the
+        // role falls through to a real pending hire.
+        agents
+            .create_agent(
+                "Norig", "engineer", "E", "eng", "eng", "founder", "subj-nr", "medium", "default",
+            )
+            .unwrap();
+        let v = json(handle_team_plan(
+            &agents,
+            &spine,
+            &fake_ctx(format!("{m}|build|engineer:subj-e").as_bytes()),
+        ));
+        assert!(v["adopted"].as_array().unwrap().is_empty(), "{v}");
+        assert_eq!(v["pending_hires"].as_array().unwrap().len(), 1, "{v}");
+    }
+
+    #[test]
+    fn company_actions_no_hire_card_for_adopted_role_only_for_missing() {
+        let (agents, spine, task) = prime_stores();
+        let m = approved_mandate(&spine);
+        // Engineer is active crew (adopted); qa is genuinely missing (hired).
+        seed_active(&agents, "engineer", "default");
+        ok_body(handle_team_plan(
+            &agents,
+            &spine,
+            &fake_ctx(format!("{m}|build|engineer:subj-e,qa:subj-q").as_bytes()),
+        ));
+        let v = json(handle_company_actions(&agents, &spine, &task, &fake_ctx(b"")));
+        let hire_cards: Vec<&serde_json::Value> = v["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a["category"] == serde_json::json!("hire"))
+            .collect();
+        assert_eq!(
+            hire_cards.len(),
+            1,
+            "exactly one hire card — for the missing qa, not the adopted engineer: {v}"
+        );
+        assert_eq!(hire_cards[0]["target_type"], "agent");
+        assert!(
+            hire_cards[0]["title"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("qa")
+                || hire_cards[0]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .to_ascii_lowercase()
+                    .contains("qa"),
+            "the hire card is for the qa role: {v}"
         );
     }
 
