@@ -278,26 +278,72 @@ a > .stat-card:hover { border-color: var(--text-faint); }
 .chat-input { flex-wrap: wrap; }
 .chat-input .input { flex: 1 1 240px; min-width: 0; }
 
-/* ── Responsive shell — collapse the rail to an icon strip on narrow widths ──
-   Pass 1 keeps the nav usable on a phone (no broken 232px sidebar); the full
-   off-canvas drawer + bottom nav from design §2 remain future work. */
+/* ── Mobile shell — top bar + off-canvas drawer (design §2) ───────────────
+   The desktop 232px rail is fine ≥881px. Below that it becomes a slide-in
+   drawer behind a scrim, opened from the mobile bar's menu button. The drawer
+   renders the FULL sidebar (labels, groups, sign out) — so sign out stays
+   reachable and the active route (NavLink `.active`) stays visible. */
+.mobile-bar { display: none; }
+.scrim { display: none; }
+.icon-btn {
+  background: transparent; border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 6px 10px; font-size: 14px; cursor: pointer; line-height: 1;
+}
+.icon-btn:hover { background: var(--bg-elev); }
+
 @media (max-width: 880px) {
-  .app { grid-template-columns: 60px 1fr; }
-  .sidebar { padding: 12px 6px; align-items: stretch; }
-  .brand { justify-content: center; padding: 6px 0 12px; gap: 0; }
-  .brand .name, .brand .env { display: none; }
-  .nav-label { text-align: center; padding: 8px 0 4px; letter-spacing: 0.3px; font-size: 9px; }
-  .nav-item { justify-content: center; padding: 9px 0; gap: 0; position: relative; }
-  .nav-item > span:not(.ico) { display: none; }
-  .nav-item .ico { width: auto; font-size: 16px; }
-  .nav-item .count {
-    position: absolute; top: 2px; right: 6px; margin: 0; padding: 0 5px; font-size: 9px;
-    min-width: 14px; text-align: center;
+  /* Single column; the rail leaves grid flow and floats over the content. */
+  .app { grid-template-columns: 1fr; }
+  .mobile-bar {
+    display: flex; align-items: center; gap: 12px;
+    position: fixed; top: 0; left: 0; right: 0; height: 48px; z-index: 30;
+    padding: 0 12px; background: var(--bg-raised); border-bottom: 1px solid var(--border);
   }
-  .sidebar-foot { padding: 10px 0 4px; }
-  .who { flex-direction: column; gap: 6px; }
-  .who > div:not(.avatar):not(.logout) { display: none; }
-  .who .logout { margin: 0; font-size: 18px; }
-  .who .logout .lbl { display: none; }
-  .who .logout .ico-only { display: inline; }
+  .mobile-bar .mb-brand { display: flex; align-items: center; gap: 8px; font-weight: 700; margin-right: auto; }
+  .mobile-bar .mb-brand .logo {
+    width: 24px; height: 24px; border-radius: 6px; background: var(--accent);
+    color: var(--accent-ink); display: grid; place-items: center; font-weight: 800; font-size: 14px;
+  }
+  /* Clear the fixed bar. */
+  .main { padding-top: 48px; }
+  /* Drawer: off-canvas by default, slides in when .app has .drawer-open. */
+  .sidebar {
+    position: fixed; top: 0; bottom: 0; left: 0; width: 248px; max-width: 84vw; z-index: 50;
+    transform: translateX(-100%); transition: transform 0.2s ease; will-change: transform;
+  }
+  .app.drawer-open .sidebar { transform: translateX(0); }
+  .app.drawer-open .scrim {
+    display: block; position: fixed; inset: 0; z-index: 40; background: rgba(0, 0, 0, 0.5);
+  }
+  /* The mobile bar already carries a palette button — drop the topbar's. */
+  .cmdk-trigger { display: none; }
+}
+
+/* ── Command palette (⌘K) — a centered modal over a scrim (design §2/§12).
+   One flat bordered surface, B&W, color reserved for meaning — no nesting. */
+.cmdk-overlay {
+  position: fixed; inset: 0; z-index: 100; background: rgba(0, 0, 0, 0.5);
+  display: flex; align-items: flex-start; justify-content: center; padding: 12vh 16px 16px;
+}
+.cmdk {
+  width: 100%; max-width: 540px; background: var(--bg-raised); border: 1px solid var(--border);
+  border-radius: var(--radius); overflow: hidden; display: flex; flex-direction: column; max-height: 70vh;
+}
+.cmdk-input {
+  background: var(--bg); border: none; border-bottom: 1px solid var(--border); color: var(--text);
+  padding: 14px 16px; font-size: 15px; font-family: inherit; outline: none; width: 100%;
+}
+.cmdk-list { list-style: none; margin: 0; padding: 6px; overflow-y: auto; }
+.cmdk-item { display: flex; align-items: baseline; gap: 12px; padding: 9px 12px; border-radius: 6px; cursor: pointer; }
+.cmdk-item.active { background: var(--bg-elev); }
+.cmdk-label { font-size: 14px; font-weight: 500; }
+.cmdk-hint { margin-left: auto; font-size: 11px; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cmdk-empty { padding: 18px 12px; color: var(--text-faint); text-align: center; font-size: 13px; }
+.cmdk-foot {
+  display: flex; gap: 16px; padding: 8px 14px; border-top: 1px solid var(--border-soft);
+  color: var(--text-faint); font-size: 11px;
+}
+.cmdk-foot kbd {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 10px;
+  border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; margin-right: 3px; color: var(--text-dim);
 }

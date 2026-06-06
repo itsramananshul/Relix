@@ -491,6 +491,41 @@ login layered on top of the bridge token (see
   **enforced**, not the spine being down — `relix dashboard doctor`
   distinguishes the two.
 
+### Dashboard mobile shell + command palette are in, with honest gaps
+
+The React dashboard now has a mobile shell and an operator command palette
+(`relix-dashboard-design.md` §2/§12):
+
+- **Mobile:** below 880px the 232px rail becomes an **off-canvas drawer**
+  opened from a fixed mobile top bar's menu button, dimmed behind a tap-to-close
+  scrim, and closed automatically on navigation. The drawer renders the **full**
+  sidebar (grouped labels + sign out), so sign out stays reachable and the
+  active route stays highlighted. Desktop layout is unchanged.
+- **Command palette (⌘K):** a dependency-free, keyboard-accessible palette
+  mounted once in the shell, opened with Ctrl/⌘+K or a topbar/mobile button. It
+  **only navigates** to existing routes (Ask Prime, Command Center, the rail
+  destinations, Action Center) or signs out — it performs **no backend
+  mutation** and creates no work objects.
+
+What it does **not** do yet:
+
+- **No fixed bottom nav.** Design §2 also calls for a phone bottom nav
+  (Home / Issues / Create / Agents / Inbox) and edge-swipe-to-open; only the
+  drawer + menu button ship. The drawer covers the same destinations.
+- **No tenant/company switcher.** Design §3 puts a tenant switcher at the top of
+  the rail, but the dashboard is a **single local admin / single tenant** today
+  (see "Dashboard admin login is a single local account" above) — there is
+  nothing to switch between, so the switcher is deferred until multi-tenant
+  operator state exists. The palette is the keyboard-first quick-jump in its
+  place.
+- **No automated visual verification.** The repo has **no Playwright / headless
+  browser tooling**, and none was added for this (no heavy dependency for a
+  screenshot). The mobile shell + palette are verified by a clean production
+  build (`tsc -b` + `vite build`) and the dist-parity gate
+  (`scripts/check-dashboard-dist.ps1`) only — **not** by rendered-pixel
+  regression at desktop/mobile widths. Cross-browser/device rendering is a
+  manual check until a browser-test harness is justified.
+
 ## Provider gaps
 
 ### `gemini` provider is a placeholder

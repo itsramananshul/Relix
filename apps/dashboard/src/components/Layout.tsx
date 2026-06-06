@@ -2,29 +2,8 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Link, NavLink, useLocation } from "react-router-dom";
 import { useAuth } from "../auth";
 import { tryGet } from "../api";
-
-interface NavEntry {
-  to: string;
-  label: string;
-  icon: string;
-}
-
-const PRIMARY: NavEntry[] = [
-  { to: "/", label: "Command Center", icon: "◈" },
-  { to: "/mandates", label: "Mandates", icon: "◎" },
-  { to: "/briefs", label: "Briefs", icon: "▤" },
-  { to: "/runs", label: "Active Runs", icon: "◐" },
-  { to: "/chat", label: "Chat", icon: "✦" },
-];
-const ORG: NavEntry[] = [
-  { to: "/agents", label: "Crew", icon: "◍" },
-  { to: "/company", label: "Company", icon: "▦" },
-  { to: "/assign", label: "Assign Work", icon: "➜" },
-];
-const SYSTEM: NavEntry[] = [
-  { to: "/scheduled", label: "Scheduled", icon: "◷" },
-  { to: "/settings", label: "Settings", icon: "⚙" },
-];
+import { PRIMARY, ORG, SYSTEM, type NavEntry } from "./nav";
+import { CommandPalette } from "./CommandPalette";
 
 const TITLES: Record<string, { title: string; sub: string }> = {
   "/": { title: "Command Center", sub: "Mesh overview & what needs attention" },
@@ -75,6 +54,27 @@ export function Layout({ children }: { children: ReactNode }) {
   const loc = useLocation();
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [company, setCompany] = useState<CompanyIdent | null>(null);
+  // Mobile off-canvas nav drawer + the ⌘K command palette (design §2 — both are
+  // shell singletons). Desktop never shows the drawer; the palette is global.
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+
+  // ⌘K / Ctrl+K toggles the palette from anywhere (design §12 — keyboard-first).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
+        e.preventDefault();
+        setPaletteOpen((p) => !p);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Navigating closes the mobile drawer so the new page is visible.
+  useEffect(() => {
+    setDrawerOpen(false);
+  }, [loc.pathname]);
 
   useEffect(() => {
     let on = true;
@@ -105,8 +105,33 @@ export function Layout({ children }: { children: ReactNode }) {
   const showIdent = !!company?.initialized || !!founder;
 
   return (
-    <div className="app">
-      <aside className="sidebar">
+    <div className={"app" + (drawerOpen ? " drawer-open" : "")}>
+      {/* Mobile-only top bar: menu + brand + palette. Hidden on desktop (CSS). */}
+      <div className="mobile-bar">
+        <button
+          className="icon-btn"
+          aria-label="Open navigation menu"
+          aria-expanded={drawerOpen}
+          aria-controls="app-sidebar"
+          onClick={() => setDrawerOpen(true)}
+        >
+          ☰
+        </button>
+        <div className="mb-brand">
+          <div className="logo">R</div>
+          <span>Relix</span>
+        </div>
+        <button
+          className="icon-btn"
+          aria-label="Open command palette"
+          onClick={() => setPaletteOpen(true)}
+        >
+          ⌘K
+        </button>
+      </div>
+      {/* Scrim behind the open drawer — tap to dismiss. Hidden unless open. */}
+      <div className="scrim" aria-hidden onClick={() => setDrawerOpen(false)} />
+      <aside className="sidebar" id="app-sidebar">
         <div className="brand">
           <div className="logo">R</div>
           <div className="name">Relix</div>
@@ -148,12 +173,21 @@ export function Layout({ children }: { children: ReactNode }) {
               </span>
             </div>
           )}
+          <button
+            className="btn sm ghost cmdk-trigger"
+            onClick={() => setPaletteOpen(true)}
+            aria-label="Open command palette"
+            title="Command palette (Ctrl / ⌘ + K)"
+          >
+            <span aria-hidden>⌘</span>K
+          </button>
           <Link to="/chat" title="Describe a goal — Prime proposes a governed plan">
             <button className="btn sm">Ask Prime →</button>
           </Link>
         </header>
         <div className="workspace">{children}</div>
       </div>
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </div>
   );
 }
