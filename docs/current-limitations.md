@@ -399,6 +399,35 @@ default) this is sufficient. However:
   shared secret, not a substitute for mTLS or OAuth.
 - `/health` and `/dashboard` are public (no auth) by design.
 
+### Dashboard admin login is a single local account
+
+The React dashboard authenticates with a username/password operator
+login layered on top of the bridge token (see
+[`relix-dashboard-design.md`](relix-dashboard-design.md)). What it does
+**not** do:
+
+- **One admin, not multi-user.** There is exactly one admin credential
+  per bridge (`dashboard-admin.json`, Argon2id hash next to the bridge
+  token). No roles, no per-operator accounts, no SSO.
+- **Sessions are in-memory.** A logged-in session rides an HttpOnly
+  `relix_session` cookie (12h TTL) held in the bridge process. Restart
+  the bridge and every operator must log in again — by design, but it
+  means a busy operator is logged out on every deploy.
+- **No online password reset.** A forgotten password is recovered
+  **only locally** on the host: `relix dashboard reset-admin` (or
+  `relix-web-bridge reset-admin`, or
+  `scripts/relix-dashboard-admin-reset.{ps1,sh}`). It rewrites just the
+  admin credential — never the data — and there is deliberately no
+  network/unauthenticated reset surface. Restart the bridge afterward.
+- **Protected APIs stay protected.** The SPA shell (`/dashboard`) is
+  public, but `/v1/tasks`, `/v1/spine/*`, `/v1/prime/*`, providers, etc.
+  require the cookie (or the bearer). Before you log in — or after the
+  session lapses — those calls return **401**; the dashboard now routes
+  that to the login screen ("Your session expired — sign in again")
+  instead of broken cards. A 401 on those routes is auth being
+  **enforced**, not the spine being down — `relix dashboard doctor`
+  distinguishes the two.
+
 ## Provider gaps
 
 ### `gemini` provider is a placeholder
