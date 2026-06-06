@@ -5525,8 +5525,10 @@ fn advance_reviewed_brief(
 ///
 /// Returns the JSON response body, or an `INVALID_ARGS` cause string on
 /// refusal/error. Extracted from the capability closure so the live route and
-/// its in-process integration tests run the SAME code.
-fn execute_run_diff(
+/// its in-process integration tests run the SAME code. `pub` so the bridge's
+/// mini-mesh HTTP regression can register the SAME body behind a fake
+/// coordinator peer and prove the route/serialization hop end to end.
+pub fn execute_run_diff(
     store: &crate::nodes::coordinator::TaskStore,
     run_id: &str,
     tenant: &str,
@@ -5579,8 +5581,10 @@ fn execute_run_diff(
 ///
 /// Returns the JSON response body, or an `INVALID_ARGS` cause string on
 /// refusal/error. ALL durable side effects happen here so the live route and
-/// its in-process integration tests run the SAME code.
-fn execute_run_apply(
+/// its in-process integration tests run the SAME code. `pub` so the bridge's
+/// mini-mesh HTTP regression can register the SAME body behind a fake
+/// coordinator peer and prove the route/serialization hop end to end.
+pub fn execute_run_apply(
     store: &crate::nodes::coordinator::TaskStore,
     run_id: &str,
     tenant: &str,

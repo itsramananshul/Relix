@@ -182,6 +182,8 @@ mod sessions_obs;
 mod skills;
 mod slack;
 mod sol_validate;
+#[cfg(test)]
+mod run_apply_mini_mesh_test;
 mod spine;
 mod sse;
 #[cfg(test)]
