@@ -90,6 +90,25 @@ interface ChronicleEntry {
   ts?: number;
   event_type?: string;
   payload?: string;
+  // The dedicated `/events` route is a passthrough of the canonical
+  // `task.events` shape, which names these fields `id` / `type` (the
+  // detail's `chronicle.recent` uses `event_id` / `event_type`). Accept
+  // both so the timeline renders an event-type label + tone dot from
+  // either source; `normalizeEvent` collapses them to the canonical pair.
+  id?: number;
+  type?: string;
+}
+
+// Collapse either Chronicle field shape (`/events` → `id`/`type`;
+// `chronicle.recent` → `event_id`/`event_type`) to the canonical pair the
+// timeline renders.
+function normalizeEvent(e: ChronicleEntry): ChronicleEntry {
+  return {
+    event_id: e.event_id ?? e.id,
+    ts: e.ts,
+    event_type: e.event_type ?? e.type,
+    payload: e.payload,
+  };
 }
 interface BriefDetailData {
   title?: string;
@@ -150,7 +169,7 @@ export function BriefDetail({
         [],
       ),
     ]);
-    return { detail, events: Array.isArray(events) ? events : [] };
+    return { detail, events: (Array.isArray(events) ? events : []).map(normalizeEvent) };
   }, [briefId]);
 
   // Live updates: refresh this Brief's detail (latest_run + Chronicle) when an
