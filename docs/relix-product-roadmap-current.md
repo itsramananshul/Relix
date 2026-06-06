@@ -4,15 +4,25 @@
 > code that exists today*, plus the next implementation queue. Read this **and** the
 > cited design-doc section **before** starting any product work.
 >
-> **Source of truth, in order:** the design docs in `docs/` (see CLAUDE.md) define
-> *intent*; `docs/product-spine-implementation.md` is the **audited implementation map +
-> divergence ledger** (what the code actually does today); this file is the **concise
-> roadmap that ties them together and orders what's next**. When they disagree, the design
-> docs win on intent and the ledger wins on "what is true right now" — fix the gap, don't
-> paper over it.
+> **Source of truth, in order:** the Paperclip audit under `references/paperclip/` captures
+> the product instincts Relix is trying to learn from; the design docs in `docs/` (see
+> CLAUDE.md) define Relix's intended adaptation; `docs/product-spine-implementation.md` is
+> the **audited implementation map + divergence ledger** (what the code actually does
+> today); this file is the **concise roadmap that ties them together and orders what's
+> next**. When they disagree, the Paperclip audit wins on "what Paperclip actually
+> felt/built like," the Relix design docs win on Relix-specific intent, and the ledger wins
+> on "what is true right now" — fix the gap, don't paper over it.
 >
 > **Last reconciled:** 2026-06-06 against the implementation ledger (through commit
-> `3c3c533c`, Live Spend Telemetry Pack era) and the design docs listed below.
+> `3c3c533c`, Live Spend Telemetry Pack era), the Paperclip audit files listed below, and
+> the design docs listed below.
+
+Paperclip audit sources this roadmap must stay grounded in (read these before product
+direction work, not as optional inspiration):
+`references/paperclip/RELIX_PAPERCLIP_AUDIT_LOG.md` ·
+`references/paperclip/.relix-audit/paperclip-file-line-coverage-summary.md` ·
+`references/paperclip/.relix-audit/paperclip-file-line-coverage-progress.md` ·
+`docs/hermes-vs-paperclip-vs-relix.md`.
 
 Design docs this roadmap is built from (read these, not vibes):
 `relix-lexicon.md` · `relix-company-model.md` · `relix-execution-and-issue-design.md` ·
@@ -34,6 +44,13 @@ immutable **Chronicle**. You watch the whole operation at a glance from **The De
 *who's doing what, what it costs, and whether it's working* — while the heavy machinery
 (signed mesh, policy admission, hash-chained audit, sandboxed execution) stays hidden until
 you need it.
+
+The Paperclip audit is binding on the product feel: Paperclip is not only a polished
+dashboard. It is a company control plane where issue execution, heartbeat/run orchestration,
+agent runtime, workspace runtime, plugin hosting, access/resource membership, secrets,
+recovery, company portability, issue detail/chat/run transcript, agent management,
+company/project/workspace surfaces, routines, search, dashboards, and tested UI states
+connect through shared contracts.
 
 The Paperclip-inspired shift (`relix-company-model.md` §1, §8): the product is organized
 around **work objects and the org** (Guild → Mandate → Campaign → Brief → Shift, and the
@@ -313,19 +330,26 @@ Relix *feels like a real product, not a mock-up*, when all of these are true (fr
 
 Before writing any code in this repo:
 
-1. **Read the relevant design-doc section first** and state it up front:
+1. **Read the Paperclip audit sources when doing product-direction work**:
+   `references/paperclip/RELIX_PAPERCLIP_AUDIT_LOG.md`,
+   `references/paperclip/.relix-audit/paperclip-file-line-coverage-summary.md`,
+   `references/paperclip/.relix-audit/paperclip-file-line-coverage-progress.md`, and
+   `docs/hermes-vs-paperclip-vs-relix.md`. Do not treat the six Relix docs alone as
+   the whole product compass; they are Claude-authored adaptations of the Paperclip audit,
+   not a replacement for it.
+2. **Read the relevant Relix design-doc section next** and state it up front:
    *Section* (`<doc> §<n>`), *Files changed*, *Not changed / out of scope*.
-2. **Then read this roadmap** (§2 for what exists, §3/§5 for what's next, §4 for what's
+3. **Then read this roadmap** (§2 for what exists, §3/§5 for what's next, §4 for what's
    deferred). Do not build anything in §4 without an explicit instruction + doc update.
-3. **Build exactly what the section specifies** — no invented features, no unrequested
+4. **Build exactly what the section specifies** — no invented features, no unrequested
    layout/IA/naming changes. The lexicon is binding on product surfaces.
-4. **Work only on `main`.** No branches, no history rewrite, no force-push. Author stays
+5. **Work only on `main`.** No branches, no history rewrite, no force-push. Author stays
    `Anshul Raman <ramanal@mail.uc.edu>`, no AI attribution. Stage with explicit paths.
-5. **Commit + push each green, doc-conformant slice**, citing the design-doc section in the
+6. **Commit + push each green, doc-conformant slice**, citing the design-doc section in the
    message (the established convention — see the git log).
-6. **No fake UI or fake data.** Every surface reads real backend routes; if a route is
+7. **No fake UI or fake data.** Every surface reads real backend routes; if a route is
    missing, build it or surface the gap — don't mock it.
-7. **After every change:** re-open the cited section, verify conformance, run `cargo test`
+8. **After every change:** re-open the cited section, verify conformance, run `cargo test`
    (touched crate then workspace) + `cargo clippy` on touched crates, rebuild
    `dashboard-dist` if `apps/dashboard` changed (dist-parity gate), and **update the
    divergence ledger + this roadmap** so the next run starts from the truth.
