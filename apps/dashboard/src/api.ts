@@ -119,6 +119,66 @@ export async function tryGetReport<T>(path: string, fallback: T): Promise<GetRep
   }
 }
 
+// ── Run (Shift) control helpers ───────────────────────────────────────────
+// One wiring for the Shift lifecycle (review / apply / cancel + the safe-apply
+// plan), shared by the Runs page and the Brief workroom so the same operator
+// actions aren't parsed two different ways. All hit the existing `/v1/runs/:id`
+// routes the bridge already serves.
+
+// One file in a safe-apply plan (`/v1/runs/:id/diff` → plan.items).
+export interface ApplyPlanItem {
+  rel_path?: string;
+  kind?: string;
+  action?: string; // create / overwrite / delete / noop / refuse
+  can_apply?: boolean;
+  conflict?: boolean;
+  reason?: string;
+}
+export interface ApplyPlan {
+  project_root?: string;
+  items?: ApplyPlanItem[];
+  applicable?: boolean;
+  changes?: number;
+  conflicts?: number;
+  blocked?: number;
+  note?: string;
+}
+// Safe-apply preview (`/v1/runs/:id/diff`).
+export interface RunDiff {
+  run_id?: string;
+  status?: string;
+  review?: string;
+  apply_status?: string;
+  eligible?: boolean;
+  reason?: string;
+  plan?: ApplyPlan;
+}
+export interface ApplyResult {
+  apply_status?: string;
+  applied_files?: number;
+  failed_files?: number;
+  brief_status?: string;
+}
+
+export const runControls = {
+  // Record an operator accept/reject of a done run.
+  review: (runId: string, decision: "accepted" | "rejected", note = "") =>
+    api.post(`/v1/runs/${encodeURIComponent(runId)}/review`, { decision, note }),
+  // Copy an accepted run's changed files into the project root.
+  apply: (runId: string) =>
+    api.post<ApplyResult>(`/v1/runs/${encodeURIComponent(runId)}/apply`, {}),
+  // Request cancellation of an in-flight run.
+  cancel: (runId: string) =>
+    api.post<{ active?: boolean; note?: string }>(
+      `/v1/runs/${encodeURIComponent(runId)}/cancel`,
+      {},
+    ),
+  // The safe-apply PLAN for a run (per-file actions + applicability). Optional
+  // surface → resolves to null on failure so the panel degrades, not blanks.
+  diff: (runId: string) =>
+    tryGet<RunDiff | null>(`/v1/runs/${encodeURIComponent(runId)}/diff`, null),
+};
+
 // ── Live run-event stream (SSE) ───────────────────────────────────────────
 // Subscribe to the bridge's `/v1/runs/events/stream` execution feed so the
 // Runs page + Brief detail can refresh the moment a Shift starts, finishes,

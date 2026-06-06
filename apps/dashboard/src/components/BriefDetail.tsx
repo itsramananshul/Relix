@@ -1,8 +1,42 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, tryGetReport, subscribeRunEvents } from "../api";
+import { api, tryGet, tryGetReport, subscribeRunEvents, runControls, type RunDiff } from "../api";
 import { useAuth } from "../auth";
 import { Badge, useAsync } from "./common";
+
+// The structured result of starting a Shift (`POST …/briefs/:id/run`). Mirrors
+// the board's run handling so a refusal reads the same everywhere.
+interface RunReport {
+  status: string; // running / done / continued / failed / a refusal token
+  rig?: string;
+  summary?: string;
+  install_hint?: string | null;
+}
+
+// Refusal token → a plain-English reason (shared phrasing with the board).
+const REFUSALS: Record<string, string> = {
+  running: "Shift started — executing in the background",
+  unassigned: "assign an Operative first",
+  no_adapter: "no adapter configured for this Operative",
+  adapter_unavailable: "adapter not installed",
+  already_running: "already running",
+  not_found: "brief not found",
+  workspace_error: "could not prepare a run workspace",
+  done: "Shift complete",
+  failed: "Shift failed",
+  continued: "Shift continued (more work to do)",
+};
+
+// Apply-status → badge tone (mirrors the Runs page).
+const APPLY_STATUS_TONE: Record<string, string> = {
+  applied: "done",
+  ready: "todo",
+  conflicted: "blocked",
+  failed: "blocked",
+  blocked: "blocked",
+  discarded: "blocked",
+  not_applicable: "todo",
+};
 
 // Bounded summary of the Brief's most recent Shift (run), from
 // `GET /v1/spine/briefs/:id`'s `latest_run`. Full run on /v1/runs/:id.
@@ -98,11 +132,26 @@ export function BriefDetail({
   const [comment, setComment] = useState("");
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  // Shift-control state: a busy flag while a run is starting, and the loaded
+  // safe-apply plan for the latest accepted run.
+  const [runBusy, setRunBusy] = useState(false);
+  const [diff, setDiff] = useState<RunDiff | null>(null);
 
-  const { data, loading, error, reload } = useAsync(
-    () => tryGetReport<BriefDetailData>(`/v1/spine/briefs/${encodeURIComponent(briefId)}`, {}),
-    [briefId],
-  );
+  // Load the Brief detail AND the fuller Chronicle timeline together. The
+  // detail carries only a bounded `chronicle.recent`; the dedicated `/events`
+  // route gives the readable, scrollable history (newest first). Both refresh
+  // on the live run-event stream below.
+  const EVENT_LIMIT = 120;
+  const { data, loading, error, reload } = useAsync(async () => {
+    const [detail, events] = await Promise.all([
+      tryGetReport<BriefDetailData>(`/v1/spine/briefs/${encodeURIComponent(briefId)}`, {}),
+      tryGet<ChronicleEntry[]>(
+        `/v1/spine/briefs/${encodeURIComponent(briefId)}/events?limit=${EVENT_LIMIT}`,
+        [],
+      ),
+    ]);
+    return { detail, events: Array.isArray(events) ? events : [] };
+  }, [briefId]);
 
   // Live updates: refresh this Brief's detail (latest_run + Chronicle) when an
   // execution event for THIS Brief arrives on the run-event stream — so the
@@ -130,11 +179,19 @@ export function BriefDetail({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const d = data?.data ?? {};
+  const d = data?.detail.data ?? {};
   const f = d.fields ?? {};
-  const loadErr = error ?? data?.error ?? null;
-  const events = Array.isArray(d.chronicle?.recent) ? d.chronicle!.recent! : [];
+  const loadErr = error ?? data?.detail.error ?? null;
+  // Prefer the fuller `/events` timeline; fall back to the detail's bounded
+  // `chronicle.recent` if that optional fetch came back empty.
+  const events =
+    (data?.events.length ?? 0) > 0
+      ? data!.events
+      : Array.isArray(d.chronicle?.recent)
+        ? d.chronicle!.recent!
+        : [];
   const claim = d.claim ?? null;
+  const lr = d.latest_run ?? null;
 
   async function submitComment() {
     const text = comment.trim();
@@ -156,6 +213,103 @@ export function BriefDetail({
       setBusy(false);
     }
   }
+
+  // ── Shift (run) lifecycle controls ──────────────────────────────────────
+  // Start a Shift through the Operative's adapter (or an explicit `rig`
+  // override such as `echo`). Refusals are surfaced honestly — never faked.
+  async function runNow(rig?: string) {
+    setRunBusy(true);
+    setBanner({ kind: "info", msg: `Starting Shift${rig ? ` (${rig})` : ""}…` });
+    try {
+      const r = await api.post<RunReport>(
+        `/v1/spine/briefs/${encodeURIComponent(briefId)}/run`,
+        rig ? { rig } : {},
+      );
+      const accepted = r.status === "running" || r.status === "done";
+      const refusal = ["unassigned", "no_adapter", "adapter_unavailable", "already_running", "not_found"].includes(r.status);
+      let msg = REFUSALS[r.status] ?? r.status;
+      if (r.rig) msg += ` · adapter ${r.rig}`;
+      if (r.summary && r.status !== "running") msg += ` — ${r.summary}`;
+      if (r.install_hint) msg += ` (${r.install_hint})`;
+      setBanner({ kind: accepted ? "ok" : refusal ? "info" : "err", msg });
+      reload();
+      onChanged?.();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Run failed" });
+    } finally {
+      setRunBusy(false);
+    }
+  }
+
+  // Accept / reject the latest done run.
+  async function reviewRun(decision: "accepted" | "rejected") {
+    if (!lr?.run_id) return;
+    setBanner(null);
+    try {
+      await runControls.review(lr.run_id, decision);
+      setBanner({ kind: "ok", msg: `Shift ${decision}.` });
+      reload();
+      onChanged?.();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Review failed" });
+    }
+  }
+
+  // Apply an accepted run's changes into the project root.
+  async function applyRun() {
+    if (!lr?.run_id) return;
+    setBanner(null);
+    try {
+      const r = await runControls.apply(lr.run_id);
+      setBanner({
+        kind: "ok",
+        msg:
+          `Apply ${r.apply_status ?? "done"}: ${r.applied_files ?? 0} applied, ${r.failed_files ?? 0} failed` +
+          (r.brief_status === "done" ? " — Brief marked done." : "."),
+      });
+      reload();
+      onChanged?.();
+      await loadDiff();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Apply failed" });
+    }
+  }
+
+  // Request cancellation of an in-flight Shift.
+  async function cancelRun() {
+    if (!lr?.run_id) return;
+    setBanner(null);
+    try {
+      const r = await runControls.cancel(lr.run_id);
+      setBanner({
+        kind: "info",
+        msg: r.active ? "Cancellation signalled — the Shift will report cancelled." : `Cancel requested: ${r.note ?? "no live process"}`,
+      });
+      reload();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Cancel failed" });
+    }
+  }
+
+  // Load (or refresh) the safe-apply plan for the latest run.
+  async function loadDiff() {
+    if (!lr?.run_id) return;
+    setDiff(await runControls.diff(lr.run_id));
+  }
+
+  // Auto-load the apply plan once a run is accepted-but-not-yet-applied, so the
+  // operator sees what would change without a manual click. Cleared otherwise.
+  const lrRunId = lr?.run_id;
+  const lrReview = lr?.review;
+  const lrApply = lr?.apply_status;
+  useEffect(() => {
+    if (lrRunId && lrReview === "accepted" && lrApply !== "applied") {
+      void loadDiff();
+    } else {
+      setDiff(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lrRunId, lrReview, lrApply]);
 
   return (
     <div className="card" style={{ borderColor: "var(--info, #2d6cdf)" }}>
@@ -221,50 +375,129 @@ export function BriefDetail({
         </span>
       </div>
 
-      {/* Latest Shift (run) — the execution lifecycle at a glance. */}
+      {/* Latest Shift (run) — the execution lifecycle, operated in place. */}
       <div className="row" style={{ marginTop: 12, marginBottom: 6 }}>
         <strong style={{ fontSize: 12 }}>Latest Shift</strong>
-        {(d.latest_run?.total_runs ?? 0) > 0 && (
-          <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>{d.latest_run!.total_runs} run(s) total</span>
+        {(lr?.total_runs ?? 0) > 0 && (
+          <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>{lr!.total_runs} run(s) total</span>
+        )}
+        <div className="spacer" style={{ flex: 1 }} />
+        {lr?.run_id && (
+          <Link to={`/runs?run=${encodeURIComponent(lr.run_id)}`} className="link" style={{ fontSize: 11 }}>
+            Full transcript →
+          </Link>
         )}
       </div>
-      {!d.latest_run ? (
-        <div className="muted" style={{ fontSize: 12 }}>
-          No Shift yet — assign an Operative and run this Brief, or hit <strong>echo</strong> on the board.
+      {!lr ? (
+        <div style={{ fontSize: 12 }}>
+          <div className="muted" style={{ marginBottom: 6 }}>
+            No Shift yet — start one through the assigned Operative's adapter, or smoke the pipeline with <strong>echo</strong>.
+          </div>
+          <div className="row wrap" style={{ gap: 6 }}>
+            <button className="btn sm" disabled={runBusy} title="Run this Brief through its Operative's adapter now" onClick={() => runNow()}>
+              {runBusy ? "…" : "Run now"}
+            </button>
+            <button className="btn ghost sm" disabled={runBusy} title="Run with the echo Rig (no real adapter needed) — verifies the pipeline end to end" onClick={() => runNow("echo")}>
+              echo
+            </button>
+          </div>
         </div>
       ) : (
         <div style={{ fontSize: 12 }}>
           <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-            <span className={"badge " + (RUN_TONE[d.latest_run.status ?? ""] ?? "todo")}>{d.latest_run.status ?? "—"}</span>
-            {d.latest_run.refusal_reason && <span className="badge blocked" style={{ fontSize: 9 }} title="why the run didn't start">{d.latest_run.refusal_reason}</span>}
-            {d.latest_run.trigger && <span className="muted" style={{ fontSize: 11 }}>{d.latest_run.trigger === "heartbeat" ? "auto" : d.latest_run.trigger}</span>}
-            {d.latest_run.rig && <span className="muted">adapter <span className="mono">{d.latest_run.rig}</span></span>}
-            {d.latest_run.review && <span className={"badge " + (d.latest_run.review === "accepted" ? "done" : d.latest_run.review === "rejected" ? "blocked" : "in_progress")} style={{ fontSize: 9 }}>{d.latest_run.review}</span>}
-            {d.latest_run.apply_status && <span className="badge" style={{ fontSize: 9 }}>apply: {d.latest_run.apply_status}</span>}
-            {(d.latest_run.artifact_count ?? 0) > 0 && <span className="muted" style={{ fontSize: 11 }}>{d.latest_run.artifact_count} changed file(s)</span>}
-            <div className="spacer" style={{ flex: 1 }} />
-            {d.latest_run.run_id && (
-              <Link to={`/runs?run=${encodeURIComponent(d.latest_run.run_id)}`} className="link" style={{ fontSize: 11 }}>
-                Open in Runs →
-              </Link>
-            )}
+            <span className={"badge " + (RUN_TONE[lr.status ?? ""] ?? "todo")}>{lr.status ?? "—"}</span>
+            {lr.refusal_reason && <span className="badge blocked" style={{ fontSize: 9 }} title="why the run didn't start">{lr.refusal_reason}</span>}
+            {lr.trigger && <span className="muted" style={{ fontSize: 11 }}>{lr.trigger === "heartbeat" ? "auto" : lr.trigger}</span>}
+            {lr.rig && <span className="muted">adapter <span className="mono">{lr.rig}</span></span>}
+            {lr.review && <span className={"badge " + (lr.review === "accepted" ? "done" : lr.review === "rejected" ? "blocked" : "in_progress")} style={{ fontSize: 9 }}>{lr.review}</span>}
+            {lr.apply_status && <span className={"badge " + (APPLY_STATUS_TONE[lr.apply_status] ?? "todo")} style={{ fontSize: 9 }}>apply: {lr.apply_status}</span>}
+            {(lr.artifact_count ?? 0) > 0 && <span className="muted" style={{ fontSize: 11 }}>{lr.artifact_count} changed file(s)</span>}
           </div>
           <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
-            {d.latest_run.started_at ? `started ${new Date(d.latest_run.started_at * 1000).toLocaleString()}` : ""}
-            {d.latest_run.finished_at ? ` · finished ${new Date(d.latest_run.finished_at * 1000).toLocaleTimeString()}` : (d.latest_run.status === "running" ? " · in flight…" : "")}
-            {typeof d.latest_run.duration_secs === "number" ? ` · ${d.latest_run.duration_secs}s` : ""}
+            {lr.started_at ? `started ${new Date(lr.started_at * 1000).toLocaleString()}` : ""}
+            {lr.finished_at ? ` · finished ${new Date(lr.finished_at * 1000).toLocaleTimeString()}` : (lr.status === "running" ? " · in flight…" : "")}
+            {typeof lr.duration_secs === "number" ? ` · ${lr.duration_secs}s` : ""}
           </div>
-          {d.latest_run.summary && (
-            <div style={{ marginTop: 4, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{d.latest_run.summary}</div>
+          {lr.summary && (
+            <div style={{ marginTop: 4, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{lr.summary}</div>
+          )}
+
+          {/* Shift controls — run/re-run, cancel, review, all wrapping. */}
+          <div className="row wrap" style={{ gap: 6, marginTop: 8 }}>
+            <button className="btn sm" disabled={runBusy || lr.status === "running"} title="Start a new Shift through the Operative's adapter" onClick={() => runNow()}>
+              {runBusy ? "…" : "Re-run"}
+            </button>
+            <button className="btn ghost sm" disabled={runBusy || lr.status === "running"} title="Run with the echo Rig (no real adapter needed)" onClick={() => runNow("echo")}>
+              echo
+            </button>
+            {lr.status === "running" && lr.run_id && (
+              <button className="btn ghost sm" title="Request cancellation of the in-flight Shift" onClick={cancelRun}>
+                Cancel run
+              </button>
+            )}
+            {lr.status === "done" && lr.run_id && lr.review !== "accepted" && (
+              <button className="btn sm" title="Accept this Shift's output" onClick={() => reviewRun("accepted")}>
+                Accept
+              </button>
+            )}
+            {lr.status === "done" && lr.run_id && lr.review !== "rejected" && (
+              <button className="btn ghost sm" title="Reject this Shift's output" onClick={() => reviewRun("rejected")}>
+                Reject
+              </button>
+            )}
+          </div>
+
+          {/* Apply — copy an accepted Shift's changes into the project root. */}
+          {lr.status === "done" && lr.review === "accepted" && (
+            <div style={{ marginTop: 10 }}>
+              <div className="row wrap" style={{ gap: 6, marginBottom: 4 }}>
+                <strong style={{ fontSize: 12 }}>Apply</strong>
+                <span className={"badge " + (APPLY_STATUS_TONE[lr.apply_status ?? ""] ?? "todo")} style={{ fontSize: 10 }}>
+                  {lr.apply_status ?? "not applied"}
+                </span>
+                {diff?.plan?.note && <span className="muted" style={{ fontSize: 11 }}>{diff.plan.note}</span>}
+                <div className="spacer" style={{ flex: 1 }} />
+                <button className="btn ghost sm" onClick={loadDiff}>Refresh plan</button>
+                {diff?.plan?.applicable && (diff.plan.changes ?? 0) > 0 && lr.apply_status !== "applied" && (
+                  <button className="btn sm" onClick={applyRun}>
+                    Apply {diff.plan.changes} change(s)
+                  </button>
+                )}
+              </div>
+              {diff?.plan?.project_root && (
+                <div className="muted mono" style={{ fontSize: 11, marginBottom: 4 }}>→ {diff.plan.project_root}</div>
+              )}
+              {diff && diff.eligible === false && (
+                <div className="banner info" style={{ fontSize: 11 }}>{diff.reason}</div>
+              )}
+              {(diff?.plan?.items?.length ?? 0) > 0 && (
+                <div style={{ fontSize: 12, maxHeight: 180, overflow: "auto" }}>
+                  {diff!.plan!.items!.map((it, j) => (
+                    <div key={(it.rel_path ?? "") + j} style={{ padding: "2px 0", borderBottom: "1px solid var(--border-soft)" }}>
+                      <span className={"badge " + (!it.can_apply ? "blocked" : it.action === "noop" ? "todo" : "done")} style={{ fontSize: 10 }}>{it.action}</span>{" "}
+                      <span className="mono" style={{ fontSize: 11 }}>{it.rel_path}</span>{" "}
+                      <span className="muted" style={{ fontSize: 10 }}>{it.reason}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {diff?.plan && diff.plan.applicable === false && (diff.plan.items?.length ?? 0) > 0 && (
+                <div className="banner err" style={{ fontSize: 11, marginTop: 4 }}>
+                  Refusing apply: {diff.plan.conflicts ?? 0} conflict(s), {diff.plan.blocked ?? 0} blocked. Resolve these before applying.
+                </div>
+              )}
+            </div>
           )}
         </div>
       )}
 
-      {/* Chronicle — newest entries + total; full timeline on the events route. */}
+      {/* Chronicle — the readable timeline (newest first) from `/events`,
+          merging system notes, run lifecycle, board moves, and comments. */}
       <div className="row" style={{ marginTop: 12, marginBottom: 6 }}>
         <strong style={{ fontSize: 12 }}>Chronicle</strong>
         <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>
           {d.chronicle?.total ?? 0} event(s) total · showing newest {events.length}
+          {events.length >= EVENT_LIMIT ? ` (capped at ${EVENT_LIMIT})` : ""}
         </span>
       </div>
       {loading ? (
