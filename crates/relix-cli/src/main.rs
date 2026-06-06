@@ -23,6 +23,7 @@ mod capability;
 mod confidence;
 mod config;
 mod credentials;
+mod dashboard;
 mod defaults;
 mod doctor;
 mod email;
@@ -474,6 +475,15 @@ enum Cmd {
     /// is unreachable, so this is safe to use as a CI / shell gate.
     Status(mesh::StatusArgs),
 
+    /// Dashboard diagnostics + recovery. `relix dashboard doctor` runs a
+    /// read-only health/auth + product-loop check (is the bridge up, an
+    /// admin configured, the SPA served, and the spine/prime routes wired?).
+    /// `relix dashboard reset-admin` is LOCAL forgotten-password recovery.
+    Dashboard {
+        #[command(subcommand)]
+        cmd: dashboard::Cmd,
+    },
+
     /// Check for a newer Relix release. Hits the GitHub release API,
     /// compares against the running binary's version, and offers to
     /// download + replace if a newer version exists.
@@ -614,6 +624,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Build(args) => build::run(args).await,
         Cmd::Stop(args) => mesh::stop(args),
         Cmd::Status(args) => mesh::status(args).await,
+        Cmd::Dashboard { cmd } => dashboard::run(cmd).await,
         Cmd::Update(args) => update::run(args).await,
         Cmd::Install(args) => install::run(args).await,
         Cmd::Export(args) => export::run(args).await,

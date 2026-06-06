@@ -169,6 +169,15 @@ pub async fn boot(args: BootArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Tell the operator how to actually get INTO the dashboard: whether this
+    // is a first-run admin setup or a normal login, where to reset a
+    // forgotten password, and how to verify the product loop is reachable.
+    // This closes the gap where `relix boot` printed a URL but never the
+    // login/setup path, leaving operators staring at a 401 dashboard shell.
+    for line in dashboard_login_lines(admin_configured(), &dashboard_url) {
+        println!("{line}");
+    }
+
     if !effective.no_browser
         && let Err(e) = open_browser(&dashboard_url)
     {
@@ -642,6 +651,49 @@ fn read_bridge_token() -> Option<(PathBuf, String)> {
     if v.is_empty() { None } else { Some((path, v)) }
 }
 
+/// Whether a dashboard admin credential already exists. The bridge stores it
+/// as `dashboard-admin.json` next to the bridge token (`~/.relix/`). Used by
+/// `relix boot` to print the right first-run vs. login hint. Best-effort: an
+/// unreadable home dir reports "not configured" so the banner errs toward
+/// showing the setup path.
+fn admin_configured() -> bool {
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let Some(home) = std::env::var_os(home_var) else {
+        return false;
+    };
+    PathBuf::from(home)
+        .join(".relix")
+        .join("dashboard-admin.json")
+        .is_file()
+}
+
+/// The login/setup hint block `relix boot` prints once the bridge is healthy.
+/// Pure function over `(admin_exists, dashboard_url)` so it is unit-testable
+/// without touching disk. First run (no admin) points at the in-dashboard
+/// setup form; an existing admin points at login + the reset path. Always
+/// names `relix dashboard doctor` so an operator can verify the product loop.
+fn dashboard_login_lines(admin_exists: bool, dashboard_url: &str) -> Vec<String> {
+    let mut out = vec![format!("dashboard:    {dashboard_url}")];
+    if admin_exists {
+        out.push("  log in with your dashboard admin username + password.".to_string());
+        out.push(
+            "  forgot it? run `relix dashboard reset-admin` (local recovery, no secret printed twice)."
+                .to_string(),
+        );
+    } else {
+        out.push(
+            "  first run: open the dashboard and create the admin account (username + password)."
+                .to_string(),
+        );
+        out.push(
+            "  prefer the CLI? `relix dashboard reset-admin` pre-creates/sets the admin locally."
+                .to_string(),
+        );
+    }
+    out.push("  verify the product loop: `relix dashboard doctor`.".to_string());
+    out
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -677,6 +729,27 @@ mod tests {
             k == OsStr::new("RELIX_AI_MODEL") && v == Some(OsStr::new("openai/gpt-oss-120b:free"))
         });
         assert!(found, "expected RELIX_AI_MODEL to be forwarded to mesh-up");
+    }
+
+    #[test]
+    fn boot_hint_first_run_points_at_setup() {
+        let lines = dashboard_login_lines(false, "http://127.0.0.1:19791/dashboard");
+        let joined = lines.join("\n");
+        assert!(joined.contains("http://127.0.0.1:19791/dashboard"));
+        assert!(joined.contains("first run"));
+        assert!(joined.contains("create the admin"));
+        // Always surfaces the verification command.
+        assert!(joined.contains("relix dashboard doctor"));
+    }
+
+    #[test]
+    fn boot_hint_existing_admin_points_at_login_and_reset() {
+        let lines = dashboard_login_lines(true, "http://127.0.0.1:19791/dashboard");
+        let joined = lines.join("\n");
+        assert!(joined.contains("log in"));
+        assert!(joined.contains("reset-admin"));
+        assert!(!joined.contains("first run"));
+        assert!(joined.contains("relix dashboard doctor"));
     }
 
     #[test]

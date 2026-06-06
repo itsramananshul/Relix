@@ -1741,8 +1741,20 @@ echo
 echo "Dashboard:   http://127.0.0.1:$BRIDGE_PORT/dashboard"
 echo "Health:      http://127.0.0.1:$BRIDGE_PORT/health"
 echo "Provider:    $PROVIDER"
-echo "Setup token: $SETUP_TOKEN"
-echo "  ^ paste this into the dashboard's \"Authentication Required\" screen on first load."
+if [ -f "$HOME/.relix/dashboard-admin.json" ]; then
+    echo "  Log in with your dashboard admin username + password."
+    echo "  Forgot it? ./scripts/relix-dashboard-admin-reset.sh  (local recovery; restart the bridge after)."
+else
+    echo "  First run: open the dashboard and CREATE the admin account (username + password)."
+    echo "  Prefer the CLI? ./scripts/relix-dashboard-admin-reset.sh  pre-creates it locally."
+fi
+echo "  Verify the product loop:  ./target/debug/relix-cli dashboard doctor"
+echo
+echo "Advanced (curl/scripts only — NOT the dashboard login):"
+echo "  Setup token: $SETUP_TOKEN"
+echo "  ^ presented as 'Authorization: Bearer <setup_token>' to GET /v1/auth/token to fetch the"
+echo "    bridge bearer for raw HTTP. The browser dashboard does NOT use this — it uses the"
+echo "    admin username/password above."
 echo
 echo "Logs:     $DATA_BASE/*.log"
 echo "PIDs:     ${PIDS[*]}"

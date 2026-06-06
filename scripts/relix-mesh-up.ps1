@@ -1909,8 +1909,30 @@ try {
     }
     Write-Host ""
     Write-Host "Dashboard:   http://127.0.0.1:$BridgePort/dashboard"
-    Write-Host "Setup token: $SetupToken"
-    Write-Host "  ^ paste this into the dashboard's `"Authentication Required`" screen on first load."
+    $AdminFile = Join-Path $env:USERPROFILE '.relix\dashboard-admin.json'
+    if (Test-Path -LiteralPath $AdminFile) {
+        Write-Host "  Log in with your dashboard admin username + password."
+        Write-Host "  Forgot it? .\scripts\relix-dashboard-admin-reset.ps1  (local recovery; restart the bridge after)."
+    }
+    else {
+        Write-Host "  First run: open the dashboard and CREATE the admin account (username + password)."
+        Write-Host "  Prefer the CLI? .\scripts\relix-dashboard-admin-reset.ps1  pre-creates it locally."
+    }
+    Write-Host "  Verify the product loop:  .\target\debug\relix-cli.exe dashboard doctor"
+    Write-Host ""
+    Write-Host "Advanced (curl/scripts only — NOT the dashboard login):"
+    Write-Host "  Setup token: $SetupToken"
+    Write-Host "  ^ presented as 'Authorization: Bearer <setup_token>' to GET /v1/auth/token to fetch the"
+    Write-Host "    bridge bearer for raw HTTP. The browser dashboard does NOT use this — it uses the"
+    Write-Host "    admin username/password above."
+    Write-Host ""
+    Write-Host "Controllers (channels are opt-in and NEVER block boot — a missing token just stays offline):"
+    Write-Host ("  tool         {0}" -f $(if (-not $NoTool) { 'started' } else { 'disabled (-NoTool)' }))
+    Write-Host ("  coordinator  {0}" -f $(if (-not $NoCoordinator) { 'started' } else { 'disabled (-NoCoordinator)' }))
+    Write-Host ("  telegram     {0}" -f $(if ($TelegramEnabled) { 'started' } else { 'disabled (set RELIX_TELEGRAM=1)' }))
+    Write-Host ("  discord      {0}" -f $(if ($DiscordEnabled) { 'started' } else { 'disabled (set RELIX_DISCORD=1)' }))
+    Write-Host ("  slack        {0}" -f $(if ($SlackEnabled) { 'started' } else { 'disabled (set RELIX_SLACK=1)' }))
+    Write-Host ("  plugin_host  {0}" -f $(if ($PluginsEnabled) { 'started' } else { 'disabled (set RELIX_PLUGINS=1)' }))
     Write-Host ""
     Write-Host "Open WebUI config:"
     Write-Host "  API Base URL: http://127.0.0.1:$BridgePort/v1"
