@@ -520,6 +520,29 @@ async fn brief_suggestion_routes_round_trip_open_list_respond() {
                             retry_hint: 0,
                             retry_after: None,
                         })
+                    } else if arg.contains("|bix_approval|") {
+                        // The accept materializes a child in a category that
+                        // needs an operator approval first — the coordinator
+                        // mints an approval_id and refuses with APPROVAL_REQUIRED.
+                        // Not a denial: admissible once approved, so the bridge
+                        // must surface a 428 (precondition), NOT a 403 or 502.
+                        HandlerOutcome::Err(ErrorEnvelope {
+                            kind: error_kinds::APPROVAL_REQUIRED,
+                            cause: "approval_required:apr-bix-9c2".into(),
+                            retry_hint: 0,
+                            retry_after: None,
+                        })
+                    } else if arg.contains("|bix_budget|") {
+                        // The accepter's cost cap is exhausted with
+                        // action_on_exceed = "reject" — a typed RESOURCE_EXHAUSTED
+                        // the bridge must surface as a 429 quota error, NOT a 502.
+                        HandlerOutcome::Err(ErrorEnvelope {
+                            kind: error_kinds::RESOURCE_EXHAUSTED,
+                            cause: "budget:reject:agent founder over cap 120/100 resets 2026-06-07T00:00:00Z"
+                                .into(),
+                            retry_hint: 0,
+                            retry_after: None,
+                        })
                     } else {
                         HandlerOutcome::Ok(
                             serde_json::to_vec(&serde_json::json!({ "created": ["c1", "c2"] }))
@@ -755,6 +778,68 @@ addr = "{addr}"
             .unwrap_or_default()
             .contains("out of assign scope"),
         "the 403 body must preserve the governance refusal reason"
+    );
+
+    // ─── an approval-required accept (coordinator APPROVAL_REQUIRED) → 428 ───
+    // The child needs an operator approval first; the coordinator mints an
+    // approval_id and refuses with APPROVAL_REQUIRED (kind 19). This is NOT a
+    // denial — it is admissible once approved — so the bridge must surface a
+    // 428 (precondition required), not a 403 and certainly not a 502.
+    let approval_url =
+        format!("http://{bound}/v1/spine/briefs/task_1/suggestions/bix_approval/respond");
+    let resp = timeout(
+        Duration::from_secs(15),
+        http.post(&approval_url)
+            .json(&serde_json::json!({ "responder": "founder", "accept": true }))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        428,
+        "an approval-required gate must surface as a 428, not a 403 or 502"
+    );
+    // The minted approval_id rides in the preserved cause so the client can
+    // decide it and retry.
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body.get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("apr-bix-9c2"),
+        "the 428 body must preserve the approval_id from the cause"
+    );
+
+    // ─── a budget-exhausted accept (coordinator RESOURCE_EXHAUSTED) → 429 ───
+    // The accepter's cost cap is exhausted with action_on_exceed = "reject";
+    // the coordinator refuses with RESOURCE_EXHAUSTED (kind 22). The bridge
+    // must surface a 429 quota error, not a 502 upstream-failure.
+    let budget_url =
+        format!("http://{bound}/v1/spine/briefs/task_1/suggestions/bix_budget/respond");
+    let resp = timeout(
+        Duration::from_secs(15),
+        http.post(&budget_url)
+            .json(&serde_json::json!({ "responder": "founder", "accept": true }))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        429,
+        "a budget cap must surface as a 429 quota error, not a 502"
+    );
+    // The limit / reset reason rides in the preserved cause.
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body.get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("over cap 120/100"),
+        "the 429 body must preserve the budget limit reason"
     );
 
     // ─── bridge-level validation: no children → 400, no peer call ───

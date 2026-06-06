@@ -1988,6 +1988,19 @@ fn json_passthrough(body: Vec<u8>) -> Result<Response, (StatusCode, Json<ApiErro
 ///   case the assignee-hint smoke hit: an assign-denied `POLICY_DENIED`
 ///   (kind 6) was surfacing as a 502, making a client governance refusal
 ///   look like an upstream outage;
+/// - an **approval-required** gate (`APPROVAL_REQUIRED`) is **428 Precondition
+///   Required** — deliberately NOT a 403. It is not a refusal: the call is
+///   *admissible once an operator approves it*. The coordinator has already
+///   minted an `approval_id` (carried in the `cause` as
+///   `approval_required:<id>`); the caller satisfies the precondition by
+///   deciding the approval, then retries the same call with an
+///   `approval_token`. Folding this into the 403 denial bucket would tell the
+///   dashboard "you may never do this," which is the opposite of the truth;
+/// - a **budget cap** (`RESOURCE_EXHAUSTED`) is **429 Too Many Requests** —
+///   matching the bridge/channel convention for quota exhaustion. The agent
+///   or deployment cost cap is configured `action_on_exceed = "reject"`; the
+///   `cause` (`budget:reject:…`) carries the limit / actual / reset so the
+///   client can surface a useful "out of allowance" message and back off;
 /// - everything else (transport, timeout, peer-unreachable, responder
 ///   internal, unknown method, …) stays **502**, so a TRUE upstream /
 ///   mesh failure is never masked as a client error. Bridge-identity
@@ -2007,6 +2020,14 @@ fn coordinator_err_status(kind: u32, cause: &str) -> StatusCode {
         || kind == ek::SECURITY_DENIED
     {
         StatusCode::FORBIDDEN
+    } else if kind == ek::APPROVAL_REQUIRED {
+        // Not a denial: admissible once approved. 428 says "satisfy the
+        // approval precondition, then retry" — distinct from 403.
+        StatusCode::PRECONDITION_REQUIRED
+    } else if kind == ek::RESOURCE_EXHAUSTED {
+        // Budget/allowance cap hit — a quota-exhaustion condition, the
+        // bridge's standing convention for which is 429.
+        StatusCode::TOO_MANY_REQUESTS
     } else {
         StatusCode::BAD_GATEWAY
     }
@@ -2129,6 +2150,33 @@ mod tests {
         assert_eq!(
             coordinator_err_status(ek::INVALID_ARGS, "suggestion already resolved"),
             StatusCode::BAD_REQUEST,
+        );
+
+        // An approval-required gate is a 428, NOT a 403 — the call is
+        // admissible once an operator approves it, not refused outright.
+        // The `approval_id` rides in the preserved cause text.
+        assert_eq!(
+            coordinator_err_status(ek::APPROVAL_REQUIRED, "approval_required:apr-7f3"),
+            StatusCode::PRECONDITION_REQUIRED,
+        );
+        // A budget cap is a 429 quota-exhaustion, not a 502 — the limit /
+        // reset reason rides in the preserved `budget:reject:…` cause.
+        assert_eq!(
+            coordinator_err_status(
+                ek::RESOURCE_EXHAUSTED,
+                "budget:reject:agent acme over cap 100/120 resets 2026-06-07T00:00:00Z",
+            ),
+            StatusCode::TOO_MANY_REQUESTS,
+        );
+        // Not-found still wins over both of the new kinds, so a tenant-gated
+        // resource never leaks its existence behind a 428/429 either.
+        assert_eq!(
+            coordinator_err_status(ek::APPROVAL_REQUIRED, "brief not found"),
+            StatusCode::NOT_FOUND,
+        );
+        assert_eq!(
+            coordinator_err_status(ek::RESOURCE_EXHAUSTED, "agent not found"),
+            StatusCode::NOT_FOUND,
         );
 
         // A not-found cause stays a 404 — and that wins even over a denial
