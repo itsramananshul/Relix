@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Link } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import { api, tryGet } from "../api";
 import { asArray, extractList, Section, useAsync } from "../components/common";
 import { BriefDetail } from "../components/BriefDetail";
@@ -115,8 +115,24 @@ export function Briefs() {
   const [priority, setPriority] = useState("normal");
   const [mandateFilter, setMandateFilter] = useState("all");
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
-  // The Brief whose detail/Chronicle panel is open (null = none).
-  const [selected, setSelected] = useState<string | null>(null);
+  // The open Brief detail/Chronicle panel is URL-driven (`/briefs?brief=<id>`),
+  // so the Action Center's ready/blocked/stale cards (and any shared deep link)
+  // land on the exact Brief — selected, highlighted, and scrolled into view —
+  // mirroring the Runs page's `?run=` pattern. Writing the param preserves any
+  // other query params already present.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const selected = searchParams.get("brief");
+  function setSelected(id: string | null) {
+    const next = new URLSearchParams(searchParams);
+    if (id) next.set("brief", id);
+    else next.delete("brief");
+    setSearchParams(next, { replace: true });
+  }
+  // Scroll the deep-linked / selected card into view once the board has
+  // rendered it. If the Brief is not in the loaded board (filtered out or
+  // beyond the page), the ref stays null and we simply leave the board as-is —
+  // the detail panel still opens (it fetches the Brief by id on its own).
+  const selectedRef = useRef<HTMLDivElement | null>(null);
 
   const { data, loading, error, reload } = useAsync(async () => {
     const byCol: Record<string, Card[]> = {};
@@ -231,6 +247,14 @@ export function Briefs() {
 
   const initialized = operatives.length > 0;
 
+  // After the board renders (data load or reload), bring the selected card into
+  // view. `block: "nearest"` avoids jumping when it is already visible.
+  useEffect(() => {
+    if (selected && selectedRef.current) {
+      selectedRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [selected, data]);
+
   return (
     <div className="grid">
       <Section
@@ -331,7 +355,11 @@ export function Briefs() {
                     const block = runBlock(c);
                     const mTitle = c.mandate_id ? (mandateTitle.get(c.mandate_id) || c.mandate_id.slice(0, 8)) : null;
                     return (
-                      <div className={"board-card" + (selected === cardId(c) ? " selected" : "")} key={cardId(c)}>
+                      <div
+                        className={"board-card" + (selected === cardId(c) ? " selected" : "")}
+                        key={cardId(c)}
+                        ref={selected === cardId(c) ? selectedRef : undefined}
+                      >
                         <div
                           className="t"
                           style={{ cursor: "pointer" }}

@@ -2160,7 +2160,7 @@ pub fn handle_strategy_reject(spine_store: &SpineStore, ctx: &InvocationCtx) -> 
 /// `missing_roles` (proposed roles with no identity yet, plus roles
 /// whose hire is disabled), `pending_clearances` (`{clearance_id,
 /// status}`), `active_agents` (`{role, agent_id}` now active),
-/// `pending_hires` (`{role, agent_id, status}` not yet active),
+/// `pending_hires` (`{role, agent_id, status, suggested_rig}` not yet active),
 /// `blocked_roles` (`{role, reason}` from denials), `readiness`
 /// (`not_planned` / `awaiting_clearance` / `staffing` / `ready`), and
 /// `next_action`.
@@ -2175,7 +2175,9 @@ pub(crate) struct ReadinessView {
     pub pending_clearances: Vec<serde_json::Value>,
     /// `(role, agent_id)` for hires that are now `active`.
     pub active_agents: Vec<(String, String)>,
-    /// `{role, agent_id, status}` for hires not yet active.
+    /// `{role, agent_id, status, suggested_rig}` for hires not yet active.
+    /// `suggested_rig` is the safe-local Rig to approve the hire on so it is
+    /// immediately runnable (same as the Action Center `hire` card).
     pub pending_hires: Vec<serde_json::Value>,
     /// `{role, reason}` for denied/disabled roles.
     pub blocked_roles: Vec<serde_json::Value>,
@@ -2286,8 +2288,15 @@ pub(crate) fn compute_readiness(
                     "reason": format!("hire {agent_id} is {status}"),
                 }));
             }
+            // Carry the safe-local Rig the operator should approve this hire on
+            // so the seat is immediately runnable — the SAME guidance the
+            // Action Center `hire` card emits (company-model §12.6). Never a
+            // paid/interactive CLI; never a secret — just the public Rig name.
             other => pending_hires.push(serde_json::json!({
-                "role": role, "agent_id": agent_id, "status": other,
+                "role": role,
+                "agent_id": agent_id,
+                "status": other,
+                "suggested_rig": crate::rig::SAFE_LOCAL_RIG,
             })),
         }
     }
@@ -7982,6 +7991,30 @@ mod tests {
         assert_eq!(r["readiness"], "staffing");
         assert_eq!(r["active_agents"].as_array().unwrap().len(), 1);
         assert_eq!(r["pending_hires"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn team_readiness_pending_hires_carry_the_safe_local_suggested_rig() {
+        // A pending hire must carry `suggested_rig` so the Mandate page approves
+        // it on backend guidance (the safe-local `echo`) instead of hardcoding —
+        // the SAME guidance the Action Center `hire` card emits (company-model
+        // §12.6). Only `echo`: never a paid/interactive CLI, never a secret.
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let m = approved_mandate(&spine);
+        // qa is genuinely missing → a minted (pending) hire.
+        let arg = format!("{m}|build|qa:subj-q");
+        json(handle_team_plan(&agents, &spine, &fake_ctx(arg.as_bytes())));
+        let r = json(handle_team_readiness(&agents, &spine, &fake_ctx(m.as_bytes())));
+        let hires = r["pending_hires"].as_array().unwrap();
+        assert_eq!(hires.len(), 1, "qa is a pending hire: {r}");
+        assert_eq!(hires[0]["role"], "qa");
+        assert_eq!(
+            hires[0]["suggested_rig"], crate::rig::SAFE_LOCAL_RIG,
+            "pending hire carries the safe-local suggested Rig: {r}"
+        );
+        // The suggested Rig is exactly the safe-local `echo` — never paid.
+        assert_eq!(hires[0]["suggested_rig"], "echo");
     }
 
     #[test]

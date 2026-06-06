@@ -588,7 +588,10 @@ pub fn ready_item(c: &BriefCard) -> ActionItem {
         target_id: Some(c.task_id.clone()),
         target_title: Some(snippet(&c.title)),
         action_label: "Start the Brief".to_string(),
-        route: Some("/briefs".to_string()),
+        // Carry the Brief id so the dashboard lands on THIS Brief on the board
+        // (selects + scrolls to it), mirroring the strategy card's
+        // `/mandates?mandate=` deep link instead of an unselected list.
+        route: Some(format!("/briefs?brief={}", c.task_id)),
         created_at: None,
         updated_at: None,
         action_api: None,
@@ -599,17 +602,20 @@ pub fn ready_item(c: &BriefCard) -> ActionItem {
 /// A Brief that cannot start: blocked on a dependency, or missing an assignee.
 /// `unassigned` distinguishes the two so the reason + action are honest.
 pub fn blocked_item(c: &BriefCard, unassigned: bool) -> ActionItem {
+    // Deep-link to THIS Brief on the board so the operator lands on the exact
+    // card to assign/unblock (mirrors the ready + strategy deep links).
+    let brief_route = Some(format!("/briefs?brief={}", c.task_id));
     let (reason, action_label, route) = if unassigned {
         (
             "no Operative assigned — assign one (or approve a hire) so it can run".to_string(),
             "Assign an Operative".to_string(),
-            Some("/briefs".to_string()),
+            brief_route,
         )
     } else {
         (
             "blocked on a dependency Brief — resolve the blocker".to_string(),
             "Resolve the blocker".to_string(),
-            Some("/briefs".to_string()),
+            brief_route,
         )
     };
     ActionItem {
@@ -645,7 +651,8 @@ pub fn stale_item(c: &BriefCard) -> ActionItem {
         target_id: Some(c.task_id.clone()),
         target_title: Some(snippet(&c.title)),
         action_label: "Review the stalled Brief".to_string(),
-        route: Some("/briefs".to_string()),
+        // Deep-link to THIS Brief on the board (select + scroll), not the list.
+        route: Some(format!("/briefs?brief={}", c.task_id)),
         created_at: None,
         updated_at: None,
         action_api: None,
@@ -691,7 +698,9 @@ fn recovery_reco(r: &RunRecord) -> (String, String, String) {
             "unassigned" => (
                 "the Shift was refused — no Operative is assigned to this Brief".to_string(),
                 "Assign an Operative".to_string(),
-                "/briefs".to_string(),
+                // Land on THIS Brief on the board so the operator assigns it
+                // directly (mirrors the ready/blocked Brief deep links).
+                format!("/briefs?brief={}", r.brief_id),
             ),
             "no_adapter" => (
                 "the Shift was refused — the configured Rig is not installed".to_string(),
@@ -928,7 +937,8 @@ mod tests {
         // Each durable refusal reason → a STABLE recommended action + the
         // existing governed route that fixes it.
         let cases = [
-            ("unassigned", "Assign an Operative", "/briefs"),
+            // `unassigned` is fixed on the board, so it deep-links to the Brief.
+            ("unassigned", "Assign an Operative", "/briefs?brief=brief-1"),
             ("no_adapter", "Configure the Rig", "/settings"),
             ("adapter_unavailable", "Configure the Rig", "/settings"),
             ("over_allowance", "Raise the Allowance", "/agents"),
@@ -965,6 +975,42 @@ mod tests {
         assert_eq!(it.target_type.as_deref(), Some("mandate"));
         assert_eq!(it.target_id.as_deref(), Some("mand-42"));
         assert_eq!(it.route.as_deref(), Some("/mandates?mandate=mand-42"));
+    }
+
+    fn brief_card(task_id: &str, title: &str, board_status: &str) -> BriefCard {
+        BriefCard {
+            task_id: task_id.to_string(),
+            title: title.to_string(),
+            board_status: board_status.to_string(),
+            priority: "normal".to_string(),
+            assignee_agent_id: None,
+            mandate_id: None,
+            campaign_id: None,
+        }
+    }
+
+    #[test]
+    fn brief_cards_deep_link_to_the_exact_brief_on_the_board() {
+        // ready / blocked / stale all point at a specific Brief, so each must
+        // carry the Brief id in its route (`/briefs?brief=<id>`) — landing the
+        // operator on the exact card to act, not the bare board (mirrors the
+        // strategy card's `/mandates?mandate=` deep link).
+        let c = brief_card("brf-7", "Wire the login form", "todo");
+
+        let ready = ready_item(&c);
+        assert_eq!(ready.category, ActionCategory::ReadyToStart);
+        assert_eq!(ready.target_type.as_deref(), Some("brief"));
+        assert_eq!(ready.target_id.as_deref(), Some("brf-7"));
+        assert_eq!(ready.route.as_deref(), Some("/briefs?brief=brf-7"));
+
+        // Both blocked variants (unassigned + dependency) deep-link the Brief.
+        let unassigned = blocked_item(&c, true);
+        assert_eq!(unassigned.route.as_deref(), Some("/briefs?brief=brf-7"));
+        let dep_blocked = blocked_item(&c, false);
+        assert_eq!(dep_blocked.route.as_deref(), Some("/briefs?brief=brf-7"));
+
+        let stale = stale_item(&c);
+        assert_eq!(stale.route.as_deref(), Some("/briefs?brief=brf-7"));
     }
 
     #[test]
