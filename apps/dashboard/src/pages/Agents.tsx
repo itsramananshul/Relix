@@ -218,6 +218,55 @@ export function Agents() {
     }
   }
 
+  // Greenlight a pending hire directly (company-model §12.6): approve + bind
+  // the safe-local `echo` Rig atomically so the now-active Operative is
+  // immediately runnable. This is the governed `route=direct` affordance — a
+  // clearance-gated hire is refused server-side, and we surface that honestly
+  // with a pointer to decide its Clearance on Mandates.
+  async function approveHire(agentId: string, name?: string) {
+    setBanner(null);
+    setBusy(true);
+    try {
+      const r = await api.post<{ runnable?: boolean; rig?: string; needs_rig?: boolean }>(
+        `/v1/agents/${encodeURIComponent(agentId)}/approve-hire`,
+        { rig: "echo" },
+      );
+      setBanner({
+        kind: "ok",
+        msg: r.needs_rig
+          ? `${name ?? "Operative"} hired — set an adapter to make it runnable.`
+          : `${name ?? "Operative"} hired and runnable on the ${r.rig ?? "echo"} adapter.`,
+      });
+      reload();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Approve hire failed";
+      setBanner({
+        kind: "err",
+        msg: /clearance/i.test(msg)
+          ? `${msg} — this hire needs a Clearance; decide it on the Mandates page.`
+          : msg,
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Decline a pending hire (pending → disabled). The role stays unfilled so the
+  // team plan can re-propose or the operator can hire someone else.
+  async function rejectHire(agentId: string, name?: string) {
+    setBanner(null);
+    setBusy(true);
+    try {
+      await api.post(`/v1/agents/${encodeURIComponent(agentId)}/reject-hire`, {});
+      setBanner({ kind: "ok", msg: `${name ?? "Hire"} declined — the role is left unfilled.` });
+      reload();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Reject hire failed" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function setRig(agentId: string, rig: string) {
     const adapter = byName.get(rig);
     const avail = adapter?.probe?.status === "available";
@@ -475,23 +524,45 @@ export function Agents() {
           <div className="row" style={{ marginBottom: 8 }}>
             <h3 style={{ margin: 0 }}>Pending hires</h3>
             <span className="muted" style={{ fontSize: 12, marginLeft: 8 }}>
-              {pendingHires.length} awaiting approval — greenlight on the Mandates page
+              {pendingHires.length} awaiting approval — approve to make it runnable, or decline
             </span>
             <span className="spacer" style={{ flex: 1 }} />
             <Link to="/mandates" className="link" style={{ fontSize: 12 }}>Clearances →</Link>
           </div>
           <div className="table-scroll">
             <table className="table">
-              <thead><tr><th>Operative</th><th>Role</th><th>Reports to</th><th>Status</th></tr></thead>
+              <thead><tr><th>Operative</th><th>Role</th><th>Reports to</th><th>Status</th><th style={{ textAlign: "right" }}>Decision</th></tr></thead>
               <tbody>
-                {pendingHires.map((a, i) => (
-                  <tr key={a.agent_id ?? i}>
-                    <td><strong>{a.name ?? (a.agent_id ?? "").slice(0, 10)}</strong><div className="mono" style={{ fontSize: 10 }}>{(a.agent_id ?? "").slice(0, 12)}</div></td>
-                    <td className="dim">{a.role ?? a.title ?? "—"}</td>
-                    <td className="muted">{nameOf(a.reports_to) ?? "—"}</td>
-                    <td><Badge status={a.status ?? "pending"} /></td>
-                  </tr>
-                ))}
+                {pendingHires.map((a, i) => {
+                  const id = a.agent_id ?? "";
+                  return (
+                    <tr key={id || i}>
+                      <td><strong>{a.name ?? id.slice(0, 10)}</strong><div className="mono" style={{ fontSize: 10 }}>{id.slice(0, 12)}</div></td>
+                      <td className="dim">{a.role ?? a.title ?? "—"}</td>
+                      <td className="muted">{nameOf(a.reports_to) ?? "—"}</td>
+                      <td><Badge status={a.status ?? "pending"} /></td>
+                      <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+                        <button
+                          className="btn sm"
+                          disabled={busy || !id}
+                          title="Approve this hire and bind the safe-local echo adapter so it is immediately runnable"
+                          onClick={() => approveHire(id, a.name)}
+                        >
+                          Approve · echo
+                        </button>
+                        <button
+                          className="btn ghost sm"
+                          style={{ marginLeft: 6 }}
+                          disabled={busy || !id}
+                          title="Decline this hire (the role is left unfilled)"
+                          onClick={() => rejectHire(id, a.name)}
+                        >
+                          Reject
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

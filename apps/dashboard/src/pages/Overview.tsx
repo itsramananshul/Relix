@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { subscribeRunEvents, tryGet, tryGetReport } from "../api";
+import { api, subscribeRunEvents, tryGet, tryGetReport } from "../api";
 import { Badge, extractList, useAsync } from "../components/common";
 import { HealthPanel } from "../components/HealthPanel";
 
@@ -67,6 +67,13 @@ interface ActionItem {
   target_title?: string;
   action_label?: string;
   route?: string;
+  // A machine-actionable endpoint the client can POST to directly (vs. the
+  // human `route`). Today only the `hire` card sets it
+  // (`POST /v1/agents/:id/approve-hire`), so the Inbox can approve inline.
+  action_api?: string;
+  // The safe-local Rig to pass when acting on this item (the `hire` card
+  // suggests `echo` so the approved Operative is immediately runnable).
+  suggested_rig?: string;
 }
 interface CompanyActions {
   actions?: ActionItem[];
@@ -152,28 +159,30 @@ export function Overview() {
   // load state and only updates on a SUCCESSFUL fetch, so a transient blip can
   // never blank it. The rest of the Overview stays a mount-load snapshot.
   const [liveActions, setLiveActions] = useState<CompanyActions | null>(null);
+  // Refetch ONLY the Action Center feed (success-only → never clobber with
+  // null, so a transient blip can't blank it). Shared by the SSE/poll effect
+  // below AND the inline Approve/Reject handlers, so acting on a hire updates
+  // the feed immediately.
+  const refreshActions = useCallback(async () => {
+    const a = await tryGet<CompanyActions | null>("/v1/spine/company/actions", null);
+    if (a) setLiveActions(a);
+  }, []);
   useEffect(() => {
-    let on = true;
     let debounce: ReturnType<typeof setTimeout> | null = null;
-    const refresh = async () => {
-      const a = await tryGet<CompanyActions | null>("/v1/spine/company/actions", null);
-      if (on && a) setLiveActions(a); // success-only → never clobber with null
-    };
     // Coalesce run-event bursts into one refresh ~1.2s later.
     const ping = () => {
       if (debounce) clearTimeout(debounce);
-      debounce = setTimeout(refresh, 1200);
+      debounce = setTimeout(refreshActions, 1200);
     };
     // onConn is required by the API but the badge isn't surfaced here; ignore it.
     const unsub = subscribeRunEvents(ping, () => {});
-    const poll = setInterval(refresh, 20000); // convergence fallback (bounded)
+    const poll = setInterval(refreshActions, 20000); // convergence fallback (bounded)
     return () => {
-      on = false;
       if (debounce) clearTimeout(debounce);
       clearInterval(poll);
       unsub();
     };
-  }, []);
+  }, [refreshActions]);
 
   const board = data?.board ?? {};
   const inbox = data?.inbox ?? {};
@@ -337,7 +346,13 @@ export function Overview() {
       )}
       {/* Action Center — the one place for what needs the operator now. Prefers
           the live-refreshed feed, falling back to the mount-load snapshot. */}
-      {initialized && <ActionCenter data={liveActions ?? data?.actions ?? null} loading={loading} />}
+      {initialized && (
+        <ActionCenter
+          data={liveActions ?? data?.actions ?? null}
+          loading={loading}
+          onActed={() => { void refreshActions(); reload(); }}
+        />
+      )}
       {/* Active work — the latest Prime session's live Shift Room, compact. */}
       {data?.session && <ActiveWork session={data.session} />}
       {/* Setup & warnings — one scannable card, not a tower of banners. */}
@@ -526,7 +541,62 @@ const CAT_LABEL: Record<string, string> = {
 // The Action Center — one ordered, deduped feed of what needs the operator,
 // computed server-side from live state (company-model §8.2). Each row links to
 // the existing route that performs the action; nothing is mutated here.
-function ActionCenter({ data, loading }: { data: CompanyActions | null; loading: boolean }) {
+function ActionCenter({
+  data,
+  loading,
+  onActed,
+}: {
+  data: CompanyActions | null;
+  loading: boolean;
+  onActed: () => void;
+}) {
+  // Which item is mid-decision (its target_id), and the last inline result —
+  // so a hire can be approved/rejected without leaving the Inbox (design §5).
+  const [acting, setActing] = useState<string | null>(null);
+  const [note, setNote] = useState<{ kind: string; msg: string } | null>(null);
+
+  // Approve a pending hire inline with its suggested safe-local Rig so the
+  // Operative is immediately runnable (company-model §12.6); a clearance-gated
+  // hire is refused server-side and we say so.
+  async function approveHire(a: ActionItem) {
+    if (!a.target_id) return;
+    setActing(a.target_id);
+    setNote(null);
+    try {
+      const r = await api.post<{ runnable?: boolean; rig?: string; needs_rig?: boolean }>(
+        `/v1/agents/${encodeURIComponent(a.target_id)}/approve-hire`,
+        a.suggested_rig ? { rig: a.suggested_rig } : {},
+      );
+      setNote({
+        kind: "ok",
+        msg: r.needs_rig
+          ? `${a.target_title ?? "Operative"} hired — set an adapter to make it runnable.`
+          : `${a.target_title ?? "Operative"} hired and runnable on ${r.rig ?? a.suggested_rig ?? "echo"}.`,
+      });
+      onActed();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Approve hire failed";
+      setNote({ kind: "err", msg: /clearance/i.test(msg) ? `${msg} — decide its Clearance on Mandates.` : msg });
+    } finally {
+      setActing(null);
+    }
+  }
+
+  async function rejectHire(a: ActionItem) {
+    if (!a.target_id) return;
+    setActing(a.target_id);
+    setNote(null);
+    try {
+      await api.post(`/v1/agents/${encodeURIComponent(a.target_id)}/reject-hire`, {});
+      setNote({ kind: "ok", msg: `${a.target_title ?? "Hire"} declined — the role is left unfilled.` });
+      onActed();
+    } catch (e) {
+      setNote({ kind: "err", msg: e instanceof Error ? e.message : "Reject hire failed" });
+    } finally {
+      setActing(null);
+    }
+  }
+
   const actions = data?.actions ?? [];
   const total = data?.counts?.total ?? actions.length;
   const high = data?.counts?.by_severity?.high ?? 0;
@@ -537,6 +607,7 @@ function ActionCenter({ data, loading }: { data: CompanyActions | null; loading:
         <div className="row" style={{ marginBottom: 6, alignItems: "center" }}>
           <h3 style={{ margin: 0 }}>Action Center</h3>
         </div>
+        {note && <div className={"banner " + note.kind} style={{ fontSize: 12 }}>{note.msg}</div>}
         <div className="empty">Nothing needs you right now — the company is moving on its own.</div>
       </div>
     );
@@ -563,9 +634,16 @@ function ActionCenter({ data, loading }: { data: CompanyActions | null; loading:
         <div className="spacer" style={{ flex: 1 }} />
         <span className="muted" style={{ fontSize: 12 }}>computed from live state</span>
       </div>
+      {note && <div className={"banner " + note.kind} style={{ fontSize: 12 }}>{note.msg}</div>}
       <table className="table compact">
         <tbody>
-          {shown.map((a, i) => (
+          {shown.map((a, i) => {
+            // A direct hire is machine-actionable here (`action_api` set) — let
+            // the operator Approve (with the safe-local Rig) / Reject without
+            // leaving the Inbox (design §5: "inline Approve/Reject").
+            const inlineHire = a.category === "hire" && !!a.action_api && !!a.target_id;
+            const isActing = acting === a.target_id;
+            return (
             <tr key={a.id ?? i}>
               <td style={{ width: 64 }}>
                 <span className={"badge " + (SEV_TONE[a.severity ?? ""] ?? "todo")} style={{ fontSize: 9 }}>
@@ -577,14 +655,35 @@ function ActionCenter({ data, loading }: { data: CompanyActions | null; loading:
                 {a.reason && <div className="muted" style={{ fontSize: 11 }}>{a.reason}</div>}
               </td>
               <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
-                {a.route ? (
+                {inlineHire ? (
+                  <>
+                    <button
+                      className="btn sm"
+                      disabled={isActing}
+                      title={`Approve this hire on the safe-local ${a.suggested_rig ?? "echo"} adapter so it is immediately runnable`}
+                      onClick={() => approveHire(a)}
+                    >
+                      {isActing ? "…" : `Approve · ${a.suggested_rig ?? "echo"}`}
+                    </button>
+                    <button
+                      className="btn ghost sm"
+                      style={{ marginLeft: 6 }}
+                      disabled={isActing}
+                      title="Decline this hire (the role is left unfilled)"
+                      onClick={() => rejectHire(a)}
+                    >
+                      Reject
+                    </button>
+                  </>
+                ) : a.route ? (
                   <Link to={a.route} className="btn sm ghost">{a.action_label ?? "Open"} →</Link>
                 ) : (
                   <span className="muted" style={{ fontSize: 11 }}>{a.action_label}</span>
                 )}
               </td>
             </tr>
-          ))}
+            );
+          })}
         </tbody>
       </table>
       {(actions.length > shown.length || data?.truncated) && (
