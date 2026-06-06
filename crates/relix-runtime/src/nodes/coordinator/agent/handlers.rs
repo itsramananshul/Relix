@@ -519,6 +519,232 @@ pub fn handle_prime_proposal_get(spine_store: &SpineStore, ctx: &InvocationCtx) 
     }
 }
 
+/// Default cap on how many Briefs a single `prime.start` call dispatches —
+/// ready Briefs beyond it are reported skipped (never silently dropped) and a
+/// repeat call continues. Overridable per call via `proposal_id|max`.
+const DEFAULT_PRIME_START_CAP: usize = 16;
+
+/// `prime.start` — Start-to-Shift (company-model §12.5B). Turns an APPROVED
+/// Prime proposal into running **Shifts** by funneling its READY Briefs
+/// through the SAME run chokepoint as `brief.run`
+/// ([`heartbeat::preflight_and_spawn`]). It creates no Mandate/Brief/hire and
+/// changes no budget — it only RUNS Briefs that are already assigned to an
+/// active Operative, unblocked, and not already claimed/running. It is
+/// operator-initiated + sovereign (a `manual`-trigger run, like `brief.run`;
+/// the single-owner Claim prevents double-work). Every created Brief that is
+/// NOT started is returned with an honest reason. Records an Orchestration run
+/// (`mode:"start"`) on the Mandate + a `prime.work_started` Chronicle event on
+/// each started Brief. Arg: `proposal_id` (optionally `proposal_id|max`).
+/// Tenant-gated: a non-approved / unknown / cross-Guild proposal is refused.
+pub fn handle_prime_start(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &Arc<TaskStore>,
+    registry: &crate::rig::RigRegistry,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("prime.start utf8: {e}")),
+    };
+    if raw.is_empty() {
+        return invalid("prime.start: proposal_id required".into());
+    }
+    // `proposal_id` or `proposal_id|max`.
+    let mut parts = raw.splitn(2, '|');
+    let proposal_id = parts.next().unwrap_or("").trim();
+    let max_start: usize = parts
+        .next()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(DEFAULT_PRIME_START_CAP);
+    if proposal_id.is_empty() {
+        return invalid("prime.start: proposal_id required".into());
+    }
+    let tenant = ctx.tenant_id_or_default();
+    let row = match spine_store.get_prime_proposal(tenant, proposal_id) {
+        Ok(Some(r)) => r,
+        // Unknown OR cross-tenant → not found (no existence leak).
+        Ok(None) => return invalid(format!("proposal not found: {proposal_id}")),
+        Err(e) => return internal(format!("prime.start load: {e}")),
+    };
+    if row.status != "approved" {
+        return invalid(format!(
+            "proposal {proposal_id} is `{}` — approve it before starting work",
+            row.status
+        ));
+    }
+    let created: Vec<String> = serde_json::from_str(&row.created_brief_ids).unwrap_or_default();
+    if created.is_empty() {
+        let body = serde_json::json!({
+            "proposal_id": proposal_id, "mandate_id": row.mandate_id,
+            "started": [], "skipped": [],
+        });
+        return match serde_json::to_vec(&body) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("prime.start encode: {e}")),
+        };
+    }
+
+    // Canonical readiness set: assigned to an active Operative, unblocked, not
+    // already claimed/running (a generous batch so we see all the ready Briefs).
+    let ready_ids: std::collections::HashSet<String> = task_store
+        .list_ready_briefs(500)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| c.task_id)
+        .collect();
+
+    // Classify each created Brief → a Start readiness (the skip reason is pure,
+    // in `prime::StartReadiness`).
+    let mut items: Vec<(String, prime::StartReadiness)> = Vec::with_capacity(created.len());
+    for id in &created {
+        let readiness = if ready_ids.contains(id) {
+            prime::StartReadiness::Ready
+        } else {
+            match task_store.brief_card(id) {
+                Ok(Some(card)) => match card.board_status.as_str() {
+                    "done" | "in_review" => prime::StartReadiness::Complete,
+                    "cancelled" => prime::StartReadiness::Cancelled,
+                    "blocked" => prime::StartReadiness::Blocked,
+                    _ => {
+                        if card.assignee_agent_id.as_deref().unwrap_or("").is_empty() {
+                            prime::StartReadiness::Unassigned
+                        } else {
+                            prime::StartReadiness::NotReady
+                        }
+                    }
+                },
+                _ => prime::StartReadiness::Missing,
+            }
+        };
+        items.push((id.clone(), readiness));
+    }
+
+    let (mut to_start, mut skipped) = prime::partition_start(&items);
+
+    // Honor the per-call start cap WITHOUT silently dropping the rest.
+    if to_start.len() > max_start {
+        let deferred = to_start.split_off(max_start);
+        for id in deferred {
+            skipped.push(prime::SkippedBrief {
+                brief_id: id,
+                reason: format!(
+                    "not started this batch (start cap {max_start} reached) — start again to continue"
+                ),
+            });
+        }
+    }
+
+    // Start each ready Brief through the SHARED chokepoint.
+    let bridge_tokens = crate::rig::bridge::BridgeTokenStore::global();
+    let mut started: Vec<serde_json::Value> = Vec::new();
+    let mut started_ids: Vec<String> = Vec::new();
+    for brief_id in &to_start {
+        // Resolve the assignee's preferred Rig + charter (exactly as brief.run).
+        let (preferred, charter, assignee) = match task_store.brief_card(brief_id) {
+            Ok(Some(card)) => {
+                let assignee = card.assignee_agent_id.clone().unwrap_or_default();
+                let agent = card
+                    .assignee_agent_id
+                    .as_deref()
+                    .and_then(|a| agent_store.get_agent(a).ok().flatten());
+                (
+                    agent.as_ref().and_then(|a| a.rig.clone()),
+                    agent
+                        .map(|a| a.instruction_bundle)
+                        .filter(|c| !c.trim().is_empty()),
+                    assignee,
+                )
+            }
+            _ => (None, None, String::new()),
+        };
+        let prompt = task_store.compose_brief_prompt_with_charter(brief_id, 10, charter.as_deref());
+        match crate::nodes::coordinator::heartbeat::preflight_and_spawn(
+            task_store,
+            registry,
+            Some(&bridge_tokens),
+            crate::nodes::coordinator::heartbeat::DEFAULT_DISPATCH_LEASE_SECS,
+            brief_id,
+            preferred.as_deref(),
+            prompt,
+        ) {
+            // A Shift started (run_id present).
+            Ok(report) if report.run_id.is_some() => {
+                let _ = task_store.append_event(
+                    brief_id,
+                    "prime.work_started",
+                    &format!(
+                        "Prime started work from proposal {proposal_id} on `{}` (run {})",
+                        report.rig,
+                        report.run_id.as_deref().unwrap_or("")
+                    ),
+                );
+                started_ids.push(brief_id.clone());
+                started.push(serde_json::json!({
+                    "brief_id": report.brief_id,
+                    "run_id": report.run_id,
+                    "rig": report.rig,
+                    "status": report.status,
+                }));
+            }
+            // A pre-run refusal (adapter unavailable / Claim lost): record the
+            // durable refused Shift + report it as a skip — never a faked run.
+            Ok(report) => {
+                let _ = task_store.record_manual_refusal_for_tenant(
+                    brief_id,
+                    tenant,
+                    &assignee,
+                    &report.rig,
+                    &report.status,
+                    &report.summary,
+                );
+                skipped.push(prime::SkippedBrief {
+                    brief_id: brief_id.clone(),
+                    reason: format!("{}: {}", report.status, report.summary),
+                });
+            }
+            Err(e) => skipped.push(prime::SkippedBrief {
+                brief_id: brief_id.clone(),
+                reason: format!("internal error: {e}"),
+            }),
+        }
+    }
+
+    // Audit: an Orchestration run (mode:"start") on the Mandate.
+    if !row.mandate_id.is_empty() {
+        let started_json = serde_json::to_string(&started_ids).unwrap_or_else(|_| "[]".into());
+        let skipped_json = serde_json::to_string(&skipped).unwrap_or_else(|_| "[]".into());
+        let created_json = serde_json::to_string(&created).unwrap_or_else(|_| "[]".into());
+        let _ = spine_store.record_orchestration_run(&OrchestrationRunRecord {
+            tenant_id: tenant,
+            mandate_id: &row.mandate_id,
+            mode: "start",
+            dry_run: false,
+            input_signature: proposal_id,
+            status: "started",
+            created_brief_ids_json: &created_json,
+            existing_brief_ids_json: "[]",
+            assigned_brief_ids_json: &started_json,
+            skipped_json: &skipped_json,
+            source_markers_json: "[]",
+            blockers_json: "[]",
+            next_actions_json: "[]",
+        });
+    }
+
+    let body = serde_json::json!({
+        "proposal_id": proposal_id,
+        "mandate_id": row.mandate_id,
+        "started": started,
+        "skipped": skipped,
+    });
+    match serde_json::to_vec(&body) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => internal(format!("prime.start encode: {e}")),
+    }
+}
+
 /// `agent.request_hire` — the **gated** creation path (company-model
 /// §4.4 / §5.5): mints the Operative `pending` (inert — the gate
 /// denies non-active) so a Lead/Founder must approve it before it can
@@ -4151,6 +4377,180 @@ mod tests {
         let (agents, spine, _task) = prime_stores();
         assert_eq!(
             err_kind(handle_prime_propose(&agents, &spine, &fake_ctx(b"   "))),
+            error_kinds::INVALID_ARGS
+        );
+    }
+
+    // ── Prime Start-to-Shift (prime.start) — company-model §12.5B ────────
+
+    fn echo_registry() -> crate::rig::RigRegistry {
+        crate::rig::RigRegistry::with_builtins().with_default("echo")
+    }
+
+    #[test]
+    fn prime_start_refuses_a_non_approved_proposal() {
+        let (agents, spine, task) = prime_stores();
+        let task = std::sync::Arc::new(task);
+        let reg = echo_registry();
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build a web dashboard"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Approve is the only thing that materializes Briefs; start before
+        // approve has nothing to run and is refused.
+        assert_eq!(
+            err_kind(handle_prime_start(
+                &agents,
+                &spine,
+                &task,
+                &reg,
+                &fake_ctx(pid.as_bytes())
+            )),
+            error_kinds::INVALID_ARGS
+        );
+    }
+
+    #[test]
+    fn prime_start_with_no_crew_starts_nothing_and_explains() {
+        let (agents, spine, task) = prime_stores();
+        let task = std::sync::Arc::new(task);
+        let reg = echo_registry();
+        // No active crew → approve creates Briefs but assigns none of them.
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build a web dashboard"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let _ = ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
+        ));
+        let v = json_of(ok_body(handle_prime_start(
+            &agents,
+            &spine,
+            &task,
+            &reg,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        // Nothing runs (no assignee), and the unassigned Briefs are reported
+        // with honest reasons — never silently dropped.
+        assert!(
+            v["started"].as_array().unwrap().is_empty(),
+            "no crew → nothing runs: {v}"
+        );
+        let skipped = v["skipped"].as_array().unwrap();
+        assert!(!skipped.is_empty());
+        assert!(
+            skipped
+                .iter()
+                .all(|s| !s["reason"].as_str().unwrap_or("").is_empty()),
+            "every skip carries a reason: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prime_start_runs_the_ready_brief_as_a_shift() {
+        let (agents, spine, task) = prime_stores();
+        let task = std::sync::Arc::new(task);
+        let reg = echo_registry();
+        // One ACTIVE engineer → the engineer track is assigned + ready on
+        // approve (the designer track is a pending hire; the integration Brief
+        // is blocked on the tracks).
+        agents
+            .create_agent(
+                "Eng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"eng"),
+                "medium",
+                "default",
+            )
+            .unwrap();
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build a web dashboard"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let _ = ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
+        ));
+        let v = json_of(ok_body(handle_prime_start(
+            &agents,
+            &spine,
+            &task,
+            &reg,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        let started = v["started"].as_array().unwrap();
+        assert_eq!(started.len(), 1, "exactly the ready engineer track runs: {v}");
+        // A REAL Shift was opened (a run_id), through the same chokepoint as
+        // brief.run — never a faked run.
+        assert!(
+            started[0]["run_id"].as_str().is_some(),
+            "a Shift (run_id) was opened: {v}"
+        );
+        // The unassigned designer + the blocked integration Brief are reported.
+        assert!(!v["skipped"].as_array().unwrap().is_empty());
+        // The start is chronicled on the started Brief.
+        let started_id = started[0]["brief_id"].as_str().unwrap();
+        let evs = task
+            .query_events(
+                started_id,
+                0,
+                50,
+                Some("prime.work_started"),
+                crate::nodes::coordinator::EventOrder::Desc,
+            )
+            .unwrap();
+        assert_eq!(evs.len(), 1, "Prime start is chronicled on the Brief");
+    }
+
+    #[test]
+    fn prime_start_is_tenant_scoped() {
+        let (agents, spine, task) = prime_stores();
+        let task = std::sync::Arc::new(task);
+        let reg = echo_registry();
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx_tenant(b"Build a dashboard", "acme"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let _ = ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx_tenant(pid.as_bytes(), "acme"),
+        ));
+        // A different Guild cannot start it (reads as not-found).
+        assert_eq!(
+            err_kind(handle_prime_start(
+                &agents,
+                &spine,
+                &task,
+                &reg,
+                &fake_ctx_tenant(pid.as_bytes(), "globex"),
+            )),
             error_kinds::INVALID_ARGS
         );
     }

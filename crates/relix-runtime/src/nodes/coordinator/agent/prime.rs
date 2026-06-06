@@ -436,6 +436,79 @@ pub fn generate_proposal(message: &str, crew: &[CrewMember]) -> PrimeProposal {
     }
 }
 
+// ── Start-to-Shift (company-model §12.5B) ──────────────────────────────
+//
+// `prime.start` turns an APPROVED proposal's ready Briefs into real Shifts.
+// The decision of WHICH created Briefs to start (and why each skipped one
+// was skipped) is a PURE partition — testable without the run pipeline.
+
+/// Why `prime.start` did not start a created Brief. Returned to the operator
+/// so the loop is legible (what still needs a Clearance / a dependency).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedBrief {
+    pub brief_id: String,
+    pub reason: String,
+}
+
+/// Whether a created Brief can become a Shift right now. The handler derives
+/// this from the canonical readiness query + the Brief card; the mapping to a
+/// human reason lives here so it is unit-tested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartReadiness {
+    /// Assigned to an active Operative, unblocked, not already claimed/running.
+    Ready,
+    /// No Operative assigned yet (a hire / Clearance is still pending).
+    Unassigned,
+    /// Blocked on a dependency Brief.
+    Blocked,
+    /// Already done / in review — nothing to start.
+    Complete,
+    /// Cancelled (terminal).
+    Cancelled,
+    /// The Brief no longer exists.
+    Missing,
+    /// Assigned but not startable right now (assignee inactive, or a Shift is
+    /// already live on it).
+    NotReady,
+}
+
+impl StartReadiness {
+    /// `None` when the Brief should be started; otherwise the honest reason it
+    /// is skipped.
+    pub fn skip_reason(self) -> Option<&'static str> {
+        match self {
+            StartReadiness::Ready => None,
+            StartReadiness::Unassigned => {
+                Some("no Operative assigned yet — approve a Clearance / hire first")
+            }
+            StartReadiness::Blocked => Some("blocked on a dependency Brief"),
+            StartReadiness::Complete => Some("already complete or in review"),
+            StartReadiness::Cancelled => Some("cancelled"),
+            StartReadiness::Missing => Some("Brief no longer exists"),
+            StartReadiness::NotReady => {
+                Some("not startable right now (assignee inactive or a Shift is already live)")
+            }
+        }
+    }
+}
+
+/// Partition an approved proposal's created Briefs into the ones to start now
+/// and the ones to skip with an honest reason. Order is preserved. PURE.
+pub fn partition_start(briefs: &[(String, StartReadiness)]) -> (Vec<String>, Vec<SkippedBrief>) {
+    let mut to_start = Vec::new();
+    let mut skipped = Vec::new();
+    for (id, readiness) in briefs {
+        match readiness.skip_reason() {
+            None => to_start.push(id.clone()),
+            Some(reason) => skipped.push(SkippedBrief {
+                brief_id: id.clone(),
+                reason: reason.to_string(),
+            }),
+        }
+    }
+    (to_start, skipped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,5 +658,42 @@ mod tests {
                 h.role
             );
         }
+    }
+
+    // ── Start-to-Shift partition (company-model §12.5B) ──
+
+    #[test]
+    fn partition_start_runs_only_ready_briefs_with_honest_skips() {
+        let items = vec![
+            ("b1".to_string(), StartReadiness::Ready),
+            ("b2".to_string(), StartReadiness::Unassigned),
+            ("b3".to_string(), StartReadiness::Blocked),
+            ("b4".to_string(), StartReadiness::Ready),
+            ("b5".to_string(), StartReadiness::Complete),
+            ("b6".to_string(), StartReadiness::Cancelled),
+            ("b7".to_string(), StartReadiness::NotReady),
+            ("b8".to_string(), StartReadiness::Missing),
+        ];
+        let (to_start, skipped) = partition_start(&items);
+        // Order preserved; only the Ready ones start.
+        assert_eq!(to_start, vec!["b1".to_string(), "b4".to_string()]);
+        // Every non-ready Brief is reported with a non-empty reason.
+        assert_eq!(skipped.len(), 6);
+        assert!(skipped.iter().all(|s| !s.reason.is_empty()));
+        let unassigned = skipped.iter().find(|s| s.brief_id == "b2").unwrap();
+        assert!(unassigned.reason.contains("no Operative"));
+        let blocked = skipped.iter().find(|s| s.brief_id == "b3").unwrap();
+        assert!(blocked.reason.contains("blocked"));
+    }
+
+    #[test]
+    fn partition_start_with_nothing_ready_starts_nothing() {
+        let items = vec![
+            ("b1".to_string(), StartReadiness::Unassigned),
+            ("b2".to_string(), StartReadiness::Blocked),
+        ];
+        let (to_start, skipped) = partition_start(&items);
+        assert!(to_start.is_empty());
+        assert_eq!(skipped.len(), 2);
     }
 }

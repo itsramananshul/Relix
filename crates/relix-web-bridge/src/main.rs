@@ -662,6 +662,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Prime Assistant: governed "describe what you want → plan".
         .route("/v1/spine/prime/propose", post(spine::prime_propose))
         .route("/v1/spine/prime/approve", post(spine::prime_approve))
+        .route("/v1/spine/prime/start", post(spine::prime_start))
         .route("/v1/spine/prime/proposals", get(spine::prime_proposals))
         .route("/v1/spine/prime/proposals/:id", get(spine::prime_proposal))
         // Composite Desk/Inbox + Brief live-thread payloads.

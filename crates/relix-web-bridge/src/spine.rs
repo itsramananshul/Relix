@@ -409,6 +409,42 @@ pub async fn prime_approve(
     json_passthrough(call_peer(&state, "prime.approve", id.as_bytes()).await?)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PrimeStartRequest {
+    pub proposal_id: String,
+    /// Optional cap on how many ready Briefs to start in this call (the rest
+    /// are reported skipped, never silently dropped). Defaults server-side.
+    #[serde(default)]
+    pub max: Option<usize>,
+}
+
+/// `POST /v1/spine/prime/start` — Start-to-Shift (company-model §12.5B). Turns
+/// an APPROVED proposal's READY Briefs into real Shifts through the same run
+/// chokepoint as `brief.run`. Creates no Mandate/Brief/hire and changes no
+/// budget — it only RUNS Briefs that are already assigned, active, and
+/// unblocked; every skipped Brief is returned with an honest reason. Returns
+/// `{proposal_id, mandate_id, started:[{brief_id,run_id,rig,status}], skipped}`.
+/// Tenant-scoped: a non-approved / unknown / cross-Guild proposal is refused.
+pub async fn prime_start(
+    State(state): State<AppState>,
+    Json(req): Json<PrimeStartRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let id = req.proposal_id.trim();
+    if id.is_empty() {
+        return Err(bad("proposal_id required"));
+    }
+    // The coordinator capability parses `proposal_id` or `proposal_id|max`.
+    // Reject a `|` in the id so the delimiter can't be smuggled.
+    if id.contains('|') {
+        return Err(bad("invalid proposal id"));
+    }
+    let arg = match req.max {
+        Some(m) if m >= 1 => format!("{id}|{m}"),
+        _ => id.to_string(),
+    };
+    json_passthrough(call_peer(&state, "prime.start", arg.as_bytes()).await?)
+}
+
 /// `GET /v1/spine/prime/proposals?limit=N` — recent Prime proposals for the
 /// Guild (the companion history).
 pub async fn prime_proposals(

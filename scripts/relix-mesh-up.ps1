@@ -1425,6 +1425,10 @@ name = "spine_prime_approve"
 method = "prime.approve"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_prime_start"
+method = "prime.start"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_prime_proposals"
 method = "prime.proposals"
 allow_groups = ["chat-users"]

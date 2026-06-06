@@ -1687,6 +1687,64 @@ pub fn run_brief_now(
     }
 }
 
+/// Pre-flight one Brief and, if it commits, hand the blocking adapter run to a
+/// background thread — returning the immediate [`RunReport`] (`running`, with
+/// a `run_id`, or a clear pre-run refusal where `run_id` is `None`).
+///
+/// This is the shared ASYNC core behind the manual `brief.run` handler and
+/// Prime's Start-to-Shift (`prime.start`): both resolve the assignee's Rig +
+/// prompt, then call this so the commit/spawn logic lives in ONE place and
+/// every Shift goes through the same chokepoint
+/// ([`preflight_run`] → [`prepare_claimed_run`] → [`execute_ready`]). Must be
+/// called from within a Tokio runtime (it uses `spawn_blocking`). The caller
+/// owns recording any tenant-scoped refusal for a `None`-`run_id` report.
+#[allow(clippy::too_many_arguments)]
+pub fn preflight_and_spawn(
+    store: &Arc<TaskStore>,
+    registry: &crate::rig::RigRegistry,
+    bridge_tokens: Option<&BridgeTokenStore>,
+    lease_secs: i64,
+    brief_id: &str,
+    preferred_rig: Option<&str>,
+    prompt: String,
+) -> Result<RunReport, CoordinatorError> {
+    match preflight_run(
+        store,
+        registry,
+        bridge_tokens,
+        lease_secs,
+        brief_id,
+        preferred_rig,
+        prompt,
+    )? {
+        Preflight::Refused(report) => Ok(report),
+        Preflight::Ready(ready) => {
+            // Committed: report `running` immediately, run the blocking adapter
+            // on a background thread (a long Claude/Codex Shift must not freeze
+            // the bridge). `execute_ready` advances the board, chronicles,
+            // closes the ledger row, and releases the Claim.
+            let accepted = RunReport {
+                brief_id: ready.brief_id.clone(),
+                status: "running".to_string(),
+                rig: ready.rig_name.clone(),
+                summary: "run started".to_string(),
+                install_hint: None,
+                run_id: Some(ready.run_id.clone()),
+                workspace: ready.workspace.clone(),
+                workspace_context: ready.workspace_context.clone(),
+                workspace_files: ready.workspace_files,
+                workspace_bytes: ready.workspace_bytes,
+            };
+            let st_bg = store.clone();
+            tokio::task::spawn_blocking(move || {
+                let bt = crate::rig::bridge::BridgeTokenStore::global();
+                let _ = execute_ready(&st_bg, Some(&bt), *ready);
+            });
+            Ok(accepted)
+        }
+    }
+}
+
 /// Pre-flight one Brief run: resolve the Operative's Rig, refuse clearly
 /// when it is unavailable (never spawns), and — only once the run is
 /// committed (adapter available + Claim won) — open the durable run

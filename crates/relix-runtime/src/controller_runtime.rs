@@ -9110,75 +9110,81 @@ fn register_node_type_handlers(
                                     },
                                 )
                             };
-                            // Async dispatch: pre-flight synchronously (resolve
-                            // adapter, refuse clearly if unavailable, win the
-                            // Claim, open the run record) — fast — then hand the
-                            // blocking `rig.run` to a background thread so a long
-                            // Claude/Codex Shift never freezes the bridge. The
-                            // handler returns immediately with the run_id +
+                            // Async dispatch through the SHARED run chokepoint
+                            // (`preflight_and_spawn`): pre-flight synchronously
+                            // (resolve adapter, refuse clearly if unavailable,
+                            // win the Claim, open the run record) — fast — then
+                            // hand the blocking `rig.run` to a background thread
+                            // so a long Claude/Codex Shift never freezes the
+                            // bridge. Returns immediately with the run_id +
                             // status `running`; the dashboard polls `/v1/runs`.
+                            // The SAME helper backs Prime's Start-to-Shift.
                             let bridge_tokens = crate::rig::bridge::BridgeTokenStore::global();
                             // An explicit override wins over the assignee's Rig.
                             let chosen_rig = rig_override.as_deref().or(preferred.as_deref());
-                            let pre = crate::nodes::coordinator::heartbeat::preflight_run(
-                                &st,
-                                &reg,
-                                Some(&bridge_tokens),
-                                300,
-                                &brief_id,
-                                chosen_rig,
-                                prompt,
-                            );
-                            let report = match pre {
-                                Err(e) => return internal(format!("brief.run: {e}")),
-                                Ok(crate::nodes::coordinator::heartbeat::Preflight::Refused(r)) => {
-                                    // Phase 3: persist a durable `refused` Shift
-                                    // for this manual attempt so the Brief
-                                    // detail / run history can later answer
-                                    // "why didn't it run?". Tenant-gated and a
-                                    // no-op for `not_found` / `already_running`
-                                    // (see record_manual_refusal_for_tenant).
-                                    let _ = st.record_manual_refusal_for_tenant(
-                                        &brief_id,
-                                        &tenant,
-                                        &assignee,
-                                        &r.rig,
-                                        &r.status,
-                                        &r.summary,
-                                    );
-                                    r
-                                }
-                                Ok(crate::nodes::coordinator::heartbeat::Preflight::Ready(ready)) => {
-                                    let accepted =
-                                        crate::nodes::coordinator::heartbeat::RunReport {
-                                            brief_id: ready.brief_id.clone(),
-                                            status: "running".to_string(),
-                                            rig: ready.rig_name.clone(),
-                                            summary: "run started".to_string(),
-                                            install_hint: None,
-                                            run_id: Some(ready.run_id.clone()),
-                                            workspace: ready.workspace.clone(),
-                                            workspace_context: ready.workspace_context.clone(),
-                                            workspace_files: ready.workspace_files,
-                                            workspace_bytes: ready.workspace_bytes,
-                                        };
-                                    let st_bg = st.clone();
-                                    tokio::task::spawn_blocking(move || {
-                                        let bt =
-                                            crate::rig::bridge::BridgeTokenStore::global();
-                                        let _ = crate::nodes::coordinator::heartbeat::execute_ready(
-                                            &st_bg,
-                                            Some(&bt),
-                                            *ready,
-                                        );
-                                    });
-                                    accepted
-                                }
-                            };
+                            let report =
+                                match crate::nodes::coordinator::heartbeat::preflight_and_spawn(
+                                    &st,
+                                    &reg,
+                                    Some(&bridge_tokens),
+                                    300,
+                                    &brief_id,
+                                    chosen_rig,
+                                    prompt,
+                                ) {
+                                    Err(e) => return internal(format!("brief.run: {e}")),
+                                    Ok(report) => {
+                                        // A pre-run refusal (no Shift started)
+                                        // is persisted as a durable `refused`
+                                        // Shift so the Brief can later answer
+                                        // "why didn't it run?". Tenant-gated +
+                                        // a no-op for not_found / already_running.
+                                        if report.run_id.is_none() {
+                                            let _ = st.record_manual_refusal_for_tenant(
+                                                &brief_id,
+                                                &tenant,
+                                                &assignee,
+                                                &report.rig,
+                                                &report.status,
+                                                &report.summary,
+                                            );
+                                        }
+                                        report
+                                    }
+                                };
                             match serde_json::to_vec(&report) {
                                 Ok(body) => crate::dispatch::HandlerOutcome::Ok(body),
                                 Err(e) => internal(format!("brief.run encode: {e}")),
                             }
+                        }
+                    },
+                )),
+            );
+        }
+        if let Some(spine) = spine_store_for_agent_caps.clone() {
+            // `prime.start` — Start-to-Shift (company-model §12.5B). Turns an
+            // APPROVED Prime proposal's READY Briefs into real Shifts through
+            // the SAME run chokepoint as `brief.run` (preflight_and_spawn). It
+            // creates no Mandate/Brief/hire and changes no budget — it only
+            // RUNS Briefs that are already assigned, active, and unblocked;
+            // every skipped Brief is returned with an honest reason. Registered
+            // only when the spine store opened (needs the approved-proposal
+            // record). Arg: proposal_id (optionally `proposal_id|max`).
+            let reg = rig_registry.clone();
+            let st = store.clone();
+            let ags = agent_store.clone();
+            bridge.register(
+                "prime.start",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let reg = reg.clone();
+                        let st = st.clone();
+                        let ags = ags.clone();
+                        let spine = spine.clone();
+                        async move {
+                            crate::nodes::coordinator::agent::handlers::handle_prime_start(
+                                &ags, &spine, &st, &reg, &ctx,
+                            )
                         }
                     },
                 )),
