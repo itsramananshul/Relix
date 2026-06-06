@@ -41,20 +41,22 @@ pub struct DossierMeta {
 
 /// A **thread interaction** — an answerable card the agent (or
 /// companion) raises on a Brief's thread (relix-execution-and-issue-
-/// design §1.9; relix-dashboard-design §7). The minimal slice covers
-/// two kinds: `ask` (an open question for the operator to answer) and
-/// `confirm` (a yes/no gate, e.g. plan approval). The third documented
-/// kind — `suggest_tasks` — stays deferred (see the divergence ledger
-/// in docs/product-spine-implementation.md). The lifecycle is
-/// `open → resolved | rejected`: a `confirm` answered yes resolves, a
-/// no rejects; an `ask` always resolves with the answer text. A
-/// response is recorded once (idempotent), and both the opening and
-/// the response are also written to the Brief's Chronicle.
+/// design §1.9; relix-dashboard-design §7). The slice covers three
+/// kinds: `ask` (an open question for the operator to answer),
+/// `confirm` (a yes/no gate, e.g. plan approval), and `suggest_tasks`
+/// (an Operative proposes a bounded list of child Briefs; the operator
+/// accepts — materializing them as real Sub-briefs — or rejects). The
+/// lifecycle is `open → resolved | rejected`: a `confirm` answered yes
+/// resolves, a no rejects; an `ask` always resolves with the answer
+/// text; a `suggest_tasks` resolves on accept (children created) and
+/// rejects on decline. A response is recorded once (idempotent), and
+/// both the opening and the response are also written to the Brief's
+/// Chronicle.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Interaction {
     pub interaction_id: String,
     pub task_id: String,
-    /// `ask` | `confirm`.
+    /// `ask` | `confirm` | `suggest_tasks`.
     pub kind: String,
     pub prompt: String,
     /// Optional answer choices (radio/checkbox for `ask`); empty for a
@@ -65,12 +67,89 @@ pub struct Interaction {
     /// `open` | `resolved` | `rejected`.
     pub status: String,
     /// The operator's answer (the chosen option, free text, or yes/no
-    /// note); `None` while still `open`.
+    /// note); `None` while still `open`. For an accepted `suggest_tasks`
+    /// card this carries the comma-joined ids of the child Briefs created.
     pub response: Option<String>,
     pub created_at: i64,
     pub resolved_at: Option<i64>,
     /// Who answered it.
     pub resolved_by: Option<String>,
+    /// The structured proposal for a `suggest_tasks` card (the proposed
+    /// child Briefs); `None` for `ask`/`confirm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<Proposal>,
+}
+
+/// One proposed child Brief inside a `suggest_tasks` interaction (§1.9):
+/// a title and, optionally, a priority. The first slice intentionally
+/// carries no assignee or dependency order — accepting it creates plain
+/// Sub-briefs (the dependency-order / assignment of the proposal stays
+/// deferred; see the divergence ledger).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildSpec {
+    pub title: String,
+    /// `low` | `normal` | `high` | `urgent`; `None` opens at the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+}
+
+/// The bounded, sanitized proposal an Operative attaches to a
+/// `suggest_tasks` card: a one-line summary plus the proposed child
+/// Briefs. Normalized + size-capped on the way in (see
+/// [`normalize_proposal`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Proposal {
+    pub summary: String,
+    pub children: Vec<ChildSpec>,
+}
+
+/// Hard caps on a `suggest_tasks` proposal — the proposal is bounded
+/// and sanitized so a card can never carry an unbounded / oversized
+/// payload (no file/path execution, no arbitrary giant JSON).
+pub const MAX_SUGGESTED_CHILDREN: usize = 20;
+/// Max length of a child-Brief title (chars). Longer titles are
+/// truncated, not refused.
+pub const MAX_CHILD_TITLE_LEN: usize = 200;
+/// Max length of the proposal summary (chars). Longer is truncated.
+pub const MAX_PROPOSAL_SUMMARY_LEN: usize = 500;
+
+/// Validate + normalize a `suggest_tasks` proposal (pure, so the
+/// doc-specified bounds are unit-testable in isolation):
+///
+/// - the summary is trimmed and length-capped (truncated, not refused);
+/// - each child title is trimmed and length-capped; empty titles are
+///   dropped;
+/// - a child priority, when present, must be a valid Brief priority
+///   (an invalid one is a hard error — it would otherwise be silently
+///   dropped at create time);
+/// - the proposal must have at least one child and **no more than**
+///   [`MAX_SUGGESTED_CHILDREN`] (over-cap is refused, never silently
+///   truncated — the operator must see the full set they accept).
+pub fn normalize_proposal(summary: &str, children: &[ChildSpec]) -> Result<Proposal, String> {
+    let summary: String = summary.trim().chars().take(MAX_PROPOSAL_SUMMARY_LEN).collect();
+    let mut norm: Vec<ChildSpec> = Vec::new();
+    for c in children {
+        let title: String = c.title.trim().chars().take(MAX_CHILD_TITLE_LEN).collect();
+        if title.is_empty() {
+            continue; // drop empties
+        }
+        let priority = match c.priority.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(p) if is_priority(p) => Some(p.to_string()),
+            Some(p) => return Err(format!("priority '{p}' not in low/normal/high/urgent")),
+        };
+        norm.push(ChildSpec { title, priority });
+    }
+    if norm.is_empty() {
+        return Err("a suggestion needs at least one child task".to_string());
+    }
+    if norm.len() > MAX_SUGGESTED_CHILDREN {
+        return Err(format!(
+            "too many proposed tasks ({}); the limit is {MAX_SUGGESTED_CHILDREN}",
+            norm.len()
+        ));
+    }
+    Ok(Proposal { summary, children: norm })
 }
 
 /// The product-spine fields of a Brief (the columns layered onto
@@ -368,5 +447,63 @@ mod tests {
     fn unknown_statuses_are_rejected() {
         assert!(!board_transition_allowed("backlog", "bogus"));
         assert!(!board_transition_allowed("bogus", "todo"));
+    }
+
+    fn child(title: &str) -> ChildSpec {
+        ChildSpec { title: title.into(), priority: None }
+    }
+
+    #[test]
+    fn proposal_normalizes_and_drops_empty_titles() {
+        let p = normalize_proposal(
+            "  Break this down  ",
+            &[child("First"), child("   "), child("  Second  ")],
+        )
+        .expect("valid");
+        assert_eq!(p.summary, "Break this down");
+        assert_eq!(p.children.len(), 2);
+        assert_eq!(p.children[0].title, "First");
+        assert_eq!(p.children[1].title, "Second");
+    }
+
+    #[test]
+    fn proposal_requires_at_least_one_child() {
+        assert!(normalize_proposal("s", &[]).is_err());
+        assert!(normalize_proposal("s", &[child("   ")]).is_err());
+    }
+
+    #[test]
+    fn proposal_rejects_over_cap() {
+        let many: Vec<ChildSpec> = (0..=MAX_SUGGESTED_CHILDREN)
+            .map(|i| child(&format!("t{i}")))
+            .collect();
+        assert!(normalize_proposal("s", &many).is_err());
+        let ok: Vec<ChildSpec> = (0..MAX_SUGGESTED_CHILDREN)
+            .map(|i| child(&format!("t{i}")))
+            .collect();
+        assert!(normalize_proposal("s", &ok).is_ok());
+    }
+
+    #[test]
+    fn proposal_validates_priority_and_bounds_lengths() {
+        assert!(
+            normalize_proposal(
+                "s",
+                &[ChildSpec { title: "t".into(), priority: Some("urgent".into()) }]
+            )
+            .is_ok()
+        );
+        assert!(
+            normalize_proposal(
+                "s",
+                &[ChildSpec { title: "t".into(), priority: Some("meh".into()) }]
+            )
+            .is_err()
+        );
+        let long_title = "x".repeat(MAX_CHILD_TITLE_LEN + 50);
+        let long_summary = "y".repeat(MAX_PROPOSAL_SUMMARY_LEN + 50);
+        let p = normalize_proposal(&long_summary, &[child(&long_title)]).expect("valid");
+        assert_eq!(p.summary.chars().count(), MAX_PROPOSAL_SUMMARY_LEN);
+        assert_eq!(p.children[0].title.chars().count(), MAX_CHILD_TITLE_LEN);
     }
 }

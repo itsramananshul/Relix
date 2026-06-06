@@ -418,3 +418,306 @@ addr = "{addr}"
     .unwrap();
     assert_eq!(resp.status().as_u16(), 400, "unknown kind is rejected at the bridge");
 }
+
+/// §1.9 suggest_tasks round-trip across a real mesh:
+/// - `POST /v1/spine/briefs/:id/suggestions` → 200 + `{interaction_id}`,
+///   and the coordinator receives a JSON arg
+///   `{task_id, author, summary, children:[{title, priority}]}`.
+/// - `GET  /v1/spine/briefs/:id/interactions` → the suggest_tasks card with
+///   its proposal passes through.
+/// - `POST .../suggestions/:iid/respond` (accept) → 200 + `{created:[…]}`,
+///   wire arg `task_id|iid|responder|accept`; a duplicate accept maps to 400.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn brief_suggestion_routes_round_trip_open_list_respond() {
+    let (mut dispatch, org_root, _audit_dir) = fresh_responder_bridge(
+        r#"
+        [[rules]]
+        name = "open"
+        method = "brief.suggest_open"
+        allow_groups = ["chat-users"]
+
+        [[rules]]
+        name = "list"
+        method = "brief.interactions"
+        allow_groups = ["chat-users"]
+
+        [[rules]]
+        name = "respond"
+        method = "brief.suggest_respond"
+        allow_groups = ["chat-users"]
+        "#,
+    );
+
+    let open_arg: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let respond_args: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    dispatch.register(
+        "brief.suggest_open",
+        Arc::new(FnHandler({
+            let seen = open_arg.clone();
+            move |ctx: InvocationCtx| {
+                let seen = seen.clone();
+                async move {
+                    *seen.lock().unwrap() = String::from_utf8_lossy(&ctx.args).to_string();
+                    HandlerOutcome::Ok(b"bix_sug".to_vec())
+                }
+            }
+        })),
+    );
+    dispatch.register(
+        "brief.interactions",
+        Arc::new(FnHandler(move |_ctx: InvocationCtx| async move {
+            let body = serde_json::json!([{
+                "interaction_id": "bix_sug",
+                "task_id": "task_1",
+                "kind": "suggest_tasks",
+                "prompt": "Break the epic down",
+                "choices": [],
+                "author": "operative-1",
+                "status": "open",
+                "response": null,
+                "created_at": 1_700_000_000_i64,
+                "resolved_at": null,
+                "resolved_by": null,
+                "proposal": {
+                    "summary": "Break the epic down",
+                    "children": [
+                        { "title": "Design the API" },
+                        { "title": "Wire the store", "priority": "high" }
+                    ]
+                }
+            }]);
+            HandlerOutcome::Ok(serde_json::to_vec(&body).unwrap())
+        })),
+    );
+    dispatch.register(
+        "brief.suggest_respond",
+        Arc::new(FnHandler({
+            let seen = respond_args.clone();
+            move |ctx: InvocationCtx| {
+                let seen = seen.clone();
+                async move {
+                    let arg = String::from_utf8_lossy(&ctx.args).to_string();
+                    seen.lock().unwrap().push(arg.clone());
+                    // A second accept of the same card is "already answered" —
+                    // a typed INVALID_ARGS the bridge maps to a 400.
+                    if arg.contains("|bix_dup|") {
+                        HandlerOutcome::Err(ErrorEnvelope {
+                            kind: error_kinds::INVALID_ARGS,
+                            cause: "brief.suggest_respond: suggestion already resolved".into(),
+                            retry_hint: 0,
+                            retry_after: None,
+                        })
+                    } else {
+                        HandlerOutcome::Ok(
+                            serde_json::to_vec(&serde_json::json!({ "created": ["c1", "c2"] }))
+                                .unwrap(),
+                        )
+                    }
+                }
+            }
+        })),
+    );
+
+    let dispatch = Arc::new(dispatch);
+    let (_peer_client, events, addr) = boot_peer(157).await;
+    spawn_inbound_loop(events, dispatch.clone());
+
+    let tmpdir = TempDir::new().unwrap();
+    let bundle_bytes =
+        mint_bridge_bundle_bytes(&org_root, "suggestion-test-bridge", vec!["chat-users".into()]);
+    let bundle_path = tmpdir.path().join("bridge.bundle");
+    std::fs::write(&bundle_path, &bundle_bytes).unwrap();
+    let client_key_path = tmpdir.path().join("client.key");
+    let chat_template_path = tmpdir.path().join("chat.sol");
+    std::fs::write(
+        &chat_template_path,
+        r#"function start() -> str { return remote_call("coord", "noop", "{{SESSION}}|{{MESSAGE}}|"); }"#,
+    )
+    .unwrap();
+    let peers_path = tmpdir.path().join("peers.toml");
+    std::fs::write(
+        &peers_path,
+        format!(
+            r#"
+[peers.coordinator]
+addr = "{addr}"
+"#
+        ),
+    )
+    .unwrap();
+
+    let cfg = BridgeConfig {
+        bridge: BridgeSection {
+            listen_addr: "127.0.0.1:9999".into(),
+            secrets_path: Some(tmpdir.path().join("secrets.toml")),
+            token_path: Some(tmpdir.path().join("bridge-token")),
+            memory_db_path: None,
+        },
+        identity: IdentitySection {
+            bundle_path,
+            client_key_path,
+        },
+        transport: TransportSection {
+            peers_path,
+            deadline_secs: 30,
+            data_dir: Some(tmpdir.path().to_path_buf()),
+        },
+        flow: FlowSection {
+            template_path: chat_template_path,
+            tool_template_path: None,
+            streaming_template_path: None,
+        },
+        openai_compat: None,
+        sse: SseSection::default(),
+        coordinator: None,
+        mesh: MeshSection::default(),
+        observability: None,
+        auth: crate::config::AuthSection::default(),
+        logging: crate::config::LoggingSection::default(),
+    };
+    let base_state = AppState::try_new(cfg).expect("AppState::try_new");
+
+    use relix_runtime::flow_runner::{PeerEntry, PeersFile};
+    use relix_runtime::manifest::{DiscoveryOptions, discover_and_pin};
+    let mut peers_map = std::collections::HashMap::new();
+    peers_map.insert(
+        "coordinator".to_string(),
+        PeerEntry {
+            addr: addr.to_string(),
+        },
+    );
+    let peers_file = PeersFile { peers: peers_map };
+    let opts = DiscoveryOptions {
+        identity_bundle: base_state.identity_bundle.clone(),
+        client_key: base_state.client_key.clone(),
+        peers: peers_file,
+        deadline_secs: 30,
+        overall_timeout: Duration::from_secs(8),
+        local_port: None,
+        source_key_registry: None,
+    };
+    let (_cache, mesh) = discover_and_pin(opts).await.expect("discover_and_pin");
+    let state = AppState {
+        mesh_client: Some(Arc::new(mesh)),
+        ..base_state
+    };
+
+    let app = Router::new()
+        .route(
+            "/v1/spine/briefs/:id/interactions",
+            get(crate::spine::list_interactions),
+        )
+        .route(
+            "/v1/spine/briefs/:id/suggestions",
+            post(crate::spine::open_suggestion),
+        )
+        .route(
+            "/v1/spine/briefs/:id/suggestions/:iid/respond",
+            post(crate::spine::respond_suggestion),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let http = reqwest::Client::new();
+
+    // ─── open → 200 + interaction_id, JSON wire arg ───
+    let url = format!("http://{bound}/v1/spine/briefs/task_1/suggestions");
+    let resp = timeout(
+        Duration::from_secs(15),
+        http.post(&url)
+            .json(&serde_json::json!({
+                "author": "operative-1",
+                "summary": "Break the epic down",
+                "children": [
+                    { "title": "Design the API" },
+                    { "title": "Wire the store", "priority": "high" }
+                ]
+            }))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body.get("interaction_id").and_then(Value::as_str),
+        Some("bix_sug")
+    );
+    // The coordinator received a JSON arg with the task_id + proposal.
+    let seen: Value = serde_json::from_str(&open_arg.lock().unwrap()).expect("open arg is JSON");
+    assert_eq!(seen.get("task_id").and_then(Value::as_str), Some("task_1"));
+    assert_eq!(seen.get("author").and_then(Value::as_str), Some("operative-1"));
+    assert_eq!(
+        seen.get("children").and_then(Value::as_array).map(|a| a.len()),
+        Some(2)
+    );
+
+    // ─── list → the suggest_tasks card with its proposal passes through ───
+    let list_url = format!("http://{bound}/v1/spine/briefs/task_1/interactions");
+    let resp = timeout(Duration::from_secs(15), http.get(&list_url).send())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let arr = body.as_array().expect("array");
+    assert_eq!(arr[0].get("kind").and_then(Value::as_str), Some("suggest_tasks"));
+    assert_eq!(
+        arr[0]["proposal"]["children"].as_array().map(|a| a.len()),
+        Some(2)
+    );
+
+    // ─── respond accept → 200 + created ids, correct wire arg ───
+    let ok_url = format!("http://{bound}/v1/spine/briefs/task_1/suggestions/bix_sug/respond");
+    let resp = timeout(
+        Duration::from_secs(15),
+        http.post(&ok_url)
+            .json(&serde_json::json!({ "responder": "founder", "accept": true }))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["created"].as_array().map(|a| a.len()), Some(2));
+    assert_eq!(
+        respond_args.lock().unwrap().last().cloned().unwrap_or_default(),
+        "task_1|bix_sug|founder|accept",
+        "respond wire arg must be task_id|iid|responder|verdict"
+    );
+
+    // ─── a duplicate accept (coordinator INVALID_ARGS) → 400 ───
+    let dup_url = format!("http://{bound}/v1/spine/briefs/task_1/suggestions/bix_dup/respond");
+    let resp = timeout(
+        Duration::from_secs(15),
+        http.post(&dup_url)
+            .json(&serde_json::json!({ "responder": "founder", "accept": true }))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "a duplicate accept must surface as a typed 400, not a 5xx"
+    );
+
+    // ─── bridge-level validation: no children → 400, no peer call ───
+    let resp = timeout(
+        Duration::from_secs(15),
+        http.post(&url)
+            .json(&serde_json::json!({ "author": "op", "children": [] }))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 400, "an empty proposal is rejected at the bridge");
+}

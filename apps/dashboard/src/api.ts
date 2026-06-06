@@ -185,10 +185,22 @@ export const runControls = {
 // operator answers them inline; the answer writes a Chronicle event and
 // flips the card's status. All hit `/v1/spine/briefs/:id/interactions`.
 
+// One proposed child Brief inside a `suggest_tasks` card.
+export interface SuggestChild {
+  title: string;
+  priority?: string | null;
+}
+
+// The bounded proposal a `suggest_tasks` card carries.
+export interface BriefProposal {
+  summary: string;
+  children: SuggestChild[];
+}
+
 export interface BriefInteraction {
   interaction_id: string;
   task_id: string;
-  kind: string; // ask | confirm
+  kind: string; // ask | confirm | suggest_tasks
   prompt: string;
   choices: string[];
   author: string;
@@ -197,6 +209,8 @@ export interface BriefInteraction {
   created_at?: number;
   resolved_at?: number | null;
   resolved_by?: string | null;
+  // Present only on `suggest_tasks` cards.
+  proposal?: BriefProposal | null;
 }
 
 export const briefInteractions = {
@@ -225,6 +239,36 @@ export const briefInteractions = {
   ) =>
     api.post(
       `/v1/spine/briefs/${encodeURIComponent(briefId)}/interactions/${encodeURIComponent(
+        interactionId,
+      )}/respond`,
+      body,
+    ),
+};
+
+// ── Brief suggest_tasks cards (proposed child-Brief trees) ────────────────
+// An Operative proposes a bounded list of child Briefs on a Brief
+// (relix-execution-and-issue-design §1.9). The operator accepts — which
+// materializes them as real Sub-briefs — or rejects. The cards list through
+// the same `briefInteractions.list` (kind `suggest_tasks`, with a `proposal`).
+export const briefSuggestions = {
+  // Raise a new suggestion (used by agents/companion; exposed for completeness).
+  open: (
+    briefId: string,
+    body: { author: string; summary?: string; children: SuggestChild[] },
+  ) =>
+    api.post<{ interaction_id: string }>(
+      `/v1/spine/briefs/${encodeURIComponent(briefId)}/suggestions`,
+      body,
+    ),
+  // Accept (materialize the child Briefs) or reject a suggestion. Accept
+  // returns the created child ids; a duplicate answer surfaces as a typed 400.
+  respond: (
+    briefId: string,
+    interactionId: string,
+    body: { responder: string; accept: boolean },
+  ) =>
+    api.post<{ created: string[] }>(
+      `/v1/spine/briefs/${encodeURIComponent(briefId)}/suggestions/${encodeURIComponent(
         interactionId,
       )}/respond`,
       body,

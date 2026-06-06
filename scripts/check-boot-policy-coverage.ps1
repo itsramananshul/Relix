@@ -79,6 +79,8 @@ $RequiredCapabilities = @(
     'brief.comment', 'brief.unassigned', 'brief.unblocked', 'brief.run', 'brief.runs',
     # Brief thread interactions (answerable ask/confirm cards, §1.9)
     'brief.interaction_open', 'brief.interactions', 'brief.interaction_respond',
+    # Brief suggest_tasks cards (propose + accept/reject a child-Brief tree, §1.9)
+    'brief.suggest_open', 'brief.suggest_respond',
     'task.events', 'task.recent_events',
     # Bridge-back operative callbacks (per-Shift brt_* token at the bridge, but
     # the bridge still calls the mesh as chat-users, so each needs an allow rule)

@@ -735,6 +735,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/spine/briefs/:id/interactions/:iid/respond",
             post(spine::respond_interaction),
         )
+        // §1.9 suggest_tasks: propose a child-Brief tree, accept (materialize
+        // as Sub-briefs) or reject it.
+        .route(
+            "/v1/spine/briefs/:id/suggestions",
+            post(spine::open_suggestion),
+        )
+        .route(
+            "/v1/spine/briefs/:id/suggestions/:iid/respond",
+            post(spine::respond_suggestion),
+        )
         .route("/v1/spine/briefs/:id/due", post(spine::set_due))
         .route("/v1/spine/briefs/:id/set", post(spine::set_field))
         .route("/v1/spine/briefs/:id/snag", post(spine::add_snag))

@@ -1398,6 +1398,14 @@ name = "spine_brief_interaction_respond"
 method = "brief.interaction_respond"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_brief_suggest_open"
+method = "brief.suggest_open"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_suggest_respond"
+method = "brief.suggest_respond"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_brief_snag"
 method = "brief.snag"
 allow_groups = ["chat-users"]

@@ -1631,7 +1631,8 @@ impl TaskStore {
         let mut stmt = conn
             .prepare(
                 "SELECT interaction_id, task_id, kind, prompt, choices, author,
-                        status, response, created_at, resolved_at, resolved_by
+                        status, response, created_at, resolved_at, resolved_by,
+                        proposal
                  FROM brief_interactions WHERE task_id = ?1
                  ORDER BY created_at ASC, rowid ASC",
             )
@@ -1641,6 +1642,9 @@ impl TaskStore {
                 let choices_json: String = r.get(4)?;
                 let choices: Vec<String> =
                     serde_json::from_str(&choices_json).unwrap_or_default();
+                let proposal: Option<String> = r.get(11)?;
+                let proposal: Option<brief::Proposal> =
+                    proposal.and_then(|p| serde_json::from_str(&p).ok());
                 Ok(brief::Interaction {
                     interaction_id: r.get(0)?,
                     task_id: r.get(1)?,
@@ -1653,6 +1657,7 @@ impl TaskStore {
                     created_at: r.get(8)?,
                     resolved_at: r.get(9)?,
                     resolved_by: r.get(10)?,
+                    proposal,
                 })
             })
             .map_err(CoordinatorError::Db)?
@@ -1693,18 +1698,27 @@ impl TaskStore {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         // Resolve the card within this Brief; a card under another Brief
         // (or a missing id) reads as not-found here.
-        let current: Option<String> = conn
+        let current: Option<(String, String)> = conn
             .query_row(
-                "SELECT status FROM brief_interactions
+                "SELECT status, kind FROM brief_interactions
                  WHERE interaction_id = ?1 AND task_id = ?2",
                 params![interaction_id, task_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(CoordinatorError::Db)?;
         match current {
             None => return Err(CoordinatorError::NotFound(interaction_id.to_string())),
-            Some(s) if s != "open" => {
+            // `suggest_tasks` cards are answered through `respond_suggestion`
+            // (accept materializes child Briefs; reject closes) — the generic
+            // respond path must not resolve one without creating its children.
+            Some((_, kind)) if kind == "suggest_tasks" => {
+                return Err(CoordinatorError::Invalid(
+                    "suggest_tasks cards are answered via the suggestion accept/reject path"
+                        .to_string(),
+                ));
+            }
+            Some((s, _)) if s != "open" => {
                 return Err(CoordinatorError::Invalid(format!(
                     "interaction already {s}"
                 )));
@@ -1739,6 +1753,195 @@ impl TaskStore {
             params![task_id, now, event_type, format!("{responder}: {response}")],
         );
         Ok(())
+    }
+
+    /// §1.9 (`suggest_tasks`): open a task-suggestion card on a Brief —
+    /// an Operative proposes a bounded list of child Briefs. The proposal
+    /// is validated + size-capped ([`brief::normalize_proposal`]) before
+    /// storage; the summary doubles as the card `prompt` (so the generic
+    /// list/Chronicle rendering has a human line). Inserts an `open`
+    /// `suggest_tasks` interaction and mirrors the opening into the
+    /// Chronicle (`brief.suggestion_opened`). Returns the new
+    /// `interaction_id`. `author` is required; the Brief must exist.
+    pub fn open_suggestion(
+        &self,
+        task_id: &str,
+        author: &str,
+        summary: &str,
+        children: &[brief::ChildSpec],
+    ) -> Result<String, CoordinatorError> {
+        let author = author.trim();
+        if author.is_empty() {
+            return Err(CoordinatorError::Invalid(
+                "suggestion author required".to_string(),
+            ));
+        }
+        let proposal = brief::normalize_proposal(summary, children)
+            .map_err(CoordinatorError::Invalid)?;
+        // The prompt is the summary, or a sensible default when the
+        // Operative left it blank — never empty (the NOT NULL column and
+        // the generic card renderer both want a line).
+        let prompt = if proposal.summary.is_empty() {
+            format!("Proposed {} task(s)", proposal.children.len())
+        } else {
+            proposal.summary.clone()
+        };
+        let proposal_json = serde_json::to_string(&proposal)
+            .map_err(|e| CoordinatorError::Invalid(format!("proposal encode: {e}")))?;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, task_id)? {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let interaction_id = new_interaction_id();
+        let now = unix_secs();
+        conn.execute(
+            "INSERT INTO brief_interactions
+                 (interaction_id, task_id, kind, prompt, choices, author,
+                  status, response, created_at, resolved_at, resolved_by, proposal)
+             VALUES (?1, ?2, 'suggest_tasks', ?3, '[]', ?4, 'open', NULL, ?5, NULL, NULL, ?6)",
+            params![interaction_id, task_id, prompt, author, now, proposal_json],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let _ = conn.execute(
+            "INSERT INTO task_events (task_id, ts, event_type, payload)
+             VALUES (?1, ?2, 'brief.suggestion_opened', ?3)",
+            params![
+                task_id,
+                now,
+                format!("{}: {} task(s)", author, proposal.children.len())
+            ],
+        );
+        Ok(interaction_id)
+    }
+
+    /// §1.9 (`suggest_tasks`): answer a task-suggestion card.
+    ///
+    /// - **reject** (`accept == false`): atomically flips the card
+    ///   `open → rejected`, creating no Briefs. Chronicles
+    ///   `brief.suggestion_rejected`.
+    /// - **accept** (`accept == true`): atomically *claims* the card
+    ///   (`open → resolved`) FIRST — the single linearization point, so a
+    ///   duplicate/concurrent accept is refused (`Invalid`) and **never
+    ///   double-creates Briefs** — then materializes each proposed child as
+    ///   a real Sub-brief via [`create_brief`] + [`link_subbrief`] (tenant-
+    ///   stamped, owner-attributed), records the created ids on the card's
+    ///   `response`, and Chronicles `brief.suggestion_materialized` with the
+    ///   child ids. Returns the created child task_ids (empty on reject).
+    ///
+    /// The card must be an `open` `suggest_tasks` card belonging to
+    /// `task_id` (else `NotFound` / `Invalid`).
+    pub fn respond_suggestion(
+        &self,
+        tenant: &str,
+        owner_subject_id: &str,
+        task_id: &str,
+        interaction_id: &str,
+        responder: &str,
+        accept: bool,
+    ) -> Result<Vec<String>, CoordinatorError> {
+        let responder = responder.trim();
+        if responder.is_empty() {
+            return Err(CoordinatorError::Invalid(
+                "suggestion responder required".to_string(),
+            ));
+        }
+        // ── 1. Claim the card under one lock: verify kind/status, then flip
+        //       open → terminal with a row-level guard. This is the only
+        //       point that can win, so accept is idempotent. ──
+        let proposal_json: Option<String> = {
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            let row: Option<(String, String, Option<String>)> = conn
+                .query_row(
+                    "SELECT kind, status, proposal FROM brief_interactions
+                     WHERE interaction_id = ?1 AND task_id = ?2",
+                    params![interaction_id, task_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .map_err(CoordinatorError::Db)?;
+            let (kind, status, proposal) = match row {
+                None => return Err(CoordinatorError::NotFound(interaction_id.to_string())),
+                Some(v) => v,
+            };
+            if kind != "suggest_tasks" {
+                return Err(CoordinatorError::Invalid(
+                    "not a suggest_tasks card".to_string(),
+                ));
+            }
+            if status != "open" {
+                return Err(CoordinatorError::Invalid(format!(
+                    "suggestion already {status}"
+                )));
+            }
+            let now = unix_secs();
+            let terminal = if accept { "resolved" } else { "rejected" };
+            let changed = conn
+                .execute(
+                    "UPDATE brief_interactions
+                     SET status = ?1, resolved_at = ?2, resolved_by = ?3
+                     WHERE interaction_id = ?4 AND task_id = ?5 AND status = 'open'",
+                    params![terminal, now, responder, interaction_id, task_id],
+                )
+                .map_err(CoordinatorError::Db)?;
+            if changed == 0 {
+                return Err(CoordinatorError::Invalid(
+                    "suggestion already answered".to_string(),
+                ));
+            }
+            if !accept {
+                let _ = conn.execute(
+                    "INSERT INTO task_events (task_id, ts, event_type, payload)
+                     VALUES (?1, ?2, 'brief.suggestion_rejected', ?3)",
+                    params![task_id, now, format!("{responder}: declined")],
+                );
+                return Ok(Vec::new());
+            }
+            proposal
+        }; // lock dropped here — `create_brief` re-locks internally.
+
+        // ── 2. Accept: materialize the proposal into real child Briefs. The
+        //       card is already claimed (`resolved`), so even a partial
+        //       failure cannot be retried into duplicate Briefs. ──
+        let proposal: brief::Proposal = proposal_json
+            .as_deref()
+            .and_then(|p| serde_json::from_str(p).ok())
+            .ok_or_else(|| CoordinatorError::Invalid("suggestion proposal missing".to_string()))?;
+        let mut created: Vec<String> = Vec::new();
+        for c in &proposal.children {
+            let child = self.create_brief(
+                tenant,
+                &c.title,
+                owner_subject_id,
+                None,
+                None,
+                None,
+                c.priority.as_deref(),
+            )?;
+            self.link_subbrief(task_id, &child)?;
+            created.push(child);
+        }
+
+        // ── 3. Record the created ids on the card + Chronicle. ──
+        {
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            let now = unix_secs();
+            let joined = created.join(",");
+            let _ = conn.execute(
+                "UPDATE brief_interactions SET response = ?1
+                 WHERE interaction_id = ?2 AND task_id = ?3",
+                params![joined, interaction_id, task_id],
+            );
+            let _ = conn.execute(
+                "INSERT INTO task_events (task_id, ts, event_type, payload)
+                 VALUES (?1, ?2, 'brief.suggestion_materialized', ?3)",
+                params![
+                    task_id,
+                    now,
+                    format!("{responder}: created {} — {joined}", created.len())
+                ],
+            );
+        }
+        Ok(created)
     }
 
     /// PHASE 5 (Brief): replace a Brief's free-form labels. Each is
@@ -9663,6 +9866,28 @@ pub fn register(
             })),
         );
     }
+    // §1.9 (suggest_tasks): propose a bounded child-Brief tree on a Brief,
+    // then accept (materialize as Sub-briefs) or reject it.
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.suggest_open",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_suggest_open(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.suggest_respond",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_suggest_respond(&s, &ctx) }
+            })),
+        );
+    }
     // PHASE 1 (Brief): Dossiers — durable artifacts on a Brief.
     {
         let s = store.clone();
@@ -11376,6 +11601,84 @@ fn handle_brief_interaction_respond(store: &TaskStore, ctx: &InvocationCtx) -> H
     {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.interaction_respond", e),
+    }
+}
+
+/// The JSON arg shape for `brief.suggest_open` — a structured proposal
+/// is awkward as a pipe-delimited string, so this capability takes JSON
+/// (like `prime.propose`). `task_id` is the owning Brief; `author` is
+/// who proposed; `summary` + `children` are the bounded proposal.
+#[derive(serde::Deserialize)]
+struct SuggestOpenArg {
+    task_id: String,
+    author: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    children: Vec<brief::ChildSpec>,
+}
+
+/// `brief.suggest_open` — open a `suggest_tasks` card on a Brief (§1.9).
+/// JSON arg `{task_id, author, summary, children:[{title, priority?}]}`.
+/// Returns the new interaction_id. The proposal is bounded + sanitized
+/// in the store; tenant scoping is on the owning Brief.
+fn handle_brief_suggest_open(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let arg: SuggestOpenArg = match serde_json::from_slice(&ctx.args) {
+        Ok(a) => a,
+        Err(e) => return invalid(format!("brief.suggest_open arg: {e}")),
+    };
+    let task = arg.task_id.trim();
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.suggest_open") {
+        return out;
+    }
+    match store.open_suggestion(task, arg.author.trim(), &arg.summary, &arg.children) {
+        Ok(id) => HandlerOutcome::Ok(id.into_bytes()),
+        Err(e) => map_edge_err("brief.suggest_open", e),
+    }
+}
+
+/// `brief.suggest_respond` — accept or reject a `suggest_tasks` card
+/// (§1.9). Arg `task_id|interaction_id|responder|verdict`, where
+/// `verdict` is `accept` (materialize children) or `reject` (close, no
+/// Briefs). Accept returns JSON `{"created":[child_ids]}`; reject
+/// returns `{"created":[]}`. A duplicate answer is a typed refusal.
+fn handle_brief_suggest_respond(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.suggest_respond utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.split('|').collect();
+    if parts.len() != 4 {
+        return invalid(
+            "brief.suggest_respond: expected `task_id|interaction_id|responder|verdict`"
+                .to_string(),
+        );
+    }
+    let task = parts[0].trim();
+    // Tenant scoping is on the owning Brief: a cross-Guild Brief id reads
+    // as not-found before any card row is touched.
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.suggest_respond") {
+        return out;
+    }
+    let accept = match parts[3].trim() {
+        "accept" => true,
+        "reject" => false,
+        other => return invalid(format!("brief.suggest_respond: verdict must be accept|reject, got `{other}`")),
+    };
+    let owner = ctx.caller.subject_id.to_string();
+    match store.respond_suggestion(
+        ctx.tenant_id_or_default(),
+        &owner,
+        task,
+        parts[1].trim(),
+        parts[2].trim(),
+        accept,
+    ) {
+        Ok(created) => match serde_json::to_vec(&serde_json::json!({ "created": created })) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.suggest_respond encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.suggest_respond", e),
     }
 }
 
@@ -13762,6 +14065,9 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         -- response are mirrored into `task_events` so they show in the
         -- Chronicle. One Brief owns its cards (tenant scoping is via the
         -- owning Brief, like Dossiers).
+        -- `kind` is `ask` | `confirm` | `suggest_tasks`. For a
+        -- `suggest_tasks` card, `proposal` holds the bounded JSON proposal
+        -- (summary + child specs); it is NULL for `ask`/`confirm`.
         CREATE TABLE IF NOT EXISTS brief_interactions (
             interaction_id TEXT PRIMARY KEY,
             task_id        TEXT NOT NULL,
@@ -13774,6 +14080,7 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             created_at     INTEGER NOT NULL,
             resolved_at    INTEGER,
             resolved_by    TEXT,
+            proposal       TEXT,
             FOREIGN KEY (task_id) REFERENCES tasks(task_id)
         );
         CREATE INDEX IF NOT EXISTS brief_interactions_by_task
@@ -14134,6 +14441,10 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         "ALTER TABLE brief_runs ADD COLUMN session_id TEXT",
         // Phase 3: durable refused Shift attempts (status='refused').
         "ALTER TABLE brief_runs ADD COLUMN refusal_reason TEXT",
+        // §1.9 suggest_tasks: the bounded JSON proposal (summary + child
+        // specs) carried by a `suggest_tasks` interaction card. NULL for
+        // `ask`/`confirm` cards and for legacy rows.
+        "ALTER TABLE brief_interactions ADD COLUMN proposal TEXT",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the
@@ -19255,6 +19566,187 @@ mod tests {
         // The card is still open for the owning Guild.
         let listed = s.list_interactions(&a).unwrap();
         assert_eq!(listed[0].status, "open");
+    }
+
+    // §1.9 (suggest_tasks): accepting a suggestion materializes the
+    // proposed children as real Sub-briefs, links them to the parent, and
+    // resolves the card with the created ids + a Chronicle entry.
+    #[test]
+    fn brief_suggestion_accept_materializes_children() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Parent epic", "subj", None, None, None, None)
+            .unwrap();
+        let children = vec![
+            brief::ChildSpec { title: "Design the API".into(), priority: None },
+            brief::ChildSpec { title: "Wire the store".into(), priority: Some("high".into()) },
+        ];
+        let id = s
+            .open_suggestion(&parent, "operative-1", "Break this epic down", &children)
+            .unwrap();
+        // The opening is chronicled and the card lists with its proposal.
+        let opened = s
+            .query_events(&parent, 0, 50, Some("brief.suggestion_opened"), EventOrder::Asc)
+            .unwrap();
+        assert_eq!(opened.len(), 1);
+        let listed = s.list_interactions(&parent).unwrap();
+        assert_eq!(listed[0].kind, "suggest_tasks");
+        assert_eq!(listed[0].proposal.as_ref().unwrap().children.len(), 2);
+
+        let created = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true)
+            .unwrap();
+        assert_eq!(created.len(), 2, "two children created");
+        // Both are real Briefs, linked as Sub-briefs of the parent.
+        let subs = s.list_subbriefs(&parent).unwrap();
+        assert_eq!(subs.len(), 2);
+        for c in &created {
+            assert!(subs.contains(c), "{c} must be a Sub-brief of the parent");
+            assert!(s.get(c).unwrap().is_some(), "{c} must exist as a real Brief");
+        }
+        // The high-priority child kept its priority.
+        let hi = s.brief_fields(&created[1]).unwrap().unwrap();
+        assert_eq!(hi.priority, "high");
+        // The card is resolved with the created ids; materialization chronicled.
+        let listed = s.list_interactions(&parent).unwrap();
+        assert_eq!(listed[0].status, "resolved");
+        assert_eq!(listed[0].response.as_deref(), Some(created.join(",").as_str()));
+        let mat = s
+            .query_events(
+                &parent,
+                0,
+                50,
+                Some("brief.suggestion_materialized"),
+                EventOrder::Asc,
+            )
+            .unwrap();
+        assert_eq!(mat.len(), 1);
+    }
+
+    // Rejecting a suggestion closes it and creates NO Briefs.
+    #[test]
+    fn brief_suggestion_reject_creates_no_briefs() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Parent", "subj", None, None, None, None)
+            .unwrap();
+        let id = s
+            .open_suggestion(
+                &parent,
+                "operative-1",
+                "Some plan",
+                &[brief::ChildSpec { title: "Do a thing".into(), priority: None }],
+            )
+            .unwrap();
+        let created = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", false)
+            .unwrap();
+        assert!(created.is_empty());
+        assert!(s.list_subbriefs(&parent).unwrap().is_empty());
+        let listed = s.list_interactions(&parent).unwrap();
+        assert_eq!(listed[0].status, "rejected");
+    }
+
+    // A second accept is a typed refusal and does NOT double-create Briefs.
+    #[test]
+    fn brief_suggestion_duplicate_accept_is_refused_no_duplicates() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Parent", "subj", None, None, None, None)
+            .unwrap();
+        let id = s
+            .open_suggestion(
+                &parent,
+                "op",
+                "Plan",
+                &[
+                    brief::ChildSpec { title: "A".into(), priority: None },
+                    brief::ChildSpec { title: "B".into(), priority: None },
+                ],
+            )
+            .unwrap();
+        let first = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true)
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        // Re-accept → typed Invalid, no new children.
+        let again = s.respond_suggestion("acme", "subj", &parent, &id, "founder", true);
+        assert!(matches!(again, Err(CoordinatorError::Invalid(_))));
+        // Re-reject after resolution is also refused.
+        let rej = s.respond_suggestion("acme", "subj", &parent, &id, "founder", false);
+        assert!(matches!(rej, Err(CoordinatorError::Invalid(_))));
+        assert_eq!(s.list_subbriefs(&parent).unwrap().len(), 2, "no duplicates");
+    }
+
+    // The generic respond path must refuse a suggest_tasks card (it would
+    // resolve it without creating the proposed children).
+    #[test]
+    fn brief_generic_respond_refuses_suggest_tasks() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Parent", "subj", None, None, None, None)
+            .unwrap();
+        let id = s
+            .open_suggestion(
+                &parent,
+                "op",
+                "Plan",
+                &[brief::ChildSpec { title: "A".into(), priority: None }],
+            )
+            .unwrap();
+        let out = s.respond_interaction(&parent, &id, "founder", "resolved", "yes");
+        assert!(matches!(out, Err(CoordinatorError::Invalid(_))));
+        // Still open; no children leaked.
+        assert_eq!(s.list_interactions(&parent).unwrap()[0].status, "open");
+        assert!(s.list_subbriefs(&parent).unwrap().is_empty());
+    }
+
+    // Tenant scoping: a cross-Guild Brief id is invisible to suggest open /
+    // respond (no existence leak); the same-Guild caller succeeds.
+    #[test]
+    fn brief_suggestion_denied_across_tenant() {
+        let s = TaskStore::in_memory().unwrap();
+        let a = s
+            .create_brief("acme", "Acme", "subj", None, None, None, None)
+            .unwrap();
+        let open_arg = serde_json::json!({
+            "task_id": a,
+            "author": "op",
+            "summary": "Plan",
+            "children": [{ "title": "A" }],
+        });
+        let open_bytes = serde_json::to_vec(&open_arg).unwrap();
+        // Cross-tenant open is refused.
+        assert!(matches!(
+            handle_brief_suggest_open(&s, &ctx_tenant(&open_bytes, "globex")),
+            HandlerOutcome::Err(_)
+        ));
+        // Same-tenant open returns the id.
+        let id = match handle_brief_suggest_open(&s, &ctx_tenant(&open_bytes, "acme")) {
+            HandlerOutcome::Ok(body) => String::from_utf8(body).unwrap(),
+            HandlerOutcome::Err(_) => panic!("suggest_open errored"),
+        };
+        // Cross-tenant accept is refused and creates nothing.
+        assert!(matches!(
+            handle_brief_suggest_respond(
+                &s,
+                &ctx_tenant(format!("{a}|{id}|hacker|accept").as_bytes(), "globex"),
+            ),
+            HandlerOutcome::Err(_)
+        ));
+        assert!(s.list_subbriefs(&a).unwrap().is_empty());
+        // Same-tenant accept works and reports the created ids.
+        let out = handle_brief_suggest_respond(
+            &s,
+            &ctx_tenant(format!("{a}|{id}|founder|accept").as_bytes(), "acme"),
+        );
+        let body = match out {
+            HandlerOutcome::Ok(b) => b,
+            HandlerOutcome::Err(_) => panic!("suggest_respond errored"),
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["created"].as_array().unwrap().len(), 1);
+        assert_eq!(s.list_subbriefs(&a).unwrap().len(), 1);
     }
 
     #[test]

@@ -1700,6 +1700,90 @@ pub async fn respond_interaction(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SuggestChild {
+    pub title: String,
+    #[serde(default)]
+    pub priority: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OpenSuggestionRequest {
+    pub author: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub children: Vec<SuggestChild>,
+}
+
+/// `POST /v1/spine/briefs/:id/suggestions` — open a `suggest_tasks` card
+/// (§1.9): an Operative proposes a bounded list of child Briefs. The
+/// proposal is JSON (a pipe-delimited string can't carry a child list),
+/// so the bridge forwards a JSON arg the coordinator validates +
+/// size-caps. Returns `{interaction_id}`.
+pub async fn open_suggestion(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<OpenSuggestionRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if req.author.trim().is_empty() {
+        return Err(bad("author required"));
+    }
+    if req.children.is_empty() {
+        return Err(bad("at least one proposed task is required"));
+    }
+    // Build the JSON wire arg (like `prime.propose`). The coordinator is the
+    // authoritative validator — it bounds the count, lengths, and priorities.
+    let children: Vec<serde_json::Value> = req
+        .children
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "title": c.title,
+                "priority": c.priority,
+            })
+        })
+        .collect();
+    let arg = serde_json::json!({
+        "task_id": id,
+        "author": req.author.trim(),
+        "summary": req.summary,
+        "children": children,
+    });
+    let arg_bytes = serde_json::to_vec(&arg).map_err(|e| bad(&format!("encode: {e}")))?;
+    let body = call_peer(&state, "brief.suggest_open", &arg_bytes).await?;
+    json_id("interaction_id", &body)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RespondSuggestionRequest {
+    pub responder: String,
+    /// `true` accepts (materializes the child Briefs); `false` rejects.
+    pub accept: bool,
+}
+
+/// `POST /v1/spine/briefs/:id/suggestions/:iid/respond` — accept or
+/// reject a `suggest_tasks` card (§1.9). Accept materializes the proposed
+/// child Briefs as Sub-briefs and returns `{created:[ids]}`; reject
+/// closes the card with no Briefs. A duplicate answer is a typed 400.
+pub async fn respond_suggestion(
+    State(state): State<AppState>,
+    Path((id, iid)): Path<(String, String)>,
+    Json(req): Json<RespondSuggestionRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if req.responder.trim().is_empty() {
+        return Err(bad("responder required"));
+    }
+    // responder is a positional wire field, so it must not carry a `|`.
+    if req.responder.contains('|') {
+        return Err(bad("responder must not contain `|`"));
+    }
+    let verdict = if req.accept { "accept" } else { "reject" };
+    let arg = format!("{id}|{iid}|{}|{verdict}", req.responder.trim());
+    let body = call_peer(&state, "brief.suggest_respond", arg.as_bytes()).await?;
+    json_passthrough(body)
+}
+
+#[derive(Debug, Deserialize)]
 pub struct SetFieldRequest {
     pub field: String,
     #[serde(default)]

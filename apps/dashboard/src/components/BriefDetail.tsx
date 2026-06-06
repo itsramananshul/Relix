@@ -7,6 +7,7 @@ import {
   subscribeRunEvents,
   runControls,
   briefInteractions,
+  briefSuggestions,
   type RunDiff,
   type BriefInteraction,
 } from "../api";
@@ -260,7 +261,14 @@ export function BriefDetail({
   // Thread interactions (§1.9): the open ask/confirm cards needing an answer
   // sit above the Conversation; resolved/rejected ones stay listed but marked.
   const interactions = data?.interactions ?? [];
-  const openInteractions = interactions.filter((i) => i.status === "open");
+  // suggest_tasks cards render with their own Accept/Reject controls; the
+  // ask/confirm cards keep the Yes/No · choice · free-text controls.
+  const openInteractions = interactions.filter(
+    (i) => i.status === "open" && i.kind !== "suggest_tasks",
+  );
+  const openSuggestions = interactions.filter(
+    (i) => i.status === "open" && i.kind === "suggest_tasks",
+  );
   const closedInteractions = interactions.filter((i) => i.status !== "open");
 
   async function submitComment() {
@@ -306,6 +314,33 @@ export function BriefDetail({
         msg: verdict === "resolved" ? "Request answered." : "Request declined.",
       });
       setIxDraft((m) => ({ ...m, [it.interaction_id]: "" }));
+      reload();
+      onChanged?.();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Response failed" });
+    } finally {
+      setIxBusy(null);
+    }
+  }
+
+  // Accept or reject a `suggest_tasks` card (§1.9). Accept materializes the
+  // proposed children as real Sub-briefs server-side and returns their ids; a
+  // duplicate answer is refused server-side and surfaces as an honest banner.
+  async function answerSuggestion(it: BriefInteraction, accept: boolean) {
+    setIxBusy(it.interaction_id);
+    setBanner(null);
+    try {
+      const r = await briefSuggestions.respond(briefId, it.interaction_id, {
+        responder: status?.username || "operator",
+        accept,
+      });
+      const n = r?.created?.length ?? 0;
+      setBanner({
+        kind: "ok",
+        msg: accept
+          ? `Suggestion accepted — ${n} Sub-brief${n === 1 ? "" : "s"} created.`
+          : "Suggestion declined.",
+      });
       reload();
       onChanged?.();
     } catch (e) {
@@ -603,7 +638,8 @@ export function BriefDetail({
           <div className="row" style={{ marginTop: 14, marginBottom: 6 }}>
             <strong style={{ fontSize: 12 }}>Requests</strong>
             <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>
-              {openInteractions.length} open · {closedInteractions.length} answered
+              {openInteractions.length + openSuggestions.length} open ·{" "}
+              {closedInteractions.length} answered
             </span>
           </div>
 
@@ -689,6 +725,64 @@ export function BriefDetail({
               )}
             </div>
           ))}
+
+          {/* suggest_tasks cards (§1.9): a proposed child-Brief tree the
+              Operative raised. The operator accepts — materializing each as a
+              real Sub-brief — or rejects. The proposed titles are listed so the
+              operator sees exactly what they're accepting (no hidden creates). */}
+          {openSuggestions.map((it) => {
+            const children = it.proposal?.children ?? [];
+            return (
+              <div
+                key={it.interaction_id}
+                className="card"
+                style={{ borderColor: "var(--warn, #b9770e)", padding: 10, marginBottom: 8 }}
+              >
+                <div className="row" style={{ gap: 6, alignItems: "baseline", flexWrap: "wrap" }}>
+                  <span className="badge in_progress" style={{ fontSize: 10 }}>suggest tasks</span>
+                  <span className="mono" style={{ fontSize: 10 }}>{it.author}</span>
+                  {it.created_at ? (
+                    <span className="muted" style={{ fontSize: 10 }}>
+                      {new Date(it.created_at * 1000).toLocaleString()}
+                    </span>
+                  ) : null}
+                </div>
+                <div style={{ fontSize: 13, margin: "5px 0 6px", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                  {it.proposal?.summary || it.prompt}
+                </div>
+                <ul style={{ margin: "0 0 8px", paddingLeft: 18, fontSize: 12 }}>
+                  {children.map((c, i) => (
+                    <li key={i} style={{ wordBreak: "break-word" }}>
+                      {c.title}
+                      {c.priority ? (
+                        <span className="muted" style={{ fontSize: 10, marginLeft: 6 }}>
+                          {c.priority}
+                        </span>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+                <div className="row wrap" style={{ gap: 6 }}>
+                  <button
+                    className="btn sm"
+                    disabled={ixBusy === it.interaction_id || children.length === 0}
+                    onClick={() => answerSuggestion(it, true)}
+                  >
+                    {ixBusy === it.interaction_id
+                      ? "…"
+                      : `Accept ${children.length} task${children.length === 1 ? "" : "s"}`}
+                  </button>
+                  <button
+                    className="btn ghost sm"
+                    disabled={ixBusy === it.interaction_id}
+                    onClick={() => answerSuggestion(it, false)}
+                  >
+                    Reject
+                  </button>
+                </div>
+              </div>
+            );
+          })}
 
           {closedInteractions.length > 0 && (
             <div style={{ fontSize: 12, marginBottom: 8 }}>
