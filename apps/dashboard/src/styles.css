@@ -190,16 +190,36 @@ label.field span { display: block; font-size: 12px; color: var(--text-dim); marg
    §2 the panel is contextual — the `.split-*` classes are applied ONLY while
    something is selected, so with nothing open the board keeps full width and
    the panel "slides away" rather than squeezing the most-used screen. */
-.split-workspace { display: flex; gap: 14px; align-items: flex-start; }
-.split-workspace > .split-main { flex: 1 1 auto; min-width: 0; }
+/* `min-width: 0`: the workspace is a grid item (the page content area is a
+   `.grid`), so without this its content min-content — the board's 5×180px
+   column floor plus the 400px panel — forces it to overflow its grid track,
+   pushing the panel past the viewport. Zeroing the automatic minimum lets it
+   shrink to the track so the board (its own `overflow-x`) scrolls instead. */
+.split-workspace { display: flex; gap: 14px; align-items: flex-start; min-width: 0; }
+/* `flex-basis: 0` (not `auto`) so the board sizes to the space LEFT OVER
+   after the fixed-width panel — using its own `overflow-x` to scroll the
+   columns — rather than to its content width, which would push the panel
+   past the viewport and clip it (design §2/§7: board flexes, panel holds). */
+.split-workspace > .split-main { flex: 1 1 0; min-width: 0; }
 .split-workspace > .context-panel {
   flex: 0 0 400px; max-width: 420px; align-self: flex-start;
   position: sticky; top: 0; max-height: calc(100vh - 96px); overflow-y: auto;
 }
+/* Inside the ~400px panel the BriefDetail header `.row` (title + badges +
+   Refresh/Close) no longer has the full board width to lay out on one line,
+   so let its rows wrap — otherwise the rightmost control (Close ✕) is pushed
+   past the panel edge and clipped. The shared `.gap` already supplies the
+   row-gap once wrapped (design §2/§7: the panel must stay usable). */
+.context-panel .row { flex-wrap: wrap; }
 /* Stack on narrow viewports: the panel becomes a normal full-width section
    below the board — no off-screen drawer (design §2: usable from a phone). */
 @media (max-width: 980px) {
-  .split-workspace { flex-direction: column; }
+  /* Stack the panel below the board. `align-items: stretch` (overriding the
+     base `flex-start`, which in a column controls the *horizontal* axis and
+     would otherwise let the board size to its 948px content width and spill
+     out of the workspace) makes both the board and the panel fill the column,
+     so the board scrolls internally rather than overflowing the page. */
+  .split-workspace { flex-direction: column; align-items: stretch; }
   .split-workspace > .context-panel {
     flex: 1 1 auto; max-width: none; width: 100%;
     position: static; max-height: none; overflow: visible;
