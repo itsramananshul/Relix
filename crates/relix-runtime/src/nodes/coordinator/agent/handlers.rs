@@ -6176,6 +6176,28 @@ mod tests {
             Some("applied"),
             "the Shift's durable terminal is `applied`: {run:?}"
         );
+
+        // 10) Productized review-to-done (company-model §12.5B/§12.6): the
+        //     completed Shift parked the Brief in `in_review`, and the operator's
+        //     apply IS the review-to-done — `run.apply` advances the Brief to
+        //     board `done` (the same store call the handler makes) so dependents
+        //     unblock WITHOUT a separate manual `brief.move done`. The loop now
+        //     closes on the BOARD, not just the run ledger.
+        assert_eq!(
+            task.board_status(&run.brief_id).unwrap().as_deref(),
+            Some("in_review"),
+            "the completed echo Shift parked its Brief in review"
+        );
+        let to = task
+            .complete_reviewed_brief(&run.brief_id)
+            .unwrap()
+            .expect("the operator's apply advances the reviewed Brief to done");
+        assert_eq!(to, "done");
+        assert_eq!(
+            task.board_status(&run.brief_id).unwrap().as_deref(),
+            Some("done"),
+            "the §12.6 positive local loop closes on the board: the Brief is done"
+        );
     }
 
     #[tokio::test]

@@ -5478,6 +5478,44 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Productized **review-to-done** for `run.apply` (company-model §12.5B /
+/// §12.6). A clean, accept-gated operator apply IS the operator's
+/// review-to-done, so the run's Brief should reach board `done` — which
+/// resolves every dependent's blocker — WITHOUT a separate manual
+/// `brief.move done`. (`run.apply` already requires the run to be `done` +
+/// `accepted`, so reaching here means the operator deliberately accepted and
+/// applied; the Shift itself never auto-advances the board.)
+///
+/// Narrow + honest: it advances ONLY a Brief that is genuinely awaiting review
+/// (`in_review`) — any other column (already `done`, re-opened, `cancelled`)
+/// is left untouched. Best-effort: a board-move refusal NEVER fails the apply
+/// (the files are already applied) — it leaves the Brief in review and returns
+/// `None`. Returns the Brief's resulting board status when it advanced, so the
+/// caller can report the board change honestly.
+fn advance_reviewed_brief(
+    store: &crate::nodes::coordinator::TaskStore,
+    brief_id: &str,
+    run_id: &str,
+) -> Option<String> {
+    match store.complete_reviewed_brief(brief_id) {
+        Ok(Some(to)) => {
+            let _ = store.append_run_event(
+                run_id,
+                "apply.brief_done",
+                "relix",
+                &format!("review-to-done: Brief {brief_id} → {to} (dependents unblock)"),
+                None,
+                false,
+            );
+            Some(to)
+        }
+        // Not awaiting review (already done / re-opened / cancelled) — honest no-op.
+        Ok(None) => None,
+        // A board refusal must never fail an already-successful apply.
+        Err(_) => None,
+    }
+}
+
 /// Post-startup wiring the per-node-type registration handed
 /// back to `run()` because it depends on the `rpc::Client` that
 /// only exists after the dispatch bridge is built.
@@ -9896,9 +9934,18 @@ fn register_node_type_handlers(
                                     &run_id, "apply.applied", "relix",
                                     "no artifacts — nothing to apply", None, false,
                                 );
+                                // Productized review-to-done (company-model
+                                // §12.5B/§12.6): a clean apply IS the operator's
+                                // review-to-done. An echo Shift writes nothing,
+                                // so this no-op apply is exactly where the
+                                // safe-local loop closes — advance the Brief to
+                                // `done` so its dependents unblock.
+                                let brief_status =
+                                    advance_reviewed_brief(&st, &run.brief_id, &run_id);
                                 let body = serde_json::json!({
                                     "run_id": run_id, "apply_status": "applied",
                                     "applied_files": 0, "failed_files": 0,
+                                    "brief_id": run.brief_id, "brief_status": brief_status,
                                 });
                                 return match serde_json::to_vec(&body) {
                                     Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
@@ -9965,11 +10012,23 @@ fn register_node_type_handlers(
                                     );
                                 }
                             }
+                            // Productized review-to-done (company-model
+                            // §12.5B/§12.6): ONLY a clean `applied` advances the
+                            // Brief. A `conflicted` (nothing written) or `failed`
+                            // (partial) apply leaves the Brief in review — the
+                            // operator's work is not integrated, so it is NOT done.
+                            let brief_status = if outcome.status == "applied" {
+                                advance_reviewed_brief(&st, &run.brief_id, &run_id)
+                            } else {
+                                None
+                            };
                             let body = serde_json::json!({
                                 "run_id": run_id,
                                 "apply_status": outcome.status,
                                 "applied_files": outcome.applied_files,
                                 "failed_files": outcome.failed_files,
+                                "brief_id": run.brief_id,
+                                "brief_status": brief_status,
                                 "plan": outcome.plan,
                             });
                             match serde_json::to_vec(&body) {

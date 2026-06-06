@@ -45,8 +45,10 @@ per-flow event log lives. Retry decisions are operator-driven via
 A Brief Shift (run) executes in a scoped sandbox workspace and its
 changed files can be **inspected** (changed-file list, secret-redacted
 text preview, bounded unified diff), **reviewed** (accept/reject),
-**applied** back into the configured project root, or **discarded**. What
-it does **not** do:
+**applied** back into the configured project root, or **discarded**. A clean
+apply is the operator's **review-to-done** (company-model §12.5B/§12.6): it
+advances the run's Brief from `in_review` to `done`, so dependents unblock
+without a separate manual `brief.move done`. What it does **not** do:
 
 - **Diff needs an intact baseline.** The unified diff
   (`/v1/runs/:id/artifacts/:aid/diff`) reconstructs the "before" side from

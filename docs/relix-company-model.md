@@ -607,12 +607,19 @@ plan, nothing created) → **Approve & create** (`prime.approve` — Mandate +
 Briefs + assignments + pending hires) → **greenlight the hires** (approve the
 pending hire / any spawn Clearance — the missing-role Operatives go active) →
 **Start the work** (`prime.start` — reconciles the now-active hires onto their
-waiting tracks, then runs every ready Brief) → review each Shift to board
-`done` → its dependents (e.g. the *integrate* track) unblock and run on a
-repeat **Start the work**. Every step is a governed gate; nothing runs itself.
+waiting tracks, then runs every ready Brief) → **review-to-done each Shift**
+(accept its run, then `run.apply` — which advances the Brief to board `done`)
+→ its dependents (e.g. the *integrate* track) unblock and run on a repeat
+**Start the work**. Every step is a governed gate; nothing runs itself.
 (A dependent Brief unblocks only when *every* blocking track reaches board
-`done`, which is the operator's review-to-done — a finished Shift opens its
-*run* review but does not move the Brief to `done` on its own.)
+`done`. A finished Shift opens its *run* review but does **not** move the
+Brief on its own — the **operator's review-to-done** does, and that
+review-to-done is now a single governed action: the operator accepts the run
+and applies it, and a clean accept-gated **`run.apply` advances the Brief from
+`in_review` to `done`** (resolving its dependents' blockers) — so no separate
+manual `brief.move done` is needed. Apply stays the file-integration step;
+it advances the board only on a clean apply and only for a Brief genuinely
+awaiting review.)
 
 ---
 

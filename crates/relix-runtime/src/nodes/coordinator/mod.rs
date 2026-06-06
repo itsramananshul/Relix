@@ -677,6 +677,42 @@ impl TaskStore {
         Ok((from, to.to_string()))
     }
 
+    /// Productized **review-to-done** (company-model §12.5B / §12.6). The
+    /// operator's deliberate, accept-gated `run.apply` *is* the review-to-done:
+    /// when an accepted run's output is applied, the Brief's review is
+    /// complete, so the Brief should reach board `done` (which resolves every
+    /// dependent's blocker) WITHOUT a separate manual `brief.move done`.
+    ///
+    /// This advances a Brief that is genuinely **awaiting review**
+    /// (`in_review`) to `done` through the SAME `set_board_status` path a
+    /// manual `brief.move` uses — so it records the `brief.board_moved`
+    /// chronicle and a dependent Brief whose blockers are now all `done`
+    /// becomes ready exactly as before. It is intentionally narrow and honest:
+    ///
+    /// - It NEVER auto-advances on a finished Shift — only the operator's apply
+    ///   calls this (a finished Shift still merely opens its run review).
+    /// - It ONLY advances from `in_review`; a Brief in any other column
+    ///   (already `done`, re-opened to `in_progress`, `cancelled`, …) is left
+    ///   untouched — nothing is forced.
+    ///
+    /// Returns `Some(to)` (the new board status, `"done"`) when it advanced,
+    /// or `None` when the Brief was not awaiting review (so the caller can
+    /// report honestly that the board was unchanged). A missing Brief is
+    /// `NotFound`.
+    pub fn complete_reviewed_brief(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<String>, CoordinatorError> {
+        match self.board_status(task_id)? {
+            None => Err(CoordinatorError::NotFound(task_id.to_string())),
+            Some(ref s) if s == "in_review" => {
+                let (_from, to) = self.set_board_status(task_id, "done")?;
+                Ok(Some(to))
+            }
+            Some(_) => Ok(None),
+        }
+    }
+
     /// PHASE 1 (Brief): read a Brief's current board status. `None`
     /// when the Brief doesn't exist.
     pub fn board_status(&self, task_id: &str) -> Result<Option<String>, CoordinatorError> {
@@ -16597,6 +16633,77 @@ mod tests {
             .map(|c| c.task_id)
             .collect();
         assert!(!still.contains(&w2)); // cancelled blocker keeps it blocked
+    }
+
+    #[test]
+    fn complete_reviewed_brief_is_the_review_to_done_that_unblocks_dependents() {
+        // company-model §12.5B/§12.6 — the productized review-to-done. A clean
+        // operator apply advances an `in_review` Brief to `done` through the
+        // same board path a manual `brief.move` uses, which resolves a
+        // dependent's blocker WITHOUT a separate manual move. It is narrow and
+        // honest: it never advances a Brief that is not awaiting review.
+        let s = store();
+        let mk = |t: &str| {
+            let id = s
+                .create(
+                    t,
+                    "flows/none.sol",
+                    "{}",
+                    "subj",
+                    RetryPolicy::None,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap();
+            s.set_board_status(&id, "todo").unwrap();
+            id
+        };
+        let integrate = mk("integrate");
+        let track = mk("track");
+        s.set_brief_field(&track, "assignee", "agt_work").unwrap();
+        s.add_snag(&integrate, &track).unwrap();
+
+        // The track has run and is awaiting review; the dependent is blocked.
+        move_to_progress(&s, &track);
+        move_to_review(&s, &track);
+        assert!(
+            s.is_blocked(&integrate).unwrap(),
+            "integrate is blocked while its track is still in review"
+        );
+
+        // The operator's apply IS the review-to-done: the track advances to
+        // `done` and the dependent unblocks — no manual `brief.move done`.
+        let to = s
+            .complete_reviewed_brief(&track)
+            .unwrap()
+            .expect("an in_review Brief advances to done");
+        assert_eq!(to, "done");
+        assert_eq!(s.board_status(&track).unwrap().as_deref(), Some("done"));
+        assert!(
+            !s.is_blocked(&integrate).unwrap(),
+            "with the track done, the dependent integrate Brief unblocks"
+        );
+
+        // Honest no-op: a Brief that is NOT awaiting review is left untouched.
+        assert_eq!(
+            s.complete_reviewed_brief(&track).unwrap(),
+            None,
+            "a `done` Brief is not awaiting review → no-op (nothing forced)"
+        );
+        let fresh = mk("fresh"); // sits in `todo`, never reviewed
+        assert_eq!(
+            s.complete_reviewed_brief(&fresh).unwrap(),
+            None,
+            "a `todo` Brief is not awaiting review → no-op"
+        );
+        assert_eq!(s.board_status(&fresh).unwrap().as_deref(), Some("todo"));
+
+        // A missing Brief is NotFound (never silently a no-op).
+        assert!(matches!(
+            s.complete_reviewed_brief("task_does_not_exist"),
+            Err(CoordinatorError::NotFound(_))
+        ));
     }
 
     #[test]

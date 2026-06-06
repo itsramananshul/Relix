@@ -1342,7 +1342,14 @@ pub async fn run_diff(
 
 /// `POST /v1/runs/:run_id/apply` — apply an accepted run's changed files
 /// back into the configured project root. Refuses the whole apply if any
-/// file is unsafe / conflicted (no partial apply, no `force`).
+/// file is unsafe / conflicted (no partial apply, no `force`). On a clean
+/// apply this is the operator's **review-to-done** (company-model
+/// §12.5B/§12.6): if the run's Brief is awaiting review (`in_review`) it is
+/// advanced to board `done` — resolving every dependent's blocker — so the
+/// loop closes WITHOUT a separate manual `brief.move done`. The response adds
+/// `brief_id` + the resulting `brief_status` (`done` when it advanced, else
+/// the unchanged column). A `conflicted`/`failed` apply never advances the
+/// Brief, and a Brief not in `in_review` is left untouched.
 pub async fn run_apply(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
