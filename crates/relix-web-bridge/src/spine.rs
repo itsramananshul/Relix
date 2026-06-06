@@ -1971,6 +1971,47 @@ fn json_passthrough(body: Vec<u8>) -> Result<Response, (StatusCode, Json<ApiErro
         })
 }
 
+/// Map a coordinator error envelope (`kind` + `cause`) onto an honest
+/// HTTP status for the dashboard. Narrow + consistent with the bridge's
+/// other routes (see `agent.rs`'s `SECURITY_DENIED → 403`) and the
+/// coordinator's own `FailureClass::from_kind` taxonomy
+/// (`nodes::coordinator::FailureClass`):
+///
+/// - a **not-found** cause stays **404** and never leaks cross-tenant
+///   existence — the coordinator already returns a generic "not found"
+///   for a tenant-gated resource, so honouring that text keeps the
+///   no-existence-leak guarantee even when the kind would be a denial;
+/// - a malformed-request kind (`INVALID_ARGS`) is **400**;
+/// - a governance / permission / safety refusal
+///   (`POLICY_DENIED` · `APPROVAL_DENIED` · `SECURITY_DENIED`) is **403** —
+///   an honest "the mesh refused you," not a server failure. This is the
+///   case the assignee-hint smoke hit: an assign-denied `POLICY_DENIED`
+///   (kind 6) was surfacing as a 502, making a client governance refusal
+///   look like an upstream outage;
+/// - everything else (transport, timeout, peer-unreachable, responder
+///   internal, unknown method, …) stays **502**, so a TRUE upstream /
+///   mesh failure is never masked as a client error. Bridge-identity
+///   failures (`IDENTITY_INVALID` / `CREDENTIAL_EXPIRED`) deliberately
+///   stay here: for this bridge they signal a server-side misconfig, not
+///   a caller governance refusal, and must not be hidden behind a 4xx.
+fn coordinator_err_status(kind: u32, cause: &str) -> StatusCode {
+    use relix_core::types::error_kinds as ek;
+    // Not-found wins first: it preserves the existing 404 behaviour and the
+    // no-cross-tenant-existence-leak guarantee regardless of kind.
+    if cause.to_ascii_lowercase().contains("not found") {
+        StatusCode::NOT_FOUND
+    } else if kind == ek::INVALID_ARGS {
+        StatusCode::BAD_REQUEST
+    } else if kind == ek::POLICY_DENIED
+        || kind == ek::APPROVAL_DENIED
+        || kind == ek::SECURITY_DENIED
+    {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
 /// Dial the coordinator and invoke `method` with `arg`, returning
 /// the raw response body. Mirrors the `agent.*` routes' helper.
 async fn call_peer(
@@ -2017,14 +2058,7 @@ async fn call_peer(
         ResponseResult::Ok(body) => Ok(body.to_vec()),
         ResponseResult::Err(env) => {
             let cause = env.cause;
-            let lower = cause.to_ascii_lowercase();
-            let status = if lower.contains("not found") {
-                StatusCode::NOT_FOUND
-            } else if env.kind == 5 {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
+            let status = coordinator_err_status(env.kind, &cause);
             Err((
                 status,
                 Json(ApiError {
@@ -2066,6 +2100,68 @@ mod tests {
         let (status, body) = bad("q required");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0.error, "q required");
+    }
+
+    #[test]
+    fn coordinator_err_status_maps_known_refusals_to_honest_4xx() {
+        use relix_core::types::error_kinds as ek;
+
+        // The regression this slice fixes: an assign-denied governance
+        // refusal (POLICY_DENIED, kind 6) is a 403, NOT a 502 — a client
+        // refusal must never look like an upstream failure.
+        assert_eq!(
+            coordinator_err_status(ek::POLICY_DENIED, "assignee hint denied: out of assign scope"),
+            StatusCode::FORBIDDEN,
+        );
+        // The rest of the governance/safety "denied" family is 403 too,
+        // matching the bridge's existing `agent.rs` convention + the
+        // coordinator's FailureClass grouping.
+        assert_eq!(
+            coordinator_err_status(ek::APPROVAL_DENIED, "operator rejected the approval"),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            coordinator_err_status(ek::SECURITY_DENIED, "content looked like a poisoning attempt"),
+            StatusCode::FORBIDDEN,
+        );
+
+        // Malformed input stays a 400 (e.g. a duplicate accept).
+        assert_eq!(
+            coordinator_err_status(ek::INVALID_ARGS, "suggestion already resolved"),
+            StatusCode::BAD_REQUEST,
+        );
+
+        // A not-found cause stays a 404 — and that wins even over a denial
+        // kind, so a tenant-gated resource never leaks its existence.
+        assert_eq!(
+            coordinator_err_status(ek::INVALID_ARGS, "brief not found"),
+            StatusCode::NOT_FOUND,
+        );
+        assert_eq!(
+            coordinator_err_status(ek::POLICY_DENIED, "brief not found"),
+            StatusCode::NOT_FOUND,
+            "a not-found cause must not be downgraded to a 403 existence leak",
+        );
+
+        // TRUE upstream/mesh failures stay 502 — never masked as a client
+        // error. Bridge-identity failures also stay 502 (server-side).
+        assert_eq!(
+            coordinator_err_status(ek::TRANSPORT, "mesh dial failed"),
+            StatusCode::BAD_GATEWAY,
+        );
+        assert_eq!(
+            coordinator_err_status(ek::RESPONDER_INTERNAL, "coordinator panicked"),
+            StatusCode::BAD_GATEWAY,
+        );
+        assert_eq!(
+            coordinator_err_status(ek::IDENTITY_INVALID, "bridge bundle expired"),
+            StatusCode::BAD_GATEWAY,
+        );
+        // An unmapped/unknown kind defaults to 502, not a misleading 4xx.
+        assert_eq!(
+            coordinator_err_status(9999, "something new"),
+            StatusCode::BAD_GATEWAY,
+        );
     }
 
     #[test]

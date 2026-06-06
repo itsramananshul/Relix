@@ -508,6 +508,18 @@ async fn brief_suggestion_routes_round_trip_open_list_respond() {
                             retry_hint: 0,
                             retry_after: None,
                         })
+                    } else if arg.contains("|bix_denied|") {
+                        // Accepting a card whose child carries an assignee hint
+                        // the accepter's assign-Key forbids is a governance
+                        // refusal — a typed POLICY_DENIED the bridge must map to
+                        // a 403, NOT a 502 (the assignee-hint smoke regression).
+                        HandlerOutcome::Err(ErrorEnvelope {
+                            kind: error_kinds::POLICY_DENIED,
+                            cause: "brief.suggest_respond: assignee hint denied — out of assign scope"
+                                .into(),
+                            retry_hint: 0,
+                            retry_after: None,
+                        })
                     } else {
                         HandlerOutcome::Ok(
                             serde_json::to_vec(&serde_json::json!({ "created": ["c1", "c2"] }))
@@ -713,6 +725,36 @@ addr = "{addr}"
         resp.status().as_u16(),
         400,
         "a duplicate accept must surface as a typed 400, not a 5xx"
+    );
+
+    // ─── an assign-denied accept (coordinator POLICY_DENIED) → 403 ───
+    // The card materializes children carrying an assignee hint the accepter's
+    // assign-Key forbids; the coordinator refuses with POLICY_DENIED (kind 6).
+    // The bridge must surface that governance refusal as a 403, not a 502.
+    let denied_url =
+        format!("http://{bound}/v1/spine/briefs/task_1/suggestions/bix_denied/respond");
+    let resp = timeout(
+        Duration::from_secs(15),
+        http.post(&denied_url)
+            .json(&serde_json::json!({ "responder": "founder", "accept": true }))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "an assign-denied refusal must surface as a typed 403, not a 502"
+    );
+    // The refusal text is preserved for the client (no existence leak).
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body.get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("out of assign scope"),
+        "the 403 body must preserve the governance refusal reason"
     );
 
     // ─── bridge-level validation: no children → 400, no peer call ───
