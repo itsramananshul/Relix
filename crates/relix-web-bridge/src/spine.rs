@@ -375,10 +375,37 @@ pub async fn decide_clearance(
 #[derive(Debug, Deserialize)]
 pub struct PrimeProposeRequest {
     pub message: String,
+    /// `"ai"` opts into the model-assisted seam (company-model §12.5A): the
+    /// bridge drafts a plan with the AI peer, then the COORDINATOR validates +
+    /// sanitizes it server-side before storage. Any other value (or absent) is
+    /// the historical rule-based path. Falls back deterministically whenever
+    /// the model is unreachable or its output fails validation.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
+
+/// The AI node's mesh alias (the chat flow already routes `remote_call("ai",
+/// …)` here). Overridable for non-default topologies; absence simply means the
+/// model path reports `unavailable` and the deterministic plan is used.
+fn ai_peer_alias() -> String {
+    std::env::var("RELIX_PRIME_AI_PEER").unwrap_or_else(|_| "ai".to_string())
+}
+
+/// Hard cap on the prompt we send the model — bounds cost and keeps the request
+/// context tight (request + roster only, never a repo dump).
+const PRIME_AI_PROMPT_MAX: usize = 4000;
+/// Most roster rows we name in the prompt.
+const PRIME_AI_ROSTER_MAX: usize = 24;
 
 /// `POST /v1/spine/prime/propose` — interpret a request into a structured,
 /// READ-ONLY plan (creates nothing but the proposal record). Tenant-scoped.
+///
+/// Default: forwards the raw message to the coordinator's rule-based planner.
+/// `mode = "ai"`: drafts the plan with the AI peer (bounded, secret-redacted
+/// prompt of the request + crew roster only), then hands the RAW model output
+/// to the coordinator, which is the authoritative validator. A model can never
+/// bypass that server-side check, and every failure degrades to the
+/// deterministic plan with an honest `ai_mode` (`fallback` / `unavailable`).
 pub async fn prime_propose(
     State(state): State<AppState>,
     Json(req): Json<PrimeProposeRequest>,
@@ -387,7 +414,129 @@ pub async fn prime_propose(
     if msg.is_empty() {
         return Err(bad("message required"));
     }
-    json_passthrough(call_peer(&state, "prime.propose", msg.as_bytes()).await?)
+    if req.mode.as_deref() != Some("ai") {
+        // Historical path — bare text, deterministic plan.
+        return json_passthrough(call_peer(&state, "prime.propose", msg.as_bytes()).await?);
+    }
+
+    // Model-assisted seam. Redact secrets BEFORE anything reaches the provider
+    // (the coordinator redacts again; defense in depth).
+    let redacted = relix_runtime::rig::redact_secrets(msg, "");
+    let roster = fetch_prime_roster(&state).await;
+    let prompt = build_prime_ai_prompt(&redacted, &roster);
+
+    let coord_arg = match call_ai_chat(&state, &prompt).await {
+        Ok(model_output) => serde_json::json!({
+            "message": msg,
+            "model_output": model_output,
+        }),
+        Err(reason) => serde_json::json!({
+            "message": msg,
+            "model_unavailable_reason": reason,
+        }),
+    };
+    let arg = serde_json::to_vec(&coord_arg).map_err(|e| bad(&format!("encode prime arg: {e}")))?;
+    json_passthrough(call_peer(&state, "prime.propose", &arg).await?)
+}
+
+/// Best-effort crew roster `(name, role, status)` for the prompt. A failure
+/// here is never fatal — the model just plans without an explicit roster (the
+/// coordinator still matches crew authoritatively afterwards).
+async fn fetch_prime_roster(state: &AppState) -> Vec<(String, String, String)> {
+    let Ok(body) = call_peer(state, "agent.operatives", b"").await else {
+        return Vec::new();
+    };
+    let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(&body) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .take(PRIME_AI_ROSTER_MAX)
+        .map(|v| {
+            let get = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+            (get("name"), get("role"), get("status"))
+        })
+        .filter(|(n, r, _)| !n.is_empty() || !r.is_empty())
+        .collect()
+}
+
+/// Build the bounded, secret-redacted planning prompt. PURE — unit-tested. The
+/// model is asked for a STRICT JSON object matching the validator's contract;
+/// the coordinator rejects anything that does not validate, so the prompt only
+/// needs to steer, not to be trusted.
+pub fn build_prime_ai_prompt(redacted_request: &str, roster: &[(String, String, String)]) -> String {
+    let mut roster_block = String::new();
+    if roster.is_empty() {
+        roster_block.push_str("(no Operatives hired yet)");
+    } else {
+        for (name, role, status) in roster {
+            roster_block.push_str(&format!("- {name} — role:{role} status:{status}\n"));
+        }
+    }
+    let prompt = format!(
+        "You are Prime, a company planning lead. Turn the operator's request into a \
+governed work plan. Respond with ONLY a single JSON object, no prose, no code fence, \
+matching exactly this schema:\n\
+{{\"intent\":\"build|fix|research|generic\",\"summary\":\"one line\",\
+\"mandate_title\":\"short title\",\"mandate_brief\":\"1-3 sentences\",\
+\"briefs\":[{{\"key\":\"slug\",\"title\":\"what to do\",\"role\":\"engineer|designer|researcher|writer|qa|ops\",\"depends_on\":[\"other-key\"]}}],\
+\"risks\":[\"short risk\"]}}\n\
+Rules: keys are unique short slugs; depends_on only references keys you define and must not cycle; \
+prefer 2-6 briefs; choose roles from the listed set; do NOT include secrets, credentials, file dumps, or commands.\n\n\
+Current crew roster:\n{roster_block}\n\
+Operator request: {redacted_request}"
+    );
+    // Bound the prompt and strip pipes/control chars so it is safe in any wire
+    // form (the JSON ai.chat arg is pipe-safe, but we keep the prompt clean).
+    let cleaned: String = prompt
+        .chars()
+        .map(|c| if c == '|' { '/' } else { c })
+        .collect();
+    cleaned.chars().take(PRIME_AI_PROMPT_MAX).collect()
+}
+
+/// Call `ai.chat` on the AI peer with the JSON arg form (pipe-safe). Returns the
+/// model's reply text, or a short honest reason on any failure (the caller
+/// turns that into `ai_mode = unavailable`). Never surfaces secrets.
+async fn call_ai_chat(state: &AppState, prompt: &str) -> Result<String, String> {
+    let mesh = state
+        .mesh_client
+        .as_ref()
+        .ok_or_else(|| "bridge mesh client not initialized".to_string())?;
+    let deadline_secs = state.cfg.transport.deadline_secs.clamp(5, 60);
+    let arg = serde_json::json!({
+        "session_id": "prime-planner",
+        "prompt": prompt,
+        "history": "",
+    });
+    let arg_bytes = serde_json::to_vec(&arg).map_err(|e| format!("encode ai.chat arg: {e}"))?;
+    let alias = ai_peer_alias();
+    let envelope = build_request_with_tenant(
+        "ai.chat",
+        arg_bytes,
+        state.identity_bundle.clone(),
+        deadline_secs,
+        None,
+        None,
+        None,
+        crate::tenant::current_tenant_or_none(),
+    );
+    let resp_bytes = mesh
+        .call(&alias, envelope)
+        .await
+        .map_err(|e| format!("ai peer unreachable: {e}"))?;
+    let resp = decode_response(&resp_bytes).map_err(|e| format!("ai.chat decode: {e}"))?;
+    match resp.res {
+        ResponseResult::Ok(body) => {
+            let text = String::from_utf8_lossy(&body).trim().to_string();
+            if text.is_empty() {
+                Err("model returned an empty reply".to_string())
+            } else {
+                Ok(text)
+            }
+        }
+        ResponseResult::Err(env) => Err(format!("ai.chat responder error: {}", env.cause)),
+        ResponseResult::StreamHandle(_) => Err("ai.chat returned a stream handle".to_string()),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1498,6 +1647,30 @@ mod tests {
         let (status, body) = bad("q required");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0.error, "q required");
+    }
+
+    #[test]
+    fn prime_ai_prompt_is_bounded_and_pipe_safe() {
+        let roster = vec![
+            ("Ada".to_string(), "engineer".to_string(), "active".to_string()),
+            ("Bea".to_string(), "designer".to_string(), "pending".to_string()),
+        ];
+        let p = build_prime_ai_prompt("Build a | dashboard", &roster);
+        // Pipes are scrubbed so the prompt is safe in any wire form.
+        assert!(!p.contains('|'));
+        // The request + roster are present; the JSON schema is steered.
+        assert!(p.contains("dashboard"));
+        assert!(p.contains("Ada"));
+        assert!(p.contains("mandate_title"));
+        // Hard length bound holds.
+        assert!(p.chars().count() <= PRIME_AI_PROMPT_MAX);
+    }
+
+    #[test]
+    fn prime_ai_prompt_handles_empty_roster() {
+        let p = build_prime_ai_prompt("Fix the login bug", &[]);
+        assert!(p.contains("no Operatives hired yet"));
+        assert!(p.contains("Fix the login bug"));
     }
 
     #[test]
