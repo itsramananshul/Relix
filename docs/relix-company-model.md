@@ -344,6 +344,40 @@ The dashboard stops being organized by *feature* and starts being organized by *
 
 A single action center showing only what needs you, in priority order: **approvals** (hire, strategy, budget, high-risk — with inline approve/reject), **alerts** (agent errors, budget thresholds), and **stale/blocked work** (things stuck with nobody moving them). It's computed from live state, not a notification table.
 
+> **Implementation status — the Action Center (SHIPPED, read-only).** This is
+> realized as **`company.actions`** → **`GET /v1/spine/company/actions`**: one
+> tenant-scoped, ordered, deduped, **READ-ONLY** feed of the operator's next
+> actions, **computed from existing live state — no notification table** (true to
+> the section above). It is surfaced on the dashboard Overview Command Center
+> with a button on each item that links to the existing governed route to act —
+> the feed itself approves/runs/applies **nothing**.
+>
+> - **Categories implemented:** `approval` (pending hire/spawn Clearances + a
+>   Mandate's *proposed* strategy gate), `hire` (Operatives `pending` and inert
+>   until approved), `ready_to_start` (assigned-to-active + unblocked + unclaimed
+>   Briefs — surfaced above generic blocked work so the operator can move things
+>   forward), `blocked` (missing-assignee + dependency-blocked Briefs),
+>   `needs_review` (a completed Shift awaiting review → apply),
+>   `failed_or_refused` (a failed/refused/interrupted Shift), and `stale`
+>   (stuck-too-long work, lowest priority). **Ordering** puts approvals/hire
+>   blockers on top, failed/refused before informational stale, ready before
+>   generic blocked; **dedupe** collapses the same underlying object (a pending
+>   hire and its spawn Clearance show once, as the approval) so the feed never
+>   spams.
+> - **How it fits the company model:** it is the Board's (§5.4) sovereign home —
+>   the one surface that says "here is everything the Founder/Prime flow needs
+>   you to decide or unblock right now," spanning the hire gate (§5.5), the
+>   strategy gate (§5.5), the assignment/heartbeat loop (§6), and the review →
+>   apply loop. Every action stays behind its existing gate; the Action Center
+>   only *routes you to it*.
+> - **Deferred (honest):** budget/spend-threshold **alerts** and the
+>   diagnosis-driven **recovery decision cards** (dashboard-design §5.2) are not
+>   built (no per-tenant spend-threshold query / recovery layer yet); the finer
+>   `blocked` sub-reasons (missing-adapter, failed-preflight) are not separate
+>   reasons here (they surface via `failed_or_refused`); and the feed is a
+>   page-load snapshot (no realtime push), capped with an honest `truncated`
+>   flag.
+
 ### 8.3 The Issue detail (where work lives)
 
 The centerpiece. One issue, showing: the description (inline-editable), the **conversation thread** (you + agent comments + system notes + the live run transcript, rendered as a chat), the **properties** (status, priority, assignee, project, goal), **sub-issues** with their progress, **documents** (plan/design/deliverables), **blockers**, **run history**, and its **cost**. Interactive prompts from the agent ("should I proceed?", "which option?") render as answerable cards right in the thread.

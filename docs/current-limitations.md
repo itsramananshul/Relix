@@ -147,6 +147,23 @@ when you click Start. What it does **not** do:
   (blocker) Brief to the proposal's own Guild. Even a **legacy `blocked_on` edge
   that crosses Guilds** can never surface a cross-tenant blocker id or title in
   the Shift Room — pinned by a coordinator test that forces such an edge.
+- **The Action Center surfaces what needs the operator, across the whole
+  company — but it is a read-only snapshot, not every signal.** `company.actions`
+  (`GET /v1/spine/company/actions`, company-model §5.4/§8.2) composes EXISTING
+  live state into one ordered, deduped feed on the Overview Command Center:
+  pending approvals/Clearances + proposed strategies (`approval`), pending hires
+  (`hire`), ready-to-start Briefs (`ready_to_start`), missing-assignee +
+  dependency-blocked Briefs (`blocked`), runs awaiting review (`needs_review`),
+  failed/refused/interrupted runs (`failed_or_refused`), and stale work
+  (`stale`). It is **READ-ONLY** (it approves/runs/applies nothing — each row
+  links to the existing governed route), **tenant-scoped** (no cross-Guild leak),
+  and **invents no notification table** — live state is the source. What it does
+  **not** do: classify the finer `blocked` sub-reasons (missing-adapter,
+  failed-preflight) as distinct Action Center reasons (they appear via the run
+  ledger's `failed_or_refused`); surface cost/budget-threshold alerts or
+  recovery-decision cards (dashboard-design §5.2 — no per-tenant spend-threshold
+  query or recovery diagnosis layer exists yet); or push updates (it is a
+  page-load snapshot, capped at 60 items with an honest `truncated` flag).
 
 In short: the *governance rails* of a company are in place and tenant-safe,
 the Shift Room makes the post-start loop legible (what ran / finished / is
