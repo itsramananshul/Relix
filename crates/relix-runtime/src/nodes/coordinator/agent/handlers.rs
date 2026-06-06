@@ -5555,7 +5555,10 @@ mod tests {
             &task,
             &fake_ctx(pid.as_bytes()),
         ));
-        // Run the ready Brief as a real echo Shift → done → pending_review.
+        // Run the ready Brief as a real echo Shift. `prime.start` dispatches the
+        // adapter on a background thread (a long Shift must not freeze the
+        // bridge), reporting `running` immediately; the run reaches `done` and
+        // opens `pending_review` only once that thread closes the ledger.
         let started = json_of(ok_body(handle_prime_start(
             &agents,
             &spine,
@@ -5563,7 +5566,32 @@ mod tests {
             &reg,
             &fake_ctx(pid.as_bytes()),
         )));
-        assert_eq!(started["started"].as_array().unwrap().len(), 1, "{started}");
+        let started_arr = started["started"].as_array().unwrap();
+        assert_eq!(started_arr.len(), 1, "{started}");
+        let run_id = started_arr[0]["run_id"].as_str().unwrap().to_string();
+
+        // Wait for the background Shift to finish and open review — without this
+        // barrier the feed is read mid-run (still `running`, review NULL).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let done = task
+                .list_runs_for_tenant("default", 10)
+                .unwrap()
+                .into_iter()
+                .any(|r| {
+                    r.run_id == run_id
+                        && r.status == "done"
+                        && r.review.as_deref() == Some("pending_review")
+                });
+            if done {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "echo Shift never reached done/pending_review"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
 
         let v = json_of(ok_body(handle_company_actions(
             &agents,
@@ -5582,6 +5610,32 @@ mod tests {
             "needs_review deep-links to the run: {nr}"
         );
         assert_eq!(v["counts"]["by_category"]["needs_review"], 1, "{v}");
+
+        // Once the operator reviews the run, the completed Shift must DROP out of
+        // `needs_review` — a reviewed run is no longer an open action.
+        task.set_run_review(&run_id, "accepted", "looks good").unwrap();
+        let v2 = json_of(ok_body(handle_company_actions(
+            &agents,
+            &spine,
+            &(*task),
+            &fake_ctx(b""),
+        )));
+        assert!(
+            !v2["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["category"] == "needs_review"),
+            "an accepted Shift no longer awaits review: {v2}"
+        );
+        assert_eq!(
+            v2["counts"]["by_category"]
+                .get("needs_review")
+                .and_then(|c| c.as_u64())
+                .unwrap_or(0),
+            0,
+            "{v2}"
+        );
     }
 
     #[test]
