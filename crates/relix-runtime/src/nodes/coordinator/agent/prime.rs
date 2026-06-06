@@ -21,10 +21,69 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Honest status string for the (currently rule-based) planning path.
-pub const AI_STATUS_DETERMINISTIC: &str = "deterministic — no LLM is wired into \
-     the coordinator, so this plan is rule-based; an LLM would refine the intent \
-     interpretation and Brief breakdown. (Not silently presented as model output.)";
+/// Honest status string for the (default) rule-based planning path.
+pub const AI_STATUS_DETERMINISTIC: &str = "deterministic — no LLM was used; this \
+     plan is rule-based. An LLM would refine the intent interpretation and Brief \
+     breakdown. (Not silently presented as model output.)";
+
+/// The provenance of a [`PrimeProposal`]. Serialized as a stable machine string
+/// in `ai_mode` so the dashboard can switch on a single field; the human
+/// `ai_status` line is derived from it. These four states are exhaustive and
+/// MUTUALLY EXCLUSIVE: a plan is either deterministic-only (no model path was
+/// requested), llm_used (a model drafted it and it passed validation),
+/// fallback (a model drafted it but the output was rejected), or unavailable
+/// (the model path was requested but no model was reachable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiMode {
+    /// No model path requested — rule-based plan (the historical default).
+    DeterministicOnly,
+    /// A model drafted the plan and it passed server-side validation.
+    LlmUsed,
+    /// A model drafted the plan but the output was rejected; rule-based instead.
+    Fallback,
+    /// The model path was requested but no model was reachable; rule-based.
+    Unavailable,
+}
+
+impl AiMode {
+    /// Stable wire string for the `ai_mode` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AiMode::DeterministicOnly => "deterministic_only",
+            AiMode::LlmUsed => "llm_used",
+            AiMode::Fallback => "fallback",
+            AiMode::Unavailable => "unavailable",
+        }
+    }
+
+    /// Whether a language model actually shaped the stored plan. ONLY
+    /// [`AiMode::LlmUsed`] is `true` — fallback/unavailable are rule-based and
+    /// must never claim otherwise.
+    pub fn ai_used(self) -> bool {
+        matches!(self, AiMode::LlmUsed)
+    }
+
+    /// The honest human-readable status line for this mode.
+    fn status(self, reason: Option<&str>) -> String {
+        match self {
+            AiMode::DeterministicOnly => AI_STATUS_DETERMINISTIC.to_string(),
+            AiMode::LlmUsed => "llm_used — a language model drafted this plan; it was \
+                 validated, sanitized, and crew-matched server-side before storage \
+                 (no unsafe or secret-shaped field was stored)."
+                .to_string(),
+            AiMode::Fallback => format!(
+                "fallback — a model drafted a plan but it was rejected, so this \
+                 rule-based plan was used instead. Reason: {}",
+                reason.unwrap_or("model output failed validation")
+            ),
+            AiMode::Unavailable => format!(
+                "unavailable — model-assisted planning was requested but no model was \
+                 reachable, so this plan is rule-based. Reason: {}",
+                reason.unwrap_or("no model peer reachable")
+            ),
+        }
+    }
+}
 
 /// One crew role the plan needs, and whether an eligible active Operative
 /// already fills it.
@@ -50,7 +109,7 @@ pub struct HireSuggestion {
 
 /// One proposed Brief in the breakdown. `key` is a stable identifier used as
 /// the source marker on approval (idempotency) and to express dependencies.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposedBrief {
     pub key: String,
     pub title: String,
@@ -73,9 +132,24 @@ pub struct PrimeProposal {
     pub briefs: Vec<ProposedBrief>,
     pub risks: Vec<String>,
     pub next_actions: Vec<String>,
-    /// Whether a language model shaped this proposal. Always `false` today.
+    /// Whether a language model shaped this proposal. `true` ONLY when
+    /// `ai_mode == "llm_used"`.
     pub ai_used: bool,
+    /// Machine-readable provenance: `deterministic_only` / `llm_used` /
+    /// `fallback` / `unavailable` (see [`AiMode`]).
+    #[serde(default = "default_ai_mode")]
+    pub ai_mode: String,
+    /// Honest human-readable status line (derived from `ai_mode`).
     pub ai_status: String,
+    /// Present for `fallback` / `unavailable`: why the model path did not
+    /// produce the stored plan. Never leaks raw model content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_reason: Option<String>,
+}
+
+/// Back-compat default for proposals persisted before `ai_mode` existed.
+fn default_ai_mode() -> String {
+    AiMode::DeterministicOnly.as_str().to_string()
 }
 
 /// One existing Operative, for crew-matching.
@@ -316,7 +390,8 @@ fn build_briefs(intent: &str, roles: &[&'static str], subject: &str) -> Vec<Prop
 }
 
 /// Build a deterministic Prime proposal from the (already secret-redacted)
-/// request and the current Crew. PURE — mutates nothing.
+/// request and the current Crew. PURE — mutates nothing. This is the default
+/// rule-based path (`ai_mode = "deterministic_only"`).
 pub fn generate_proposal(message: &str, crew: &[CrewMember]) -> PrimeProposal {
     let msg = message.trim();
     let (intent, role_refs) = classify(msg);
@@ -327,10 +402,106 @@ pub fn generate_proposal(message: &str, crew: &[CrewMember]) -> PrimeProposal {
         "research" => format!("Research: {subject}"),
         _ => format!("Work: {subject}"),
     };
-
-    // Intent-shaped breakdown FIRST, so crew/hires reflect the roles the plan
-    // actually uses — every suggested hire maps to a Brief, and vice versa.
+    // Intent-shaped breakdown — every suggested hire maps to a Brief role.
     let briefs = build_briefs(intent, &role_refs, &subject);
+    finalize_proposal(
+        intent,
+        summary,
+        subject,
+        msg.to_string(),
+        briefs,
+        Vec::new(),
+        crew,
+        AiMode::DeterministicOnly,
+        None,
+    )
+}
+
+/// Turn a validated model plan ([`crate::nodes::coordinator::agent::prime_plan::ValidatedPlan`])
+/// into a governed [`PrimeProposal`]. The model shaped the *interpretation*
+/// (intent, Mandate, Brief breakdown, deps, surfaced risks); crew matching,
+/// hire suggestions, and the governance risks/next-actions stay
+/// coordinator-authoritative and are computed here from the live roster — never
+/// trusted from the model. PURE. (`ai_mode = "llm_used"`.)
+pub fn proposal_from_model(
+    plan: crate::nodes::coordinator::agent::prime_plan::ValidatedPlan,
+    crew: &[CrewMember],
+) -> PrimeProposal {
+    finalize_proposal(
+        intent_ref(&plan.intent),
+        plan.summary,
+        plan.mandate_title,
+        plan.mandate_brief,
+        plan.briefs,
+        plan.risks,
+        crew,
+        AiMode::LlmUsed,
+        None,
+    )
+}
+
+/// Build the deterministic plan but stamp it as a model `fallback` /
+/// `unavailable` with an honest reason (the model path was attempted but did
+/// not produce the stored plan). PURE.
+pub fn deterministic_fallback(
+    message: &str,
+    crew: &[CrewMember],
+    mode: AiMode,
+    reason: String,
+) -> PrimeProposal {
+    debug_assert!(matches!(mode, AiMode::Fallback | AiMode::Unavailable));
+    let msg = message.trim();
+    let (intent, role_refs) = classify(msg);
+    let subject = derive_title(msg);
+    let summary = match intent {
+        "build" => format!("Build: {subject}"),
+        "fix" => format!("Fix: {subject}"),
+        "research" => format!("Research: {subject}"),
+        _ => format!("Work: {subject}"),
+    };
+    let briefs = build_briefs(intent, &role_refs, &subject);
+    finalize_proposal(
+        intent,
+        summary,
+        subject,
+        msg.to_string(),
+        briefs,
+        Vec::new(),
+        crew,
+        mode,
+        Some(reason),
+    )
+}
+
+/// Map a validated intent string to the `&'static str` the rest of the planner
+/// uses. The validator already constrains it to the canonical set.
+fn intent_ref(intent: &str) -> &'static str {
+    match intent {
+        "build" => "build",
+        "fix" => "fix",
+        "research" => "research",
+        _ => "generic",
+    }
+}
+
+/// Assemble a [`PrimeProposal`] from a plan SHAPE (intent + Mandate + Briefs +
+/// model-surfaced risks) plus the live Crew. The crew match, hire suggestions,
+/// governance risks, and next actions are computed identically for the
+/// deterministic and the model paths — so a model can only influence the
+/// *interpretation*, never the governance. PURE — mutates nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn finalize_proposal(
+    intent: &str,
+    summary: String,
+    mandate_title: String,
+    mandate_brief: String,
+    briefs: Vec<ProposedBrief>,
+    extra_risks: Vec<String>,
+    crew: &[CrewMember],
+    ai_mode: AiMode,
+    ai_reason: Option<String>,
+) -> PrimeProposal {
+    // Roles the plan actually uses, in first-seen order.
     let mut used_roles: Vec<&'static str> = Vec::new();
     for b in &briefs {
         let canon = canon_role(&b.role);
@@ -373,7 +544,8 @@ pub fn generate_proposal(message: &str, crew: &[CrewMember]) -> PrimeProposal {
         }
     }
 
-    // Risks / blockers.
+    // Governance risks/blockers FIRST (the critical ones), then any
+    // model-surfaced risks (already sanitized + bounded by the validator).
     let mut risks = Vec::new();
     let active_count = crew.iter().filter(|c| c.status == "active").count();
     if active_count == 0 {
@@ -382,9 +554,7 @@ pub fn generate_proposal(message: &str, crew: &[CrewMember]) -> PrimeProposal {
                 .to_string(),
         );
     }
-    let has_prime = crew
-        .iter()
-        .any(|c| c.role.eq_ignore_ascii_case("prime"));
+    let has_prime = crew.iter().any(|c| c.role.eq_ignore_ascii_case("prime"));
     if !has_prime {
         risks.push("No Prime hired — consider hiring a Prime to own Mandate strategy.".to_string());
     }
@@ -394,10 +564,11 @@ pub fn generate_proposal(message: &str, crew: &[CrewMember]) -> PrimeProposal {
             hires.len()
         ));
     }
+    risks.extend(extra_risks);
 
     // Next actions the operator can approve.
     let mut next_actions = vec![format!(
-        "Approve to create the Mandate \u{201c}{subject}\u{201d} + {} Brief(s).",
+        "Approve to create the Mandate \u{201c}{mandate_title}\u{201d} + {} Brief(s).",
         briefs.len()
     )];
     if !hires.is_empty() {
@@ -420,19 +591,22 @@ pub fn generate_proposal(message: &str, crew: &[CrewMember]) -> PrimeProposal {
             .to_string(),
     );
 
+    let ai_status = ai_mode.status(ai_reason.as_deref());
     PrimeProposal {
         intent: intent.to_string(),
         summary,
-        mandate_title: subject,
-        mandate_brief: msg.to_string(),
+        mandate_title,
+        mandate_brief,
         roles,
         crew: crew_slots,
         hires,
         briefs,
         risks,
         next_actions,
-        ai_used: false,
-        ai_status: AI_STATUS_DETERMINISTIC.to_string(),
+        ai_used: ai_mode.ai_used(),
+        ai_mode: ai_mode.as_str().to_string(),
+        ai_status,
+        ai_reason,
     }
 }
 
@@ -700,6 +874,95 @@ mod tests {
                 h.role
             );
         }
+    }
+
+    // ── Model-assisted path (company-model §12.5A seam) ──
+
+    use crate::nodes::coordinator::agent::prime_plan::{ValidatedPlan, validate_model_plan};
+
+    fn model_json() -> String {
+        serde_json::json!({
+            "intent": "build",
+            "mandate_title": "Billing system",
+            "mandate_brief": "A subscription billing system.",
+            "briefs": [
+                {"key": "api", "title": "Billing API", "role": "engineer", "depends_on": []},
+                {"key": "ui", "title": "Billing UI", "role": "designer", "depends_on": []},
+                {"key": "ship", "title": "Integrate + ship", "role": "engineer",
+                 "depends_on": ["api", "ui"]}
+            ],
+            "risks": ["PCI compliance is required"]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn model_plan_is_llm_used_and_crew_matched_authoritatively() {
+        let plan: ValidatedPlan = validate_model_plan(&model_json(), "Build a billing system").unwrap();
+        // Only an active engineer exists — designer must still be a hire (the
+        // model never decides crew).
+        let crew = vec![member("engineer", "active")];
+        let p = proposal_from_model(plan, &crew);
+        assert!(p.ai_used, "llm_used must report ai_used = true");
+        assert_eq!(p.ai_mode, "llm_used");
+        assert!(p.ai_reason.is_none());
+        assert!(p.ai_status.contains("llm_used"));
+        // Crew match is coordinator-authoritative: engineer filled, designer hired.
+        let eng = p.crew.iter().find(|s| s.role == "engineer").unwrap();
+        assert!(eng.have);
+        let des = p.crew.iter().find(|s| s.role == "designer").unwrap();
+        assert!(!des.have);
+        assert!(p.hires.iter().any(|h| h.role == "designer"));
+        // The model's Brief shape is preserved.
+        assert!(p.briefs.iter().any(|b| b.key == "ship"));
+        // Governance risks come first, the model's risk is appended.
+        assert!(p.risks.iter().any(|r| r.contains("PCI compliance")));
+    }
+
+    #[test]
+    fn model_path_never_lets_the_model_set_governance_risks_order() {
+        let plan = validate_model_plan(&model_json(), "Build a billing system").unwrap();
+        let p = proposal_from_model(plan, &[]); // no crew at all
+        // With no crew, the standard governance risks must still be present and
+        // precede the model risk.
+        assert!(p.risks[0].contains("No active Operatives"));
+        assert!(p.risks.iter().any(|r| r.contains("No Prime")));
+        assert!(p.risks.iter().any(|r| r.contains("PCI compliance")));
+    }
+
+    #[test]
+    fn fallback_and_unavailable_are_honest_and_not_ai_used() {
+        let fb = deterministic_fallback(
+            "Build a dashboard",
+            &[],
+            AiMode::Fallback,
+            "duplicate Brief key \"x\"".to_string(),
+        );
+        assert!(!fb.ai_used);
+        assert_eq!(fb.ai_mode, "fallback");
+        assert!(fb.ai_status.contains("fallback"));
+        assert_eq!(fb.ai_reason.as_deref(), Some("duplicate Brief key \"x\""));
+        // It is still a real, usable deterministic plan.
+        assert!(!fb.briefs.is_empty());
+
+        let un = deterministic_fallback(
+            "Build a dashboard",
+            &[],
+            AiMode::Unavailable,
+            "no model peer reachable".to_string(),
+        );
+        assert!(!un.ai_used);
+        assert_eq!(un.ai_mode, "unavailable");
+        assert!(un.ai_status.contains("unavailable"));
+    }
+
+    #[test]
+    fn deterministic_default_reports_deterministic_only() {
+        let p = generate_proposal("Build a dashboard", &[]);
+        assert!(!p.ai_used);
+        assert_eq!(p.ai_mode, "deterministic_only");
+        assert!(p.ai_reason.is_none());
+        assert!(p.ai_status.contains("deterministic"));
     }
 
     // ── Start-to-Shift partition (company-model §12.5B) ──

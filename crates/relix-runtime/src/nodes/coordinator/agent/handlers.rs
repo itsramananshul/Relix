@@ -235,15 +235,33 @@ pub fn handle_operatives(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutc
 /// READ-ONLY plan (intent, Mandate, crew roles, suggested hires, Brief
 /// breakdown + deps, risks, next actions). Creates NOTHING except the
 /// proposal record itself. The request is secret-redacted before it is
-/// interpreted or persisted. Tenant-scoped. The plan is rule-based (no LLM is
-/// wired into a coordinator capability) and says so honestly via `ai_status`.
-/// Arg: the raw request message (UTF-8). Returns `{proposal_id, status,
-/// proposal}`.
+/// interpreted or persisted. Tenant-scoped.
+///
+/// **Arg (two accepted forms):**
+/// - Raw UTF-8 text — the historical form; produces a rule-based plan
+///   (`ai_mode = "deterministic_only"`).
+/// - A JSON object `{"message": "...", "model_output"?: "...",
+///   "model_unavailable_reason"?: "..."}` — the model-assisted seam
+///   (company-model §12.5A). When `model_output` is present it is the RAW
+///   text a model emitted (supplied by the bridge, which is the only place a
+///   model is reachable today — no LLM is synchronously callable from this
+///   coordinator handler). The coordinator is the AUTHORITATIVE validator: it
+///   runs the output through [`prime_plan::validate_model_plan`] server-side
+///   (bounded, sanitized, secret-redacted, dependency-checked) and only on
+///   success stores it as `ai_mode = "llm_used"`. Any validation failure falls
+///   back to the deterministic plan (`ai_mode = "fallback"`, with an honest
+///   reason); `model_unavailable_reason` records that no model was reachable
+///   (`ai_mode = "unavailable"`). The model can NEVER inject crew, hires, or
+///   governance — those stay coordinator-computed from the live roster.
+///
+/// Returns `{proposal_id, status, proposal}`.
 pub fn handle_prime_propose(
     agent_store: &AgentStore,
     spine_store: &SpineStore,
     ctx: &InvocationCtx,
 ) -> HandlerOutcome {
+    use crate::nodes::coordinator::agent::{prime_plan, prime_plan::PlanValidationError};
+
     let raw = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s.trim(),
         Err(e) => return invalid(format!("prime.propose utf8: {e}")),
@@ -251,8 +269,36 @@ pub fn handle_prime_propose(
     if raw.is_empty() {
         return invalid("prime.propose: a request message is required".into());
     }
+
+    // Parse the optional structured form. A bare message that is not a JSON
+    // object with a `message` field is treated verbatim (back-compat).
+    #[derive(serde::Deserialize)]
+    struct ProposeArgs {
+        message: String,
+        #[serde(default)]
+        model_output: Option<String>,
+        #[serde(default)]
+        model_unavailable_reason: Option<String>,
+    }
+    let (raw_message, model_output, model_unavailable) = if raw.starts_with('{') {
+        match serde_json::from_str::<ProposeArgs>(raw) {
+            Ok(a) if !a.message.trim().is_empty() => {
+                (a.message, a.model_output, a.model_unavailable_reason)
+            }
+            // A `{...}` that isn't our schema (or empty message) → treat the
+            // whole thing as the literal request, never a silent failure.
+            _ => (raw.to_string(), None, None),
+        }
+    } else {
+        (raw.to_string(), None, None)
+    };
+    let raw_message = raw_message.trim();
+    if raw_message.is_empty() {
+        return invalid("prime.propose: a request message is required".into());
+    }
+
     // Redact secrets BEFORE the request is interpreted or persisted.
-    let message = crate::rig::redact_secrets(raw, "");
+    let message = crate::rig::redact_secrets(raw_message, "");
     let tenant = ctx.tenant_id_or_default();
     let operatives = match agent_store.list_operatives_for_tenant(tenant) {
         Ok(v) => v,
@@ -267,7 +313,35 @@ pub fn handle_prime_propose(
             status: p.status.clone(),
         })
         .collect();
-    let proposal = prime::generate_proposal(&message, &crew);
+
+    // Model-assisted seam: validate server-side, fall back on ANY failure.
+    let proposal = if let Some(reason) = model_unavailable
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        let reason = prime_plan::sanitize_text(reason, 200);
+        prime::deterministic_fallback(&message, &crew, prime::AiMode::Unavailable, reason)
+    } else if let Some(output) = model_output
+        .as_deref()
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+    {
+        match prime_plan::validate_model_plan(output, &message) {
+            Ok(plan) => prime::proposal_from_model(plan, &crew),
+            Err(e) => {
+                // The reason is the validator's own message — never raw model
+                // content — so it is safe to surface and store.
+                let reason = match &e {
+                    PlanValidationError::Parse(_) => "model output was not valid plan JSON".to_string(),
+                    other => other.to_string(),
+                };
+                prime::deterministic_fallback(&message, &crew, prime::AiMode::Fallback, reason)
+            }
+        }
+    } else {
+        prime::generate_proposal(&message, &crew)
+    };
     let proposal_json = match serde_json::to_string(&proposal) {
         Ok(s) => s,
         Err(e) => return internal(format!("prime.propose plan encode: {e}")),
@@ -4541,6 +4615,84 @@ mod tests {
         let row = json_of(ok_body(handle_prime_proposal_get(&spine, &fake_ctx(pid.as_bytes()))));
         assert_eq!(row["status"], "proposed");
         assert!(row["mandate_id"].is_null(), "propose must not create a Mandate");
+    }
+
+    #[test]
+    fn prime_propose_ai_mode_validates_model_output_server_side() {
+        let (agents, spine, _task) = prime_stores();
+        let model = serde_json::json!({
+            "intent": "build",
+            "mandate_title": "Billing system",
+            "mandate_brief": "A subscription billing system.",
+            "briefs": [
+                {"key": "api", "title": "Billing API", "role": "engineer", "depends_on": []},
+                {"key": "ship", "title": "Ship it", "role": "engineer", "depends_on": ["api"]}
+            ],
+            "risks": ["PCI scope"]
+        })
+        .to_string();
+        let arg = serde_json::json!({
+            "message": "Build a billing system",
+            "model_output": model,
+        })
+        .to_string();
+        let v = json_of(ok_body(handle_prime_propose(&agents, &spine, &fake_ctx(arg.as_bytes()))));
+        assert_eq!(v["status"], "proposed");
+        assert_eq!(v["proposal"]["ai_used"], true);
+        assert_eq!(v["proposal"]["ai_mode"], "llm_used");
+        assert_eq!(v["proposal"]["mandate_title"], "Billing system");
+        assert!(v["proposal"]["briefs"].as_array().unwrap().iter().any(|b| b["key"] == "ship"));
+    }
+
+    #[test]
+    fn prime_propose_ai_mode_falls_back_on_bad_model_output() {
+        let (agents, spine, _task) = prime_stores();
+        // Cyclic deps → validator rejects → deterministic fallback.
+        let model = serde_json::json!({
+            "mandate_title": "X",
+            "briefs": [
+                {"key": "a", "title": "a", "role": "engineer", "depends_on": ["b"]},
+                {"key": "b", "title": "b", "role": "engineer", "depends_on": ["a"]}
+            ]
+        })
+        .to_string();
+        let arg = serde_json::json!({"message": "Build a thing", "model_output": model}).to_string();
+        let v = json_of(ok_body(handle_prime_propose(&agents, &spine, &fake_ctx(arg.as_bytes()))));
+        assert_eq!(v["proposal"]["ai_used"], false);
+        assert_eq!(v["proposal"]["ai_mode"], "fallback");
+        assert!(
+            v["proposal"]["ai_status"].as_str().unwrap().contains("fallback"),
+            "{}",
+            v["proposal"]["ai_status"]
+        );
+        // It is still a real, usable deterministic plan.
+        assert!(!v["proposal"]["briefs"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn prime_propose_ai_mode_reports_unavailable() {
+        let (agents, spine, _task) = prime_stores();
+        let arg = serde_json::json!({
+            "message": "Build a thing",
+            "model_unavailable_reason": "no model peer reachable",
+        })
+        .to_string();
+        let v = json_of(ok_body(handle_prime_propose(&agents, &spine, &fake_ctx(arg.as_bytes()))));
+        assert_eq!(v["proposal"]["ai_used"], false);
+        assert_eq!(v["proposal"]["ai_mode"], "unavailable");
+    }
+
+    #[test]
+    fn prime_propose_bare_text_is_still_deterministic() {
+        let (agents, spine, _task) = prime_stores();
+        // The legacy raw-text form keeps working unchanged.
+        let v = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build a web dashboard"),
+        )));
+        assert_eq!(v["proposal"]["ai_mode"], "deterministic_only");
+        assert_eq!(v["proposal"]["ai_used"], false);
     }
 
     #[test]
