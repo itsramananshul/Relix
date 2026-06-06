@@ -1,5 +1,6 @@
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { tryGet, tryGetReport } from "../api";
+import { subscribeRunEvents, tryGet, tryGetReport } from "../api";
 import { Badge, extractList, useAsync } from "../components/common";
 import { HealthPanel } from "../components/HealthPanel";
 
@@ -143,6 +144,37 @@ export function Overview() {
     };
   }, []);
 
+  // Keep the Action Center less stale (company-model §8.2; dashboard §5) WITHOUT
+  // a new event bus: subscribe to the EXISTING run-event SSE as a cheap
+  // change-trigger and fall back to a low-frequency poll so approval/hire/prime
+  // changes still converge and the surface stays fresh if the stream is absent.
+  // This refreshes ONLY the Action Center feed — it never touches the page's
+  // load state and only updates on a SUCCESSFUL fetch, so a transient blip can
+  // never blank it. The rest of the Overview stays a mount-load snapshot.
+  const [liveActions, setLiveActions] = useState<CompanyActions | null>(null);
+  useEffect(() => {
+    let on = true;
+    let debounce: ReturnType<typeof setTimeout> | null = null;
+    const refresh = async () => {
+      const a = await tryGet<CompanyActions | null>("/v1/spine/company/actions", null);
+      if (on && a) setLiveActions(a); // success-only → never clobber with null
+    };
+    // Coalesce run-event bursts into one refresh ~1.2s later.
+    const ping = () => {
+      if (debounce) clearTimeout(debounce);
+      debounce = setTimeout(refresh, 1200);
+    };
+    // onConn is required by the API but the badge isn't surfaced here; ignore it.
+    const unsub = subscribeRunEvents(ping, () => {});
+    const poll = setInterval(refresh, 20000); // convergence fallback (bounded)
+    return () => {
+      on = false;
+      if (debounce) clearTimeout(debounce);
+      clearInterval(poll);
+      unsub();
+    };
+  }, []);
+
   const board = data?.board ?? {};
   const inbox = data?.inbox ?? {};
   const company = data?.company ?? {};
@@ -273,8 +305,9 @@ export function Overview() {
           <span className="banner-cta" onClick={reload} style={{ cursor: "pointer" }}>Retry →</span>
         </div>
       )}
-      {/* Action Center — the one place for what needs the operator now. */}
-      {initialized && <ActionCenter data={data?.actions ?? null} loading={loading} />}
+      {/* Action Center — the one place for what needs the operator now. Prefers
+          the live-refreshed feed, falling back to the mount-load snapshot. */}
+      {initialized && <ActionCenter data={liveActions ?? data?.actions ?? null} loading={loading} />}
       {/* Active work — the latest Prime session's live Shift Room, compact. */}
       {data?.session && <ActiveWork session={data.session} />}
       {/* Actionable system warnings + next steps */}
