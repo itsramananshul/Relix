@@ -338,7 +338,10 @@ export function BriefDetail({
       setBanner({
         kind: "ok",
         msg: accept
-          ? `Suggestion accepted — ${n} Sub-brief${n === 1 ? "" : "s"} created.`
+          ? `Suggestion accepted — ${n} Sub-brief${n === 1 ? "" : "s"} created. ` +
+            `${n === 1 ? "It opens" : "They open"} unassigned (assignment is governance-gated, not ` +
+            `inherited): assign an Operative to ${n === 1 ? "it" : "each"} below — they're also listed ` +
+            `in the Action Center as “Assign an Operative”.`
           : "Suggestion declined.",
       });
       reload();
@@ -804,29 +807,73 @@ export function BriefDetail({
 
           {closedInteractions.length > 0 && (
             <div style={{ fontSize: 12, marginBottom: 8 }}>
-              {closedInteractions.map((it) => (
-                <div
-                  key={it.interaction_id}
-                  style={{ padding: "4px 0", borderBottom: "1px solid var(--border-soft)" }}
-                >
-                  <div className="row" style={{ gap: 6, alignItems: "baseline", flexWrap: "wrap" }}>
-                    <span
-                      className={"badge " + (it.status === "resolved" ? "done" : "blocked")}
-                      style={{ fontSize: 9 }}
-                    >
-                      {it.status}
-                    </span>
-                    <span className="muted" style={{ fontSize: 11 }}>{it.kind}</span>
-                    <span style={{ wordBreak: "break-word" }}>{it.prompt}</span>
-                  </div>
-                  {(it.response || it.resolved_by) && (
-                    <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>
-                      {it.resolved_by ? `${it.resolved_by}: ` : ""}
-                      {it.response ?? ""}
+              {closedInteractions.map((it) => {
+                // An accepted `suggest_tasks` card records its created child
+                // ids in `response` (comma-joined, in proposal order). Surface
+                // each as a deep-link to its board card so the operator can
+                // assign it — materialized children open UNASSIGNED on purpose
+                // (assignment is governance-gated, not inherited from the
+                // parent), so they're inert until staffed. Titles come from the
+                // proposal (same index order as the created ids).
+                const createdIds =
+                  it.kind === "suggest_tasks" && it.status === "resolved"
+                    ? (it.response ?? "")
+                        .split(",")
+                        .map((s) => s.trim())
+                        .filter(Boolean)
+                    : [];
+                const childTitles = it.proposal?.children ?? [];
+                return (
+                  <div
+                    key={it.interaction_id}
+                    style={{ padding: "4px 0", borderBottom: "1px solid var(--border-soft)" }}
+                  >
+                    <div className="row" style={{ gap: 6, alignItems: "baseline", flexWrap: "wrap" }}>
+                      <span
+                        className={"badge " + (it.status === "resolved" ? "done" : "blocked")}
+                        style={{ fontSize: 9 }}
+                      >
+                        {it.status}
+                      </span>
+                      <span className="muted" style={{ fontSize: 11 }}>{it.kind}</span>
+                      <span style={{ wordBreak: "break-word" }}>{it.prompt}</span>
                     </div>
-                  )}
-                </div>
-              ))}
+                    {createdIds.length > 0 ? (
+                      <div style={{ marginTop: 3 }}>
+                        <div className="muted" style={{ fontSize: 11 }}>
+                          {it.resolved_by ? `${it.resolved_by}: ` : ""}
+                          {createdIds.length} Sub-brief{createdIds.length === 1 ? "" : "s"} created —
+                          {" "}each opens unassigned and won't run until you assign an Operative
+                          {" "}(also listed in the Action Center as “Assign an Operative”).
+                        </div>
+                        <ul style={{ margin: "3px 0 0", paddingLeft: 16 }}>
+                          {createdIds.map((cid, i) => (
+                            <li key={cid} style={{ wordBreak: "break-word", marginTop: 2 }}>
+                              <Link
+                                to={`/briefs?brief=${encodeURIComponent(cid)}`}
+                                className="link"
+                                title="Open this Sub-brief on the board to assign an Operative"
+                              >
+                                {childTitles[i]?.title ?? `Sub-brief ${i + 1}`}
+                              </Link>{" "}
+                              <span className="badge blocked" style={{ fontSize: 9 }}>
+                                needs assignment
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : (
+                      (it.response || it.resolved_by) && (
+                        <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>
+                          {it.resolved_by ? `${it.resolved_by}: ` : ""}
+                          {it.response ?? ""}
+                        </div>
+                      )
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
         </>
