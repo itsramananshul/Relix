@@ -5516,6 +5516,224 @@ fn advance_reviewed_brief(
     }
 }
 
+/// The mesh-independent body of the `run.diff` capability — the safe-apply
+/// PLAN preview (`GET /v1/runs/:id/diff`). PURE: never mutates files or the
+/// ledger. Reports per-file action / conflict plus whether the run is
+/// apply-eligible (done + accepted + scoped workspace) — and the plan is
+/// computed regardless of eligibility, so an operator can preview the pending
+/// change BEFORE accepting. Tenant-scoped: another Guild's run reads not-found.
+///
+/// Returns the JSON response body, or an `INVALID_ARGS` cause string on
+/// refusal/error. Extracted from the capability closure so the live route and
+/// its in-process integration tests run the SAME code.
+fn execute_run_diff(
+    store: &crate::nodes::coordinator::TaskStore,
+    run_id: &str,
+    tenant: &str,
+) -> Result<serde_json::Value, String> {
+    match store.run_belongs_to_tenant(run_id, tenant) {
+        Ok(true) => {}
+        Ok(false) => return Err(format!("run not found: {run_id}")),
+        Err(e) => return Err(format!("run.diff: {e}")),
+    }
+    let run = match store.get_run(run_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Err(format!("run not found: {run_id}")),
+        Err(e) => return Err(format!("run.diff: {e}")),
+    };
+    let eligibility = crate::nodes::coordinator::heartbeat::run_apply_eligibility(&run);
+    let eligible = eligibility.is_ok();
+    let reason = match &eligibility {
+        Ok(()) => "eligible".to_string(),
+        Err(e) => e.clone(),
+    };
+    let artifacts = match store.list_run_artifacts(run_id) {
+        Ok(a) => a,
+        Err(e) => return Err(format!("run.diff: {e}")),
+    };
+    let root = store.run_workspace_config().project_root.clone();
+    let plan = match crate::nodes::coordinator::heartbeat::build_apply_plan(&root, &artifacts) {
+        Ok(p) => p,
+        Err(e) => return Err(format!("run.diff: invalid project root: {e}")),
+    };
+    Ok(serde_json::json!({
+        "run_id": run_id,
+        "status": run.status,
+        "review": run.review,
+        "apply_status": run.apply_status,
+        "eligible": eligible,
+        "reason": reason,
+        "plan": plan,
+    }))
+}
+
+/// The mesh-independent body of the `run.apply` capability — apply an accepted
+/// run's changed files back into the configured project root (`POST
+/// /v1/runs/:id/apply`). Refuses the WHOLE apply if ANY file is unsafe /
+/// conflicted (no partial apply, no `force`). Tenant-scoped; only a `done` +
+/// `accepted` + scoped-workspace run applies. Records the durable apply status
+/// and the apply.plan / apply.started / apply.applied / apply.conflicted /
+/// apply.failed transcript events, and — ONLY on a clean `applied` — closes the
+/// productized review-to-done (advances the Brief to `done`, unblocking
+/// dependents).
+///
+/// Returns the JSON response body, or an `INVALID_ARGS` cause string on
+/// refusal/error. ALL durable side effects happen here so the live route and
+/// its in-process integration tests run the SAME code.
+fn execute_run_apply(
+    store: &crate::nodes::coordinator::TaskStore,
+    run_id: &str,
+    tenant: &str,
+) -> Result<serde_json::Value, String> {
+    match store.run_belongs_to_tenant(run_id, tenant) {
+        Ok(true) => {}
+        Ok(false) => return Err(format!("run not found: {run_id}")),
+        Err(e) => return Err(format!("run.apply: {e}")),
+    }
+    let run = match store.get_run(run_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Err(format!("run not found: {run_id}")),
+        Err(e) => return Err(format!("run.apply: {e}")),
+    };
+    // Eligibility gate — refuse (and record `blocked`) for any non-done /
+    // unaccepted / inherit run.
+    if let Err(reason) = crate::nodes::coordinator::heartbeat::run_apply_eligibility(&run) {
+        let _ = store.set_run_apply_status(run_id, "blocked", &reason, 0, 0);
+        let _ = store.append_run_event(
+            run_id,
+            "apply.conflicted",
+            "relix",
+            &format!("apply refused: {reason}"),
+            None,
+            false,
+        );
+        return Err(format!("apply refused: {reason}"));
+    }
+    let artifacts = match store.list_run_artifacts(run_id) {
+        Ok(a) => a,
+        Err(e) => return Err(format!("run.apply: {e}")),
+    };
+    let root = store.run_workspace_config().project_root.clone();
+    // Zero-artifact run: a clear no-op (nothing to do). An echo Shift writes
+    // nothing, so this is exactly where the safe-local loop closes — advance
+    // the Brief to `done` so its dependents unblock.
+    if artifacts.is_empty() {
+        let _ =
+            store.set_run_apply_status(run_id, "applied", "no artifacts — nothing to apply", 0, 0);
+        let _ = store.append_run_event(
+            run_id,
+            "apply.applied",
+            "relix",
+            "no artifacts — nothing to apply",
+            None,
+            false,
+        );
+        let brief_status = advance_reviewed_brief(store, &run.brief_id, run_id);
+        return Ok(serde_json::json!({
+            "run_id": run_id, "apply_status": "applied",
+            "applied_files": 0, "failed_files": 0,
+            "brief_id": run.brief_id, "brief_status": brief_status,
+        }));
+    }
+    let outcome = match crate::nodes::coordinator::heartbeat::apply_run(&root, &artifacts) {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = store.set_run_apply_status(
+                run_id,
+                "failed",
+                &format!("invalid project root: {e}"),
+                0,
+                0,
+            );
+            let _ = store.append_run_event(
+                run_id,
+                "apply.failed",
+                "relix",
+                &format!("apply failed: {e}"),
+                None,
+                false,
+            );
+            return Err(format!("run.apply: {e}"));
+        }
+    };
+    // Plan event (always recorded — the preview the apply acted on).
+    let _ = store.append_run_event(run_id, "apply.plan", "relix", &outcome.plan.note, None, false);
+    if outcome.status == "conflicted" {
+        // Refused the whole apply — nothing written.
+        let _ = store.set_run_apply_status(run_id, "conflicted", &outcome.plan.note, 0, 0);
+        let _ = store.append_run_event(
+            run_id,
+            "apply.conflicted",
+            "relix",
+            &format!("apply refused — {}", outcome.plan.note),
+            None,
+            false,
+        );
+    } else {
+        let _ = store.append_run_event(
+            run_id,
+            "apply.started",
+            "relix",
+            &format!(
+                "applying {} change(s) to {}",
+                outcome.plan.changes, outcome.plan.project_root
+            ),
+            None,
+            false,
+        );
+        let summary = format!("{} applied, {} failed", outcome.applied_files, outcome.failed_files);
+        let _ = store.set_run_apply_status(
+            run_id,
+            outcome.status,
+            &summary,
+            outcome.applied_files as i64,
+            outcome.failed_files as i64,
+        );
+        if outcome.status == "failed" {
+            let detail = if outcome.errors.is_empty() {
+                summary.clone()
+            } else {
+                format!("{summary}: {}", outcome.errors.join("; "))
+            };
+            let _ = store.append_run_event(
+                run_id,
+                "apply.failed",
+                "relix",
+                &format!("apply incomplete — {detail}"),
+                None,
+                false,
+            );
+        } else {
+            let _ = store.append_run_event(
+                run_id,
+                "apply.applied",
+                "relix",
+                &format!("apply complete — {summary}"),
+                None,
+                false,
+            );
+        }
+    }
+    // Productized review-to-done (company-model §12.5B/§12.6): ONLY a clean
+    // `applied` advances the Brief. A `conflicted` (nothing written) or
+    // `failed` (partial) apply leaves the Brief in review — the operator's
+    // work is not integrated, so it is NOT done.
+    let brief_status = if outcome.status == "applied" {
+        advance_reviewed_brief(store, &run.brief_id, run_id)
+    } else {
+        None
+    };
+    Ok(serde_json::json!({
+        "run_id": run_id,
+        "apply_status": outcome.status,
+        "applied_files": outcome.applied_files,
+        "failed_files": outcome.failed_files,
+        "brief_id": run.brief_id,
+        "brief_status": brief_status,
+        "plan": outcome.plan,
+    }))
+}
+
 /// Post-startup wiring the per-node-type registration handed
 /// back to `run()` because it depends on the `rpc::Client` that
 /// only exists after the dispatch bridge is built.
@@ -9823,48 +10041,12 @@ fn register_node_type_handlers(
                                     },
                                 )
                             };
-                            match st.run_belongs_to_tenant(&run_id, &tenant) {
-                                Ok(true) => {}
-                                Ok(false) => return invalid(format!("run not found: {run_id}")),
-                                Err(e) => return invalid(format!("run.diff: {e}")),
-                            }
-                            let run = match st.get_run(&run_id) {
-                                Ok(Some(r)) => r,
-                                Ok(None) => return invalid(format!("run not found: {run_id}")),
-                                Err(e) => return invalid(format!("run.diff: {e}")),
-                            };
-                            let eligibility =
-                                crate::nodes::coordinator::heartbeat::run_apply_eligibility(&run);
-                            let eligible = eligibility.is_ok();
-                            let reason = match &eligibility {
-                                Ok(()) => "eligible".to_string(),
-                                Err(e) => e.clone(),
-                            };
-                            let artifacts = match st.list_run_artifacts(&run_id) {
-                                Ok(a) => a,
-                                Err(e) => return invalid(format!("run.diff: {e}")),
-                            };
-                            let root = st.run_workspace_config().project_root.clone();
-                            let plan = match crate::nodes::coordinator::heartbeat::build_apply_plan(
-                                &root, &artifacts,
-                            ) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    return invalid(format!("run.diff: invalid project root: {e}"))
-                                }
-                            };
-                            let body = serde_json::json!({
-                                "run_id": run_id,
-                                "status": run.status,
-                                "review": run.review,
-                                "apply_status": run.apply_status,
-                                "eligible": eligible,
-                                "reason": reason,
-                                "plan": plan,
-                            });
-                            match serde_json::to_vec(&body) {
-                                Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
-                                Err(e) => invalid(format!("run.diff encode: {e}")),
+                            match execute_run_diff(&st, &run_id, &tenant) {
+                                Ok(body) => match serde_json::to_vec(&body) {
+                                    Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                    Err(e) => invalid(format!("run.diff encode: {e}")),
+                                },
+                                Err(c) => invalid(c),
                             }
                         }
                     },
@@ -9898,142 +10080,12 @@ fn register_node_type_handlers(
                                     },
                                 )
                             };
-                            match st.run_belongs_to_tenant(&run_id, &tenant) {
-                                Ok(true) => {}
-                                Ok(false) => return invalid(format!("run not found: {run_id}")),
-                                Err(e) => return invalid(format!("run.apply: {e}")),
-                            }
-                            let run = match st.get_run(&run_id) {
-                                Ok(Some(r)) => r,
-                                Ok(None) => return invalid(format!("run not found: {run_id}")),
-                                Err(e) => return invalid(format!("run.apply: {e}")),
-                            };
-                            // Eligibility gate — refuse (and record `blocked`)
-                            // for any non-done / unaccepted / inherit run.
-                            if let Err(reason) =
-                                crate::nodes::coordinator::heartbeat::run_apply_eligibility(&run)
-                            {
-                                let _ = st.set_run_apply_status(&run_id, "blocked", &reason, 0, 0);
-                                let _ = st.append_run_event(
-                                    &run_id, "apply.conflicted", "relix",
-                                    &format!("apply refused: {reason}"), None, false,
-                                );
-                                return invalid(format!("apply refused: {reason}"));
-                            }
-                            let artifacts = match st.list_run_artifacts(&run_id) {
-                                Ok(a) => a,
-                                Err(e) => return invalid(format!("run.apply: {e}")),
-                            };
-                            let root = st.run_workspace_config().project_root.clone();
-                            // Zero-artifact run: a clear no-op (nothing to do).
-                            if artifacts.is_empty() {
-                                let _ = st.set_run_apply_status(
-                                    &run_id, "applied", "no artifacts — nothing to apply", 0, 0,
-                                );
-                                let _ = st.append_run_event(
-                                    &run_id, "apply.applied", "relix",
-                                    "no artifacts — nothing to apply", None, false,
-                                );
-                                // Productized review-to-done (company-model
-                                // §12.5B/§12.6): a clean apply IS the operator's
-                                // review-to-done. An echo Shift writes nothing,
-                                // so this no-op apply is exactly where the
-                                // safe-local loop closes — advance the Brief to
-                                // `done` so its dependents unblock.
-                                let brief_status =
-                                    advance_reviewed_brief(&st, &run.brief_id, &run_id);
-                                let body = serde_json::json!({
-                                    "run_id": run_id, "apply_status": "applied",
-                                    "applied_files": 0, "failed_files": 0,
-                                    "brief_id": run.brief_id, "brief_status": brief_status,
-                                });
-                                return match serde_json::to_vec(&body) {
+                            match execute_run_apply(&st, &run_id, &tenant) {
+                                Ok(body) => match serde_json::to_vec(&body) {
                                     Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
                                     Err(e) => invalid(format!("run.apply encode: {e}")),
-                                };
-                            }
-                            let outcome = match crate::nodes::coordinator::heartbeat::apply_run(
-                                &root, &artifacts,
-                            ) {
-                                Ok(o) => o,
-                                Err(e) => {
-                                    let _ = st.set_run_apply_status(
-                                        &run_id, "failed", &format!("invalid project root: {e}"), 0, 0,
-                                    );
-                                    let _ = st.append_run_event(
-                                        &run_id, "apply.failed", "relix",
-                                        &format!("apply failed: {e}"), None, false,
-                                    );
-                                    return invalid(format!("run.apply: {e}"));
-                                }
-                            };
-                            // Plan event (always recorded — the preview the
-                            // apply acted on).
-                            let _ = st.append_run_event(
-                                &run_id, "apply.plan", "relix", &outcome.plan.note, None, false,
-                            );
-                            if outcome.status == "conflicted" {
-                                // Refused the whole apply — nothing written.
-                                let _ = st.set_run_apply_status(
-                                    &run_id, "conflicted", &outcome.plan.note,
-                                    0, 0,
-                                );
-                                let _ = st.append_run_event(
-                                    &run_id, "apply.conflicted", "relix",
-                                    &format!("apply refused — {}", outcome.plan.note), None, false,
-                                );
-                            } else {
-                                let _ = st.append_run_event(
-                                    &run_id, "apply.started", "relix",
-                                    &format!("applying {} change(s) to {}", outcome.plan.changes, outcome.plan.project_root),
-                                    None, false,
-                                );
-                                let summary = format!(
-                                    "{} applied, {} failed", outcome.applied_files, outcome.failed_files
-                                );
-                                let _ = st.set_run_apply_status(
-                                    &run_id, outcome.status, &summary,
-                                    outcome.applied_files as i64, outcome.failed_files as i64,
-                                );
-                                if outcome.status == "failed" {
-                                    let detail = if outcome.errors.is_empty() {
-                                        summary.clone()
-                                    } else {
-                                        format!("{summary}: {}", outcome.errors.join("; "))
-                                    };
-                                    let _ = st.append_run_event(
-                                        &run_id, "apply.failed", "relix",
-                                        &format!("apply incomplete — {detail}"), None, false,
-                                    );
-                                } else {
-                                    let _ = st.append_run_event(
-                                        &run_id, "apply.applied", "relix",
-                                        &format!("apply complete — {summary}"), None, false,
-                                    );
-                                }
-                            }
-                            // Productized review-to-done (company-model
-                            // §12.5B/§12.6): ONLY a clean `applied` advances the
-                            // Brief. A `conflicted` (nothing written) or `failed`
-                            // (partial) apply leaves the Brief in review — the
-                            // operator's work is not integrated, so it is NOT done.
-                            let brief_status = if outcome.status == "applied" {
-                                advance_reviewed_brief(&st, &run.brief_id, &run_id)
-                            } else {
-                                None
-                            };
-                            let body = serde_json::json!({
-                                "run_id": run_id,
-                                "apply_status": outcome.status,
-                                "applied_files": outcome.applied_files,
-                                "failed_files": outcome.failed_files,
-                                "brief_id": run.brief_id,
-                                "brief_status": brief_status,
-                                "plan": outcome.plan,
-                            });
-                            match serde_json::to_vec(&body) {
-                                Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
-                                Err(e) => invalid(format!("run.apply encode: {e}")),
+                                },
+                                Err(c) => invalid(c),
                             }
                         }
                     },
@@ -12577,5 +12629,239 @@ mod sec13_node_type_failclosed_tests {
         // Sanity: the named real type from the section criteria.
         assert!(validate_controller_node_type("ai").is_ok());
         assert!(validate_controller_node_type("memory").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod run_apply_capability_tests {
+    //! In-process integration coverage for the `run.diff` / `run.apply`
+    //! capability bodies, driven by a REAL run that a real adapter process
+    //! actually writes files in — the deterministic equivalent of the live
+    //! HTTP smoke (no paid/interactive CLI, no fake product adapter: just a
+    //! `cmd`/`sh` one-liner registered as a test Rig). It proves the full
+    //! spine contract through the SAME code the bridge route runs:
+    //!   real changed file → diff preview (review-gated) → accept → apply into
+    //!   the configured project root → productized review-to-done (the Brief
+    //!   reaches board `done`, dependents unblock) → idempotent re-apply;
+    //! and that a post-baseline divergence is detected as a conflict that
+    //! refuses the whole apply and leaves the Brief in review.
+    use super::{execute_run_apply, execute_run_diff};
+    use crate::nodes::coordinator::heartbeat::{
+        DEFAULT_WORKSPACE_MAX_BYTES, DEFAULT_WORKSPACE_MAX_FILES, WorkspaceConfig, WorkspaceContext,
+        run_brief_now,
+    };
+    use crate::nodes::coordinator::{RetryPolicy, TaskStore};
+
+    /// A store whose scoped workspaces land under `<workspace_root>/runs` and
+    /// whose `copy_repo` snapshots come from `project_root` (a DISJOINT dir, so
+    /// a copy can never recurse into the run tree). This is the operator config
+    /// the Brief prompt never influences.
+    fn store_with_project_root(
+        workspace_root: &std::path::Path,
+        project_root: &std::path::Path,
+    ) -> TaskStore {
+        let mut s = TaskStore::in_memory().unwrap();
+        s.set_run_workspace_root(workspace_root.join("runs"));
+        s.set_run_workspace_config(WorkspaceConfig {
+            context: WorkspaceContext::CopyRepo,
+            project_root: project_root.to_path_buf(),
+            max_bytes: DEFAULT_WORKSPACE_MAX_BYTES,
+            max_files: DEFAULT_WORKSPACE_MAX_FILES,
+        });
+        s
+    }
+
+    fn ready_brief(s: &TaskStore, title: &str, assignee: &str) -> String {
+        let id = s
+            .create(title, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .unwrap();
+        s.set_brief_field(&id, "assignee", assignee).unwrap();
+        s.set_brief_field(&id, "reviewer", "reviewer_1").unwrap();
+        s.set_board_status(&id, "todo").unwrap();
+        id
+    }
+
+    /// A real adapter that OVERWRITES `seed.txt` in its working directory (the
+    /// scoped workspace) with `content`. Because `seed.txt` was copied in from
+    /// the project root, this exercises the MODIFIED-file path (baseline hash →
+    /// overwrite / conflict), the strongest apply semantics, not just create.
+    fn seed_modifying_rig(content: &str) -> crate::rig::RigRegistry {
+        let (prog, args) = if cfg!(windows) {
+            ("cmd".to_string(), vec!["/C".to_string(), format!("echo {content}> seed.txt")])
+        } else {
+            ("sh".to_string(), vec!["-c".to_string(), format!("printf '{content}' > seed.txt")])
+        };
+        let mut reg = crate::rig::RigRegistry::new();
+        reg.register(std::sync::Arc::new(crate::rig::ProcessRig::new("mk", prog, args)));
+        reg.set_default(Some("mk".to_string()));
+        reg
+    }
+
+    #[test]
+    fn run_apply_capability_proves_real_file_change_review_gate_and_review_to_done() {
+        let ws_tmp = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        // A pre-existing project file the run will modify.
+        std::fs::write(proj.path().join("seed.txt"), "v1").unwrap();
+        let s = store_with_project_root(ws_tmp.path(), proj.path());
+
+        // A track Brief plus a dependent that is blocked until the track is done.
+        let track = ready_brief(&s, "edit the seed file", "agt_eng");
+        let integrate = ready_brief(&s, "integrate", "agt_eng");
+        s.add_snag(&integrate, &track).unwrap();
+
+        // Run on a real adapter that rewrites seed.txt in the scoped workspace.
+        let report =
+            run_brief_now(&s, &seed_modifying_rig("v2"), None, 300, &track, None, "go".into())
+                .unwrap();
+        let run_id = report.run_id.expect("a committed run has an id");
+
+        // (1) The run captured a REAL changed file as an artifact, with the
+        //     pre-run baseline hash safe-apply needs to detect divergence.
+        let arts = s.list_run_artifacts(&run_id).unwrap();
+        let seed_art = arts
+            .iter()
+            .find(|a| a.rel_path == "seed.txt")
+            .expect("the seed.txt change is recorded as an artifact");
+        assert_eq!(seed_art.kind, "modified");
+        assert!(
+            seed_art.baseline_hash.is_some(),
+            "a modified artifact carries the pre-run baseline hash"
+        );
+
+        // The successful Shift parked the Brief in review; the dependent blocks.
+        assert_eq!(s.board_status(&track).unwrap().as_deref(), Some("in_review"));
+        assert!(
+            s.is_blocked(&integrate).unwrap(),
+            "integrate is blocked while the track awaits review"
+        );
+
+        // (2) Before review: run.diff shows the pending change but is INELIGIBLE.
+        let diff = execute_run_diff(&s, &run_id, "default").unwrap();
+        assert_eq!(diff["eligible"], serde_json::json!(false));
+        assert!(
+            diff["plan"]["changes"].as_u64().unwrap() >= 1,
+            "the pending file change is previewable before acceptance"
+        );
+        // Apply is gated behind acceptance — nothing is written, Brief unmoved.
+        assert!(
+            execute_run_apply(&s, &run_id, "default").is_err(),
+            "apply is refused until the run is accepted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj.path().join("seed.txt")).unwrap(),
+            "v1",
+            "a refused apply writes nothing"
+        );
+        assert_eq!(s.board_status(&track).unwrap().as_deref(), Some("in_review"));
+
+        // (3) Accept → run.diff flips to eligible.
+        s.set_run_review(&run_id, "accepted", "lgtm").unwrap();
+        let diff2 = execute_run_diff(&s, &run_id, "default").unwrap();
+        assert_eq!(diff2["eligible"], serde_json::json!(true));
+
+        // (4/5) Apply writes the real change into the project root AND closes
+        //       the review-to-done: the Brief reaches board `done`.
+        let applied = execute_run_apply(&s, &run_id, "default").unwrap();
+        assert_eq!(applied["apply_status"], serde_json::json!("applied"));
+        assert!(applied["applied_files"].as_u64().unwrap() >= 1);
+        assert_eq!(
+            applied["brief_status"],
+            serde_json::json!("done"),
+            "a clean apply IS the operator's review-to-done"
+        );
+        let landed = std::fs::read_to_string(proj.path().join("seed.txt")).unwrap();
+        assert!(
+            landed.starts_with("v2"),
+            "the run's real change must land in the project root: {landed:?}"
+        );
+        // Board done + the dependent unblocks — through the capability's code.
+        assert_eq!(s.board_status(&track).unwrap().as_deref(), Some("done"));
+        assert!(
+            !s.is_blocked(&integrate).unwrap(),
+            "with the track done, the dependent integrate Brief unblocks"
+        );
+
+        // (7) Idempotent re-apply: the target already matches → 0 writes, no
+        //     corruption, no duplicate write.
+        let again = execute_run_apply(&s, &run_id, "default").unwrap();
+        assert_eq!(again["apply_status"], serde_json::json!("applied"));
+        assert_eq!(
+            again["applied_files"],
+            serde_json::json!(0),
+            "a second apply rewrites nothing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj.path().join("seed.txt")).unwrap(),
+            landed,
+            "idempotent re-apply must not corrupt the file"
+        );
+    }
+
+    #[test]
+    fn run_apply_capability_refuses_a_post_baseline_conflict_and_keeps_brief_in_review() {
+        let ws_tmp = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("seed.txt"), "v1").unwrap();
+        let s = store_with_project_root(ws_tmp.path(), proj.path());
+        let track = ready_brief(&s, "edit the seed file", "agt_eng");
+        let report =
+            run_brief_now(&s, &seed_modifying_rig("v2"), None, 300, &track, None, "go".into())
+                .unwrap();
+        let run_id = report.run_id.unwrap();
+        s.set_run_review(&run_id, "accepted", "").unwrap();
+
+        // The project file diverges from the run's baseline AFTER the run — a
+        // real conflict the all-or-nothing apply must refuse (no three-way merge).
+        std::fs::write(proj.path().join("seed.txt"), "operator edited this meanwhile").unwrap();
+
+        let res = execute_run_apply(&s, &run_id, "default").unwrap();
+        assert_eq!(res["apply_status"], serde_json::json!("conflicted"));
+        assert_eq!(res["applied_files"], serde_json::json!(0));
+        assert!(
+            res["brief_status"].is_null(),
+            "a conflicted apply does NOT review-to-done the Brief"
+        );
+        // The operator's intervening edit is untouched; the Brief stays in review.
+        assert_eq!(
+            std::fs::read_to_string(proj.path().join("seed.txt")).unwrap(),
+            "operator edited this meanwhile"
+        );
+        assert_eq!(s.board_status(&track).unwrap().as_deref(), Some("in_review"));
+        // The durable run row records the conflict.
+        assert_eq!(
+            s.get_run(&run_id).unwrap().unwrap().apply_status.as_deref(),
+            Some("conflicted")
+        );
+    }
+
+    #[test]
+    fn run_apply_capability_is_tenant_scoped_and_gates_unaccepted_runs() {
+        let ws_tmp = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("seed.txt"), "v1").unwrap();
+        let s = store_with_project_root(ws_tmp.path(), proj.path());
+        let track = ready_brief(&s, "edit", "agt_eng");
+        s.set_task_tenant(&track, "guild-a").unwrap();
+        let report =
+            run_brief_now(&s, &seed_modifying_rig("v2"), None, 300, &track, None, "go".into())
+                .unwrap();
+        let run_id = report.run_id.unwrap();
+
+        // Another Guild cannot diff or apply this run — it reads as not-found.
+        assert!(execute_run_diff(&s, &run_id, "guild-b").is_err());
+        assert!(execute_run_apply(&s, &run_id, "guild-b").is_err());
+
+        // The owning Guild can diff, but apply is refused until acceptance —
+        // and the refusal records a durable `blocked` apply status, writing
+        // nothing into the project root.
+        assert!(execute_run_diff(&s, &run_id, "guild-a").is_ok());
+        let err = execute_run_apply(&s, &run_id, "guild-a").unwrap_err();
+        assert!(err.contains("apply refused"), "an unaccepted run is gated: {err}");
+        assert_eq!(std::fs::read_to_string(proj.path().join("seed.txt")).unwrap(), "v1");
+        assert_eq!(
+            s.get_run(&run_id).unwrap().unwrap().apply_status.as_deref(),
+            Some("blocked")
+        );
     }
 }
