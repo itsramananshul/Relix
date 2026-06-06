@@ -119,28 +119,43 @@ when you click Start. What it does **not** do:
   already-assigned Briefs on a timer — it never authors strategy, staffs a
   team, or orchestrates a Mandate.
 - **No org-graph visual** beyond a shallow reports-to list.
-- **The Live Shift Room refreshes by polling + a reused run-event SSE, not a
-  dedicated session stream.** After `prime.start`, the Chat approved-plan card
-  shows a live Shift Room (each Brief's latest Shift, blockers, review/apply
-  state, and a next-action button) sourced from the READ-ONLY `prime.status`
-  capability (`GET /v1/spine/prime/proposals/:id/status`). It refreshes the
-  moment a run event arrives over the **existing** `/v1/runs/events/stream`
-  feed, and **polls every 4 s while a Shift is running** as a fallback. There
-  is **no per-Prime-session push channel** — the run-event SSE is reused only
-  as a refresh trigger. `prime.status` itself **never starts, applies, or
-  discards** anything (those remain the existing explicit routes); when a
-  relation is unknowable it returns honest partial data (e.g. `latest_run:null`),
-  never a fabricated state. So a finished/blocked Shift can take up to one poll
-  interval (or one SSE event) to appear — it is not a hard-realtime room.
+- **The Live Shift Room now has a dedicated session stream, with polling as a
+  fallback.** After `prime.start`, the Chat approved-plan card shows a live
+  Shift Room (each Brief's latest Shift, blockers, review/apply state, and a
+  next-action button) sourced from the READ-ONLY `prime.status` capability. The
+  dashboard **prefers a dedicated per-session SSE stream**
+  (`GET /v1/spine/prime/proposals/:id/status/stream`): the server emits the
+  initial status snapshot immediately, **reuses** the existing run-event feed
+  (`run.events.recent`) only as a cheap change-trigger so a Shift transition
+  reflects within ~1 s, and **force-refreshes on a low (~3 s) interval** so the
+  room still converges if an event is missed or the run-event source is absent.
+  Identical frames are de-duped (keep-alive ping only), so the loop never spins.
+  When the stream **isn't** connected the dashboard falls back to **polling the
+  snapshot every 4 s** and the header badge honestly reads `polling` (it only
+  says `live` when the stream is actually connected) — it never claims realtime
+  when the stream is unavailable. A tenant-gated / unknown proposal emits a
+  terminal `event: not_found` (no existence leak) and stops cleanly. The stream
+  invents **no new state or event table** — it composes the same read
+  capability the polling route uses. `prime.status` itself **never starts,
+  applies, or discards** anything (those remain the existing explicit routes);
+  when a relation is unknowable it returns honest partial data (e.g.
+  `latest_run:null`), never a fabricated state. So a finished/blocked Shift
+  still appears within ~1 s of its run event (or one forced-refresh / poll
+  interval) — low-latency, not hard-realtime push of every field.
+- **Shift-Room blockers are tenant-scoped.** `prime.status` reads a Brief's open
+  blockers (Snags) through `list_snags_for_tenant`, which filters the related
+  (blocker) Brief to the proposal's own Guild. Even a **legacy `blocked_on` edge
+  that crosses Guilds** can never surface a cross-tenant blocker id or title in
+  the Shift Room — pinned by a coordinator test that forces such an edge.
 
 In short: the *governance rails* of a company are in place and tenant-safe,
 the Shift Room makes the post-start loop legible (what ran / finished / is
-blocked / needs review, with the next action one click away), and a model can
+blocked / needs review, with the next action one click away) over a dedicated
+low-latency status stream (polling fallback, honest badge), and a model can
 now draft the plan **opt-in** behind a server-authoritative validator — but the
 default Prime is still rules, the model only shapes the *interpretation* (never
-crew/governance), there is no autonomous driver that reasons about strategy +
-team + work end to end, and the room is poll/SSE-refreshed, not a dedicated
-realtime session stream.
+crew/governance), and there is no autonomous driver that reasons about strategy +
+team + work end to end.
 
 ### Bridge persists every chat as a Task (fail-soft)
 
