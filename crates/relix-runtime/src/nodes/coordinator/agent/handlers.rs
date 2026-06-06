@@ -7571,6 +7571,211 @@ mod tests {
         );
     }
 
+    // ── Live spend through the REAL ledger: the same tests as above, but driven
+    //    end-to-end through the PRODUCTION seam — a real `MetricsStore` →
+    //    `MetricsQuery` → `MetricsSpendSource::trailing_30d` (the exact type +
+    //    window `register_agent_capabilities` wires at boot), not a hand-rolled
+    //    `FakeSpend`. Closes the impl-map gap: the spend SOURCE was previously
+    //    exercised only with a fake. ──────────────────────────────────────────
+
+    /// Wall-clock now in unix-ms — matches `MetricsSpendSource::trailing_30d`'s
+    /// own clock so seeded timestamps land on the intended side of the window.
+    fn now_unix_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    /// A priced AI invocation row for the metrics ledger. The live-spend seam
+    /// (and the heartbeat Allowance gate it mirrors) attribute cost by the
+    /// Operative's `agent_id`, so the recorded `agent_name` MUST be the
+    /// `agent_id` for the row to count — exactly the production contract the
+    /// impl-map calls out ("best-effort … only counts priced AI calls whose
+    /// recorded `agent_name` matches the Operative's `agent_id`").
+    fn spend_row(
+        agent_id: &str,
+        tenant: &str,
+        ts_ms: i64,
+        cost_micros: u64,
+    ) -> crate::metrics::InvocationMetric {
+        crate::metrics::InvocationMetric {
+            agent_name: agent_id.to_string(),
+            tenant_id: tenant.to_string(),
+            peer_alias: "coord".to_string(),
+            method: "ai.chat".to_string(),
+            timestamp_ms: ts_ms,
+            latency_ms: 10,
+            success: true,
+            error_kind: None,
+            token_count: Some(100),
+            cost_micros: Some(cost_micros),
+            input_bytes: 0,
+            output_bytes: 0,
+            model: Some("mock".to_string()),
+            confidence_score: None,
+            routing_tier: None,
+            request_id: None,
+        }
+    }
+
+    #[test]
+    fn company_actions_live_spend_from_real_metrics_store() {
+        // Same scenario as `..._over_and_near_allowance`, but the spend signal
+        // flows through the production `MetricsSpendSource` over a real
+        // in-memory `MetricsStore`/`MetricsQuery` — proving the handler reads
+        // actual ledger cost, sums multiple rows, and honours the trailing-30d
+        // window, not just that it trusts a fake's number.
+        let (agents, spine, task) = prime_stores();
+        let over = agents
+            .create_agent(
+                "Over", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"real-over"), "medium", "default",
+            )
+            .unwrap();
+        let near = agents
+            .create_agent(
+                "Near", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"real-near"), "medium", "default",
+            )
+            .unwrap();
+        agents.update_agent_field(&over, "allowance", "20000").unwrap();
+        agents.update_agent_field(&near, "allowance", "20000").unwrap();
+
+        let store = crate::metrics::MetricsStore::in_memory().unwrap();
+        let now = now_unix_ms();
+        let recent = now - 1_000; // 1s ago — inside the trailing-30d window.
+        let stale = now - 31 * 86_400 * 1000; // 31d ago — OUTSIDE the window.
+        store
+            .insert_batch(&[
+                // over: $150 + $100 = $250 of $200 (125%) → High. Split across
+                // two rows so the assert proves the seam SUMS the window, not
+                // reads a single row.
+                spend_row(&over, "default", recent, 150_000_000),
+                spend_row(&over, "default", recent, 100_000_000),
+                // A huge STALE row for `over` that — were the 30d window ignored
+                // — would blow the figure far past $250. Its exclusion is what
+                // pins the window behaviour.
+                spend_row(&over, "default", stale, 5_000_000_000),
+                // near: $170 of $200 (85% ≥ 80% band) → Medium.
+                spend_row(&near, "default", recent, 170_000_000),
+            ])
+            .unwrap();
+
+        // The EXACT production type + window wired in `register_agent_capabilities`.
+        let spend =
+            MetricsSpendSource::trailing_30d(crate::metrics::MetricsQuery::new(store));
+
+        let v = json_of(ok_body(handle_company_actions_with_spend(
+            &agents,
+            &spine,
+            &task,
+            Some(&spend),
+            &fake_ctx(b""),
+        )));
+        let actions = v["actions"].as_array().unwrap();
+
+        let o = actions
+            .iter()
+            .find(|a| a["id"] == serde_json::json!(format!("budget:spend:{over}")))
+            .expect("an over-Allowance spend item for `over`, read from the real ledger");
+        assert_eq!(o["severity"], "high", "{o}");
+        let oreason = o["reason"].as_str().unwrap();
+        assert!(
+            oreason.contains("$250.00"),
+            "summed live spend with the stale row excluded: {oreason}"
+        );
+        assert!(oreason.contains("$200.00"), "cap shown: {oreason}");
+        assert!(oreason.contains("125%"), "percent shown: {oreason}");
+        assert!(oreason.contains("at/over the cap"), "over phrasing: {oreason}");
+
+        let n = actions
+            .iter()
+            .find(|a| a["id"] == serde_json::json!(format!("budget:spend:{near}")))
+            .expect("a near-Allowance spend item for `near`, read from the real ledger");
+        assert_eq!(n["severity"], "medium", "{n}");
+        assert!(
+            n["reason"].as_str().unwrap().contains("85%"),
+            "percent shown: {n}"
+        );
+    }
+
+    #[test]
+    fn company_actions_live_spend_real_metrics_is_tenant_isolated() {
+        // Two Guilds share ONE physical metrics ledger. `cost_since` itself does
+        // NOT filter by tenant — isolation comes solely from the handler asking
+        // only about its OWN roster's `agent_id`s. With BOTH Operatives over
+        // their cap in the same store, prove neither Guild's spend leaks into
+        // the other's feed, exercised through the real `MetricsSpendSource`.
+        let (agents, spine, task) = prime_stores();
+        let acme = agents
+            .create_agent(
+                "AcmeEng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"real-acme"), "medium", "acme",
+            )
+            .unwrap();
+        let globex = agents
+            .create_agent(
+                "GlobexEng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"real-globex"), "medium", "globex",
+            )
+            .unwrap();
+        agents.update_agent_field(&acme, "allowance", "20000").unwrap();
+        agents.update_agent_field(&globex, "allowance", "20000").unwrap();
+
+        let store = crate::metrics::MetricsStore::in_memory().unwrap();
+        let now = now_unix_ms();
+        // BOTH Operatives are over their $200 cap in the SHARED ledger ($250 each).
+        store
+            .insert_batch(&[
+                spend_row(&acme, "acme", now - 1_000, 250_000_000),
+                spend_row(&globex, "globex", now - 1_000, 250_000_000),
+            ])
+            .unwrap();
+        let spend =
+            MetricsSpendSource::trailing_30d(crate::metrics::MetricsQuery::new(store));
+
+        // acme's feed surfaces acme's Operative ONLY.
+        let a = json_of(ok_body(handle_company_actions_with_spend(
+            &agents,
+            &spine,
+            &task,
+            Some(&spend),
+            &fake_ctx_tenant(b"", "acme"),
+        )));
+        let aa = a["actions"].as_array().unwrap();
+        assert!(
+            aa.iter()
+                .any(|x| x["id"] == serde_json::json!(format!("budget:spend:{acme}"))),
+            "acme sees its own real-ledger spend: {a}"
+        );
+        assert!(
+            !aa.iter()
+                .any(|x| x["id"] == serde_json::json!(format!("budget:spend:{globex}"))),
+            "globex's spend never leaks into acme's feed: {a}"
+        );
+
+        // globex's feed surfaces globex's Operative ONLY.
+        let g = json_of(ok_body(handle_company_actions_with_spend(
+            &agents,
+            &spine,
+            &task,
+            Some(&spend),
+            &fake_ctx_tenant(b"", "globex"),
+        )));
+        let gg = g["actions"].as_array().unwrap();
+        assert!(
+            gg.iter()
+                .any(|x| x["id"] == serde_json::json!(format!("budget:spend:{globex}"))),
+            "globex sees its own real-ledger spend: {g}"
+        );
+        assert!(
+            !gg.iter()
+                .any(|x| x["id"] == serde_json::json!(format!("budget:spend:{acme}"))),
+            "acme's spend never leaks into globex's feed: {g}"
+        );
+    }
+
     #[test]
     fn company_actions_is_tenant_isolated() {
         let (agents, spine, task) = prime_stores();
