@@ -108,10 +108,26 @@ when you click Start. What it does **not** do:
   already-assigned Briefs on a timer — it never authors strategy, staffs a
   team, or orchestrates a Mandate.
 - **No org-graph visual** beyond a shallow reports-to list.
+- **The Live Shift Room refreshes by polling + a reused run-event SSE, not a
+  dedicated session stream.** After `prime.start`, the Chat approved-plan card
+  shows a live Shift Room (each Brief's latest Shift, blockers, review/apply
+  state, and a next-action button) sourced from the READ-ONLY `prime.status`
+  capability (`GET /v1/spine/prime/proposals/:id/status`). It refreshes the
+  moment a run event arrives over the **existing** `/v1/runs/events/stream`
+  feed, and **polls every 4 s while a Shift is running** as a fallback. There
+  is **no per-Prime-session push channel** — the run-event SSE is reused only
+  as a refresh trigger. `prime.status` itself **never starts, applies, or
+  discards** anything (those remain the existing explicit routes); when a
+  relation is unknowable it returns honest partial data (e.g. `latest_run:null`),
+  never a fabricated state. So a finished/blocked Shift can take up to one poll
+  interval (or one SSE event) to appear — it is not a hard-realtime room.
 
 In short: the *governance rails* of a company are in place and tenant-safe,
-but the *intelligence* that would make it feel like Paperclip (a Prime that
-reasons about strategy + team + work) is still a human + rules, not a model.
+the Shift Room makes the post-start loop legible (what ran / finished / is
+blocked / needs review, with the next action one click away), but the
+*intelligence* that would make it feel like Paperclip (a Prime that reasons
+about strategy + team + work) is still a human + rules, not a model — and the
+room is poll/SSE-refreshed, not a dedicated realtime session stream.
 
 ### Bridge persists every chat as a Task (fail-soft)
 
