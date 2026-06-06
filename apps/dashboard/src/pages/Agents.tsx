@@ -514,7 +514,7 @@ export function Agents() {
                     </tr>
                     {keysOpen === id && (
                       <tr>
-                        <td colSpan={9} style={{ background: "rgba(0,0,0,0.02)" }}>{keysDetail(id)}</td>
+                        <td colSpan={9} style={{ background: "var(--bg)" }}>{keysDetail(id)}</td>
                       </tr>
                     )}
                     </Fragment>

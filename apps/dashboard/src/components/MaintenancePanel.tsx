@@ -192,7 +192,7 @@ export function MaintenancePanel() {
                 ) : (
                   <div style={{ maxHeight: 180, overflow: "auto", fontSize: 12 }}>
                     {(report.to_delete ?? []).map((it, i) => (
-                      <div key={it.run_id ?? i} style={{ padding: "2px 0", borderBottom: "1px solid rgba(0,0,0,0.05)" }}>
+                      <div key={it.run_id ?? i} style={{ padding: "2px 0", borderBottom: "1px solid var(--border-soft)" }}>
                         <span className="mono" style={{ fontSize: 11 }}>{it.run_id}</span>{" "}
                         <span className="muted" style={{ fontSize: 10 }}>{fmtBytes(it.bytes)} · {it.age_days}d old</span>
                       </div>

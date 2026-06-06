@@ -614,7 +614,7 @@ export function Runs() {
                       </tr>
                       {open && (
                         <tr>
-                          <td colSpan={COLS} style={{ background: "rgba(0,0,0,0.02)" }}>
+                          <td colSpan={COLS} style={{ background: "var(--bg)" }}>
                             {/* Compact run header — the at-a-glance state. */}
                             <div className="run-head">
                               <span className={"badge " + (TONE[r.status ?? ""] ?? "todo")}>{r.status ?? "—"}</span>
@@ -646,7 +646,7 @@ export function Runs() {
                             ) : (
                               <div style={{ maxHeight: 320, overflow: "auto", fontSize: 12 }}>
                                 {events.map((ev, j) => (
-                                  <div key={ev.event_id ?? j} style={{ padding: "2px 0", borderBottom: "1px solid rgba(0,0,0,0.05)" }}>
+                                  <div key={ev.event_id ?? j} style={{ padding: "2px 0", borderBottom: "1px solid var(--border-soft)" }}>
                                     <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 4, marginRight: 6, background: EVENT_TONE[ev.kind ?? ""] ?? "#999" }} />
                                     <span className="muted" style={{ fontSize: 10 }}>{ev.ts ? new Date(ev.ts * 1000).toLocaleTimeString() : ""}</span>{" "}
                                     <span className="mono" style={{ fontSize: 11 }}>{ev.source}/{ev.kind}</span>{" — "}
@@ -672,7 +672,7 @@ export function Runs() {
                             ) : (
                               <div style={{ fontSize: 12 }}>
                                 {artifacts.map((a, j) => (
-                                  <div key={a.artifact_id ?? j} style={{ padding: "2px 0", borderBottom: "1px solid rgba(0,0,0,0.05)" }}>
+                                  <div key={a.artifact_id ?? j} style={{ padding: "2px 0", borderBottom: "1px solid var(--border-soft)" }}>
                                     <span className={"badge " + (ARTIFACT_TONE[a.kind ?? ""] ?? "todo")} style={{ fontSize: 10 }}>{a.kind}</span>{" "}
                                     <span className="mono" style={{ fontSize: 11 }}>{a.rel_path}</span>{" "}
                                     <span className="muted" style={{ fontSize: 10 }}>{fmtBytes(a.size)}</span>
@@ -687,13 +687,13 @@ export function Runs() {
                                       </button>
                                     )}
                                     {preview && preview.id === a.artifact_id && (
-                                      <pre style={{ margin: "4px 0 4px 14px", padding: 8, background: "rgba(0,0,0,0.04)", maxHeight: 220, overflow: "auto", fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                                      <pre style={{ margin: "4px 0 4px 14px", padding: 8, background: "var(--bg-elev)", maxHeight: 220, overflow: "auto", fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
                                         {preview.data.available ? (preview.data.content || "(empty)") + (preview.data.truncated ? "\n…[truncated]" : "") : `(no preview: ${preview.data.reason ?? "unavailable"})`}
                                       </pre>
                                     )}
                                     {diffView && diffView.id === a.artifact_id && (
                                       diffView.data.available ? (
-                                        <pre style={{ margin: "4px 0 4px 14px", padding: 8, background: "rgba(0,0,0,0.04)", maxHeight: 260, overflow: "auto", fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                                        <pre style={{ margin: "4px 0 4px 14px", padding: 8, background: "var(--bg-elev)", maxHeight: 260, overflow: "auto", fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
                                           {(diffView.data.diff || "(no textual changes)") + (diffView.data.truncated ? "\n…[truncated]" : "")}
                                         </pre>
                                       ) : (
@@ -752,7 +752,7 @@ export function Runs() {
                                 ) : (
                                   <div style={{ fontSize: 12 }}>
                                     {(diff?.plan?.items ?? []).map((it, j) => (
-                                      <div key={(it.rel_path ?? "") + j} style={{ padding: "2px 0", borderBottom: "1px solid rgba(0,0,0,0.05)" }}>
+                                      <div key={(it.rel_path ?? "") + j} style={{ padding: "2px 0", borderBottom: "1px solid var(--border-soft)" }}>
                                         <span className={"badge " + applyActionTone(it)} style={{ fontSize: 10 }}>{it.action}</span>{" "}
                                         <span className="mono" style={{ fontSize: 11 }}>{it.rel_path}</span>{" "}
                                         <span className="muted" style={{ fontSize: 10 }}>{it.reason}</span>

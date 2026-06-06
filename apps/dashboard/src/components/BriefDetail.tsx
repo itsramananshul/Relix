@@ -274,7 +274,7 @@ export function BriefDetail({
       ) : (
         <div style={{ maxHeight: 240, overflow: "auto", fontSize: 12 }}>
           {events.map((ev, i) => (
-            <div key={ev.event_id ?? i} style={{ padding: "3px 0", borderBottom: "1px solid rgba(0,0,0,0.05)" }}>
+            <div key={ev.event_id ?? i} style={{ padding: "3px 0", borderBottom: "1px solid var(--border-soft)" }}>
               <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 4, marginRight: 6, background: eventTone(ev.event_type) }} />
               <span className="muted" style={{ fontSize: 10 }}>{ev.ts ? new Date(ev.ts * 1000).toLocaleString() : ""}</span>{" "}
               <span className="mono" style={{ fontSize: 11 }}>{ev.event_type}</span>
