@@ -1,6 +1,6 @@
-import { useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api } from "../api";
+import { api, subscribeRunEvents } from "../api";
 
 // ── Prime Assistant proposal shapes (from /v1/spine/prime/propose) ──────────
 interface CrewSlot { role?: string; have?: boolean; agent_name?: string }
@@ -38,6 +38,69 @@ interface StartResponse {
   started?: StartedShift[];
   skipped?: SkippedBrief[];
 }
+
+// Live Shift Room (GET /v1/spine/prime/proposals/:id/status) — the command
+// center for one Prime work session. Polled after start (no per-session SSE).
+interface StatusBlocker { brief_id?: string; title?: string; status?: string }
+interface StatusRun {
+  run_id?: string;
+  status?: string;
+  rig?: string;
+  trigger?: string;
+  review?: string;
+  apply_status?: string;
+  refusal_reason?: string;
+  summary?: string;
+}
+interface StatusBrief {
+  brief_id?: string;
+  title?: string;
+  board_status?: string;
+  assignee?: string | null;
+  rig?: string | null;
+  start_readiness?: string;
+  blockers?: StatusBlocker[];
+  needs_review?: boolean;
+  latest_run?: StatusRun | null;
+  next_action?: string;
+  exists?: boolean;
+}
+interface StatusCounts {
+  total_briefs?: number;
+  running?: number;
+  done?: number;
+  blocked?: number;
+  needs_review?: number;
+  refused?: number;
+  failed?: number;
+  ready?: number;
+  unassigned?: number;
+  not_ready?: number;
+  missing?: number;
+}
+interface SessionStatus {
+  proposal_id?: string;
+  status?: string;
+  mandate_id?: string | null;
+  mandate_title?: string | null;
+  briefs?: StatusBrief[];
+  counts?: StatusCounts;
+  recommended_next_actions?: string[];
+}
+
+// Tone for a Brief's Start-readiness / live state badge.
+const READINESS_TONE: Record<string, string> = {
+  ready: "todo",
+  running: "in_progress",
+  needs_review: "in_review",
+  done: "done",
+  blocked: "blocked",
+  unassigned: "backlog",
+  refused: "blocked",
+  failed: "blocked",
+  not_ready: "backlog",
+  missing: "blocked",
+};
 
 // A chat-log entry is plain text, a Prime proposal card, an approval result,
 // or a Start-to-Shift result.
@@ -311,7 +374,148 @@ function ApprovedCard({ entry, onStart, busy }: { entry: { data: ApproveResponse
               : "No assigned Briefs yet — greenlight Clearances first, then start."}
           </span>
         </div>
+
+        {/* Live Shift Room — the command center for this work session. It polls
+            the session status (and refreshes on run events) so the operator
+            sees what started, ran, finished, blocked, or needs review. */}
+        {data.proposal_id && <ShiftRoom proposalId={data.proposal_id} />}
       </div>
+    </div>
+  );
+}
+
+// ── Live Shift Room ─────────────────────────────────────────────────────────
+// Given an approved proposal id, render the live status of every created Brief
+// with its latest Shift + a concrete next action. Refreshes the moment a run
+// event arrives over the existing SSE stream; ALSO polls every few seconds
+// while a Shift is running, so it stays live even if SSE is unavailable.
+function ShiftRoom({ proposalId }: { proposalId: string }) {
+  const [status, setStatus] = useState<SessionStatus | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [acting, setActing] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const s = await api.get<SessionStatus>(`/v1/spine/prime/proposals/${proposalId}/status`);
+      setStatus(s);
+      setErr(null);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "status failed");
+    }
+  }, [proposalId]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  // Live refresh on any execution-stream event (run started/finished/reviewed/
+  // applied/moved). Reuses the existing bridge SSE — no new event bus.
+  useEffect(() => subscribeRunEvents(() => refresh(), () => {}), [refresh]);
+
+  // Poll fallback while a Shift is running (covers SSE-unavailable).
+  const running = status?.counts?.running ?? 0;
+  useEffect(() => {
+    if (running <= 0) return;
+    const t = setInterval(refresh, 4000);
+    return () => clearInterval(t);
+  }, [running, refresh]);
+
+  async function runBrief(id: string) {
+    setActing(id);
+    try {
+      await api.post(`/v1/spine/briefs/${id}/run`, {});
+      await refresh();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "run failed");
+    } finally {
+      setActing(null);
+    }
+  }
+
+  const counts = status?.counts ?? {};
+  const briefs = status?.briefs ?? [];
+  return (
+    <div className="card" style={{ margin: "10px 0 0", background: "var(--bg-2, transparent)" }}>
+      <div className="row" style={{ gap: 8, alignItems: "center" }}>
+        <strong style={{ fontSize: 13 }}>Shift Room</strong>
+        {status?.mandate_title && <span className="muted" style={{ fontSize: 11 }}>· {status.mandate_title}</span>}
+        <div className="spacer" style={{ flex: 1 }} />
+        <button className="btn ghost" style={{ fontSize: 11, padding: "2px 8px" }} onClick={refresh}>
+          Refresh
+        </button>
+      </div>
+
+      {/* Roll-up counts — only the non-zero buckets, so it reads at a glance. */}
+      <div className="row wrap" style={{ gap: 6, marginTop: 8 }}>
+        {([
+          ["ready", "ready"],
+          ["running", "running"],
+          ["needs_review", "review"],
+          ["done", "done"],
+          ["blocked", "blocked"],
+          ["unassigned", "unassigned"],
+          ["failed", "failed"],
+          ["refused", "refused"],
+        ] as [keyof StatusCounts, string][])
+          .filter(([k]) => (counts[k] ?? 0) > 0)
+          .map(([k, label]) => (
+            <span key={k} className={"badge " + (READINESS_TONE[k] ?? "todo")} style={{ fontSize: 9 }}>
+              {counts[k]} {label}
+            </span>
+          ))}
+        <span className="muted" style={{ fontSize: 11 }}>{counts.total_briefs ?? briefs.length} Brief(s)</span>
+      </div>
+
+      {err && <div className="banner err" style={{ fontSize: 11, marginTop: 6 }}>⚠ {err}</div>}
+
+      {/* Per-Brief rows: state badge, assignee/rig, latest Shift, next action. */}
+      <div style={{ marginTop: 8 }}>
+        {briefs.map((b, i) => {
+          const run = b.latest_run ?? null;
+          const tone = READINESS_TONE[b.start_readiness ?? ""] ?? "todo";
+          return (
+            <div key={b.brief_id ?? i} className="row" style={{ gap: 8, alignItems: "center", padding: "3px 0", borderTop: i ? "1px solid var(--border, #e5e5e5)" : undefined }}>
+              <span className={"badge " + tone} style={{ fontSize: 9, minWidth: 64, textAlign: "center" }}>
+                {b.needs_review ? "review" : b.start_readiness}
+              </span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b.title}</div>
+                <div className="muted" style={{ fontSize: 10 }}>
+                  {b.assignee ? <>→ {b.rig ?? "no rig"}</> : "unassigned"}
+                  {run && <> · Shift <span className="mono">{(run.run_id ?? "").slice(0, 10)}</span> {run.status}</>}
+                  {(b.blockers?.length ?? 0) > 0 && <> · blocked on {b.blockers!.length}</>}
+                </div>
+              </div>
+              {/* The single most useful next action for this Brief. */}
+              {b.start_readiness === "ready" ? (
+                <button className="btn" style={{ fontSize: 11, padding: "2px 8px" }} disabled={acting === b.brief_id} onClick={() => b.brief_id && runBrief(b.brief_id)}>
+                  Run
+                </button>
+              ) : run?.run_id && (b.needs_review || run.status === "running" || run.status === "failed" || run.status === "refused") ? (
+                <Link to={`/runs?run=${run.run_id}`} className="link" style={{ fontSize: 11 }}>
+                  {b.needs_review ? "Review →" : "Inspect →"}
+                </Link>
+              ) : run?.run_id && run.review === "accepted" && run.apply_status !== "applied" ? (
+                <Link to={`/runs?run=${run.run_id}`} className="link" style={{ fontSize: 11 }}>Apply →</Link>
+              ) : b.start_readiness === "unassigned" ? (
+                <Link to="/mandates" className="link" style={{ fontSize: 11 }}>Hire →</Link>
+              ) : (
+                <Link to="/briefs" className="link" style={{ fontSize: 11 }}>Open →</Link>
+              )}
+            </div>
+          );
+        })}
+        {briefs.length === 0 && <div className="empty" style={{ fontSize: 12 }}>No Briefs in this session yet.</div>}
+      </div>
+
+      {/* Session-level recommended next actions. */}
+      {(status?.recommended_next_actions?.length ?? 0) > 0 && (
+        <div style={{ marginTop: 8 }}>
+          {status!.recommended_next_actions!.map((a, i) => (
+            <div key={i} className="muted" style={{ fontSize: 11 }}>• {a}</div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

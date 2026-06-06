@@ -39,6 +39,19 @@ interface MaintSummary {
   warnings?: { level?: string; message?: string }[];
 }
 interface MandateRow { mandate_id?: string; id?: string; title?: string; name?: string; status?: string }
+// Compact live Prime-session view (GET /v1/spine/prime/proposals/:id/status).
+interface ProposalRow { proposal_id?: string; status?: string; mandate_title?: string | null }
+interface SessionCounts {
+  total_briefs?: number; running?: number; done?: number; blocked?: number;
+  needs_review?: number; refused?: number; failed?: number; ready?: number; unassigned?: number;
+}
+interface SessionStatus {
+  proposal_id?: string;
+  status?: string;
+  mandate_title?: string | null;
+  counts?: SessionCounts;
+  recommended_next_actions?: string[];
+}
 
 const COLUMNS = ["backlog", "todo", "in_progress", "in_review", "done"];
 const RUN_TONE: Record<string, string> = {
@@ -77,6 +90,17 @@ export function Overview() {
       tryGet<unknown>("/v1/tasks/events/recent?limit=10", {}),
     ]);
     const mandates = await tryGet<unknown>("/v1/spine/mandates?limit=8", {});
+    // The newest Prime work session — if it's approved, pull its live Shift-Room
+    // status for the compact "Active work" card (best-effort, optional surface).
+    const proposals = await tryGet<ProposalRow[]>("/v1/spine/prime/proposals?limit=1", []);
+    const latestProposal = Array.isArray(proposals) ? proposals[0] : undefined;
+    const session =
+      latestProposal?.status === "approved" && latestProposal.proposal_id
+        ? await tryGet<SessionStatus | null>(
+            `/v1/spine/prime/proposals/${latestProposal.proposal_id}/status`,
+            null,
+          )
+        : null;
     const coreError =
       boardR.error || companyR.error || runsR.error
         ? (boardR.error ?? companyR.error ?? runsR.error)
@@ -92,6 +116,7 @@ export function Overview() {
       maint: maint ?? null,
       mandates: extractList<MandateRow>(mandates, ["mandates"]),
       events: extractList<EventRow>(events),
+      session: session ?? null,
       coreError,
     };
   }, []);
@@ -226,6 +251,8 @@ export function Overview() {
           <span className="banner-cta" onClick={reload} style={{ cursor: "pointer" }}>Retry →</span>
         </div>
       )}
+      {/* Active work — the latest Prime session's live Shift Room, compact. */}
+      {data?.session && <ActiveWork session={data.session} />}
       {/* Actionable system warnings + next steps */}
       {warnings.length > 0 && (
         <div className="grid" style={{ gap: 8 }}>
@@ -398,6 +425,45 @@ export function Overview() {
           ))}
         </div>
       </div>
+    </div>
+  );
+}
+
+// Compact live view of the latest Prime work session (Shift Room), sourced
+// from the new `prime.status` API. The full interactive room lives on /chat.
+function ActiveWork({ session }: { session: SessionStatus }) {
+  const c = session.counts ?? {};
+  const chips: [keyof SessionCounts, string, string][] = [
+    ["ready", "ready", "todo"],
+    ["running", "running", "in_progress"],
+    ["needs_review", "review", "in_review"],
+    ["done", "done", "done"],
+    ["blocked", "blocked", "blocked"],
+    ["unassigned", "unassigned", "backlog"],
+    ["failed", "failed", "blocked"],
+    ["refused", "refused", "blocked"],
+  ];
+  return (
+    <div className="card">
+      <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
+        <h3 style={{ margin: 0 }}>Active work</h3>
+        {session.mandate_title && <span className="muted" style={{ fontSize: 12, marginLeft: 8 }}>· {session.mandate_title}</span>}
+        <div className="spacer" style={{ flex: 1 }} />
+        <Link to="/chat" className="link">open Shift Room →</Link>
+      </div>
+      <div className="row wrap" style={{ gap: 6 }}>
+        {chips
+          .filter(([k]) => (c[k] ?? 0) > 0)
+          .map(([k, label, tone]) => (
+            <span key={k} className={"badge " + tone} style={{ fontSize: 9 }}>
+              {c[k]} {label}
+            </span>
+          ))}
+        <span className="muted" style={{ fontSize: 12 }}>{c.total_briefs ?? 0} Brief(s) in session</span>
+      </div>
+      {(session.recommended_next_actions ?? []).slice(0, 2).map((a, i) => (
+        <div key={i} className="muted" style={{ fontSize: 11, marginTop: 4 }}>• {a}</div>
+      ))}
     </div>
   );
 }
