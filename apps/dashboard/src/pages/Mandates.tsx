@@ -386,11 +386,13 @@ export function Mandates() {
                                 // Action Center hire card); fall back to `echo` if absent.
                                 const rig = h.suggested_rig || SAFE_RIG;
                                 return (
-                                <div key={h.agent_id ?? i} className="row" style={{ gap: 6, padding: "3px 0", borderBottom: "1px solid var(--border-soft)" }}>
+                                <div key={h.agent_id ?? i} className="row wrap" style={{ gap: 6, padding: "3px 0", borderBottom: "1px solid var(--border-soft)" }}>
                                   <span className="mono" style={{ fontSize: 11 }} title={h.agent_id}>{(h.agent_id ?? "").slice(0, 10)}</span>
-                                  <span className="muted" style={{ fontSize: 10, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{h.role || "role"}{h.status ? ` · ${h.status}` : ""}</span>
-                                  <button className="btn sm" disabled={busy} title={`Approve this hire on the safe-local ${rig} adapter so it is immediately runnable`} onClick={() => approveHire(h.agent_id!, h.role, rig)}>Approve · {rig}</button>
-                                  <button className="btn ghost sm" disabled={busy} title="Decline this hire (the role is left unfilled)" onClick={() => rejectHire(h.agent_id!, h.role)}>Reject</button>
+                                  <span className="muted" style={{ fontSize: 10, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{h.role || "role"}{h.status ? ` · ${h.status}` : ""}</span>
+                                  <span className="btn-group">
+                                    <button className="btn sm" disabled={busy} title={`Approve this hire on the safe-local ${rig} adapter so it is immediately runnable`} onClick={() => approveHire(h.agent_id!, h.role, rig)}>Approve · {rig}</button>
+                                    <button className="btn ghost sm" disabled={busy} title="Decline this hire (the role is left unfilled)" onClick={() => rejectHire(h.agent_id!, h.role)}>Reject</button>
+                                  </span>
                                 </div>
                                 );
                               })}
@@ -408,11 +410,13 @@ export function Mandates() {
                     <strong style={{ fontSize: 12 }}>3 · Pending clearances</strong>
                     <div style={{ marginTop: 4 }}>
                       {clearances.map((c, i) => (
-                        <div key={c.approval_id ?? i} className="row" style={{ gap: 6, padding: "3px 0", borderBottom: "1px solid var(--border-soft)" }}>
+                        <div key={c.approval_id ?? i} className="row wrap" style={{ gap: 6, padding: "3px 0", borderBottom: "1px solid var(--border-soft)" }}>
                           <span className="mono" style={{ fontSize: 11 }}>{(c.agent_id ?? "").slice(0, 10) || (c.approval_id ?? "").slice(0, 10)}</span>
-                          <span className="muted" style={{ fontSize: 10, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={c.reason}>{c.method} · {c.reason}</span>
-                          <button className="btn sm" disabled={busy || !c.approval_id} onClick={() => c.approval_id && decideClearance(c.approval_id, "approve")}>Approve</button>
-                          <button className="btn ghost sm" disabled={busy || !c.approval_id} onClick={() => c.approval_id && decideClearance(c.approval_id, "reject")}>Reject</button>
+                          <span className="muted" style={{ fontSize: 10, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={c.reason}>{c.method} · {c.reason}</span>
+                          <span className="btn-group">
+                            <button className="btn sm" disabled={busy || !c.approval_id} onClick={() => c.approval_id && decideClearance(c.approval_id, "approve")}>Approve</button>
+                            <button className="btn ghost sm" disabled={busy || !c.approval_id} onClick={() => c.approval_id && decideClearance(c.approval_id, "reject")}>Reject</button>
+                          </span>
                         </div>
                       ))}
                     </div>

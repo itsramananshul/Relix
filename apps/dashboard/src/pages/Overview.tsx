@@ -321,8 +321,11 @@ export function Overview() {
             <Link to="/briefs" className="counter" title={`${totalBriefs} Briefs total`}>
               <b className={active ? "info" : ""}>{active}</b><span>Active Briefs</span>
             </Link>
-            <Link to="/runs" className="counter" title={`${inReview} in review`}>
+            <Link to="/runs" className="counter">
               <b className={running ? "info" : ""}>{running}</b><span>Running now</span>
+            </Link>
+            <Link to="/runs" className="counter" title={`${inReview} run(s) awaiting review → apply`}>
+              <b className={inReview ? "info" : ""}>{inReview}</b><span>In review</span>
             </Link>
             <Link to="/runs" className="counter">
               <b className={attention ? "warn" : ""}>{attention}</b><span>Needs attention</span>
@@ -635,6 +638,7 @@ function ActionCenter({
         <span className="muted" style={{ fontSize: 12 }}>computed from live state</span>
       </div>
       {note && <div className={"banner " + note.kind} style={{ fontSize: 12 }}>{note.msg}</div>}
+      <div className="table-scroll">
       <table className="table compact">
         <tbody>
           {shown.map((a, i) => {
@@ -654,9 +658,9 @@ function ActionCenter({
                 <div style={{ fontSize: 13, fontWeight: 600 }}>{a.title ?? "(action)"}</div>
                 {a.reason && <div className="muted" style={{ fontSize: 11 }}>{a.reason}</div>}
               </td>
-              <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+              <td style={{ textAlign: "right" }}>
                 {inlineHire ? (
-                  <>
+                  <span className="btn-group" style={{ justifyContent: "flex-end" }}>
                     <button
                       className="btn sm"
                       disabled={isActing}
@@ -667,14 +671,13 @@ function ActionCenter({
                     </button>
                     <button
                       className="btn ghost sm"
-                      style={{ marginLeft: 6 }}
                       disabled={isActing}
                       title="Decline this hire (the role is left unfilled)"
                       onClick={() => rejectHire(a)}
                     >
                       Reject
                     </button>
-                  </>
+                  </span>
                 ) : a.route ? (
                   <Link to={a.route} className="btn sm ghost">{a.action_label ?? "Open"} →</Link>
                 ) : (
@@ -686,6 +689,7 @@ function ActionCenter({
           })}
         </tbody>
       </table>
+      </div>
       {(actions.length > shown.length || data?.truncated) && (
         <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
           {actions.length - shown.length > 0 ? `+${actions.length - shown.length} more` : "More actions"} —

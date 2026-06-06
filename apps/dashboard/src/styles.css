@@ -146,6 +146,13 @@ label.field span { display: block; font-size: 12px; color: var(--text-dim); marg
 .wrap { flex-wrap: wrap; }
 .pill-row { display: flex; gap: 8px; flex-wrap: wrap; }
 
+/* Action-cluster utilities — keep button rows from overflowing at narrow
+   widths (design §2: usable from a phone; §12: dense but scannable). A
+   `.filter-bar` wraps its clusters; a `.btn-group` keeps related actions
+   together and wraps them as a unit rather than spilling past the edge. */
+.filter-bar { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+.btn-group { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+
 /* ── Board (kanban) ────────────────────────────────────── */
 .board { display: grid; grid-template-columns: repeat(5, minmax(180px, 1fr)); gap: 12px; overflow-x: auto; }
 .board-col { background: var(--bg-raised); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px; min-height: 120px; }

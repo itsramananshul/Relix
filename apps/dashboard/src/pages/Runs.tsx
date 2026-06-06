@@ -492,7 +492,7 @@ export function Runs() {
       <Section
         title="Active runs"
         action={
-          <div className="row" style={{ gap: 8, alignItems: "center" }}>
+          <div className="row wrap" style={{ gap: 8, alignItems: "center" }}>
             <span
               className={"badge " + LIVE_TONE[liveConn]}
               style={{ fontSize: 10 }}
@@ -534,30 +534,35 @@ export function Runs() {
         )}
 
         <div className="card">
-          <div className="row" style={{ marginBottom: 8 }}>
+          <div className="row wrap" style={{ marginBottom: 8, gap: 8 }}>
             <h3 style={{ margin: 0 }}>Execution runs</h3>
             <div className="spacer" style={{ flex: 1 }} />
-            <div className="row" style={{ gap: 4 }}>
-              {FILTERS.map((f) => (
-                <button
-                  key={f}
-                  className={"btn sm " + (filter === f ? "" : "ghost")}
-                  onClick={() => setFilter(f)}
-                >
-                  {f}
-                </button>
-              ))}
-              <span className="muted" style={{ margin: "0 4px" }}>·</span>
-              {TRIGGERS.map((t) => (
-                <button
-                  key={t}
-                  className={"btn sm " + (triggerFilter === t ? "" : "ghost")}
-                  onClick={() => setTriggerFilter(t)}
-                  title="filter by trigger source"
-                >
-                  {t === "heartbeat" ? "auto" : t}
-                </button>
-              ))}
+            {/* Status + trigger filters wrap as two clusters so the row never
+                overflows on narrow viewports (design §2/§12). */}
+            <div className="filter-bar">
+              <div className="btn-group" role="group" aria-label="Filter by run status">
+                {FILTERS.map((f) => (
+                  <button
+                    key={f}
+                    className={"btn sm " + (filter === f ? "" : "ghost")}
+                    onClick={() => setFilter(f)}
+                  >
+                    {f}
+                  </button>
+                ))}
+              </div>
+              <div className="btn-group" role="group" aria-label="Filter by trigger source">
+                {TRIGGERS.map((t) => (
+                  <button
+                    key={t}
+                    className={"btn sm " + (triggerFilter === t ? "" : "ghost")}
+                    onClick={() => setTriggerFilter(t)}
+                    title="filter by trigger source"
+                  >
+                    {t === "heartbeat" ? "auto" : t}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
           {loading ? (
