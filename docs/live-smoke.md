@@ -123,6 +123,59 @@ unassigned; the operator greenlights the hire and `prime.start` then
   `done` → the `integrate` Brief unblocks and runs) is pinned by the
   in-process test `prime_start_reconciles_a_greenlit_hire_so_dependent_work_unblocks`.
 
+## Variant: the Mandate → Strategy gate → Orchestrate path
+
+Proves the higher-level **company operating model** over live HTTP, not just the
+direct Prime-task runner: a Founder/owner creates a **Mandate**, passes it
+through the governed **strategy gate**, and **orchestrates** it into the existing
+Prime/Brief execution spine — with Mandate linkage preserved end-to-end and one
+resulting echo Shift driven to board `done` (company-model §12.5B/§12.6,
+execution-and-issue §1.3).
+
+The gate is real: `mandate.orchestrate` **refuses** to materialise anything
+until the strategy is approved (`blockers: [{reason: "strategy_not_approved"}]`).
+The team is staffed through the **same** governed hire + echo-Rig affordance as
+the Prime variant above, and every orchestrated Brief is stamped with the
+Founder/Board reviewer up front, so its completed Shift lands in `in_review`
+(not `blocked`) and `run.apply` is the review-to-done.
+
+```
+#   POST /v1/auth/setup                  {username,password}            -> session cookie
+#   POST /v1/spine/company/starter-crew  {rig:"echo",roles:"engineer,designer"}
+#   POST /v1/spine/mandates              {title,description}            -> mandate_id
+#   GET  /v1/spine/mandates/<id>/strategy                               -> status:null
+#   POST /v1/spine/mandates/<id>/strategy/propose {doc:"..."}           -> status:"proposed"
+#   GET  /v1/spine/company/actions                                      -> approval card target_type:"mandate"
+#   POST /v1/spine/mandates/<id>/orchestrate {mode:"assign_ready"}      -> REFUSED: blockers[strategy_not_approved], no Briefs
+#   POST /v1/spine/mandates/<id>/strategy/approve                       -> status:"approved"
+#   POST /v1/spine/mandates/<id>/team_plan {roles:"engineer:onboard-eng,designer:onboard-design"}
+#                                                                       -> pending_hires:[{agent_id},{agent_id}]
+#   GET  /v1/spine/mandates/<id>/team_readiness                         -> readiness:"staffing"
+#   POST /v1/agents/<hire agent_id>/approve-hire {rig:"echo"}  (each)   -> {runnable:true,rig:"echo"}
+#   GET  /v1/spine/mandates/<id>/team_readiness                         -> readiness:"ready"
+#   POST /v1/spine/mandates/<id>/orchestrate {mode:"assign_ready"}      -> parent + role tracks + subject Briefs, assigned
+#   GET  /v1/spine/company/actions                                      -> mandate strategy card GONE; ready_to_start present
+#   GET  /v1/spine/mandates/<id>/briefs                                 -> every Brief carries mandate_id (linkage)
+#   POST /v1/spine/briefs/<subject brief>/run                           -> echo run_id, status done -> pending_review
+#   GET  /v1/runs/<run_id>/diff                                         -> eligible:false (pending_review)
+#   POST /v1/runs/<run_id>/review {decision:"accepted"}                 -> accepted
+#   GET  /v1/runs/<run_id>/diff                                         -> eligible:true (0 changes, echo no-op)
+#   POST /v1/runs/<run_id>/apply                                        -> apply_status:"applied", brief_status:"done"
+#   GET  /v1/spine/mandates/<id>/orchestration/latest                  -> status:"assigned"
+```
+
+- The orchestrate Brief tree is three-tier and idempotent (parent →
+  role track → subject execution), keyed on stable `mandate:<id>:…` source
+  markers — a rerun reuses the tree and never duplicates Briefs. The full
+  tier/idempotency/placeholder semantics are pinned by the in-process
+  `orchestrate_*` tests; the reviewer-aware tail (a Mandate-orchestrated Shift
+  reaching `in_review` so `run.apply` advances it to `done`) is pinned by
+  `orchestrate_stamps_founder_reviewer_so_shift_is_review_to_apply_able`.
+- All `mandate.*` capabilities used here (`mandate.create`, `mandate.strategy.*`,
+  `mandate.team_plan`, `mandate.team_readiness`, `mandate.orchestrate`,
+  `mandate.orchestration.latest`) already carry boot-policy allow rules in both
+  boot scripts and are in the guard's `$RequiredCapabilities` manifest.
+
 ## Caveat that the live smoke caught
 
 Every `/v1/spine/*` capability the bridge forwards is mesh-default-denied unless

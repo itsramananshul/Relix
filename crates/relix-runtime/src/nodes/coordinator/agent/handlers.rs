@@ -2705,12 +2705,29 @@ pub fn handle_orchestrate(
     let mut placeholder_tracks_created: Vec<serde_json::Value> = Vec::new();
     let mut placeholder_tracks_existing: Vec<serde_json::Value> = Vec::new();
 
+    // The company's reviewer for every Brief this run materialises: the
+    // Founder/Board (company-model §5.4 / §12.6). Mirrors prime.approve —
+    // with a reviewer stamped up front a finished Shift moves in_progress →
+    // in_review instead of parking in `blocked` for want of a reviewer
+    // (execution-and-issue §1.3; heartbeat's "missing reviewer parks it"),
+    // so the operator's run.review → run.apply can advance the Brief to
+    // `done`. `find_founder` is tenant-scoped + deterministic (oldest
+    // `role='founder'` row), never a cross-Guild agent. No Founder (company
+    // not bootstrapped) → leave it unset and the honest "parks in blocked
+    // until a reviewer is set" fallback still holds.
+    let reviewer_agent_id: Option<String> = agent_store
+        .find_founder(tenant)
+        .ok()
+        .flatten()
+        .map(|f| f.agent_id);
+
     // Helper: get-or-create a Brief by its stable source marker.
     // Returns (task_id, was_existing, current_assignee, current_title) or
     // None when creation is not allowed and it does not yet exist. Reuse
     // is by marker only; a reused Brief's title is left untouched here so
     // manual user edits are never clobbered (the caller decides any safe
-    // auto-title promotion).
+    // auto-title promotion). A newly-created Brief is stamped with the
+    // Founder/Board reviewer so its completed Shift is review-to-apply-able.
     let ensure_marked = |marker: &str,
                          title: &str,
                          created: &mut Vec<serde_json::Value>,
@@ -2748,6 +2765,13 @@ pub fn handle_orchestrate(
             marker,
         ) {
             Ok(id) => {
+                // Stamp the Founder/Board as reviewer so a completed Shift
+                // lands in `in_review`, not `blocked` (company-model §12.6) —
+                // the same reviewer-aware lifecycle prime.approve gives its
+                // Briefs, now on the Mandate orchestration path.
+                if let Some(rev) = reviewer_agent_id.as_deref() {
+                    let _ = task_store.set_brief_field(&id, "reviewer", rev);
+                }
                 created.push(serde_json::json!({"task_id": id, "title": title, "marker": marker}));
                 Some((id, false, None, title.to_string()))
             }
@@ -6850,6 +6874,44 @@ mod tests {
     }
 
     #[test]
+    fn company_actions_strategy_card_clears_after_approval() {
+        // The strategy-approval card is the gate that must clear before a team
+        // can be built. Once the operator approves the strategy it MUST drop off
+        // the Action Center feed (computed from live state, never stale).
+        let (agents, spine, task) = prime_stores();
+        let m = spine
+            .create_mandate("default", "Ship v1", "the why", None, None)
+            .unwrap();
+        spine.propose_strategy("default", &m, "the plan").unwrap();
+        let strategy_card = |v: &serde_json::Value| -> bool {
+            v["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["target_type"] == "mandate" && a["target_id"] == serde_json::json!(m))
+        };
+        let before = json_of(ok_body(handle_company_actions(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(b""),
+        )));
+        assert!(strategy_card(&before), "card present while proposed: {before}");
+        // Approve the strategy → the gate is closed.
+        spine.approve_strategy("default", &m).unwrap();
+        let after = json_of(ok_body(handle_company_actions(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(b""),
+        )));
+        assert!(
+            !strategy_card(&after),
+            "the strategy card must disappear after approval: {after}"
+        );
+    }
+
+    #[test]
     fn company_actions_budget_alert_when_committed_over_guild_budget() {
         let (agents, spine, task) = prime_stores();
         // A small Guild budget and an active Operative committing more than it.
@@ -7634,6 +7696,65 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(latest.status, "assigned");
+    }
+
+    #[test]
+    fn orchestrate_stamps_founder_reviewer_so_shift_is_review_to_apply_able() {
+        // A Mandate-orchestrated Brief MUST be stamped with the Founder/Board
+        // reviewer (like prime.approve), or its completed Shift parks in
+        // `blocked` for want of a reviewer and the operator's run.apply cannot
+        // advance it to `done` (company-model §12.6 / execution-and-issue §1.3).
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        // The Founder must exist for the reviewer to resolve.
+        let (founder, _) = agents.ensure_founder("", "echo", "operator", "default").unwrap();
+        let (m, _agent) = ready_team(&agents, &spine, "engineer");
+        let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        // The runnable subject Brief carries the Founder as reviewer.
+        let subject_id = v["subject_briefs_created"][0]["task_id"].as_str().unwrap();
+        assert_eq!(
+            tasks
+                .brief_fields(subject_id)
+                .unwrap()
+                .unwrap()
+                .reviewer_agent_id
+                .as_deref(),
+            Some(founder.as_str()),
+            "the subject execution Brief must be stamped with the Founder reviewer"
+        );
+        // Every materialised tier (parent + role track) gets the same reviewer.
+        let parent_id = v["parent_brief"]["task_id"].as_str().unwrap();
+        assert_eq!(
+            tasks
+                .brief_fields(parent_id)
+                .unwrap()
+                .unwrap()
+                .reviewer_agent_id
+                .as_deref(),
+            Some(founder.as_str())
+        );
+    }
+
+    #[test]
+    fn orchestrate_without_founder_leaves_reviewer_unset() {
+        // No Founder (company not bootstrapped) → the honest fallback: no
+        // reviewer is fabricated, and the Brief parks until one is set.
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, _agent) = ready_team(&agents, &spine, "engineer");
+        let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        let subject_id = v["subject_briefs_created"][0]["task_id"].as_str().unwrap();
+        assert!(
+            tasks
+                .brief_fields(subject_id)
+                .unwrap()
+                .unwrap()
+                .reviewer_agent_id
+                .is_none(),
+            "no Founder → reviewer stays unset (never fabricated)"
+        );
     }
 
     #[test]
