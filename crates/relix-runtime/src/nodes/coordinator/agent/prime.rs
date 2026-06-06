@@ -218,24 +218,134 @@ fn derive_title(message: &str) -> String {
     bound_title(&title, 80)
 }
 
+/// Build the intent-shaped Brief breakdown (company-model §12.5A). The
+/// *shape* depends on the intent, and each Brief title carries the extracted
+/// `subject` so the plan names WHAT is being done, not just a role:
+///
+/// - `fix` → a sequential *reproduce → fix → verify* chain (verify is QA
+///   when a QA role is inferred, else the primary role);
+/// - `research` → a sequential *investigate → synthesize* chain;
+/// - `build` / `generic` → one role-track per inferred role + an
+///   *integrate & ship* Brief that depends on every track (only when there
+///   is more than one track).
+///
+/// PURE — the seam where a future model can author a richer breakdown while
+/// reusing the same `ProposedBrief` contract and governed execution path.
+fn build_briefs(intent: &str, roles: &[&'static str], subject: &str) -> Vec<ProposedBrief> {
+    let primary = roles.first().copied().unwrap_or("engineer");
+    match intent {
+        "fix" => {
+            // The fix lands on the primary work role; verification prefers a
+            // QA Operative when the request implied one.
+            let verifier = if roles.contains(&"qa") { "qa" } else { primary };
+            vec![
+                ProposedBrief {
+                    key: "reproduce".into(),
+                    title: format!("Reproduce: {subject}"),
+                    role: primary.into(),
+                    depends_on: Vec::new(),
+                },
+                ProposedBrief {
+                    key: "fix".into(),
+                    title: format!("Fix: {subject}"),
+                    role: primary.into(),
+                    depends_on: vec!["reproduce".into()],
+                },
+                ProposedBrief {
+                    key: "verify".into(),
+                    title: format!("Verify the fix: {subject}"),
+                    role: verifier.into(),
+                    depends_on: vec!["fix".into()],
+                },
+            ]
+        }
+        "research" => {
+            let investigator = if roles.contains(&"researcher") {
+                "researcher"
+            } else {
+                primary
+            };
+            // Write-up prefers a writer when one was inferred, else the
+            // investigator carries it through.
+            let writer = if roles.contains(&"writer") {
+                "writer"
+            } else {
+                investigator
+            };
+            vec![
+                ProposedBrief {
+                    key: "investigate".into(),
+                    title: format!("Investigate: {subject}"),
+                    role: investigator.into(),
+                    depends_on: Vec::new(),
+                },
+                ProposedBrief {
+                    key: "synthesize".into(),
+                    title: format!("Synthesize findings: {subject}"),
+                    role: writer.into(),
+                    depends_on: vec!["investigate".into()],
+                },
+            ]
+        }
+        // build / generic: role tracks + an integration Brief.
+        _ => {
+            let mut briefs = Vec::new();
+            let mut track_keys = Vec::new();
+            for r in roles {
+                let canon = *r;
+                let key = format!("track:{canon}");
+                track_keys.push(key.clone());
+                briefs.push(ProposedBrief {
+                    key,
+                    title: format!("{} track: {subject}", role_title(canon)),
+                    role: canon.to_string(),
+                    depends_on: Vec::new(),
+                });
+            }
+            if track_keys.len() > 1 {
+                briefs.push(ProposedBrief {
+                    key: "integrate".into(),
+                    title: format!("Integrate + ship: {subject}"),
+                    role: "engineer".into(),
+                    depends_on: track_keys,
+                });
+            }
+            briefs
+        }
+    }
+}
+
 /// Build a deterministic Prime proposal from the (already secret-redacted)
 /// request and the current Crew. PURE — mutates nothing.
 pub fn generate_proposal(message: &str, crew: &[CrewMember]) -> PrimeProposal {
     let msg = message.trim();
     let (intent, role_refs) = classify(msg);
-    let roles: Vec<String> = role_refs.iter().map(|r| r.to_string()).collect();
-    let title = derive_title(msg);
+    let subject = derive_title(msg);
     let summary = match intent {
-        "build" => format!("Build: {title}"),
-        "fix" => format!("Fix: {title}"),
-        "research" => format!("Research: {title}"),
-        _ => format!("Work: {title}"),
+        "build" => format!("Build: {subject}"),
+        "fix" => format!("Fix: {subject}"),
+        "research" => format!("Research: {subject}"),
+        _ => format!("Work: {subject}"),
     };
 
-    // Crew match: each role wants an ACTIVE Operative in a matching family.
+    // Intent-shaped breakdown FIRST, so crew/hires reflect the roles the plan
+    // actually uses — every suggested hire maps to a Brief, and vice versa.
+    let briefs = build_briefs(intent, &role_refs, &subject);
+    let mut used_roles: Vec<&'static str> = Vec::new();
+    for b in &briefs {
+        let canon = canon_role(&b.role);
+        if !used_roles.contains(&canon) {
+            used_roles.push(canon);
+        }
+    }
+    let roles: Vec<String> = used_roles.iter().map(|r| r.to_string()).collect();
+
+    // Crew match: each used role wants an ACTIVE Operative in a matching
+    // family; a missing role becomes a `pending` hire suggestion (never a
+    // fake active agent).
     let mut crew_slots = Vec::new();
     let mut hires = Vec::new();
-    for r in &role_refs {
+    for r in &used_roles {
         let canon = *r;
         let found = crew
             .iter()
@@ -263,30 +373,6 @@ pub fn generate_proposal(message: &str, crew: &[CrewMember]) -> PrimeProposal {
         }
     }
 
-    // Brief breakdown: one role-track Brief per role + an integration Brief
-    // that depends on every track (only when there is more than one track).
-    let mut briefs = Vec::new();
-    let mut track_keys = Vec::new();
-    for r in &role_refs {
-        let canon = *r;
-        let key = format!("track:{canon}");
-        track_keys.push(key.clone());
-        briefs.push(ProposedBrief {
-            key,
-            title: format!("{} track: {title}", role_title(canon)),
-            role: canon.to_string(),
-            depends_on: Vec::new(),
-        });
-    }
-    if track_keys.len() > 1 {
-        briefs.push(ProposedBrief {
-            key: "integrate".into(),
-            title: format!("Integrate + ship: {title}"),
-            role: "engineer".into(),
-            depends_on: track_keys.clone(),
-        });
-    }
-
     // Risks / blockers.
     let mut risks = Vec::new();
     let active_count = crew.iter().filter(|c| c.status == "active").count();
@@ -311,7 +397,7 @@ pub fn generate_proposal(message: &str, crew: &[CrewMember]) -> PrimeProposal {
 
     // Next actions the operator can approve.
     let mut next_actions = vec![format!(
-        "Approve to create the Mandate \u{201c}{title}\u{201d} + {} Brief(s).",
+        "Approve to create the Mandate \u{201c}{subject}\u{201d} + {} Brief(s).",
         briefs.len()
     )];
     if !hires.is_empty() {
@@ -326,13 +412,18 @@ pub fn generate_proposal(message: &str, crew: &[CrewMember]) -> PrimeProposal {
             "{assignable} Brief track(s) can be assigned to existing active Operatives immediately."
         ));
     }
-    next_actions
-        .push("Nothing runs automatically — start a Brief from the board when you're ready.".to_string());
+    // Honest end of the loop (company-model §12.5B): the Start-to-Shift step
+    // is itself a governed gate — nothing runs until the operator starts it.
+    next_actions.push(
+        "Nothing runs automatically — after approving (and greenlighting any Clearances), \
+         use Start the work to run the ready Briefs."
+            .to_string(),
+    );
 
     PrimeProposal {
         intent: intent.to_string(),
         summary,
-        mandate_title: title,
+        mandate_title: subject,
         mandate_brief: msg.to_string(),
         roles,
         crew: crew_slots,
@@ -423,5 +514,76 @@ mod tests {
         let p = generate_proposal("Write the onboarding docs", &[]);
         assert!(p.briefs.iter().any(|b| b.key == "track:writer"));
         assert!(!p.briefs.iter().any(|b| b.key == "integrate"));
+    }
+
+    // ── Prime Intelligence (company-model §12.5A): the breakdown SHAPE is
+    //    intent-aware, and each Brief title carries the extracted subject. ──
+
+    #[test]
+    fn fix_intent_yields_reproduce_fix_verify_chain() {
+        let p = generate_proposal("Fix the broken login bug", &[]);
+        assert_eq!(p.intent, "fix");
+        let keys: Vec<&str> = p.briefs.iter().map(|b| b.key.as_str()).collect();
+        assert_eq!(keys, vec!["reproduce", "fix", "verify"]);
+        // Sequential chain: fix depends on reproduce, verify depends on fix.
+        let fix = p.briefs.iter().find(|b| b.key == "fix").unwrap();
+        assert_eq!(fix.depends_on, vec!["reproduce".to_string()]);
+        let verify = p.briefs.iter().find(|b| b.key == "verify").unwrap();
+        assert_eq!(verify.depends_on, vec!["fix".to_string()]);
+        // No parallel role tracks / integration Brief for a fix.
+        assert!(!p.briefs.iter().any(|b| b.key.starts_with("track:")));
+        assert!(!p.briefs.iter().any(|b| b.key == "integrate"));
+        // Title carries the subject (deliverable-aware), not just a role.
+        assert!(fix.title.contains("login"));
+    }
+
+    #[test]
+    fn fix_with_qa_signal_routes_verify_to_qa() {
+        // A QA signal in the request sends the verify Brief to a QA role.
+        let p = generate_proposal("Fix the failing checkout test coverage", &[]);
+        assert_eq!(p.intent, "fix");
+        let verify = p.briefs.iter().find(|b| b.key == "verify").unwrap();
+        assert_eq!(verify.role, "qa");
+    }
+
+    #[test]
+    fn research_intent_yields_investigate_synthesize_chain() {
+        let p = generate_proposal("Research the best auth provider", &[]);
+        assert_eq!(p.intent, "research");
+        let keys: Vec<&str> = p.briefs.iter().map(|b| b.key.as_str()).collect();
+        assert_eq!(keys, vec!["investigate", "synthesize"]);
+        let synth = p.briefs.iter().find(|b| b.key == "synthesize").unwrap();
+        assert_eq!(synth.depends_on, vec!["investigate".to_string()]);
+        assert!(synth.title.contains("auth provider"));
+    }
+
+    #[test]
+    fn different_intents_yield_different_plan_shapes() {
+        // The core "Prime Intelligence" promise: the plan is request-aware —
+        // a build and a fix of the "same" noun produce DIFFERENT shapes.
+        let build = generate_proposal("Build a payments dashboard", &[]);
+        let fix = generate_proposal("Fix a payments dashboard bug", &[]);
+        let build_keys: Vec<&str> = build.briefs.iter().map(|b| b.key.as_str()).collect();
+        let fix_keys: Vec<&str> = fix.briefs.iter().map(|b| b.key.as_str()).collect();
+        assert_ne!(build_keys, fix_keys);
+        assert!(build.briefs.iter().any(|b| b.key == "integrate"));
+        assert!(fix.briefs.iter().any(|b| b.key == "fix"));
+    }
+
+    #[test]
+    fn hires_only_cover_roles_the_breakdown_uses() {
+        // research → investigate/synthesize only needs a researcher; even
+        // though "auth" hints engineer, no engineer Brief exists, so no
+        // engineer is suggested (every hire maps to a Brief role).
+        let p = generate_proposal("Research the best auth library", &[]);
+        let used: std::collections::HashSet<&str> =
+            p.briefs.iter().map(|b| b.role.as_str()).collect();
+        for h in &p.hires {
+            assert!(
+                used.contains(h.role.as_str()),
+                "suggested hire {} has no Brief in the plan",
+                h.role
+            );
+        }
     }
 }
