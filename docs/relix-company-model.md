@@ -452,6 +452,98 @@ These are intentionally unresolved; we'll settle each when its phase arrives:
 
 ---
 
+## 12.5 Prime Intelligence + Start-to-Shift (closing the product loop)
+
+The Prime Assistant (§4.2, §7.2) gives the operator a governed
+*describe → plan → approve* flow. Two gaps kept it from feeling like a real
+product, and this section is the contract for closing them. Neither gap is
+closed by faking model output, and neither bypasses a governance gate.
+
+### A. Prime Intelligence — the plan must reflect the request
+
+**The gap.** The proposal generator was templated to the point that two
+different requests produced the same plan shape ("build a dashboard" and
+"build a billing system" both yielded `Engineer track / Designer track /
+Integrate`). That is honest about *not* using an LLM, but it is not useful
+intelligence.
+
+**The contract.** `prime.propose` stays **deterministic and honest**
+(`ai_used:false` + an `ai_status` string — never silently presented as model
+output; no language model is synchronously callable from a coordinator
+handler today), but the rule-based planner MUST be **request-aware**:
+
+- **Read the request, not just keywords.** Extract the concrete deliverable
+  / subject of the work and carry it into the Mandate title and into each
+  Brief title, so the plan names *what* is being built, not just a role.
+- **Intent shapes the breakdown.** The Brief sequence differs by intent:
+  - `fix` → a *reproduce → fix → verify* chain (a QA/verify Brief depends on
+    the fix), not parallel role tracks;
+  - `research` → an *investigate → synthesize/write-up* chain;
+  - `build` → role tracks (one per inferred role) + an *integrate & ship*
+    Brief that depends on every track;
+  - `generic` → a single work Brief.
+- **Role inference stays evidence-based.** Roles are inferred from the
+  request (existing `classify`) and matched to **active** Operatives; a
+  missing role is a `pending` hire suggestion, never a fake active agent.
+- **The seam stays clean.** The generator remains a single PURE function
+  (`agent/prime.rs::generate_proposal`) so a future model can replace the
+  *interpretation* step while reusing the identical governed `prime.approve`
+  / `prime.start` execution path. Honesty is mandatory: AI-unavailable is
+  stated, not hidden.
+
+### B. Start-to-Shift — the operator can actually start the planned work
+
+**The gap.** After `prime.approve` created the Mandate + Briefs + crew
+assignments, the operator had to leave the Prime flow and start each Brief
+by hand from the board. The "I described it and watched it run" moment never
+arrived through Prime.
+
+**The contract.** A new governed capability **`prime.start`** turns an
+**approved** proposal into running **Shifts** — but it invents NO new
+execution path. It funnels every Brief through the SAME run chokepoint the
+manual `brief.run` and the autonomous heartbeat already use
+(`preflight_run` → `prepare_claimed_run` → `execute_ready`):
+
+- **Approved-only.** `prime.start` operates on a proposal whose status is
+  `approved` (so its Mandate + Briefs already exist). A non-approved or
+  unknown / cross-Guild proposal is refused (not-found, no existence leak).
+- **Only the ready Briefs run.** A created Brief is started **only** when it
+  is ready to work — assigned to an **active** Operative, unblocked, not
+  already claimed/running, and not already complete. Every Brief that is NOT
+  started is returned with an **honest reason** (unassigned / blocked /
+  already complete / cancelled / not currently startable), so the operator
+  can see exactly what still needs a Clearance or a dependency.
+- **Real Shifts, same gates.** Each started Brief goes through the existing
+  pre-flight: the assignee's Rig is resolved and **probed** (an unavailable
+  adapter refuses cleanly and records a durable refused Shift — never a
+  faked run), the single-owner **Claim** is won, the durable `brief_runs`
+  ledger row is opened (stamped `manual` — `prime.start` is operator-
+  initiated), and the blocking adapter call is handed to a background thread.
+  The response returns the `run_id`s so the dashboard can watch each Shift
+  move `running → done/failed/continued` via `/v1/runs`.
+- **Sovereign, operator-initiated.** Like `brief.run`, `prime.start` is a
+  deliberate operator action and carries the same semantics as a manual run
+  (the per-Operative Allowance hard-stop is enforced on the autonomous
+  heartbeat path, not on operator-initiated runs — the Board is sovereign;
+  the single-owner Claim still prevents double-work). It changes no budget,
+  hires no one, and runs nothing that is not already an assigned, ready Brief.
+- **Audited.** `prime.start` records an Orchestration run (`mode:"start"`)
+  on the Mandate and a Chronicle event on each started Brief, so the
+  *what Prime suggested → what was approved → what was actually run* trail is
+  complete.
+- **It is not autonomy.** `prime.start` still requires the operator to click
+  start; it does not propose, approve, staff, or loop on its own. It is the
+  governed trigger that lets the heartbeat/assignment loop (§6.1) begin for a
+  planned Mandate in one step instead of Brief-by-Brief.
+
+**The closed loop:** describe in Chat → `prime.propose` (a request-aware
+plan, nothing created) → **Approve & create** (`prime.approve` — Mandate +
+Briefs + assignments + pending hires) → greenlight any Clearances → **Start
+the work** (`prime.start` — the ready Briefs become real Shifts) → watch the
+runs finish on the board. Every step is a governed gate; nothing runs itself.
+
+---
+
 ## 13. Glossary
 
 - **Company** — your organization; the top-level container (a tenant, product-faced).
