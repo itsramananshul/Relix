@@ -1386,6 +1386,18 @@ name = "spine_brief_comment"
 method = "brief.comment"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_brief_interaction_open"
+method = "brief.interaction_open"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_interactions"
+method = "brief.interactions"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_interaction_respond"
+method = "brief.interaction_respond"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_brief_snag"
 method = "brief.snag"
 allow_groups = ["chat-users"]

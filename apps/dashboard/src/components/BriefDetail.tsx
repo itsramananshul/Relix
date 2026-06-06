@@ -1,6 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, tryGet, tryGetReport, subscribeRunEvents, runControls, type RunDiff } from "../api";
+import {
+  api,
+  tryGet,
+  tryGetReport,
+  subscribeRunEvents,
+  runControls,
+  briefInteractions,
+  type RunDiff,
+  type BriefInteraction,
+} from "../api";
 import { useAuth } from "../auth";
 import { Badge, useAsync } from "./common";
 
@@ -173,6 +182,10 @@ export function BriefDetail({
   // safe-apply plan for the latest accepted run.
   const [runBusy, setRunBusy] = useState(false);
   const [diff, setDiff] = useState<RunDiff | null>(null);
+  // Thread-interaction state: which card is being answered, and the free-text
+  // draft for open `ask` cards that have no fixed choices.
+  const [ixBusy, setIxBusy] = useState<string | null>(null);
+  const [ixDraft, setIxDraft] = useState<Record<string, string>>({});
 
   // Load the Brief detail AND the fuller Chronicle timeline together. The
   // detail carries only a bounded `chronicle.recent`; the dedicated `/events`
@@ -180,14 +193,19 @@ export function BriefDetail({
   // on the live run-event stream below.
   const EVENT_LIMIT = 120;
   const { data, loading, error, reload } = useAsync(async () => {
-    const [detail, events] = await Promise.all([
+    const [detail, events, interactions] = await Promise.all([
       tryGetReport<BriefDetailData>(`/v1/spine/briefs/${encodeURIComponent(briefId)}`, {}),
       tryGet<ChronicleEntry[]>(
         `/v1/spine/briefs/${encodeURIComponent(briefId)}/events?limit=${EVENT_LIMIT}`,
         [],
       ),
+      briefInteractions.list(briefId),
     ]);
-    return { detail, events: (Array.isArray(events) ? events : []).map(normalizeEvent) };
+    return {
+      detail,
+      events: (Array.isArray(events) ? events : []).map(normalizeEvent),
+      interactions: Array.isArray(interactions) ? interactions : [],
+    };
   }, [briefId]);
 
   // Live updates: refresh this Brief's detail (latest_run + Chronicle) when an
@@ -239,6 +257,12 @@ export function BriefDetail({
     .map(parseComment)
     .reverse();
 
+  // Thread interactions (§1.9): the open ask/confirm cards needing an answer
+  // sit above the Conversation; resolved/rejected ones stay listed but marked.
+  const interactions = data?.interactions ?? [];
+  const openInteractions = interactions.filter((i) => i.status === "open");
+  const closedInteractions = interactions.filter((i) => i.status !== "open");
+
   async function submitComment() {
     const text = comment.trim();
     if (!text) return;
@@ -257,6 +281,37 @@ export function BriefDetail({
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Comment failed" });
     } finally {
       setBusy(false);
+    }
+  }
+
+  // Answer an interaction card. `verdict` is the terminal status the runtime
+  // records (`resolved` / `rejected`); `response` is the chosen option, the
+  // free-text answer, or a yes/no note. A duplicate answer is refused server-
+  // side and surfaces here as an honest error banner.
+  async function answerInteraction(
+    it: BriefInteraction,
+    verdict: "resolved" | "rejected",
+    response: string,
+  ) {
+    setIxBusy(it.interaction_id);
+    setBanner(null);
+    try {
+      await briefInteractions.respond(briefId, it.interaction_id, {
+        responder: status?.username || "operator",
+        status: verdict,
+        response,
+      });
+      setBanner({
+        kind: "ok",
+        msg: verdict === "resolved" ? "Request answered." : "Request declined.",
+      });
+      setIxDraft((m) => ({ ...m, [it.interaction_id]: "" }));
+      reload();
+      onChanged?.();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Response failed" });
+    } finally {
+      setIxBusy(null);
     }
   }
 
@@ -535,6 +590,134 @@ export function BriefDetail({
             </div>
           )}
         </div>
+      )}
+
+      {/* Requests — answerable interaction cards (§1.9; dashboard-design §7).
+          Open ask/confirm cards an Operative or the companion raised sit above
+          the Conversation so they read as "needs an answer", not a buried
+          comment. Resolved/rejected cards stay listed but clearly marked. The
+          section is omitted entirely when the Brief has no interactions (an
+          honest empty state — no fabricated card). */}
+      {interactions.length > 0 && (
+        <>
+          <div className="row" style={{ marginTop: 14, marginBottom: 6 }}>
+            <strong style={{ fontSize: 12 }}>Requests</strong>
+            <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>
+              {openInteractions.length} open · {closedInteractions.length} answered
+            </span>
+          </div>
+
+          {openInteractions.map((it) => (
+            <div
+              key={it.interaction_id}
+              className="card"
+              style={{ borderColor: "var(--warn, #b9770e)", padding: 10, marginBottom: 8 }}
+            >
+              <div className="row" style={{ gap: 6, alignItems: "baseline", flexWrap: "wrap" }}>
+                <span className="badge in_progress" style={{ fontSize: 10 }}>{it.kind}</span>
+                <span className="mono" style={{ fontSize: 10 }}>{it.author}</span>
+                {it.created_at ? (
+                  <span className="muted" style={{ fontSize: 10 }}>
+                    {new Date(it.created_at * 1000).toLocaleString()}
+                  </span>
+                ) : null}
+              </div>
+              <div style={{ fontSize: 13, margin: "5px 0 8px", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                {it.prompt}
+              </div>
+
+              {it.kind === "confirm" ? (
+                // Yes/No gate: yes resolves, no rejects.
+                <div className="row wrap" style={{ gap: 6 }}>
+                  <button
+                    className="btn sm"
+                    disabled={ixBusy === it.interaction_id}
+                    onClick={() => answerInteraction(it, "resolved", "yes")}
+                  >
+                    {ixBusy === it.interaction_id ? "…" : "Yes"}
+                  </button>
+                  <button
+                    className="btn ghost sm"
+                    disabled={ixBusy === it.interaction_id}
+                    onClick={() => answerInteraction(it, "rejected", "no")}
+                  >
+                    No
+                  </button>
+                </div>
+              ) : it.choices.length > 0 ? (
+                // ask with fixed options: each choice resolves with that label.
+                <div className="row wrap" style={{ gap: 6 }}>
+                  {it.choices.map((c) => (
+                    <button
+                      key={c}
+                      className="btn ghost sm"
+                      disabled={ixBusy === it.interaction_id}
+                      onClick={() => answerInteraction(it, "resolved", c)}
+                    >
+                      {c}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                // open-ended ask: free-text answer.
+                <div className="row" style={{ gap: 6 }}>
+                  <input
+                    className="input"
+                    style={{ flex: 1, boxSizing: "border-box" }}
+                    placeholder="Type an answer…"
+                    value={ixDraft[it.interaction_id] ?? ""}
+                    onChange={(e) =>
+                      setIxDraft((m) => ({ ...m, [it.interaction_id]: e.target.value }))
+                    }
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && (ixDraft[it.interaction_id] ?? "").trim()) {
+                        e.preventDefault();
+                        void answerInteraction(it, "resolved", (ixDraft[it.interaction_id] ?? "").trim());
+                      }
+                    }}
+                  />
+                  <button
+                    className="btn sm"
+                    disabled={ixBusy === it.interaction_id || !(ixDraft[it.interaction_id] ?? "").trim()}
+                    onClick={() =>
+                      answerInteraction(it, "resolved", (ixDraft[it.interaction_id] ?? "").trim())
+                    }
+                  >
+                    {ixBusy === it.interaction_id ? "…" : "Answer"}
+                  </button>
+                </div>
+              )}
+            </div>
+          ))}
+
+          {closedInteractions.length > 0 && (
+            <div style={{ fontSize: 12, marginBottom: 8 }}>
+              {closedInteractions.map((it) => (
+                <div
+                  key={it.interaction_id}
+                  style={{ padding: "4px 0", borderBottom: "1px solid var(--border-soft)" }}
+                >
+                  <div className="row" style={{ gap: 6, alignItems: "baseline", flexWrap: "wrap" }}>
+                    <span
+                      className={"badge " + (it.status === "resolved" ? "done" : "blocked")}
+                      style={{ fontSize: 9 }}
+                    >
+                      {it.status}
+                    </span>
+                    <span className="muted" style={{ fontSize: 11 }}>{it.kind}</span>
+                    <span style={{ wordBreak: "break-word" }}>{it.prompt}</span>
+                  </div>
+                  {(it.response || it.resolved_by) && (
+                    <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>
+                      {it.resolved_by ? `${it.resolved_by}: ` : ""}
+                      {it.response ?? ""}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </>
       )}
 
       {/* Conversation — the Brief's work thread: every `brief.comment`

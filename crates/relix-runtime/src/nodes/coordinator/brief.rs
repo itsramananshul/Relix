@@ -39,6 +39,40 @@ pub struct DossierMeta {
     pub updated_at: i64,
 }
 
+/// A **thread interaction** — an answerable card the agent (or
+/// companion) raises on a Brief's thread (relix-execution-and-issue-
+/// design §1.9; relix-dashboard-design §7). The minimal slice covers
+/// two kinds: `ask` (an open question for the operator to answer) and
+/// `confirm` (a yes/no gate, e.g. plan approval). The third documented
+/// kind — `suggest_tasks` — stays deferred (see the divergence ledger
+/// in docs/product-spine-implementation.md). The lifecycle is
+/// `open → resolved | rejected`: a `confirm` answered yes resolves, a
+/// no rejects; an `ask` always resolves with the answer text. A
+/// response is recorded once (idempotent), and both the opening and
+/// the response are also written to the Brief's Chronicle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Interaction {
+    pub interaction_id: String,
+    pub task_id: String,
+    /// `ask` | `confirm`.
+    pub kind: String,
+    pub prompt: String,
+    /// Optional answer choices (radio/checkbox for `ask`); empty for a
+    /// plain `confirm`.
+    pub choices: Vec<String>,
+    /// Who raised the card (the Operative, the companion, or a human).
+    pub author: String,
+    /// `open` | `resolved` | `rejected`.
+    pub status: String,
+    /// The operator's answer (the chosen option, free text, or yes/no
+    /// note); `None` while still `open`.
+    pub response: Option<String>,
+    pub created_at: i64,
+    pub resolved_at: Option<i64>,
+    /// Who answered it.
+    pub resolved_by: Option<String>,
+}
+
 /// The product-spine fields of a Brief (the columns layered onto
 /// the Task ledger): who it's assigned to, where it sits on the
 /// board, its priority, and what it links *up* to.

@@ -77,6 +77,8 @@ $RequiredCapabilities = @(
     # Brief board: reads / moves / comments / fields / deps + events
     'brief.board', 'brief.board_summary', 'brief.detail', 'brief.create', 'brief.move', 'brief.set',
     'brief.comment', 'brief.unassigned', 'brief.unblocked', 'brief.run', 'brief.runs',
+    # Brief thread interactions (answerable ask/confirm cards, §1.9)
+    'brief.interaction_open', 'brief.interactions', 'brief.interaction_respond',
     'task.events', 'task.recent_events',
     # Bridge-back operative callbacks (per-Shift brt_* token at the bridge, but
     # the bridge still calls the mesh as chat-users, so each needs an allow rule)

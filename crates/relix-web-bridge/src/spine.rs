@@ -1610,6 +1610,96 @@ pub async fn comment_brief(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct OpenInteractionRequest {
+    /// `ask` | `confirm`.
+    pub kind: String,
+    pub prompt: String,
+    /// Answer options (for `ask`); empty/omitted for a plain `confirm`.
+    #[serde(default)]
+    pub choices: Vec<String>,
+    pub author: String,
+}
+
+/// `POST /v1/spine/briefs/:id/interactions` — raise an answerable card
+/// (ask/confirm) on a Brief's thread (§1.9). Returns the interaction_id.
+pub async fn open_interaction(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<OpenInteractionRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if req.kind.trim() != "ask" && req.kind.trim() != "confirm" {
+        return Err(bad("kind must be `ask` or `confirm`"));
+    }
+    if req.prompt.trim().is_empty() || req.author.trim().is_empty() {
+        return Err(bad("prompt and author required"));
+    }
+    // kind/author/choices are positional wire fields, so they must not
+    // carry a literal `|`; prompt is the trailing field and may.
+    if req.author.contains('|') {
+        return Err(bad("author must not contain `|`"));
+    }
+    if req.choices.iter().any(|c| c.contains('|')) {
+        return Err(bad("a choice must not contain `|`"));
+    }
+    let choices_json = serde_json::to_string(&req.choices)
+        .map_err(|e| bad(&format!("choices: {e}")))?;
+    let arg = format!(
+        "{id}|{}|{}|{}|{}",
+        req.kind.trim(),
+        req.author.trim(),
+        choices_json,
+        req.prompt
+    );
+    let body = call_peer(&state, "brief.interaction_open", arg.as_bytes()).await?;
+    json_id("interaction_id", &body)
+}
+
+/// `GET /v1/spine/briefs/:id/interactions` — a Brief's thread
+/// interactions (JSON array, oldest first).
+pub async fn list_interactions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "brief.interactions", id.as_bytes()).await?)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RespondInteractionRequest {
+    pub responder: String,
+    /// `resolved` | `rejected`.
+    pub status: String,
+    #[serde(default)]
+    pub response: String,
+}
+
+/// `POST /v1/spine/briefs/:id/interactions/:iid/respond` — answer an
+/// interaction (§1.9). A duplicate answer is a typed 400.
+pub async fn respond_interaction(
+    State(state): State<AppState>,
+    Path((id, iid)): Path<(String, String)>,
+    Json(req): Json<RespondInteractionRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if req.status.trim() != "resolved" && req.status.trim() != "rejected" {
+        return Err(bad("status must be `resolved` or `rejected`"));
+    }
+    if req.responder.trim().is_empty() {
+        return Err(bad("responder required"));
+    }
+    if req.responder.contains('|') {
+        return Err(bad("responder must not contain `|`"));
+    }
+    // `response` is the trailing wire field so it may contain `|`.
+    let arg = format!(
+        "{id}|{iid}|{}|{}|{}",
+        req.responder.trim(),
+        req.status.trim(),
+        req.response
+    );
+    call_peer(&state, "brief.interaction_respond", arg.as_bytes()).await?;
+    ok_json()
+}
+
+#[derive(Debug, Deserialize)]
 pub struct SetFieldRequest {
     pub field: String,
     #[serde(default)]

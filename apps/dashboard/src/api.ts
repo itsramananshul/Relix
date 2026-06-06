@@ -179,6 +179,58 @@ export const runControls = {
     tryGet<RunDiff | null>(`/v1/runs/${encodeURIComponent(runId)}/diff`, null),
 };
 
+// ── Brief thread interactions (answerable cards) ──────────────────────────
+// The ask/confirm cards an Operative/companion raises on a Brief
+// (relix-execution-and-issue-design §1.9; relix-dashboard-design §7). The
+// operator answers them inline; the answer writes a Chronicle event and
+// flips the card's status. All hit `/v1/spine/briefs/:id/interactions`.
+
+export interface BriefInteraction {
+  interaction_id: string;
+  task_id: string;
+  kind: string; // ask | confirm
+  prompt: string;
+  choices: string[];
+  author: string;
+  status: string; // open | resolved | rejected
+  response?: string | null;
+  created_at?: number;
+  resolved_at?: number | null;
+  resolved_by?: string | null;
+}
+
+export const briefInteractions = {
+  // List a Brief's cards (oldest first). Optional surface → degrades to []
+  // so a Brief with no interactions (or a bridge hiccup) never blanks.
+  list: (briefId: string) =>
+    tryGet<BriefInteraction[]>(
+      `/v1/spine/briefs/${encodeURIComponent(briefId)}/interactions`,
+      [],
+    ),
+  // Raise a new card (used by agents/companion; exposed for completeness).
+  open: (
+    briefId: string,
+    body: { kind: "ask" | "confirm"; prompt: string; choices?: string[]; author: string },
+  ) =>
+    api.post<{ interaction_id: string }>(
+      `/v1/spine/briefs/${encodeURIComponent(briefId)}/interactions`,
+      body,
+    ),
+  // Answer a card. `status` is the terminal verdict; a duplicate answer
+  // surfaces as a typed 400 (ApiError).
+  respond: (
+    briefId: string,
+    interactionId: string,
+    body: { responder: string; status: "resolved" | "rejected"; response?: string },
+  ) =>
+    api.post(
+      `/v1/spine/briefs/${encodeURIComponent(briefId)}/interactions/${encodeURIComponent(
+        interactionId,
+      )}/respond`,
+      body,
+    ),
+};
+
 // ── Live run-event stream (SSE) ───────────────────────────────────────────
 // Subscribe to the bridge's `/v1/runs/events/stream` execution feed so the
 // Runs page + Brief detail can refresh the moment a Shift starts, finishes,

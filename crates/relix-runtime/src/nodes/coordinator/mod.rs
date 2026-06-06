@@ -1555,6 +1555,192 @@ impl TaskStore {
         Ok(())
     }
 
+    /// §1.9 (thread interactions): raise an answerable card on a Brief
+    /// — an `ask` (open question, optional `choices`) or a `confirm`
+    /// (yes/no gate). Inserts an `open` interaction and mirrors the
+    /// opening into the Chronicle (`brief.interaction_opened`). Returns
+    /// the new `interaction_id`. `kind` must be `ask`/`confirm`; `prompt`
+    /// and `author` are required; the Brief must exist.
+    pub fn open_interaction(
+        &self,
+        task_id: &str,
+        kind: &str,
+        author: &str,
+        prompt: &str,
+        choices: &[String],
+    ) -> Result<String, CoordinatorError> {
+        let kind = kind.trim();
+        if kind != "ask" && kind != "confirm" {
+            return Err(CoordinatorError::Invalid(
+                "interaction kind must be `ask` or `confirm`".to_string(),
+            ));
+        }
+        let author = author.trim();
+        let prompt = prompt.trim();
+        if author.is_empty() {
+            return Err(CoordinatorError::Invalid(
+                "interaction author required".to_string(),
+            ));
+        }
+        if prompt.is_empty() {
+            return Err(CoordinatorError::Invalid(
+                "interaction prompt required".to_string(),
+            ));
+        }
+        // Normalize choices: trim, drop empties, dedupe (first wins).
+        let mut seen = std::collections::BTreeSet::new();
+        let norm: Vec<String> = choices
+            .iter()
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty() && seen.insert(c.clone()))
+            .collect();
+        let choices_json = serde_json::to_string(&norm)
+            .map_err(|e| CoordinatorError::Invalid(format!("interaction choices: {e}")))?;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, task_id)? {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let interaction_id = new_interaction_id();
+        let now = unix_secs();
+        conn.execute(
+            "INSERT INTO brief_interactions
+                 (interaction_id, task_id, kind, prompt, choices, author,
+                  status, response, created_at, resolved_at, resolved_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', NULL, ?7, NULL, NULL)",
+            params![interaction_id, task_id, kind, prompt, choices_json, author, now],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let _ = conn.execute(
+            "INSERT INTO task_events (task_id, ts, event_type, payload)
+             VALUES (?1, ?2, 'brief.interaction_opened', ?3)",
+            params![task_id, now, format!("{kind}: {prompt}")],
+        );
+        Ok(interaction_id)
+    }
+
+    /// §1.9: list a Brief's thread interactions (oldest first), open
+    /// and resolved alike, so the workroom can show open cards above
+    /// the Conversation and mark resolved ones. Does not check Brief
+    /// existence — tenant scoping is enforced by the caller against the
+    /// owning Brief (like `list_dossiers`).
+    pub fn list_interactions(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<brief::Interaction>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT interaction_id, task_id, kind, prompt, choices, author,
+                        status, response, created_at, resolved_at, resolved_by
+                 FROM brief_interactions WHERE task_id = ?1
+                 ORDER BY created_at ASC, rowid ASC",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows: Vec<brief::Interaction> = stmt
+            .query_map(params![task_id], |r| {
+                let choices_json: String = r.get(4)?;
+                let choices: Vec<String> =
+                    serde_json::from_str(&choices_json).unwrap_or_default();
+                Ok(brief::Interaction {
+                    interaction_id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    prompt: r.get(3)?,
+                    choices,
+                    author: r.get(5)?,
+                    status: r.get(6)?,
+                    response: r.get(7)?,
+                    created_at: r.get(8)?,
+                    resolved_at: r.get(9)?,
+                    resolved_by: r.get(10)?,
+                })
+            })
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
+    /// §1.9: answer an interaction. `status` is the terminal verdict
+    /// (`resolved` | `rejected`); `response` is the answer text (the
+    /// chosen option, free text, or a yes/no note). The fetch + update
+    /// run under one lock, so a second response to an already-answered
+    /// card is a **clear typed refusal** (`Invalid`), not a silent
+    /// overwrite — idempotent. Mirrors the answer into the Chronicle
+    /// (`brief.interaction_resolved` / `…_rejected`). The interaction
+    /// must belong to `task_id`.
+    pub fn respond_interaction(
+        &self,
+        task_id: &str,
+        interaction_id: &str,
+        responder: &str,
+        status: &str,
+        response: &str,
+    ) -> Result<(), CoordinatorError> {
+        let status = status.trim();
+        if status != "resolved" && status != "rejected" {
+            return Err(CoordinatorError::Invalid(
+                "interaction status must be `resolved` or `rejected`".to_string(),
+            ));
+        }
+        let responder = responder.trim();
+        if responder.is_empty() {
+            return Err(CoordinatorError::Invalid(
+                "interaction responder required".to_string(),
+            ));
+        }
+        let response = response.trim();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        // Resolve the card within this Brief; a card under another Brief
+        // (or a missing id) reads as not-found here.
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT status FROM brief_interactions
+                 WHERE interaction_id = ?1 AND task_id = ?2",
+                params![interaction_id, task_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        match current {
+            None => return Err(CoordinatorError::NotFound(interaction_id.to_string())),
+            Some(s) if s != "open" => {
+                return Err(CoordinatorError::Invalid(format!(
+                    "interaction already {s}"
+                )));
+            }
+            Some(_) => {}
+        }
+        let now = unix_secs();
+        // Guard the write on `status = 'open'` too, so concurrent
+        // responders can't both land (the lock already serializes us, but
+        // this keeps the invariant explicit at the row level).
+        let changed = conn
+            .execute(
+                "UPDATE brief_interactions
+                 SET status = ?1, response = ?2, resolved_at = ?3, resolved_by = ?4
+                 WHERE interaction_id = ?5 AND task_id = ?6 AND status = 'open'",
+                params![status, response, now, responder, interaction_id, task_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+        if changed == 0 {
+            return Err(CoordinatorError::Invalid(
+                "interaction already answered".to_string(),
+            ));
+        }
+        let event_type = if status == "resolved" {
+            "brief.interaction_resolved"
+        } else {
+            "brief.interaction_rejected"
+        };
+        let _ = conn.execute(
+            "INSERT INTO task_events (task_id, ts, event_type, payload)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![task_id, now, event_type, format!("{responder}: {response}")],
+        );
+        Ok(())
+    }
+
     /// PHASE 5 (Brief): replace a Brief's free-form labels. Each is
     /// trimmed; empties and any containing the `,` separator are
     /// dropped; duplicates are removed (first wins, order preserved).
@@ -9446,6 +9632,37 @@ pub fn register(
             })),
         );
     }
+    // §1.9 (thread interactions): answerable ask/confirm cards on a Brief.
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.interaction_open",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_interaction_open(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.interactions",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_interactions(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.interaction_respond",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_interaction_respond(&s, &ctx) }
+            })),
+        );
+    }
     // PHASE 1 (Brief): Dossiers — durable artifacts on a Brief.
     {
         let s = store.clone();
@@ -11080,6 +11297,85 @@ fn handle_brief_comment(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcom
     match store.comment_on_brief(parts[0].trim(), parts[1].trim(), parts[2]) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.comment", e),
+    }
+}
+
+/// `brief.interaction_open` — raise an answerable card on a Brief
+/// (§1.9). Arg `task_id|kind|author|choices|prompt`, where `choices`
+/// is a JSON array of options (`[]` for none) and `prompt` is the
+/// trailing field (may contain pipes). Returns the new interaction_id.
+fn handle_brief_interaction_open(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.interaction_open utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(5, '|').collect();
+    if parts.len() < 5 {
+        return invalid(
+            "brief.interaction_open: expected `task_id|kind|author|choices|prompt`".to_string(),
+        );
+    }
+    let task = parts[0].trim();
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.interaction_open") {
+        return out;
+    }
+    let choices: Vec<String> = match serde_json::from_str(parts[3].trim()) {
+        Ok(c) => c,
+        Err(_) if parts[3].trim().is_empty() => Vec::new(),
+        Err(e) => return invalid(format!("brief.interaction_open choices: {e}")),
+    };
+    match store.open_interaction(task, parts[1].trim(), parts[2].trim(), parts[4], &choices) {
+        Ok(id) => HandlerOutcome::Ok(id.into_bytes()),
+        Err(e) => map_edge_err("brief.interaction_open", e),
+    }
+}
+
+/// `brief.interactions` — list a Brief's thread interactions (JSON
+/// array, oldest first). Arg `task_id`.
+fn handle_brief_interactions(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task = match single_id(ctx, "brief.interactions") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.interactions") {
+        return out;
+    }
+    match store.list_interactions(task) {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.interactions encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.interactions", e),
+    }
+}
+
+/// `brief.interaction_respond` — answer an interaction (§1.9). Arg
+/// `task_id|interaction_id|responder|status|response`, where `status`
+/// is `resolved`/`rejected` and `response` is the trailing field (may
+/// contain pipes). A duplicate response is a typed refusal.
+fn handle_brief_interaction_respond(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.interaction_respond utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(5, '|').collect();
+    if parts.len() < 5 {
+        return invalid(
+            "brief.interaction_respond: expected \
+             `task_id|interaction_id|responder|status|response`"
+                .to_string(),
+        );
+    }
+    let task = parts[0].trim();
+    // Tenant scoping is on the owning Brief: a cross-Guild Brief id reads
+    // as not-found before any interaction row is touched.
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.interaction_respond") {
+        return out;
+    }
+    match store.respond_interaction(task, parts[1].trim(), parts[2].trim(), parts[3].trim(), parts[4])
+    {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.interaction_respond", e),
     }
 }
 
@@ -13458,6 +13754,30 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         );
         CREATE INDEX IF NOT EXISTS task_documents_by_task
             ON task_documents(task_id, created_at);
+        -- Thread interactions — answerable cards on a Brief
+        -- (relix-execution-and-issue-design §1.9; relix-dashboard-design
+        -- §7). `kind` is `ask` | `confirm`; `status` is `open` and then a
+        -- terminal `resolved` | `rejected`. `choices` is a JSON array of
+        -- answer options (empty for a plain confirm). The opening and the
+        -- response are mirrored into `task_events` so they show in the
+        -- Chronicle. One Brief owns its cards (tenant scoping is via the
+        -- owning Brief, like Dossiers).
+        CREATE TABLE IF NOT EXISTS brief_interactions (
+            interaction_id TEXT PRIMARY KEY,
+            task_id        TEXT NOT NULL,
+            kind           TEXT NOT NULL,
+            prompt         TEXT NOT NULL,
+            choices        TEXT NOT NULL DEFAULT '[]',
+            author         TEXT NOT NULL,
+            status         TEXT NOT NULL DEFAULT 'open',
+            response       TEXT,
+            created_at     INTEGER NOT NULL,
+            resolved_at    INTEGER,
+            resolved_by    TEXT,
+            FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+        );
+        CREATE INDEX IF NOT EXISTS brief_interactions_by_task
+            ON brief_interactions(task_id, created_at);
         -- PHASE 1 (Brief identity, relix-execution-and-issue-design
         -- §1.2): the per-company (per-Guild) counter the human Brief
         -- identifier (e.g. REL-42) is allocated from. One row per
@@ -14039,6 +14359,13 @@ fn new_doc_id() -> String {
     let mut bytes = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     format!("doc_{}", hex::encode(bytes))
+}
+
+fn new_interaction_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    format!("bix_{}", hex::encode(bytes))
 }
 
 fn unix_secs() -> i64 {
@@ -18820,6 +19147,114 @@ mod tests {
             handle_brief_dossier_get(&s, &ctx_tenant(doc_id.as_bytes(), "acme")),
             HandlerOutcome::Ok(_)
         ));
+    }
+
+    // §1.9 (thread interactions): open → list → respond happy path,
+    // including the Chronicle mirror on both the open and the answer.
+    #[test]
+    fn brief_interaction_open_list_respond_happy_path() {
+        let s = TaskStore::in_memory().unwrap();
+        let b = s
+            .create_brief("acme", "Ship it?", "subj", None, None, None, None)
+            .unwrap();
+        let id = s
+            .open_interaction(
+                &b,
+                "confirm",
+                "operative-1",
+                "Ship the v2 plan?",
+                &["yes".into(), "no".into()],
+            )
+            .unwrap();
+        // Opening mirrors into the Chronicle.
+        let opened = s
+            .query_events(&b, 0, 50, Some("brief.interaction_opened"), EventOrder::Asc)
+            .unwrap();
+        assert_eq!(opened.len(), 1);
+        assert!(opened[0].payload.contains("Ship the v2 plan?"));
+
+        // The card lists as open with its choices preserved.
+        let listed = s.list_interactions(&b).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].interaction_id, id);
+        assert_eq!(listed[0].status, "open");
+        assert_eq!(listed[0].choices, vec!["yes".to_string(), "no".to_string()]);
+        assert!(listed[0].response.is_none());
+
+        // Answer it; status + response land and the answer mirrors too.
+        s.respond_interaction(&b, &id, "founder", "resolved", "yes — ship")
+            .unwrap();
+        let listed = s.list_interactions(&b).unwrap();
+        assert_eq!(listed[0].status, "resolved");
+        assert_eq!(listed[0].response.as_deref(), Some("yes — ship"));
+        assert_eq!(listed[0].resolved_by.as_deref(), Some("founder"));
+        assert!(listed[0].resolved_at.is_some());
+        let answered = s
+            .query_events(&b, 0, 50, Some("brief.interaction_resolved"), EventOrder::Asc)
+            .unwrap();
+        assert_eq!(answered.len(), 1);
+        assert!(answered[0].payload.contains("yes — ship"));
+    }
+
+    // A second answer to an already-answered card is a typed refusal,
+    // not a silent overwrite (idempotent response contract).
+    #[test]
+    fn brief_interaction_duplicate_response_is_typed_refusal() {
+        let s = TaskStore::in_memory().unwrap();
+        let b = s
+            .create_brief("acme", "Q", "subj", None, None, None, None)
+            .unwrap();
+        let id = s
+            .open_interaction(&b, "ask", "op", "Which region?", &[])
+            .unwrap();
+        s.respond_interaction(&b, &id, "founder", "resolved", "us-east")
+            .unwrap();
+        let again = s.respond_interaction(&b, &id, "founder", "resolved", "eu-west");
+        assert!(matches!(again, Err(CoordinatorError::Invalid(_))));
+        // The original answer is untouched.
+        let listed = s.list_interactions(&b).unwrap();
+        assert_eq!(listed[0].response.as_deref(), Some("us-east"));
+    }
+
+    // Open / list / respond are all scoped to the owning Brief's Guild:
+    // a cross-Guild Brief or interaction id reads as not-found.
+    #[test]
+    fn brief_interaction_denied_across_tenant() {
+        let s = TaskStore::in_memory().unwrap();
+        let a = s
+            .create_brief("acme", "Acme", "subj", None, None, None, None)
+            .unwrap();
+        // Cross-tenant open is refused (empty choices arg `[]`).
+        assert!(matches!(
+            handle_brief_interaction_open(
+                &s,
+                &ctx_tenant(format!("{a}|confirm|op|[]|Proceed?").as_bytes(), "globex"),
+            ),
+            HandlerOutcome::Err(_)
+        ));
+        // Same-tenant open returns the id.
+        let id = match handle_brief_interaction_open(
+            &s,
+            &ctx_tenant(format!("{a}|confirm|op|[]|Proceed?").as_bytes(), "acme"),
+        ) {
+            HandlerOutcome::Ok(body) => String::from_utf8(body).unwrap(),
+            HandlerOutcome::Err(_) => panic!("interaction_open errored"),
+        };
+        // List + respond are isolated by the owning Brief's Guild.
+        assert!(matches!(
+            handle_brief_interactions(&s, &ctx_tenant(a.as_bytes(), "globex")),
+            HandlerOutcome::Err(_)
+        ));
+        assert!(matches!(
+            handle_brief_interaction_respond(
+                &s,
+                &ctx_tenant(format!("{a}|{id}|hacker|resolved|yes").as_bytes(), "globex"),
+            ),
+            HandlerOutcome::Err(_)
+        ));
+        // The card is still open for the owning Guild.
+        let listed = s.list_interactions(&a).unwrap();
+        assert_eq!(listed[0].status, "open");
     }
 
     #[test]

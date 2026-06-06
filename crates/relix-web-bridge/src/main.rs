@@ -99,6 +99,8 @@ mod approval;
 #[cfg(test)]
 mod approval_get_mini_mesh_test;
 mod audit_tenants;
+#[cfg(test)]
+mod brief_interaction_mini_mesh_test;
 mod auth;
 mod belief;
 mod blocklist;
@@ -724,6 +726,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/run-config", get(spine::run_config))
         .route("/v1/spine/briefs/:id/pin", post(spine::pin_brief))
         .route("/v1/spine/briefs/:id/comment", post(spine::comment_brief))
+        // §1.9 thread interactions: list/raise answerable cards + answer one.
+        .route(
+            "/v1/spine/briefs/:id/interactions",
+            get(spine::list_interactions).post(spine::open_interaction),
+        )
+        .route(
+            "/v1/spine/briefs/:id/interactions/:iid/respond",
+            post(spine::respond_interaction),
+        )
         .route("/v1/spine/briefs/:id/due", post(spine::set_due))
         .route("/v1/spine/briefs/:id/set", post(spine::set_field))
         .route("/v1/spine/briefs/:id/snag", post(spine::add_snag))
