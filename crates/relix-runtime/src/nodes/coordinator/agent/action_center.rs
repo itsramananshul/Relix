@@ -565,7 +565,10 @@ pub fn strategy_item(m: &Mandate) -> ActionItem {
         target_id: Some(m.mandate_id.clone()),
         target_title: Some(snippet(&m.title)),
         action_label: "Approve the strategy".to_string(),
-        route: Some("/mandates".to_string()),
+        // Carry the Mandate id so the dashboard lands on THIS Mandate with
+        // context (mirrors the review card's `/runs?run=` deep link), instead
+        // of dropping the operator on an unselected list.
+        route: Some(format!("/mandates?mandate={}", m.mandate_id)),
         created_at: Some(m.created_at),
         updated_at: Some(m.updated_at),
         action_api: None,
@@ -939,6 +942,29 @@ mod tests {
             assert_eq!(it.route.as_deref(), Some(route), "route for {reason_code}");
             assert!(!it.reason.trim().is_empty(), "reason for {reason_code}");
         }
+    }
+
+    #[test]
+    fn strategy_card_route_carries_the_mandate_id() {
+        // The "Approve strategy" card must deep-link to THIS Mandate so the
+        // dashboard selects it with context (mirrors `/runs?run=`), not the
+        // bare list.
+        let m = Mandate {
+            mandate_id: "mand-42".to_string(),
+            tenant_id: "t".to_string(),
+            title: "Ship the login page".to_string(),
+            description: String::new(),
+            owner_agent_id: None,
+            status: "planned".to_string(),
+            parent_mandate_id: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        let it = strategy_item(&m);
+        assert_eq!(it.category, ActionCategory::Approval);
+        assert_eq!(it.target_type.as_deref(), Some("mandate"));
+        assert_eq!(it.target_id.as_deref(), Some("mand-42"));
+        assert_eq!(it.route.as_deref(), Some("/mandates?mandate=mand-42"));
     }
 
     #[test]

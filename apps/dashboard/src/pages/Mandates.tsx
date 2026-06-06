@@ -1,7 +1,11 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { api, tryGet } from "../api";
 import { extractList, Section, useAsync } from "../components/common";
+
+// The safe-local Rig bound at hire approval so the Operative is immediately
+// runnable (company-model §12.6 — `agent.approve_hire` accepts a `rig`).
+const SAFE_RIG = "echo";
 
 interface Mandate { mandate_id?: string; id?: string; title?: string; name?: string; status?: string; description?: string }
 interface Card { task_id?: string; id?: string; title?: string; board_status?: string; assignee_agent_id?: string | null }
@@ -9,9 +13,12 @@ interface Operative { agent_id?: string; name?: string; role?: string; rig?: str
 interface Adapter { name?: string; probe?: { status?: string } }
 interface Strategy { status?: string | null; approved?: boolean }
 interface ActiveAgent { agent_id?: string; name?: string; role?: string; status?: string }
+// A minted-but-unapproved hire from team readiness — carries the agent_id the
+// operator approves/rejects via `agent.approve_hire` / `agent.reject_hire`.
+interface PendingHire { agent_id?: string; role?: string; status?: string }
 interface Readiness {
   planned?: boolean; plan_status?: string | null; readiness?: string; next_action?: string;
-  missing_roles?: unknown[]; pending_hires?: unknown[]; pending_clearances?: { clearance_id?: string; status?: string }[];
+  missing_roles?: unknown[]; pending_hires?: PendingHire[]; pending_clearances?: { clearance_id?: string; status?: string }[];
   active_agents?: ActiveAgent[]; blocked_roles?: unknown[];
 }
 interface Clearance { approval_id?: string; agent_id?: string; method?: string; reason?: string }
@@ -41,7 +48,11 @@ function blockerText(b: unknown): string {
 const READY_TONE: Record<string, string> = { ready: "done", staffing: "in_progress", awaiting_clearance: "in_progress", not_planned: "backlog" };
 
 export function Mandates() {
-  const [selected, setSelected] = useState<string | null>(null);
+  // The selected Mandate is URL-driven (`/mandates?mandate=<id>`), so the
+  // Action Center's "Approve strategy" card (and any deep link) lands on the
+  // right Mandate with context — mirroring the Runs page's `?run=` pattern.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const selected = searchParams.get("mandate");
   const [creating, setCreating] = useState(false);
   const [title, setTitle] = useState("");
   const [spec, setSpec] = useState("");
@@ -101,6 +112,16 @@ export function Mandates() {
   const total = briefs.length;
   const done = byCol.done ?? 0;
 
+  // Select a Mandate by writing the `?mandate=` param (or clear it). Resets the
+  // local orchestration preview so it never bleeds across Mandates.
+  function selectMandate(id: string | null) {
+    const next = new URLSearchParams(searchParams);
+    if (id) next.set("mandate", id);
+    else next.delete("mandate");
+    setSearchParams(next, { replace: true });
+    setResult(null);
+  }
+
   async function create() {
     if (!title.trim()) return;
     setBanner(null);
@@ -109,7 +130,7 @@ export function Mandates() {
       setBanner({ kind: "ok", msg: "Mandate created. Now propose + approve a strategy to unblock orchestration." });
       setTitle(""); setSpec(""); setCreating(false);
       reload();
-      if (r.mandate_id) { setSelected(r.mandate_id); setResult(null); }
+      if (r.mandate_id) selectMandate(r.mandate_id);
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Create failed" });
     }
@@ -139,6 +160,47 @@ export function Mandates() {
       detail.reload();
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Clearance decision failed" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Approve a pending hire inline with the safe-local Rig so the Operative is
+  // immediately runnable (company-model §12.6) — the same approve-with-rig
+  // behavior as the Overview Action Center / Crew. A clearance-gated hire is
+  // refused server-side and we point the operator at the Clearance step.
+  async function approveHire(agentId: string, role?: string) {
+    setBusy(true); setBanner(null);
+    try {
+      const r = await api.post<{ runnable?: boolean; rig?: string; needs_rig?: boolean }>(
+        `/v1/agents/${encodeURIComponent(agentId)}/approve-hire`,
+        { rig: SAFE_RIG },
+      );
+      setBanner({
+        kind: "ok",
+        msg: r.needs_rig
+          ? `${role ?? "Operative"} hired — set an adapter to make it runnable.`
+          : `${role ?? "Operative"} hired and runnable on ${r.rig ?? SAFE_RIG}.`,
+      });
+      detail.reload();
+      reload();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Approve hire failed";
+      setBanner({ kind: "err", msg: /clearance/i.test(msg) ? `${msg} — decide its Clearance below.` : msg });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function rejectHire(agentId: string, role?: string) {
+    setBusy(true); setBanner(null);
+    try {
+      await api.post(`/v1/agents/${encodeURIComponent(agentId)}/reject-hire`, {});
+      setBanner({ kind: "ok", msg: `${role ?? "Hire"} declined — the role is left unfilled.` });
+      detail.reload();
+      reload();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Reject hire failed" });
     } finally {
       setBusy(false);
     }
@@ -230,7 +292,7 @@ export function Mandates() {
                   const id = mid(m);
                   const sel = selected === id;
                   return (
-                    <div key={id} className="mandate-row" onClick={() => { setSelected(id); setResult(null); }} style={sel ? { borderColor: "var(--text-faint)", background: "var(--bg-elev)" } : undefined}>
+                    <div key={id} className="mandate-row" onClick={() => selectMandate(id)} style={sel ? { borderColor: "var(--text-faint)", background: "var(--bg-elev)" } : undefined}>
                       <div className="row" style={{ justifyContent: "space-between" }}>
                         <strong style={{ fontSize: 13 }}>{m.title ?? m.name ?? "(untitled)"}</strong>
                         <span className={"badge " + (m.status ?? "todo")} style={{ fontSize: 9 }}>{m.status ?? "—"}</span>
@@ -308,6 +370,22 @@ export function Mandates() {
                                 <span key={ag.agent_id ?? i} className="badge done" style={{ fontSize: 9 }} title={ag.agent_id}>
                                   {ag.name ?? (ag.agent_id ?? "").slice(0, 8)}{ag.role ? ` · ${ag.role}` : ""}
                                 </span>
+                              ))}
+                            </div>
+                          )}
+                          {/* Pending hires — approve inline with the safe-local Rig (same
+                              approve-with-rig behavior as Overview/Crew) so the seat is
+                              filled and runnable without leaving this Mandate. */}
+                          {(rdy.pending_hires ?? []).some((h) => h.agent_id) && (
+                            <div style={{ marginTop: 6 }}>
+                              <span className="muted" style={{ fontSize: 11 }}>Pending hires:</span>
+                              {(rdy.pending_hires ?? []).filter((h) => h.agent_id).map((h, i) => (
+                                <div key={h.agent_id ?? i} className="row" style={{ gap: 6, padding: "3px 0", borderBottom: "1px solid var(--border-soft)" }}>
+                                  <span className="mono" style={{ fontSize: 11 }} title={h.agent_id}>{(h.agent_id ?? "").slice(0, 10)}</span>
+                                  <span className="muted" style={{ fontSize: 10, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{h.role || "role"}{h.status ? ` · ${h.status}` : ""}</span>
+                                  <button className="btn sm" disabled={busy} title={`Approve this hire on the safe-local ${SAFE_RIG} adapter so it is immediately runnable`} onClick={() => approveHire(h.agent_id!, h.role)}>Approve · {SAFE_RIG}</button>
+                                  <button className="btn ghost sm" disabled={busy} title="Decline this hire (the role is left unfilled)" onClick={() => rejectHire(h.agent_id!, h.role)}>Reject</button>
+                                </div>
                               ))}
                             </div>
                           )}

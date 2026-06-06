@@ -423,11 +423,16 @@ export function Runs() {
   async function apply(runId: string) {
     setBanner(null);
     try {
-      const r = await api.post<{ apply_status?: string; applied_files?: number; failed_files?: number }>(
+      const r = await api.post<{ apply_status?: string; applied_files?: number; failed_files?: number; brief_status?: string }>(
         `/v1/runs/${encodeURIComponent(runId)}/apply`,
         {},
       );
-      setBanner(`Apply ${r.apply_status ?? "done"}: ${r.applied_files ?? 0} applied, ${r.failed_files ?? 0} failed.`);
+      // `run.apply` is the operator's review-to-done: when the Brief advances to
+      // `done` (company-model §12.5B) say so, so the loop's close is visible.
+      setBanner(
+        `Apply ${r.apply_status ?? "done"}: ${r.applied_files ?? 0} applied, ${r.failed_files ?? 0} failed` +
+          (r.brief_status === "done" ? " — Brief marked done." : "."),
+      );
       reload();
       await Promise.all([loadDiff(runId), loadEvents(runId)]);
     } catch (e) {
