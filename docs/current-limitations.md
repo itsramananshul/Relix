@@ -148,22 +148,39 @@ when you click Start. What it does **not** do:
   that crosses Guilds** can never surface a cross-tenant blocker id or title in
   the Shift Room — pinned by a coordinator test that forces such an edge.
 - **The Action Center surfaces what needs the operator, across the whole
-  company — but it is a read-only snapshot, not every signal.** `company.actions`
+  company — but it is a read-only feed, not every signal.** `company.actions`
   (`GET /v1/spine/company/actions`, company-model §5.4/§8.2) composes EXISTING
   live state into one ordered, deduped feed on the Overview Command Center:
   pending approvals/Clearances + proposed strategies (`approval`), pending hires
-  (`hire`), ready-to-start Briefs (`ready_to_start`), missing-assignee +
-  dependency-blocked Briefs (`blocked`), runs awaiting review (`needs_review`),
-  failed/refused/interrupted runs (`failed_or_refused`), and stale work
-  (`stale`). It is **READ-ONLY** (it approves/runs/applies nothing — each row
-  links to the existing governed route), **tenant-scoped** (no cross-Guild leak),
-  and **invents no notification table** — live state is the source. What it does
-  **not** do: classify the finer `blocked` sub-reasons (missing-adapter,
-  failed-preflight) as distinct Action Center reasons (they appear via the run
-  ledger's `failed_or_refused`); surface cost/budget-threshold alerts or
-  recovery-decision cards (dashboard-design §5.2 — no per-tenant spend-threshold
-  query or recovery diagnosis layer exists yet); or push updates (it is a
-  page-load snapshot, capped at 60 items with an honest `truncated` flag).
+  (`hire`), **budget alerts** (`budget`), ready-to-start Briefs
+  (`ready_to_start`), missing-assignee + dependency-blocked Briefs (`blocked`),
+  runs awaiting review (`needs_review`), failed/refused/interrupted runs
+  (`failed_or_refused`, now a recovery-decision card), and stale work (`stale`).
+  It is **READ-ONLY** (it approves/runs/applies nothing — each row links to the
+  existing governed route), **tenant-scoped** (no cross-Guild leak), and
+  **invents no notification table** — live state is the source. The Overview card
+  now **refreshes** off the existing run-event SSE (debounced change-trigger)
+  with a low-frequency (20 s) poll fallback; it updates only on a successful
+  fetch (a transient blip never blanks it) and stays stable if the stream is
+  absent — **no new event bus**.
+  - **Budget alerts are allowance-backed, not live-spend.** The `budget` category
+    fires only from configured Allowance state: **(a)** committed Allowance (sum
+    of active Operatives' caps) over/near the Guild budget — and only when the
+    Guild has a positive budget set — and **(b)** an active Operative hard-stopped
+    by a `0` Allowance that has runnable/blocked work assigned. The authoritative
+    **month-to-date spend** the dispatch gate enforces lives in the metrics store
+    (`MetricsQuery::cost_since`, the `over_allowance` refusal path) and is **not**
+    threaded into this read-only handler, so the feed shows **no live
+    "spent $X of $Y" figure** (it would disagree with the gate or fabricate a
+    number). Real over-spend still surfaces *reactively* as the `over_allowance`
+    recovery card. Wiring true per-tenant/per-Operative spend-threshold alerts is
+    the remaining real-spend gap.
+  - What it still does **not** do: classify a true **retryable-vs-not** (there is
+    no diagnosis layer and no per-run failure-class/retry-budget — recovery cards
+    map the durable refusal taxonomy to a recommended action + route, no more);
+    classify the finer `blocked` sub-reasons as distinct reasons; or push every
+    field in hard-realtime (the refresh is event-trigger + poll; the feed is
+    capped at 60 with an honest `truncated` flag).
 
 In short: the *governance rails* of a company are in place and tenant-safe,
 the Shift Room makes the post-start loop legible (what ran / finished / is

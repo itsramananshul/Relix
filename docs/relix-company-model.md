@@ -354,29 +354,40 @@ A single action center showing only what needs you, in priority order: **approva
 >
 > - **Categories implemented:** `approval` (pending hire/spawn Clearances + a
 >   Mandate's *proposed* strategy gate), `hire` (Operatives `pending` and inert
->   until approved), `ready_to_start` (assigned-to-active + unblocked + unclaimed
->   Briefs — surfaced above generic blocked work so the operator can move things
->   forward), `blocked` (missing-assignee + dependency-blocked Briefs),
->   `needs_review` (a completed Shift awaiting review → apply),
->   `failed_or_refused` (a failed/refused/interrupted Shift), and `stale`
->   (stuck-too-long work, lowest priority). **Ordering** puts approvals/hire
->   blockers on top, failed/refused before informational stale, ready before
->   generic blocked; **dedupe** collapses the same underlying object (a pending
->   hire and its spawn Clearance show once, as the approval) so the feed never
->   spams.
+>   until approved), **`budget`** (allowance-backed: committed Allowance over/near
+>   the Guild budget, and an active Operative hard-stopped by a `0` Allowance that
+>   has work waiting), `ready_to_start` (assigned-to-active + unblocked +
+>   unclaimed Briefs — surfaced above generic blocked work so the operator can
+>   move things forward), `blocked` (missing-assignee + dependency-blocked
+>   Briefs), `needs_review` (a completed Shift awaiting review → apply),
+>   `failed_or_refused` (a failed/refused/interrupted Shift — now a
+>   **recovery-decision card** that names the root cause and recommends the
+>   existing fix: assign · configure Rig · raise Allowance · review runtime ·
+>   inspect), and `stale` (stuck-too-long work, lowest priority). **Ordering**
+>   puts approvals/hire blockers on top, then budget governance (a hard-stop
+>   blocks all of an Operative's work; over-commitment is a Board concern), then
+>   recovery before informational stale, ready before generic blocked; **dedupe**
+>   collapses the same underlying object so the feed never spams.
 > - **How it fits the company model:** it is the Board's (§5.4) sovereign home —
 >   the one surface that says "here is everything the Founder/Prime flow needs
 >   you to decide or unblock right now," spanning the hire gate (§5.5), the
->   strategy gate (§5.5), the assignment/heartbeat loop (§6), and the review →
->   apply loop. Every action stays behind its existing gate; the Action Center
->   only *routes you to it*.
-> - **Deferred (honest):** budget/spend-threshold **alerts** and the
->   diagnosis-driven **recovery decision cards** (dashboard-design §5.2) are not
->   built (no per-tenant spend-threshold query / recovery layer yet); the finer
+>   strategy gate (§5.5), **budget oversight (§5.4 — committed Allowance vs the
+>   Guild budget)**, the assignment/heartbeat loop (§6), and the review → apply
+>   loop. Every action stays behind its existing gate; the Action Center only
+>   *routes you to it*. The Overview card **refreshes** off the existing run-event
+>   stream (debounced change-trigger) with a low-frequency poll fallback — no new
+>   event bus.
+> - **Deferred (honest):** budget alerts are **allowance-config-backed only** —
+>   the authoritative **live month-to-date spend** the dispatch gate enforces
+>   (`cost_since` / the `over_allowance` path) is not threaded into this read-only
+>   feed, so it shows no "spent $X of $Y" figure (over-spend surfaces reactively
+>   as the `over_allowance` recovery card); recovery cards map the durable refusal
+>   taxonomy to a recommended action but there is still **no diagnosis layer and
+>   no per-run failure-class/retry-budget** (no true retryable-vs-not); the finer
 >   `blocked` sub-reasons (missing-adapter, failed-preflight) are not separate
->   reasons here (they surface via `failed_or_refused`); and the feed is a
->   page-load snapshot (no realtime push), capped with an honest `truncated`
->   flag.
+>   reasons here; and the refresh is low-latency event-trigger + poll, not
+>   hard-realtime push of every field (the feed is capped with an honest
+>   `truncated` flag).
 
 ### 8.3 The Issue detail (where work lives)
 
