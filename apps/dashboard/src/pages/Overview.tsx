@@ -290,15 +290,40 @@ export function Overview() {
 
   return (
     <div className="grid">
-      {/* Live system health — only loud when a layer is down. */}
-      <HealthPanel compact />
-      {/* Start-work entry point: describe a goal → Prime proposes a plan. */}
+      {/* Command strip — who's running + the live counters + start-work, before
+          any banners, so the Overview opens like a cockpit (design §2/§3). */}
       {initialized && (
-        <div className="banner ok banner-action">
-          <span><strong>Start work</strong> — describe a goal and Prime proposes a governed plan (Mandate + Briefs + crew) for you to approve.</span>
-          <Link to="/chat" className="banner-cta">Plan with Prime →</Link>
+        <div className="cmd-strip">
+          <div className="who-band">
+            <span className="title">{company.founder?.name ? `${company.founder.name}'s Guild` : "Your Guild"}</span>
+            <div className="meta">
+              <span>Founder {company.founder?.name ?? "—"}</span>
+              <span>Prime {company.prime?.name ?? "not hired"}</span>
+              <span>{crew} Operative{crew === 1 ? "" : "s"}</span>
+              <span>{availAdapters.length}/{adapters.length} adapters ready</span>
+            </div>
+          </div>
+          <div className="counters">
+            <Link to="/briefs" className="counter" title={`${totalBriefs} Briefs total`}>
+              <b className={active ? "info" : ""}>{active}</b><span>Active Briefs</span>
+            </Link>
+            <Link to="/runs" className="counter" title={`${inReview} in review`}>
+              <b className={running ? "info" : ""}>{running}</b><span>Running now</span>
+            </Link>
+            <Link to="/runs" className="counter">
+              <b className={attention ? "warn" : ""}>{attention}</b><span>Needs attention</span>
+            </Link>
+            <div className="counter"><b>{done}</b><span>Completed</span></div>
+          </div>
+          <div className="grow" />
+          <div className="cta">
+            <Link to="/chat"><button className="btn">Plan with Prime →</button></Link>
+            <span className="hint">Describe a goal → governed plan</span>
+          </div>
         </div>
       )}
+      {/* Live system health — only loud when a layer is down. */}
+      <HealthPanel compact />
       {data?.coreError && (
         <div className="banner err banner-action">
           <span>Some Command Center data failed to load: {data.coreError}</span>
@@ -310,28 +335,21 @@ export function Overview() {
       {initialized && <ActionCenter data={liveActions ?? data?.actions ?? null} loading={loading} />}
       {/* Active work — the latest Prime session's live Shift Room, compact. */}
       {data?.session && <ActiveWork session={data.session} />}
-      {/* Actionable system warnings + next steps */}
+      {/* Setup & warnings — one scannable card, not a tower of banners. */}
       {warnings.length > 0 && (
-        <div className="grid" style={{ gap: 8 }}>
-          {warnings.map((w, i) => (
-            <div key={i} className={"banner " + w.tone + " banner-action"}>
-              <span>{w.msg}</span>
-              {w.to && (
-                <Link to={w.to} className="banner-cta">
-                  {w.cta ?? "Open"} →
-                </Link>
-              )}
-            </div>
-          ))}
+        <div className="card">
+          <h3>Setup &amp; warnings</h3>
+          <div className="warn-list">
+            {warnings.map((w, i) => (
+              <div key={i} className="warn-row">
+                <span className={"dot " + w.tone} />
+                <span className="msg">{w.msg}</span>
+                {w.to && <Link to={w.to} className="link" style={{ whiteSpace: "nowrap" }}>{w.cta ?? "Open"} →</Link>}
+              </div>
+            ))}
+          </div>
         </div>
       )}
-
-      <div className="grid cols-4">
-        <Stat n={active} label="Active Briefs" sub={`${totalBriefs} total`} to="/briefs" />
-        <Stat n={running} label="Running now" sub={`${inReview} in review`} to="/runs" tone={running ? "info" : undefined} />
-        <Stat n={attention} label="Needs Attention" to="/runs" tone={attention ? "warn" : undefined} />
-        <Stat n={done} label="Completed" />
-      </div>
 
       <div className="grid cols-2">
         {/* Company + runtime snapshot */}
@@ -613,18 +631,6 @@ function ActiveWork({ session }: { session: SessionStatus }) {
       ))}
     </div>
   );
-}
-
-function Stat({ n, label, sub, to, tone }: { n: number; label: string; sub?: string; to?: string; tone?: "warn" | "info" }) {
-  const color = tone === "warn" && n > 0 ? "var(--warn)" : tone === "info" && n > 0 ? "var(--info)" : undefined;
-  const body = (
-    <div className="card stat-card">
-      <div className="stat" style={color ? { color } : undefined}>{n}</div>
-      <div className="stat-label">{label}</div>
-      {sub && <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>{sub}</div>}
-    </div>
-  );
-  return to ? <Link to={to}>{body}</Link> : body;
 }
 
 function AttnList({ label, rows, tone }: { label: string; rows?: Card[]; tone: string }) {

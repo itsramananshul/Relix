@@ -126,7 +126,7 @@ export function Chat() {
       role: "assistant",
       kind: "text",
       text:
-        "I'm Prime, your company planner. Describe what you want to build and I'll propose a plan — a Mandate, the crew roles, suggested hires, and a Brief breakdown — for you to approve. Nothing is created or run until you approve. (Or use the quick commands: \"create a brief …\", \"move … to …\", \"board\".)",
+        "I'm Prime, your company planner. Describe a goal and I'll propose a governed plan — Mandate, crew, hires, and Briefs — for you to approve. Nothing is created or run until you approve.",
     },
   ]);
   const [text, setText] = useState("");
@@ -288,11 +288,13 @@ function ProposalCard({ entry, onApprove, busy }: { entry: { data: ProposalRespo
   const p = entry.data.proposal ?? {};
   const missing = (p.hires ?? []).length;
   return (
-    <div className="msg assistant" style={{ maxWidth: "100%" }}>
-      <div className="card" style={{ margin: 0 }}>
-        <div className="row" style={{ gap: 8, alignItems: "center" }}>
+    <div className="panel-msg">
+      <div className="panel">
+        <div className="panel-head">
           <span className={"badge " + (INTENT_TONE[p.intent ?? ""] ?? "todo")} style={{ fontSize: 9 }}>{p.intent ?? "plan"}</span>
-          <strong>{p.summary ?? "Proposed plan"}</strong>
+          <span className="panel-title">{p.summary ?? "Proposed plan"}</span>
+          <div className="spacer" style={{ flex: 1 }} />
+          <AiStatusBadge mode={p.ai_mode} aiUsed={p.ai_used} status={p.ai_status} reason={p.ai_reason} />
         </div>
         <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
           Mandate: <strong>{p.mandate_title}</strong>
@@ -334,12 +336,8 @@ function ProposalCard({ entry, onApprove, busy }: { entry: { data: ProposalRespo
           </div>
         )}
 
-        {/* AI provenance — compact + honest (full status on hover) */}
-        <AiStatusBadge mode={p.ai_mode} aiUsed={p.ai_used} status={p.ai_status} reason={p.ai_reason} />
-
-
         {/* Actions */}
-        <div className="row" style={{ gap: 8, marginTop: 10 }}>
+        <div className="panel-section row" style={{ gap: 8 }}>
           {entry.done ? (
             <span className="badge done">approved ✓</span>
           ) : (
@@ -380,11 +378,11 @@ function ApprovedCard({ entry, onStart, busy }: { entry: { data: ApproveResponse
   const data = entry.data;
   const assigned = (data.assigned_briefs ?? []).length;
   return (
-    <div className="msg assistant" style={{ maxWidth: "100%" }}>
-      <div className="card" style={{ margin: 0 }}>
-        <div className="row" style={{ gap: 8 }}>
+    <div className="panel-msg">
+      <div className="panel">
+        <div className="panel-head">
           <span className="badge done">created</span>
-          <strong>{data.already_approved ? "Already approved" : "Plan approved"}</strong>
+          <span className="panel-title">{data.already_approved ? "Already approved" : "Plan approved"}</span>
         </div>
         <div style={{ fontSize: 12, marginTop: 6 }}>
           <div>Mandate <span className="mono">{(data.mandate_id ?? "").slice(0, 14)}</span> · <Link to="/mandates" className="link">open Mandates →</Link></div>
@@ -491,7 +489,7 @@ function ShiftRoom({ proposalId }: { proposalId: string }) {
   const counts = status?.counts ?? {};
   const briefs = status?.briefs ?? [];
   return (
-    <div className="card" style={{ margin: "10px 0 0", background: "var(--bg-2, transparent)" }}>
+    <div className="panel-section">
       <div className="row" style={{ gap: 8, alignItems: "center" }}>
         <strong style={{ fontSize: 13 }}>Shift Room</strong>
         {status?.mandate_title && <span className="muted" style={{ fontSize: 11 }}>· {status.mandate_title}</span>}
@@ -542,7 +540,7 @@ function ShiftRoom({ proposalId }: { proposalId: string }) {
           const run = b.latest_run ?? null;
           const tone = READINESS_TONE[b.start_readiness ?? ""] ?? "todo";
           return (
-            <div key={b.brief_id ?? i} className="row" style={{ gap: 8, alignItems: "center", padding: "3px 0", borderTop: i ? "1px solid var(--border, #e5e5e5)" : undefined }}>
+            <div key={b.brief_id ?? i} className="shift-room-row">
               <span className={"badge " + tone} style={{ fontSize: 9, minWidth: 64, textAlign: "center" }}>
                 {b.needs_review ? "review" : b.start_readiness}
               </span>
@@ -592,13 +590,13 @@ function StartedCard({ data }: { data: StartResponse }) {
   const started = data.started ?? [];
   const skipped = data.skipped ?? [];
   return (
-    <div className="msg assistant" style={{ maxWidth: "100%" }}>
-      <div className="card" style={{ margin: 0 }}>
-        <div className="row" style={{ gap: 8 }}>
+    <div className="panel-msg">
+      <div className="panel">
+        <div className="panel-head">
           <span className={"badge " + (started.length > 0 ? "in_progress" : "todo")}>
             {started.length > 0 ? "running" : "nothing started"}
           </span>
-          <strong>{started.length} Shift(s) started</strong>
+          <span className="panel-title">{started.length} Shift(s) started</span>
         </div>
 
         {started.length > 0 && (
