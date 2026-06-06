@@ -52,6 +52,26 @@ interface SessionStatus {
   counts?: SessionCounts;
   recommended_next_actions?: string[];
 }
+// Action Center (GET /v1/spine/company/actions) — the operator's next-actions
+// feed computed from live state. Read-only; each item links to its existing
+// action route.
+interface ActionItem {
+  id?: string;
+  category?: string;
+  severity?: string;
+  title?: string;
+  reason?: string;
+  target_type?: string;
+  target_id?: string;
+  target_title?: string;
+  action_label?: string;
+  route?: string;
+}
+interface CompanyActions {
+  actions?: ActionItem[];
+  counts?: { total?: number; by_category?: Record<string, number>; by_severity?: Record<string, number> };
+  truncated?: boolean;
+}
 
 const COLUMNS = ["backlog", "todo", "in_progress", "in_review", "done"];
 const RUN_TONE: Record<string, string> = {
@@ -81,13 +101,14 @@ export function Overview() {
       tryGetReport<CompanyStatus>("/v1/spine/company", {}),
       tryGetReport<RunRow[]>("/v1/runs", []),
     ]);
-    const [inbox, roster, adapters, runCfg, maint, events] = await Promise.all([
+    const [inbox, roster, adapters, runCfg, maint, events, actions] = await Promise.all([
       tryGet<Inbox>("/v1/spine/inbox?limit=50", {}),
       tryGet<Roster>("/v1/spine/roster", {}),
       tryGet<Adapter[]>("/v1/adapters", []),
       tryGet<RunConfig>("/v1/spine/run-config", {}),
       tryGet<MaintSummary | null>("/v1/maintenance/summary", null),
       tryGet<unknown>("/v1/tasks/events/recent?limit=10", {}),
+      tryGet<CompanyActions | null>("/v1/spine/company/actions", null),
     ]);
     const mandates = await tryGet<unknown>("/v1/spine/mandates?limit=8", {});
     // The newest Prime work session — if it's approved, pull its live Shift-Room
@@ -117,6 +138,7 @@ export function Overview() {
       mandates: extractList<MandateRow>(mandates, ["mandates"]),
       events: extractList<EventRow>(events),
       session: session ?? null,
+      actions: actions ?? null,
       coreError,
     };
   }, []);
@@ -251,6 +273,8 @@ export function Overview() {
           <span className="banner-cta" onClick={reload} style={{ cursor: "pointer" }}>Retry →</span>
         </div>
       )}
+      {/* Action Center — the one place for what needs the operator now. */}
+      {initialized && <ActionCenter data={data?.actions ?? null} loading={loading} />}
       {/* Active work — the latest Prime session's live Shift Room, compact. */}
       {data?.session && <ActiveWork session={data.session} />}
       {/* Actionable system warnings + next steps */}
@@ -425,6 +449,96 @@ export function Overview() {
           ))}
         </div>
       </div>
+    </div>
+  );
+}
+
+// Severity → badge tone. Color is reserved for meaning only (design §12):
+// high = needs you (blocked tone), medium = actionable, low = informational.
+const SEV_TONE: Record<string, string> = { high: "blocked", medium: "in_progress", low: "backlog" };
+// A short human label per category for the row chip.
+const CAT_LABEL: Record<string, string> = {
+  approval: "approval",
+  hire: "hire",
+  failed_or_refused: "failed",
+  needs_review: "review",
+  ready_to_start: "ready",
+  blocked: "blocked",
+  stale: "stale",
+};
+
+// The Action Center — one ordered, deduped feed of what needs the operator,
+// computed server-side from live state (company-model §8.2). Each row links to
+// the existing route that performs the action; nothing is mutated here.
+function ActionCenter({ data, loading }: { data: CompanyActions | null; loading: boolean }) {
+  const actions = data?.actions ?? [];
+  const total = data?.counts?.total ?? actions.length;
+  const high = data?.counts?.by_severity?.high ?? 0;
+  // Calm empty state — once initialized, an empty feed means nothing needs you.
+  if (!loading && total === 0) {
+    return (
+      <div className="card">
+        <div className="row" style={{ marginBottom: 6, alignItems: "center" }}>
+          <h3 style={{ margin: 0 }}>Action Center</h3>
+        </div>
+        <div className="empty">Nothing needs you right now — the company is moving on its own.</div>
+      </div>
+    );
+  }
+  if (data === null && !loading) {
+    // The endpoint was unavailable (optional surface) — say so, don't fake it.
+    return (
+      <div className="card">
+        <h3 style={{ margin: 0 }}>Action Center</h3>
+        <div className="empty">Action Center unavailable right now.</div>
+      </div>
+    );
+  }
+  const shown = actions.slice(0, 8);
+  return (
+    <div className="card">
+      <div className="row" style={{ marginBottom: 10, alignItems: "center" }}>
+        <h3 style={{ margin: 0 }}>Action Center</h3>
+        {total > 0 && (
+          <span className={"badge " + (high > 0 ? "blocked" : "in_progress")} style={{ fontSize: 9, marginLeft: 8 }}>
+            {total} need{total === 1 ? "s" : ""} you
+          </span>
+        )}
+        <div className="spacer" style={{ flex: 1 }} />
+        <span className="muted" style={{ fontSize: 12 }}>computed from live state</span>
+      </div>
+      <table className="table compact">
+        <tbody>
+          {shown.map((a, i) => (
+            <tr key={a.id ?? i}>
+              <td style={{ width: 64 }}>
+                <span className={"badge " + (SEV_TONE[a.severity ?? ""] ?? "todo")} style={{ fontSize: 9 }}>
+                  {CAT_LABEL[a.category ?? ""] ?? a.category ?? "action"}
+                </span>
+              </td>
+              <td>
+                <div style={{ fontSize: 13, fontWeight: 600 }}>{a.title ?? "(action)"}</div>
+                {a.reason && <div className="muted" style={{ fontSize: 11 }}>{a.reason}</div>}
+              </td>
+              <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+                {a.route ? (
+                  <Link to={a.route} className="btn sm ghost">{a.action_label ?? "Open"} →</Link>
+                ) : (
+                  <span className="muted" style={{ fontSize: 11 }}>{a.action_label}</span>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {(actions.length > shown.length || data?.truncated) && (
+        <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+          {actions.length - shown.length > 0 ? `+${actions.length - shown.length} more` : "More actions"} —
+          {" "}work them from <Link to="/briefs" className="link">Briefs</Link>,{" "}
+          <Link to="/mandates" className="link">Mandates</Link>, or{" "}
+          <Link to="/runs" className="link">Runs</Link>.
+        </div>
+      )}
     </div>
   );
 }
