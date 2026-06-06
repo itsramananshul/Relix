@@ -251,7 +251,7 @@ team + work end to end.
 
 ### Bridge persists every chat as a Task (fail-soft)
 
-(Formerly a documented gap; **closed** in commit `<pending>`.)
+(Formerly a documented gap; now **closed** — see git history.)
 All three chat-bearing endpoints (`/chat`, `/chat_with_tool`,
 `/v1/chat/completions`) auto-create a Task on the Coordinator before
 the flow runs, append `task.created` + `flow.started` (and
@@ -279,7 +279,7 @@ What's still **not** done:
 
 ### The bridge's `MeshClient` auto-reconnects on transient drops
 
-(Formerly a documented limitation; **closed** in commit `<pending>`.)
+(Formerly a documented limitation; now **closed** — see git history.)
 The bridge holds an alias → `Multiaddr` address book alongside the
 alias → `PeerId` map. When `MeshClient::call` sees a transport-class
 error (`DialFailure`, `ConnectionClosed`, `Timeout`, `io`), it re-dials
@@ -298,7 +298,7 @@ with a different `PeerId`. The fix is "delete the bridge's cache too
 
 ### Discovery refreshes periodically
 
-(Formerly a documented limitation; **closed** in commit `<pending>`.)
+(Formerly a documented limitation; now **closed** — see git history.)
 The bridge spawns a background task that re-runs `node.manifest`
 against every peer in its address book every 60s, updating the
 `ManifestCache`. A peer that comes online *after* the bridge will be
