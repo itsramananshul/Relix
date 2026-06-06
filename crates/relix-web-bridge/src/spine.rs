@@ -463,6 +463,20 @@ pub async fn prime_proposal(
     json_passthrough(call_peer(&state, "prime.proposal", id.as_bytes()).await?)
 }
 
+/// `GET /v1/spine/prime/proposals/:id/status` — the LIVE Shift-Room status of
+/// one Prime work session (PART A). READ-ONLY: joins the proposal row, the
+/// Brief board, and the run ledger into one command-center payload (created
+/// Briefs with their latest Shift / blockers / review-apply state + roll-up
+/// counts + recommended next actions). Tenant-scoped: an unknown / cross-Guild
+/// proposal reads as not-found. The dashboard POLLS this after start (there is
+/// no live SSE stream for a Prime session today).
+pub async fn prime_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "prime.status", id.as_bytes()).await?)
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct TeamPlanRequest {
     /// Optional plain-text goal/team description.

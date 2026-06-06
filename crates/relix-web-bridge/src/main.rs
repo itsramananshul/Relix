@@ -665,6 +665,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/prime/start", post(spine::prime_start))
         .route("/v1/spine/prime/proposals", get(spine::prime_proposals))
         .route("/v1/spine/prime/proposals/:id", get(spine::prime_proposal))
+        // Live Shift-Room status of a Prime work session (polled after start).
+        .route(
+            "/v1/spine/prime/proposals/:id/status",
+            get(spine::prime_status),
+        )
         // Composite Desk/Inbox + Brief live-thread payloads.
         .route("/v1/spine/inbox", get(spine::inbox))
         .route("/v1/spine/briefs/:id/events", get(spine::brief_events))
