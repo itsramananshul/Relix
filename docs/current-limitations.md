@@ -72,22 +72,29 @@ it does **not** do:
 
 Relix models a company — Founder, Prime (planning lead), Crew, Mandates,
 Clearances — and the dashboard drives the whole loop (found the company →
-hire a Prime → propose+approve a Mandate strategy → plan the team →
-greenlight spawn Clearances → orchestrate the Mandate into Briefs →
-execute). The `company.status` summary surfaces the Founder, the Prime, and
-the crew breakdown (active / pending / by role). What it does **not** do:
+hire a Prime → describe a goal so **Prime proposes a plan** → approve it to
+create the Mandate + Briefs + crew assignments + pending hires → greenlight
+spawn Clearances → execute). The `company.status` summary surfaces the
+Founder, the Prime, and the crew breakdown (active / pending / by role). The
+**Prime Assistant** (`POST /v1/spine/prime/propose` → `…/approve`, the Chat
+page) turns a free-text request into a structured, governed plan that creates
+nothing until approved. What it does **not** do:
 
-- **The Prime is rule-based, not an LLM.** Strategy proposal, the team
+- **The Prime is rule-based, not an LLM.** Intent interpretation, the team
   plan, and Mandate→Brief decomposition are deterministic/templated
-  (role-track + per-subject Briefs by canned titles), not authored by a
-  planning model. A Mandate becomes generic role tracks, not a
-  model-reasoned project plan.
-- **A human is in the loop at every gate.** Proposing and approving a
-  strategy, greenlighting each spawn Clearance, and choosing the
-  orchestration mode are all operator actions. There is no auto-pilot that
-  takes a Mandate end-to-end without approvals.
-- **Hiring is request → approve only.** Nothing suggests *who* to hire or
-  *which* adapter to assign; the operator decides.
+  (role-track + integration Briefs by canned titles), not authored by a
+  language model — no model is wired into a coordinator capability, and the
+  response says so honestly (`ai_used:false` + an `ai_status` string), never
+  faking model output. Two different "build a dashboard" requests yield the
+  same plan shape.
+- **A human is in the loop at every gate.** Prime PROPOSES; the operator must
+  click approve to create anything, then greenlight each spawn Clearance and
+  start each Brief. There is no auto-pilot that takes a goal end-to-end
+  (propose → approve → staff → orchestrate → run) without approvals.
+- **Hiring is request → approve only.** Prime suggests *which roles* are
+  missing and files them as `pending` hire requests on approval, but it does
+  not decide *which person/identity* to hire or *which adapter* to assign,
+  and a pending hire is inert until a separate Clearance activates it.
 - **The autonomous heartbeat only executes**, it does not plan. It runs
   already-assigned Briefs on a timer — it never authors strategy, staffs a
   team, or orchestrates a Mandate.
