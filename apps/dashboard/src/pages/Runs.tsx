@@ -2,6 +2,7 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, tryGet, subscribeRunEvents, type RunEventConn } from "../api";
 import { Empty, Section, useAsync } from "../components/common";
+import { invalidate } from "../invalidate";
 
 // Live run-event connection → a small honest status chip.
 const LIVE_LABEL: Record<RunEventConn, string> = {
@@ -323,6 +324,8 @@ export function Runs() {
       setBanner(`Run discarded (${r.apply_status ?? "discarded"}). Its workspace will be reclaimed by cleanup.`);
       reload();
       if (expanded === runId) await Promise.all([loadDiff(runId), loadEvents(runId)]);
+      // Discarding rejects the run — the board card + open Brief panel update (§11).
+      invalidate(["briefs", "brief"], { briefId: data?.runs?.find((x) => x.run_id === runId)?.brief_id });
     } catch (e) {
       setBanner(e instanceof Error ? e.message : "Discard failed");
     }
@@ -435,6 +438,9 @@ export function Runs() {
       );
       reload();
       await Promise.all([loadDiff(runId), loadEvents(runId)]);
+      // Apply can advance the Brief to done — refresh the board card + the open
+      // Brief panel on surfaces that show them (dashboard-design §11).
+      invalidate(["briefs", "brief"], { briefId: data?.runs?.find((x) => x.run_id === runId)?.brief_id });
     } catch (e) {
       setBanner(e instanceof Error ? e.message : "Apply failed");
     }
@@ -446,6 +452,8 @@ export function Runs() {
       await api.post(`/v1/runs/${encodeURIComponent(runId)}/review`, { decision, note: "" });
       setBanner(`Run ${decision}.`);
       reload();
+      // Review verdict shows on the board card + the open Brief panel (§11).
+      invalidate(["briefs", "brief"], { briefId: data?.runs?.find((x) => x.run_id === runId)?.brief_id });
     } catch (e) {
       setBanner(e instanceof Error ? e.message : "Review failed");
     }
@@ -461,6 +469,7 @@ export function Runs() {
       setBanner(r.active ? "Cancellation signalled — the run will report cancelled." : `Cancel requested: ${r.note ?? "no live process"}`);
       reload();
       if (expanded === runId) await loadEvents(runId);
+      invalidate(["briefs", "brief"], { briefId: data?.runs?.find((x) => x.run_id === runId)?.brief_id });
     } catch (e) {
       setBanner(e instanceof Error ? e.message : "Cancel failed");
     }

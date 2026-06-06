@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { api, subscribeRunEvents, tryGet, tryGetReport } from "../api";
 import { Badge, extractList, useAsync } from "../components/common";
 import { HealthPanel } from "../components/HealthPanel";
+import { invalidate, useInvalidate } from "../invalidate";
 
 // The board summary arrives as an object keyed by board status, e.g.
 // `{ "backlog": 1, "todo": 2, "total": 3 }`.
@@ -183,6 +184,13 @@ export function Overview() {
       unsub();
     };
   }, [refreshActions]);
+  // Client invalidation bus (dashboard-design §11): the EXISTING run-event SSE
+  // (above) covers run-lifecycle change-triggers; the bus covers the NON-run
+  // mutations the operator performs elsewhere in the app — assign, create,
+  // hire, interaction/suggestion answers, orchestration — so the Action Center
+  // feed converges on them without waiting for the 20s poll. Refreshes ONLY the
+  // feed (success-only), never the page's load state.
+  useInvalidate(["actions", "briefs", "mandates"], refreshActions);
 
   const board = data?.board ?? {};
   const inbox = data?.inbox ?? {};
@@ -577,6 +585,9 @@ function ActionCenter({
           : `${a.target_title ?? "Operative"} hired and runnable on ${r.rig ?? a.suggested_rig ?? "echo"}.`,
       });
       onActed();
+      // A hire changes the roster + Mandate readiness — notify those surfaces
+      // (dashboard-design §11). `onActed` already refreshes this Action feed.
+      invalidate(["briefs", "mandates"]);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Approve hire failed";
       setNote({ kind: "err", msg: /clearance/i.test(msg) ? `${msg} — decide its Clearance on Mandates.` : msg });
@@ -593,6 +604,7 @@ function ActionCenter({
       await api.post(`/v1/agents/${encodeURIComponent(a.target_id)}/reject-hire`, {});
       setNote({ kind: "ok", msg: `${a.target_title ?? "Hire"} declined — the role is left unfilled.` });
       onActed();
+      invalidate(["briefs", "mandates"]);
     } catch (e) {
       setNote({ kind: "err", msg: e instanceof Error ? e.message : "Reject hire failed" });
     } finally {

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, tryGet } from "../api";
 import { extractList, Section, useAsync } from "../components/common";
+import { invalidate } from "../invalidate";
 
 // The safe-local Rig bound at hire approval so the Operative is immediately
 // runnable (company-model §12.6 — `agent.approve_hire` accepts a `rig`).
@@ -145,6 +146,9 @@ export function Mandates() {
       setBanner({ kind: "ok", msg: okMsg });
       detail.reload();
       reload();
+      // Strategy / team-plan changes shift Mandate readiness + Action Center
+      // next-actions — notify those surfaces (dashboard-design §11).
+      invalidate(["mandates", "actions"]);
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Action failed" });
     } finally {
@@ -158,6 +162,7 @@ export function Mandates() {
       await api.post(`/v1/spine/clearances/${encodeURIComponent(approvalId)}/decide`, { decision });
       setBanner({ kind: "ok", msg: `Clearance ${decision}d.` });
       detail.reload();
+      invalidate(["mandates", "actions"]);
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Clearance decision failed" });
     } finally {
@@ -186,6 +191,9 @@ export function Mandates() {
       });
       detail.reload();
       reload();
+      // A hire fills a seat — the board's Operative list + the Action Center
+      // hire item update on the surfaces that show them (dashboard-design §11).
+      invalidate(["actions", "briefs", "mandates"]);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Approve hire failed";
       setBanner({ kind: "err", msg: /clearance/i.test(msg) ? `${msg} — decide its Clearance below.` : msg });
@@ -201,6 +209,7 @@ export function Mandates() {
       setBanner({ kind: "ok", msg: `${role ?? "Hire"} declined — the role is left unfilled.` });
       detail.reload();
       reload();
+      invalidate(["actions", "briefs", "mandates"]);
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Reject hire failed" });
     } finally {
@@ -225,6 +234,9 @@ export function Mandates() {
       });
       detail.reload();
       reload();
+      // A real (non-dry) orchestration creates/assigns Briefs — refresh the
+      // board + the Action Center; a dry-run preview creates nothing (§11).
+      if (!dryRun) invalidate(["briefs", "actions", "mandates"]);
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Orchestrate failed" });
     } finally {

@@ -3,6 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { api, tryGet } from "../api";
 import { asArray, extractList, Section, useAsync } from "../components/common";
 import { BriefDetail } from "../components/BriefDetail";
+import { invalidate, useInvalidate } from "../invalidate";
 
 interface Card {
   task_id?: string;
@@ -172,6 +173,14 @@ export function Briefs() {
     };
   }, []);
 
+  // Client invalidation bus (dashboard-design §11): reload the board when the
+  // CO-MOUNTED Brief detail panel reports a change that touches a Brief or its
+  // Shift — a Run started/reviewed/applied, or a `suggest_tasks` accept that
+  // materialized new Sub-briefs — so the columns + run badges stay in lockstep
+  // with the panel beside them. The board's OWN mutations refetch locally and
+  // emit the keys the OTHER surfaces (the open panel, Action Center) need.
+  useInvalidate(["briefs"], reload);
+
   const operatives = data?.operatives ?? [];
   const adapters = data?.adapters ?? [];
   const runs = data?.runs ?? [];
@@ -197,6 +206,9 @@ export function Briefs() {
       });
       setBanner({ kind: "ok", msg: agentId ? "Operative assigned." : "Operative cleared." });
       reload();
+      // Mirror into the open detail panel + clear the "assign an Operative"
+      // Action Center item (dashboard-design §11).
+      invalidate(["brief", "actions"], { briefId: cardId(c) });
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Assign failed" });
     }
@@ -211,6 +223,8 @@ export function Briefs() {
       setCreating(false);
       setBanner({ kind: "ok", msg: "Brief created." });
       reload();
+      // A new unassigned Brief raises an Action Center item (dashboard-design §11).
+      invalidate(["actions"]);
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Create failed" });
     }
@@ -230,6 +244,9 @@ export function Briefs() {
       await api.post(`/v1/spine/briefs/${encodeURIComponent(cardId(c))}/move`, { status });
       setMoveNote({ kind: "ok", msg: `Moved “${name}” → ${label}.` });
       reload();
+      // Mirror the new column into the open detail panel + refresh the Action
+      // Center (a move can clear a blocked/review item) (dashboard-design §11).
+      invalidate(["brief", "actions"], { briefId: cardId(c) });
     } catch (e) {
       const why = e instanceof Error ? e.message : "Move failed";
       setMoveNote({ kind: "err", msg: `Couldn't move “${name}” → ${label}: ${why}` });
@@ -264,6 +281,9 @@ export function Briefs() {
       if (r.status === "running") msg += " — see Active Runs";
       setBanner({ kind, msg });
       reload();
+      // Mirror the started Shift into the open detail panel + the Runs ledger
+      // (dashboard-design §11).
+      invalidate(["brief", "runs"], { briefId: cardId(c) });
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Run failed" });
     }
@@ -578,7 +598,6 @@ export function Briefs() {
               <BriefDetail
                 briefId={selected}
                 onClose={() => setSelected(null)}
-                onChanged={reload}
               />
             </div>
           )}

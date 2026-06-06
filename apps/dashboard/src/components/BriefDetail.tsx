@@ -13,6 +13,7 @@ import {
 } from "../api";
 import { useAuth } from "../auth";
 import { Badge, useAsync } from "./common";
+import { invalidate, useInvalidate } from "../invalidate";
 
 // The structured result of starting a Shift (`POST …/briefs/:id/run`). Mirrors
 // the board's run handling so a refusal reads the same everywhere.
@@ -169,11 +170,9 @@ function eventTone(type?: string): string {
 export function BriefDetail({
   briefId,
   onClose,
-  onChanged,
 }: {
   briefId: string;
   onClose: () => void;
-  onChanged?: () => void;
 }) {
   const { status } = useAuth();
   const [comment, setComment] = useState("");
@@ -235,6 +234,14 @@ export function BriefDetail({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Client invalidation bus (dashboard-design §11): refetch this Brief when a
+  // CO-MOUNTED surface (the Issue board beside this panel) reports it changed —
+  // e.g. an assign/move on the board card mirrors into the open detail without
+  // a manual Refresh. Scoped to THIS Brief so other Briefs' churn is ignored.
+  useInvalidate("brief", reload, {
+    match: (m) => !m.briefId || m.briefId === briefId,
+  });
+
   const d = data?.detail.data ?? {};
   const f = d.fields ?? {};
   const loadErr = error ?? data?.detail.error ?? null;
@@ -284,7 +291,6 @@ export function BriefDetail({
       setComment("");
       setBanner({ kind: "ok", msg: "Comment posted to the Conversation." });
       reload();
-      onChanged?.();
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Comment failed" });
     } finally {
@@ -315,7 +321,9 @@ export function BriefDetail({
       });
       setIxDraft((m) => ({ ...m, [it.interaction_id]: "" }));
       reload();
-      onChanged?.();
+      // Answering a Request can clear an Action Center item (§1.9); a `confirm`
+      // can also unblock board work — refresh those co-mounted surfaces.
+      invalidate(["briefs", "actions"], { briefId });
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Response failed" });
     } finally {
@@ -345,7 +353,9 @@ export function BriefDetail({
           : "Suggestion declined.",
       });
       reload();
-      onChanged?.();
+      // Accept materializes child Sub-briefs on the board and adds
+      // "assign an Operative" items to the Action Center (§1.9) — refresh both.
+      invalidate(["briefs", "actions"], { briefId });
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Response failed" });
     } finally {
@@ -372,7 +382,8 @@ export function BriefDetail({
       if (r.install_hint) msg += ` (${r.install_hint})`;
       setBanner({ kind: accepted ? "ok" : refusal ? "info" : "err", msg });
       reload();
-      onChanged?.();
+      // Starting a Shift updates the board card's run badge + the Runs ledger.
+      invalidate(["briefs", "runs"], { briefId });
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Run failed" });
     } finally {
@@ -388,7 +399,8 @@ export function BriefDetail({
       await runControls.review(lr.run_id, decision);
       setBanner({ kind: "ok", msg: `Shift ${decision}.` });
       reload();
-      onChanged?.();
+      // Review verdict shows on the board card + the Runs ledger.
+      invalidate(["briefs", "runs"], { briefId });
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Review failed" });
     }
@@ -407,7 +419,8 @@ export function BriefDetail({
           (r.brief_status === "done" ? " — Brief marked done." : "."),
       });
       reload();
-      onChanged?.();
+      // Apply can advance the Brief to done — refresh the board card + Runs.
+      invalidate(["briefs", "runs"], { briefId });
       await loadDiff();
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Apply failed" });
@@ -425,6 +438,8 @@ export function BriefDetail({
         msg: r.active ? "Cancellation signalled — the Shift will report cancelled." : `Cancel requested: ${r.note ?? "no live process"}`,
       });
       reload();
+      // A cancellation request shows on the board card + the Runs ledger.
+      invalidate(["briefs", "runs"], { briefId });
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Cancel failed" });
     }
