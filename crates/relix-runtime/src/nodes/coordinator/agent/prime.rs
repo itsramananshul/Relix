@@ -473,6 +473,20 @@ pub enum StartReadiness {
 }
 
 impl StartReadiness {
+    /// A stable wire string for the dashboard Shift Room (PART A). Mirrors the
+    /// variant names so the UI can switch on a single field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StartReadiness::Ready => "ready",
+            StartReadiness::Unassigned => "unassigned",
+            StartReadiness::Blocked => "blocked",
+            StartReadiness::Complete => "complete",
+            StartReadiness::Cancelled => "cancelled",
+            StartReadiness::Missing => "missing",
+            StartReadiness::NotReady => "not_ready",
+        }
+    }
+
     /// `None` when the Brief should be started; otherwise the honest reason it
     /// is skipped.
     pub fn skip_reason(self) -> Option<&'static str> {
@@ -487,6 +501,34 @@ impl StartReadiness {
             StartReadiness::Missing => Some("Brief no longer exists"),
             StartReadiness::NotReady => {
                 Some("not startable right now (assignee inactive or a Shift is already live)")
+            }
+        }
+    }
+}
+
+/// Classify a created Brief's Start readiness from the live signals the
+/// handler already has: its board status, whether it has an assignee, and
+/// whether the canonical ready-set (assigned-to-active + unblocked +
+/// unclaimed) contains it. PURE — the single source of truth shared by
+/// `prime.start` (what to run) and `prime.status` (what to SHOW). A
+/// `None`/missing card is the caller's `Missing`.
+pub fn classify_start_readiness(
+    board_status: &str,
+    has_assignee: bool,
+    in_ready_set: bool,
+) -> StartReadiness {
+    if in_ready_set {
+        return StartReadiness::Ready;
+    }
+    match board_status {
+        "done" | "in_review" => StartReadiness::Complete,
+        "cancelled" => StartReadiness::Cancelled,
+        "blocked" => StartReadiness::Blocked,
+        _ => {
+            if has_assignee {
+                StartReadiness::NotReady
+            } else {
+                StartReadiness::Unassigned
             }
         }
     }

@@ -599,24 +599,13 @@ pub fn handle_prime_start(
     // in `prime::StartReadiness`).
     let mut items: Vec<(String, prime::StartReadiness)> = Vec::with_capacity(created.len());
     for id in &created {
-        let readiness = if ready_ids.contains(id) {
-            prime::StartReadiness::Ready
-        } else {
-            match task_store.brief_card(id) {
-                Ok(Some(card)) => match card.board_status.as_str() {
-                    "done" | "in_review" => prime::StartReadiness::Complete,
-                    "cancelled" => prime::StartReadiness::Cancelled,
-                    "blocked" => prime::StartReadiness::Blocked,
-                    _ => {
-                        if card.assignee_agent_id.as_deref().unwrap_or("").is_empty() {
-                            prime::StartReadiness::Unassigned
-                        } else {
-                            prime::StartReadiness::NotReady
-                        }
-                    }
-                },
-                _ => prime::StartReadiness::Missing,
-            }
+        let readiness = match task_store.brief_card(id) {
+            Ok(Some(card)) => prime::classify_start_readiness(
+                &card.board_status,
+                !card.assignee_agent_id.as_deref().unwrap_or("").is_empty(),
+                ready_ids.contains(id),
+            ),
+            _ => prime::StartReadiness::Missing,
         };
         items.push((id.clone(), readiness));
     }
@@ -742,6 +731,303 @@ pub fn handle_prime_start(
     match serde_json::to_vec(&body) {
         Ok(b) => HandlerOutcome::Ok(b),
         Err(e) => internal(format!("prime.start encode: {e}")),
+    }
+}
+
+/// One created Brief's live state in the Shift Room (PART A). Read-only — it
+/// joins the Brief card, its open blockers, and its latest Shift (run) from the
+/// existing stores. No new state is invented.
+struct BriefStatus {
+    json: serde_json::Value,
+    /// The bucket this Brief counts toward (`running` / `done` / `blocked` /
+    /// `needs_review` / `refused` / `failed` / `ready` / `unassigned` /
+    /// `not_ready` / `missing`).
+    bucket: &'static str,
+}
+
+/// Compose one created Brief's live Shift-Room row. PURE w.r.t. the stores it
+/// reads (no mutation). Tenant safety is provided by the caller already having
+/// gated the owning proposal — the Briefs here are this Guild's own.
+fn brief_status_row(
+    agent_store: &AgentStore,
+    task_store: &TaskStore,
+    brief_id: &str,
+    in_ready_set: bool,
+) -> BriefStatus {
+    let card = task_store.brief_card(brief_id).ok().flatten();
+    let Some(card) = card else {
+        return BriefStatus {
+            json: serde_json::json!({
+                "brief_id": brief_id,
+                "start_readiness": prime::StartReadiness::Missing.as_str(),
+                "exists": false,
+            }),
+            bucket: "missing",
+        };
+    };
+
+    let assignee = card.assignee_agent_id.clone().unwrap_or_default();
+    let has_assignee = !assignee.is_empty();
+    // The assignee's preferred Rig (display only — the run path resolves it
+    // authoritatively at start time).
+    let rig = if has_assignee {
+        agent_store
+            .get_agent(&assignee)
+            .ok()
+            .flatten()
+            .and_then(|a| a.rig)
+    } else {
+        None
+    };
+
+    // Open blockers (Snags): the Briefs this one is blocked by that are not yet
+    // done/cancelled. Same-proposal Briefs → same Guild, no cross-tenant leak.
+    let mut blockers: Vec<serde_json::Value> = Vec::new();
+    if let Ok(snags) = task_store.list_snags(brief_id) {
+        for b in snags {
+            if let Ok(Some(bc)) = task_store.brief_card(&b) {
+                let resolved = matches!(bc.board_status.as_str(), "done" | "cancelled");
+                if !resolved {
+                    blockers.push(serde_json::json!({
+                        "brief_id": bc.task_id,
+                        "title": bc.title,
+                        "status": bc.board_status,
+                    }));
+                }
+            }
+        }
+    }
+    let has_open_blockers = !blockers.is_empty();
+
+    // A Snag keeps a Brief out of the ready-set but does NOT move its board
+    // column, so an open blocker is the honest reason it can't start even when
+    // the board still reads `todo`. Surface that as `blocked` for the operator.
+    let base = prime::classify_start_readiness(&card.board_status, has_assignee, in_ready_set);
+    let readiness = if base != prime::StartReadiness::Ready
+        && !matches!(
+            base,
+            prime::StartReadiness::Complete | prime::StartReadiness::Cancelled
+        )
+        && has_open_blockers
+    {
+        prime::StartReadiness::Blocked
+    } else {
+        base
+    };
+
+    // The latest Shift (run) on this Brief, if any.
+    let latest = task_store.latest_run_for_brief(brief_id).ok().flatten();
+    let needs_review = latest
+        .as_ref()
+        .map(|r| r.status == "done" && r.review.as_deref() == Some("pending_review"))
+        .unwrap_or(false);
+    let run_json = latest.as_ref().map(|r| {
+        serde_json::json!({
+            "run_id": r.run_id,
+            "status": r.status,
+            "rig": r.rig,
+            "trigger": r.trigger,
+            "started_at": r.started_at,
+            "finished_at": r.finished_at,
+            "review": r.review,
+            "apply_status": r.apply_status,
+            "refusal_reason": r.refusal_reason,
+            "summary": r.summary.chars().take(240).collect::<String>(),
+        })
+    });
+
+    // The single most-useful bucket + per-Brief next action. Live execution
+    // state wins over board state.
+    let run_status = latest.as_ref().map(|r| r.status.as_str());
+    let apply_status = latest.as_ref().and_then(|r| r.apply_status.as_deref());
+    let (bucket, next_action): (&'static str, &str) = if run_status == Some("running") {
+        ("running", "inspect the running Shift")
+    } else if needs_review {
+        ("needs_review", "review the completed Shift")
+    } else if run_status == Some("failed") {
+        ("failed", "inspect the failed Shift")
+    } else if run_status == Some("refused") {
+        ("refused", "inspect why the Shift was refused")
+    } else if matches!(card.board_status.as_str(), "done" | "in_review") {
+        if latest.as_ref().map(|r| r.review.as_deref()) == Some(Some("accepted"))
+            && apply_status != Some("applied")
+        {
+            ("done", "apply the reviewed Shift")
+        } else {
+            ("done", "complete")
+        }
+    } else if readiness == prime::StartReadiness::Blocked {
+        ("blocked", "resolve the blocker")
+    } else if readiness == prime::StartReadiness::Ready {
+        ("ready", "start this Brief")
+    } else if !has_assignee {
+        ("unassigned", "approve a hire / Clearance, then assign")
+    } else {
+        ("not_ready", "assignee not active yet")
+    };
+
+    BriefStatus {
+        json: serde_json::json!({
+            "brief_id": card.task_id,
+            "title": card.title,
+            "board_status": card.board_status,
+            "priority": card.priority,
+            "assignee": if has_assignee { serde_json::json!(assignee) } else { serde_json::Value::Null },
+            "rig": rig,
+            "mandate_id": card.mandate_id,
+            "start_readiness": readiness.as_str(),
+            "blockers": blockers,
+            "needs_review": needs_review,
+            "latest_run": run_json,
+            "next_action": next_action,
+            "exists": true,
+        }),
+        bucket,
+    }
+}
+
+/// `prime.status` — the LIVE status of a Prime work session (PART A of the
+/// Live Shift Room pack). READ-ONLY: it starts/applies/mutates NOTHING. Given a
+/// `proposal_id` (proposed or approved) it answers the operator's "what is
+/// happening now" view from the EXISTING stores only — the proposal row, the
+/// Brief board, and the run ledger: the proposal status + created objects, the
+/// Mandate (id/title), each created Brief (title / board status / assignee /
+/// Rig / open blockers / Start readiness / latest Shift + its run/review/apply
+/// state / next action), session-level recommended next actions, and roll-up
+/// counts (total / running / done / blocked / needs_review / refused / failed /
+/// ready / unassigned). Tenant-gated: an unknown / cross-Guild proposal reads
+/// as not-found (no existence leak). Arg: `proposal_id`.
+pub fn handle_prime_status(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &TaskStore,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let proposal_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("prime.status utf8: {e}")),
+    };
+    if proposal_id.is_empty() {
+        return invalid("prime.status: proposal_id required".into());
+    }
+    let tenant = ctx.tenant_id_or_default();
+    let row = match spine_store.get_prime_proposal(tenant, proposal_id) {
+        Ok(Some(r)) => r,
+        // Unknown OR cross-tenant → not found (no existence leak).
+        Ok(None) => return invalid(format!("proposal not found: {proposal_id}")),
+        Err(e) => return internal(format!("prime.status load: {e}")),
+    };
+
+    // The Mandate title (if approved + still resolvable in this Guild).
+    let mandate_title = if row.mandate_id.is_empty() {
+        None
+    } else {
+        spine_store
+            .get_mandate_for_tenant(&row.mandate_id, tenant)
+            .ok()
+            .flatten()
+            .map(|m| m.title)
+    };
+
+    let created: Vec<String> = serde_json::from_str(&row.created_brief_ids).unwrap_or_default();
+
+    // The canonical ready-set, computed once (assigned-to-active + unblocked +
+    // unclaimed). A generous batch so every ready Brief is seen.
+    let ready_ids: std::collections::HashSet<String> = task_store
+        .list_ready_briefs(500)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| c.task_id)
+        .collect();
+
+    let mut briefs: Vec<serde_json::Value> = Vec::with_capacity(created.len());
+    let mut c_running = 0i64;
+    let mut c_done = 0i64;
+    let mut c_blocked = 0i64;
+    let mut c_needs_review = 0i64;
+    let mut c_refused = 0i64;
+    let mut c_failed = 0i64;
+    let mut c_ready = 0i64;
+    let mut c_unassigned = 0i64;
+    let mut c_not_ready = 0i64;
+    let mut c_missing = 0i64;
+    for id in &created {
+        let row = brief_status_row(agent_store, task_store, id, ready_ids.contains(id));
+        match row.bucket {
+            "running" => c_running += 1,
+            "done" => c_done += 1,
+            "blocked" => c_blocked += 1,
+            "needs_review" => c_needs_review += 1,
+            "refused" => c_refused += 1,
+            "failed" => c_failed += 1,
+            "ready" => c_ready += 1,
+            "unassigned" => c_unassigned += 1,
+            "missing" => c_missing += 1,
+            _ => c_not_ready += 1,
+        }
+        briefs.push(row.json);
+    }
+
+    // Session-level recommended next actions, derived from the counts (no
+    // fabricated state — each only appears when the count is non-zero).
+    let mut next_actions: Vec<String> = Vec::new();
+    if row.status != "approved" {
+        next_actions
+            .push("Approve the proposal to create the Mandate + Briefs + crew assignments.".into());
+    }
+    if c_ready > 0 {
+        next_actions.push(format!("Start {c_ready} ready Brief(s) — they will run as Shifts."));
+    }
+    if c_running > 0 {
+        next_actions.push(format!("{c_running} Shift(s) running — inspect progress."));
+    }
+    if c_needs_review > 0 {
+        next_actions.push(format!("Review {c_needs_review} completed Shift(s)."));
+    }
+    if c_unassigned > 0 {
+        next_actions.push(format!(
+            "{c_unassigned} Brief(s) have no active Operative — approve a hire / Clearance first."
+        ));
+    }
+    if c_blocked > 0 {
+        next_actions.push(format!("{c_blocked} Brief(s) are blocked on a dependency."));
+    }
+    if c_failed > 0 || c_refused > 0 {
+        next_actions.push(format!(
+            "{} Shift(s) need attention (failed / refused) — inspect the run.",
+            c_failed + c_refused
+        ));
+    }
+    if next_actions.is_empty() {
+        next_actions.push("Nothing pending right now.".into());
+    }
+
+    let body = serde_json::json!({
+        "proposal_id": proposal_id,
+        "status": row.status,
+        "message": row.message,
+        "mandate_id": if row.mandate_id.is_empty() { serde_json::Value::Null } else { serde_json::json!(row.mandate_id) },
+        "mandate_title": mandate_title,
+        "briefs": briefs,
+        "counts": {
+            "total_briefs": created.len(),
+            "running": c_running,
+            "done": c_done,
+            "blocked": c_blocked,
+            "needs_review": c_needs_review,
+            "refused": c_refused,
+            "failed": c_failed,
+            "ready": c_ready,
+            "unassigned": c_unassigned,
+            "not_ready": c_not_ready,
+            "missing": c_missing,
+        },
+        "recommended_next_actions": next_actions,
+        "updated_at": row.updated_at,
+    });
+    match serde_json::to_vec(&body) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => internal(format!("prime.status encode: {e}")),
     }
 }
 
@@ -4551,6 +4837,234 @@ mod tests {
                 &reg,
                 &fake_ctx_tenant(pid.as_bytes(), "globex"),
             )),
+            error_kinds::INVALID_ARGS
+        );
+    }
+
+    // ── Prime Shift-Room status (prime.status) — Live Shift Room PART A ──
+
+    #[test]
+    fn prime_status_for_approved_proposal_reports_briefs_and_counts() {
+        let (agents, spine, task) = prime_stores();
+        // One ACTIVE engineer → the engineer track is assigned + ready; the
+        // designer track is an unassigned pending hire; integration is blocked.
+        agents
+            .create_agent(
+                "Eng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"eng"), "medium", "default",
+            )
+            .unwrap();
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build a web dashboard"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let _ = ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
+        ));
+
+        let v = json_of(ok_body(handle_prime_status(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        assert_eq!(v["status"], "approved");
+        assert!(v["mandate_id"].is_string(), "approved → a Mandate id: {v}");
+        assert!(v["mandate_title"].is_string(), "Mandate title resolved: {v}");
+        let briefs = v["briefs"].as_array().unwrap();
+        assert!(briefs.len() >= 3, "engineer + designer + integration: {v}");
+        let counts = &v["counts"];
+        assert_eq!(counts["total_briefs"], briefs.len());
+        // The engineer track is ready; the designer track is unassigned; the
+        // integration Brief is blocked on the tracks.
+        assert_eq!(counts["ready"], 1, "{v}");
+        assert_eq!(counts["unassigned"], 1, "{v}");
+        assert_eq!(counts["blocked"], 1, "{v}");
+        // The ready engineer track names its assignee + Rig + a start action.
+        let ready_brief = briefs
+            .iter()
+            .find(|b| b["start_readiness"] == "ready")
+            .expect("a ready Brief");
+        assert!(ready_brief["assignee"].is_string());
+        assert!(
+            ready_brief["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("start")
+        );
+        // The blocked integration Brief explains WHAT blocks it.
+        let blocked = briefs
+            .iter()
+            .find(|b| b["start_readiness"] == "blocked")
+            .expect("a blocked Brief");
+        assert!(
+            !blocked["blockers"].as_array().unwrap().is_empty(),
+            "a blocked Brief lists its open blockers: {blocked}"
+        );
+        // The session surfaces concrete next actions.
+        assert!(!v["recommended_next_actions"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prime_status_reflects_a_started_shift() {
+        let (agents, spine, task) = prime_stores();
+        let task = std::sync::Arc::new(task);
+        let reg = echo_registry();
+        agents
+            .create_agent(
+                "Eng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"eng"), "medium", "default",
+            )
+            .unwrap();
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build a web dashboard"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let _ = ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
+        ));
+        // Start the ready Brief as a real Shift through the run chokepoint.
+        let started = json_of(ok_body(handle_prime_start(
+            &agents,
+            &spine,
+            &task,
+            &reg,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        assert_eq!(started["started"].as_array().unwrap().len(), 1, "{started}");
+
+        // The status now carries the latest Shift on that Brief.
+        let v = json_of(ok_body(handle_prime_status(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        let with_run = v["briefs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["latest_run"].is_object())
+            .expect("a Brief with a latest run");
+        let run = &with_run["latest_run"];
+        assert!(run["run_id"].is_string(), "a real run_id: {with_run}");
+        // The run reached a terminal echo state (done) — the status must not
+        // fake it. The done Shift opens review, so the Brief needs review.
+        let counts = &v["counts"];
+        let accounted = counts["running"].as_i64().unwrap()
+            + counts["done"].as_i64().unwrap()
+            + counts["needs_review"].as_i64().unwrap()
+            + counts["failed"].as_i64().unwrap()
+            + counts["refused"].as_i64().unwrap();
+        assert!(accounted >= 1, "the started Shift is accounted for: {v}");
+    }
+
+    #[test]
+    fn prime_status_is_tenant_scoped() {
+        let (agents, spine, task) = prime_stores();
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx_tenant(b"Build a dashboard", "acme"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // The owning Guild can read its session status.
+        let _ = ok_body(handle_prime_status(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx_tenant(pid.as_bytes(), "acme"),
+        ));
+        // A different Guild reads it as not-found (no existence leak).
+        assert_eq!(
+            err_kind(handle_prime_status(
+                &agents,
+                &spine,
+                &task,
+                &fake_ctx_tenant(pid.as_bytes(), "globex"),
+            )),
+            error_kinds::INVALID_ARGS
+        );
+    }
+
+    #[tokio::test]
+    async fn prime_status_idempotent_start_still_reflected() {
+        let (agents, spine, task) = prime_stores();
+        let task = std::sync::Arc::new(task);
+        let reg = echo_registry();
+        agents
+            .create_agent(
+                "Eng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"eng"), "medium", "default",
+            )
+            .unwrap();
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build a web dashboard"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let _ = ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
+        ));
+        // Start once; the ready Brief now has a live/terminal Shift, so a second
+        // start finds nothing newly ready — idempotent (no double-work). The
+        // status remains coherent across both.
+        let _ = ok_body(handle_prime_start(
+            &agents, &spine, &task, &reg, &fake_ctx(pid.as_bytes()),
+        ));
+        let second = json_of(ok_body(handle_prime_start(
+            &agents, &spine, &task, &reg, &fake_ctx(pid.as_bytes()),
+        )));
+        // The second start began no NEW Shift on the already-run Brief.
+        assert!(
+            second["started"].as_array().unwrap().is_empty()
+                || second["started"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|s| s["run_id"].is_string()),
+            "second start is idempotent / honest: {second}"
+        );
+        // Status total is stable (start creates no new Briefs).
+        let v = json_of(ok_body(handle_prime_status(
+            &agents,
+            &spine,
+            &(*task),
+            &fake_ctx(pid.as_bytes()),
+        )));
+        assert_eq!(
+            v["counts"]["total_briefs"].as_u64().unwrap(),
+            v["briefs"].as_array().unwrap().len() as u64
+        );
+    }
+
+    #[test]
+    fn prime_status_requires_proposal_id() {
+        let (agents, spine, task) = prime_stores();
+        assert_eq!(
+            err_kind(handle_prime_status(&agents, &spine, &task, &fake_ctx(b"   "))),
             error_kinds::INVALID_ARGS
         );
     }

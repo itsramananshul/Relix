@@ -3314,6 +3314,22 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // PRIME ASSISTANT: the LIVE Shift-Room status of one work session
+    // (proposal). READ-ONLY — joins the proposal row, the Brief board, and the
+    // run ledger into a single command-center payload. Tenant-scoped.
+    if let Some(spine) = spine_store.clone() {
+        let s = agent_store.clone();
+        let ts = task_store.clone();
+        bridge.register(
+            "prime.status",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let spine = spine.clone();
+                let ts = ts.clone();
+                async move { handlers::handle_prime_status(&s, &spine, &ts, &ctx) }
+            })),
+        );
+    }
     if let Some(spine) = spine_store.clone() {
         bridge.register(
             "mandate.orchestration.latest",
