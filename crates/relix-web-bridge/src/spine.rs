@@ -1709,6 +1709,16 @@ pub struct SuggestChild {
     /// remaps it at open time; the bridge just forwards it.
     #[serde(default)]
     pub after: Option<usize>,
+    /// Optional explicit assignee hint by Operative id (§1.9, model A).
+    /// Mutually exclusive with `assignee_role`. The coordinator validates +
+    /// assign-Key gates it at accept; the bridge just forwards it.
+    #[serde(default)]
+    pub assignee_agent_id: Option<String>,
+    /// Optional explicit assignee hint by role (§1.9, model B) — resolved to
+    /// the oldest active same-role Operative at accept. Mutually exclusive
+    /// with `assignee_agent_id`.
+    #[serde(default)]
+    pub assignee_role: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1746,6 +1756,8 @@ pub async fn open_suggestion(
                 "title": c.title,
                 "priority": c.priority,
                 "after": c.after,
+                "assignee_agent_id": c.assignee_agent_id,
+                "assignee_role": c.assignee_role,
             })
         })
         .collect();

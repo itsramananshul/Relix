@@ -1814,6 +1814,39 @@ impl TaskStore {
         Ok(interaction_id)
     }
 
+    /// Read the proposal of an **open** `suggest_tasks` card without
+    /// answering it (§1.9). The wire handler uses this to resolve +
+    /// assign-Key gate each child's optional assignee hint *before* the
+    /// (claiming) [`respond_suggestion`] accept, so an invalid hint is
+    /// refused with no partial creation. Returns `Ok(None)` when the card
+    /// is absent / not a `suggest_tasks` card / no longer `open` (or its
+    /// proposal won't parse) — the subsequent `respond_suggestion` then
+    /// produces the precise typed error.
+    pub fn suggestion_proposal(
+        &self,
+        task_id: &str,
+        interaction_id: &str,
+    ) -> Result<Option<brief::Proposal>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let row: Option<(String, String, Option<String>)> = conn
+            .query_row(
+                "SELECT kind, status, proposal FROM brief_interactions
+                 WHERE interaction_id = ?1 AND task_id = ?2",
+                params![interaction_id, task_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        match row {
+            Some((kind, status, Some(p)))
+                if kind == "suggest_tasks" && status == "open" =>
+            {
+                Ok(serde_json::from_str(&p).ok())
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// §1.9 (`suggest_tasks`): answer a task-suggestion card.
     ///
     /// - **reject** (`accept == false`): atomically flips the card
@@ -1827,9 +1860,14 @@ impl TaskStore {
     ///   stamped, owner-attributed). Each child **inherits the parent's safe
     ///   spine context** so the children stay company-consistent: the
     ///   parent's `mandate_id` / `campaign_id` (passed at create) and its
-    ///   `reviewer_agent_id` (set best-effort after create). The **assignee
-    ///   is intentionally NOT inherited** — assignment runs governance
-    ///   gating, so it stays deferred. Where a child carries an `after`
+    ///   `reviewer_agent_id` (set best-effort after create). The **parent's
+    ///   assignee is never inherited.** A child is assigned only when
+    ///   `resolved_assignees[i]` carries an id — the wire handler resolved +
+    ///   assign-Key gated each child's optional hint (§1.9) *before* this
+    ///   (claiming) accept, so an invalid/cross-Guild/inactive hint already
+    ///   refused the whole accept with NO partial creation; here we just
+    ///   apply the validated assignee (a `None` slot opens the child
+    ///   unassigned, the default). Where a child carries an `after`
     ///   dependency (§1.6, validated + remapped at open time) it is wired as
     ///   a Snag (`blocked_on`) on the referenced earlier sibling — both
     ///   already exist because children are created in order. Records the
@@ -1839,6 +1877,7 @@ impl TaskStore {
     ///
     /// The card must be an `open` `suggest_tasks` card belonging to
     /// `task_id` (else `NotFound` / `Invalid`).
+    #[allow(clippy::too_many_arguments)]
     pub fn respond_suggestion(
         &self,
         tenant: &str,
@@ -1847,6 +1886,7 @@ impl TaskStore {
         interaction_id: &str,
         responder: &str,
         accept: bool,
+        resolved_assignees: &[Option<String>],
     ) -> Result<Vec<String>, CoordinatorError> {
         let responder = responder.trim();
         if responder.is_empty() {
@@ -1925,16 +1965,26 @@ impl TaskStore {
             None => (None, None, None),
         };
         let mut created: Vec<String> = Vec::new();
-        for c in &proposal.children {
+        let mut assigned = 0usize;
+        for (idx, c) in proposal.children.iter().enumerate() {
+            // Apply the pre-validated assignee for this child (the wire
+            // handler resolved + assign-Key gated each hint BEFORE this
+            // claiming accept, so a bad hint already refused the whole
+            // accept). A `None`/absent slot opens the child unassigned —
+            // the default; the parent's assignee is never inherited.
+            let assignee = resolved_assignees.get(idx).and_then(|o| o.as_deref());
             let child = self.create_brief(
                 tenant,
                 &c.title,
                 owner_subject_id,
-                None, // assignee — deferred (governance-gated)
+                assignee,
                 inh_mandate.as_deref(),
                 inh_campaign.as_deref(),
                 c.priority.as_deref(),
             )?;
+            if assignee.is_some() {
+                assigned += 1;
+            }
             self.link_subbrief(task_id, &child)?;
             // Inherit the parent's reviewer best-effort: a fresh child has
             // none, and carrying the parent's keeps the review chain intact.
@@ -1984,6 +2034,7 @@ impl TaskStore {
                  WHERE interaction_id = ?2 AND task_id = ?3",
                 params![joined, interaction_id, task_id],
             );
+            let needs_assignment = created.len().saturating_sub(assigned);
             let _ = conn.execute(
                 "INSERT INTO task_events (task_id, ts, event_type, payload)
                  VALUES (?1, ?2, 'brief.suggestion_materialized', ?3)",
@@ -1991,7 +2042,7 @@ impl TaskStore {
                     task_id,
                     now,
                     format!(
-                        "{responder}: created {} (inherited: {inherited}; {dep_edges} dependency edge(s)) — {joined}",
+                        "{responder}: created {} ({assigned} assigned, {needs_assignment} need assignment; inherited: {inherited}; {dep_edges} dependency edge(s)) — {joined}",
                         created.len()
                     )
                 ],
@@ -9984,11 +10035,13 @@ pub fn register(
     }
     {
         let s = store.clone();
+        let a = agent_store.clone();
         bridge.register(
             "brief.suggest_respond",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
-                async move { handle_brief_suggest_respond(&s, &ctx) }
+                let a = a.clone();
+                async move { handle_brief_suggest_respond(&s, a.as_deref(), &ctx) }
             })),
         );
     }
@@ -11746,7 +11799,11 @@ fn handle_brief_suggest_open(store: &TaskStore, ctx: &InvocationCtx) -> HandlerO
 /// `verdict` is `accept` (materialize children) or `reject` (close, no
 /// Briefs). Accept returns JSON `{"created":[child_ids]}`; reject
 /// returns `{"created":[]}`. A duplicate answer is a typed refusal.
-fn handle_brief_suggest_respond(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+fn handle_brief_suggest_respond(
+    store: &TaskStore,
+    agent_store: Option<&agent::AgentStore>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
     let raw = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
         Err(e) => return invalid(format!("brief.suggest_respond utf8: {e}")),
@@ -11769,14 +11826,65 @@ fn handle_brief_suggest_respond(store: &TaskStore, ctx: &InvocationCtx) -> Handl
         "reject" => false,
         other => return invalid(format!("brief.suggest_respond: verdict must be accept|reject, got `{other}`")),
     };
+    let interaction = parts[1].trim();
+    // Resolve + assign-Key gate each proposed child's optional assignee hint
+    // (§1.9) BEFORE the (claiming) accept, so an invalid / cross-Guild /
+    // inactive hint refuses the whole accept with NO partial child creation.
+    // A `None` slot (or absent hint) opens that child unassigned — today's
+    // default. The reject path carries no assignees.
+    let resolved: Vec<Option<String>> = if accept {
+        match store.suggestion_proposal(task, interaction) {
+            Ok(Some(proposal)) => {
+                let mut out: Vec<Option<String>> = Vec::with_capacity(proposal.children.len());
+                for c in &proposal.children {
+                    let has_hint =
+                        c.assignee_agent_id.is_some() || c.assignee_role.is_some();
+                    match agent_store {
+                        Some(astore) => {
+                            match agent::handlers::resolve_assignee_hint(
+                                astore,
+                                ctx,
+                                c.assignee_agent_id.as_deref(),
+                                c.assignee_role.as_deref(),
+                            ) {
+                                Ok(a) => out.push(a),
+                                // Refuse the whole accept — the card stays
+                                // `open`, no child is created.
+                                Err(denial) => return denial,
+                            }
+                        }
+                        // No agent store wired (not the bridge path): a hint
+                        // can't be governance-validated, so refuse to honour
+                        // it rather than assign ungated. No hint → unassigned.
+                        None => {
+                            if has_hint {
+                                return internal(
+                                    "brief.suggest_respond: assignee hint present but the agent store is unavailable".to_string(),
+                                );
+                            }
+                            out.push(None);
+                        }
+                    }
+                }
+                out
+            }
+            // Card not found / not open / unparsable proposal: fall through —
+            // `respond_suggestion` produces the precise typed error.
+            Ok(None) => Vec::new(),
+            Err(e) => return map_edge_err("brief.suggest_respond", e),
+        }
+    } else {
+        Vec::new()
+    };
     let owner = ctx.caller.subject_id.to_string();
     match store.respond_suggestion(
         ctx.tenant_id_or_default(),
         &owner,
         task,
-        parts[1].trim(),
+        interaction,
         parts[2].trim(),
         accept,
+        &resolved,
     ) {
         Ok(created) => match serde_json::to_vec(&serde_json::json!({ "created": created })) {
             Ok(b) => HandlerOutcome::Ok(b),
@@ -19750,11 +19858,13 @@ mod tests {
             .create_brief("acme", "Parent epic", "subj", None, None, None, None)
             .unwrap();
         let children = vec![
-            brief::ChildSpec { title: "Design the API".into(), priority: None, after: None },
+            brief::ChildSpec { title: "Design the API".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
             brief::ChildSpec {
                 title: "Wire the store".into(),
                 priority: Some("high".into()),
                 after: None,
+                assignee_agent_id: None,
+                assignee_role: None,
             },
         ];
         let id = s
@@ -19770,7 +19880,7 @@ mod tests {
         assert_eq!(listed[0].proposal.as_ref().unwrap().children.len(), 2);
 
         let created = s
-            .respond_suggestion("acme", "subj", &parent, &id, "founder", true)
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
             .unwrap();
         assert_eq!(created.len(), 2, "two children created");
         // Both are real Briefs, linked as Sub-briefs of the parent.
@@ -19819,14 +19929,14 @@ mod tests {
         s.set_brief_field(&parent, "reviewer", "agent_reviewer").unwrap();
 
         let children = vec![
-            brief::ChildSpec { title: "Child one".into(), priority: None, after: None },
-            brief::ChildSpec { title: "Child two".into(), priority: None, after: None },
+            brief::ChildSpec { title: "Child one".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
+            brief::ChildSpec { title: "Child two".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
         ];
         let id = s
             .open_suggestion(&parent, "operative-1", "Break it down", &children)
             .unwrap();
         let created = s
-            .respond_suggestion("acme", "subj", &parent, &id, "founder", true)
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
             .unwrap();
         assert_eq!(created.len(), 2);
         for c in &created {
@@ -19863,6 +19973,120 @@ mod tests {
         );
     }
 
+    // §1.9 (governed assignee hints): accept applies the pre-validated
+    // per-child assignees — one child assigned, one left unassigned — and
+    // the Chronicle names the split. (Resolution + the assign-Key gate run
+    // in the wire handler before this call; here we pin the materialization
+    // that applies the validated result.)
+    #[test]
+    fn brief_suggestion_accept_applies_resolved_assignees() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Parent", "subj", None, None, None, None)
+            .unwrap();
+        let children = vec![
+            brief::ChildSpec {
+                title: "Assigned child".into(),
+                priority: None,
+                after: None,
+                assignee_agent_id: Some("agt_eng_1".into()),
+                assignee_role: None,
+            },
+            brief::ChildSpec {
+                title: "Unassigned child".into(),
+                priority: None,
+                after: None,
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
+        ];
+        let id = s
+            .open_suggestion(&parent, "op", "Plan with one assignment", &children)
+            .unwrap();
+        // The handler would resolve these; here we pass the validated result.
+        let resolved = vec![Some("agt_eng_1".to_string()), None];
+        let created = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &resolved)
+            .unwrap();
+        assert_eq!(created.len(), 2);
+        // Child #0 carries the assignee; child #1 opens unassigned.
+        let f0 = s.brief_fields(&created[0]).unwrap().unwrap();
+        assert_eq!(f0.assignee_agent_id.as_deref(), Some("agt_eng_1"));
+        let f1 = s.brief_fields(&created[1]).unwrap().unwrap();
+        assert_eq!(f1.assignee_agent_id, None, "second child stays unassigned");
+        // The assigned child records a `brief.assigned` Chronicle event.
+        let assigned_events = s
+            .query_events(&created[0], 0, 50, Some("brief.assigned"), EventOrder::Asc)
+            .unwrap();
+        assert_eq!(assigned_events.len(), 1, "assigned child is chronicled");
+        // The parent's materialization Chronicle names assigned vs needs-assignment.
+        let mat = s
+            .query_events(
+                &parent,
+                0,
+                50,
+                Some("brief.suggestion_materialized"),
+                EventOrder::Asc,
+            )
+            .unwrap();
+        assert!(
+            mat[0].payload.contains("1 assigned, 1 need assignment"),
+            "Chronicle must name the assignment split: {}",
+            mat[0].payload
+        );
+    }
+
+    // An empty `resolved_assignees` slice (the no-hint path) leaves every
+    // child unassigned — today's default behavior is preserved.
+    #[test]
+    fn brief_suggestion_absent_assignees_open_unassigned() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Parent", "subj", None, None, None, None)
+            .unwrap();
+        let children = vec![
+            brief::ChildSpec {
+                title: "A".into(),
+                priority: None,
+                after: None,
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
+            brief::ChildSpec {
+                title: "B".into(),
+                priority: None,
+                after: None,
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
+        ];
+        let id = s.open_suggestion(&parent, "op", "Plan", &children).unwrap();
+        let created = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
+            .unwrap();
+        for c in &created {
+            assert_eq!(
+                s.brief_fields(c).unwrap().unwrap().assignee_agent_id,
+                None,
+                "no hint → unassigned"
+            );
+        }
+        let mat = s
+            .query_events(
+                &parent,
+                0,
+                50,
+                Some("brief.suggestion_materialized"),
+                EventOrder::Asc,
+            )
+            .unwrap();
+        assert!(
+            mat[0].payload.contains("0 assigned, 2 need assignment"),
+            "Chronicle reflects all-unassigned: {}",
+            mat[0].payload
+        );
+    }
+
     // A valid `after` materializes a dependency (Snag) edge among the
     // accepted children: the dependent is blocked until its prerequisite
     // reaches `done`.
@@ -19874,14 +20098,14 @@ mod tests {
             .unwrap();
         // child #1 depends on child #0 (a backward edge).
         let children = vec![
-            brief::ChildSpec { title: "Prerequisite".into(), priority: None, after: None },
-            brief::ChildSpec { title: "Dependent".into(), priority: None, after: Some(0) },
+            brief::ChildSpec { title: "Prerequisite".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
+            brief::ChildSpec { title: "Dependent".into(), priority: None, after: Some(0), assignee_agent_id: None, assignee_role: None },
         ];
         let id = s
             .open_suggestion(&parent, "op", "Ordered plan", &children)
             .unwrap();
         let created = s
-            .respond_suggestion("acme", "subj", &parent, &id, "founder", true)
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
             .unwrap();
         assert_eq!(created.len(), 2);
         // The dependent (#1) is blocked_on the prerequisite (#0).
@@ -19933,8 +20157,8 @@ mod tests {
             .unwrap();
         // #0 → #1 is a forward reference: rejected at open.
         let children = vec![
-            brief::ChildSpec { title: "A".into(), priority: None, after: Some(1) },
-            brief::ChildSpec { title: "B".into(), priority: None, after: None },
+            brief::ChildSpec { title: "A".into(), priority: None, after: Some(1), assignee_agent_id: None, assignee_role: None },
+            brief::ChildSpec { title: "B".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
         ];
         let out = s.open_suggestion(&parent, "op", "Bad order", &children);
         assert!(matches!(out, Err(CoordinatorError::Invalid(_))));
@@ -19955,11 +20179,11 @@ mod tests {
                 &parent,
                 "operative-1",
                 "Some plan",
-                &[brief::ChildSpec { title: "Do a thing".into(), priority: None, after: None }],
+                &[brief::ChildSpec { title: "Do a thing".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None }],
             )
             .unwrap();
         let created = s
-            .respond_suggestion("acme", "subj", &parent, &id, "founder", false)
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", false, &[])
             .unwrap();
         assert!(created.is_empty());
         assert!(s.list_subbriefs(&parent).unwrap().is_empty());
@@ -19980,20 +20204,20 @@ mod tests {
                 "op",
                 "Plan",
                 &[
-                    brief::ChildSpec { title: "A".into(), priority: None, after: None },
-                    brief::ChildSpec { title: "B".into(), priority: None, after: None },
+                    brief::ChildSpec { title: "A".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
+                    brief::ChildSpec { title: "B".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
                 ],
             )
             .unwrap();
         let first = s
-            .respond_suggestion("acme", "subj", &parent, &id, "founder", true)
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
             .unwrap();
         assert_eq!(first.len(), 2);
         // Re-accept → typed Invalid, no new children.
-        let again = s.respond_suggestion("acme", "subj", &parent, &id, "founder", true);
+        let again = s.respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[]);
         assert!(matches!(again, Err(CoordinatorError::Invalid(_))));
         // Re-reject after resolution is also refused.
-        let rej = s.respond_suggestion("acme", "subj", &parent, &id, "founder", false);
+        let rej = s.respond_suggestion("acme", "subj", &parent, &id, "founder", false, &[]);
         assert!(matches!(rej, Err(CoordinatorError::Invalid(_))));
         assert_eq!(s.list_subbriefs(&parent).unwrap().len(), 2, "no duplicates");
     }
@@ -20011,7 +20235,7 @@ mod tests {
                 &parent,
                 "op",
                 "Plan",
-                &[brief::ChildSpec { title: "A".into(), priority: None, after: None }],
+                &[brief::ChildSpec { title: "A".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None }],
             )
             .unwrap();
         let out = s.respond_interaction(&parent, &id, "founder", "resolved", "yes");
@@ -20050,6 +20274,7 @@ mod tests {
         assert!(matches!(
             handle_brief_suggest_respond(
                 &s,
+                None,
                 &ctx_tenant(format!("{a}|{id}|hacker|accept").as_bytes(), "globex"),
             ),
             HandlerOutcome::Err(_)
@@ -20058,6 +20283,7 @@ mod tests {
         // Same-tenant accept works and reports the created ids.
         let out = handle_brief_suggest_respond(
             &s,
+            None,
             &ctx_tenant(format!("{a}|{id}|founder|accept").as_bytes(), "acme"),
         );
         let body = match out {
@@ -20067,6 +20293,123 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["created"].as_array().unwrap().len(), 1);
         assert_eq!(s.list_subbriefs(&a).unwrap().len(), 1);
+    }
+
+    // An operator-role ctx in `tenant`: the Founder/operator is sovereign
+    // over assignment, so the assign-Key check is bypassed — the resolver
+    // still enforces same-Guild + active explicitly.
+    fn ctx_op_tenant(args: &[u8], tenant: &str) -> InvocationCtx {
+        let mut c = ctx_tenant(args, tenant);
+        c.caller.role = "operator".into();
+        c
+    }
+
+    // §1.9 (governed assignee hints) — end to end through the wire handler:
+    // a child carrying a role hint is resolved + gated and assigned on
+    // accept; a sibling with no hint opens unassigned.
+    #[test]
+    fn brief_suggestion_handler_assigns_via_role_hint() {
+        let s = TaskStore::in_memory().unwrap();
+        let astore = agent::AgentStore::in_memory().unwrap();
+        // One active engineer in the Guild — the role hint resolves to it.
+        let (eng, _) = astore
+            .ensure_starter_operative(
+                "engineer",
+                "Eng (local · echo)",
+                "Engineer",
+                "echo",
+                "acme",
+            )
+            .unwrap();
+        let parent = s
+            .create_brief("acme", "Parent", "subj", None, None, None, None)
+            .unwrap();
+        let open_arg = serde_json::json!({
+            "task_id": parent,
+            "author": "op",
+            "summary": "Plan with a role assignment",
+            "children": [
+                { "title": "Assigned", "assignee_role": "engineer" },
+                { "title": "Plain" },
+            ],
+        });
+        let open_bytes = serde_json::to_vec(&open_arg).unwrap();
+        let id = match handle_brief_suggest_open(&s, &ctx_op_tenant(&open_bytes, "acme")) {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("open: {} {}", e.kind, e.cause),
+        };
+        let out = handle_brief_suggest_respond(
+            &s,
+            Some(&astore),
+            &ctx_op_tenant(format!("{parent}|{id}|founder|accept").as_bytes(), "acme"),
+        );
+        let body = match out {
+            HandlerOutcome::Ok(b) => b,
+            HandlerOutcome::Err(e) => panic!("accept: {} {}", e.kind, e.cause),
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let created: Vec<String> = v["created"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(created.len(), 2);
+        // First child assigned to the resolved engineer; second unassigned.
+        assert_eq!(
+            s.brief_fields(&created[0])
+                .unwrap()
+                .unwrap()
+                .assignee_agent_id
+                .as_deref(),
+            Some(eng.as_str())
+        );
+        assert_eq!(
+            s.brief_fields(&created[1]).unwrap().unwrap().assignee_agent_id,
+            None
+        );
+    }
+
+    // §1.9: an unhonourable hint (a role with no active Operative) refuses
+    // the WHOLE accept — no child is created (no partial materialization)
+    // and the card stays open for a retry.
+    #[test]
+    fn brief_suggestion_handler_invalid_hint_refused_no_partial() {
+        let s = TaskStore::in_memory().unwrap();
+        let astore = agent::AgentStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Parent", "subj", None, None, None, None)
+            .unwrap();
+        let open_arg = serde_json::json!({
+            "task_id": parent,
+            "author": "op",
+            "summary": "Plan",
+            "children": [
+                { "title": "A" },
+                { "title": "B", "assignee_role": "ghost" },
+            ],
+        });
+        let open_bytes = serde_json::to_vec(&open_arg).unwrap();
+        let id = match handle_brief_suggest_open(&s, &ctx_op_tenant(&open_bytes, "acme")) {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("open: {} {}", e.kind, e.cause),
+        };
+        let out = handle_brief_suggest_respond(
+            &s,
+            Some(&astore),
+            &ctx_op_tenant(format!("{parent}|{id}|founder|accept").as_bytes(), "acme"),
+        );
+        assert!(
+            matches!(out, HandlerOutcome::Err(_)),
+            "an unhonourable hint must refuse the accept"
+        );
+        // No child created, and the card is still open (a retry is possible).
+        assert!(
+            s.list_subbriefs(&parent).unwrap().is_empty(),
+            "no partial creation"
+        );
+        let listed = s.list_interactions(&parent).unwrap();
+        assert_eq!(listed[0].status, "open", "card stays open after refusal");
     }
 
     #[test]

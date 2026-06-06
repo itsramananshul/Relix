@@ -81,11 +81,16 @@ pub struct Interaction {
 }
 
 /// One proposed child Brief inside a `suggest_tasks` interaction (§1.9):
-/// a title, optionally a priority, and an optional simple **dependency
-/// order** (`after`). Accepting the proposal materializes each child as a
-/// real Sub-brief that inherits the parent's safe spine context
-/// (Mandate/Campaign/reviewer; see [`super::TaskStore::respond_suggestion`]);
-/// assignment still stays deferred (it runs governance gating).
+/// a title, optionally a priority, an optional simple **dependency
+/// order** (`after`), and an optional **explicit assignee hint** (by
+/// Operative id or by role). Accepting the proposal materializes each
+/// child as a real Sub-brief that inherits the parent's safe spine
+/// context (Mandate/Campaign/reviewer; see
+/// [`super::TaskStore::respond_suggestion`]). The parent's assignee is
+/// **never** inherited; assignment happens only when a child carries an
+/// explicit hint, and only after that hint passes the existing
+/// assign-Key gate (same-Guild, active) — otherwise the child opens
+/// unassigned, exactly as before.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildSpec {
     pub title: String,
@@ -102,6 +107,25 @@ pub struct ChildSpec {
     /// time, so accept never has to fail half-way. `None` = no dependency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<usize>,
+    /// Optional **explicit assignee hint by Operative id** (§1.9, model A
+    /// — precise). When set, accepting the proposal validates the id
+    /// (same-Guild, active) through the existing assign-Key gate and
+    /// assigns the materialized child to it; an unknown / cross-Guild /
+    /// inactive id, or an id the accepter's assign-Key forbids, refuses
+    /// the **whole** accept *before* any child is created (never a partial
+    /// materialization). Mutually exclusive with [`Self::assignee_role`]
+    /// (both set is rejected at open). `None` = the child opens unassigned
+    /// (the default — the parent's assignee is never inherited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee_agent_id: Option<String>,
+    /// Optional **explicit assignee hint by role** (§1.9, model B —
+    /// friendly). On accept the role is resolved to the **oldest active
+    /// same-role Operative in the Guild** (deterministic) and assigned
+    /// through the same gate; no active match refuses the whole accept
+    /// before any child is created. Mutually exclusive with
+    /// [`Self::assignee_agent_id`]. `None` = unassigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee_role: Option<String>,
 }
 
 /// The bounded, sanitized proposal an Operative attaches to a
@@ -123,6 +147,23 @@ pub const MAX_SUGGESTED_CHILDREN: usize = 20;
 pub const MAX_CHILD_TITLE_LEN: usize = 200;
 /// Max length of the proposal summary (chars). Longer is truncated.
 pub const MAX_PROPOSAL_SUMMARY_LEN: usize = 500;
+/// Max length of an assignee hint (Operative id or role) on a proposed
+/// child (chars). Over-cap is a hard error, not truncated — an over-long
+/// id/role would never resolve and must not bloat the card.
+pub const MAX_ASSIGNEE_HINT_LEN: usize = 128;
+
+/// Trim + length-check an optional assignee hint (id or role); empty ⇒
+/// `None`, over-cap ⇒ hard error (`what` names the kind for the message).
+fn normalize_hint(value: Option<&str>, what: &str) -> Result<Option<String>, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(s) if s.chars().count() > MAX_ASSIGNEE_HINT_LEN => Err(format!(
+            "{what} hint too long ({} chars); the limit is {MAX_ASSIGNEE_HINT_LEN}",
+            s.chars().count()
+        )),
+        Some(s) => Ok(Some(s.to_string())),
+    }
+}
 
 /// Validate + normalize a `suggest_tasks` proposal (pure, so the
 /// doc-specified bounds are unit-testable in isolation):
@@ -159,10 +200,26 @@ pub fn normalize_proposal(summary: &str, children: &[ChildSpec]) -> Result<Propo
             Some(p) if is_priority(p) => Some(p.to_string()),
             Some(p) => return Err(format!("priority '{p}' not in low/normal/high/urgent")),
         };
+        // Assignee hints (§1.9): an id OR a role, never both. Trimmed +
+        // length-capped here; resolved + assign-Key gated only at accept
+        // (an id/role can name an Operative hired after this card opened).
+        let assignee_agent_id = normalize_hint(c.assignee_agent_id.as_deref(), "assignee")?;
+        let assignee_role = normalize_hint(c.assignee_role.as_deref(), "role")?;
+        if assignee_agent_id.is_some() && assignee_role.is_some() {
+            return Err(format!(
+                "task '{title}' sets both an assignee and a role — choose one, not both"
+            ));
+        }
         old_to_new.push(Some(kept.len()));
         // `after` is carried through pass 1 untouched (still an *original*
         // index); pass 2 validates + remaps it once all positions are known.
-        kept.push(ChildSpec { title, priority, after: c.after });
+        kept.push(ChildSpec {
+            title,
+            priority,
+            after: c.after,
+            assignee_agent_id,
+            assignee_role,
+        });
     }
     if kept.is_empty() {
         return Err("a suggestion needs at least one child task".to_string());
@@ -503,7 +560,13 @@ mod tests {
     }
 
     fn child(title: &str) -> ChildSpec {
-        ChildSpec { title: title.into(), priority: None, after: None }
+        ChildSpec {
+            title: title.into(),
+            priority: None,
+            after: None,
+            assignee_agent_id: None,
+            assignee_role: None,
+        }
     }
 
     #[test]
@@ -542,14 +605,26 @@ mod tests {
         assert!(
             normalize_proposal(
                 "s",
-                &[ChildSpec { title: "t".into(), priority: Some("urgent".into()), after: None }]
+                &[ChildSpec {
+                    title: "t".into(),
+                    priority: Some("urgent".into()),
+                    after: None,
+                    assignee_agent_id: None,
+                    assignee_role: None,
+                }]
             )
             .is_ok()
         );
         assert!(
             normalize_proposal(
                 "s",
-                &[ChildSpec { title: "t".into(), priority: Some("meh".into()), after: None }]
+                &[ChildSpec {
+                    title: "t".into(),
+                    priority: Some("meh".into()),
+                    after: None,
+                    assignee_agent_id: None,
+                    assignee_role: None,
+                }]
             )
             .is_err()
         );
@@ -561,7 +636,66 @@ mod tests {
     }
 
     fn child_after(title: &str, after: Option<usize>) -> ChildSpec {
-        ChildSpec { title: title.into(), priority: None, after }
+        ChildSpec {
+            title: title.into(),
+            priority: None,
+            after,
+            assignee_agent_id: None,
+            assignee_role: None,
+        }
+    }
+
+    // Helper: a child carrying an explicit assignee hint (id or role).
+    fn child_hint(title: &str, agent: Option<&str>, role: Option<&str>) -> ChildSpec {
+        ChildSpec {
+            title: title.into(),
+            priority: None,
+            after: None,
+            assignee_agent_id: agent.map(str::to_string),
+            assignee_role: role.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn proposal_carries_and_trims_assignee_hints() {
+        let p = normalize_proposal(
+            "s",
+            &[
+                child_hint("by id", Some("  agt_eng_1  "), None),
+                child_hint("by role", None, Some("  engineer  ")),
+                child("plain"),
+            ],
+        )
+        .expect("valid");
+        assert_eq!(p.children[0].assignee_agent_id.as_deref(), Some("agt_eng_1"));
+        assert_eq!(p.children[0].assignee_role, None);
+        assert_eq!(p.children[1].assignee_role.as_deref(), Some("engineer"));
+        assert_eq!(p.children[1].assignee_agent_id, None);
+        // A plain child keeps the unassigned default.
+        assert_eq!(p.children[2].assignee_agent_id, None);
+        assert_eq!(p.children[2].assignee_role, None);
+    }
+
+    #[test]
+    fn proposal_rejects_both_assignee_and_role_on_one_child() {
+        let out = normalize_proposal(
+            "s",
+            &[child_hint("conflict", Some("agt_eng_1"), Some("engineer"))],
+        );
+        assert!(out.is_err(), "an id AND a role on one child must be refused");
+    }
+
+    #[test]
+    fn proposal_rejects_over_long_assignee_hint() {
+        let long = "x".repeat(MAX_ASSIGNEE_HINT_LEN + 1);
+        assert!(normalize_proposal("s", &[child_hint("t", Some(&long), None)]).is_err());
+        assert!(normalize_proposal("s", &[child_hint("t", None, Some(&long))]).is_err());
+    }
+
+    #[test]
+    fn proposal_empty_assignee_hint_normalizes_to_none() {
+        let p = normalize_proposal("s", &[child_hint("t", Some("   "), None)]).expect("valid");
+        assert_eq!(p.children[0].assignee_agent_id, None);
     }
 
     #[test]

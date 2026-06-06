@@ -4137,6 +4137,89 @@ pub(crate) fn enforce_assign_key(
     }
 }
 
+/// Resolve + governance-validate a suggested child's optional **assignee
+/// hint** (relix-execution-and-issue-design §1.9). `agent_hint` (model A,
+/// an Operative id) and `role_hint` (model B, a role) are mutually
+/// exclusive — at most one is `Some` (the proposal normalizer rejects
+/// both). Returns:
+///
+/// - `Ok(None)` when neither hint is set — the child opens **unassigned**
+///   (today's default; the parent's assignee is never inherited);
+/// - `Ok(Some(id))` with the concrete, same-Guild, **active** Operative to
+///   assign — for a role hint, the **oldest active same-role** Operative in
+///   the Guild (deterministic, via [`AgentStore::list_by_role_for_tenant`]);
+/// - `Err(denial)` when the hint can't be honoured: an unknown /
+///   cross-Guild / inactive id, no active Operative for the role, or the
+///   accepter's assign-Key forbids it. The caller refuses the **whole**
+///   accept on `Err` *before* any child is created, so a bad hint never
+///   half-materializes a proposal.
+///
+/// Reuses [`enforce_assign_key`] for the assign-Key authority check, and
+/// adds an explicit same-Guild + active check that holds **even for the
+/// Founder/operator** (whose assign-Key check is bypassed) — so no caller,
+/// not even the operator, can assign across Guilds or to an inactive
+/// Operative through a suggestion.
+pub(crate) fn resolve_assignee_hint(
+    store: &AgentStore,
+    ctx: &InvocationCtx,
+    agent_hint: Option<&str>,
+    role_hint: Option<&str>,
+) -> Result<Option<String>, HandlerOutcome> {
+    let tenant = ctx.tenant_id_or_default();
+    let agent_hint = agent_hint.map(str::trim).filter(|s| !s.is_empty());
+    let role_hint = role_hint.map(str::trim).filter(|s| !s.is_empty());
+    // Pin the concrete candidate Operative id from whichever hint is set.
+    let candidate = match (agent_hint, role_hint) {
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => {
+            // The normalizer rejects this at open; defend in depth here too.
+            return Err(invalid(
+                "assignee hint: set an Operative id OR a role, not both".to_string(),
+            ));
+        }
+        (Some(id), None) => id.to_string(),
+        (None, Some(role)) => {
+            // The role-adoption helper is tenant-scoped + active-only +
+            // deterministic (oldest first), so "no match" is a clean refusal
+            // and the pick can never come from another Guild.
+            let matches = match store.list_by_role_for_tenant(role, tenant) {
+                Ok(m) => m,
+                Err(e) => return Err(internal(format!("role resolution: {e}"))),
+            };
+            match matches.into_iter().next() {
+                Some(id) => id,
+                None => {
+                    return Err(policy_denied(format!(
+                        "assign denied: no active Operative with role `{role}` in this Guild"
+                    )));
+                }
+            }
+        }
+    };
+    // Explicit same-Guild + active check — holds even for the operator,
+    // whose assign-Key check below is bypassed. (For the role path this is
+    // already guaranteed; re-checking keeps one path and is cheap.)
+    let target = match store.get_agent_for_tenant(&candidate, tenant) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Err(policy_denied(format!(
+                "assign denied: `{candidate}` is not an Operative in this Guild"
+            )));
+        }
+        Err(e) => return Err(internal(format!("assignee lookup: {e}"))),
+    };
+    if target.status != "active" {
+        return Err(policy_denied(format!(
+            "assign denied: `{candidate}` is {} (not active) — cannot receive executable work",
+            target.status
+        )));
+    }
+    // Assign-Key authority: a no-op for the Founder/operator, enforced for
+    // an Operative-raised accept (same gate as `brief.set` assignee).
+    enforce_assign_key(store, ctx, &candidate)?;
+    Ok(Some(candidate))
+}
+
 /// Enforce the **manage Key** (company-model §5.2A) for an
 /// agent-originated mutation of a Brief **owned by another Operative**
 /// (move / override fields / due / pin / snag). `owner` is the Brief's
@@ -4858,6 +4941,119 @@ mod tests {
     fn pending_qa_hire(s: &AgentStore, subj: &str, tenant: &str) -> String {
         s.request_hire("QA", "qa", "QA", "qa", "qa", "ceo", subj, "low", tenant)
             .unwrap()
+    }
+
+    // ── resolve_assignee_hint (suggest_tasks §1.9) ───────────────────────────
+
+    /// An active Operative with `role` in `tenant`; returns its agent_id.
+    #[cfg(test)]
+    fn active_op(s: &AgentStore, role: &str, tenant: &str) -> String {
+        let (id, _) = s
+            .ensure_starter_operative(role, &format!("{role} (local · echo)"), role, "echo", tenant)
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn resolve_hint_absent_opens_unassigned() {
+        let s = store();
+        let ctx = fake_ctx_tenant(b"", "acme");
+        // (HandlerOutcome isn't Debug, so compare via `.ok()`.)
+        assert_eq!(resolve_assignee_hint(&s, &ctx, None, None).ok(), Some(None));
+        // Empty / whitespace hints are also "no hint".
+        assert_eq!(
+            resolve_assignee_hint(&s, &ctx, Some("  "), Some("")).ok(),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn resolve_hint_by_agent_id_happy_path() {
+        let s = store();
+        let id = active_op(&s, "engineer", "acme");
+        let ctx = fake_ctx_tenant(b"", "acme");
+        assert_eq!(
+            resolve_assignee_hint(&s, &ctx, Some(&id), None).ok(),
+            Some(Some(id))
+        );
+    }
+
+    #[test]
+    fn resolve_hint_by_role_resolves_active_same_role() {
+        let s = store();
+        let id = active_op(&s, "engineer", "acme");
+        let ctx = fake_ctx_tenant(b"", "acme");
+        assert_eq!(
+            resolve_assignee_hint(&s, &ctx, None, Some("engineer")).ok(),
+            Some(Some(id))
+        );
+    }
+
+    #[test]
+    fn resolve_hint_unknown_agent_id_is_denied() {
+        let s = store();
+        let ctx = fake_ctx_tenant(b"", "acme");
+        let out = resolve_assignee_hint(&s, &ctx, Some("agt_nope_1"), None);
+        assert!(out.is_err(), "an unknown id must be refused");
+    }
+
+    #[test]
+    fn resolve_hint_cross_tenant_agent_id_is_denied() {
+        let s = store();
+        // Operative lives in `acme`, but the accept runs in `other`.
+        let id = active_op(&s, "engineer", "acme");
+        let ctx = fake_ctx_tenant(b"", "other");
+        let out = resolve_assignee_hint(&s, &ctx, Some(&id), None);
+        assert!(out.is_err(), "a cross-Guild id must be refused");
+    }
+
+    #[test]
+    fn resolve_hint_cross_tenant_role_is_denied() {
+        let s = store();
+        active_op(&s, "engineer", "acme");
+        // No engineer exists in `other` → no match → refused (never reaches acme).
+        let ctx = fake_ctx_tenant(b"", "other");
+        let out = resolve_assignee_hint(&s, &ctx, None, Some("engineer"));
+        assert!(out.is_err(), "a role with no in-Guild match must be refused");
+    }
+
+    #[test]
+    fn resolve_hint_inactive_agent_id_is_denied() {
+        let s = store();
+        // A pending (not-yet-approved) hire is not active.
+        let id = pending_qa_hire(&s, "subj-x", "acme");
+        let ctx = fake_ctx_tenant(b"", "acme");
+        let out = resolve_assignee_hint(&s, &ctx, Some(&id), None);
+        assert!(out.is_err(), "an inactive Operative must be refused");
+    }
+
+    #[test]
+    fn resolve_hint_role_with_no_active_match_is_denied() {
+        let s = store();
+        let ctx = fake_ctx_tenant(b"", "acme");
+        let out = resolve_assignee_hint(&s, &ctx, None, Some("ghost"));
+        assert!(out.is_err(), "a role with no active Operative must be refused");
+    }
+
+    #[test]
+    fn resolve_hint_both_id_and_role_is_rejected() {
+        let s = store();
+        let id = active_op(&s, "engineer", "acme");
+        let ctx = fake_ctx_tenant(b"", "acme");
+        let out = resolve_assignee_hint(&s, &ctx, Some(&id), Some("engineer"));
+        assert!(out.is_err(), "an id AND a role together must be refused");
+    }
+
+    #[test]
+    fn resolve_hint_non_operator_without_profile_is_denied() {
+        let s = store();
+        // A valid, active assignee exists, but the caller is a plain agent
+        // with no Operative profile → the assign-Key layer refuses.
+        let id = active_op(&s, "engineer", "acme");
+        let mut ctx = fake_ctx_with_role(b"", "agent", b"stranger");
+        ctx.tenant_id = Some("acme".to_string());
+        let out = resolve_assignee_hint(&s, &ctx, Some(&id), None);
+        assert!(out.is_err(), "a caller without an Operative profile cannot assign");
     }
 
     #[test]

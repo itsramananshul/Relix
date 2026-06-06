@@ -343,13 +343,22 @@ export function BriefDetail({
         accept,
       });
       const n = r?.created?.length ?? 0;
+      // Resolution is all-or-nothing, so a successful accept means every
+      // child that carried an assignee hint passed the assign-Key gate and is
+      // staffed; the rest opened unassigned (the default).
+      const assignedN = (it.proposal?.children ?? []).filter(
+        (c) => c.assignee_agent_id || c.assignee_role,
+      ).length;
+      const needN = n - assignedN;
       setBanner({
         kind: "ok",
         msg: accept
-          ? `Suggestion accepted — ${n} Sub-brief${n === 1 ? "" : "s"} created. ` +
-            `${n === 1 ? "It opens" : "They open"} unassigned (assignment is governance-gated, not ` +
-            `inherited): assign an Operative to ${n === 1 ? "it" : "each"} below — they're also listed ` +
-            `in the Action Center as “Assign an Operative”.`
+          ? `Suggestion accepted — ${n} Sub-brief${n === 1 ? "" : "s"} created` +
+            (assignedN > 0 ? `, ${assignedN} assigned through the assign-Key gate` : "") +
+            (needN > 0
+              ? `. ${needN} open${needN === 1 ? "s" : ""} unassigned — assign an Operative below ` +
+                `(also in the Action Center as “Assign an Operative”).`
+              : ".")
           : "Suggestion declined.",
       });
       reload();
@@ -777,12 +786,35 @@ export function BriefDetail({
                       typeof c.after === "number" && c.after >= 0 && c.after < children.length
                         ? children[c.after]
                         : null;
+                    // The proposed assignee hint (§1.9): an Operative id
+                    // (precise) or a role (resolved to the oldest active
+                    // same-role Operative). Surfaced BEFORE accept so the
+                    // operator sees who each child would be assigned to — it's
+                    // still validated through the assign-Key gate on accept.
+                    const hint = c.assignee_agent_id
+                      ? { label: "→", value: c.assignee_agent_id, kind: "assignee" as const }
+                      : c.assignee_role
+                        ? { label: "→ role", value: c.assignee_role, kind: "role" as const }
+                        : null;
                     return (
                       <li key={i} style={{ wordBreak: "break-word" }}>
                         {c.title}
                         {c.priority ? (
                           <span className="muted" style={{ fontSize: 10, marginLeft: 6 }}>
                             {c.priority}
+                          </span>
+                        ) : null}
+                        {hint ? (
+                          <span
+                            className="badge in_progress"
+                            style={{ fontSize: 9, marginLeft: 6 }}
+                            title={
+                              hint.kind === "role"
+                                ? `Proposed assignee: the oldest active "${hint.value}" Operative (validated on accept)`
+                                : `Proposed assignee: ${hint.value} (validated on accept)`
+                            }
+                          >
+                            {hint.label} {hint.value}
                           </span>
                         ) : null}
                         {dep ? (
@@ -838,6 +870,19 @@ export function BriefDetail({
                         .filter(Boolean)
                     : [];
                 const childTitles = it.proposal?.children ?? [];
+                // A child that carried an assignee hint (§1.9) WAS assigned on
+                // accept — resolution is all-or-nothing, so a resolved card
+                // means every hinted child passed the gate and is staffed. The
+                // rest opened unassigned (the default). Reflect both honestly.
+                const childHint = (i: number): string | null => {
+                  const c = childTitles[i];
+                  if (!c) return null;
+                  if (c.assignee_agent_id) return c.assignee_agent_id;
+                  if (c.assignee_role) return `role: ${c.assignee_role}`;
+                  return null;
+                };
+                const assignedN = createdIds.filter((_, i) => childHint(i)).length;
+                const needN = createdIds.length - assignedN;
                 return (
                   <div
                     key={it.interaction_id}
@@ -857,25 +902,46 @@ export function BriefDetail({
                       <div style={{ marginTop: 3 }}>
                         <div className="muted" style={{ fontSize: 11 }}>
                           {it.resolved_by ? `${it.resolved_by}: ` : ""}
-                          {createdIds.length} Sub-brief{createdIds.length === 1 ? "" : "s"} created —
-                          {" "}each opens unassigned and won't run until you assign an Operative
-                          {" "}(also listed in the Action Center as “Assign an Operative”).
+                          {createdIds.length} Sub-brief{createdIds.length === 1 ? "" : "s"} created
+                          {assignedN > 0 ? ` — ${assignedN} assigned` : ""}
+                          {needN > 0
+                            ? `${assignedN > 0 ? ", " : " — "}${needN} need${
+                                needN === 1 ? "s" : ""
+                              } an Operative (also in the Action Center as “Assign an Operative”).`
+                            : "."}
                         </div>
                         <ul style={{ margin: "3px 0 0", paddingLeft: 16 }}>
-                          {createdIds.map((cid, i) => (
-                            <li key={cid} style={{ wordBreak: "break-word", marginTop: 2 }}>
-                              <Link
-                                to={`/briefs?brief=${encodeURIComponent(cid)}`}
-                                className="link"
-                                title="Open this Sub-brief on the board to assign an Operative"
-                              >
-                                {childTitles[i]?.title ?? `Sub-brief ${i + 1}`}
-                              </Link>{" "}
-                              <span className="badge blocked" style={{ fontSize: 9 }}>
-                                needs assignment
-                              </span>
-                            </li>
-                          ))}
+                          {createdIds.map((cid, i) => {
+                            const assignedTo = childHint(i);
+                            return (
+                              <li key={cid} style={{ wordBreak: "break-word", marginTop: 2 }}>
+                                <Link
+                                  to={`/briefs?brief=${encodeURIComponent(cid)}`}
+                                  className="link"
+                                  title={
+                                    assignedTo
+                                      ? `Assigned to ${assignedTo} — open this Sub-brief`
+                                      : "Open this Sub-brief on the board to assign an Operative"
+                                  }
+                                >
+                                  {childTitles[i]?.title ?? `Sub-brief ${i + 1}`}
+                                </Link>{" "}
+                                {assignedTo ? (
+                                  <span
+                                    className="badge done"
+                                    style={{ fontSize: 9 }}
+                                    title={`Assigned to ${assignedTo}`}
+                                  >
+                                    assigned: {assignedTo}
+                                  </span>
+                                ) : (
+                                  <span className="badge blocked" style={{ fontSize: 9 }}>
+                                    needs assignment
+                                  </span>
+                                )}
+                              </li>
+                            );
+                          })}
                         </ul>
                       </div>
                     ) : (

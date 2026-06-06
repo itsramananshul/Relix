@@ -193,6 +193,13 @@ export interface SuggestChild {
   // sibling this child depends on (§1.6). On accept it becomes a Snag
   // (blocked_on) — the referenced sibling must reach `done` first.
   after?: number | null;
+  // Optional explicit assignee hint (§1.9). Mutually exclusive: a child
+  // names an Operative by id (precise) OR by role (resolved to the oldest
+  // active same-role Operative), never both. On accept the hint is
+  // validated through the existing assign-Key gate (same-Guild, active)
+  // and the child is assigned; absent ⇒ the child opens unassigned.
+  assignee_agent_id?: string | null;
+  assignee_role?: string | null;
 }
 
 // The bounded proposal a `suggest_tasks` card carries.
