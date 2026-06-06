@@ -2001,6 +2001,26 @@ fn json_passthrough(body: Vec<u8>) -> Result<Response, (StatusCode, Json<ApiErro
 ///   or deployment cost cap is configured `action_on_exceed = "reject"`; the
 ///   `cause` (`budget:reject:…`) carries the limit / actual / reset so the
 ///   client can surface a useful "out of allowance" message and back off;
+/// - an **invalid approval token** (`APPROVAL_TOKEN_INVALID`) is **403
+///   Forbidden** — it joins the denial family. The caller presented an
+///   `approval_token` that is unknown, expired, already consumed, or scoped
+///   to a different method, so the authorization it claims does not grant
+///   this call: the presented credential was *refused*, exactly like
+///   `APPROVAL_DENIED`. This is the inverse of `APPROVAL_REQUIRED`'s 428 —
+///   428 means "you hold no approval yet, go get one"; 403 here means "the
+///   approval you presented is not valid." Not a 400: a well-formed token
+///   that is semantically invalid is an authorization refusal, not a
+///   malformed request body. The live admission path already collapses
+///   bad-token gate denials onto `POLICY_DENIED` (→ 403), so this keeps the
+///   shared map consistent should the coordinator ever surface kind 20;
+/// - an **expired approval window** (`APPROVAL_TIMEOUT`) is **410 Gone** —
+///   the operator did not decide the approval before its window elapsed
+///   (default one hour), so that approval opportunity is gone and the caller
+///   must request a fresh one (back to a 428). Deliberately NOT 504/502:
+///   this is a governance window expiring, not an upstream/transport
+///   timeout. A TRUE transport `TIMEOUT` (kind 2) stays 502 below, so the
+///   two are never conflated despite the coordinator's `FailureClass`
+///   lumping both under its retry-class `Timeout`;
 /// - everything else (transport, timeout, peer-unreachable, responder
 ///   internal, unknown method, …) stays **502**, so a TRUE upstream /
 ///   mesh failure is never masked as a client error. Bridge-identity
@@ -2018,12 +2038,22 @@ fn coordinator_err_status(kind: u32, cause: &str) -> StatusCode {
     } else if kind == ek::POLICY_DENIED
         || kind == ek::APPROVAL_DENIED
         || kind == ek::SECURITY_DENIED
+        // An invalid/expired/consumed/wrong-scope approval token is a
+        // refused authorization, not a malformed request — same family
+        // as APPROVAL_DENIED. Distinct from APPROVAL_REQUIRED's 428.
+        || kind == ek::APPROVAL_TOKEN_INVALID
     {
         StatusCode::FORBIDDEN
     } else if kind == ek::APPROVAL_REQUIRED {
         // Not a denial: admissible once approved. 428 says "satisfy the
         // approval precondition, then retry" — distinct from 403.
         StatusCode::PRECONDITION_REQUIRED
+    } else if kind == ek::APPROVAL_TIMEOUT {
+        // The approval window elapsed before an operator decided it — that
+        // approval is gone; the caller must request a fresh one. A
+        // governance-window expiry, NOT an upstream/transport timeout
+        // (kind 2 stays 502 below), so 410, never 504/502.
+        StatusCode::GONE
     } else if kind == ek::RESOURCE_EXHAUSTED {
         // Budget/allowance cap hit — a quota-exhaustion condition, the
         // bridge's standing convention for which is 429.
@@ -2168,14 +2198,49 @@ mod tests {
             ),
             StatusCode::TOO_MANY_REQUESTS,
         );
-        // Not-found still wins over both of the new kinds, so a tenant-gated
-        // resource never leaks its existence behind a 428/429 either.
+        // An invalid approval token is a 403, NOT a 502 and NOT a 428 —
+        // the presented authorization was refused (unknown / expired /
+        // consumed / wrong-method), the same family as APPROVAL_DENIED.
+        assert_eq!(
+            coordinator_err_status(ek::APPROVAL_TOKEN_INVALID, "approval_token_expired"),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            coordinator_err_status(ek::APPROVAL_TOKEN_INVALID, "approval_token_consumed"),
+            StatusCode::FORBIDDEN,
+        );
+        // An expired approval window is a 410 Gone, NOT a 502/504 — the
+        // governance window elapsed and the caller must request a fresh
+        // approval. The reason rides in the preserved cause text.
+        assert_eq!(
+            coordinator_err_status(ek::APPROVAL_TIMEOUT, "approval window expired after 3600s"),
+            StatusCode::GONE,
+        );
+        // The approval-window timeout (kind 15) must NOT be conflated with a
+        // TRUE transport timeout (kind 2): the latter stays a 502 upstream
+        // failure, never a 410.
+        assert_eq!(
+            coordinator_err_status(ek::TIMEOUT, "peer deadline exceeded"),
+            StatusCode::BAD_GATEWAY,
+        );
+
+        // Not-found still wins over every one of the new kinds, so a
+        // tenant-gated resource never leaks its existence behind a
+        // 428/429/403/410 either.
         assert_eq!(
             coordinator_err_status(ek::APPROVAL_REQUIRED, "brief not found"),
             StatusCode::NOT_FOUND,
         );
         assert_eq!(
             coordinator_err_status(ek::RESOURCE_EXHAUSTED, "agent not found"),
+            StatusCode::NOT_FOUND,
+        );
+        assert_eq!(
+            coordinator_err_status(ek::APPROVAL_TOKEN_INVALID, "brief not found"),
+            StatusCode::NOT_FOUND,
+        );
+        assert_eq!(
+            coordinator_err_status(ek::APPROVAL_TIMEOUT, "brief not found"),
             StatusCode::NOT_FOUND,
         );
 
