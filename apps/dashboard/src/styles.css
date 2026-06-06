@@ -150,8 +150,14 @@ label.field span { display: block; font-size: 12px; color: var(--text-dim); marg
    widths (design §2: usable from a phone; §12: dense but scannable). A
    `.filter-bar` wraps its clusters; a `.btn-group` keeps related actions
    together and wraps them as a unit rather than spilling past the edge. */
-.filter-bar { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
-.btn-group { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+/* `min-width:0` is load-bearing: without it a nested flex item keeps its
+   max-content width and spills past the edge instead of shrinking so its own
+   flex-wrap can break the buttons onto the next line. */
+.filter-bar { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; min-width: 0; }
+.btn-group { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; min-width: 0; max-width: 100%; }
+/* Buttons keep their natural size and WRAP to the next line — without this they
+   shrink to cram onto one line and the last label clips past the edge. */
+.btn-group > .btn { flex: 0 0 auto; }
 
 /* ── Board (kanban) ────────────────────────────────────── */
 .board { display: grid; grid-template-columns: repeat(5, minmax(180px, 1fr)); gap: 12px; overflow-x: auto; }
@@ -246,8 +252,8 @@ a > .stat-card:hover { border-color: var(--text-faint); }
 .cmd-strip .who-band { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .cmd-strip .who-band .title { font-size: 16px; font-weight: 650; }
 .cmd-strip .who-band .meta { display: flex; gap: 10px; flex-wrap: wrap; color: var(--text-faint); font-size: 12px; }
-.cmd-strip .counters { display: flex; gap: 22px; flex-wrap: wrap; }
-.cmd-strip .counter { display: flex; flex-direction: column; }
+.cmd-strip .counters { display: flex; gap: 14px 22px; flex-wrap: wrap; min-width: 0; }
+.cmd-strip .counter { display: flex; flex-direction: column; flex: 0 0 auto; }
 .cmd-strip .counter b { font-size: 20px; font-weight: 700; line-height: 1.1; }
 .cmd-strip .counter span { font-size: 11px; color: var(--text-faint); }
 .cmd-strip .counter b.warn { color: var(--warn); }
@@ -255,6 +261,13 @@ a > .stat-card:hover { border-color: var(--text-faint); }
 .cmd-strip .grow { flex: 1 1 auto; }
 .cmd-strip .cta { display: flex; flex-direction: column; gap: 4px; align-items: stretch; }
 .cmd-strip .cta .hint { font-size: 11px; color: var(--text-faint); text-align: center; }
+/* On a phone the strip stacks: identity, then the counter grid full-width,
+   then the CTA — so counters wrap into a tidy block instead of clipping. */
+@media (max-width: 760px) {
+  .cmd-strip { gap: 12px; }
+  .cmd-strip .counters { width: 100%; gap: 12px 18px; }
+  .cmd-strip .cta { width: 100%; }
+}
 
 /* Compact "setup & warnings" list — replaces a tower of full-width banners
    with one scannable card (design §12: progressive disclosure, no noise). */
