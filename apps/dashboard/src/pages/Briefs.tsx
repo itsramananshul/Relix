@@ -12,6 +12,11 @@ interface Card {
   priority?: string;
   assignee_agent_id?: string | null;
   mandate_id?: string | null;
+  // The Brief's UNRESOLVED blockers (Snags whose blocker isn't `done`), as
+  // their human-ref where set else id — same-Guild only, served by the board
+  // route so the card can show a "Blocked by X" chip without opening the
+  // detail (relix-dashboard-design §6). Absent/empty when nothing blocks it.
+  blocked_by?: string[];
 }
 
 interface Operative {
@@ -465,6 +470,27 @@ export function Briefs() {
                             <span className="muted">· unassigned</span>
                           )}
                         </div>
+
+                        {/* Blocked-by chip — a compact, REAL reason the card
+                            can't advance, drawn straight from the board row's
+                            unresolved same-Guild blockers (no faked ids). Shows
+                            the single blocker's ref, else a count; the full list
+                            is in the title + the Brief detail's Relations.
+                            Omitted entirely when nothing blocks it, so clear
+                            cards stay uncluttered (relix-dashboard-design §6). */}
+                        {(c.blocked_by?.length ?? 0) > 0 && (
+                          <div className="m" style={{ marginTop: 2 }}>
+                            <span
+                              className="badge blocked"
+                              style={{ fontSize: 10, maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" }}
+                              title={`Blocked by ${c.blocked_by!.length} Brief${c.blocked_by!.length === 1 ? "" : "s"}: ${c.blocked_by!.join(", ")} — open the Brief to see its Snags`}
+                            >
+                              ⛔ {c.blocked_by!.length === 1
+                                ? `Blocked by ${c.blocked_by![0]}`
+                                : `Blocked by ${c.blocked_by!.length} Briefs`}
+                            </span>
+                          </div>
+                        )}
 
                         {lr && (
                           <div className="card-run">

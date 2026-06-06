@@ -229,6 +229,14 @@ pub struct BriefCard {
     pub assignee_agent_id: Option<String>,
     pub mandate_id: Option<String>,
     pub campaign_id: Option<String>,
+    /// The Brief's *unresolved* blockers (Snags whose blocker isn't yet
+    /// `done`), as their human-ref where set else their id — same-Guild
+    /// only, so the board can render a "Blocked by X" chip without opening
+    /// the detail (relix-dashboard-design §6). Populated only by the board
+    /// query; the other card lists leave it empty (and it is then omitted
+    /// from the wire entirely).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
 }
 
 /// The current Claim (lease) holder on a Brief — the Operative that

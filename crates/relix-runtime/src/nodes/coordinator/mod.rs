@@ -2660,6 +2660,7 @@ impl TaskStore {
                 assignee_agent_id: r.get(4)?,
                 mandate_id: r.get(5)?,
                 campaign_id: r.get(6)?,
+                blocked_by: Vec::new(),
             })
         };
         // `cols` is a fixed string, never user input.
@@ -2737,6 +2738,53 @@ impl TaskStore {
                     .map_err(CoordinatorError::Db)?
             }
         };
+        // Enrich each card with its *unresolved* blockers (Snags whose
+        // blocker isn't yet `done`) so the board can render a "Blocked by X"
+        // chip without opening the detail (relix-dashboard-design §6). One
+        // batched read over the page's ids; the blocker side is filtered to
+        // the SAME Guild, so a cross-tenant blocker is neither shown nor
+        // counted (no existence leak). A blocker with a `human_ref` (REL-2)
+        // surfaces by ref; otherwise by its id.
+        let mut rows = rows;
+        if !rows.is_empty() {
+            let placeholders = (0..rows.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT e.task_id, COALESCE(NULLIF(b.human_ref, ''), b.task_id) \
+                 FROM task_edges e \
+                 JOIN tasks b ON b.task_id = e.related_task_id \
+                 WHERE e.edge_type = 'blocked_on' \
+                   AND e.related_task_id IS NOT NULL \
+                   AND b.board_status != 'done' \
+                   AND COALESCE(b.tenant_id, 'default') = ?1 \
+                   AND e.task_id IN ({placeholders}) \
+                 ORDER BY e.edge_id ASC"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(CoordinatorError::Db)?;
+            // ?1 = tenant, ?2.. = the page's Brief ids (all bound as text).
+            let mut bind: Vec<String> = Vec::with_capacity(rows.len() + 1);
+            bind.push(t.to_string());
+            for r in &rows {
+                bind.push(r.task_id.clone());
+            }
+            let mut by_task: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            let mut q = stmt
+                .query(rusqlite::params_from_iter(bind.iter()))
+                .map_err(CoordinatorError::Db)?;
+            while let Some(row) = q.next().map_err(CoordinatorError::Db)? {
+                let task_id: String = row.get(0).map_err(CoordinatorError::Db)?;
+                let blocker_ref: String = row.get(1).map_err(CoordinatorError::Db)?;
+                by_task.entry(task_id).or_default().push(blocker_ref);
+            }
+            for card in &mut rows {
+                if let Some(blockers) = by_task.remove(&card.task_id) {
+                    card.blocked_by = blockers;
+                }
+            }
+        }
         Ok(rows)
     }
 
@@ -14543,6 +14591,9 @@ fn brief_card_from_row(r: &rusqlite::Row) -> rusqlite::Result<brief::BriefCard> 
         assignee_agent_id: r.get(4)?,
         mandate_id: r.get(5)?,
         campaign_id: r.get(6)?,
+        // Filled in by a second batch pass only on the board query; every
+        // other card list leaves it empty (serde then omits it).
+        blocked_by: Vec::new(),
     })
 }
 
@@ -18427,6 +18478,71 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(acme_counts.get("todo").copied().unwrap_or(0), 1);
+    }
+
+    /// Board cards carry their *unresolved* blockers so the board can show a
+    /// "Blocked by X" chip without opening the detail (relix-dashboard-design
+    /// §6). The list is honest and tenant-safe: a resolved (`done`) blocker
+    /// drops off, a cross-Guild blocker is neither shown nor counted (no
+    /// existence leak), and a non-blocked card stays empty.
+    #[test]
+    fn board_cards_carry_unresolved_blocker_refs_tenant_safe() {
+        let s = store();
+        // A waiter in acme, blocked by: one open same-Guild blocker (by ref),
+        // one resolved same-Guild blocker, and one open cross-Guild blocker.
+        let waiter = s
+            .create_brief("acme", "waiter", "subj", None, None, None, None)
+            .unwrap();
+        let open = s
+            .create_brief("acme", "open blocker", "subj", None, None, None, None)
+            .unwrap();
+        let resolved = s
+            .create_brief("acme", "resolved blocker", "subj", None, None, None, None)
+            .unwrap();
+        let foreign = s
+            .create_brief("globex", "globex blocker", "subj", None, None, None, None)
+            .unwrap();
+        // The open same-Guild blocker carries a human-ref → it should surface
+        // by ref (e.g. REL-2), not by raw id.
+        let open_ref = s.assign_brief_ref("acme", &open).unwrap();
+
+        s.add_snag(&waiter, &open).unwrap();
+        s.add_snag(&waiter, &resolved).unwrap();
+        s.add_snag(&waiter, &foreign).unwrap();
+
+        // Drive the `resolved` blocker to done so it no longer blocks.
+        move_to_progress(&s, &resolved);
+        move_to_review(&s, &resolved);
+        s.set_board_status(&resolved, "done").unwrap();
+
+        // A second acme card with no Snag stays uncluttered.
+        let clear = s
+            .create_brief("acme", "clear card", "subj", None, None, None, None)
+            .unwrap();
+
+        let acme_todo = s
+            .list_briefs_by_board_for_tenant(Some("todo"), "acme", 50)
+            .unwrap();
+        let w = acme_todo
+            .iter()
+            .find(|c| c.task_id == waiter)
+            .expect("waiter on the acme todo board");
+        // Only the open, same-Guild blocker is shown — by its ref.
+        assert_eq!(w.blocked_by, vec![open_ref], "only the open same-Guild blocker, by ref");
+        assert!(!w.blocked_by.iter().any(|r| *r == resolved), "resolved blocker dropped");
+        assert!(!w.blocked_by.iter().any(|r| *r == foreign), "cross-Guild blocker not leaked");
+
+        let c = acme_todo
+            .iter()
+            .find(|c| c.task_id == clear)
+            .expect("clear card on the acme todo board");
+        assert!(c.blocked_by.is_empty(), "a non-blocked card carries no blockers");
+
+        // The foreign blocker is real but isolated: globex sees no acme waiter.
+        let globex_todo = s
+            .list_briefs_by_board_for_tenant(Some("todo"), "globex", 50)
+            .unwrap();
+        assert!(!globex_todo.iter().any(|c| c.task_id == waiter));
     }
 
     #[test]

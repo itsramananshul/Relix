@@ -986,6 +986,7 @@ mod tests {
             assignee_agent_id: None,
             mandate_id: None,
             campaign_id: None,
+            blocked_by: Vec::new(),
         }
     }
 
