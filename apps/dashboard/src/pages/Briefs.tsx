@@ -115,6 +115,17 @@ export function Briefs() {
   const [priority, setPriority] = useState("normal");
   const [mandateFilter, setMandateFilter] = useState("all");
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
+  // Drag/drop board movement (desktop): the card being dragged + its source
+  // column, and the column currently hovered as a drop target. The select +
+  // buttons below remain the keyboard/mobile fallback. A drop reuses the same
+  // real `brief.move` route — no optimistic mutation, so a backend gate refusal
+  // simply leaves the card where it is and we surface the reason.
+  const [drag, setDrag] = useState<{ card: Card; from: string } | null>(null);
+  const [overCol, setOverCol] = useState<string | null>(null);
+  // A transient note pinned right above the board for the LAST move result
+  // (success or refusal) — distinct from the section banner, so a refused drop
+  // reports next to the columns where the drop happened.
+  const [moveNote, setMoveNote] = useState<{ kind: string; msg: string } | null>(null);
   // The open Brief detail/Chronicle panel is URL-driven (`/briefs?brief=<id>`),
   // so the Action Center's ready/blocked/stale cards (and any shared deep link)
   // land on the exact Brief — selected, highlighted, and scrolled into view —
@@ -200,14 +211,34 @@ export function Briefs() {
     }
   }
 
+  // Move a Brief to a board column via the real `brief.move` route. Used by
+  // both the select fallback and a drag/drop drop. We do NOT optimistically
+  // re-place the card: the coordinator's state-machine guards (reviewer/
+  // assignee/dependency gates, §1.3) can refuse, so we wait for the server and
+  // only reload on success — a refused move leaves the card in place and shows
+  // why, right above the board.
   async function move(c: Card, status: string) {
-    setBanner(null);
+    const label = COLUMN_LABEL[status] ?? status;
+    const name = c.title ?? "Brief";
+    setMoveNote({ kind: "info", msg: `Moving “${name}” → ${label}…` });
     try {
       await api.post(`/v1/spine/briefs/${encodeURIComponent(cardId(c))}/move`, { status });
+      setMoveNote({ kind: "ok", msg: `Moved “${name}” → ${label}.` });
       reload();
     } catch (e) {
-      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Move failed" });
+      const why = e instanceof Error ? e.message : "Move failed";
+      setMoveNote({ kind: "err", msg: `Couldn't move “${name}” → ${label}: ${why}` });
     }
+  }
+
+  // Finish a drag: move the dragged card to the dropped column via the real
+  // route. A same-column drop is a no-op; a missing drag is ignored.
+  function handleDrop(targetCol: string) {
+    const d = drag;
+    setOverCol(null);
+    setDrag(null);
+    if (!d || d.from === targetCol) return;
+    move(d.card, targetCol);
   }
 
   async function run(c: Card, rig?: string) {
@@ -334,7 +365,14 @@ export function Briefs() {
             then assign it to an Operative and run it.
           </div>
         ) : (
-          <div className="board">
+          <>
+            {moveNote && (
+              <div className={"banner " + moveNote.kind} style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                <span style={{ flex: 1 }}>{moveNote.msg}</span>
+                <span className="link" style={{ whiteSpace: "nowrap" }} onClick={() => setMoveNote(null)}>dismiss ✕</span>
+              </div>
+            )}
+            <div className="board">
             {COLUMNS.map((col) => {
               const cards = (data?.board?.[col] ?? []).filter((c) =>
                 mandateFilter === "all"
@@ -343,8 +381,25 @@ export function Briefs() {
                     ? !c.mandate_id
                     : c.mandate_id === mandateFilter,
               );
+              // A column accepts a drop when a card from a DIFFERENT column is
+              // being dragged. Same-column hover gets no affordance.
+              const droppable = !!drag && drag.from !== col;
               return (
-                <div className="board-col" key={col}>
+                <div
+                  className={"board-col" + (droppable && overCol === col ? " drop-over" : "")}
+                  key={col}
+                  onDragOver={(e) => {
+                    if (!droppable) return;
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = "move";
+                    if (overCol !== col) setOverCol(col);
+                  }}
+                  onDrop={(e) => {
+                    if (!drag) return;
+                    e.preventDefault();
+                    handleDrop(col);
+                  }}
+                >
                   <h4>
                     {COLUMN_LABEL[col]} <span className="muted">{cards.length}</span>
                   </h4>
@@ -356,9 +411,34 @@ export function Briefs() {
                     const mTitle = c.mandate_id ? (mandateTitle.get(c.mandate_id) || c.mandate_id.slice(0, 8)) : null;
                     return (
                       <div
-                        className={"board-card" + (selected === cardId(c) ? " selected" : "")}
+                        className={
+                          "board-card" +
+                          (selected === cardId(c) ? " selected" : "") +
+                          (drag?.card && cardId(drag.card) === cardId(c) ? " dragging" : "")
+                        }
                         key={cardId(c)}
                         ref={selected === cardId(c) ? selectedRef : undefined}
+                        draggable
+                        aria-roledescription="Draggable Brief card — drag to another column to move it, or use the move control below."
+                        onDragStart={(e) => {
+                          // Don't hijack a drag that begins on an interactive
+                          // control (assign/move selects, Run/echo buttons,
+                          // links) — those stay clickable and are the keyboard/
+                          // mobile fallback path.
+                          const t = e.target as HTMLElement;
+                          if (t.closest("select, button, a, input, textarea, label")) {
+                            e.preventDefault();
+                            return;
+                          }
+                          setMoveNote(null);
+                          setDrag({ card: c, from: col });
+                          e.dataTransfer.effectAllowed = "move";
+                          e.dataTransfer.setData("text/plain", cardId(c));
+                        }}
+                        onDragEnd={() => {
+                          setDrag(null);
+                          setOverCol(null);
+                        }}
                       >
                         <div
                           className="t"
@@ -416,13 +496,13 @@ export function Briefs() {
                             ))}
                           </select>
                         </label>
-                        <div className="row" style={{ marginTop: 6, gap: 6 }}>
+                        <div className="row" style={{ marginTop: 6, gap: 6, flexWrap: "wrap" }}>
                           <select
                             className="select"
-                            style={{ fontSize: 11, padding: "3px 6px", flex: 1 }}
+                            style={{ fontSize: 11, padding: "3px 6px", flex: 1, minWidth: 110 }}
                             value={col}
                             onChange={(e) => move(c, e.target.value)}
-                            title="Move to a board column"
+                            title="Move to a board column (keyboard / touch fallback for drag-and-drop)"
                           >
                             {COLUMNS.map((s) => (
                               <option key={s} value={s}>→ {COLUMN_LABEL[s]}</option>
@@ -461,7 +541,8 @@ export function Briefs() {
                 </div>
               );
             })}
-          </div>
+            </div>
+          </>
         )}
       </Section>
     </div>

@@ -168,6 +168,14 @@ label.field span { display: block; font-size: 12px; color: var(--text-dim); marg
 .board-card .t { font-size: 13px; font-weight: 500; margin-bottom: 5px; word-break: break-word; }
 .board-card .m { font-size: 11px; color: var(--text-faint); display: flex; gap: 7px; flex-wrap: wrap; }
 .board-card.selected { border-color: var(--info, #2d6cdf); box-shadow: 0 0 0 1px var(--info, #2d6cdf) inset; }
+/* Drag/drop affordances. The card body grabs; the column being hovered as a
+   drop target lifts; the card in flight dims. Interactive controls inside the
+   card stay on the default pointer so they read as clickable, not draggable. */
+.board-card { cursor: grab; }
+.board-card:active { cursor: grabbing; }
+.board-card.dragging { opacity: 0.45; }
+.board-card select, .board-card button, .board-card a, .board-card .t { cursor: pointer; }
+.board-col.drop-over { border-color: var(--info, #2d6cdf); box-shadow: 0 0 0 1px var(--info, #2d6cdf) inset; }
 /* Two-column key/value grid for the Operative Keys panel. */
 .kv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 18px; }
 @media (max-width: 720px) { .kv-grid { grid-template-columns: 1fr; } }
