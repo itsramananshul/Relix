@@ -14,6 +14,7 @@ use crate::dispatch::{HandlerOutcome, InvocationCtx};
 use crate::nodes::coordinator::agent::keys::{
     KeyVerdict, assign_verdict, configure_verdict, manage_verdict, spawn_verdict,
 };
+use crate::nodes::coordinator::agent::action_center;
 use crate::nodes::coordinator::agent::prime;
 use crate::nodes::coordinator::agent::store::{
     AgentProfile, AgentStore, AgentStoreError, ApprovalStatus, StandingApprovalCreate,
@@ -1106,6 +1107,156 @@ pub fn handle_prime_status(
     match serde_json::to_vec(&body) {
         Ok(b) => HandlerOutcome::Ok(b),
         Err(e) => internal(format!("prime.status encode: {e}")),
+    }
+}
+
+/// Default stale threshold (1 day) for the Action Center's stale signal —
+/// matches the Desk/Inbox `/v1/spine/stale` default so the two surfaces agree.
+const ACTION_STALE_IDLE_SECS: i64 = 86_400;
+/// Per-source read bound — each contributing query is capped so the feed can
+/// never balloon; the merged feed is additionally capped at [`ACTION_FEED_CAP`].
+const ACTION_SRC_CAP: usize = 50;
+/// Final cap on the ordered+deduped action feed returned to the operator.
+const ACTION_FEED_CAP: usize = 60;
+
+/// `company.actions` — the **Action Center** (company-model §5.4 / §8.2,
+/// dashboard-design §5). READ-ONLY: it computes the operator's next actions
+/// from EXISTING live state — pending approvals/Clearances, pending hires, the
+/// Mandate strategy gate, the Brief board (ready / unassigned / blocked /
+/// stale), and the run ledger (needs-review / failed-refused-interrupted) — and
+/// returns one ordered, deduped feed. It approves, runs, applies, and mutates
+/// NOTHING; mutations stay on their existing governed routes. No new
+/// notification table — live state IS the source (company-model §8.2).
+///
+/// Tenant-scoped: every contributing read is scoped to the caller's Guild, so a
+/// different Guild's approvals / hires / Briefs / runs never surface here (no
+/// existence leak). No args. Returns `{actions, counts, truncated}`.
+pub fn handle_company_actions(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &TaskStore,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let tenant = ctx.tenant_id_or_default();
+    let mut items: Vec<action_center::ActionItem> = Vec::new();
+
+    // 1. Pending approvals / Clearances (hire activation, spawn, …). The most
+    //    urgent class — they gate the whole company (company-model §5.5).
+    match agent_store.list_pending_approvals_for_tenant(ACTION_SRC_CAP, tenant) {
+        Ok(approvals) => {
+            for a in &approvals {
+                items.push(action_center::approval_item(a));
+            }
+        }
+        Err(e) => return internal(format!("company.actions approvals: {e}")),
+    }
+
+    // 2. Pending hires — Operatives stuck `pending` (inert until approved). A
+    //    hire that already has a spawn Clearance (#1) is collapsed by the
+    //    dedupe in `finalize` (same underlying agent), so it shows once.
+    match agent_store.list_operatives_for_tenant(tenant) {
+        Ok(ops) => {
+            for o in &ops {
+                if o.status.eq_ignore_ascii_case("pending") {
+                    items.push(action_center::hire_item(o));
+                }
+            }
+        }
+        Err(e) => return internal(format!("company.actions roster: {e}")),
+    }
+
+    // 3. Strategy approvals — Mandates whose strategy is `proposed` (the gate
+    //    that must clear before a team can be built). Best-effort: a strategy
+    //    read failure for one Mandate simply omits it, never fails the feed.
+    if let Ok(mandates) = spine_store.list_mandates(tenant, None) {
+        for m in mandates.iter().take(ACTION_SRC_CAP) {
+            if spine_store
+                .strategy_status(tenant, &m.mandate_id)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some("proposed")
+            {
+                items.push(action_center::strategy_item(m));
+            }
+        }
+    }
+
+    // 4. ready_to_start — Briefs that can run now (assigned-to-active +
+    //    unblocked + unclaimed). Surfaced ABOVE generic blocked work because it
+    //    can move the company forward (Part B).
+    if let Ok(cards) = task_store.list_ready_briefs_for_tenant(tenant, ACTION_SRC_CAP) {
+        for c in &cards {
+            items.push(action_center::ready_item(c));
+        }
+    }
+
+    // 5. blocked — unassigned active Briefs (missing assignee) + Briefs blocked
+    //    on an unfinished dependency.
+    if let Ok(cards) = task_store.list_unassigned_briefs_for_tenant(tenant, ACTION_SRC_CAP) {
+        for c in &cards {
+            items.push(action_center::blocked_item(c, true));
+        }
+    }
+    if let Ok(cards) = task_store.list_blocked_briefs_for_tenant(tenant, ACTION_SRC_CAP) {
+        for c in &cards {
+            items.push(action_center::blocked_item(c, false));
+        }
+    }
+
+    // 6 + 7. needs_review + failed/refused/interrupted — from the LATEST run per
+    //        Brief only (runs are newest-first), so an old failed Shift and a
+    //        newer done Shift on the same Brief don't both spam the feed.
+    if let Ok(runs) = task_store.list_runs_for_tenant(tenant, 200) {
+        let mut seen_brief: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for r in &runs {
+            if !seen_brief.insert(r.brief_id.clone()) {
+                continue;
+            }
+            let needs_review =
+                r.status == "done" && r.review.as_deref() == Some("pending_review");
+            if needs_review {
+                items.push(action_center::needs_review_item(r));
+            } else if matches!(r.status.as_str(), "failed" | "refused" | "interrupted") {
+                items.push(action_center::failed_item(r));
+            }
+        }
+    }
+
+    // 8. stale — lowest priority, informational (stuck-too-long work).
+    if let Ok(cards) =
+        task_store.list_stale_briefs_for_tenant(ACTION_STALE_IDLE_SECS, tenant, ACTION_SRC_CAP)
+    {
+        for c in &cards {
+            items.push(action_center::stale_item(c));
+        }
+    }
+
+    // Order + dedupe (Part B), then bound the feed honestly.
+    let mut feed = action_center::finalize(items);
+    let truncated = feed.len() > ACTION_FEED_CAP;
+    feed.truncate(ACTION_FEED_CAP);
+
+    // Counts (computed AFTER dedupe + truncate so the badge matches the feed).
+    let mut by_category = serde_json::Map::new();
+    let mut by_severity = serde_json::Map::new();
+    for it in &feed {
+        bump_tally(&mut by_category, it.category.as_str());
+        bump_tally(&mut by_severity, it.severity.as_str());
+    }
+
+    let body = serde_json::json!({
+        "actions": feed,
+        "counts": {
+            "total": feed.len(),
+            "by_category": by_category,
+            "by_severity": by_severity,
+        },
+        "truncated": truncated,
+    });
+    match serde_json::to_vec(&body) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => internal(format!("company.actions encode: {e}")),
     }
 }
 
@@ -5302,6 +5453,240 @@ mod tests {
         assert_eq!(
             err_kind(handle_prime_status(&agents, &spine, &task, &fake_ctx(b"   "))),
             error_kinds::INVALID_ARGS
+        );
+    }
+
+    // ── Action Center (company.actions) — company-model §5.4 / §8.2 ──────
+
+    #[test]
+    fn company_actions_empty_is_calm() {
+        let (agents, spine, task) = prime_stores();
+        let v = json_of(ok_body(handle_company_actions(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(b""),
+        )));
+        assert_eq!(v["counts"]["total"], 0, "{v}");
+        assert!(v["actions"].as_array().unwrap().is_empty());
+        assert_eq!(v["truncated"], false);
+    }
+
+    #[test]
+    fn company_actions_surfaces_hire_ready_and_blocked() {
+        let (agents, spine, task) = prime_stores();
+        // One ACTIVE engineer → the engineer track is ready; the designer track
+        // is an unassigned pending hire; integration is dependency-blocked.
+        agents
+            .create_agent(
+                "Eng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"eng"), "medium", "default",
+            )
+            .unwrap();
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build a web dashboard"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let _ = ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
+        ));
+
+        let v = json_of(ok_body(handle_company_actions(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(b""),
+        )));
+        let actions = v["actions"].as_array().unwrap();
+        let cats: Vec<&str> = actions
+            .iter()
+            .map(|a| a["category"].as_str().unwrap())
+            .collect();
+        assert!(cats.contains(&"hire"), "a pending designer hire: {v}");
+        assert!(cats.contains(&"ready_to_start"), "engineer track ready: {v}");
+        assert!(cats.contains(&"blocked"), "integration blocked: {v}");
+        // Part B ordering: hire (high) before ready_to_start (medium) before
+        // blocked (medium, but ranked after ready so work can move forward).
+        let hire_pos = cats.iter().position(|c| *c == "hire").unwrap();
+        let ready_pos = cats.iter().position(|c| *c == "ready_to_start").unwrap();
+        let blocked_pos = cats.iter().position(|c| *c == "blocked").unwrap();
+        assert!(hire_pos < ready_pos, "hire before ready: {cats:?}");
+        assert!(ready_pos < blocked_pos, "ready before blocked: {cats:?}");
+        // Counts match the deduped feed; every item has an actionable label.
+        assert_eq!(v["counts"]["total"].as_u64().unwrap(), actions.len() as u64);
+        assert!(
+            actions.iter().all(|a| a["action_label"]
+                .as_str()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)),
+            "every action carries a recommended action label: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn company_actions_includes_needs_review_after_a_shift() {
+        let (agents, spine, task) = prime_stores();
+        let task = std::sync::Arc::new(task);
+        let reg = echo_registry();
+        agents
+            .create_agent(
+                "Eng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"eng"), "medium", "default",
+            )
+            .unwrap();
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(b"Build a web dashboard"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let _ = ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
+        ));
+        // Run the ready Brief as a real echo Shift → done → pending_review.
+        let started = json_of(ok_body(handle_prime_start(
+            &agents,
+            &spine,
+            &task,
+            &reg,
+            &fake_ctx(pid.as_bytes()),
+        )));
+        assert_eq!(started["started"].as_array().unwrap().len(), 1, "{started}");
+
+        let v = json_of(ok_body(handle_company_actions(
+            &agents,
+            &spine,
+            &(*task),
+            &fake_ctx(b""),
+        )));
+        let actions = v["actions"].as_array().unwrap();
+        let nr = actions
+            .iter()
+            .find(|a| a["category"] == "needs_review")
+            .expect("a done Shift awaits review");
+        // It deep-links to the run for review → apply.
+        assert!(
+            nr["route"].as_str().unwrap().contains("/runs?run="),
+            "needs_review deep-links to the run: {nr}"
+        );
+        assert_eq!(v["counts"]["by_category"]["needs_review"], 1, "{v}");
+    }
+
+    #[test]
+    fn company_actions_dedupes_hire_with_its_spawn_clearance() {
+        // A pending hire AND a spawn Clearance for it both point at the same
+        // Operative; the feed must show ONE item (the approval), not two.
+        let (agents, spine, task) = prime_stores();
+        let hire = agents
+            .request_hire(
+                "Des", "designer", "D", "des", "des", "founder",
+                &subject_of(b"des"), "medium", "default",
+            )
+            .unwrap();
+        agents
+            .create_spawn_clearance(&hire, &subject_of(b"des"), "route=founder", &[], "default")
+            .unwrap();
+        let v = json_of(ok_body(handle_company_actions(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(b""),
+        )));
+        let actions = v["actions"].as_array().unwrap();
+        let for_agent: Vec<&serde_json::Value> = actions
+            .iter()
+            .filter(|a| a["target_id"] == serde_json::json!(hire))
+            .collect();
+        assert_eq!(
+            for_agent.len(),
+            1,
+            "a hire + its Clearance must not spam the operator: {actions:?}"
+        );
+        assert_eq!(
+            for_agent[0]["category"], "approval",
+            "the more-urgent approval wins the dedupe"
+        );
+    }
+
+    #[test]
+    fn company_actions_surfaces_proposed_strategy() {
+        let (agents, spine, task) = prime_stores();
+        let m = spine
+            .create_mandate("default", "Ship v1", "the why", None, None)
+            .unwrap();
+        spine.propose_strategy("default", &m, "the plan").unwrap();
+        let v = json_of(ok_body(handle_company_actions(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(b""),
+        )));
+        let a = v["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["target_type"] == "mandate" && a["target_id"] == serde_json::json!(m))
+            .expect("a proposed-strategy approval item");
+        assert_eq!(a["category"], "approval");
+        assert!(
+            a["action_label"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("strategy"),
+            "{a}"
+        );
+    }
+
+    #[test]
+    fn company_actions_is_tenant_isolated() {
+        let (agents, spine, task) = prime_stores();
+        // Guild "acme" gets a pending hire + a proposed-strategy Mandate.
+        agents
+            .request_hire(
+                "Sec", "engineer", "E", "x", "x", "founder",
+                &subject_of(b"acme-hire"), "medium", "acme",
+            )
+            .unwrap();
+        let m = spine
+            .create_mandate("acme", "ACME secret mandate", "d", None, None)
+            .unwrap();
+        spine.propose_strategy("acme", &m, "plan").unwrap();
+
+        // acme sees its own work.
+        let a = json_of(ok_body(handle_company_actions(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx_tenant(b"", "acme"),
+        )));
+        assert!(
+            a["counts"]["total"].as_u64().unwrap() >= 2,
+            "acme sees its own hire + strategy: {a}"
+        );
+        // globex sees NONE of acme's items (no existence leak).
+        let g = json_of(ok_body(handle_company_actions(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx_tenant(b"", "globex"),
+        )));
+        assert_eq!(g["counts"]["total"], 0, "globex must not see acme: {g}");
+        assert!(
+            !g.to_string().contains("ACME secret mandate"),
+            "no cross-tenant title leak: {g}"
         );
     }
 

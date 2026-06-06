@@ -713,6 +713,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // owner-gated "Initialize Company" (create the Founder) action.
         .route("/v1/spine/company", get(spine::company_status))
         .route("/v1/spine/company/init", post(spine::company_init))
+        // Action Center: the operator's next-actions feed (company-model §8.2).
+        .route("/v1/spine/company/actions", get(spine::company_actions))
         .route("/v1/spine/operatives", get(spine::operatives))
         // Run-workspace context config (mode / project root / caps).
         .route("/v1/spine/run-config", get(spine::run_config))

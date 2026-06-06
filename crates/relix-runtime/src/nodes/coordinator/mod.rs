@@ -3600,6 +3600,46 @@ impl TaskStore {
         Ok(out)
     }
 
+    /// Tenant-scoped recent runs — the run ledger filtered to ONE Guild by
+    /// joining `brief_runs` to its Brief's `tenant_id` (the same join
+    /// [`run_belongs_to_tenant`] uses). The Action Center reads this so the
+    /// needs-review / failed-or-refused signals never surface another Guild's
+    /// Shifts. Newest first. (`list_runs` stays for the operator-global
+    /// `/v1/runs` ledger.)
+    pub fn list_runs_for_tenant(
+        &self,
+        tenant: &str,
+        limit: i64,
+    ) -> Result<Vec<RunRecord>, CoordinatorError> {
+        let limit = limit.clamp(1, 500);
+        let tenant = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT r.run_id, r.brief_id, r.agent_id, r.rig, r.status, r.started_at,
+                        r.finished_at, r.summary,
+                        r.workspace, r.workspace_context, r.workspace_files, r.workspace_bytes,
+                        r.review, r.review_note, r.reviewed_at,
+                        r.apply_status, r.applied_at, r.apply_note, r.applied_files, r.failed_files,
+                        r.trigger, r.provider, r.model, r.input_tokens, r.output_tokens,
+                        r.cached_input_tokens, r.cost_micros, r.session_id, r.refusal_reason
+                 FROM brief_runs r
+                 JOIN tasks t ON t.task_id = r.brief_id
+                 WHERE COALESCE(t.tenant_id, 'default') = ?1
+                 ORDER BY r.started_at DESC, r.rowid DESC
+                 LIMIT ?2",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![tenant, limit], RunRecord::from_row)
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(CoordinatorError::Db)?);
+        }
+        Ok(out)
+    }
+
     /// Run records for a single Brief, newest first — the per-Brief
     /// Shift history shown on the Brief card.
     pub fn runs_for_brief(
@@ -3864,6 +3904,50 @@ impl TaskStore {
             .map_err(CoordinatorError::Db)?;
         let rows = stmt
             .query_map(params![now, lim], brief_card_from_row)
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(rows)
+    }
+
+    /// GROUP 6 (tenant isolation): ready Briefs scoped to `tenant` — the same
+    /// "assigned-to-active-and-unblocked-and-unclaimed" predicate as
+    /// [`list_ready_briefs`] with a `COALESCE(tenant_id,'default')` filter, so
+    /// the Action Center's ready-to-start signal only sees this Guild's work.
+    pub fn list_ready_briefs_for_tenant(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<brief::BriefCard>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT t.task_id, t.title, t.board_status, t.priority,
+                        t.assignee_agent_id, t.mandate_id, t.campaign_id
+                 FROM tasks t
+                 WHERE t.assignee_agent_id IS NOT NULL
+                   AND t.board_status IN ('todo', 'in_progress')
+                   AND COALESCE(t.tenant_id, 'default') = ?2
+                   AND (t.claim_agent_id IS NULL OR t.claim_expires_at IS NULL
+                        OR t.claim_expires_at < ?1)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM task_edges e
+                       JOIN tasks b ON b.task_id = e.related_task_id
+                       WHERE e.task_id = t.task_id AND e.edge_type = 'blocked_on'
+                         AND b.board_status != 'done'
+                   )
+                 ORDER BY
+                   CASE t.priority
+                       WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
+                       WHEN 'normal' THEN 2 ELSE 3 END,
+                   t.updated_at ASC
+                 LIMIT ?3",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![now, norm_tenant(tenant), lim], brief_card_from_row)
             .map_err(CoordinatorError::Db)?
             .collect::<rusqlite::Result<_>>()
             .map_err(CoordinatorError::Db)?;

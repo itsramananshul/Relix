@@ -14,6 +14,7 @@
 //! - `standing_approvals` — Phase 5 — time-bounded categorical
 //!   pre-approvals.
 
+pub mod action_center;
 pub mod handlers;
 pub mod keys;
 pub mod prime;

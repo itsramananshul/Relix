@@ -3330,6 +3330,23 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // ACTION CENTER (company-model §5.4 / §8.2): one READ-ONLY feed of the
+    // operator's next actions, computed from existing live state (approvals,
+    // hires, the Brief board, the run ledger, the strategy gate). Tenant-scoped;
+    // mutates nothing. Needs the agent + spine + task stores.
+    if let Some(spine) = spine_store.clone() {
+        let s = agent_store.clone();
+        let ts = task_store.clone();
+        bridge.register(
+            "company.actions",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let spine = spine.clone();
+                let ts = ts.clone();
+                async move { handlers::handle_company_actions(&s, &spine, &ts, &ctx) }
+            })),
+        );
+    }
     if let Some(spine) = spine_store.clone() {
         bridge.register(
             "mandate.orchestration.latest",

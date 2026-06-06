@@ -1493,6 +1493,10 @@ name = "spine_company_status"
 method = "company.status"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_company_actions"
+method = "company.actions"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_company_bootstrap_founder"
 method = "company.bootstrap_founder"
 allow_groups = ["chat-users"]

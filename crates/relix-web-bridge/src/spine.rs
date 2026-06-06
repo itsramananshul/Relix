@@ -1423,6 +1423,18 @@ pub async fn operatives(
     json_passthrough(call_peer(&state, "agent.operatives", b"").await?)
 }
 
+/// `GET /v1/spine/company/actions` — the **Action Center** (company-model
+/// §5.4 / §8.2): one ordered, deduped, READ-ONLY feed of the operator's next
+/// actions (pending approvals/Clearances · pending hires · proposed strategies
+/// · ready-to-start · blocked · needs-review · failed/refused · stale),
+/// computed from existing live state and tenant-scoped. Mutations stay on their
+/// existing governed routes — this surface starts/approves/applies nothing.
+pub async fn company_actions(
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "company.actions", b"").await?)
+}
+
 /// `GET /v1/spine/run-config` — the run-workspace context config (mode /
 /// project root / caps) the dashboard Settings shows so an operator sees
 /// how Brief runs are sandboxed.
@@ -1981,6 +1993,12 @@ mod tests {
             .route("/v1/spine/briefs/:id/snag", post(add_snag))
             .route("/v1/spine/briefs/:id/unsnag", post(remove_snag))
             .route("/v1/spine/briefs/:id/subbrief", post(add_subbrief))
+            // First-run company surfaces + the Action Center (company-model
+            // §8.2) — `/company` vs `/company/actions` vs `/company/init` must
+            // not collide in matchit.
+            .route("/v1/spine/company", get(company_status))
+            .route("/v1/spine/company/init", post(company_init))
+            .route("/v1/spine/company/actions", get(company_actions))
             // Prime Shift-Room: the dedicated status stream (PART B) registered
             // alongside the polling snapshot — matchit panics here if the two
             // `…/status` and `…/status/stream` patterns conflict.
