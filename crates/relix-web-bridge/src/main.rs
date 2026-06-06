@@ -163,6 +163,8 @@ mod pii;
 mod planning;
 #[cfg(test)]
 mod planning_mini_mesh_test;
+#[cfg(test)]
+mod prime_status_mini_mesh_test;
 mod plugins;
 mod policy_denials;
 mod policy_simulate;
@@ -665,7 +667,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/prime/start", post(spine::prime_start))
         .route("/v1/spine/prime/proposals", get(spine::prime_proposals))
         .route("/v1/spine/prime/proposals/:id", get(spine::prime_proposal))
-        // Live Shift-Room status of a Prime work session (polled after start).
+        // Live Shift-Room status of a Prime work session: a dedicated
+        // tenant-scoped SSE stream (preferred) + the polling snapshot (fallback).
+        .route(
+            "/v1/spine/prime/proposals/:id/status/stream",
+            get(spine::prime_status_stream),
+        )
         .route(
             "/v1/spine/prime/proposals/:id/status",
             get(spine::prime_status),

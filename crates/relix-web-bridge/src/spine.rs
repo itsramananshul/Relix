@@ -7,19 +7,27 @@
 //! `agent.*` / `task.*` routes — these add no new trust, just a
 //! browser-friendly shape over the existing capabilities.
 
+use std::time::Duration;
+
+use async_stream::stream;
 use axum::{
     Json,
     body::Body,
     extract::{Path, Query, State},
     http::{StatusCode, header},
-    response::{IntoResponse, Redirect, Response},
+    response::{
+        IntoResponse, Redirect, Response, Sse,
+        sse::{Event, KeepAlive},
+    },
 };
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
 use crate::config::AppState;
+use crate::tenant::{CURRENT_TENANT, DEFAULT_TENANT, current_tenant};
 
 /// The coordinator's mesh alias (same as the `agent.*` routes).
 const DEFAULT_PEER: &str = "coordinator";
@@ -617,13 +625,168 @@ pub async fn prime_proposal(
 /// Brief board, and the run ledger into one command-center payload (created
 /// Briefs with their latest Shift / blockers / review-apply state + roll-up
 /// counts + recommended next actions). Tenant-scoped: an unknown / cross-Guild
-/// proposal reads as not-found. The dashboard POLLS this after start (there is
-/// no live SSE stream for a Prime session today).
+/// proposal reads as not-found. The dashboard prefers the dedicated
+/// `…/status/stream` SSE and falls back to polling this snapshot.
 pub async fn prime_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
     json_passthrough(call_peer(&state, "prime.status", id.as_bytes()).await?)
+}
+
+/// Forced `prime.status` refresh interval — a poll fallback so the Shift Room
+/// converges even if a run event is missed or the run-event source is absent.
+/// Low enough to feel live, high enough not to spin.
+const PRIME_STATUS_FORCED_REFRESH: Duration = Duration::from_secs(3);
+/// Fast tick used to watch the REUSED run-event feed for activity, so a Shift
+/// transition reflects within ~1s without polling the heavier status join.
+const PRIME_STATUS_RUN_POLL: Duration = Duration::from_millis(1000);
+/// Page size for the reused run-event change-detection read.
+const PRIME_STATUS_RUN_PAGE: usize = 200;
+
+/// Scan a `run.events.recent` body (one JSON object per line, each with an
+/// integer `id`) for activity newer than `since`. Returns `(changed, newest)`:
+/// `changed` is true when any line carries `id > since`, and `newest` is the
+/// max id seen (or `since` when the body has none). PURE — tolerant of blank /
+/// malformed lines (skipped). Used by the status stream as the cheap "did
+/// anything run?" trigger before re-fetching the heavier status join.
+pub fn scan_run_events_for_change(body: &str, since: i64) -> (bool, i64) {
+    let mut newest = since;
+    let mut changed = false;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let id = serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v.get("id").and_then(|x| x.as_i64()));
+        if let Some(id) = id {
+            if id > since {
+                changed = true;
+            }
+            if id > newest {
+                newest = id;
+            }
+        }
+    }
+    (changed, newest)
+}
+
+/// `GET /v1/spine/prime/proposals/:id/status/stream` — the dedicated REALTIME
+/// Shift-Room stream for one Prime work session (PART B). Tenant-scoped via the
+/// normal bridge auth/context (the resolved tenant is captured at open time and
+/// re-applied to every downstream coord call). The stream:
+///
+/// - emits the initial status immediately as `event: status` (JSON = the same
+///   `prime.status` snapshot the polling route returns);
+/// - REUSES the existing `/v1/runs/events/stream` source (`run.events.recent`)
+///   only as a cheap change-trigger — when a run event arrives it re-fetches the
+///   status within ~1s — and ALSO force-refreshes on a low interval so the room
+///   converges even if an event is missed or the run-event source is absent;
+/// - de-dupes: an unchanged status pushes nothing (keep-alive `ping` only), so
+///   the loop never spins on identical frames;
+/// - on a tenant-gated / unknown proposal emits a terminal `event: not_found`
+///   and stops cleanly (no existence leak); transient errors emit `event: error`
+///   and keep trying;
+/// - stops cleanly when the client disconnects (the stream future is dropped,
+///   releasing the stream-metrics guard).
+///
+/// No new persistent state or event table — it composes the existing read
+/// capabilities exactly like the polling route.
+pub async fn prime_status_stream(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<
+    Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, Json<ApiError>),
+> {
+    let proposal_id = id.trim().to_string();
+    if proposal_id.is_empty() {
+        return Err(bad("proposal_id required"));
+    }
+    // Capture the resolved tenant NOW (inside the middleware scope); the stream
+    // body runs later, OUTSIDE that scope, and must re-apply it on each call.
+    let tenant_scope = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    let opened_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let stream_guard = state
+        .stream_metrics
+        .open(format!("prime:{proposal_id}"), opened_at);
+
+    let s = stream! {
+        let _live_guard = stream_guard;
+        let mut last_emitted: Option<String> = None;
+        let mut run_cursor: i64 = 0;
+        let mut first = true;
+        // Forced refresh cadence expressed in fast-poll ticks.
+        let forced_every: u128 = (PRIME_STATUS_FORCED_REFRESH.as_millis()
+            / PRIME_STATUS_RUN_POLL.as_millis().max(1))
+        .max(1);
+        let mut ticks_since_refresh: u128 = 0;
+
+        loop {
+            // 1) Detect run-event activity since the last cursor (only new rows).
+            //    Reuses the existing run-event feed; a failure here is non-fatal —
+            //    the forced poll below still converges the room. Absent recorder →
+            //    pure forced polling.
+            let mut run_changed = false;
+            if let Some(rec) = state.task_recorder.as_ref() {
+                let fetch = CURRENT_TENANT.scope(
+                    tenant_scope.clone(),
+                    rec.run_events_recent(run_cursor, PRIME_STATUS_RUN_PAGE),
+                );
+                if let Ok(body) = fetch.await {
+                    let (changed, newest) = scan_run_events_for_change(&body, run_cursor);
+                    if newest > run_cursor {
+                        run_cursor = newest;
+                    }
+                    // The very first read just seeds the cursor — only events
+                    // AFTER the stream opened should trigger a refresh.
+                    run_changed = changed && !first;
+                }
+            }
+
+            // 2) Refresh when: first frame, a run event arrived, or the forced
+            //    interval elapsed (so a missed event still eventually converges).
+            let due = first || run_changed || ticks_since_refresh >= forced_every;
+            if due {
+                let fetch = CURRENT_TENANT.scope(
+                    tenant_scope.clone(),
+                    call_peer(&state, "prime.status", proposal_id.as_bytes()),
+                );
+                match fetch.await {
+                    Ok(body) => {
+                        let text = String::from_utf8_lossy(&body).to_string();
+                        // De-dupe: only push when the payload actually changed.
+                        if last_emitted.as_deref() != Some(text.as_str()) {
+                            yield Ok(Event::default().event("status").data(text.clone()));
+                            last_emitted = Some(text);
+                        }
+                    }
+                    Err((status, err)) => {
+                        let payload = serde_json::json!({ "error": err.0.error }).to_string();
+                        if status == StatusCode::NOT_FOUND {
+                            // Tenant-gated / unknown proposal → terminal, no leak.
+                            yield Ok(Event::default().event("not_found").data(payload));
+                            break;
+                        }
+                        // Transient (mesh / gateway) — surface and keep trying.
+                        yield Ok(Event::default().event("error").data(payload));
+                    }
+                }
+                first = false;
+                ticks_since_refresh = 0;
+            } else {
+                ticks_since_refresh += 1;
+            }
+
+            tokio::time::sleep(PRIME_STATUS_RUN_POLL).await;
+        }
+    };
+    Ok(Sse::new(s).keep_alive(KeepAlive::default().text("ping")))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1708,6 +1871,32 @@ mod tests {
     }
 
     #[test]
+    fn scan_run_events_detects_new_activity_and_tracks_newest() {
+        // run.events.recent is newest-first, one JSON object per line. The
+        // scanner reports whether anything is newer than `since` + the max id.
+        let body = "{\"id\":7,\"type\":\"run.finished\"}\n{\"id\":5,\"type\":\"run.started\"}\n";
+        let (changed, newest) = scan_run_events_for_change(body, 4);
+        assert!(changed, "ids 5 & 7 are newer than 4");
+        assert_eq!(newest, 7);
+        // Nothing newer than the cursor → no change, cursor preserved.
+        let (changed, newest) = scan_run_events_for_change(body, 7);
+        assert!(!changed, "nothing newer than 7");
+        assert_eq!(newest, 7);
+    }
+
+    #[test]
+    fn scan_run_events_is_blank_and_garbage_tolerant() {
+        // Blank lines, non-JSON, and rows missing an integer id are skipped so
+        // the change-trigger never panics on an unexpected feed shape.
+        let body = "\n\nnot json\n{\"type\":\"x\"}\n{\"id\":3}\n";
+        let (changed, newest) = scan_run_events_for_change(body, 0);
+        assert!(changed);
+        assert_eq!(newest, 3);
+        // An entirely empty body → no change, cursor unchanged.
+        assert_eq!(scan_run_events_for_change("", 9), (false, 9));
+    }
+
+    #[test]
     fn parse_event_lines_builds_array_and_skips_blanks() {
         // task.events is newline-delimited JSON objects; the composite
         // turns it into a real array and drops blank / unparseable lines.
@@ -1791,6 +1980,22 @@ mod tests {
             .route("/v1/spine/briefs/:id/set", post(set_field))
             .route("/v1/spine/briefs/:id/snag", post(add_snag))
             .route("/v1/spine/briefs/:id/unsnag", post(remove_snag))
-            .route("/v1/spine/briefs/:id/subbrief", post(add_subbrief));
+            .route("/v1/spine/briefs/:id/subbrief", post(add_subbrief))
+            // Prime Shift-Room: the dedicated status stream (PART B) registered
+            // alongside the polling snapshot — matchit panics here if the two
+            // `…/status` and `…/status/stream` patterns conflict.
+            .route("/v1/spine/prime/propose", post(prime_propose))
+            .route("/v1/spine/prime/approve", post(prime_approve))
+            .route("/v1/spine/prime/start", post(prime_start))
+            .route("/v1/spine/prime/proposals", get(prime_proposals))
+            .route("/v1/spine/prime/proposals/:id", get(prime_proposal))
+            .route(
+                "/v1/spine/prime/proposals/:id/status",
+                get(prime_status),
+            )
+            .route(
+                "/v1/spine/prime/proposals/:id/status/stream",
+                get(prime_status_stream),
+            );
     }
 }
