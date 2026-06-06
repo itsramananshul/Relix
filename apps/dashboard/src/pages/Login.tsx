@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { useAuth } from "../auth";
 
 export function Login() {
-  const { status, login, setup, bridgeDown, bridgeError, refresh } = useAuth();
+  const { status, login, setup, bridgeDown, bridgeError, sessionExpired, refresh } = useAuth();
   const isSetup = status?.needs_setup ?? false;
   const [username, setUsername] = useState("admin");
   const [password, setPassword] = useState("");
@@ -38,6 +38,11 @@ export function Login() {
             ? "Create the operator admin account for this bridge."
             : "Operator console for your Relix mesh."}
         </p>
+        {sessionExpired && !isSetup && !bridgeDown && (
+          <div className="banner err" style={{ marginBottom: 8 }}>
+            Your session expired — sign in again to continue.
+          </div>
+        )}
         {bridgeDown && (
           <div className="banner err banner-action" style={{ marginBottom: 8 }}>
             <span>

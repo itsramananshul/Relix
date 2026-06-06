@@ -12,6 +12,40 @@ export class ApiError extends Error {
   }
 }
 
+// ── Session-expired signal ────────────────────────────────────────────────
+// When a PROTECTED API call comes back 401/403, the operator's session cookie
+// has lapsed (or was never minted). Rather than let every page render a broken
+// "Could not load …" card, we fire a single signal the AuthProvider listens
+// for, so the app can flip back to the login screen with a clear message.
+//
+// This is a CLIENT-SIDE reaction only — it never makes a protected route
+// public; it just routes an honest 401 to the login path instead of a dead end.
+type SessionExpiredHandler = () => void;
+const sessionExpiredHandlers = new Set<SessionExpiredHandler>();
+
+export function onSessionExpired(cb: SessionExpiredHandler): () => void {
+  sessionExpiredHandlers.add(cb);
+  return () => {
+    sessionExpiredHandlers.delete(cb);
+  };
+}
+
+function notifySessionExpired(): void {
+  for (const cb of sessionExpiredHandlers) {
+    try {
+      cb();
+    } catch {
+      /* a misbehaving listener must not break the request path */
+    }
+  }
+}
+
+// The auth endpoints self-gate (a wrong password is a legitimate 401 on the
+// login form, NOT an expired session) — never treat them as a lapsed session.
+function isAuthPath(path: string): boolean {
+  return path.startsWith("/v1/auth/");
+}
+
 async function parse(res: Response): Promise<unknown> {
   const text = await res.text();
   if (!text) return null;
@@ -31,6 +65,11 @@ async function request(method: string, path: string, body?: unknown): Promise<un
   });
   const data = await parse(res);
   if (!res.ok) {
+    // A 401/403 on any non-auth route means the session lapsed — signal the
+    // app to reauthenticate instead of leaving the page on a broken card.
+    if ((res.status === 401 || res.status === 403) && !isAuthPath(path)) {
+      notifySessionExpired();
+    }
     const msg =
       (data && typeof data === "object" && "error" in data
         ? String((data as Record<string, unknown>).error)
