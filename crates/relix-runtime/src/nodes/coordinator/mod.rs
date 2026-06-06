@@ -769,6 +769,19 @@ impl TaskStore {
         self.list_brief_edges(task, "blocked_on")
     }
 
+    /// GROUP 6 (tenant isolation): like [`Self::list_snags`], but only the
+    /// Snags whose blocker Brief lives in `tenant`'s Guild — so a Brief's
+    /// open-blocker read can never leak a cross-Guild blocker id even if a
+    /// legacy `blocked_on` edge crosses tenants. Backs the tenant-scoped
+    /// `prime.status` Shift-Room blocker read.
+    pub fn list_snags_for_tenant(
+        &self,
+        task: &str,
+        tenant: &str,
+    ) -> Result<Vec<String>, CoordinatorError> {
+        self.list_brief_edges_for_tenant(task, "blocked_on", tenant)
+    }
+
     /// PHASE 1 (Brief): clear a **Snag** — remove the `task` →
     /// `blocker` 'blocked_on' edge (the dependency was wrong, or has
     /// been resolved out-of-band). Chronicles `brief.snag_cleared`

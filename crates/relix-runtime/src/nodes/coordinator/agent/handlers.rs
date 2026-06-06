@@ -820,11 +820,14 @@ struct BriefStatus {
 }
 
 /// Compose one created Brief's live Shift-Room row. PURE w.r.t. the stores it
-/// reads (no mutation). Tenant safety is provided by the caller already having
-/// gated the owning proposal — the Briefs here are this Guild's own.
+/// reads (no mutation). The caller has already gated the owning proposal to
+/// `tenant`'s Guild; `tenant` is threaded through so the open-blocker read is
+/// itself tenant-scoped — a legacy `blocked_on` edge that crosses Guilds can
+/// never surface a cross-tenant blocker here.
 fn brief_status_row(
     agent_store: &AgentStore,
     task_store: &TaskStore,
+    tenant: &str,
     brief_id: &str,
     in_ready_set: bool,
 ) -> BriefStatus {
@@ -855,9 +858,10 @@ fn brief_status_row(
     };
 
     // Open blockers (Snags): the Briefs this one is blocked by that are not yet
-    // done/cancelled. Same-proposal Briefs → same Guild, no cross-tenant leak.
+    // done/cancelled. Tenant-scoped read — even if a legacy `blocked_on` edge
+    // crosses Guilds, a cross-tenant blocker id is filtered out (no leak).
     let mut blockers: Vec<serde_json::Value> = Vec::new();
-    if let Ok(snags) = task_store.list_snags(brief_id) {
+    if let Ok(snags) = task_store.list_snags_for_tenant(brief_id, tenant) {
         for b in snags {
             if let Ok(Some(bc)) = task_store.brief_card(&b) {
                 let resolved = matches!(bc.board_status.as_str(), "done" | "cancelled");
@@ -1026,7 +1030,7 @@ pub fn handle_prime_status(
     let mut c_not_ready = 0i64;
     let mut c_missing = 0i64;
     for id in &created {
-        let row = brief_status_row(agent_store, task_store, id, ready_ids.contains(id));
+        let row = brief_status_row(agent_store, task_store, tenant, id, ready_ids.contains(id));
         match row.bucket {
             "running" => c_running += 1,
             "done" => c_done += 1,
@@ -5152,6 +5156,86 @@ mod tests {
                 &fake_ctx_tenant(pid.as_bytes(), "globex"),
             )),
             error_kinds::INVALID_ARGS
+        );
+    }
+
+    #[test]
+    fn prime_status_blockers_are_tenant_scoped_against_legacy_cross_tenant_edges() {
+        // A created Brief in Guild "acme" gains a legacy `blocked_on` edge to a
+        // Brief that lives in a DIFFERENT Guild ("globex"). `prime.status` must
+        // NOT surface that cross-tenant blocker — even though the raw edge
+        // exists — because the open-blocker read is tenant-scoped.
+        let (agents, spine, task) = prime_stores();
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx_tenant(b"Build a web dashboard", "acme"),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let approved = json_of(ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx_tenant(pid.as_bytes(), "acme"),
+        )));
+        let created: Vec<String> = approved["created_briefs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let victim = created.first().expect("at least one created Brief").clone();
+
+        // A Brief owned by a different Guild — the would-be leaked blocker.
+        let foreign = task
+            .create_brief(
+                "globex",
+                "SECRET cross-tenant blocker",
+                "owner",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        // Force the legacy cross-tenant edge directly (the store's edge writer
+        // does not itself tenant-check — only existence + no-cycle).
+        task.add_snag(&victim, &foreign).unwrap();
+        // Sanity: the raw (un-scoped) edge really is present.
+        assert!(
+            task.list_snags(&victim).unwrap().contains(&foreign),
+            "the cross-tenant edge must exist for the test to be meaningful"
+        );
+
+        // The acme Guild's Shift Room must not leak it.
+        let v = json_of(ok_body(handle_prime_status(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx_tenant(pid.as_bytes(), "acme"),
+        )));
+        let raw = v.to_string();
+        assert!(
+            !raw.contains(&foreign),
+            "cross-tenant blocker id leaked into prime.status: {raw}"
+        );
+        assert!(
+            !raw.contains("SECRET cross-tenant blocker"),
+            "cross-tenant blocker title leaked into prime.status: {raw}"
+        );
+        // Specifically, the victim Brief lists none of the foreign blocker.
+        let victim_row = v["briefs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["brief_id"] == serde_json::json!(victim))
+            .expect("the victim Brief is present");
+        let blockers = victim_row["blockers"].as_array().unwrap();
+        assert!(
+            blockers.iter().all(|b| b["brief_id"] != serde_json::json!(foreign)),
+            "the foreign blocker must be filtered from the victim's blockers: {victim_row}"
         );
     }
 
