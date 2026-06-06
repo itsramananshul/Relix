@@ -74,23 +74,32 @@ Relix models a company — Founder, Prime (planning lead), Crew, Mandates,
 Clearances — and the dashboard drives the whole loop (found the company →
 hire a Prime → describe a goal so **Prime proposes a plan** → approve it to
 create the Mandate + Briefs + crew assignments + pending hires → greenlight
-spawn Clearances → execute). The `company.status` summary surfaces the
-Founder, the Prime, and the crew breakdown (active / pending / by role). The
-**Prime Assistant** (`POST /v1/spine/prime/propose` → `…/approve`, the Chat
-page) turns a free-text request into a structured, governed plan that creates
-nothing until approved. What it does **not** do:
+spawn Clearances → **Start the work**). The `company.status` summary surfaces
+the Founder, the Prime, and the crew breakdown (active / pending / by role).
+The **Prime Assistant** (`POST /v1/spine/prime/propose` → `…/approve` →
+`…/start`, the Chat page) turns a free-text request into a structured,
+governed plan that creates nothing until approved, then starts the ready work
+when you click Start. What it does **not** do:
 
-- **The Prime is rule-based, not an LLM.** Intent interpretation, the team
-  plan, and Mandate→Brief decomposition are deterministic/templated
-  (role-track + integration Briefs by canned titles), not authored by a
-  language model — no model is wired into a coordinator capability, and the
-  response says so honestly (`ai_used:false` + an `ai_status` string), never
-  faking model output. Two different "build a dashboard" requests yield the
-  same plan shape.
+- **The Prime is rule-based, not an LLM** (request-aware, but still
+  deterministic). The plan now *reflects the request* — intent shapes the
+  breakdown (a `fix` is a reproduce → fix → verify chain, `research` is
+  investigate → synthesize, `build` is role tracks + integrate), and each
+  Brief title carries the extracted deliverable — so two different requests no
+  longer collapse to one shape (company-model §12.5A). But this is rule-based
+  pattern-matching, not a language model: no model is wired into a coordinator
+  capability, and the response says so honestly (`ai_used:false` + an
+  `ai_status` string), never faking model output. It cannot reason about
+  ambiguous or novel requests the way a model would.
 - **A human is in the loop at every gate.** Prime PROPOSES; the operator must
-  click approve to create anything, then greenlight each spawn Clearance and
-  start each Brief. There is no auto-pilot that takes a goal end-to-end
-  (propose → approve → staff → orchestrate → run) without approvals.
+  click **Approve & create** to create anything, greenlight each spawn
+  Clearance, and click **Start the work** to run it. `prime.start`
+  (company-model §12.5B) closes the loop — it turns the approved Mandate's
+  ready Briefs into real Shifts through the same governed run path as a manual
+  run (approved-only, ready-only, every skipped Brief reported with a reason) —
+  but it is still an operator-initiated gate, not an auto-pilot. There is no
+  driver that takes a goal end-to-end (propose → approve → staff → orchestrate
+  → run) on its own.
 - **Hiring is request → approve only.** Prime suggests *which roles* are
   missing and files them as `pending` hire requests on approval, but it does
   not decide *which person/identity* to hire or *which adapter* to assign,
