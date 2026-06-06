@@ -1137,6 +1137,27 @@ pub fn handle_company_actions(
     task_store: &TaskStore,
     ctx: &InvocationCtx,
 ) -> HandlerOutcome {
+    // No live-spend ledger wired (e.g. metrics disabled, or a caller that
+    // predates the spend seam) → allowance-backed budget signals only, never a
+    // fabricated spend figure.
+    handle_company_actions_with_spend(agent_store, spine_store, task_store, None, ctx)
+}
+
+/// `company.actions` with an optional authoritative **live-spend** source — the
+/// SAME month-to-date ledger + trailing-30-day window the dispatch/refusal gate
+/// enforces (`MetricsQuery::cost_since`, the `over_allowance` path). When
+/// `spend` is `Some`, the feed adds actual-spend budget alerts (per-Operative
+/// over/near Allowance + Guild over/near budget) keyed off real recorded cost;
+/// when `None`, NO spend item is emitted (the allowance-committed planning
+/// signals still surface). Reading spend through this seam keeps the feed from
+/// either disagreeing with the gate or inventing a number.
+pub fn handle_company_actions_with_spend(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &TaskStore,
+    spend: Option<&dyn action_center::SpendSource>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
     let tenant = ctx.tenant_id_or_default();
     let mut items: Vec<action_center::ActionItem> = Vec::new();
 
@@ -1254,6 +1275,79 @@ pub fn handle_company_actions(
         }
     }
 
+    //     (c) LIVE SPEND (Part B) — actual recorded month-to-date cost from the
+    //         SAME authoritative source + window the dispatch/refusal gate
+    //         enforces (`MetricsQuery::cost_since` over the trailing 30 days,
+    //         `heartbeat::allowance_admits`). Read ONLY through the `SpendSource`
+    //         seam, so when no ledger is wired (`spend == None`) NO spend item is
+    //         emitted — the feed never fabricates a figure.
+    //
+    //         TENANT ISOLATION: we sum ONLY this tenant's own active Operatives'
+    //         per-agent spend (each `agent_id` came from
+    //         `list_operatives_for_tenant`). We NEVER call a company-wide
+    //         `cost_since(None, …)`, so no other Guild's spend can leak into this
+    //         Guild's totals. This is ACTUAL spend — kept DISTINCT from the
+    //         committed-Allowance planning signal in (a) (different ids/targets,
+    //         so both can coexist without double-counting).
+    if let Some(spend) = spend {
+        let mut company_spend_micros: u64 = 0;
+        let mut have_company_spend = false;
+        for o in &operatives {
+            if !o.status.eq_ignore_ascii_case("active") {
+                continue;
+            }
+            // No recorded spend for this Operative → no signal (never a faked 0).
+            let Some(used) = spend.operative_spend_micros(&o.agent_id) else {
+                continue;
+            };
+            company_spend_micros = company_spend_micros.saturating_add(used);
+            have_company_spend = true;
+            // Per-Operative ACTUAL spend vs its own Allowance — only meaningful
+            // for a positive cap (a `0`/negative cap is the hard-stop in (b);
+            // a `None` cap is ungated, so there's no threshold to breach).
+            if let Some(cap) = o.monthly_allowance_cents
+                && cap > 0
+            {
+                let cap_micros =
+                    (cap as u64).saturating_mul(action_center::MICROS_PER_CENT);
+                if used >= cap_micros {
+                    items.push(action_center::operative_spend_item(o, used, cap, true));
+                } else if used.saturating_mul(100)
+                    >= cap_micros.saturating_mul(action_center::SPEND_NEAR_PCT)
+                {
+                    items.push(action_center::operative_spend_item(o, used, cap, false));
+                }
+            }
+        }
+        // Guild ACTUAL spend (sum of THIS tenant's Operatives) vs the Guild's
+        // configured monthly budget — same budget number the committed signal in
+        // (a) uses, but compared against money already spent. Fires only when at
+        // least one Operative had recorded spend AND the Guild has a positive
+        // budget set.
+        if have_company_spend
+            && let Ok(Some(guild)) = spine_store.get_guild(tenant)
+            && let Some(budget) = guild.monthly_allowance_cents
+            && budget > 0
+        {
+            let budget_micros = (budget as u64).saturating_mul(action_center::MICROS_PER_CENT);
+            if company_spend_micros >= budget_micros {
+                items.push(action_center::company_spend_item(
+                    company_spend_micros,
+                    budget,
+                    true,
+                ));
+            } else if company_spend_micros.saturating_mul(100)
+                >= budget_micros.saturating_mul(action_center::SPEND_NEAR_PCT)
+            {
+                items.push(action_center::company_spend_item(
+                    company_spend_micros,
+                    budget,
+                    false,
+                ));
+            }
+        }
+    }
+
     // 6 + 7. needs_review + failed/refused/interrupted — from the LATEST run per
     //        Brief only (runs are newest-first), so an old failed Shift and a
     //        newer done Shift on the same Brief don't both spam the feed.
@@ -1307,6 +1401,43 @@ pub fn handle_company_actions(
     match serde_json::to_vec(&body) {
         Ok(b) => HandlerOutcome::Ok(b),
         Err(e) => internal(format!("company.actions encode: {e}")),
+    }
+}
+
+/// Production [`action_center::SpendSource`] — the authoritative month-to-date
+/// spend the dispatch/refusal gate enforces, exposed READ-ONLY to the Action
+/// Center. Wraps a [`crate::metrics::MetricsQuery`] and pins the SAME trailing
+/// window the heartbeat Allowance gate computes (`now − 30d`), so the feed can
+/// never disagree with the gate by reading a different source or window. A
+/// ledger read error degrades to `None` (no spend signal) — never a fabricated
+/// `0`.
+pub struct MetricsSpendSource {
+    query: crate::metrics::MetricsQuery,
+    since_ms: i64,
+}
+
+impl MetricsSpendSource {
+    /// Build a source whose window is the trailing 30 days ending now — the
+    /// exact window the heartbeat budget closure uses
+    /// (`controller_runtime`: `now − 30 * 86_400 * 1000` ms).
+    pub fn trailing_30d(query: crate::metrics::MetricsQuery) -> Self {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        Self {
+            query,
+            since_ms: now_ms - 30 * 86_400 * 1000,
+        }
+    }
+}
+
+impl action_center::SpendSource for MetricsSpendSource {
+    fn operative_spend_micros(&self, agent_id: &str) -> Option<u64> {
+        // Mirror the gate exactly: sum `cost_micros` for THIS Operative since the
+        // pinned window start. A query error → `None` (no signal), so a transient
+        // metrics failure never fabricates spend.
+        self.query.cost_since(Some(agent_id), self.since_ms).ok()
     }
 }
 
@@ -5892,6 +6023,250 @@ mod tests {
         if let Some(ready_pos) = cats.iter().position(|c| *c == "ready_to_start") {
             assert!(budget_pos < ready_pos, "budget before ready: {cats:?}");
         }
+    }
+
+    /// A fake [`action_center::SpendSource`] — maps `agent_id → micro-USD`. An
+    /// unknown agent returns `None` (no recorded spend), so it exercises both the
+    /// "has spend" and "no signal" branches without any SQLite dependency.
+    struct FakeSpend(std::collections::HashMap<String, u64>);
+    impl FakeSpend {
+        fn of(pairs: &[(&str, u64)]) -> Self {
+            FakeSpend(pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect())
+        }
+    }
+    impl action_center::SpendSource for FakeSpend {
+        fn operative_spend_micros(&self, agent_id: &str) -> Option<u64> {
+            self.0.get(agent_id).copied()
+        }
+    }
+
+    // ── Live spend (Part B): actual month-to-date cost from the SAME source the
+    //    dispatch gate enforces (MetricsQuery::cost_since), read through the
+    //    SpendSource seam. ───────────────────────────────────────────────────
+
+    #[test]
+    fn company_actions_live_spend_over_and_near_allowance() {
+        let (agents, spine, task) = prime_stores();
+        // Two active Operatives, each with a $200 monthly Allowance (20_000c).
+        // No Guild budget set → only per-Operative spend items can fire.
+        let over = agents
+            .create_agent(
+                "Over", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"over"), "medium", "default",
+            )
+            .unwrap();
+        let near = agents
+            .create_agent(
+                "Near", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"near"), "medium", "default",
+            )
+            .unwrap();
+        agents.update_agent_field(&over, "allowance", "20000").unwrap();
+        agents.update_agent_field(&near, "allowance", "20000").unwrap();
+        // over: $250 spent of $200 (125%, at/over the cap → High).
+        // near: $170 spent of $200 (85% ≥ 80% band → Medium); not yet refused.
+        let spend = FakeSpend::of(&[
+            (over.as_str(), 250_000_000),
+            (near.as_str(), 170_000_000),
+        ]);
+
+        let v = json_of(ok_body(handle_company_actions_with_spend(
+            &agents,
+            &spine,
+            &task,
+            Some(&spend),
+            &fake_ctx(b""),
+        )));
+        let actions = v["actions"].as_array().unwrap();
+
+        let o = actions
+            .iter()
+            .find(|a| a["id"] == serde_json::json!(format!("budget:spend:{over}")))
+            .expect("an over-Allowance spend item for `over`");
+        assert_eq!(o["category"], "budget");
+        assert_eq!(o["severity"], "high", "{o}");
+        let oreason = o["reason"].as_str().unwrap();
+        assert!(oreason.contains("$250.00"), "spent shown: {oreason}");
+        assert!(oreason.contains("$200.00"), "cap shown: {oreason}");
+        assert!(oreason.contains("125%"), "percent shown: {oreason}");
+        assert!(oreason.contains("at/over the cap"), "over phrasing: {oreason}");
+
+        let n = actions
+            .iter()
+            .find(|a| a["id"] == serde_json::json!(format!("budget:spend:{near}")))
+            .expect("a near-Allowance spend item for `near`");
+        assert_eq!(n["severity"], "medium", "{n}");
+        let nreason = n["reason"].as_str().unwrap();
+        assert!(nreason.contains("85%"), "percent shown: {nreason}");
+        assert!(nreason.contains("approaching"), "near phrasing: {nreason}");
+    }
+
+    #[test]
+    fn company_actions_live_spend_guild_over_budget_is_distinct_from_committed() {
+        let (agents, spine, task) = prime_stores();
+        // $500 Guild budget; two active Operatives committing $300 each ($600
+        // committed > $500 → the COMMITTED planning alert fires).
+        spine.set_guild_allowance("default", Some(50_000)).unwrap();
+        let e1 = agents
+            .create_agent(
+                "E1", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"e1"), "medium", "default",
+            )
+            .unwrap();
+        let e2 = agents
+            .create_agent(
+                "E2", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"e2"), "medium", "default",
+            )
+            .unwrap();
+        agents.update_agent_field(&e1, "allowance", "30000").unwrap();
+        agents.update_agent_field(&e2, "allowance", "30000").unwrap();
+        // ACTUAL spend: $200 + $400 = $600 > $500 budget → company spend (120%).
+        let spend = FakeSpend::of(&[
+            (e1.as_str(), 200_000_000),
+            (e2.as_str(), 400_000_000),
+        ]);
+
+        let v = json_of(ok_body(handle_company_actions_with_spend(
+            &agents,
+            &spine,
+            &task,
+            Some(&spend),
+            &fake_ctx(b""),
+        )));
+        let actions = v["actions"].as_array().unwrap();
+
+        // The COMMITTED planning signal (capacity reserved) is present…
+        let committed = actions
+            .iter()
+            .find(|a| a["id"] == "budget:committed")
+            .expect("the committed-Allowance planning alert");
+        assert!(committed["reason"].as_str().unwrap().contains("Allowance"));
+
+        // …AND the ACTUAL-spend company signal (money spent) is present, as a
+        // DISTINCT item — the two never collapse onto each other.
+        let spent = actions
+            .iter()
+            .find(|a| a["id"] == "budget:spend:company")
+            .expect("the Guild actual-spend alert");
+        assert_eq!(spent["severity"], "high");
+        let sreason = spent["reason"].as_str().unwrap();
+        assert!(sreason.contains("$600.00"), "spent shown: {sreason}");
+        assert!(sreason.contains("$500.00"), "budget shown: {sreason}");
+        assert!(sreason.contains("120%"), "percent shown: {sreason}");
+        assert!(sreason.contains("over budget"), "{sreason}");
+        // Distinct objects → both survive dedupe.
+        assert_ne!(committed["target_id"], spent["target_id"]);
+    }
+
+    #[test]
+    fn company_actions_no_spend_item_when_source_is_empty() {
+        // A Guild budget + a positively-capped active Operative, but the spend
+        // ledger has NO recorded cost for it (source returns None) → NO spend
+        // item is fabricated; only the allowance-committed planning signal may
+        // surface. Proves the feed never invents a spend figure.
+        let (agents, spine, task) = prime_stores();
+        spine.set_guild_allowance("default", Some(10_000)).unwrap();
+        let eng = agents
+            .create_agent(
+                "Eng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"eng"), "medium", "default",
+            )
+            .unwrap();
+        agents.update_agent_field(&eng, "allowance", "20000").unwrap();
+        let empty = FakeSpend::of(&[]);
+
+        let v = json_of(ok_body(handle_company_actions_with_spend(
+            &agents,
+            &spine,
+            &task,
+            Some(&empty),
+            &fake_ctx(b""),
+        )));
+        assert!(
+            !v["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"]
+                    .as_str()
+                    .map(|s| s.starts_with("budget:spend:"))
+                    .unwrap_or(false)),
+            "no recorded spend ⇒ no spend item: {v}"
+        );
+        // The committed-Allowance planning signal is unaffected (still fires).
+        assert!(
+            v["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"] == "budget:committed"),
+            "committed planning signal still surfaces: {v}"
+        );
+    }
+
+    #[test]
+    fn company_actions_live_spend_is_tenant_isolated() {
+        // A spend source keyed on a DIFFERENT Guild's Operative must never leak
+        // into this Guild's feed — the handler only ever asks about its OWN
+        // tenant roster, so a foreign agent's spend can't surface here.
+        let (agents, spine, task) = prime_stores();
+        spine.set_guild_allowance("acme", Some(10_000)).unwrap();
+        spine.set_guild_allowance("globex", Some(10_000)).unwrap();
+        let acme_eng = agents
+            .create_agent(
+                "AcmeEng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"acme-eng"), "medium", "acme",
+            )
+            .unwrap();
+        let globex_eng = agents
+            .create_agent(
+                "GlobexEng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"globex-eng"), "medium", "globex",
+            )
+            .unwrap();
+        agents.update_agent_field(&acme_eng, "allowance", "20000").unwrap();
+        agents.update_agent_field(&globex_eng, "allowance", "20000").unwrap();
+        // ONLY acme's Operative has recorded spend ($250, over its $200 cap).
+        let spend = FakeSpend::of(&[(acme_eng.as_str(), 250_000_000)]);
+
+        // acme sees its own over-spend.
+        let a = json_of(ok_body(handle_company_actions_with_spend(
+            &agents,
+            &spine,
+            &task,
+            Some(&spend),
+            &fake_ctx_tenant(b"", "acme"),
+        )));
+        assert!(
+            a["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["id"] == serde_json::json!(format!("budget:spend:{acme_eng}"))),
+            "acme sees its own spend alert: {a}"
+        );
+
+        // globex sees NO spend item — neither its own (no recorded spend) nor,
+        // critically, acme's (never queried; never summed into globex's total).
+        let g = json_of(ok_body(handle_company_actions_with_spend(
+            &agents,
+            &spine,
+            &task,
+            Some(&spend),
+            &fake_ctx_tenant(b"", "globex"),
+        )));
+        assert!(
+            !g["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["id"]
+                    .as_str()
+                    .map(|s| s.starts_with("budget:spend:"))
+                    .unwrap_or(false)),
+            "no cross-tenant spend leak into globex: {g}"
+        );
     }
 
     #[test]

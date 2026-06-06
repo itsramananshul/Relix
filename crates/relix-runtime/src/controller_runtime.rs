@@ -3102,6 +3102,7 @@ async fn run_approval_expire_loop(
 /// waiting task back to running / failed and append the
 /// corresponding chronicle event.
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub fn register_agent_capabilities(
     bridge: &mut crate::dispatch::DispatchBridge,
     agent_store: Arc<crate::nodes::coordinator::agent::AgentStore>,
@@ -3110,6 +3111,11 @@ pub fn register_agent_capabilities(
     token_ttl_secs: u64,
     clock: Arc<dyn relix_core::clock::Clock>,
     descriptor_cache: crate::manifest::DescriptorCache,
+    // Authoritative live-spend ledger for the Action Center budget alerts — the
+    // SAME `MetricsQuery::cost_since` source the dispatch gate enforces. `None`
+    // when metrics are disabled, in which case the feed shows allowance-backed
+    // budget signals only (never a fabricated spend figure).
+    metrics_query: Option<crate::metrics::MetricsQuery>,
 ) {
     use crate::dispatch::{FnHandler, InvocationCtx};
     use crate::nodes::coordinator::agent::handlers;
@@ -3337,13 +3343,26 @@ pub fn register_agent_capabilities(
     if let Some(spine) = spine_store.clone() {
         let s = agent_store.clone();
         let ts = task_store.clone();
+        let mq = metrics_query.clone();
         bridge.register(
             "company.actions",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 let spine = spine.clone();
                 let ts = ts.clone();
-                async move { handlers::handle_company_actions(&s, &spine, &ts, &ctx) }
+                let mq = mq.clone();
+                async move {
+                    // Live-spend seam: the SAME metrics ledger + trailing-30-day
+                    // window the dispatch gate enforces. `None` → allowance-backed
+                    // budget signals only (no fabricated spend figure).
+                    let spend = mq.map(handlers::MetricsSpendSource::trailing_30d);
+                    let spend_ref: Option<
+                        &dyn crate::nodes::coordinator::agent::action_center::SpendSource,
+                    > = spend.as_ref().map(|s| {
+                        s as &dyn crate::nodes::coordinator::agent::action_center::SpendSource
+                    });
+                    handlers::handle_company_actions_with_spend(&s, &spine, &ts, spend_ref, &ctx)
+                }
             })),
         );
     }
@@ -10692,6 +10711,11 @@ fn register_node_type_handlers(
             effective_ttl_secs,
             agent_caps_clock,
             manifest.descriptor_cache(),
+            // Authoritative live-spend ledger for the Action Center budget
+            // alerts — the SAME query the heartbeat Allowance gate uses.
+            // `Option<&MetricsBundle>` is `Copy`, so this read does not disturb
+            // the heartbeat closure's own `metrics.map(...)` above.
+            metrics.map(|m| m.query.clone()),
         );
         let agent_caps: &[(&str, &str, &[&str])] = &[
             (

@@ -163,18 +163,47 @@ when you click Start. What it does **not** do:
   with a low-frequency (20 s) poll fallback; it updates only on a successful
   fetch (a transient blip never blanks it) and stays stable if the stream is
   absent — **no new event bus**.
-  - **Budget alerts are allowance-backed, not live-spend.** The `budget` category
-    fires only from configured Allowance state: **(a)** committed Allowance (sum
-    of active Operatives' caps) over/near the Guild budget — and only when the
-    Guild has a positive budget set — and **(b)** an active Operative hard-stopped
-    by a `0` Allowance that has runnable/blocked work assigned. The authoritative
-    **month-to-date spend** the dispatch gate enforces lives in the metrics store
-    (`MetricsQuery::cost_since`, the `over_allowance` refusal path) and is **not**
-    threaded into this read-only handler, so the feed shows **no live
-    "spent $X of $Y" figure** (it would disagree with the gate or fabricate a
-    number). Real over-spend still surfaces *reactively* as the `over_allowance`
-    recovery card. Wiring true per-tenant/per-Operative spend-threshold alerts is
-    the remaining real-spend gap.
+  - **Budget alerts now carry live spend — from the SAME source the gate
+    enforces.** The `budget` category has two kinds of signal, kept clearly
+    distinct:
+    - **Committed-Allowance planning signals** (capacity *reserved*, from
+      configured Allowance state): **(a)** committed Allowance (sum of active
+      Operatives' caps) over/near the Guild budget — only when the Guild has a
+      positive budget set — and **(b)** an active Operative hard-stopped by a `0`
+      Allowance that has runnable/blocked work assigned.
+    - **Live actual-spend signals** (money already *spent*): when the metrics
+      ledger is wired, the handler reads the **authoritative month-to-date spend
+      the dispatch gate itself enforces** — `MetricsQuery::cost_since` summing
+      `cost_micros` over the **trailing 30 days**, the exact source + window of
+      the `over_allowance` refusal (`heartbeat::allowance_admits`) — through a
+      read-only `SpendSource` seam, and emits: a per-Operative **spend over/near
+      its Allowance** alert (over = at/over the cap = the gate's refusal
+      threshold), and a **Guild spend over/near budget** alert. Each carries the
+      real `spent / limit / percent` in its reason (e.g. *"spent $250.00 of the
+      $200.00 monthly Allowance (125%) in the last 30 days"*).
+
+    Honest scope and the remaining gaps:
+    - **No fabricated spend.** When metrics are disabled (`[metrics] enabled =
+      false`) the `SpendSource` is `None`, so **no spend item appears at all** —
+      only the committed/hard-stop allowance signals. A transient ledger read
+      error is treated as "no signal", never as a `0`.
+    - **Committed ≠ spent.** The committed-Allowance item (capacity reserved) and
+      the actual-spend item (money spent) are separate objects with separate ids
+      — they never collapse onto one another and never double-count the same
+      money.
+    - **Window.** Spend is the **trailing 30 days** (matching the gate), compared
+      against the Guild's *monthly* budget / Operative *monthly* Allowance — an
+      approximate calendar month, stated literally in every reason line so no two
+      windows are silently mixed. The near band is 80% (the gate refuses at 100%).
+    - **Tenant isolation.** Guild spend is the **sum of this tenant's own
+      Operatives'** per-agent `cost_since`; the handler never issues a
+      company-wide `cost_since(None, …)`, so no other Guild's spend can leak into
+      this Guild's totals.
+    - **Still alert-only at the Guild level.** There is **no Guild-level spend
+      *gate*** — the dispatch gate enforces the per-Operative Allowance hard-stop;
+      Guild over-budget is surfaced for the operator, not auto-enforced. Real
+      per-Operative over-spend continues to surface *reactively* as the
+      `over_allowance` recovery card as well.
   - What it still does **not** do: classify a true **retryable-vs-not** (there is
     no diagnosis layer and no per-run failure-class/retry-budget — recovery cards
     map the durable refusal taxonomy to a recommended action + route, no more);

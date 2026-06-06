@@ -286,11 +286,31 @@ pub fn hire_item(p: &AgentProfile) -> ActionItem {
     }
 }
 
+/// Micro-USD per cent — the unit bridge between the metrics ledger's
+/// `cost_micros` (what the dispatch gate sums) and an Allowance/budget expressed
+/// in cents. Mirrors `heartbeat::MICROS_PER_CENT` (the gate's constant); kept
+/// local so this PURE module carries no dependency on the dispatch layer.
+pub const MICROS_PER_CENT: u64 = 10_000;
+
+/// The "near" warning band for ACTUAL spend: a spend alert fires once spend
+/// reaches this percentage of the cap/budget — strictly below the gate's 100%
+/// hard refusal — so the operator gets runway before a hard-stop. The gate
+/// itself only refuses at ≥ 100% (`heartbeat::allowance_admits`).
+pub const SPEND_NEAR_PCT: u64 = 80;
+
 /// Render a cents amount as `$D.CC` for an operator-facing reason line.
 fn fmt_cents(cents: i64) -> String {
     let neg = cents < 0;
     let abs = cents.unsigned_abs();
     format!("{}${}.{:02}", if neg { "-" } else { "" }, abs / 100, abs % 100)
+}
+
+/// Render a micro-USD amount as `$D.CC` (the metrics ledger's `cost_micros`
+/// unit; 1 USD = 1_000_000 micros). Truncates to the nearest whole cent for
+/// display, so it never implies *more* spend than the ledger recorded.
+fn fmt_micros(micros: u64) -> String {
+    let cents = micros / MICROS_PER_CENT; // 10_000 micros = 1 cent (floor sub-cent)
+    format!("${}.{:02}", cents / 100, cents % 100)
 }
 
 /// **Budget alert (Part A)** — the Guild's committed Allowance against its
@@ -364,6 +384,137 @@ pub fn allowance_hardstop_item(p: &AgentProfile) -> ActionItem {
         action_label: "Raise the Allowance".to_string(),
         route: Some("/agents".to_string()),
         created_at: Some(p.created_at),
+        updated_at: None,
+    }
+}
+
+/// A read-only view of authoritative **month-to-date spend** — the SAME source
+/// and window the dispatch/refusal gate enforces (`MetricsQuery::cost_since`
+/// summing `cost_micros` over the trailing 30 days; see the heartbeat Allowance
+/// gate in `controller_runtime` and `heartbeat::allowance_admits`).
+///
+/// The Action Center reads spend ONLY through this seam so that:
+/// - it can never fabricate a spend figure — the production impl is backed by
+///   the metrics ledger, and when metrics are disabled the handler is handed
+///   `None` and emits NO spend item at all;
+/// - it stays unit-testable with a fake that has no SQLite dependency;
+/// - it is tenant-safe by construction — the handler only ever asks about
+///   Operative ids it already resolved from the caller's OWN tenant roster, so
+///   no cross-tenant or company-wide (`cost_since(None, …)`) total is ever read.
+pub trait SpendSource {
+    /// Trailing-30-day spend for ONE Operative, in micro-USD. `None` means the
+    /// ledger could not answer (treated as "no spend signal" — never silently
+    /// as `0`, so a transient read failure can't fabricate or suppress an alert
+    /// dishonestly).
+    fn operative_spend_micros(&self, agent_id: &str) -> Option<u64>;
+}
+
+/// **Live spend alert (Part B)** — an active Operative's ACTUAL trailing-30-day
+/// spend against its configured Allowance, read from the SAME metrics ledger +
+/// window the dispatch gate enforces (`MetricsQuery::cost_since`). `over = true`
+/// means spend has reached/passed the cap — the gate's `over_allowance` refusal
+/// threshold (High); otherwise it is *near* the cap (≥ [`SPEND_NEAR_PCT`] —
+/// Medium). DISTINCT from the committed-Allowance planning signal
+/// ([`budget_committed_item`]): this is money already *spent*, not capacity
+/// *reserved*. `spend_micros` is micro-USD; `cap_cents` is the Allowance.
+pub fn operative_spend_item(
+    p: &AgentProfile,
+    spend_micros: u64,
+    cap_cents: i64,
+    over: bool,
+) -> ActionItem {
+    let cap_micros = (cap_cents.max(0) as u64).saturating_mul(MICROS_PER_CENT);
+    let pct = spend_micros
+        .saturating_mul(100)
+        .checked_div(cap_micros)
+        .unwrap_or(0);
+    let (title, reason, severity) = if over {
+        (
+            format!("Spend over Allowance — {}", p.name),
+            format!(
+                "spent {} of the {} monthly Allowance ({pct}%) in the last 30 days — at/over the cap; \
+                 the dispatch gate now refuses this Operative. Raise the Allowance to resume",
+                fmt_micros(spend_micros),
+                fmt_cents(cap_cents),
+            ),
+            ActionSeverity::High,
+        )
+    } else {
+        (
+            format!("Spend near Allowance — {}", p.name),
+            format!(
+                "spent {} of the {} monthly Allowance ({pct}%) in the last 30 days — approaching the cap",
+                fmt_micros(spend_micros),
+                fmt_cents(cap_cents),
+            ),
+            ActionSeverity::Medium,
+        )
+    };
+    ActionItem {
+        id: format!("budget:spend:{}", p.agent_id),
+        category: ActionCategory::Budget,
+        severity,
+        title,
+        reason,
+        target_type: Some("agent".to_string()),
+        target_id: Some(p.agent_id.clone()),
+        target_title: Some(p.name.clone()),
+        action_label: "Review the Allowance".to_string(),
+        route: Some("/agents".to_string()),
+        created_at: Some(p.created_at),
+        updated_at: None,
+    }
+}
+
+/// **Live spend alert (Part B)** — the Guild's ACTUAL trailing-30-day spend (the
+/// sum of THIS tenant's active Operatives' `cost_since`, never a cross-tenant
+/// `cost_since(None, …)`) against its configured monthly budget. `over = true`
+/// means actual spend has reached/passed the budget (High); otherwise it is
+/// *near* it (≥ [`SPEND_NEAR_PCT`] — Medium). DISTINCT from the committed-
+/// Allowance item: committed is capacity *reserved*; this is money already
+/// *spent*. A single stable id so it never spams. `spend_micros` is micro-USD;
+/// `budget_cents` is the Guild budget.
+pub fn company_spend_item(spend_micros: u64, budget_cents: i64, over: bool) -> ActionItem {
+    let budget_micros = (budget_cents.max(0) as u64).saturating_mul(MICROS_PER_CENT);
+    let pct = spend_micros
+        .saturating_mul(100)
+        .checked_div(budget_micros)
+        .unwrap_or(0);
+    let (title, reason, severity) = if over {
+        (
+            "Guild spend over budget".to_string(),
+            format!(
+                "the Guild has spent {} of its {} monthly budget ({pct}%) in the last 30 days — over \
+                 budget; raise the budget or trim Operative spend",
+                fmt_micros(spend_micros),
+                fmt_cents(budget_cents),
+            ),
+            ActionSeverity::High,
+        )
+    } else {
+        (
+            "Guild spend near budget".to_string(),
+            format!(
+                "the Guild has spent {} of its {} monthly budget ({pct}%) in the last 30 days — \
+                 approaching the cap",
+                fmt_micros(spend_micros),
+                fmt_cents(budget_cents),
+            ),
+            ActionSeverity::Medium,
+        )
+    };
+    ActionItem {
+        id: "budget:spend:company".to_string(),
+        category: ActionCategory::Budget,
+        severity,
+        title,
+        reason,
+        target_type: Some("company".to_string()),
+        target_id: Some("actual_spend".to_string()),
+        target_title: None,
+        action_label: "Review spend".to_string(),
+        route: Some("/agents".to_string()),
+        created_at: None,
         updated_at: None,
     }
 }
@@ -650,6 +801,42 @@ mod tests {
         // Both share the singleton id/target so only one can ever survive.
         assert_eq!(over.id, near.id);
         assert_eq!(over.dedupe_key(), near.dedupe_key());
+    }
+
+    #[test]
+    fn fmt_micros_renders_dollars() {
+        assert_eq!(fmt_micros(0), "$0.00");
+        assert_eq!(fmt_micros(10_000), "$0.01"); // 1 cent
+        assert_eq!(fmt_micros(1_000_000), "$1.00"); // 1 USD
+        assert_eq!(fmt_micros(123_450_000), "$123.45");
+        // Sub-cent is floored, never rounded up (no over-statement of spend).
+        assert_eq!(fmt_micros(19_999), "$0.01");
+    }
+
+    #[test]
+    fn company_spend_over_vs_near_severity_distinct_from_committed() {
+        // $150 spent of a $100 budget → over (High). budget_cents=10_000 ($100),
+        // spend_micros=150_000_000 ($150).
+        let over = company_spend_item(150_000_000, 10_000, true);
+        assert_eq!(over.category, ActionCategory::Budget);
+        assert_eq!(over.severity, ActionSeverity::High);
+        assert!(over.reason.contains("over budget"));
+        assert!(over.reason.contains("$150.00"));
+        assert!(over.reason.contains("150%"));
+        assert!(over.reason.contains("30 days"), "window stated: {}", over.reason);
+
+        // $85 spent of a $100 budget → near (Medium).
+        let near = company_spend_item(85_000_000, 10_000, false);
+        assert_eq!(near.severity, ActionSeverity::Medium);
+        assert!(near.reason.contains("approaching"));
+        assert!(near.reason.contains("85%"));
+
+        // The ACTUAL-spend company item is a SEPARATE object from the
+        // committed-Allowance planning item: distinct id + dedupe key, so both
+        // can coexist in the feed without collapsing onto one another.
+        let committed = budget_committed_item(9_000, 10_000, false);
+        assert_ne!(over.id, committed.id);
+        assert_ne!(over.dedupe_key(), committed.dedupe_key());
     }
 
     fn run(status: &str, refusal: Option<&str>, summary: &str) -> RunRecord {
