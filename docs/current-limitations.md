@@ -61,7 +61,7 @@ does **not** do:
   same-scope only — Claude stays stored-not-replayed.** When a run starts,
   Relix looks up the stored `session_id` for the EXACT
   `(tenant, Operative, Rig, Brief)` pairing and, **for the Codex Rig**,
-  threads it into the next spawn as `codex exec resume <session> …` (discrete
+  threads it into the next spawn as `codex exec resume [OPTIONS] <session> -` (discrete
   argv, the trailing stdin `-` marker preserved) so a Codex Operative
   continues its prior thread instead of starting cold. This applies on every
   start path (manual `brief.run`, Prime Start-to-Shift, the autonomous

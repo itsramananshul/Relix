@@ -72,7 +72,7 @@ pub struct RigRunRequest {
     /// (tenant, Operative, Rig, Brief) runtime state currently stored
     /// (relix-agent-adapters.md §3.3). Empty/absent → the adapter starts a
     /// fresh session. Only the Codex Rig maps this (`codex exec resume
-    /// <session> …`); the Claude Rig deliberately does NOT (its
+    /// [OPTIONS] <session> -`); the Claude Rig deliberately does NOT (its
     /// working-dir-keyed session store does not survive Relix's per-run
     /// scoped workspace — see `argv_with_resume`); echo / raw / Gemini /
     /// generic Rigs ignore it, so the field is fully backward-compatible.
@@ -1439,11 +1439,12 @@ fn clean_session_id(session_id: Option<&str>) -> Option<String> {
 /// adapter's [`RigOutputFormat`] — the same safe discriminator
 /// [`model_flag_args`] uses (relix-agent-adapters.md §3.3).
 ///
-/// - **Codex (`CodexJsonl`)** — maps resume: `codex exec resume <session> …`.
-///   The `resume <id>` subcommand is spliced in right after the leading
-///   `exec`, leaving every other flag AND the trailing stdin `-` marker in
-///   place (so the prompt still reads from stdin). Defensive: it only
-///   transforms a recognizably-Codex argv that begins with `exec`.
+/// - **Codex (`CodexJsonl`)** — maps resume:
+///   `codex exec resume [OPTIONS] <session> -`. The `resume` subcommand is
+///   spliced in right after the leading `exec`; existing options stay before
+///   the session id, and the trailing stdin `-` marker stays last (so the
+///   prompt still reads from stdin). Defensive: it only transforms a
+///   recognizably-Codex argv that begins with `exec`.
 /// - **Claude (`ClaudeStreamJson`)** — deliberately **NOT** mapped. Claude
 ///   Code's `--print --resume <session>` resolves the session from the run's
 ///   working directory, and Relix runs every Shift in a FRESH per-run scoped
@@ -1475,8 +1476,14 @@ pub fn argv_with_resume(
             let mut out: Vec<String> = Vec::with_capacity(base.len() + 2);
             out.push(base[0].clone()); // `exec`
             out.push("resume".to_string());
-            out.push(sid);
-            out.extend(base[1..].iter().cloned());
+            if base.last().map(String::as_str) == Some("-") {
+                out.extend(base[1..base.len() - 1].iter().cloned());
+                out.push(sid);
+                out.push("-".to_string());
+            } else {
+                out.extend(base[1..].iter().cloned());
+                out.push(sid);
+            }
             out
         }
         // Claude resume is intentionally unmapped (see the doc comment above);
@@ -1769,24 +1776,25 @@ impl ProcessRig {
                 RunUsage::default(),
             );
         };
-        // First, continue a prior adapter session when one is carried and the
-        // adapter supports it (Codex only: `exec resume <session> …`; Claude
-        // intentionally unmapped; raw/echo ignore). This inserts `resume <id>`
-        // after Codex's leading `exec`, leaving the trailing stdin `-` last.
-        // Then splice in any per-run model/effort flags the assigned
-        // Operative's stored preference asks for, keyed on this adapter's
-        // output format. Discrete argv only — a trailing stdin `-` (Codex)
-        // stays last so the prompt still reads from stdin, and resume + model
-        // flags compose without disturbing each other.
-        let resumed_args =
-            argv_with_resume(&self.args, self.output_format, req.resume_session_id.as_deref());
-        let effective_args = argv_with_model_flags(
-            &resumed_args,
+        // First splice in model/effort flags, then continue a prior adapter
+        // session when one is carried and the adapter supports it. For Codex
+        // this yields the canonical `exec resume [OPTIONS] <session> -` shape:
+        // options (including `--model` / `-c model_reasoning_effort`) stay
+        // before the session id, and the trailing stdin `-` stays last.
+        // Claude is intentionally unmapped; raw/echo ignore. Discrete argv
+        // only throughout.
+        let args_with_model = argv_with_model_flags(
+            &self.args,
             model_flag_args(
                 self.output_format,
                 req.model_preference.as_deref(),
                 req.reasoning_effort.as_deref(),
             ),
+        );
+        let effective_args = argv_with_resume(
+            &args_with_model,
+            self.output_format,
+            req.resume_session_id.as_deref(),
         );
         let mut command = command_for(&spawn, &effective_args);
         command
@@ -3018,19 +3026,24 @@ mod tests {
 
     #[test]
     fn resume_argv_maps_codex_after_exec_keeping_stdin_marker() {
-        // Codex maps resume: `codex exec resume <session> …`, with the
-        // `resume <id>` spliced in right after `exec` and the trailing stdin
-        // `-` marker left LAST so the prompt still reads from stdin.
+        // Codex maps resume to its documented shape:
+        // `codex exec resume [OPTIONS] <session> -`. `resume` is spliced in
+        // right after `exec`, existing options remain before the session id,
+        // and the trailing stdin `-` marker stays LAST so the prompt still
+        // reads from stdin.
         let base = codex_rig().args().to_vec();
         let argv = argv_with_resume(&base, RigOutputFormat::CodexJsonl, Some("thread-xyz"));
         assert_eq!(argv[0], "exec");
         assert_eq!(argv[1], "resume");
-        assert_eq!(argv[2], "thread-xyz");
+        let sid_at = argv.iter().position(|a| a == "thread-xyz").unwrap();
+        let dash_at = argv.iter().rposition(|a| a == "-").unwrap();
+        assert_eq!(sid_at + 1, dash_at, "session id immediately precedes stdin marker");
         assert_eq!(argv.last().map(String::as_str), Some("-"), "stdin marker stays last");
         // The original flags survive intact.
         assert!(argv.iter().any(|a| a == "--json"));
         assert!(argv.iter().any(|a| a == "workspace-write"));
         assert!(argv.iter().any(|a| a == "--skip-git-repo-check"));
+        assert!(argv.iter().position(|a| a == "--json").unwrap() < sid_at);
     }
 
     #[test]
@@ -3074,26 +3087,27 @@ mod tests {
     fn resume_and_model_flags_compose_for_codex() {
         // The EXACT argv `ProcessRig::execute` builds when BOTH a resume
         // session and a model/effort preference are present: resume goes after
-        // `exec`, model/effort flags go before the trailing stdin `-`, and the
-        // `-` stays last. The two transforms compose without disturbing each
-        // other.
+        // `exec`, model/effort flags stay in the resume subcommand's option
+        // section, the session id is the penultimate positional, and the `-`
+        // stays last. The two transforms compose without disturbing each other.
         let base = codex_rig().args().to_vec();
-        let resumed = argv_with_resume(&base, RigOutputFormat::CodexJsonl, Some("thread-xyz"));
-        let argv = argv_with_model_flags(
-            &resumed,
+        let with_model = argv_with_model_flags(
+            &base,
             model_flag_args(RigOutputFormat::CodexJsonl, Some("gpt-5-codex"), Some("high")),
         );
-        assert_eq!(&argv[0..3], &["exec", "resume", "thread-xyz"], "resume after exec");
+        let argv = argv_with_resume(&with_model, RigOutputFormat::CodexJsonl, Some("thread-xyz"));
+        assert_eq!(&argv[0..2], &["exec", "resume"], "resume after exec");
         assert_eq!(argv.last().map(String::as_str), Some("-"), "stdin marker stays last");
         assert!(argv.windows(2).any(|w| w[0] == "--model" && w[1] == "gpt-5-codex"));
         assert!(argv
             .windows(2)
             .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=high"));
-        // The model flags land BEFORE the stdin marker, after the resume tokens.
+        // The model flags land BEFORE the session id and stdin marker.
         let model_at = argv.iter().position(|a| a == "--model").unwrap();
+        let sid_at = argv.iter().position(|a| a == "thread-xyz").unwrap();
         let dash_at = argv.iter().rposition(|a| a == "-").unwrap();
-        assert!(model_at < dash_at, "model flag precedes the stdin marker");
-        assert!(model_at > 2, "model flag comes after the resume tokens");
+        assert!(model_at < sid_at, "model flag precedes the session id");
+        assert_eq!(sid_at + 1, dash_at, "session id immediately precedes stdin marker");
     }
 
     #[test]
