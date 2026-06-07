@@ -75,6 +75,13 @@ interface TickRecord {
   action?: string;
   outcome?: string;
   reason?: string;
+  // Provenance: how the action was chosen (ai_mode) and, on a propose_strategy
+  // row, how the proposed strategy *body* was authored (strategy_ai_mode). Both ∈
+  // deterministic_only / llm_used / fallback / unavailable.
+  ai_mode?: string;
+  ai_reason?: string | null;
+  strategy_ai_mode?: string | null;
+  strategy_ai_reason?: string | null;
 }
 interface TickResult {
   tenant?: string;
@@ -338,14 +345,26 @@ export function Settings() {
           <span className="mono">RELIX_AUTONOMOUS_PRIME_INTERVAL_SECS</span> and bounded by{" "}
           <span className="mono">RELIX_AUTONOMOUS_PRIME_MAX</span>. Autonomous runs still honor adapter
           readiness, per-Operative wake/concurrency caps, and budget hard-stops.{" "}
-          <strong>Prime Deliberation</strong> is opt-in via{" "}
-          <span className="mono">RELIX_PRIME_LLM_DELIBERATION</span> (off by default): when on, a model
-          may only <em>choose among the already-computed governed actions</em> — confirming the one legal
-          next step or holding this tick — and never approves a gate, invents an action, or bypasses
-          budget/Claim/adapter checks; it falls back deterministically if the model is unavailable or its
-          output is invalid (each tick record shows the provenance: <span className="mono">deterministic_only</span>
-          {" / "}<span className="mono">llm_used</span> / <span className="mono">fallback</span> /{" "}
-          <span className="mono">unavailable</span>).
+          Prime has <strong>two independent, opt-in LLM switches</strong>, both off by default and both
+          falling back deterministically — <em>neither ever approves a gate</em>.{" "}
+          <strong>Prime Deliberation</strong> (<span className="mono">RELIX_PRIME_LLM_DELIBERATION</span>):
+          when on, a model may only <em>choose among the already-computed governed actions</em> —
+          confirming the one legal next step or holding this tick — and never approves a gate, invents an
+          action, or bypasses budget/Claim/adapter checks.{" "}
+          <strong>Prime Strategy Draft authoring</strong> (
+          <span className="mono">RELIX_PRIME_LLM_STRATEGY_DRAFT</span>): when on, a model may <em>author the
+          text of a PROPOSED Mandate strategy</em> from a bounded, secret-free snapshot (title / status /
+          description / active roles / readiness); the body is re-validated + sanitized server-side and is
+          only ever <em>proposed</em> — the human <span className="mono">mandate.strategy.approve</span> gate
+          is unchanged, and an existing proposed/approved/rejected strategy is never overwritten. Either
+          switch falls back deterministically if the model is unavailable or its output is invalid. Each
+          tick record shows the provenance — action choice (<span className="mono">act:</span>) and, on a
+          strategy draft, the body author (<span className="mono">strat:</span>) — each ∈{" "}
+          <span className="mono">deterministic_only</span> / <span className="mono">llm_used</span> /{" "}
+          <span className="mono">fallback</span> / <span className="mono">unavailable</span>. Both reuse the
+          existing governed <span className="mono">ai.chat</span> mesh path; no provider key enters the
+          coordinator, web bridge, or dashboard. Explicit one-click{" "}
+          <span className="mono">prime.advance</span> strategy drafting stays deterministic.
         </p>
       </div>
 
@@ -555,8 +574,9 @@ function AutonomousPrimeSwitchPanel({
               Wakes <strong>exactly one</strong> bounded tick for this Guild (up to{" "}
               {autonomy.autonomous_prime_max ?? 1} action). It does <strong>not</strong> require the
               loop to be on and does <strong>not</strong> bypass standing approvals or budgets.{" "}
-              <strong>Run Prime now</strong> uses the same deliberation layer when the coordinator mesh
-              AI peer is available; otherwise it falls back deterministically.
+              <strong>Run Prime now</strong> uses the same deliberation and strategy-draft layers (when
+              their switches are on) whenever the coordinator mesh AI peer is available; otherwise it falls
+              back deterministically.
             </span>
           </div>
 
@@ -570,6 +590,7 @@ function AutonomousPrimeSwitchPanel({
                     <th>Phase</th>
                     <th>Action</th>
                     <th>Outcome</th>
+                    <th>Provenance</th>
                     <th>Reason</th>
                   </tr>
                 </thead>
@@ -595,6 +616,19 @@ function AutonomousPrimeSwitchPanel({
                         >
                           {r.outcome ?? "—"}
                         </span>
+                      </td>
+                      <td className="mono" style={{ fontSize: 11 }}>
+                        {/* Action-choice provenance (deliberation), plus the
+                            strategy-body author on a propose_strategy row. */}
+                        <span title={r.ai_reason ?? undefined}>act:{r.ai_mode ?? "deterministic_only"}</span>
+                        {r.strategy_ai_mode ? (
+                          <>
+                            <br />
+                            <span title={r.strategy_ai_reason ?? undefined}>
+                              strat:{r.strategy_ai_mode}
+                            </span>
+                          </>
+                        ) : null}
                       </td>
                       <td className="muted">{r.reason ?? ""}</td>
                     </tr>

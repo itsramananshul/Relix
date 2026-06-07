@@ -414,13 +414,17 @@ the approved work is already ready. What it does **not** do:
     stop until an operator hand-wrote and proposed a strategy doc. Now, when a
     Mandate has **no strategy yet**, the guided/autonomous driver classifies it as
     `needs_strategy_proposal` (`advance_action = "propose_strategy"`,
-    `can_advance = true`) and can compose a **deterministic** strategy doc from the
+    `can_advance = true`) and can compose a strategy doc from the
     Mandate's own fields (title / description / status) + the Guild's active work
     roles and propose it through the **existing** `mandate.strategy.propose` path
-    (`draft_mandate_strategy` → `handle_strategy_propose`). The manual
+    (`draft_mandate_strategy` → `handle_strategy_propose`). The body is
+    **deterministic by default** and **opt-in model-authored** under
+    `RELIX_PRIME_LLM_STRATEGY_DRAFT` for the autonomous/manual-tick loop (Prime
+    Strategy Authoring v1, below). The manual
     one-click `prime.advance {action:"propose_strategy"}` and the opt-in autonomous
     Prime tick both run it through that same governed handler, stale-guarded exactly
-    like the other advance actions. **It is emphatically NOT strategy approval:** the
+    like the other advance actions (the explicit one-click route stays
+    deterministic). **It is emphatically NOT strategy approval:** the
     doc lands `proposed` (it surfaces in the Action Center / Approvals as an
     `approval` item, and the next governed step becomes the human
     `mandate.strategy.approve` gate); team planning and orchestration stay locked
@@ -442,11 +446,43 @@ the approved work is already ready. What it does **not** do:
     — a distinct `prime.autonomous_strategy_proposed` event is appended to the
     Mandate's parent Brief if one exists (a strategy is usually drafted *before*
     orchestration, so there is often no Brief yet and the `PrimeAutonomyRecord` is
-    the only trace, by design — an idle/skipped tick spams nothing). The draft is
-    **deterministic v1 only** — there is **no model-backed strategy reasoning**; the
-    body is a structured objective / constraints / team-tracks / execution /
-    review-apply / risk-and-approval doc derived from the Mandate, sanitized for the
-    pipe-delimited wire and length-bounded. **No new provider/key system was added.**
+    the only trace, by design — an idle/skipped tick spams nothing). The draft body
+    is **deterministic by default** — a structured objective / constraints /
+    team-tracks / execution / review-apply / risk-and-approval doc derived from the
+    Mandate, sanitized for the pipe-delimited wire and length-bounded — and is
+    **opt-in model-authored** when `RELIX_PRIME_LLM_STRATEGY_DRAFT` is on (see Prime
+    Strategy Authoring below). Either way the doc is only ever **proposed**, never
+    approved by the model. **No new provider/key system was added.**
+  - **Prime Strategy Authoring (v1) — the proposed strategy *body* can be
+    model-authored; the strategy is still only PROPOSED, never approved by the
+    model (default OFF).** Behind `RELIX_PRIME_LLM_STRATEGY_DRAFT` (`1|true|yes|on`,
+    off by default), when the autonomous/manual-tick Prime loop executes
+    `propose_strategy` and a live mesh AI decider is available, a model authors the
+    strategy *text* from the SAME bounded, secret-free snapshot the deterministic
+    draft uses (Mandate title / status / bounded description / active work roles /
+    Brief readiness counts) — never secrets, credentials, tokens, repo/file content,
+    or huge dumps; the prompt is length-capped. **The model is not the permission
+    system:** its reply is fully re-validated + sanitized server-side by
+    `prime_strategy::validate_strategy_draft` (rejects empty / overlong /
+    prompt-injection boilerplate; sanitizes the pipe to `/` and non-whitespace
+    control chars; appends a standard "DRAFT / not approved" governance footer when
+    the model omits it; bounds the final doc to `STRATEGY_DRAFT_BODY_CAP` with the
+    footer preserved), and is **only ever proposed** through the EXISTING
+    `mandate.strategy.propose` handler — the human `mandate.strategy.approve` gate is
+    unchanged, and an existing `proposed`/`approved`/`rejected` strategy is **never
+    overwritten** (the classifier only yields `propose_strategy` for a Mandate with
+    no strategy, so a human rejection stays final). On unavailable / malformed /
+    unsafe / disabled output the body degrades to the deterministic
+    `draft_mandate_strategy` with an honest provenance mode
+    (`deterministic_only` / `llm_used` / `fallback` / `unavailable`), surfaced on the
+    tick record as `strategy_ai_mode` / `strategy_ai_reason` (distinct from the
+    action-choice `ai_mode`). It reuses the existing governed `ai.chat` mesh path
+    (the SAME `MeshAiDecider` + AI peer / session the deliberation layer uses) — **no
+    provider key enters the coordinator, web bridge, or dashboard**. **Honest scope:**
+    model-backed strategy authoring is wired into the **autonomous loop and the
+    manual `Run Prime now` tick** only; the explicit one-click
+    `prime.advance {action:"propose_strategy"}` route stays **deterministic** by
+    design (it never builds a decider).
   - **Prime Deliberation (v1) — the autonomous loop is no longer a hardcoded
     deterministic state machine; an opt-in model may CHOOSE among the already-computed
     governed actions (default OFF).** Behind `RELIX_PRIME_LLM_DELIBERATION`
@@ -488,10 +524,12 @@ the approved work is already ready. What it does **not** do:
     `unavailable` and runs deterministically.
   - What this still does **NOT** do: there is **no freeform model reasoning or
     tool-calling** — the deliberation above is constrained to confirm-or-hold the ONE
-    computed governed action (it cannot author strategy, invent a goal, or call a
-    tool), and the
-    strategy it drafts (above) is a **deterministic** doc, never a model-reasoned
-    one; it **drafts a strategy proposal and — by default — does not approve it,
+    computed governed action (it cannot invent a goal or call a tool). A model **may**
+    now author the *text* of a PROPOSED strategy (Prime Strategy Authoring, above)
+    when its switch is on, but only the **body** of a `proposed` doc — it does not
+    approve the strategy, choose the action, pick which person/identity to hire, or
+    invent a goal from raw intent; with the switch off the body is a **deterministic**
+    doc. It **drafts a strategy proposal and — by default — does not approve it,
     does not decide which person/identity to hire, and does not invent a goal from
     raw intent**. **Raw goal creation still starts from a submitted
     goal/proposal** — Prime proposes a plan from a request; it never conjures a
@@ -505,7 +543,8 @@ the approved work is already ready. What it does **not** do:
     **no grant**, proposing/approving plans, greenlighting hires/Clearances, and
     the Guild-budget ceiling all remain the human/Board's, exactly as before. The
     default Prime is still rules; a model can shape only the *interpretation* of a
-    propose request (never crew/governance). So the Board/human approval gates are
+    propose request and the *text* of a PROPOSED strategy (never crew, governance,
+    approvals, or the action choice). So the Board/human approval gates are
     preserved by default, and autonomy operates strictly **inside** them — either
     after a human approval (layer a) or within an explicit standing grant
     (layer b).
@@ -725,10 +764,13 @@ grant** the loop **never** auto-approves a strategy / proposal / hire / spawn /
 budget / Clearance gate — so by default approvals + strategy + hire decisions +
 the Guild budget
 ceiling stay human, raw goal creation still starts from a submitted
-goal/proposal. Prime now **drafts** a deterministic Mandate strategy and proposes
-it (Prime Strategy Drafting v1, above) — but that is a *draft*, left `proposed`
-for a human to approve, not a driver that **reasons about strategy itself** or
-takes a goal from raw intent to done autonomously. With **Prime Deliberation v1**
+goal/proposal. Prime now **drafts** a Mandate strategy and proposes it (Prime
+Strategy Drafting v1, above) — deterministic by default, or **opt-in
+model-authored** for the *body* under `RELIX_PRIME_LLM_STRATEGY_DRAFT` (Prime
+Strategy Authoring v1, above) — but either way that is a *draft*, left `proposed`
+for a human to approve, never approved or executed by the model itself, and never
+a driver that takes a goal from raw intent to done autonomously. With **Prime
+Deliberation v1**
 (opt-in, `RELIX_PRIME_LLM_DELIBERATION`, off by default) the autonomous loop is no
 longer a hardcoded deterministic state machine: a model may **choose among the
 already-computed governed actions** (confirm the one legal next action or hold), but

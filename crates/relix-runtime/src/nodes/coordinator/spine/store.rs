@@ -553,6 +553,28 @@ impl SpineStore {
         Ok(row)
     }
 
+    /// The Mandate's strategy doc text (the proposed/approved/rejected body),
+    /// or `None` if none was proposed. Tenant-guarded. Read-only accessor used to
+    /// surface the proposed strategy for review (and to assert provenance in
+    /// tests).
+    pub fn strategy_doc(
+        &self,
+        tenant: &str,
+        mandate_id: &str,
+    ) -> Result<Option<String>, SpineStoreError> {
+        let tenant = normalize_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        require_mandate_in_tenant(&conn, mandate_id, tenant)?;
+        let row = conn
+            .query_row(
+                "SELECT doc FROM mandate_strategy WHERE mandate_id = ?1",
+                params![mandate_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// Is the Mandate's strategy approved? The gate the CEO/hire flow
     /// checks before spawning a team. Tenant-guarded.
     pub fn strategy_approved(

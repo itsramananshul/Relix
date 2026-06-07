@@ -9927,12 +9927,20 @@ fn register_node_type_handlers(
                             use crate::nodes::coordinator::agent::prime_deliberation::PrimeAiDecider;
                             use crate::nodes::coordinator::agent::prime_driver::{
                                 MeshAiDecider, handle_prime_autonomy_tick_now_with_ai,
-                                parse_prime_llm_deliberation,
+                                parse_prime_llm_deliberation, parse_prime_llm_strategy_draft,
                             };
-                            // Re-read the deliberation switch (like the timer) so an
-                            // operator can flip it without a restart.
+                            // Re-read both Prime LLM switches (like the timer) so an
+                            // operator can flip them without a restart: deliberation
+                            // (action choice) and strategy draft (proposed strategy
+                            // body authoring). Both are opt-in and fall back
+                            // deterministically; neither approves a gate.
                             let llm_enabled = parse_prime_llm_deliberation(
                                 std::env::var("RELIX_PRIME_LLM_DELIBERATION")
+                                    .ok()
+                                    .as_deref(),
+                            );
+                            let strategy_llm_enabled = parse_prime_llm_strategy_draft(
+                                std::env::var("RELIX_PRIME_LLM_STRATEGY_DRAFT")
                                     .ok()
                                     .as_deref(),
                             );
@@ -9941,11 +9949,13 @@ fn register_node_type_handlers(
                             let prime_handle = tokio::runtime::Handle::current();
                             let tenant = ctx.tenant_id_or_default().to_string();
                             let outcome = tokio::task::spawn_blocking(move || {
-                                // Build the live decider only when the switch is on
-                                // AND the coordinator mesh cell is populated (a
-                                // reachable outbound client). Otherwise pass None →
-                                // honest `unavailable`/`deterministic_only` fallback.
-                                let prime_decider = if llm_enabled {
+                                // Build the live decider when EITHER switch is on AND
+                                // the coordinator mesh cell is populated (a reachable
+                                // outbound client). The SAME decider serves both the
+                                // deliberation pre-pass and the strategy-body author.
+                                // Otherwise pass None → honest
+                                // `unavailable`/`deterministic_only` fallback.
+                                let prime_decider = if llm_enabled || strategy_llm_enabled {
                                     prime_alert_cell
                                         .as_ref()
                                         .and_then(|c| c.get())
@@ -9974,6 +9984,7 @@ fn register_node_type_handlers(
                                     &ctx,
                                     prime_ai,
                                     llm_enabled,
+                                    strategy_llm_enabled,
                                 )
                             })
                             .await;
@@ -11628,17 +11639,24 @@ fn register_node_type_handlers(
                         use crate::nodes::coordinator::agent::prime_driver::{
                             AutonomyDrive, MeshAiDecider, RUNTIME_KEY_AUTONOMOUS_PRIME,
                             autonomous_prime_tick, parse_prime_llm_deliberation,
-                            plan_autonomy_drive,
+                            parse_prime_llm_strategy_draft, plan_autonomy_drive,
                         };
-                        // Re-read the deliberation switch each tick. When on AND a
-                        // populated coordinator mesh client exists, build the live
-                        // decider; otherwise leave it None (deterministic).
+                        // Re-read both Prime LLM switches each tick: deliberation
+                        // (action choice) and strategy draft (proposed strategy body
+                        // authoring). When EITHER is on AND a populated coordinator
+                        // mesh client exists, build the live decider (the SAME decider
+                        // serves both); otherwise leave it None (deterministic).
                         let prime_llm = parse_prime_llm_deliberation(
                             std::env::var("RELIX_PRIME_LLM_DELIBERATION")
                                 .ok()
                                 .as_deref(),
                         );
-                        let prime_decider = if prime_llm {
+                        let prime_strategy_llm = parse_prime_llm_strategy_draft(
+                            std::env::var("RELIX_PRIME_LLM_STRATEGY_DRAFT")
+                                .ok()
+                                .as_deref(),
+                        );
+                        let prime_decider = if prime_llm || prime_strategy_llm {
                             prime_alert_cell.as_ref().and_then(|c| c.get()).map(|ctx| {
                                 MeshAiDecider::new(
                                     prime_handle.clone(),
@@ -11694,6 +11712,7 @@ fn register_node_type_handlers(
                                     &hire_rig,
                                     prime_ai,
                                     prime_llm,
+                                    prime_strategy_llm,
                                 )?;
                                 records.append(&mut r);
                             }
@@ -11713,6 +11732,7 @@ fn register_node_type_handlers(
                                         &hire_rig,
                                         prime_ai,
                                         prime_llm,
+                                        prime_strategy_llm,
                                     )?;
                                     records.append(&mut r);
                                 }

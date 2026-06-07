@@ -544,9 +544,11 @@ ledger entry or design section.
    only the explicitly granted proposal/strategy/hire/spawn-Clearance categories; budget is never delegated.
    **Prime Strategy Drafting v1 — SHIPPED:** a
    Mandate with no strategy yet is classified `needs_strategy_proposal` and the driver (manual click or
-   the opt-in autonomous tick) can **DRAFT** a deterministic strategy doc and propose it through the
+   the opt-in autonomous tick) can **DRAFT** a strategy doc and propose it through the
    existing `mandate.strategy.propose` path — *draft only*, left `proposed` for a human to approve, never
-   overwriting an existing proposed/approved/rejected strategy (so a rejection is honoured). *Files:*
+   overwriting an existing proposed/approved/rejected strategy (so a rejection is honoured). The body is
+   deterministic by default and **opt-in model-authored** under `RELIX_PRIME_LLM_STRATEGY_DRAFT` for the
+   autonomous/manual-tick loop (Prime Strategy Authoring v1, below). *Files:*
    `crates/relix-runtime/src/nodes/coordinator/agent/prime_driver.rs`
    (+ `controller_runtime.rs` registration, `handlers.rs` reuse), `crates/relix-web-bridge/src/{spine.rs,main.rs}`
    (4 routes + 409 mapping), `apps/dashboard/src/{api.ts,pages/Chat.tsx}`, the boot scripts +
@@ -587,10 +589,26 @@ ledger entry or design section.
    module + 16 tests), `…/agent/prime_driver.rs` (wrapper + `MeshAiDecider` + manual-tick helper + loop tests),
    `…/agent/mod.rs`, `controller_runtime.rs` (live wiring for the timer + the manual tick),
    `apps/dashboard/src/pages/Settings.tsx` + rebuilt `dashboard-dist`.
+   **Prime Strategy Authoring v1 — SHIPPED (opt-in, default OFF):** behind `RELIX_PRIME_LLM_STRATEGY_DRAFT`,
+   when the autonomous/manual-tick loop executes `propose_strategy` and a live mesh decider is available, a
+   model authors the *body* of the PROPOSED strategy from a bounded, secret-free snapshot (Mandate
+   title/status/description + active roles + readiness counts); the reply is re-validated + sanitized
+   server-side (`prime_strategy::validate_strategy_draft` — rejects empty/over-long/injection, sanitizes the
+   pipe + control chars, appends a "DRAFT / not approved" footer, bounds to `STRATEGY_DRAFT_BODY_CAP`) and is
+   only ever **proposed** — the human `mandate.strategy.approve` gate is unchanged and an existing
+   proposed/approved/rejected strategy is never overwritten. Unavailable/malformed/disabled output falls back
+   to the deterministic draft with honest provenance (`strategy_ai_mode`/`strategy_ai_reason`, distinct from
+   the action-choice `ai_mode`). It reuses the deliberation layer's `MeshAiDecider`/AI peer/session — **no
+   provider key in the coordinator / web bridge / dashboard.** The explicit one-click `prime.advance` strategy
+   route stays deterministic by design. *Files:*
+   `…/agent/prime_strategy.rs` (new pure module + tests), `…/agent/prime_driver.rs`
+   (`draft_strategy_doc` + record provenance + loop wiring + tests), `…/agent/mod.rs`,
+   `…/spine/store.rs` (`strategy_doc` read accessor), `controller_runtime.rs` (both tick wiring sites),
+   `apps/dashboard/src/pages/Settings.tsx` + rebuilt `dashboard-dist`.
    *Still deferred:* a true end-to-end no-grant autonomous driver that also **approves** on its own (propose →
-   **approve** → staff → orchestrate with nothing granted) — intentionally not built; **freeform tool-calling /
-   model-reasoned strategy authoring** remains deferred (deliberation only confirms-or-holds a computed action;
-   the strategy draft + approval are still deterministic).
+   **approve** → staff → orchestrate with nothing granted) — intentionally not built; **freeform tool-calling**
+   remains deferred (deliberation only confirms-or-holds a computed action; the model may now author a
+   *proposed* strategy's body but never approves it, chooses the action, or invents a goal).
 9. **[BE/FE] Smarter companion** — **BACKEND SHIPPED (now AI-assisted action selection, opt-in +
    validated + fallback; still one-turn / one-action, NOT autonomous).**
    The `POST /v1/spine/companion` parser is a **company-aware action spine**

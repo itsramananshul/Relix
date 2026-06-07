@@ -738,8 +738,53 @@ system.** The security invariant is absolute and unchanged:
 
 **It is not freeform Prime.** This is *constrained deliberation over the existing
 action menu* — confirm-or-hold one computed action with a short reason. It does
-not author strategy, invent a goal, pick which identity to hire, or call tools;
-the strategy draft (§A) and its approval remain deterministic / governed.
+not author the *action choice* freely, invent a goal, pick which identity to hire,
+or call tools. (The *body* of a proposed strategy may be model-authored under a
+separate opt-in switch — see §D — but its **approval** remains deterministic /
+governed.)
+
+### D. Prime Strategy Authoring v1 — a model may author the PROPOSED strategy text (opt-in)
+
+**The gap.** When the driver drafts a Mandate strategy (§A / §5.4), the body was
+deterministic-only — a templated objective/constraints/tracks/execution doc. The
+loop could *propose* a strategy but never *reason* about its content.
+
+**The contract.** Behind an explicit, default-OFF switch
+(`RELIX_PRIME_LLM_STRATEGY_DRAFT`), when the autonomous/manual-tick loop executes
+`propose_strategy` and a live mesh decider is available, a model may author the
+**body** of the proposed strategy — but **the model is NOT the permission system**,
+exactly as in §C:
+
+- **Body only, still PROPOSED.** The model authors the strategy *text* from a
+  bounded, secret-free snapshot (Mandate title / status / bounded description /
+  active work roles / Brief readiness counts — never secrets, tokens, repo/file
+  content, or large dumps; the prompt is length-capped). The result is proposed
+  through the EXISTING `mandate.strategy.propose` handler and lands `proposed`; the
+  human `mandate.strategy.approve` gate is unchanged. **The model never approves or
+  executes a strategy.**
+- **Strict server-side validation + sanitization.** The reply is re-validated by
+  `prime_strategy::validate_strategy_draft`: it rejects empty / over-long output
+  and obvious prompt-injection boilerplate, sanitizes the pipe to `/` + control
+  chars, appends a standard "DRAFT / not approved" governance footer when the model
+  omits it, and bounds the final doc to `STRATEGY_DRAFT_BODY_CAP` (footer
+  preserved). Any rejection degrades to the deterministic `draft_mandate_strategy`.
+- **Never overwrites.** The classifier only yields `propose_strategy` for a Mandate
+  with **no** strategy, so an existing `proposed` / `approved` / `rejected` strategy
+  is never overwritten or re-authored — a human rejection stays final.
+- **Honest provenance.** Each tick record carries `strategy_ai_mode`
+  (`deterministic_only` / `llm_used` / `fallback` / `unavailable`) +
+  `strategy_ai_reason`, distinct from the action-choice `ai_mode`, surfaced on
+  `prime.autonomy_tick_now`.
+- **No keys in the coordinator.** It reuses the SAME `ai.chat` mesh path + decider
+  (AI peer `RELIX_PRIME_AI_PEER`, session `RELIX_PRIME_LLM_SESSION`) as §C — no
+  provider key enters the coordinator, web bridge, or dashboard; an unavailable
+  peer falls back deterministically.
+- **Independent of §C.** The action choice (§C) and the strategy body author (§D)
+  are separate switches: a Guild can run deterministic action selection with a
+  model-authored body, or vice versa. If §C holds (`none`), no strategy is drafted.
+- **Explicit click stays deterministic.** Model-backed authoring is wired into the
+  autonomous loop and the manual **Run Prime now** tick only; the operator one-click
+  `prime.advance {action:"propose_strategy"}` route remains deterministic by design.
 
 ---
 

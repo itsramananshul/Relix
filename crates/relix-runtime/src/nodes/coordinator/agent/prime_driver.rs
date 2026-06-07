@@ -45,6 +45,10 @@ use crate::nodes::coordinator::agent::prime_deliberation::{
     ACTION_NONE, PrimeAiDecider, PrimeDeliberationInput, PrimeDeliberationMode,
     build_prime_deliberation_prompt, parse_prime_decision,
 };
+use crate::nodes::coordinator::agent::prime_strategy::{
+    PrimeStrategyDraftMode, PrimeStrategyDraftResult, PrimeStrategySnapshot,
+    build_strategy_draft_prompt, validate_strategy_draft,
+};
 use crate::nodes::coordinator::agent::store::{AgentStore, StandingApprovalMatch};
 use crate::nodes::coordinator::spine::SpineStore;
 
@@ -374,10 +378,11 @@ fn active_crew_roles(agent_store: &AgentStore, tenant: &str) -> Vec<&'static str
 }
 
 /// Max characters of a Mandate's free-text description folded into a drafted
-/// strategy — keeps the proposal bounded regardless of input size.
-const STRATEGY_DRAFT_DESC_CAP: usize = 600;
-/// Hard cap on the whole drafted strategy body.
-const STRATEGY_DRAFT_BODY_CAP: usize = 4000;
+/// strategy — keeps the proposal bounded regardless of input size. Shared with
+/// the model strategy-authoring snapshot in `prime_strategy`.
+pub(crate) const STRATEGY_DRAFT_DESC_CAP: usize = 600;
+/// Hard cap on the whole drafted strategy body (deterministic or model-authored).
+pub(crate) const STRATEGY_DRAFT_BODY_CAP: usize = 4000;
 
 /// Prime Strategy Drafting v1 (company-model §12.5/§12.5A — the Prime planner).
 /// Produce a concise, useful strategy doc DETERMINISTICALLY from the Mandate's own
@@ -456,6 +461,70 @@ pub(crate) fn draft_mandate_strategy(
         body = body.chars().take(STRATEGY_DRAFT_BODY_CAP).collect();
     }
     body
+}
+
+/// Prime Strategy Authoring v1 (company-model §12.5/§12.5A — the Prime planner).
+/// Author the strategy DRAFT body to propose for a Mandate. When model authoring
+/// is enabled (`strategy_llm_enabled`) AND a live decider is wired, the model
+/// authors the body from the SAME safe, bounded snapshot the deterministic draft
+/// uses (title / status / bounded description / active roles / readiness counts);
+/// the reply is fully re-validated + sanitized + governance-footered by
+/// [`validate_strategy_draft`]. **This is NOT approval:** the returned doc is
+/// always proposed through the existing `mandate.strategy.propose` handler and
+/// lands `proposed`. If model authoring is off, no decider is wired, the model is
+/// unavailable, or its output is rejected, the body degrades to the deterministic
+/// [`draft_mandate_strategy`] with an honest [`PrimeStrategyDraftMode`]. The
+/// returned `doc` is always non-empty, pipe-safe, and `STRATEGY_DRAFT_BODY_CAP`-
+/// bounded.
+fn draft_strategy_doc(
+    ai: Option<&dyn PrimeAiDecider>,
+    mandate: &crate::nodes::coordinator::spine::store::Mandate,
+    active_roles: &[&str],
+    counts: Option<&BriefCounts>,
+    strategy_llm_enabled: bool,
+) -> PrimeStrategyDraftResult {
+    let deterministic = || draft_mandate_strategy(mandate, active_roles);
+    if !strategy_llm_enabled {
+        return PrimeStrategyDraftResult {
+            doc: deterministic(),
+            mode: PrimeStrategyDraftMode::DeterministicOnly,
+            reason: None,
+        };
+    }
+    let Some(decider) = ai else {
+        return PrimeStrategyDraftResult {
+            doc: deterministic(),
+            mode: PrimeStrategyDraftMode::Unavailable,
+            reason: Some("no AI decider wired for strategy drafting".to_string()),
+        };
+    };
+    let snap = PrimeStrategySnapshot::new(
+        &mandate.title,
+        &mandate.status,
+        &mandate.description,
+        active_roles,
+        counts.map(|c| (c.total, c.ready, c.running)),
+    );
+    let prompt = build_strategy_draft_prompt(&snap);
+    match decider.deliberate(&prompt) {
+        Ok(raw) => match validate_strategy_draft(&raw) {
+            Ok(doc) => PrimeStrategyDraftResult {
+                doc,
+                mode: PrimeStrategyDraftMode::LlmUsed,
+                reason: Some("model-authored strategy draft".to_string()),
+            },
+            Err(e) => PrimeStrategyDraftResult {
+                doc: deterministic(),
+                mode: PrimeStrategyDraftMode::Fallback,
+                reason: Some(format!("model strategy output rejected: {e}")),
+            },
+        },
+        Err(e) => PrimeStrategyDraftResult {
+            doc: deterministic(),
+            mode: PrimeStrategyDraftMode::Unavailable,
+            reason: Some(format!("model unavailable: {e}")),
+        },
+    }
 }
 
 /// Compute the next governed step for a proposal or a mandate. Returns
@@ -1223,6 +1292,11 @@ fn prime_autonomy_record_json(r: &PrimeAutonomyRecord) -> Value {
         // deterministic_only so the operator always sees how the action was chosen.
         "ai_mode": r.ai_mode.as_deref().unwrap_or("deterministic_only"),
         "ai_reason": r.ai_reason,
+        // Prime Strategy Authoring v1 provenance: present only on a propose_strategy
+        // row (the strategy body's author); null elsewhere so the operator can tell
+        // an LLM-authored proposed strategy from a deterministic one.
+        "strategy_ai_mode": r.strategy_ai_mode,
+        "strategy_ai_reason": r.strategy_ai_reason,
     })
 }
 
@@ -1269,6 +1343,11 @@ pub fn handle_prime_autonomy_tick_now(
             .ok()
             .as_deref(),
     );
+    let strategy_llm_enabled = parse_prime_llm_strategy_draft(
+        std::env::var("RELIX_PRIME_LLM_STRATEGY_DRAFT")
+            .ok()
+            .as_deref(),
+    );
     handle_prime_autonomy_tick_now_with_ai(
         agent_store,
         spine_store,
@@ -1278,6 +1357,7 @@ pub fn handle_prime_autonomy_tick_now(
         ctx,
         None,
         llm_enabled,
+        strategy_llm_enabled,
     )
 }
 
@@ -1307,6 +1387,7 @@ pub fn handle_prime_autonomy_tick_now_with_ai(
     ctx: &InvocationCtx,
     ai: Option<&dyn PrimeAiDecider>,
     llm_enabled: bool,
+    strategy_llm_enabled: bool,
 ) -> HandlerOutcome {
     // Same Board-only gate as the runtime toggle: a worker subject can never
     // wake the autonomous Prime driver, even though this takes no new authority.
@@ -1346,6 +1427,7 @@ pub fn handle_prime_autonomy_tick_now_with_ai(
         &hire_rig,
         ai,
         llm_enabled,
+        strategy_llm_enabled,
     ) {
         Ok(r) => r,
         Err(e) => return internal(format!("prime.autonomy_tick_now: {e}")),
@@ -1405,6 +1487,19 @@ pub fn handle_prime_autonomy_tick_now_with_ai(
 /// Parse `RELIX_PRIME_LLM_DELIBERATION` (`1|true|yes|on`, case-insensitive) into
 /// the deliberation-enabled flag. Default OFF — absent/blank/anything else.
 pub fn parse_prime_llm_deliberation(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Parse `RELIX_PRIME_LLM_STRATEGY_DRAFT` (`1|true|yes|on`, case-insensitive) into
+/// the model-strategy-authoring flag (Prime Strategy Authoring v1). Default OFF.
+/// Independent of `RELIX_PRIME_LLM_DELIBERATION`: a Guild may let the model author
+/// the *proposed* strategy body while keeping deterministic action selection (or
+/// vice versa). Either way the strategy is only ever PROPOSED, never approved by
+/// the model.
+pub fn parse_prime_llm_strategy_draft(raw: Option<&str>) -> bool {
     matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
         Some("1" | "true" | "yes" | "on")
@@ -1669,6 +1764,16 @@ pub struct PrimeAutonomyRecord {
     /// The model's short reason when it participated (`llm_used`), or the honest
     /// reason it was not used (`fallback` / `unavailable`). Secret-free.
     pub ai_reason: Option<String>,
+    /// Prime Strategy Authoring v1 provenance — how the PROPOSED strategy *body*
+    /// was authored on a `propose_strategy` action: `deterministic_only` /
+    /// `llm_used` / `fallback` / `unavailable`. `None` for every other action (no
+    /// strategy was drafted). This is distinct from `ai_mode`, which is the
+    /// *action-choice* provenance.
+    pub strategy_ai_mode: Option<String>,
+    /// Secret-free reason the strategy body was authored the way it was (model
+    /// reason on `llm_used`, or the honest fallback/unavailable reason). `None`
+    /// when no strategy was drafted.
+    pub strategy_ai_reason: Option<String>,
 }
 
 /// Build the synthetic **autonomous Prime** invocation context for `tenant`.
@@ -1933,6 +2038,7 @@ fn process_candidate(
     hire_rig: &str,
     ai: Option<&dyn PrimeAiDecider>,
     llm_enabled: bool,
+    strategy_llm_enabled: bool,
 ) -> PrimeAutonomyRecord {
     let mut delib_mode = PrimeDeliberationMode::DeterministicOnly;
     let mut delib_reason: Option<String> = None;
@@ -1959,6 +2065,8 @@ fn process_candidate(
                         },
                         ai_mode: Some(mode.as_str().to_string()),
                         ai_reason: reason,
+                        strategy_ai_mode: None,
+                        strategy_ai_reason: None,
                     };
                 }
                 Deliberation::Proceed { mode, reason } => {
@@ -1983,6 +2091,8 @@ fn process_candidate(
         actions,
         max,
         hire_rig,
+        ai,
+        strategy_llm_enabled,
     );
     rec.ai_mode = Some(delib_mode.as_str().to_string());
     rec.ai_reason = delib_reason;
@@ -2011,6 +2121,8 @@ fn process_candidate_inner(
     actions: &mut usize,
     max: usize,
     hire_rig: &str,
+    ai: Option<&dyn PrimeAiDecider>,
+    strategy_llm_enabled: bool,
 ) -> PrimeAutonomyRecord {
     let mk = |phase: String,
               action: &'static str,
@@ -2031,6 +2143,9 @@ fn process_candidate_inner(
             // provenance; the deterministic inner defaults to none.
             ai_mode: None,
             ai_reason: None,
+            // Set only on the propose_strategy arm below (the strategy author).
+            strategy_ai_mode: None,
+            strategy_ai_reason: None,
         }
     };
 
@@ -2067,6 +2182,92 @@ fn process_candidate_inner(
                 mandate_id,
             );
         }
+
+        // (A1) Prime Strategy Authoring v1 — when the safe advance is
+        // `propose_strategy`, author the strategy *body* here (model-authored when
+        // the strategy flag is on AND a live decider is wired, else deterministic)
+        // and propose it through the EXISTING governed `mandate.strategy.propose`
+        // handler. The classification above only yields this advance for a Mandate
+        // with NO strategy yet (`needs_strategy_proposal`), so an existing
+        // proposed/approved/rejected strategy is NEVER overwritten — exactly the
+        // stale-guard the deterministic `handle_prime_advance` enforces. Drafting is
+        // NOT approval: the doc lands `proposed`; the strategy provenance is stamped
+        // on the record so the operator sees whether the model authored it.
+        if action == ADVANCE_PROPOSE_STRATEGY {
+            let Some(mid) = mandate_id.clone() else {
+                return mk(
+                    phase,
+                    action,
+                    "skipped",
+                    "propose_strategy: next step has no mandate".into(),
+                    None,
+                );
+            };
+            let mandate = match spine_store.get_mandate_for_tenant(&mid, tenant) {
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    return mk(
+                        phase,
+                        action,
+                        "blocked",
+                        format!("propose_strategy: mandate not found: {mid}"),
+                        Some(mid),
+                    );
+                }
+                Err(e) => {
+                    return mk(
+                        phase,
+                        action,
+                        "blocked",
+                        format!("propose_strategy load mandate: {e}"),
+                        Some(mid),
+                    );
+                }
+            };
+            let roles = active_crew_roles(agent_store, tenant);
+            let draft = draft_strategy_doc(
+                ai,
+                &mandate,
+                &roles,
+                Some(&step.counts),
+                strategy_llm_enabled,
+            );
+            let propose_ctx =
+                autonomous_prime_ctx(tenant, format!("{mid}|{}", draft.doc).into_bytes());
+            return match handle_strategy_propose(spine_store, &propose_ctx) {
+                HandlerOutcome::Ok(_) => {
+                    *actions += 1;
+                    chronicle_autonomous(
+                        task_store,
+                        &mid,
+                        "prime.autonomous_strategy_proposed",
+                        &format!(
+                            "autonomous Prime drafted a strategy proposal for mandate {mid} (body: {})",
+                            draft.mode.as_str()
+                        ),
+                    );
+                    let mut rec = mk(
+                        phase,
+                        action,
+                        "advanced",
+                        format!("proposed a {} strategy draft", draft.mode.as_str()),
+                        Some(mid),
+                    );
+                    rec.strategy_ai_mode = Some(draft.mode.as_str().to_string());
+                    rec.strategy_ai_reason = draft.reason;
+                    rec
+                }
+                // Governance / store refusal — propagate honestly, take no credit.
+                HandlerOutcome::Err(e) => mk(
+                    phase,
+                    action,
+                    "blocked",
+                    format!("strategy propose refused: {}", e.cause),
+                    Some(mid),
+                ),
+            };
+        }
+
         let mut adv = target.clone();
         adv["action"] = json!(action);
         let adv_ctx = autonomous_prime_ctx(tenant, adv.to_string().into_bytes());
@@ -2533,6 +2734,7 @@ pub fn autonomous_prime_tick(
     hire_rig: &str,
     ai: Option<&dyn PrimeAiDecider>,
     llm_enabled: bool,
+    strategy_llm_enabled: bool,
 ) -> Result<Vec<PrimeAutonomyRecord>, String> {
     if max == 0 {
         return Ok(Vec::new());
@@ -2613,6 +2815,8 @@ pub fn autonomous_prime_tick(
                         },
                         ai_mode: Some(mode.as_str().to_string()),
                         ai_reason: reason,
+                        strategy_ai_mode: None,
+                        strategy_ai_reason: None,
                     });
                     continue;
                 }
@@ -2662,6 +2866,8 @@ pub fn autonomous_prime_tick(
                         .to_string(),
                     ai_mode: None,
                     ai_reason: None,
+                    strategy_ai_mode: None,
+                    strategy_ai_reason: None,
                 }
             }
             HandlerOutcome::Err(e) => PrimeAutonomyRecord {
@@ -2675,6 +2881,8 @@ pub fn autonomous_prime_tick(
                 reason: format!("autonomous approve refused: {}", e.cause),
                 ai_mode: None,
                 ai_reason: None,
+                strategy_ai_mode: None,
+                strategy_ai_reason: None,
             },
         };
         rec.ai_mode = Some(pass0_mode.as_str().to_string());
@@ -2712,6 +2920,7 @@ pub fn autonomous_prime_tick(
             hire_rig,
             ai,
             llm_enabled,
+            strategy_llm_enabled,
         ));
     }
 
@@ -2743,6 +2952,7 @@ pub fn autonomous_prime_tick(
                 hire_rig,
                 ai,
                 llm_enabled,
+                strategy_llm_enabled,
             ));
         }
     }
@@ -3169,7 +3379,7 @@ mod tests {
         tenant: Option<&str>,
     ) -> Vec<PrimeAutonomyRecord> {
         autonomous_prime_tick(
-            agents, spine, tasks, reg, None, 0, max, tenant, "echo", None, false,
+            agents, spine, tasks, reg, None, 0, max, tenant, "echo", None, false, false,
         )
         .unwrap()
     }
@@ -3186,7 +3396,7 @@ mod tests {
         hire_rig: &str,
     ) -> Vec<PrimeAutonomyRecord> {
         autonomous_prime_tick(
-            agents, spine, tasks, reg, None, 0, max, tenant, hire_rig, None, false,
+            agents, spine, tasks, reg, None, 0, max, tenant, hire_rig, None, false, false,
         )
         .unwrap()
     }
@@ -3228,6 +3438,7 @@ mod tests {
             "echo",
             Some(decider),
             true,
+            false,
         )
         .unwrap()
     }
@@ -3383,6 +3594,7 @@ mod tests {
             "echo",
             None,
             true,
+            false,
         )
         .unwrap();
         let rec = recs
@@ -3430,6 +3642,256 @@ mod tests {
             );
         }
         assert!(!parse_prime_llm_deliberation(None));
+    }
+
+    // ── PRIME STRATEGY AUTHORING v1 (scripted strategy drafter) ────────────
+    // These exercise the *strategy body* authoring layer (separate from action
+    // deliberation): deliberation is OFF, so the deterministic classifier still
+    // chooses `propose_strategy`, and the scripted decider authors only the body.
+
+    /// Run an autonomous Prime tick with deliberation OFF but strategy authoring
+    /// ON and a scripted decider — so `propose_strategy`'s body is model-authored
+    /// (or falls back) while the action choice stays deterministic.
+    fn tick_strategy_ai(
+        agents: &AgentStore,
+        spine: &SpineStore,
+        tasks: &Arc<TaskStore>,
+        reg: &crate::rig::RigRegistry,
+        max: usize,
+        tenant: Option<&str>,
+        decider: &dyn crate::nodes::coordinator::agent::prime_deliberation::PrimeAiDecider,
+    ) -> Vec<PrimeAutonomyRecord> {
+        autonomous_prime_tick(
+            agents,
+            spine,
+            tasks,
+            reg,
+            None,
+            0,
+            max,
+            tenant,
+            "echo",
+            Some(decider),
+            false,
+            true,
+        )
+        .unwrap()
+    }
+
+    /// A bare Mandate (status `planned`, no strategy) is discovered by the tick
+    /// (`list_active_mandates` includes `planned`), so its next governed step is
+    /// `propose_strategy`.
+    const GOOD_STRATEGY_REPLY: &str = "# Strategy — Ship login\n\nThis is a DRAFT and is NOT \
+approved.\n\n## Objective\nDeliver the login page wired to auth.\n\n## Risks\nApproval gates remain \
+in force.\n";
+
+    // STR-1) Strategy flag ON + a scripted GOOD draft → the proposed strategy
+    //        carries the MODEL's content and the record reads strategy_ai_mode
+    //        llm_used. The action choice stays deterministic (deliberation OFF).
+    #[test]
+    fn strategy_llm_authors_proposed_strategy_body() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = bare_mandate(&spine);
+
+        let decider = ScriptedDecider {
+            reply: Ok(GOOD_STRATEGY_REPLY.to_string()),
+        };
+        let recs = tick_strategy_ai(&agents, &spine, &tasks, &reg, 1, Some("default"), &decider);
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.phase, "needs_strategy_proposal");
+        assert_eq!(rec.action, "propose_strategy");
+        assert_eq!(rec.outcome, "advanced");
+        // Action-choice provenance is deterministic; strategy-body provenance is llm.
+        assert_eq!(rec.ai_mode.as_deref(), Some("deterministic_only"));
+        assert_eq!(rec.strategy_ai_mode.as_deref(), Some("llm_used"));
+        // The strategy is PROPOSED (never approved by the model).
+        assert_eq!(
+            spine.strategy_status("default", &m).unwrap().as_deref(),
+            Some("proposed")
+        );
+        assert!(!spine.strategy_approved("default", &m).unwrap());
+        // The proposed doc contains the model's authored content.
+        let doc = spine.strategy_doc("default", &m).unwrap().unwrap();
+        assert!(doc.contains("Deliver the login page wired to auth"));
+    }
+
+    // STR-2) Strategy flag ON + a scripted BAD (empty) draft → falls back to the
+    //        deterministic body and the record reads strategy_ai_mode fallback.
+    #[test]
+    fn strategy_llm_bad_output_falls_back_deterministically() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = bare_mandate(&spine);
+
+        let decider = ScriptedDecider {
+            reply: Ok("   \n  ".to_string()),
+        };
+        let recs = tick_strategy_ai(&agents, &spine, &tasks, &reg, 1, Some("default"), &decider);
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.action, "propose_strategy");
+        assert_eq!(rec.outcome, "advanced");
+        assert_eq!(rec.strategy_ai_mode.as_deref(), Some("fallback"));
+        // Still proposed — the deterministic draft was used.
+        assert_eq!(
+            spine.strategy_status("default", &m).unwrap().as_deref(),
+            Some("proposed")
+        );
+        let doc = spine.strategy_doc("default", &m).unwrap().unwrap();
+        assert!(doc.contains("deterministic v1"));
+    }
+
+    // STR-2b) An overlong scripted draft is rejected by the validator → fallback.
+    #[test]
+    fn strategy_llm_overlong_output_falls_back() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = bare_mandate(&spine);
+
+        let huge = "x".repeat(
+            crate::nodes::coordinator::agent::prime_strategy::MAX_STRATEGY_OUTPUT_CHARS + 1,
+        );
+        let decider = ScriptedDecider { reply: Ok(huge) };
+        let recs = tick_strategy_ai(&agents, &spine, &tasks, &reg, 1, Some("default"), &decider);
+        let rec = recs.iter().find(|r| r.target_id == m).unwrap();
+        assert_eq!(rec.strategy_ai_mode.as_deref(), Some("fallback"));
+        let doc = spine.strategy_doc("default", &m).unwrap().unwrap();
+        assert!(doc.contains("deterministic v1"));
+    }
+
+    // STR-3) Strategy flag ON but NO decider wired → record reads strategy_ai_mode
+    //        unavailable and the deterministic draft is proposed.
+    #[test]
+    fn strategy_llm_no_decider_is_unavailable() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = bare_mandate(&spine);
+
+        // Strategy ON (last arg) but ai = None.
+        let recs = autonomous_prime_tick(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            None,
+            0,
+            1,
+            Some("default"),
+            "echo",
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+        let rec = recs.iter().find(|r| r.target_id == m).unwrap();
+        assert_eq!(rec.action, "propose_strategy");
+        assert_eq!(rec.outcome, "advanced");
+        assert_eq!(rec.strategy_ai_mode.as_deref(), Some("unavailable"));
+        assert_eq!(
+            spine.strategy_status("default", &m).unwrap().as_deref(),
+            Some("proposed")
+        );
+    }
+
+    // STR-4) Strategy flag OFF → the deterministic draft is used and the
+    //        propose_strategy row honestly reads strategy_ai_mode
+    //        `deterministic_only` (the body author is the deterministic draft).
+    #[test]
+    fn strategy_llm_off_is_deterministic_only() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = bare_mandate(&spine);
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec = recs.iter().find(|r| r.target_id == m).unwrap();
+        assert_eq!(rec.action, "propose_strategy");
+        assert_eq!(rec.outcome, "advanced");
+        assert_eq!(rec.strategy_ai_mode.as_deref(), Some("deterministic_only"));
+        let doc = spine.strategy_doc("default", &m).unwrap().unwrap();
+        assert!(doc.contains("deterministic v1"));
+    }
+
+    // STR-5) A REJECTED strategy is never re-proposed/overwritten by the strategy
+    //        authoring layer — the candidate is `blocked`, the strategy stays
+    //        rejected, and the model is never consulted (no strategy provenance).
+    #[test]
+    fn strategy_llm_does_not_overwrite_a_rejected_strategy() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = bare_mandate(&spine);
+        spine
+            .propose_strategy("default", &m, "human draft")
+            .unwrap();
+        spine.reject_strategy("default", &m).unwrap();
+
+        let decider = ScriptedDecider {
+            reply: Ok(GOOD_STRATEGY_REPLY.to_string()),
+        };
+        let recs = tick_strategy_ai(&agents, &spine, &tasks, &reg, 1, Some("default"), &decider);
+        let rec = recs.iter().find(|r| r.target_id == m).unwrap();
+        // Not a propose_strategy step — the rejected strategy is a blocked human gate.
+        assert_ne!(rec.action, "propose_strategy");
+        assert!(rec.strategy_ai_mode.is_none());
+        // Still rejected — never reset to proposed and never re-authored.
+        assert_eq!(
+            spine.strategy_status("default", &m).unwrap().as_deref(),
+            Some("rejected")
+        );
+    }
+
+    // STR-6) An ALREADY-PROPOSED strategy is not re-proposed: the next step is the
+    //        (human) strategy-approval gate, not propose_strategy, so the strategy
+    //        authoring layer never runs and never overwrites the existing doc.
+    #[test]
+    fn strategy_llm_does_not_overwrite_an_existing_proposed_strategy() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = bare_mandate(&spine);
+        spine
+            .propose_strategy("default", &m, "the human's own strategy")
+            .unwrap();
+
+        let decider = ScriptedDecider {
+            reply: Ok(GOOD_STRATEGY_REPLY.to_string()),
+        };
+        let recs = tick_strategy_ai(&agents, &spine, &tasks, &reg, 1, Some("default"), &decider);
+        let rec = recs.iter().find(|r| r.target_id == m).unwrap();
+        assert_ne!(rec.action, "propose_strategy");
+        assert!(rec.strategy_ai_mode.is_none());
+        // The original proposed doc is untouched.
+        let doc = spine.strategy_doc("default", &m).unwrap().unwrap();
+        assert_eq!(doc, "the human's own strategy");
+    }
+
+    // STR-7) The strategy-draft env flag parser honours the truthy set, defaults OFF.
+    #[test]
+    fn prime_llm_strategy_draft_flag_parsing() {
+        for on in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert!(
+                parse_prime_llm_strategy_draft(Some(on)),
+                "`{on}` should enable"
+            );
+        }
+        for off in ["0", "false", "no", "off", "", "maybe"] {
+            assert!(
+                !parse_prime_llm_strategy_draft(Some(off)),
+                "`{off}` should not"
+            );
+        }
+        assert!(!parse_prime_llm_strategy_draft(None));
     }
 
     /// Grant the synthetic Prime authority a bounded standing approval for
@@ -3942,6 +4404,7 @@ mod tests {
             "echo",
             None,
             false,
+            false,
         )
         .unwrap();
         let rec = recs
@@ -4235,6 +4698,8 @@ mod tests {
             &ctx,
             ai,
             llm_enabled,
+            // Strategy authoring off for the deliberation-focused manual-tick tests.
+            false,
         )
     }
 
