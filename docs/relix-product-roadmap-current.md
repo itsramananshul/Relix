@@ -701,9 +701,11 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    + node-card `reports_to` tree from `/v1/spine/operatives` (apex order from
    `/v1/spine/company`), role/status/rig chips, direct-report counts, a live pill from
    `/v1/runs`, click → per-Operative Keys/allowance/risk-ceiling detail; B&W aesthetic (§12).
-   *Partial:* full drag-pan/pinch **deferred** — ships a scrollable stage (overflow:auto = pan)
-   + explicit −/reset/+ zoom controls (CSP-clean, no SVG-pan dependency). *Verify:* `npm run
-   build` green; dist rebuilt + committed (dist-parity gate); `git diff --check` clean.
+   *Follow-up shipped:* full drag-pan/pinch + Fit/Reset now close the earlier partial gap:
+   PointerEvent drag-pan + two-finger pinch, cursor-anchored wheel zoom, auto-fit-once,
+   and explicit zoom/Fit/Reset controls (CSP-clean, no SVG-pan dependency). *Remaining
+   nuance:* view state is in-memory per mount, not persisted. *Verify:* `npm run build`
+   green; dist rebuilt + committed (dist-parity gate); `git diff --check` clean.
 
 4. **Costs surface** — `dashboard-design.md §10`.
    **✅ DONE.** *Files changed:* new `apps/dashboard/src/pages/Costs.tsx`,
