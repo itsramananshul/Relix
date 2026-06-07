@@ -2630,9 +2630,19 @@ impl TaskStore {
                 let sql = format!("UPDATE tasks SET {col}=?1, updated_at=?2 WHERE task_id=?3");
                 conn.execute(&sql, params![stored, now, task_id])
             }
+            // ISSUE-TREE COST ROLLUP (company-model §6.6): the Brief's billing
+            // code — cross-team cost attribution. Empty value clears it.
+            "billing_code" => {
+                let t = value.trim();
+                let stored: Option<&str> = if t.is_empty() { None } else { Some(t) };
+                conn.execute(
+                    "UPDATE tasks SET billing_code=?1, updated_at=?2 WHERE task_id=?3",
+                    params![stored, now, task_id],
+                )
+            }
             other => {
                 return Err(CoordinatorError::Invalid(format!(
-                    "unknown brief field '{other}' (title/assignee/reviewer/priority/mandate/campaign)"
+                    "unknown brief field '{other}' (title/assignee/reviewer/priority/mandate/campaign/billing_code)"
                 )));
             }
         }
@@ -2683,7 +2693,8 @@ impl TaskStore {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         match conn.query_row(
             "SELECT task_id, assignee_agent_id, board_status, priority,
-                    reviewer_agent_id, mandate_id, campaign_id, human_ref
+                    reviewer_agent_id, mandate_id, campaign_id, human_ref,
+                    billing_code
              FROM tasks WHERE task_id = ?1",
             params![task_id],
             |r| {
@@ -2696,6 +2707,7 @@ impl TaskStore {
                     mandate_id: r.get(5)?,
                     campaign_id: r.get(6)?,
                     human_ref: r.get(7)?,
+                    billing_code: r.get(8)?,
                 })
             },
         ) {
@@ -3681,6 +3693,204 @@ impl TaskStore {
         )
         .map_err(CoordinatorError::Db)?;
         Ok(())
+    }
+
+    /// ISSUE-TREE COST ROLLUP (company-model §6.6): the Brief's OWN billing
+    /// code (trimmed; `None` when unset/empty/missing).
+    fn billing_code_of(&self, brief_id: &str) -> Result<Option<String>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let code: Option<String> = conn
+            .query_row(
+                "SELECT billing_code FROM tasks WHERE task_id = ?1",
+                params![brief_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?
+            .flatten();
+        Ok(code.and_then(|c| {
+            let t = c.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }))
+    }
+
+    /// Resolve a Brief's EFFECTIVE billing code (company-model §6.6): the
+    /// Brief's own `billing_code` if set, else inherited from the nearest
+    /// ancestor Sub-brief (walking `spawned` parent edges) WITHIN THE SAME
+    /// Guild — so cross-Guild inheritance can never happen. `None` when no
+    /// Brief in the chain carries a code. The walk is bounded and cycle-safe.
+    pub fn effective_billing_code(
+        &self,
+        brief_id: &str,
+    ) -> Result<Option<String>, CoordinatorError> {
+        // Resolve the Brief's own Guild once; inheritance never crosses it.
+        let Some(tenant) = self.task_tenant(brief_id)? else {
+            return Ok(None);
+        };
+        let mut current = brief_id.to_string();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for _ in 0..64 {
+            if !seen.insert(current.clone()) {
+                break; // cycle guard
+            }
+            if let Some(code) = self.billing_code_of(&current)? {
+                return Ok(Some(code));
+            }
+            // Walk up to the nearest same-Guild parent Sub-brief (if any).
+            match self
+                .parent_briefs_for_tenant(&current, &tenant)?
+                .into_iter()
+                .next()
+            {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        Ok(None)
+    }
+
+    /// Stamp a run row with the Brief's effective billing code at run START
+    /// (company-model §6.6) — durable point-in-time attribution. A no-op when
+    /// the Brief carries no effective code (the column stays NULL →
+    /// unattributed). Best-effort; called from `prepare_claimed_run`, so both
+    /// manual and autonomous runs are attributed identically.
+    pub fn stamp_run_billing_code(
+        &self,
+        run_id: &str,
+        brief_id: &str,
+    ) -> Result<(), CoordinatorError> {
+        let Some(code) = self.effective_billing_code(brief_id)? else {
+            return Ok(());
+        };
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        conn.execute(
+            "UPDATE brief_runs SET billing_code = ?1 WHERE run_id = ?2",
+            params![code, run_id],
+        )
+        .map_err(CoordinatorError::Db)?;
+        Ok(())
+    }
+
+    /// ISSUE-TREE COST ROLLUP (company-model §6.6): the cost of `root` and its
+    /// entire same-Guild Sub-brief tree over a window, summed from the durable
+    /// `brief_runs` ledger (REAL run cost — never UI data). `None` when `root`
+    /// is not in the caller's Guild (no existence leak).
+    ///
+    /// **Tenant-safe by construction:** the recursive descent follows
+    /// `spawned` edges only into Briefs in the SAME Guild, so a stray
+    /// cross-Guild edge (and its whole subtree) is excluded — another Guild's
+    /// runs can never enter this rollup. `since_secs`/`until_secs` are unix
+    /// SECONDS (matching `brief_runs.started_at`); a run counts when
+    /// `since_secs <= started_at < until_secs`. Pre-run `refused` rows are
+    /// excluded (no adapter ran, no cost). Cost is grouped by each run's
+    /// stamped billing code (empty = unattributed).
+    pub fn brief_cost_rollup_for_tenant(
+        &self,
+        root: &str,
+        tenant: &str,
+        since_secs: i64,
+        until_secs: i64,
+    ) -> Result<Option<brief::BriefCostRollup>, CoordinatorError> {
+        let tenant = norm_tenant(tenant).to_string();
+        // No-leak: a Brief outside the caller's Guild reads as absent.
+        if !self.task_in_tenant(root, &tenant)? {
+            return Ok(None);
+        }
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        // The same-Guild Sub-brief tree under `root` (root included). The
+        // descent only follows `spawned` edges into SAME-Guild Briefs — a
+        // foreign-tenant child (and its whole subtree) is dropped at the JOIN,
+        // so a bad cross-Guild edge can never pull another Guild's runs in.
+        // `UNION` dedupes ids, so a diamond/cycle in the edge graph
+        // terminates.
+        let tree_cte = "
+            WITH RECURSIVE tree(id) AS (
+                SELECT ?1
+                UNION
+                SELECT e.related_task_id
+                FROM task_edges e
+                JOIN tree ON e.task_id = tree.id
+                JOIN tasks c ON c.task_id = e.related_task_id
+                WHERE e.edge_type = 'spawned'
+                  AND COALESCE(c.tenant_id, 'default') = ?2
+            )";
+        let brief_count: i64 = conn
+            .query_row(
+                &format!("{tree_cte} SELECT COUNT(*) FROM tree"),
+                params![root, tenant],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
+        // Whole-tree totals (own + descendants). NULL cost (running / echo /
+        // raw runs) is ignored by SUM but the run still counts.
+        let (run_count, cost_micros): (i64, i64) = conn
+            .query_row(
+                &format!(
+                    "{tree_cte}
+                     SELECT COUNT(*), COALESCE(SUM(cost_micros), 0)
+                     FROM brief_runs
+                     WHERE brief_id IN (SELECT id FROM tree)
+                       AND status != 'refused'
+                       AND started_at >= ?3 AND started_at < ?4"
+                ),
+                params![root, tenant, since_secs, until_secs],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(CoordinatorError::Db)?;
+        // Root-only (own) totals.
+        let (own_run_count, own_cost_micros): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(cost_micros), 0)
+                 FROM brief_runs
+                 WHERE brief_id = ?1
+                   AND status != 'refused'
+                   AND started_at >= ?2 AND started_at < ?3",
+                params![root, since_secs, until_secs],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(CoordinatorError::Db)?;
+        // Cost grouped by the run's stamped billing code (empty = unattributed).
+        let mut stmt = conn
+            .prepare(&format!(
+                "{tree_cte}
+                 SELECT COALESCE(NULLIF(TRIM(billing_code), ''), '') AS code,
+                        COUNT(*), COALESCE(SUM(cost_micros), 0)
+                 FROM brief_runs
+                 WHERE brief_id IN (SELECT id FROM tree)
+                   AND status != 'refused'
+                   AND started_at >= ?3 AND started_at < ?4
+                 GROUP BY code ORDER BY code"
+            ))
+            .map_err(CoordinatorError::Db)?;
+        let by_billing_code: Vec<brief::BillingCodeCost> = stmt
+            .query_map(params![root, tenant, since_secs, until_secs], |r| {
+                Ok(brief::BillingCodeCost {
+                    billing_code: r.get(0)?,
+                    run_count: r.get(1)?,
+                    cost_micros: r.get(2)?,
+                })
+            })
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(CoordinatorError::Db)?;
+        Ok(Some(brief::BriefCostRollup {
+            brief_id: root.to_string(),
+            tenant_id: tenant,
+            since_secs,
+            until_secs,
+            brief_count,
+            run_count,
+            cost_micros,
+            own_run_count,
+            own_cost_micros,
+            descendant_run_count: run_count - own_run_count,
+            descendant_cost_micros: cost_micros - own_cost_micros,
+            by_billing_code,
+        }))
     }
 
     /// Persist the per-(tenant, agent, rig, brief) adapter runtime state
@@ -10128,6 +10338,16 @@ pub fn register(
     {
         let s = store.clone();
         bridge.register(
+            "brief.cost_rollup",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_cost_rollup(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
             "brief.subbrief_progress",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
@@ -11717,6 +11937,49 @@ fn handle_brief_detail(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome
         },
         Ok(None) => invalid(format!("brief.detail: not found: {task}")),
         Err(e) => map_edge_err("brief.detail", e),
+    }
+}
+
+/// `brief.cost_rollup` — the cost of a Brief and its entire Sub-brief tree
+/// over a window (relix-company-model §6.6), as one JSON object. Arg
+/// `brief_id[|since_secs|until_secs]`: an absent/empty window defaults to the
+/// canonical Allowance window (current UTC calendar month via
+/// `heartbeat::allowance_window`); a caller/test may override with explicit
+/// unix-second bounds. Tenant-scoped — a cross-Guild Brief reads as
+/// not-found. Cost is summed from the durable `brief_runs` ledger.
+fn handle_brief_cost_rollup(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.cost_rollup utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.split('|').collect();
+    let brief_id = parts.first().map(|s| s.trim()).unwrap_or("");
+    if brief_id.is_empty() {
+        return invalid("brief.cost_rollup: brief_id required".to_string());
+    }
+    // Default window: the canonical Allowance month (company-model §6.6) —
+    // converted from unix-ms (the window's unit) to unix-secs (the run
+    // ledger's `started_at` unit). Override with `brief_id|since|until`.
+    let win = heartbeat::allowance_window(unix_secs() * 1000);
+    let parse_bound = |idx: usize| -> Option<i64> {
+        parts.get(idx).and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                t.parse::<i64>().ok()
+            }
+        })
+    };
+    let since = parse_bound(1).unwrap_or(win.start_ms / 1000);
+    let until = parse_bound(2).unwrap_or(win.resets_at_ms / 1000);
+    match store.brief_cost_rollup_for_tenant(brief_id, ctx.tenant_id_or_default(), since, until) {
+        Ok(Some(r)) => match serde_json::to_vec(&r) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.cost_rollup encode: {e}")),
+        },
+        Ok(None) => invalid(format!("brief.cost_rollup: not found: {brief_id}")),
+        Err(e) => map_edge_err("brief.cost_rollup", e),
     }
 }
 
@@ -14907,6 +15170,20 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         // specs) carried by a `suggest_tasks` interaction card. NULL for
         // `ask`/`confirm` cards and for legacy rows.
         "ALTER TABLE brief_interactions ADD COLUMN proposal TEXT",
+        // ISSUE-TREE COST ROLLUP + BILLING ATTRIBUTION (company-model §6.6):
+        // an optional billing code on a Brief so its (and its descendant
+        // Sub-briefs') run cost attributes to the requesting team. Additive +
+        // nullable — existing Briefs are simply unattributed. Settable via
+        // `brief.set <id>|billing_code|<code>` (manage-Key gated); surfaced on
+        // the Brief detail (`BriefFields`).
+        "ALTER TABLE tasks ADD COLUMN billing_code TEXT",
+        // The EFFECTIVE billing code stamped onto a run row when the run
+        // STARTS (`prepare_claimed_run`), resolved from the Brief, else
+        // inherited from the nearest same-Guild ancestor Sub-brief. Durable
+        // point-in-time attribution: a later change to a Brief's code never
+        // rewrites a past run's bill. NULL = unattributed run. The Brief-tree
+        // cost rollup groups on this column.
+        "ALTER TABLE brief_runs ADD COLUMN billing_code TEXT",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the
@@ -25646,6 +25923,159 @@ mod tests {
         // Empty usage must not clobber the stored values.
         s.set_run_usage("run_u", &crate::rig::RunUsage::default()).unwrap();
         assert_eq!(s.get_run("run_u").unwrap().unwrap().provider.as_deref(), Some("anthropic"));
+    }
+
+    // ── Issue-tree cost rollup + billing attribution (company-model §6.6) ──
+
+    /// Insert a `brief_runs` row directly with a chosen `started_at` (unix
+    /// secs), status, cost, and billing code — so a test can pin the window
+    /// and grouping deterministically without going through the live run path.
+    fn seed_run(
+        s: &TaskStore,
+        run_id: &str,
+        brief_id: &str,
+        started_at: i64,
+        status: &str,
+        cost_micros: Option<i64>,
+        billing_code: Option<&str>,
+    ) {
+        let c = s.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO brief_runs
+                 (run_id, brief_id, agent_id, rig, status, started_at, summary,
+                  trigger, cost_micros, billing_code)
+             VALUES (?1, ?2, 'agt', 'echo', ?3, ?4, '', 'manual', ?5, ?6)",
+            params![run_id, brief_id, status, started_at, cost_micros, billing_code],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cost_rollup_sums_own_and_descendant_runs() {
+        let s = store();
+        let parent = brief(&s, "parent brief");
+        let child = brief(&s, "child brief");
+        s.link_subbrief(&parent, &child).unwrap();
+        // parent: two runs (1000 + 2000); child: one run (500).
+        seed_run(&s, "r1", &parent, 100, "done", Some(1_000), None);
+        seed_run(&s, "r2", &parent, 200, "done", Some(2_000), None);
+        seed_run(&s, "r3", &child, 150, "done", Some(500), None);
+        let roll = s
+            .brief_cost_rollup_for_tenant(&parent, "default", 0, 1_000)
+            .unwrap()
+            .expect("root in tenant");
+        assert_eq!(roll.brief_count, 2);
+        assert_eq!(roll.run_count, 3);
+        assert_eq!(roll.cost_micros, 3_500);
+        assert_eq!(roll.own_run_count, 2);
+        assert_eq!(roll.own_cost_micros, 3_000);
+        assert_eq!(roll.descendant_run_count, 1);
+        assert_eq!(roll.descendant_cost_micros, 500);
+    }
+
+    #[test]
+    fn cost_rollup_excludes_foreign_tenant_child_and_siblings() {
+        let s = store();
+        let parent = brief(&s, "parent in guild-a");
+        s.set_task_tenant(&parent, "guild-a").unwrap();
+        // A child whose Brief lives in ANOTHER Guild, mis-linked under parent.
+        let foreign = brief(&s, "foreign child in guild-b");
+        s.set_task_tenant(&foreign, "guild-b").unwrap();
+        s.link_subbrief(&parent, &foreign).unwrap();
+        // A sibling Brief in guild-a NOT under parent.
+        let sibling = brief(&s, "sibling in guild-a");
+        s.set_task_tenant(&sibling, "guild-a").unwrap();
+        seed_run(&s, "rp", &parent, 100, "done", Some(1_000), None);
+        seed_run(&s, "rf", &foreign, 100, "done", Some(9_999), None);
+        seed_run(&s, "rs", &sibling, 100, "done", Some(7_777), None);
+        let roll = s
+            .brief_cost_rollup_for_tenant(&parent, "guild-a", 0, 1_000)
+            .unwrap()
+            .expect("root in guild-a");
+        // Only the parent's own run — the cross-Guild child is dropped at the
+        // tenant-filtered JOIN, and the sibling is not in the tree at all.
+        assert_eq!(roll.brief_count, 1, "foreign child excluded from tree");
+        assert_eq!(roll.run_count, 1);
+        assert_eq!(roll.cost_micros, 1_000);
+        // A caller from another Guild cannot read this Brief's rollup at all.
+        assert!(
+            s.brief_cost_rollup_for_tenant(&parent, "guild-b", 0, 1_000)
+                .unwrap()
+                .is_none(),
+            "cross-Guild caller reads as not-found (no existence leak)"
+        );
+    }
+
+    #[test]
+    fn cost_rollup_groups_by_billing_code_with_inheritance() {
+        let s = store();
+        let parent = brief(&s, "billed parent");
+        let child = brief(&s, "child inherits code");
+        s.link_subbrief(&parent, &child).unwrap();
+        // Parent carries the code; child has none → inherits the parent's.
+        s.set_brief_field(&parent, "billing_code", "PROJ-X").unwrap();
+        assert_eq!(
+            s.effective_billing_code(&parent).unwrap().as_deref(),
+            Some("PROJ-X")
+        );
+        assert_eq!(
+            s.effective_billing_code(&child).unwrap().as_deref(),
+            Some("PROJ-X"),
+            "child inherits the parent Sub-brief's code"
+        );
+        // Open + stamp a run on each (mirrors the shared run-start seam), then
+        // give them cost.
+        running_run(&s, "rp", &parent, "agt");
+        s.stamp_run_billing_code("rp", &parent).unwrap();
+        running_run(&s, "rc", &child, "agt");
+        s.stamp_run_billing_code("rc", &child).unwrap();
+        let usage = |c: i64| crate::rig::RunUsage {
+            cost_micros: Some(c),
+            ..Default::default()
+        };
+        s.set_run_usage("rp", &usage(1_000)).unwrap();
+        s.set_run_usage("rc", &usage(500)).unwrap();
+        let until = unix_secs() + 10;
+        let roll = s
+            .brief_cost_rollup_for_tenant(&parent, "default", 0, until)
+            .unwrap()
+            .unwrap();
+        assert_eq!(roll.by_billing_code.len(), 1, "one bucket: PROJ-X");
+        let bucket = &roll.by_billing_code[0];
+        assert_eq!(bucket.billing_code, "PROJ-X");
+        assert_eq!(bucket.run_count, 2, "own + inherited child run");
+        assert_eq!(bucket.cost_micros, 1_500);
+    }
+
+    #[test]
+    fn cost_rollup_window_excludes_out_of_window_runs() {
+        let s = store();
+        let b = brief(&s, "windowed brief");
+        // Window [1000, 2000): lower inclusive, upper exclusive.
+        seed_run(&s, "before", &b, 999, "done", Some(100), None); // excluded
+        seed_run(&s, "lo", &b, 1_000, "done", Some(1), None); // included
+        seed_run(&s, "mid", &b, 1_500, "done", Some(10), None); // included
+        seed_run(&s, "hi", &b, 2_000, "done", Some(100), None); // excluded
+        let roll = s
+            .brief_cost_rollup_for_tenant(&b, "default", 1_000, 2_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(roll.run_count, 2, "only in-window runs counted");
+        assert_eq!(roll.cost_micros, 11);
+    }
+
+    #[test]
+    fn cost_rollup_excludes_refused_runs() {
+        let s = store();
+        let b = brief(&s, "refused-excluded");
+        seed_run(&s, "ok", &b, 100, "done", Some(50), None);
+        seed_run(&s, "ref", &b, 100, "refused", None, None);
+        let roll = s
+            .brief_cost_rollup_for_tenant(&b, "default", 0, 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(roll.run_count, 1, "pre-run refusal not a real run");
+        assert_eq!(roll.cost_micros, 50);
     }
 
     #[test]

@@ -66,6 +66,18 @@ pub struct ListQuery {
 }
 
 #[derive(Debug, Deserialize, Default)]
+pub struct CostRollupQuery {
+    /// Optional window lower bound (unix SECONDS, inclusive). Omitted →
+    /// the canonical Allowance month start.
+    #[serde(default)]
+    pub since: Option<i64>,
+    /// Optional window upper bound (unix SECONDS, exclusive). Omitted →
+    /// the canonical Allowance month reset edge.
+    #[serde(default)]
+    pub until: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 pub struct AssignCheckQuery {
     /// The Operative that would do the assigning.
     #[serde(default)]
@@ -1255,6 +1267,21 @@ pub async fn brief_runs(
     Path(id): Path<String>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
     json_passthrough(call_peer(&state, "brief.runs", id.as_bytes()).await?)
+}
+
+/// `GET /v1/spine/briefs/:id/cost?since=&until=` — the cost of a Brief and
+/// its Sub-brief tree (relix-company-model §6.6), summed from the durable
+/// `brief_runs` ledger. `since`/`until` are optional unix-second bounds;
+/// omitted → the canonical Allowance month window. Tenant-scoped.
+pub async fn brief_cost_rollup(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<CostRollupQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let since = q.since.map(|v| v.to_string()).unwrap_or_default();
+    let until = q.until.map(|v| v.to_string()).unwrap_or_default();
+    let arg = format!("{id}|{since}|{until}");
+    json_passthrough(call_peer(&state, "brief.cost_rollup", arg.as_bytes()).await?)
 }
 
 /// `GET /v1/runs/:run_id` — one run record (detail).

@@ -1336,6 +1336,10 @@ name = "spine_brief_detail"
 method = "brief.detail"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_brief_cost_rollup"
+method = "brief.cost_rollup"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_brief_search"
 method = "brief.search"
 allow_groups = ["chat-users"]

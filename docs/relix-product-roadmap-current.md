@@ -223,16 +223,25 @@ ledger entry or design section.
    budget, mirroring the per-Operative hard-stop and additive on top of it
    (`guild.budget_refused` / `over_guild_budget`), tenant-safe (the Guild spend is summed
    over only the Brief's own Guild). Manual `brief.run` / `prime.start` stay sovereign
-   (operator-initiated, no Guild gate). *Remaining (deferred, see §5 slice 10):* no
-   issue-tree cost rollup or billing-code attribution (`company-model §6.6`; ledger
-   "Guild-level spend hard-stop (autonomous)" = DONE). *(The spend window is now the UTC
-   calendar month with reset — slice 9 = DONE.)*
+   (operator-initiated, no Guild gate). *(The issue-tree cost rollup + billing-code
+   attribution backend is now SHIPPED — see §P1 slice 3b; the spend window is the UTC
+   calendar month with reset — slice 9 = DONE. Remaining deferred: the frontend Costs
+   surface, object-level billing codes, and the delegation-depth counter.)*
 3. **[BE] Allowance windowing** — **DONE** (§5 slice 9). The per-Operative and Guild
    hard-stops + the Action Center live-spend feed now bill against the **current UTC
    calendar month** via the single canonical `heartbeat::allowance_window(now_ms)`
    (inclusive month start → reset edge), replacing the trailing-30-day approximation; reset
-   is implicit (spend re-summed from the live month start). *Still deferred:* issue-tree
-   cost rollup + billing-code attribution (`company-model §6.6` → slice 10).
+   is implicit (spend re-summed from the live month start).
+3b. **[BE] Issue-tree cost rollup + billing-code attribution** — **BACKEND SHIPPED**
+   (`company-model §6.6`). `brief.cost_rollup` (→ `GET /v1/spine/briefs/:id/cost`) sums the
+   durable `brief_runs` ledger over a Brief **and its same-Guild Sub-brief tree** (own vs
+   descendant totals, tree counts, per-billing-code breakdown), tenant-safe by construction
+   and windowed on the canonical `allowance_window` (overridable since/until). Billing code is
+   an additive `tasks.billing_code` (set via `brief.set`, on `BriefFields`) + a
+   `brief_runs.billing_code` **stamped at run start** (Brief's own, else inherited from the
+   nearest same-Guild ancestor Sub-brief) for manual + autonomous runs alike. *Still deferred:*
+   the **frontend** Costs surface (§P2 slice 5), object-level (Mandate/Campaign/Guild) billing
+   codes, and the delegation-depth counter.
 
 **P2 — product-feel surfaces (mostly frontend on data that already exists)**
 4. **[FE] The Lattice (org chart)** — pan/zoom org-tree view is **not started**
@@ -240,7 +249,8 @@ ledger entry or design section.
    *visual org* that sells "a company" does not.
 5. **[FE] Full Costs surface** — spend by Guild/Operative/Campaign/Brief with budget
    progress + incident cards + tree rollup (`dashboard-design §10`). Data exists (metrics +
-   Allowance); there is no dedicated Costs page.
+   Allowance) and the **Brief-tree rollup backend now ships** (`brief.cost_rollup` →
+   `GET /v1/spine/briefs/:id/cost`, §P1 slice 3b); there is still no dedicated Costs page.
 6. **[FE] Run transcript renderer** — block-grouped "nice"/"raw" transcript view, live-tailed
    (`dashboard-design §8`). SSE + `run_events` exist; the rich renderer does not.
 7. **[FE] Streaming Brief thread** — the workroom is request/response; the design wants the
@@ -253,8 +263,10 @@ ledger entry or design section.
 9. **[BE/FE] Smarter companion** — `prime.propose` AI mode is opt-in and rule-validated;
    replacing the deterministic planner with an LLM driving the governed spine APIs is
    future (`current-limitations.md`; ledger "Mandate orchestration" still not autonomous).
-10. **[BE] Exactly-once decomposition + cost-tree rollup + auto-wake promotion** — deferred
-    (`execution §1.7`; ledger line 209 = NOT STARTED).
+10. **[BE] Exactly-once decomposition + auto-wake promotion** — deferred
+    (`execution §1.7`). The **cost-tree rollup + billing-code attribution** part of this
+    line is now **backend SHIPPED** (see §P1 slice 3b); only the frontend Costs surface
+    (§P2 slice 5) consumes it.
 
 ---
 
@@ -339,10 +351,10 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    precedence; cross-tenant spend does not trip another Guild's cap; manual `preflight_run`
    stays sovereign for the same over-budget Brief. *Verified:* full `cargo test -p
    relix-runtime` green (3944 lib tests, +6); `cargo check` clean; `cargo clippy` clean on the
-   touched code (2 pre-existing unrelated warnings only); `git diff --check` clean. *Remaining
-   spend caveats (deferred):* no issue-tree cost rollup / billing-code attribution
-   (`company-model §6.6` → slice 10). *(The calendar-month spend window with implicit reset
-   shipped in slice 9 = DONE.)*
+   touched code (2 pre-existing unrelated warnings only); `git diff --check` clean. *(The
+   issue-tree cost rollup + billing-code attribution backend shipped in §P1 slice 3b; the
+   calendar-month spend window with implicit reset shipped in slice 9 = DONE. Remaining
+   deferred: the frontend Costs surface, object-level billing codes, delegation-depth.)*
 
 3. **The Lattice org-chart view** — `dashboard-design.md §9`.
    *Files:* new `apps/dashboard/src/pages/Lattice.tsx` (or extend Agents.tsx), `nav.ts`;
@@ -400,8 +412,9 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    window opens at the inclusive month start, resets at the next month's first instant; 1ms
    before the boundary belongs to the previous month; Feb 2024 is 29 days; December rolls
    into the next January. *Verified:* targeted + full `cargo test -p relix-runtime` green;
-   `cargo check`/`cargo clippy` clean on the touched code. *Remaining (deferred → slice 10):*
-   issue-tree cost rollup + billing-code attribution (`company-model §6.6`).
+   `cargo check`/`cargo clippy` clean on the touched code. *(The issue-tree cost rollup +
+   billing-code attribution backend shipped in §P1 slice 3b; remaining deferred: the
+   frontend Costs surface, object-level billing codes, the delegation-depth counter.)*
 
 10. **Stale-run adoption by terminal evidence** — `execution-and-issue-design.md §1.4/§7.1`.
     **✅ DONE.** *Files changed:* `crates/relix-runtime/src/nodes/coordinator/mod.rs` (new

@@ -323,9 +323,31 @@ When a manager delegates, the subordinate's costs **roll up** to the requester. 
 > - **Manual sovereignty unchanged.** Only the autonomous heartbeat path passes
 >   through this gate; a manual `brief.run` / `prime.start` never does (the Board
 >   is sovereign).
-> - **Still deferred (honest):** issue-tree **cost rollup** and **billing-code**
->   cross-team attribution (the two mechanisms above) are not yet built — the
->   window/reset work does not add them.
+>
+> **Implementation note — issue-tree cost rollup + billing attribution
+> (BACKEND SHIPPED).** Both §6.6 mechanisms now have a backend foundation:
+> - **The work tree.** `brief.cost_rollup` (→ `GET /v1/spine/briefs/:id/cost`)
+>   computes the cost of a Brief **and its entire same-Guild Sub-brief tree** by
+>   summing the durable `brief_runs` ledger (real run `cost_micros` — never UI
+>   data), returning own vs. descendant totals, a tree run/Brief count, and a
+>   per-billing-code breakdown. It is **tenant-safe by construction**: the
+>   recursive descent follows `spawned` edges only into same-Guild Briefs, so a
+>   stray cross-Guild edge (and its whole subtree) is excluded, and a cross-Guild
+>   caller reads not-found.
+> - **Billing code.** An additive `billing_code` on a Brief (set via
+>   `brief.set <id>|billing_code|<code>`, surfaced on the Brief detail). When a
+>   run **starts**, its effective code is **stamped** onto the run row — the
+>   Brief's own code, else inherited from the nearest same-Guild ancestor
+>   Sub-brief — so attribution is durable and point-in-time (a later code change
+>   never rewrites a past run's bill). Manual and autonomous runs are attributed
+>   identically (the stamp is in the shared `prepare_claimed_run` seam).
+> - **Window.** The rollup bills against the **same canonical
+>   `heartbeat::allowance_window`** (current UTC calendar month) the dispatch
+>   gate uses; a caller/test may override with explicit bounded since/until.
+> - **Still deferred (honest):** Mandate/Campaign/Guild-level billing **codes**
+>   (those objects carry no billing-code field — only the Brief tree does), the
+>   delegation-**depth** counter, and the **frontend** Costs surface remain
+>   unbuilt.
 
 ---
 

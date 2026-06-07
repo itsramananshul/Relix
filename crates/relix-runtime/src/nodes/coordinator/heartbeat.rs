@@ -2236,6 +2236,12 @@ pub fn prepare_claimed_run(
             bytes: workspace_bytes,
         },
     );
+    // Stamp the run's effective billing code at START (company-model §6.6):
+    // the Brief's own code, else inherited from the nearest same-Guild
+    // ancestor Sub-brief. Durable point-in-time attribution — a later change
+    // to the Brief's code never rewrites this run's bill. Best-effort + a
+    // no-op when there is no code (the column stays NULL → unattributed).
+    let _ = store.stamp_run_billing_code(run_id, &card.task_id);
     // Register the run as cancellable + open its transcript with the
     // lifecycle events an operator needs to follow the run.
     crate::rig::CancelRegistry::global().register(run_id);

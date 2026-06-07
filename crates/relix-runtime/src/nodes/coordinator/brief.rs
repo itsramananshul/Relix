@@ -272,6 +272,55 @@ pub struct BriefFields {
     pub reviewer_agent_id: Option<String>,
     pub mandate_id: Option<String>,
     pub campaign_id: Option<String>,
+    /// The Brief's billing code — cross-team cost attribution
+    /// (relix-company-model §3.4/§6.6). `None` when unset; runs inherit it
+    /// (or the nearest ancestor Sub-brief's) at run start. Omitted from the
+    /// wire when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_code: Option<String>,
+}
+
+/// One billing-code bucket in a Brief-tree cost rollup
+/// (relix-company-model §6.6). `billing_code` is empty (`""`) for runs with
+/// no attribution. `cost_micros` is micro-USD.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BillingCodeCost {
+    pub billing_code: String,
+    pub run_count: i64,
+    pub cost_micros: i64,
+}
+
+/// The cost of a Brief and its entire Sub-brief tree over a window
+/// (relix-company-model §6.6 "Cost rollup & attribution"). Summed from the
+/// durable `brief_runs` ledger (real run cost, never UI data) and tenant-safe
+/// (only same-Guild Briefs in the tree contribute). Counts/cost exclude
+/// pre-run `refused` rows (no adapter ran). `*_micros` are micro-USD.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BriefCostRollup {
+    /// The root Brief the rollup is anchored at.
+    pub brief_id: String,
+    /// The Guild the rollup is scoped to.
+    pub tenant_id: String,
+    /// Window lower bound (unix SECONDS, inclusive — matches
+    /// `brief_runs.started_at`).
+    pub since_secs: i64,
+    /// Window upper bound (unix SECONDS, exclusive).
+    pub until_secs: i64,
+    /// Number of Briefs in the tree (the root + its same-Guild descendants).
+    pub brief_count: i64,
+    /// Total runs across the whole tree (own + descendants) in the window.
+    pub run_count: i64,
+    /// Total cost across the whole tree in the window.
+    pub cost_micros: i64,
+    /// Just the root Brief's own runs.
+    pub own_run_count: i64,
+    pub own_cost_micros: i64,
+    /// The descendant Sub-briefs' runs (= total − own).
+    pub descendant_run_count: i64,
+    pub descendant_cost_micros: i64,
+    /// Cost grouped by each run's stamped billing code (sorted by code;
+    /// `""` = unattributed).
+    pub by_billing_code: Vec<BillingCodeCost>,
 }
 
 /// A Brief as it appears on the board — a compact card with its

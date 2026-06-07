@@ -713,6 +713,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/maintenance/prune", post(spine::maintenance_prune))
         .route("/v1/maintenance/audit", get(spine::maintenance_audit))
         .route("/v1/spine/briefs/:id/runs", get(spine::brief_runs))
+        // Issue-tree cost rollup + billing attribution (company-model §6.6).
+        .route("/v1/spine/briefs/:id/cost", get(spine::brief_cost_rollup))
         // First-run company bootstrap: status read, Crew roster, and the
         // owner-gated "Initialize Company" (create the Founder) action.
         .route("/v1/spine/company", get(spine::company_status))
