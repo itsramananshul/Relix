@@ -131,18 +131,74 @@ const ZOOM_MAX = 2.5;
 // point (sx,sy) renders at screen (tx + s*sx, ty + s*sy); transform-origin 0 0.
 interface View { s: number; tx: number; ty: number }
 
+// The canonical default view (top-left, 1×). Reset returns here.
+const DEFAULT_VIEW: View = { s: 1, tx: 24, ty: 24 };
+
+// ── Persistent local viewport (dashboard-design §9) ─────────────────────────
+// The org chart's pan/zoom is kept in the browser under a versioned key so a
+// refresh/return restores the operator's last view instead of snapping back to
+// the auto-fit. This mirrors the Chat page's local-session pattern (§13): it is
+// LOCAL UI PREFERENCE ONLY — three plain numbers (scale + pan x/y), never any
+// company data. Every read is hard-validated (finite numbers, scale within the
+// zoom range, pan within a sane bound); anything corrupt/foreign resets cleanly
+// to null so the chart falls back to the default + auto-fit.
+const VIEWPORT_STORAGE_KEY = "relix.lattice.viewport.v1";
+// Generous absolute bound on a persisted pan offset (px). Real pans never
+// approach this; it only rejects absurd/corrupt values that survive the finite
+// check.
+const PAN_LIMIT = 100000;
+
+function loadViewport(): View | null {
+  try {
+    const raw = typeof localStorage !== "undefined" ? localStorage.getItem(VIEWPORT_STORAGE_KEY) : null;
+    if (!raw) return null;
+    const p: unknown = JSON.parse(raw);
+    if (!p || typeof p !== "object") return null;
+    const { s, tx, ty } = p as Record<string, unknown>;
+    if (typeof s !== "number" || typeof tx !== "number" || typeof ty !== "number") return null;
+    if (!Number.isFinite(s) || !Number.isFinite(tx) || !Number.isFinite(ty)) return null;
+    if (s < ZOOM_MIN || s > ZOOM_MAX) return null;
+    if (Math.abs(tx) > PAN_LIMIT || Math.abs(ty) > PAN_LIMIT) return null;
+    return { s, tx, ty };
+  } catch {
+    // Parse/shape error → drop the bad value so we never read it again.
+    try {
+      localStorage.removeItem(VIEWPORT_STORAGE_KEY);
+    } catch {
+      /* storage unavailable — fall through to the in-memory default */
+    }
+    return null;
+  }
+}
+
+// Persist only the three view numbers. Best-effort — a storage failure (private
+// mode / quota) must never break the chart.
+function saveViewport(v: View): void {
+  try {
+    localStorage.setItem(VIEWPORT_STORAGE_KEY, JSON.stringify({ s: v.s, tx: v.tx, ty: v.ty }));
+  } catch {
+    /* storage unavailable — the viewport stays in-memory for this session */
+  }
+}
+
 export function Lattice() {
   const [selId, setSelId] = useState<string | null>(null);
   const [detailCache, setDetailCache] = useState<Record<string, { keys: Keys | null; detail: AgentDetail | null }>>({});
 
   // ── Pan/zoom view state + interaction refs ──────────────────────────────
   const viewportRef = useRef<HTMLDivElement>(null);
-  const [view, setView] = useState<View>({ s: 1, tx: 24, ty: 24 });
+  // Read the persisted viewport ONCE at mount (validated; corrupt → null). Held
+  // in a ref so the read happens a single time, not on every render.
+  const restoredRef = useRef<View | null | undefined>(undefined);
+  if (restoredRef.current === undefined) restoredRef.current = loadViewport();
+  const [view, setView] = useState<View>(restoredRef.current ?? DEFAULT_VIEW);
   // A live mirror so the native (non-passive) wheel listener + pointer math read
   // the current view without re-binding every frame.
   const viewRef = useRef(view);
   viewRef.current = view;
-  const didFitRef = useRef(false);
+  // If a saved viewport was restored, the one-time auto-fit is already satisfied —
+  // we must NOT fit over the operator's last view.
+  const didFitRef = useRef(restoredRef.current !== null);
   // Active touch/mouse pointers (id → last client position) for pinch + pan.
   const pointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const dragRef = useRef<{ sx: number; sy: number; baseTx: number; baseTy: number; active: boolean; moved: boolean } | null>(null);
@@ -245,7 +301,11 @@ export function Lattice() {
     const s = clamp(Math.min((r.width - pad * 2) / w, (r.height - pad * 2) / h, 1), ZOOM_MIN, ZOOM_MAX);
     setView({ s, tx: (r.width - w * s) / 2, ty: (r.height - h * s) / 2 });
   }, [w, h]);
-  const reset = useCallback(() => setView({ s: 1, tx: 24, ty: 24 }), []);
+  // Reset → the canonical default view. The persist effect mirrors the live view
+  // to storage, so Reset OVERWRITES the saved viewport with the default (it does
+  // not leave a stale saved view behind) — and Fit likewise persists the fitted
+  // view. Semantics: storage always reflects what's on screen.
+  const reset = useCallback(() => setView(DEFAULT_VIEW), []);
 
   // Frame the tree once on first render (so it opens centered, not top-left).
   // Guarded so it never re-fits — the chart must not jump while the operator
@@ -258,6 +318,16 @@ export function Lattice() {
     didFitRef.current = true;
     fit();
   }, [stageReady, fit]);
+
+  // Persist the viewport locally so a refresh/return keeps the operator's last
+  // pan/zoom. Debounced: a drag/pinch/wheel gesture fires many `setView`s, so we
+  // write once it settles rather than on every frame. localStorage MIRRORS the
+  // live view — that's what makes Fit persist the fitted view and Reset overwrite
+  // with the default.
+  useEffect(() => {
+    const t = setTimeout(() => saveViewport(view), 250);
+    return () => clearTimeout(t);
+  }, [view]);
 
   // Cursor-anchored wheel zoom. Bound natively (not via React's passive onWheel)
   // so `preventDefault` actually suppresses the page scroll.
@@ -402,8 +472,8 @@ export function Lattice() {
           <button className="btn ghost sm" aria-label="Zoom out" onClick={() => zoomByCenter(1 / 1.2)}>−</button>
           <button className="btn ghost sm" aria-label="Current zoom" title="Current zoom" onClick={reset}>{Math.round(view.s * 100)}%</button>
           <button className="btn ghost sm" aria-label="Zoom in" onClick={() => zoomByCenter(1.2)}>+</button>
-          <button className="btn ghost sm" onClick={fit}>Fit</button>
-          <button className="btn ghost sm" onClick={reset}>Reset</button>
+          <button className="btn ghost sm" onClick={fit} title="Fit the whole tree in view (saved locally)">Fit</button>
+          <button className="btn ghost sm" onClick={reset} title="Reset to the default view — overwrites the locally-saved viewport">Reset</button>
         </div>
       }
     >
@@ -500,6 +570,7 @@ export function Lattice() {
                 <span><span className="dot warn" /> pending</span>
                 <span><span className="dot" /> suspended / disabled</span>
                 <span>drag to pan · scroll or pinch to zoom · click a node for detail</span>
+                <span title="Your pan/zoom is remembered in this browser only — not the server.">view saved locally</span>
               </div>
             </div>
           )}

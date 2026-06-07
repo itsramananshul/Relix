@@ -391,10 +391,12 @@ ledger entry or design section.
    hover/click), and `touch-action:none` for mobile gesture handling — still CSP-clean and
    dependency-free (no SVG-pan lib). Cycles + orphan `reports_to` pointers render safely
    (visited-set DFS; an orphan/cycle node falls back to a root, an edge to a missing parent is
-   simply not drawn). *Honest remaining nuance:* view state (zoom/pan) is in-memory per mount
-   only — not persisted to storage, since the app has no local-preference pattern to reuse
-   (avoided overbuilding per the brief); `brief.detail`'s `delegation_depth` is still not
-   rendered here.
+   simply not drawn). *View state now persists:* the viewport (scale + pan x/y) is saved to
+   `localStorage` under the versioned key `relix.lattice.viewport.v1` (debounced, hard-validated
+   on read — finite numbers, scale within range, pan within a sane bound; corrupt values reset
+   cleanly). Fit persists the fitted view, Reset overwrites with the default, and a restored
+   viewport suppresses the one-time auto-fit so it is never clobbered. *Honest remaining nuance:*
+   `brief.detail`'s `delegation_depth` is still not rendered here.
 5. **[FE] Full Costs surface** — **SHIPPED** (`dashboard-design §10`).
    `apps/dashboard/src/pages/Costs.tsx` (nav `/costs`): the Guild budget card now reads
    **canonical month-to-date Guild spend** from the dedicated `guild.spend` route
@@ -740,8 +742,11 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    `/v1/runs`, click → per-Operative Keys/allowance/risk-ceiling detail; B&W aesthetic (§12).
    *Follow-up shipped:* full drag-pan/pinch + Fit/Reset now close the earlier partial gap:
    PointerEvent drag-pan + two-finger pinch, cursor-anchored wheel zoom, auto-fit-once,
-   and explicit zoom/Fit/Reset controls (CSP-clean, no SVG-pan dependency). *Remaining
-   nuance:* view state is in-memory per mount, not persisted. *Verify:* `npm run build`
+   and explicit zoom/Fit/Reset controls (CSP-clean, no SVG-pan dependency). *Follow-up
+   shipped:* the viewport (scale + pan) now persists to `localStorage`
+   (`relix.lattice.viewport.v1`, debounced + hard-validated on read), so a refresh/return
+   restores the last view; Fit/Reset overwrite it consistently and a restored view suppresses
+   the auto-fit. *Verify:* `npm run build`
    green; dist rebuilt + committed (dist-parity gate); `git diff --check` clean.
 
 4. **Costs surface** — `dashboard-design.md §10`.
