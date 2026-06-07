@@ -339,12 +339,18 @@ ledger entry or design section.
    via `/v1/spine/clearances/:id/decide`), plus direct **pending hires** + **budget alerts** from
    `/v1/spine/company/actions` (hire approve/reject via `/v1/agents/:id/approve-hire|reject-hire`).
    A pending-Clearance nav badge; decisions invalidate the actions/mandates/briefs surfaces.
-   Settings hub gains an **Admin · session recovery** section over `/v1/runs/runtime-state`
-   (per-agent lookup + gated reset) on top of the existing Health/Maintenance/Adapter/run-sandbox/
-   heartbeat sections. *Honest gaps:* the budget-alert decision still lives on its own route (no
-   inline decide route exists); strategy/budget/high-risk Clearances decide through the same generic
-   `decide` (no per-type typed payload editor yet); runtime-state is per-agent (the route requires an
-   `agent_id`), so there is no global session list.
+   Settings hub gains an **Admin · session recovery** section that now **auto-loads the global
+   runtime-state list** (`GET /v1/runs/runtime-state/list`, capability `rig.runtime_state.list`):
+   a tenant-scoped table of **every** persisted adapter session in the Guild (Operative, Rig, Brief,
+   masked session, status, tokens, cost, updated), a client-side filter (Operative/Rig/Brief/status/
+   session fragment), and a per-row guarded reset (brief-scoped reset for a row with a `brief_key`;
+   typed `RESET` confirm for the dangerous agent-level reset). On top of the existing
+   Health/Maintenance/Adapter/run-sandbox/heartbeat sections. *Honest gaps:* the budget-alert
+   decision still lives on its own route (no inline decide route exists); strategy/budget/high-risk
+   Clearances decide through the same generic `decide` (no per-type typed payload editor yet); the
+   stored session id is surfaced only as a **masked/truncated** summary, session **resume is still
+   stored-not-replayed**, and there is **no diagnosis / retry-budget layer** (reset forgets the row;
+   it does not classify retryable-vs-not).
 
 **P3 — depth / autonomy**
 9. **[BE/FE] Smarter companion** — **BACKEND SHIPPED (now AI-assisted action selection, opt-in +
@@ -627,12 +633,34 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
 
 8. **Settings hub** — `dashboard-design.md §10`.
    **✅ DONE (partial).** *Files changed:* `apps/dashboard/src/pages/Settings.tsx` (+`api.ts`
-   `runtimeState.get/reset`). Added an **Admin · session recovery** section over
-   `/v1/runs/runtime-state` (per-agent lookup of the persisted adapter runtime rows + a typed-confirm
-   reset) on top of the already-real Health, Maintenance & storage, AI providers, run-execution
-   sandbox, autonomous-heartbeat, Bridge-info, and Adapter-readiness sections. *Honest gap:*
-   runtime-state is per-agent (the route requires an `agent_id`) — there is no global session list.
-   *Verify:* `npm run build` green; dist rebuilt + committed.
+   `runtimeState.list/get/reset`). Added an **Admin · session recovery** section on top of the
+   already-real Health, Maintenance & storage, AI providers, run-execution sandbox,
+   autonomous-heartbeat, Bridge-info, and Adapter-readiness sections.
+13. **Global runtime-state session list + control-plane recovery surface** —
+    `dashboard-design.md §10`, `current-limitations.md`.
+    **✅ DONE.** *Files changed:* `crates/relix-runtime/src/nodes/coordinator/mod.rs`
+    (`TaskStore::list_runtime_state_for_tenant(tenant, limit)` — every persisted
+    `agent_runtime_state` row for the tenant across ALL agents, `updated_at DESC` with stable
+    `(agent_id, rig, brief_key)` tie-breakers, clamped to `MAX_RUNTIME_STATE_LIST = 200`; +2 store
+    tests for cross-agent span / tenant isolation / limit-respect-and-clamp),
+    `crates/relix-runtime/src/controller_runtime.rs` (new tenant-scoped capability
+    `rig.runtime_state.list` returning `{rows:[...]}`, optional `{"limit":n}` arg, defaults on empty
+    args, uses `ctx.tenant_id_or_default()`), `crates/relix-web-bridge/src/{main.rs,spine.rs}`
+    (`GET /v1/runs/runtime-state/list[?limit=N]` → `runtime_state_list` proxy; the per-agent get +
+    reset routes untouched), `scripts/relix-mesh-up.{ps1,sh}` + `scripts/check-boot-policy-coverage.ps1`
+    (`rig.runtime_state.list` allow rule + manifest), `apps/dashboard/src/api.ts`
+    (`runtimeState.list(limit?)` + `RuntimeStateRow` now carries `rig`/`last_run_id`/`last_status`/
+    `last_error`/`input_tokens`/`output_tokens`/`cost_micros`),
+    `apps/dashboard/src/pages/Settings.tsx` (the recovery panel now auto-loads the global list as a
+    filterable table with per-row guarded reset; masked session id), rebuilt `dashboard-dist`. *Adds:*
+    the operator can see and recover every adapter session in the Guild without first typing one agent
+    id. Tenant-safe: the store filters by `tenant_id` exactly like the per-agent path; a foreign-Guild
+    row never appears. *Honest remaining:* the stored session id is shown only as a **masked/truncated**
+    summary; session **resume is still stored-not-replayed**; there is **no diagnosis / retry-budget
+    layer** (reset forgets the row, it does not classify retryable-vs-not). *Verified:* targeted
+    `cargo test -p relix-runtime --lib runtime_state` (5) green; `cargo test -p relix-web-bridge
+    spine::tests --bins` green; `cargo check`/`cargo clippy` clean on the touched code; `npm run build`
+    green; dist rebuilt + committed (parity gate); `git diff --check` clean.
 
 9. **Allowance calendar-month windowing + reset bookkeeping** — `company-model.md §6/§6.6`.
    **✅ DONE.** *Files changed:* `crates/relix-runtime/src/nodes/coordinator/heartbeat.rs`

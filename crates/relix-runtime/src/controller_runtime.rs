@@ -10220,6 +10220,70 @@ fn register_node_type_handlers(
             );
         }
         {
+            // `rig.runtime_state.list` — the persisted adapter runtime state
+            // for EVERY agent in the caller's Guild
+            // (`GET /v1/runs/runtime-state/list`). The global operator recovery
+            // list: it lets the Settings hub surface all persisted adapter
+            // sessions without first knowing an agent id. Optional arg is JSON
+            // `{"limit": <n>}` (or empty for the default page); the limit is
+            // clamped store-side. Tenant-scoped: only the caller's Guild rows.
+            // Returns `{"rows": [...]}`, newest first.
+            let st = store.clone();
+            bridge.register(
+                "rig.runtime_state.list",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let st = st.clone();
+                        async move {
+                            let tenant = ctx.tenant_id_or_default().to_string();
+                            let invalid = |c: String| {
+                                crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                        cause: c,
+                                        retry_hint: 0,
+                                        retry_after: None,
+                                    },
+                                )
+                            };
+                            // Empty args → default page; otherwise an optional
+                            // `{"limit": n}` (0 also means "default page").
+                            let raw = String::from_utf8_lossy(&ctx.args);
+                            let trimmed = raw.trim();
+                            let limit = if trimmed.is_empty() {
+                                0usize
+                            } else {
+                                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                                    Ok(v) => v
+                                        .get("limit")
+                                        .and_then(|x| x.as_u64())
+                                        .map(|n| n as usize)
+                                        .unwrap_or(0),
+                                    Err(e) => {
+                                        return invalid(format!(
+                                            "rig.runtime_state.list: invalid JSON: {e}"
+                                        ))
+                                    }
+                                }
+                            };
+                            match st.list_runtime_state_for_tenant(&tenant, limit) {
+                                Ok(rows) => {
+                                    let body = serde_json::json!({ "rows": rows });
+                                    match serde_json::to_vec(&body) {
+                                        Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                        Err(e) => invalid(format!(
+                                            "rig.runtime_state.list encode: {e}"
+                                        )),
+                                    }
+                                }
+                                Err(e) => invalid(format!("rig.runtime_state.list: {e}")),
+                            }
+                        }
+                    },
+                )),
+            );
+        }
+        {
             // `rig.runtime_state.reset` — forget persisted adapter runtime
             // state (`POST /v1/runs/runtime-state/reset`). Arg is JSON
             // `{"agent_id":"...","brief_key":"..."?}`; with `brief_key` the

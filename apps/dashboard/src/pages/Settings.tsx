@@ -303,52 +303,70 @@ export function Settings() {
 }
 
 // Admin / session recovery (dashboard-design §10): the persisted adapter
-// runtime state for one Operative — the resumable session id, accumulated
-// usage/cost, and last run status the heartbeat/Rig layer keeps so a Shift can
-// resume. A wedged resumable session is cleared with Reset (the route forgets
-// the rows only; the durable run ledger is untouched). The route is per-agent
-// (`agent_id` is required), so this is an operator lookup, not a global list.
+// runtime state for the WHOLE Guild — every Operative's resumable session id,
+// accumulated usage/cost, and last run status the heartbeat/Rig layer keeps so
+// a Shift can resume. The panel auto-loads the global list
+// (`GET /v1/runs/runtime-state/list`) so the operator can see and recover any
+// wedged session without first knowing an agent id, filter it, inspect safe
+// summary fields, and reset a row in place. Reset forgets the rows only; the
+// durable run ledger, transcripts, and artifacts are untouched. Tenant-scoped.
+//
+// A long session id is never shown in full — it is masked to a short fragment.
+function maskSession(s?: string): string {
+  if (!s) return "—";
+  return s.length <= 14 ? s : `${s.slice(0, 8)}…${s.slice(-4)}`;
+}
+
 function AdminRecoveryPanel() {
-  const [agentId, setAgentId] = useState("");
-  const [rows, setRows] = useState<RuntimeStateRow[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const { data: rows, loading, error, reload } = useAsync<RuntimeStateRow[]>(async () => {
+    const r = await runtimeState.list();
+    if (r.error) throw new Error(r.error);
+    const d = r.data;
+    return Array.isArray(d)
+      ? d
+      : d && typeof d === "object" && Array.isArray((d as { rows?: RuntimeStateRow[] }).rows)
+        ? (d as { rows: RuntimeStateRow[] }).rows
+        : [];
+  });
+  const [filter, setFilter] = useState("");
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  // The row queued for reset (confirmation strip) + the typed RESET text used
+  // for the dangerous agent-level (whole-Operative) case.
+  const [pending, setPending] = useState<RuntimeStateRow | null>(null);
   const [confirm, setConfirm] = useState("");
 
-  async function lookup() {
-    const id = agentId.trim();
-    if (!id) return;
-    setBusy(true);
-    setError(null);
+  const all = rows ?? [];
+  const needle = filter.trim().toLowerCase();
+  const shown = needle
+    ? all.filter((row) =>
+        [row.agent_id, row.rig, row.brief_key, row.last_status, row.session_id]
+          .some((f) => (f ?? "").toString().toLowerCase().includes(needle)),
+      )
+    : all;
+
+  function queueReset(row: RuntimeStateRow) {
     setBanner(null);
     setConfirm("");
-    const r = await runtimeState.get(id);
-    setBusy(false);
-    if (r.error) {
-      setError(r.error);
-      setRows(null);
-      return;
-    }
-    const data = r.data;
-    const list = Array.isArray(data)
-      ? data
-      : data && typeof data === "object" && Array.isArray((data as { rows?: RuntimeStateRow[] }).rows)
-        ? (data as { rows: RuntimeStateRow[] }).rows
-        : [];
-    setRows(list);
+    setPending(row);
   }
 
-  async function reset() {
-    const id = agentId.trim();
+  async function doReset() {
+    if (!pending) return;
+    const id = (pending.agent_id ?? "").trim();
     if (!id) return;
+    const briefKey = (pending.brief_key ?? "").trim() || undefined;
     setBusy(true);
     setBanner(null);
     try {
-      const r = await runtimeState.reset(id);
-      setBanner({ kind: "ok", msg: `Forgot ${r.removed ?? 0} runtime-state row(s) for ${id}.` });
+      const r = await runtimeState.reset(id, briefKey);
+      setBanner({
+        kind: "ok",
+        msg: `Forgot ${r.removed ?? 0} runtime-state row(s) for ${id}${briefKey ? ` · ${briefKey}` : ""}.`,
+      });
+      setPending(null);
       setConfirm("");
-      await lookup();
+      reload();
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Reset failed" });
     } finally {
@@ -356,79 +374,131 @@ function AdminRecoveryPanel() {
     }
   }
 
-  const canReset = confirm.trim().toUpperCase() === "RESET";
+  // The brief-scoped reset clears just one row and is the safe default. The
+  // agent-level reset (a row with no brief_key) forgets EVERY session for that
+  // Operative, so it stays gated behind a typed RESET confirmation.
+  const agentLevel = pending != null && !((pending.brief_key ?? "").trim());
+  const canConfirm = !agentLevel || confirm.trim().toUpperCase() === "RESET";
 
   return (
     <div className="card" style={{ gridColumn: "1 / -1" }}>
-      <h3 style={{ margin: 0, marginBottom: 8 }}>Admin · session recovery</h3>
+      <div className="row wrap" style={{ justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
+        <h3 style={{ margin: 0, marginBottom: 8 }}>Admin · session recovery</h3>
+        <button className="btn ghost" disabled={loading} onClick={() => reload()} style={{ fontSize: 12 }}>
+          {loading ? "…" : "Refresh"}
+        </button>
+      </div>
       <p className="muted" style={{ marginTop: -2, marginBottom: 12, fontSize: 12 }}>
-        Inspect the persisted adapter runtime state for one Operative (resumable session id,
-        accumulated usage/cost, last status). Reset forgets those rows so a wedged resumable session
-        is cleared — it never touches the durable run ledger, transcripts, or artifacts. Tenant-scoped
-        via <span className="mono">/v1/runs/runtime-state</span>.
+        Every persisted adapter session in the Guild — resumable session id (masked), accumulated
+        usage/cost, and last status — across all Operatives. Reset forgets a row so a wedged resumable
+        session is cleared; it never touches the durable run ledger, transcripts, or artifacts.
+        Tenant-scoped via <span className="mono">/v1/runs/runtime-state/list</span>.
       </p>
 
       {banner && <div className={"banner " + banner.kind} style={{ fontSize: 12 }}>{banner.msg}</div>}
 
       <div className="row wrap" style={{ gap: 10, alignItems: "flex-end" }}>
-        <label className="field" style={{ margin: 0, flex: "1 1 260px" }}>
-          <span>Operative (agent id)</span>
+        <label className="field" style={{ margin: 0, flex: "1 1 280px" }}>
+          <span>Filter (Operative, Rig, Brief, status, or session fragment)</span>
           <input
             className="input"
-            value={agentId}
-            placeholder="agent id"
-            onChange={(e) => setAgentId(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") void lookup(); }}
+            value={filter}
+            placeholder="filter sessions…"
+            onChange={(e) => setFilter(e.target.value)}
           />
         </label>
-        <button className="btn ghost" disabled={busy || !agentId.trim()} onClick={() => void lookup()}>
-          {busy ? "…" : "Look up"}
-        </button>
+        {all.length > 0 && (
+          <span className="muted" style={{ fontSize: 12 }}>
+            {shown.length === all.length ? `${all.length} session(s)` : `${shown.length} of ${all.length}`}
+          </span>
+        )}
       </div>
 
       {error && (
         <div className="banner err" style={{ fontSize: 12, marginTop: 10 }}>
-          Could not read runtime state — <span className="mono">GET /v1/runs/runtime-state</span>: {error}
+          Could not read runtime state — <span className="mono">GET /v1/runs/runtime-state/list</span>: {error}
         </div>
       )}
 
-      {rows != null && !error && (
-        rows.length === 0 ? (
-          <div className="empty" style={{ marginTop: 10 }}>No persisted runtime state for this Operative.</div>
+      {!error && (
+        loading && rows == null ? (
+          <div className="empty" style={{ marginTop: 10 }}>Loading persisted sessions…</div>
+        ) : all.length === 0 ? (
+          <div className="empty" style={{ marginTop: 10 }}>No persisted runtime state in this Guild yet.</div>
+        ) : shown.length === 0 ? (
+          <div className="empty" style={{ marginTop: 10 }}>No sessions match “{filter.trim()}”.</div>
         ) : (
-          <>
-            <div className="table-scroll" style={{ marginTop: 12 }}>
-              <table className="table compact">
-                <thead>
-                  <tr><th>Brief</th><th>Session</th><th>Status</th><th>Tokens</th><th>Cost</th><th>Updated</th></tr>
-                </thead>
-                <tbody>
-                  {rows.map((row, i) => (
+          <div className="table-scroll" style={{ marginTop: 12 }}>
+            <table className="table compact">
+              <thead>
+                <tr>
+                  <th>Operative</th><th>Rig</th><th>Brief</th><th>Session</th><th>Status</th>
+                  <th>Tokens</th><th>Cost</th><th>Updated</th><th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {shown.map((row, i) => {
+                  const tokens = (row.input_tokens ?? 0) + (row.output_tokens ?? 0);
+                  return (
                     <tr key={i}>
+                      <td className="mono" style={{ fontSize: 11 }}>{row.agent_id ?? "—"}</td>
+                      <td className="mono" style={{ fontSize: 11 }}>{row.rig ?? "—"}</td>
                       <td className="mono" style={{ fontSize: 11 }}>{row.brief_key ?? "—"}</td>
-                      <td className="mono" style={{ fontSize: 11 }}>{(row.session_id ?? "—").slice(0, 16)}</td>
-                      <td><span className="badge" style={{ fontSize: 9 }}>{row.status ?? "—"}</span></td>
-                      <td className="muted" style={{ fontSize: 11 }}>{row.total_tokens ?? 0}</td>
+                      <td className="mono" style={{ fontSize: 11 }} title={row.session_id ? "session id masked" : undefined}>
+                        {maskSession(row.session_id)}
+                      </td>
+                      <td>
+                        <span className="badge" style={{ fontSize: 9 }} title={row.last_error || undefined}>
+                          {row.last_status ?? "—"}{row.last_error ? " ⚠" : ""}
+                        </span>
+                      </td>
+                      <td className="muted" style={{ fontSize: 11 }}>{tokens}</td>
                       <td className="muted" style={{ fontSize: 11 }}>
-                        ${(((row.total_cost_micros ?? 0) as number) / 1_000_000).toFixed(2)}
+                        ${((row.cost_micros ?? 0) / 1_000_000).toFixed(2)}
                       </td>
                       <td className="muted" style={{ fontSize: 11 }}>
-                        {row.updated_at ? new Date((row.updated_at as number) * 1000).toLocaleString() : "—"}
+                        {row.updated_at ? new Date(row.updated_at * 1000).toLocaleString() : "—"}
+                      </td>
+                      <td>
+                        <button className="btn ghost" style={{ fontSize: 11 }} disabled={busy} onClick={() => queueReset(row)}>
+                          Reset
+                        </button>
                       </td>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div className="row wrap" style={{ marginTop: 10, gap: 8, alignItems: "center" }}>
-              <span className="muted" style={{ fontSize: 12 }}>
-                Type <strong>RESET</strong> to forget this Operative's runtime state:
-              </span>
-              <input className="input" style={{ width: 130 }} value={confirm} placeholder="RESET" onChange={(e) => setConfirm(e.target.value)} />
-              <button className="btn" disabled={busy || !canReset} onClick={() => void reset()}>Reset runtime state</button>
-            </div>
-          </>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         )
+      )}
+
+      {pending && (
+        <div className="banner" style={{ marginTop: 12, fontSize: 12 }}>
+          {agentLevel ? (
+            <div className="row wrap" style={{ gap: 8, alignItems: "center" }}>
+              <span>
+                Reset <strong>ALL</strong> persisted sessions for{" "}
+                <span className="mono">{pending.agent_id}</span> (this row has no Brief scope). Type{" "}
+                <strong>RESET</strong> to confirm:
+              </span>
+              <input className="input" style={{ width: 120 }} value={confirm} placeholder="RESET" onChange={(e) => setConfirm(e.target.value)} />
+            </div>
+          ) : (
+            <span>
+              Reset the runtime session for <span className="mono">{pending.agent_id}</span> ·{" "}
+              <span className="mono">{pending.brief_key}</span>? This forgets the resumable session only.
+            </span>
+          )}
+          <div className="row wrap" style={{ marginTop: 8, gap: 8 }}>
+            <button className="btn" disabled={busy || !canConfirm} onClick={() => void doReset()}>
+              {busy ? "…" : "Confirm reset"}
+            </button>
+            <button className="btn ghost" disabled={busy} onClick={() => { setPending(null); setConfirm(""); }}>
+              Cancel
+            </button>
+          </div>
+        </div>
       )}
     </div>
   );

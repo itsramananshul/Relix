@@ -5356,6 +5356,46 @@ impl TaskStore {
         Ok(out)
     }
 
+    /// All persisted runtime-state rows for the tenant across EVERY agent,
+    /// newest first, bounded by `limit`. This is the global operator recovery
+    /// list — it lets the Settings hub surface every persisted adapter session
+    /// in the Guild without first knowing an agent id. Tenant-scoped exactly
+    /// like the per-agent path, so one Guild can never read another Guild's
+    /// adapter state. `limit` is clamped to `[1, MAX_RUNTIME_STATE_LIST]`
+    /// defensively (a `0`/oversized caller value can't return an unbounded or
+    /// empty page); order is `updated_at DESC` with stable
+    /// `(agent_id, rig, brief_key)` tie-breakers so equal timestamps page
+    /// deterministically.
+    pub fn list_runtime_state_for_tenant(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<AgentRuntimeState>, CoordinatorError> {
+        let tenant = norm_tenant(tenant);
+        let capped = if limit == 0 {
+            MAX_RUNTIME_STATE_LIST
+        } else {
+            limit.min(MAX_RUNTIME_STATE_LIST)
+        } as i64;
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {AGENT_RUNTIME_STATE_COLS} FROM agent_runtime_state
+                 WHERE tenant_id = ?1
+                 ORDER BY updated_at DESC, agent_id ASC, rig ASC, brief_key ASC
+                 LIMIT ?2"
+            ))
+            .map_err(CoordinatorError::Db)?;
+        let mapped = stmt
+            .query_map(params![tenant, capped], AgentRuntimeState::from_row)
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::new();
+        for r in mapped {
+            out.push(r.map_err(CoordinatorError::Db)?);
+        }
+        Ok(out)
+    }
+
     /// One runtime-state row for a precise (tenant, agent, rig, brief) key, or
     /// None if no run has populated it yet.
     pub fn get_runtime_state(
@@ -11182,6 +11222,13 @@ pub struct AgentRuntimeState {
 const AGENT_RUNTIME_STATE_COLS: &str = "tenant_id, agent_id, rig, brief_key, \
      session_id, provider, model, input_tokens, output_tokens, cost_micros, \
      last_run_id, last_status, last_error, runtime_state, created_at, updated_at";
+
+/// Defensive cap on the global runtime-state list page
+/// ([`TaskStore::list_runtime_state_for_tenant`]). The operator recovery
+/// surface is a bounded summary, never a full table dump — a caller-supplied
+/// limit is clamped to this so one request can't scan an unbounded number of
+/// persisted adapter sessions.
+const MAX_RUNTIME_STATE_LIST: usize = 200;
 
 impl AgentRuntimeState {
     fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -29570,6 +29617,83 @@ mod tests {
         assert_eq!(s.reset_runtime_state("default", "agt_x").unwrap(), 1);
         assert!(s.list_runtime_state("default", "agt_x").unwrap().is_empty());
         assert_eq!(s.list_runtime_state("default", "agt_y").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn runtime_state_global_list_spans_agents_and_isolates_tenants() {
+        let s = store();
+        let u = crate::rig::RunUsage {
+            session_id: Some("s".into()),
+            ..Default::default()
+        };
+
+        // Three rows in the default tenant across two agents + two briefs.
+        let b1 = brief(&s, "gl b1");
+        let b2 = brief(&s, "gl b2");
+        running_run(&s, "gl1", &b1, "agt_a");
+        running_run(&s, "gl2", &b2, "agt_a");
+        running_run(&s, "gl3", &b1, "agt_b");
+        s.record_run_runtime_state("gl1", &u, "done", None, None).unwrap();
+        s.record_run_runtime_state("gl2", &u, "done", None, None).unwrap();
+        s.record_run_runtime_state("gl3", &u, "done", None, None).unwrap();
+
+        // A foreign-Guild row that must never leak into the default list.
+        let bf = brief(&s, "gl foreign");
+        s.set_task_tenant(&bf, "guild-b").unwrap();
+        running_run(&s, "glf", &bf, "agt_foreign");
+        s.record_run_runtime_state("glf", &u, "done", None, None).unwrap();
+
+        // Global list for `default` sees all three default rows across both
+        // agents — and not the foreign-Guild row.
+        let rows = s.list_runtime_state_for_tenant("default", 100).unwrap();
+        assert_eq!(rows.len(), 3, "all default-tenant rows, every agent");
+        assert!(
+            rows.iter().all(|r| r.tenant_id == "default"),
+            "no cross-tenant leak"
+        );
+        let agents: std::collections::BTreeSet<_> =
+            rows.iter().map(|r| r.agent_id.as_str()).collect();
+        assert_eq!(
+            agents,
+            ["agt_a", "agt_b"].into_iter().collect(),
+            "spans multiple agents"
+        );
+        assert!(
+            !rows.iter().any(|r| r.agent_id == "agt_foreign"),
+            "foreign-Guild agent never appears"
+        );
+
+        // The foreign Guild sees only its own row.
+        let foreign = s.list_runtime_state_for_tenant("guild-b", 100).unwrap();
+        assert_eq!(foreign.len(), 1);
+        assert_eq!(foreign[0].agent_id, "agt_foreign");
+
+        // The per-agent path still works alongside the global list.
+        assert_eq!(s.list_runtime_state("default", "agt_a").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn runtime_state_global_list_respects_and_clamps_limit() {
+        let s = store();
+        let u = crate::rig::RunUsage::default();
+        // Five rows across distinct (agent, brief) keys in one tenant.
+        for i in 0..5 {
+            let b = brief(&s, &format!("lim b{i}"));
+            let run = format!("lim{i}");
+            running_run(&s, &run, &b, &format!("agt_{i}"));
+            s.record_run_runtime_state(&run, &u, "done", None, None).unwrap();
+        }
+        // A caller limit is honoured exactly.
+        assert_eq!(s.list_runtime_state_for_tenant("default", 2).unwrap().len(), 2);
+        assert_eq!(s.list_runtime_state_for_tenant("default", 5).unwrap().len(), 5);
+        // `0` means "the default page" (clamped to the max), not "no rows".
+        assert_eq!(s.list_runtime_state_for_tenant("default", 0).unwrap().len(), 5);
+        // An oversized limit is clamped to the defensive max but still returns
+        // every available row (there are fewer rows than the cap here).
+        assert_eq!(
+            s.list_runtime_state_for_tenant("default", 100_000).unwrap().len(),
+            5
+        );
     }
 
     #[test]

@@ -1441,6 +1441,28 @@ pub async fn runtime_state_get(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RuntimeStateListQuery {
+    pub limit: Option<u32>,
+}
+
+/// `GET /v1/runs/runtime-state/list[?limit=N]` — every persisted adapter
+/// runtime-state row in the caller's Guild, across ALL Operatives (newest
+/// first), so the Settings hub can recover a wedged session without first
+/// knowing an agent id. Tenant-scoped; the limit is clamped store-side.
+/// Returns `{"rows": [...]}`.
+pub async fn runtime_state_list(
+    State(state): State<AppState>,
+    Query(q): Query<RuntimeStateListQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let arg = match q.limit {
+        Some(n) => serde_json::to_vec(&serde_json::json!({ "limit": n }))
+            .map_err(|e| bad(&format!("encode: {e}")))?,
+        None => Vec::new(),
+    };
+    json_passthrough(call_peer(&state, "rig.runtime_state.list", &arg).await?)
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RuntimeStateResetRequest {
     pub agent_id: String,
     #[serde(default)]

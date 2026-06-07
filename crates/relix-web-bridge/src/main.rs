@@ -697,6 +697,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Persisted adapter runtime state (TG2). Static paths registered
         // before `:run_id` so they take routing precedence.
         .route("/v1/runs/runtime-state", get(spine::runtime_state_get))
+        .route("/v1/runs/runtime-state/list", get(spine::runtime_state_list))
         .route("/v1/runs/runtime-state/reset", post(spine::runtime_state_reset))
         // Run/Brief execution event stream (TG5) — tenant-scoped SSE.
         .route("/v1/runs/events/stream", get(tasks::runs_events_stream))

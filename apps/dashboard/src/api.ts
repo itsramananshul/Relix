@@ -779,16 +779,30 @@ export const companyActions = {
 // cleared without touching the durable run ledger.
 export interface RuntimeStateRow {
   agent_id?: string;
+  rig?: string;
   brief_key?: string;
   session_id?: string;
-  status?: string;
-  total_cost_micros?: number;
-  total_tokens?: number;
+  provider?: string;
+  model?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  cost_micros?: number;
+  last_run_id?: string;
+  last_status?: string;
+  last_error?: string;
   updated_at?: number;
   [k: string]: unknown;
 }
 
 export const runtimeState = {
+  // Global recovery list: every persisted adapter session in the Guild across
+  // ALL Operatives, newest first (`GET /v1/runs/runtime-state/list`). Reports
+  // failure so the panel shows the bridge's own error, not a blank.
+  list: (limit?: number) =>
+    tryGetReport<{ rows?: RuntimeStateRow[] } | RuntimeStateRow[] | null>(
+      `/v1/runs/runtime-state/list${limit ? `?limit=${limit}` : ""}`,
+      null,
+    ),
   // Per-agent lookup (the route requires an agent_id). Reports failure so the
   // panel shows the bridge's own error, not a blank.
   get: (agentId: string) =>

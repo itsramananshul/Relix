@@ -40,6 +40,33 @@ what, the chronicle of how it went, and the pointer to where the
 per-flow event log lives. Retry decisions are operator-driven via
 `relix-cli task retry`.
 
+### Adapter session recovery is a masked summary + reset, not session replay
+
+The Settings hub now surfaces a **global** adapter-session recovery
+table: `GET /v1/runs/runtime-state/list` returns every persisted
+`agent_runtime_state` row for the current Guild across **all**
+Operatives (newest first, tenant-scoped, clamped to 200), so an
+operator can find and clear a wedged session without first knowing an
+agent id. Each row shows the Operative, Rig, Brief, a **masked**
+session id, last status, accumulated tokens/cost, and the update time;
+a per-row **Reset** (`POST /v1/runs/runtime-state/reset`) forgets the
+row — brief-scoped when the row carries a `brief_key`, behind a typed
+`RESET` confirmation for the dangerous whole-Operative reset. What it
+does **not** do:
+
+- **The session id is a masked summary, never shown in full.** The
+  list/table truncate it; it is a recovery pointer, not a credential
+  to copy.
+- **Session resume is stored-not-replayed.** The persisted
+  `session_id` / `runtime_state` is recorded so a Rig *could* resume,
+  but the SOL VM is synchronous and there is no durable replay (see
+  "No durable replay / no flow snapshots" below) — reset is "forget
+  the wedged pointer", not "resume from a snapshot".
+- **There is no diagnosis / retry-budget layer.** Reset deletes the
+  row; it does **not** classify a failure as retryable-vs-not, and
+  there is no per-run failure-class or retry budget attached to the
+  session. That recovery-diagnosis layer remains future work.
+
 ### Run-workspace review/apply is inspect-and-copy, not a full VCS workflow
 
 A Brief Shift (run) executes in a scoped sandbox workspace and its

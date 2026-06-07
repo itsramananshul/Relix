@@ -1666,6 +1666,10 @@ name = "spine_runtime_state_get"
 method = "rig.runtime_state.get"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_runtime_state_list"
+method = "rig.runtime_state.list"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_runtime_state_reset"
 method = "rig.runtime_state.reset"
 allow_groups = ["chat-users"]

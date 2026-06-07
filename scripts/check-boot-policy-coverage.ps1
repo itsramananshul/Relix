@@ -100,7 +100,7 @@ $RequiredCapabilities = @(
     # Run review -> apply loop
     'run.get', 'run.events', 'run.diff', 'run.review', 'run.apply', 'run.discard',
     'run.artifacts', 'run.artifact_preview', 'run.artifact_diff', 'run.cancel',
-    'rig.runtime_state.get', 'rig.runtime_state.reset',
+    'rig.runtime_state.get', 'rig.runtime_state.list', 'rig.runtime_state.reset',
     # Messaging surface
     'msg.send', 'msg.inbox', 'msg.read', 'msg.thread', 'msg.delete'
 )
