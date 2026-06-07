@@ -324,6 +324,23 @@ the approved work is already ready. What it does **not** do:
     caveat), beside the still-read-only heartbeat + recovery surfaces
     (`/v1/spine/run-config`: `autonomous_prime_enabled` / `autonomous_prime_max` /
     `autonomous_prime_interval_secs` remain the env-derived knobs).
+    **The loop is also operator-wakeable on demand (Manual Autonomy Tick v1).**
+    Beside the background timer, an operator can run **exactly one** bounded
+    autonomous Prime tick for their Guild from the product — `prime.autonomy_tick_now`
+    (`POST /v1/spine/prime/autonomy/tick`), surfaced as a **Run Prime now** button
+    on Settings — and get back the per-candidate tick records
+    (`{tenant, max, records:[{target_kind, target_id, mandate_id, phase, action,
+    outcome, reason}], advanced, started, considered}`), so autonomous Prime is
+    legible instead of mysterious. The **background runtime toggle controls the
+    timer; the tick-now button is an explicit operator wake-up for one Guild and
+    does NOT require the timer switch to be ON.** It is the SAME governed path the
+    timer uses: **operator/admin-only** (a worker subject is denied, no side
+    effect), **tenant-scoped** (it drives only the caller's own Guild, never all
+    Guilds, even if the env override is set), and it still obeys every gate —
+    standing approvals (no grant ⇒ every approval still left to the human), the
+    autonomous-start budget hard-stop, Rig readiness, and the per-tick
+    `RELIX_AUTONOMOUS_PRIME_MAX` bound. It grants **no new authority** — it only
+    wakes the existing driver once.
   - **Prime standing authority (v1) — opt-in, default OFF, *grant-gated*.** Prime
     now has **two** autonomy layers. Layer (a) above is the **approved-work
     driver** (runtime toggle or `RELIX_AUTONOMOUS_PRIME` env override): it only moves work that a human already

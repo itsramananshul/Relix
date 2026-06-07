@@ -2002,6 +2002,22 @@ pub async fn prime_autonomy_set(
     json_passthrough(call_peer(&state, "prime.autonomy_set", arg.as_bytes()).await?)
 }
 
+/// `POST /v1/spine/prime/autonomy/tick` — run EXACTLY ONE bounded autonomous
+/// Prime tick for the caller's Guild on explicit operator request, returning the
+/// tick records (Manual Autonomy Tick v1). It proxies `prime.autonomy_tick_now`
+/// with empty args; the coordinator handler does all the work (role gate,
+/// tenant-scoping, the bounded `autonomous_prime_tick`). This does NOT require
+/// the runtime autonomy switch to be ON — it is an explicit wake-up of the same
+/// governed driver — but it grants no new authority and obeys the same
+/// standing-grant / budget / Rig / per-tick-max gates the timer path uses. A
+/// permission denial (a non-operator caller) maps to **403** via the shared
+/// `coordinator_err_status`; no special bypass.
+pub async fn prime_autonomy_tick(
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "prime.autonomy_tick_now", b"").await?)
+}
+
 /// `GET /v1/maintenance/summary` — operator storage + run-ledger overview
 /// (workspace count/bytes, run/event/artifact counts, warnings). Bounded,
 /// no secrets. Auth-gated by the bridge middleware like every `/v1/*`.
@@ -3811,7 +3827,15 @@ mod tests {
                 post(prime_proposal_advance),
             )
             .route("/v1/spine/mandates/:id/next-step", get(mandate_next_step))
-            .route("/v1/spine/mandates/:id/advance", post(mandate_advance));
+            .route("/v1/spine/mandates/:id/advance", post(mandate_advance))
+            // Prime Runtime Autonomy Switch + the Manual Autonomy Tick: the static
+            // `…/autonomy/tick` segment must not collide with the sibling
+            // `…/autonomy` GET/PUT (matchit gives the longer static path priority).
+            .route(
+                "/v1/spine/prime/autonomy",
+                get(prime_autonomy).put(prime_autonomy_set),
+            )
+            .route("/v1/spine/prime/autonomy/tick", post(prime_autonomy_tick));
     }
 
     #[test]

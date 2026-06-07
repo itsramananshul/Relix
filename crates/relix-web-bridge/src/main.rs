@@ -724,6 +724,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/spine/prime/autonomy",
             get(spine::prime_autonomy).put(spine::prime_autonomy_set),
         )
+        // Manual Autonomy Tick (v1): run exactly one bounded autonomous Prime
+        // tick for the Guild on operator request and return the tick records.
+        // Does NOT require the runtime switch ON; same governed gates as the
+        // timer path. (Static `…/autonomy/tick` does not collide with `…/autonomy`.)
+        .route(
+            "/v1/spine/prime/autonomy/tick",
+            post(spine::prime_autonomy_tick),
+        )
         // Live Shift-Room status of a Prime work session: a dedicated
         // tenant-scoped SSE stream (preferred) + the polling snapshot (fallback).
         .route(

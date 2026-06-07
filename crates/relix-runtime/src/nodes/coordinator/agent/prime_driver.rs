@@ -1201,6 +1201,102 @@ pub fn handle_prime_autonomy_set(spine_store: &SpineStore, ctx: &InvocationCtx) 
     ok_json(&autonomy_state_json(args.enabled))
 }
 
+/// Render one [`PrimeAutonomyRecord`] as the wire JSON the operator tick-now
+/// surface returns. Secret-free by construction — only the bounded fields the
+/// in-memory tick summary carries.
+fn prime_autonomy_record_json(r: &PrimeAutonomyRecord) -> Value {
+    json!({
+        "tenant": r.tenant,
+        "target_kind": r.target_kind,
+        "target_id": r.target_id,
+        "mandate_id": r.mandate_id,
+        "phase": r.phase,
+        "action": r.action,
+        "outcome": r.outcome,
+        "reason": r.reason,
+    })
+}
+
+/// `prime.autonomy_tick_now` — run EXACTLY ONE bounded autonomous Prime tick for
+/// the caller's Guild on explicit operator request, and return the resulting
+/// [`PrimeAutonomyRecord`] list (company-model §5.4/§8.2 — the Action Center's
+/// "next governed step", here as an operator-triggered wake-up of the same
+/// timer-driven driver). This makes autonomous Prime operationally legible: the
+/// operator can wake the loop once and SEE what it considered / advanced /
+/// started, instead of only knowing a background timer might run.
+///
+/// This is **still governed autonomy**, NOT a new power. It calls the SAME
+/// [`autonomous_prime_tick`] path the timer uses, so every action goes through
+/// the same standing-authority gates, the autonomous start budget hard-stop, the
+/// Rig-readiness check, and the per-tick `RELIX_AUTONOMOUS_PRIME_MAX` bound. It
+/// is scoped to the caller's OWN Guild (`Some(tenant)`) so it never drives all
+/// Guilds even when the env override is on. It does **not** require the runtime
+/// autonomy switch (or the env override) to be ON — an explicit operator
+/// wake-up — but it grants no new authority: with no live standing grant every
+/// approval gate is still left to the human exactly as before.
+///
+/// ROLE-GATED to operator/admin via the same `caller_is_operator` gate as
+/// `prime.autonomy_set` — a worker subject is `POLICY_DENIED` with no mutation.
+/// Returns `{ tenant, max, records:[…], advanced, started, considered }`; an
+/// `autonomous_prime_tick` error is surfaced honestly as RESPONDER_INTERNAL.
+#[allow(clippy::too_many_arguments)]
+pub fn handle_prime_autonomy_tick_now(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &Arc<TaskStore>,
+    registry: &crate::rig::RigRegistry,
+    metrics: Option<&crate::metrics::MetricsQuery>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    // Same Board-only gate as the runtime toggle: a worker subject can never
+    // wake the autonomous Prime driver, even though this takes no new authority.
+    if !caller_is_operator(ctx) {
+        return policy_denied(
+            "prime.autonomy_tick_now is operator/admin-only — a worker subject cannot wake \
+             autonomous Prime"
+                .to_string(),
+        );
+    }
+    let tenant = ctx.tenant_id_or_default();
+    // Live per-tick bound + safe hire Rig — the SAME knobs the timer reads, so a
+    // manual wake-up never exceeds the configured action budget.
+    let max = crate::nodes::coordinator::heartbeat::parse_autonomous_prime_max(
+        std::env::var("RELIX_AUTONOMOUS_PRIME_MAX").ok().as_deref(),
+    );
+    let hire_rig = configured_autonomous_hire_rig();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    // Tenant-scoped (`Some(tenant)`): this wakes ONLY the caller's Guild, never
+    // all Guilds — even if the env override is on for the background timer.
+    let records = match autonomous_prime_tick(
+        agent_store,
+        spine_store,
+        task_store,
+        registry,
+        metrics,
+        now_ms,
+        max,
+        Some(tenant),
+        &hire_rig,
+    ) {
+        Ok(r) => r,
+        Err(e) => return internal(format!("prime.autonomy_tick_now: {e}")),
+    };
+    let advanced = records.iter().filter(|r| r.outcome == "advanced").count();
+    let started = records.iter().filter(|r| r.outcome == "started").count();
+    let rows: Vec<Value> = records.iter().map(prime_autonomy_record_json).collect();
+    ok_json(&json!({
+        "tenant": tenant,
+        "max": max,
+        "records": rows,
+        "advanced": advanced,
+        "started": started,
+        "considered": records.len(),
+    }))
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // AUTONOMOUS PRIME DRIVER (v1) — opt-in, bounded (company-model §5.4/§8.2 the
 // Action Center "next governed step"; §12.5/§12.5B the Prime planner + Start).
@@ -2772,6 +2868,177 @@ mod tests {
         assert!(
             recs2.iter().all(|r| r.outcome != "started"),
             "a running proposal must not be double-started"
+        );
+    }
+
+    // ── MANUAL AUTONOMY TICK (operator `prime.autonomy_tick_now`) ──────────
+    // An explicit operator wake-up that runs EXACTLY ONE bounded autonomous
+    // Prime tick scoped to the caller's OWN Guild, through the same governed
+    // `autonomous_prime_tick` path the timer uses. It does NOT require the
+    // runtime switch to be on and grants no new authority.
+
+    /// Run `handle_prime_autonomy_tick_now` for `tenant` as `role` (no metrics →
+    /// the autonomous budget gate is inert). Returns the raw outcome so the
+    /// deny-path test can assert POLICY_DENIED.
+    fn tick_now_raw(
+        agents: &AgentStore,
+        spine: &SpineStore,
+        tasks: &Arc<TaskStore>,
+        reg: &crate::rig::RigRegistry,
+        role: &str,
+        tenant: &str,
+    ) -> HandlerOutcome {
+        let mut ctx = fake_ctx_with_role(b"", role, b"caller");
+        ctx.tenant_id = Some(tenant.to_string());
+        handle_prime_autonomy_tick_now(agents, spine, tasks, reg, None, &ctx)
+    }
+
+    /// Like [`tick_now_raw`] but as an operator, unwrapping the Ok JSON.
+    fn tick_now(
+        agents: &AgentStore,
+        spine: &SpineStore,
+        tasks: &Arc<TaskStore>,
+        reg: &crate::rig::RigRegistry,
+        tenant: &str,
+    ) -> Value {
+        match tick_now_raw(agents, spine, tasks, reg, "operator", tenant) {
+            HandlerOutcome::Ok(b) => serde_json::from_slice(&b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("tick_now errored: {}", e.cause),
+        }
+    }
+
+    // T-a) A worker / non-operator subject is DENIED tick-now (POLICY_DENIED) and
+    //      no governed step runs as a side effect.
+    #[test]
+    fn tick_now_is_operator_only_no_side_effect() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        runnable_operative(&agents, "engineer", "subj-e");
+
+        let out = tick_now_raw(&agents, &spine, &tasks, &reg, "worker", "default");
+        match out {
+            HandlerOutcome::Err(e) => {
+                assert_eq!(e.kind, relix_core::types::error_kinds::POLICY_DENIED);
+            }
+            HandlerOutcome::Ok(_) => panic!("a worker subject must be denied tick-now"),
+        }
+        // The mandate was at needs_team_plan but no Team Plan was recorded — the
+        // denied call mutated nothing.
+        assert!(spine.latest_team_plan("default", &m).unwrap().is_none());
+    }
+
+    // T-b) Tenant scoping — a tick-now run by an operator in Guild "other" never
+    //      touches Guild "default"'s bare Mandate or proposed proposal, even when
+    //      "default" holds a proposal-approve standing grant (so it is the SCOPING,
+    //      not a missing grant, that protects the other Guild).
+    #[test]
+    fn tick_now_is_tenant_scoped() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = bare_mandate(&spine); // "default", no strategy
+        let pid = propose_pid(&agents, &spine); // "default", proposed
+        grant_standing(&agents, "default", CATEGORY_PROPOSAL_APPROVE, Some(5));
+
+        let v = tick_now(&agents, &spine, &tasks, &reg, "other");
+        assert_eq!(v["tenant"], "other");
+        let records = v["records"].as_array().unwrap();
+        assert!(
+            records
+                .iter()
+                .all(|r| r["target_id"] != json!(m) && r["target_id"] != json!(pid)),
+            "an `other` tick must not consider `default` work"
+        );
+        // `default`'s bare Mandate got no strategy, and its proposal stays proposed.
+        assert!(spine.strategy_status("default", &m).unwrap().is_none());
+        assert_eq!(
+            spine
+                .get_prime_proposal("default", &pid)
+                .unwrap()
+                .unwrap()
+                .status,
+            "proposed"
+        );
+    }
+
+    // T-c) Tick-now advances a same-tenant approved Mandate at needs_team_plan via
+    //      the existing autonomous logic (the same governed team-plan route).
+    #[test]
+    fn tick_now_advances_same_tenant_approved_mandate() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        runnable_operative(&agents, "engineer", "subj-e");
+
+        let v = tick_now(&agents, &spine, &tasks, &reg, "default");
+        assert_eq!(v["tenant"], "default");
+        let rec = v["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["target_id"] == json!(m))
+            .expect("mandate considered");
+        assert_eq!(rec["phase"], "needs_team_plan");
+        assert_eq!(rec["action"], "create_team_plan");
+        assert_eq!(rec["outcome"], "advanced");
+        assert!(v["advanced"].as_u64().unwrap() >= 1);
+        // A Team Plan now exists, recorded through the governed route.
+        assert!(spine.latest_team_plan("default", &m).unwrap().is_some());
+    }
+
+    // T-d) Tick-now honors the SAME action budget as the timer and never exceeds
+    //      RELIX_AUTONOMOUS_PRIME_MAX. With one MORE advanceable Mandate than the
+    //      per-tick budget, exactly `max` advance and the excess is budget-skipped.
+    //      (Computes `max` the same way the handler does, so it holds for any
+    //      configured value without mutating the process env.)
+    #[test]
+    fn tick_now_honors_action_budget() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        runnable_operative(&agents, "engineer", "subj-e");
+        let max = crate::nodes::coordinator::heartbeat::parse_autonomous_prime_max(
+            std::env::var("RELIX_AUTONOMOUS_PRIME_MAX").ok().as_deref(),
+        );
+        // `max + 1` approved Mandates, each at needs_team_plan (advanceable).
+        for _ in 0..=max {
+            approved_mandate(&spine);
+        }
+
+        let v = tick_now(&agents, &spine, &tasks, &reg, "default");
+        assert_eq!(v["max"].as_u64().unwrap() as usize, max);
+        let advanced = v["advanced"].as_u64().unwrap() as usize;
+        let started = v["started"].as_u64().unwrap() as usize;
+        // Exactly `max` advanced even though `max + 1` Mandates were advanceable —
+        // the per-tick budget capped it; the bound is never exceeded.
+        assert_eq!(
+            advanced, max,
+            "advanced exactly the per-tick budget — never more"
+        );
+        assert_eq!(started, 0);
+        assert!(
+            advanced + started <= max,
+            "a tick must never exceed RELIX_AUTONOMOUS_PRIME_MAX"
+        );
+        // The bound stopped the loop short of the excess candidate: only `max`
+        // Team Plans were recorded across the `max + 1` Mandates.
+        let team_planned = spine
+            .list_active_mandates(Some("default"), 50)
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                spine
+                    .latest_team_plan("default", &m.mandate_id)
+                    .unwrap()
+                    .is_some()
+            })
+            .count();
+        assert_eq!(
+            team_planned, max,
+            "the per-tick budget left the excess Mandate untouched"
         );
     }
 

@@ -65,6 +65,26 @@ interface AutonomyState {
   note?: string;
 }
 
+// One record from a manual autonomy tick — what the loop considered/did for one
+// candidate (Manual Autonomy Tick v1; mirrors the coordinator PrimeAutonomyRecord).
+interface TickRecord {
+  target_kind?: string;
+  target_id?: string;
+  mandate_id?: string | null;
+  phase?: string;
+  action?: string;
+  outcome?: string;
+  reason?: string;
+}
+interface TickResult {
+  tenant?: string;
+  max?: number;
+  records?: TickRecord[];
+  advanced?: number;
+  started?: number;
+  considered?: number;
+}
+
 function extractProviders(v: unknown): Provider[] {
   if (Array.isArray(v)) return v as Provider[];
   if (v && typeof v === "object") {
@@ -423,6 +443,8 @@ function AutonomousPrimeSwitchPanel({
 }) {
   const [busy, setBusy] = useState(false);
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
+  const [tickBusy, setTickBusy] = useState(false);
+  const [tick, setTick] = useState<TickResult | null>(null);
 
   const runtimeOn = !!autonomy.runtime_enabled;
   const envOverride = !!autonomy.env_override;
@@ -446,6 +468,28 @@ function AutonomousPrimeSwitchPanel({
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Toggle failed" });
     } finally {
       setBusy(false);
+    }
+  }
+
+  // Run exactly ONE bounded autonomous Prime tick for this Guild now. This is an
+  // explicit operator wake-up of the same governed driver — it does NOT bypass
+  // standing approvals or budgets and does not require the loop to be ON.
+  async function runTickNow() {
+    setTickBusy(true);
+    setBanner(null);
+    setTick(null);
+    try {
+      const res = await api.post<TickResult>("/v1/spine/prime/autonomy/tick", {});
+      setTick(res);
+      setBanner({
+        kind: "ok",
+        msg: `Prime tick ran: considered ${res.considered ?? 0}, advanced ${res.advanced ?? 0}, started ${res.started ?? 0}.`,
+      });
+      onChanged();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Tick failed" });
+    } finally {
+      setTickBusy(false);
     }
   }
 
@@ -492,6 +536,71 @@ function AutonomousPrimeSwitchPanel({
               {autonomy.autonomous_prime_interval_secs ?? 30}s
             </span>
           </div>
+
+          {/* Manual Autonomy Tick: wake the loop ONCE for this Guild and see what
+              it did. Works even when the loop is off — it is an explicit wake-up,
+              not a bypass: it still obeys standing grants, budgets, and bounds. */}
+          <div className="row wrap" style={{ gap: 10, alignItems: "center", marginTop: 10 }}>
+            <button className="btn ghost" disabled={tickBusy} onClick={() => void runTickNow()}>
+              {tickBusy ? "Running…" : "Run Prime now"}
+            </button>
+            <span className="muted" style={{ fontSize: 12 }}>
+              Wakes <strong>exactly one</strong> bounded tick for this Guild (up to{" "}
+              {autonomy.autonomous_prime_max ?? 1} action). It does <strong>not</strong> require the
+              loop to be on and does <strong>not</strong> bypass standing approvals or budgets.
+            </span>
+          </div>
+
+          {/* The latest tick's records: phase / action / outcome / reason. */}
+          {tick && (tick.records ?? []).length > 0 && (
+            <div className="card" style={{ marginTop: 10, padding: 8 }}>
+              <table className="table" style={{ fontSize: 12 }}>
+                <thead>
+                  <tr>
+                    <th>Target</th>
+                    <th>Phase</th>
+                    <th>Action</th>
+                    <th>Outcome</th>
+                    <th>Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(tick.records ?? []).slice(0, 5).map((r, i) => (
+                    <tr key={i}>
+                      <td className="mono">{r.target_kind ?? "?"}</td>
+                      <td>{r.phase ?? "—"}</td>
+                      <td className="mono">{r.action ?? "—"}</td>
+                      <td>
+                        <span
+                          className={
+                            "badge " +
+                            (r.outcome === "advanced" || r.outcome === "started"
+                              ? "done"
+                              : r.outcome === "blocked"
+                                ? "backlog"
+                                : "")
+                          }
+                        >
+                          {r.outcome ?? "—"}
+                        </span>
+                      </td>
+                      <td className="muted">{r.reason ?? ""}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {(tick.records ?? []).length > 5 && (
+                <p className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+                  Showing 5 of {(tick.records ?? []).length} considered.
+                </p>
+              )}
+            </div>
+          )}
+          {tick && (tick.records ?? []).length === 0 && (
+            <p className="muted" style={{ fontSize: 12, marginTop: 8 }}>
+              The tick considered no candidates — nothing approved/active to drive in this Guild.
+            </p>
+          )}
 
           {/* Env override: the OFF control can only clear the persisted row. */}
           {envOverride && (

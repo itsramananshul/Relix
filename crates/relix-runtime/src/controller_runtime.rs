@@ -9878,6 +9878,42 @@ fn register_node_type_handlers(
                 )),
             );
         }
+        if let Some(spine) = spine_store_for_agent_caps.clone() {
+            // `prime.autonomy_tick_now` — operator-triggered single bounded
+            // autonomous Prime tick for the caller's Guild (Manual Autonomy Tick
+            // v1; company-model §5.4/§8.2 — the Action Center's "next governed
+            // step", here as an explicit wake-up of the same timer-driven
+            // driver). It runs EXACTLY ONE `autonomous_prime_tick` scoped to the
+            // caller's OWN Guild (never all Guilds) and returns the
+            // PrimeAutonomyRecord list, so the operator can wake the loop once
+            // and see what it considered/advanced/started. Still governed
+            // autonomy: same standing-authority + budget + Rig + per-tick-max
+            // gates the timer path uses; does NOT require the runtime switch ON,
+            // but grants no new authority. Role-gated to operator/admin (worker →
+            // POLICY_DENIED). Needs the agent + spine + task stores, the Rig
+            // registry, and the metrics query (for the autonomous budget gate).
+            let reg = rig_registry.clone();
+            let st = store.clone();
+            let ags = agent_store.clone();
+            let mq = metrics.map(|m| m.query.clone());
+            bridge.register(
+                "prime.autonomy_tick_now",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let reg = reg.clone();
+                        let st = st.clone();
+                        let ags = ags.clone();
+                        let spine = spine.clone();
+                        let mq = mq.clone();
+                        async move {
+                            crate::nodes::coordinator::agent::prime_driver::handle_prime_autonomy_tick_now(
+                                &ags, &spine, &st, &reg, mq.as_ref(), &ctx,
+                            )
+                        }
+                    },
+                )),
+            );
+        }
         {
             // `brief.runs` — the durable run ledger (`brief_runs`). With a
             // non-empty arg, the runs for that one Brief (the Shift history

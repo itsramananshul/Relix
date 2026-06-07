@@ -252,7 +252,15 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   `can_advance` (else the route to take by hand). Best-effort + honest empty/stale states; uses
   the existing `prime.next_step` / `prime.advance` routes — no new backend authority. Still one
   explicit governed step; the separate opt-in autonomous Prime driver can now
-  run those same approved-work steps on a bounded timer.
+  run those same approved-work steps on a bounded timer — and, with **Manual
+  Autonomy Tick v1**, an operator can also **Run Prime now** (`prime.autonomy_tick_now`
+  / `POST /v1/spine/prime/autonomy/tick`, Settings) to fire **exactly one** bounded
+  tick for their Guild and read back the per-candidate tick records (considered /
+  advanced / started). The background runtime toggle controls the *timer*; this
+  tick-now wake-up is an explicit operator action for one Guild that does **not**
+  require the timer to be ON, is operator/admin-only + tenant-scoped, and still
+  obeys standing grants, the autonomous-start budget hard-stop, Rig readiness, and
+  the per-tick `RELIX_AUTONOMOUS_PRIME_MAX` bound (it grants no new authority).
 - **Operations snapshot** — a compact, read-only cockpit card fed by `company.operations`
   (the server-computed, tenant-scoped summary above): three glance groups — *work in flight*
   (running / ready / in review), *needs attention* (unassigned / blocked / stale / recovery),
