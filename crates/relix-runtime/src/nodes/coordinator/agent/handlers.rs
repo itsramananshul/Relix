@@ -11,10 +11,10 @@ use relix_core::types::{ErrorEnvelope, error_kinds};
 use serde::Deserialize;
 
 use crate::dispatch::{HandlerOutcome, InvocationCtx};
+use crate::nodes::coordinator::agent::action_center;
 use crate::nodes::coordinator::agent::keys::{
     KeyVerdict, assign_verdict, configure_verdict, manage_verdict, spawn_verdict,
 };
-use crate::nodes::coordinator::agent::action_center;
 use crate::nodes::coordinator::agent::prime;
 use crate::nodes::coordinator::agent::store::{
     AgentProfile, AgentStore, AgentStoreError, ApprovalStatus, StandingApprovalCreate,
@@ -116,7 +116,11 @@ fn caller_is_owner(store: &AgentStore, ctx: &InvocationCtx) -> bool {
 /// the "Initialize Company" first-run state vs the normal Crew.
 /// Increment a `{key: count}` tally in a JSON object (empty key → `unknown`).
 fn bump_tally(map: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
-    let key = if key.trim().is_empty() { "unknown" } else { key.trim() };
+    let key = if key.trim().is_empty() {
+        "unknown"
+    } else {
+        key.trim()
+    };
     let n = map.get(key).and_then(|v| v.as_i64()).unwrap_or(0) + 1;
     map.insert(key.to_string(), serde_json::json!(n));
 }
@@ -128,13 +132,21 @@ fn bump_tally(map: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
 fn company_status_base(
     store: &AgentStore,
     tenant: &str,
-) -> Result<(serde_json::Map<String, serde_json::Value>, Vec<AgentProfile>), AgentStoreError> {
+) -> Result<
+    (
+        serde_json::Map<String, serde_json::Value>,
+        Vec<AgentProfile>,
+    ),
+    AgentStoreError,
+> {
     let founder = store.find_founder(tenant)?;
     let operatives = store.list_operatives_for_tenant(tenant)?;
     // Prime = the Founder's right hand (Lexicon) — the Operative whose role is
     // `prime`, who proposes the strategy + builds the team. `None` until one is
     // hired, so the dashboard can show "no Prime yet" honestly.
-    let prime = operatives.iter().find(|o| o.role.eq_ignore_ascii_case("prime"));
+    let prime = operatives
+        .iter()
+        .find(|o| o.role.eq_ignore_ascii_case("prime"));
     // Crew breakdown by status + role, so the dashboard can show a real company
     // shape (who's active, who's pending a hire, the role mix) instead of a
     // bare head-count.
@@ -160,7 +172,10 @@ fn company_status_base(
     );
     // The Prime is the company's planning lead; null until hired.
     map.insert("prime".into(), serde_json::json!(prime.map(operative_json)));
-    map.insert("operative_count".into(), serde_json::json!(operatives.len()));
+    map.insert(
+        "operative_count".into(),
+        serde_json::json!(operatives.len()),
+    );
     map.insert(
         "crew".into(),
         serde_json::json!({
@@ -634,7 +649,9 @@ pub fn handle_prime_propose(
                 // The reason is the validator's own message — never raw model
                 // content — so it is safe to surface and store.
                 let reason = match &e {
-                    PlanValidationError::Parse(_) => "model output was not valid plan JSON".to_string(),
+                    PlanValidationError::Parse(_) => {
+                        "model output was not valid plan JSON".to_string()
+                    }
                     other => other.to_string(),
                 };
                 prime::deterministic_fallback(&message, &crew, prime::AiMode::Fallback, reason)
@@ -715,12 +732,16 @@ pub fn handle_prime_approve(
     let actor = ctx.caller.subject_id.to_string();
 
     // 1) Mandate.
-    let mandate_id =
-        match spine_store.create_mandate(tenant, &plan.mandate_title, &plan.mandate_brief, None, None)
-        {
-            Ok(id) => id,
-            Err(e) => return internal(format!("prime.approve mandate: {e}")),
-        };
+    let mandate_id = match spine_store.create_mandate(
+        tenant,
+        &plan.mandate_title,
+        &plan.mandate_brief,
+        None,
+        None,
+    ) {
+        Ok(id) => id,
+        Err(e) => return internal(format!("prime.approve mandate: {e}")),
+    };
 
     // 2) Briefs (idempotent per-key markers), mapping proposal key → task_id.
     //    Each Brief is stamped with the company's reviewer up front: the
@@ -778,7 +799,9 @@ pub fn handle_prime_approve(
     // 4) Assignments — ONLY to an existing eligible active Operative whose
     //    role family matches the track. No match → leave unassigned (the
     //    matching hire is suggested below, never silently created active).
-    let operatives = agent_store.list_operatives_for_tenant(tenant).unwrap_or_default();
+    let operatives = agent_store
+        .list_operatives_for_tenant(tenant)
+        .unwrap_or_default();
     let mut assigned: Vec<String> = Vec::new();
     for b in &plan.briefs {
         if let Some(task_id) = key_to_id.get(&b.key) {
@@ -786,7 +809,9 @@ pub fn handle_prime_approve(
             if let Some(op) = operatives
                 .iter()
                 .find(|o| o.status == "active" && prime::canon_role(&o.role) == want)
-                && task_store.set_brief_field(task_id, "assignee", &op.agent_id).is_ok()
+                && task_store
+                    .set_brief_field(task_id, "assignee", &op.agent_id)
+                    .is_ok()
             {
                 assigned.push(task_id.clone());
             }
@@ -811,7 +836,8 @@ pub fn handle_prime_approve(
     // 6) History — flip the proposal + record on the existing Mandate-history
     //    surfaces + a Chronicle event on each created Brief.
     let created_json = serde_json::to_string(&created_ids).unwrap_or_else(|_| "[]".into());
-    let _ = spine_store.mark_prime_proposal_approved(tenant, proposal_id, &mandate_id, &created_json);
+    let _ =
+        spine_store.mark_prime_proposal_approved(tenant, proposal_id, &mandate_id, &created_json);
 
     let roles_json = serde_json::to_string(&plan.roles).unwrap_or_else(|_| "[]".into());
     let pending_hires: Vec<serde_json::Value> = hire_agent_ids
@@ -999,7 +1025,9 @@ pub fn handle_prime_start(
     // staffed track is seen as ready in this same call.
     let mut late_assigned: Vec<String> = Vec::new();
     if let Ok(plan) = serde_json::from_str::<prime::PrimeProposal>(&row.proposal_json) {
-        let operatives = agent_store.list_operatives_for_tenant(tenant).unwrap_or_default();
+        let operatives = agent_store
+            .list_operatives_for_tenant(tenant)
+            .unwrap_or_default();
         for b in &plan.briefs {
             let marker = format!("prime:{proposal_id}:{}", b.key);
             let card = match task_store.get_brief_by_source_marker(&marker) {
@@ -1445,7 +1473,9 @@ pub fn handle_prime_status(
             .push("Approve the proposal to create the Mandate + Briefs + crew assignments.".into());
     }
     if c_ready > 0 {
-        next_actions.push(format!("Start {c_ready} ready Brief(s) — they will run as Shifts."));
+        next_actions.push(format!(
+            "Start {c_ready} ready Brief(s) — they will run as Shifts."
+        ));
     }
     if c_running > 0 {
         next_actions.push(format!("{c_running} Shift(s) running — inspect progress."));
@@ -1635,10 +1665,14 @@ pub fn handle_company_actions_with_spend(
         && let Ok(committed) = agent_store.committed_allowance_cents_for_tenant(tenant)
     {
         if committed > budget {
-            items.push(action_center::budget_committed_item(committed, budget, true));
+            items.push(action_center::budget_committed_item(
+                committed, budget, true,
+            ));
         } else if committed.saturating_mul(100) >= budget.saturating_mul(90) {
             // committed ≥ 90% of budget — approaching the cap.
-            items.push(action_center::budget_committed_item(committed, budget, false));
+            items.push(action_center::budget_committed_item(
+                committed, budget, false,
+            ));
         }
     }
 
@@ -1700,8 +1734,7 @@ pub fn handle_company_actions_with_spend(
             if let Some(cap) = o.monthly_allowance_cents
                 && cap > 0
             {
-                let cap_micros =
-                    (cap as u64).saturating_mul(action_center::MICROS_PER_CENT);
+                let cap_micros = (cap as u64).saturating_mul(action_center::MICROS_PER_CENT);
                 if used >= cap_micros {
                     items.push(action_center::operative_spend_item(o, used, cap, true));
                 } else if used.saturating_mul(100)
@@ -1758,8 +1791,7 @@ pub fn handle_company_actions_with_spend(
             if !seen_brief.insert(r.brief_id.clone()) {
                 continue;
             }
-            let needs_review =
-                r.status == "done" && r.review.as_deref() == Some("pending_review");
+            let needs_review = r.status == "done" && r.review.as_deref() == Some("pending_review");
             if needs_review {
                 items.push(action_center::needs_review_item(r));
             } else if matches!(r.status.as_str(), "failed" | "refused" | "interrupted") {
@@ -1900,8 +1932,9 @@ pub fn handle_guild_spend(
     let spent_micros: Option<u64> =
         metrics.map(|m| heartbeat::guild_spend_micros(agent_store, m, tenant, win.start_ms));
     // Rounded half-up to the nearest cent; the exact value stays in spent_micros.
-    let spent_cents: Option<i64> = spent_micros
-        .map(|m| ((m + action_center::MICROS_PER_CENT / 2) / action_center::MICROS_PER_CENT) as i64);
+    let spent_cents: Option<i64> = spent_micros.map(|m| {
+        ((m + action_center::MICROS_PER_CENT / 2) / action_center::MICROS_PER_CENT) as i64
+    });
 
     // remaining = budget − spent (cents); honest even when negative (= over).
     let remaining_cents: Option<i64> = match (budget_cents, spent_cents) {
@@ -2363,7 +2396,11 @@ pub fn handle_team_plan_latest(spine_store: &SpineStore, ctx: &InvocationCtx) ->
 // WITHOUT bypassing governance.
 
 /// Build the `{mandate_id, status, approved}` body for a Mandate's strategy.
-fn strategy_status_body(spine_store: &SpineStore, tenant: &str, mandate_id: &str) -> HandlerOutcome {
+fn strategy_status_body(
+    spine_store: &SpineStore,
+    tenant: &str,
+    mandate_id: &str,
+) -> HandlerOutcome {
     match spine_store.strategy_status(tenant, mandate_id) {
         Ok(status) => {
             let approved = status.as_deref() == Some("approved");
@@ -2532,7 +2569,12 @@ pub(crate) fn adopt_active_operative(
     actives
         .into_iter()
         .filter(|p| prime::try_canon_role(&p.role) == Some(want))
-        .find(|p| p.rig.as_deref().map(str::trim).is_some_and(|r| !r.is_empty()))
+        .find(|p| {
+            p.rig
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|r| !r.is_empty())
+        })
         .map(|p| (want, p.agent_id))
 }
 
@@ -3701,9 +3743,9 @@ pub fn handle_approve_hire(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOu
         }
         // Absent / cross-tenant read identically as "no pending hire" — no
         // existence leak.
-        Err(AgentStoreError::NotFound(_)) => {
-            invalid(format!("agent.approve_hire: no pending hire {id} in this Guild"))
-        }
+        Err(AgentStoreError::NotFound(_)) => invalid(format!(
+            "agent.approve_hire: no pending hire {id} in this Guild"
+        )),
         Err(AgentStoreError::BadInput(m)) => invalid(format!("agent.approve_hire: {m}")),
         Err(e) => internal(format!("agent.approve_hire: {e}")),
     }
@@ -4997,7 +5039,7 @@ pub fn handle_approval_decide(
 /// driver. It reuses the EXACT side effects `handle_approval_decide` applies to
 /// an approved spawn Clearance — the **store decide path**
 /// ([`AgentStore::decide_approval`] `Approved`) followed by the identical
-/// spawn-clearance hire-activation hop ([`AgentStore::approve_hire`]) — but
+/// spawn-clearance hire-activation hop ([`AgentStore::approve_hire_with_rig`]) — but
 /// without the interactive approver/token/task-resume machinery the manual
 /// route needs (a spawn Clearance carries no `task_id`, and the autonomous
 /// loop needs no bearer token). It is deliberately **narrow**:
@@ -5015,6 +5057,7 @@ pub fn autonomous_approve_spawn_clearance(
     store: &AgentStore,
     tenant: &str,
     approval_id: &str,
+    rig: Option<&str>,
 ) -> Result<String, String> {
     let rec = match store.get_approval_record_for_tenant(approval_id, tenant) {
         Ok(Some(r)) => r,
@@ -5037,12 +5080,17 @@ pub fn autonomous_approve_spawn_clearance(
     let hire_id = rec.agent_id.clone();
     // THE store decide path — identical to what handle_approval_decide calls.
     store
-        .decide_approval(approval_id, ApprovalStatus::Approved, "autonomous-prime", "autonomous Prime standing authority")
+        .decide_approval(
+            approval_id,
+            ApprovalStatus::Approved,
+            "autonomous-prime",
+            "autonomous Prime standing authority",
+        )
         .map_err(|e| format!("decide: {e}"))?;
-    // Spawn-Clearance hire-activation hop — identical to handle_approval_decide's
-    // hop. A hire that is no longer pending (already activated) is a safe no-op.
-    match store.approve_hire(&hire_id) {
-        Ok(()) => {}
+    // Spawn-Clearance hire-activation hop. The manual approval route keeps its
+    // historic behavior, but autonomous Prime must produce runnable workers.
+    match store.approve_hire_with_rig(&hire_id, rig, tenant) {
+        Ok(_) => {}
         Err(AgentStoreError::NotFound(_)) => {}
         Err(e) => return Err(format!("activate hire: {e}")),
     }
@@ -5334,7 +5382,13 @@ mod tests {
     #[cfg(test)]
     fn active_op(s: &AgentStore, role: &str, tenant: &str) -> String {
         let (id, _) = s
-            .ensure_starter_operative(role, &format!("{role} (local · echo)"), role, "echo", tenant)
+            .ensure_starter_operative(
+                role,
+                &format!("{role} (local · echo)"),
+                role,
+                "echo",
+                tenant,
+            )
             .unwrap();
         id
     }
@@ -5399,7 +5453,10 @@ mod tests {
         // No engineer exists in `other` → no match → refused (never reaches acme).
         let ctx = fake_ctx_tenant(b"", "other");
         let out = resolve_assignee_hint(&s, &ctx, None, Some("engineer"));
-        assert!(out.is_err(), "a role with no in-Guild match must be refused");
+        assert!(
+            out.is_err(),
+            "a role with no in-Guild match must be refused"
+        );
     }
 
     #[test]
@@ -5417,7 +5474,10 @@ mod tests {
         let s = store();
         let ctx = fake_ctx_tenant(b"", "acme");
         let out = resolve_assignee_hint(&s, &ctx, None, Some("ghost"));
-        assert!(out.is_err(), "a role with no active Operative must be refused");
+        assert!(
+            out.is_err(),
+            "a role with no active Operative must be refused"
+        );
     }
 
     #[test]
@@ -5438,7 +5498,10 @@ mod tests {
         let mut ctx = fake_ctx_with_role(b"", "agent", b"stranger");
         ctx.tenant_id = Some("acme".to_string());
         let out = resolve_assignee_hint(&s, &ctx, Some(&id), None);
-        assert!(out.is_err(), "a caller without an Operative profile cannot assign");
+        assert!(
+            out.is_err(),
+            "a caller without an Operative profile cannot assign"
+        );
     }
 
     #[test]
@@ -5595,7 +5658,8 @@ mod tests {
         // carries the boot-seeded allow-all console profile.
         let ctx = fake_ctx_with_role(b"Ada|echo", "service", b"bridge-owner");
         let subject = ctx.caller.subject_id.to_string();
-        s.ensure_operator_console_profile(&subject, "default").unwrap();
+        s.ensure_operator_console_profile(&subject, "default")
+            .unwrap();
         let out = ok_body(handle_bootstrap_founder(&s, &ctx));
         assert!(out.contains("\"created\":true"), "got {out}");
     }
@@ -5613,7 +5677,10 @@ mod tests {
         let crew = body["crew"].as_array().unwrap();
         assert_eq!(crew.len(), 2, "default roster is engineer+designer: {body}");
         let roles: Vec<&str> = crew.iter().map(|c| c["role"].as_str().unwrap()).collect();
-        assert!(roles.contains(&"engineer") && roles.contains(&"designer"), "{body}");
+        assert!(
+            roles.contains(&"engineer") && roles.contains(&"designer"),
+            "{body}"
+        );
         // Every starter is created active, on echo, and labelled local — never a
         // fake Claude/Codex agent.
         for c in crew {
@@ -5731,9 +5798,15 @@ mod tests {
     fn company_status_is_tenant_scoped() {
         let s = store();
         // Found a company in the `acme` Guild only.
-        ok_body(handle_bootstrap_founder(&s, &fake_ctx_tenant(b"Ada|echo", "acme")));
+        ok_body(handle_bootstrap_founder(
+            &s,
+            &fake_ctx_tenant(b"Ada|echo", "acme"),
+        ));
         let acme = ok_body(handle_company_status(&s, &fake_ctx_tenant(b"", "acme")));
-        assert!(acme.contains("\"initialized\":true"), "owning Guild sees it: {acme}");
+        assert!(
+            acme.contains("\"initialized\":true"),
+            "owning Guild sees it: {acme}"
+        );
         // A different Guild sees an EMPTY company — no founder/prime leak.
         let globex = ok_body(handle_company_status(&s, &fake_ctx_tenant(b"", "globex")));
         assert!(globex.contains("\"initialized\":false"), "got {globex}");
@@ -5757,8 +5830,15 @@ mod tests {
         ));
         agents
             .create_agent(
-                "Eng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"eng"), "medium", tenant,
+                "Eng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"eng"),
+                "medium",
+                tenant,
             )
             .unwrap();
         let pid = json_of(ok_body(handle_prime_propose(
@@ -5883,7 +5963,8 @@ mod tests {
     fn operatives_roster_excludes_the_infra_console() {
         let s = store();
         // Seed an operator-console (infra) profile + a Founder.
-        s.ensure_operator_console_profile("console-subj", "default").unwrap();
+        s.ensure_operator_console_profile("console-subj", "default")
+            .unwrap();
         ok_body(handle_bootstrap_founder(&s, &fake_ctx(b"Ada|echo")));
         let roster = ok_body(handle_operatives(&s, &fake_ctx(b"")));
         assert!(roster.contains("\"role\":\"founder\""), "got {roster}");
@@ -6041,7 +6122,9 @@ mod tests {
     #[test]
     fn strategy_capability_reject_blocks_approval() {
         let spine = SpineStore::in_memory().unwrap();
-        let m = spine.create_mandate("default", "X", "y", None, None).unwrap();
+        let m = spine
+            .create_mandate("default", "X", "y", None, None)
+            .unwrap();
         handle_strategy_propose(&spine, &fake_ctx(format!("{m}|plan").as_bytes()));
         let v = json(handle_strategy_reject(&spine, &fake_ctx(m.as_bytes())));
         assert_eq!(v["status"], "rejected");
@@ -6051,10 +6134,15 @@ mod tests {
     #[test]
     fn strategy_propose_requires_doc_and_id() {
         let spine = SpineStore::in_memory().unwrap();
-        let m = spine.create_mandate("default", "X", "y", None, None).unwrap();
+        let m = spine
+            .create_mandate("default", "X", "y", None, None)
+            .unwrap();
         // Empty doc + empty mandate id are both INVALID_ARGS.
         assert_eq!(
-            err_kind(handle_strategy_propose(&spine, &fake_ctx(format!("{m}|").as_bytes()))),
+            err_kind(handle_strategy_propose(
+                &spine,
+                &fake_ctx(format!("{m}|").as_bytes())
+            )),
             error_kinds::INVALID_ARGS
         );
         assert_eq!(
@@ -6066,7 +6154,9 @@ mod tests {
     #[test]
     fn strategy_capability_is_tenant_scoped() {
         let spine = SpineStore::in_memory().unwrap();
-        let m = spine.create_mandate("tenant-a", "X", "y", None, None).unwrap();
+        let m = spine
+            .create_mandate("tenant-a", "X", "y", None, None)
+            .unwrap();
         // A different tenant cannot propose on tenant-a's Mandate.
         let kind = err_kind(handle_strategy_propose(
             &spine,
@@ -6184,9 +6274,15 @@ mod tests {
             v["proposal"]["ai_status"]
         );
         // READ-ONLY: nothing was created — the stored proposal has no Mandate.
-        let row = json_of(ok_body(handle_prime_proposal_get(&spine, &fake_ctx(pid.as_bytes()))));
+        let row = json_of(ok_body(handle_prime_proposal_get(
+            &spine,
+            &fake_ctx(pid.as_bytes()),
+        )));
         assert_eq!(row["status"], "proposed");
-        assert!(row["mandate_id"].is_null(), "propose must not create a Mandate");
+        assert!(
+            row["mandate_id"].is_null(),
+            "propose must not create a Mandate"
+        );
     }
 
     #[test]
@@ -6208,12 +6304,22 @@ mod tests {
             "model_output": model,
         })
         .to_string();
-        let v = json_of(ok_body(handle_prime_propose(&agents, &spine, &fake_ctx(arg.as_bytes()))));
+        let v = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(arg.as_bytes()),
+        )));
         assert_eq!(v["status"], "proposed");
         assert_eq!(v["proposal"]["ai_used"], true);
         assert_eq!(v["proposal"]["ai_mode"], "llm_used");
         assert_eq!(v["proposal"]["mandate_title"], "Billing system");
-        assert!(v["proposal"]["briefs"].as_array().unwrap().iter().any(|b| b["key"] == "ship"));
+        assert!(
+            v["proposal"]["briefs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["key"] == "ship")
+        );
     }
 
     #[test]
@@ -6228,12 +6334,20 @@ mod tests {
             ]
         })
         .to_string();
-        let arg = serde_json::json!({"message": "Build a thing", "model_output": model}).to_string();
-        let v = json_of(ok_body(handle_prime_propose(&agents, &spine, &fake_ctx(arg.as_bytes()))));
+        let arg =
+            serde_json::json!({"message": "Build a thing", "model_output": model}).to_string();
+        let v = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(arg.as_bytes()),
+        )));
         assert_eq!(v["proposal"]["ai_used"], false);
         assert_eq!(v["proposal"]["ai_mode"], "fallback");
         assert!(
-            v["proposal"]["ai_status"].as_str().unwrap().contains("fallback"),
+            v["proposal"]["ai_status"]
+                .as_str()
+                .unwrap()
+                .contains("fallback"),
             "{}",
             v["proposal"]["ai_status"]
         );
@@ -6249,7 +6363,11 @@ mod tests {
             "model_unavailable_reason": "no model peer reachable",
         })
         .to_string();
-        let v = json_of(ok_body(handle_prime_propose(&agents, &spine, &fake_ctx(arg.as_bytes()))));
+        let v = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx(arg.as_bytes()),
+        )));
         assert_eq!(v["proposal"]["ai_used"], false);
         assert_eq!(v["proposal"]["ai_mode"], "unavailable");
     }
@@ -6273,8 +6391,15 @@ mod tests {
         // One ACTIVE engineer exists; no designer.
         agents
             .create_agent(
-                "Eng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"eng"), "medium", "default",
+                "Eng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"eng"),
+                "medium",
+                "default",
             )
             .unwrap();
         let pid = json_of(ok_body(handle_prime_propose(
@@ -6307,8 +6432,14 @@ mod tests {
         // active agent.
         let hires = a["hire_requests"].as_array().unwrap();
         assert_eq!(hires.len(), 1);
-        let hire = agents.get_agent(hires[0].as_str().unwrap()).unwrap().unwrap();
-        assert_eq!(hire.status, "pending", "a suggested hire is inert until Clearance");
+        let hire = agents
+            .get_agent(hires[0].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            hire.status, "pending",
+            "a suggested hire is inert until Clearance"
+        );
         assert_eq!(hire.role, "designer");
         // Chronicle: each created Brief carries a prime.brief_created event.
         let evs = task
@@ -6348,13 +6479,20 @@ mod tests {
             &fake_ctx(pid.as_bytes()),
         )));
         let created = a["created_briefs"].as_array().unwrap();
-        assert!(created.len() >= 3, "engineer + designer tracks + integrate: {created:?}");
+        assert!(
+            created.len() >= 3,
+            "engineer + designer tracks + integrate: {created:?}"
+        );
         // EVERY created Brief — the role tracks AND the dependent `integrate`
         // Brief — carries the Founder as reviewer, with a Chronicle event.
         for b in created {
             let id = b.as_str().unwrap();
             assert_eq!(
-                task.brief_fields(id).unwrap().unwrap().reviewer_agent_id.as_deref(),
+                task.brief_fields(id)
+                    .unwrap()
+                    .unwrap()
+                    .reviewer_agent_id
+                    .as_deref(),
                 Some(founder_id.as_str()),
                 "Brief {id} should be stamped with the Founder reviewer"
             );
@@ -6367,7 +6505,11 @@ mod tests {
                     crate::nodes::coordinator::EventOrder::Desc,
                 )
                 .unwrap();
-            assert_eq!(evs.len(), 1, "reviewer assignment is chronicled on Brief {id}");
+            assert_eq!(
+                evs.len(),
+                1,
+                "reviewer assignment is chronicled on Brief {id}"
+            );
         }
         // The dependent `integrate` Brief specifically follows the same rule.
         let integrate = task
@@ -6376,7 +6518,11 @@ mod tests {
             .expect("integrate brief")
             .task_id;
         assert_eq!(
-            task.brief_fields(&integrate).unwrap().unwrap().reviewer_agent_id.as_deref(),
+            task.brief_fields(&integrate)
+                .unwrap()
+                .unwrap()
+                .reviewer_agent_id
+                .as_deref(),
             Some(founder_id.as_str()),
             "the dependent integrate Brief is reviewer-aware too"
         );
@@ -6407,7 +6553,11 @@ mod tests {
         for b in a["created_briefs"].as_array().unwrap() {
             let id = b.as_str().unwrap();
             assert!(
-                task.brief_fields(id).unwrap().unwrap().reviewer_agent_id.is_none(),
+                task.brief_fields(id)
+                    .unwrap()
+                    .unwrap()
+                    .reviewer_agent_id
+                    .is_none(),
                 "no Founder → Brief {id} carries no reviewer (honest fallback)"
             );
         }
@@ -6420,7 +6570,10 @@ mod tests {
         // Founder, so its Briefs stay reviewer-less rather than borrowing acme's.
         let (agents, spine, task) = prime_stores();
         // A Founder exists ONLY in `acme`.
-        ok_body(handle_bootstrap_founder(&agents, &fake_ctx_tenant(b"Ada|echo", "acme")));
+        ok_body(handle_bootstrap_founder(
+            &agents,
+            &fake_ctx_tenant(b"Ada|echo", "acme"),
+        ));
         assert!(agents.find_founder("acme").unwrap().is_some());
         assert!(agents.find_founder("globex").unwrap().is_none());
         // Approve a proposal in `globex`.
@@ -6441,7 +6594,11 @@ mod tests {
         for b in a["created_briefs"].as_array().unwrap() {
             let id = b.as_str().unwrap();
             assert!(
-                task.brief_fields(id).unwrap().unwrap().reviewer_agent_id.is_none(),
+                task.brief_fields(id)
+                    .unwrap()
+                    .unwrap()
+                    .reviewer_agent_id
+                    .is_none(),
                 "globex Brief {id} must NOT borrow acme's Founder as reviewer"
             );
         }
@@ -6480,7 +6637,10 @@ mod tests {
             &fake_ctx(pid.as_bytes()),
         )));
         let runs = started["started"].as_array().unwrap().clone();
-        assert!(!runs.is_empty(), "at least one track Shift started: {started}");
+        assert!(
+            !runs.is_empty(),
+            "at least one track Shift started: {started}"
+        );
         // Wait for every started Shift to reach its terminal `done` run state.
         let run_ids: Vec<String> = runs
             .iter()
@@ -6494,7 +6654,10 @@ mod tests {
             if all_done {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "Shifts never reached done");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Shifts never reached done"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         // Each completed track sits in `in_review` — NOT `blocked` — because it
@@ -6521,12 +6684,18 @@ mod tests {
             .unwrap()
             .to_string();
         let first = json_of(ok_body(handle_prime_approve(
-            &agents, &spine, &task, &fake_ctx(pid.as_bytes()),
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
         )));
         let mandate1 = first["mandate_id"].as_str().unwrap().to_string();
         // A second approve does NOT create a second Mandate.
         let second = json_of(ok_body(handle_prime_approve(
-            &agents, &spine, &task, &fake_ctx(pid.as_bytes()),
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(pid.as_bytes()),
         )));
         assert_eq!(second["already_approved"], true);
         assert_eq!(second["mandate_id"].as_str().unwrap(), mandate1);
@@ -6696,7 +6865,11 @@ mod tests {
             &fake_ctx(pid.as_bytes()),
         )));
         let started = v["started"].as_array().unwrap();
-        assert_eq!(started.len(), 1, "exactly the ready engineer track runs: {v}");
+        assert_eq!(
+            started.len(),
+            1,
+            "exactly the ready engineer track runs: {v}"
+        );
         // A REAL Shift was opened (a run_id), through the same chokepoint as
         // brief.run — never a faked run.
         assert!(
@@ -6760,8 +6933,15 @@ mod tests {
         // designer track is an unassigned pending hire; integration is blocked.
         agents
             .create_agent(
-                "Eng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"eng"), "medium", "default",
+                "Eng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"eng"),
+                "medium",
+                "default",
             )
             .unwrap();
         let pid = json_of(ok_body(handle_prime_propose(
@@ -6787,7 +6967,10 @@ mod tests {
         )));
         assert_eq!(v["status"], "approved");
         assert!(v["mandate_id"].is_string(), "approved → a Mandate id: {v}");
-        assert!(v["mandate_title"].is_string(), "Mandate title resolved: {v}");
+        assert!(
+            v["mandate_title"].is_string(),
+            "Mandate title resolved: {v}"
+        );
         let briefs = v["briefs"].as_array().unwrap();
         assert!(briefs.len() >= 3, "engineer + designer + integration: {v}");
         let counts = &v["counts"];
@@ -6829,8 +7012,15 @@ mod tests {
         let reg = echo_registry();
         agents
             .create_agent(
-                "Eng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"eng"), "medium", "default",
+                "Eng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"eng"),
+                "medium",
+                "default",
             )
             .unwrap();
         let pid = json_of(ok_body(handle_prime_propose(
@@ -6959,7 +7149,8 @@ mod tests {
 
         // 7) The operator accepts the review → the run becomes apply-eligible
         //    (the documented review → apply tail of the local loop).
-        task.set_run_review(&run_id, "accepted", "looks good").unwrap();
+        task.set_run_review(&run_id, "accepted", "looks good")
+            .unwrap();
         let run = task.get_run(&run_id).unwrap().expect("the run row");
         assert!(
             crate::nodes::coordinator::heartbeat::run_apply_eligibility(&run).is_ok(),
@@ -6971,13 +7162,17 @@ mod tests {
         //    closes WITHOUT the run ever touching a real project root.
         let project_root = tempfile::TempDir::new().unwrap();
         let artifacts = task.list_run_artifacts(&run_id).unwrap();
-        let outcome = crate::nodes::coordinator::heartbeat::apply_run(
-            project_root.path(),
-            &artifacts,
-        )
-        .unwrap();
-        assert_eq!(outcome.status, "applied", "echo run applies cleanly: {outcome:?}");
-        assert_eq!(outcome.applied_files, 0, "echo writes nothing — a no-op apply");
+        let outcome =
+            crate::nodes::coordinator::heartbeat::apply_run(project_root.path(), &artifacts)
+                .unwrap();
+        assert_eq!(
+            outcome.status, "applied",
+            "echo run applies cleanly: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.applied_files, 0,
+            "echo writes nothing — a no-op apply"
+        );
         assert_eq!(outcome.failed_files, 0);
 
         // 9) Persist the apply result → the Shift's durable lifecycle terminal is
@@ -7060,7 +7255,11 @@ mod tests {
             &fake_ctx(pid.as_bytes()),
         )));
         let hires = approved["hire_requests"].as_array().unwrap();
-        assert_eq!(hires.len(), 1, "exactly the missing qa role is a hire: {approved}");
+        assert_eq!(
+            hires.len(),
+            1,
+            "exactly the missing qa role is a hire: {approved}"
+        );
         let qa_hire_id = hires[0].as_str().unwrap().to_string();
 
         // Resolve the Brief ids by their stable Prime source markers.
@@ -7120,11 +7319,17 @@ mod tests {
             "qa track skipped because no Operative is assigned yet: {qa_skip}"
         );
         run_ids.extend(started_runs(&s1));
-        assert!(!run_ids.is_empty(), "engineer/designer tracks started: {s1}");
+        assert!(
+            !run_ids.is_empty(),
+            "engineer/designer tracks started: {s1}"
+        );
 
         // The operator greenlights the qa hire (pending → active) — the GOVERNED
         // hire-approval path.
-        let _ = ok_body(handle_approve_hire(&agents, &fake_ctx(qa_hire_id.as_bytes())));
+        let _ = ok_body(handle_approve_hire(
+            &agents,
+            &fake_ctx(qa_hire_id.as_bytes()),
+        ));
 
         // Start #2: prime.start now RECONCILES — it staffs the qa track to the
         // now-active hire and starts it (where before it skipped forever).
@@ -7158,7 +7363,10 @@ mod tests {
             .iter()
             .find(|r| r["brief_id"] == serde_json::json!(qa_track))
             .expect("the qa track started a real Shift");
-        assert_eq!(qa_run["rig"], "echo", "ran on the safe local echo Rig: {qa_run}");
+        assert_eq!(
+            qa_run["rig"], "echo",
+            "ran on the safe local echo Rig: {qa_run}"
+        );
         run_ids.extend(started_runs(&s2));
 
         // Wait for every started track Shift to reach its terminal echo state, so
@@ -7224,8 +7432,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|r| r["brief_id"] == serde_json::json!(integrate)
-                    && r["run_id"].is_string()),
+                .any(|r| r["brief_id"] == serde_json::json!(integrate) && r["run_id"].is_string()),
             "the dependent integrate Brief starts a real Shift once unblocked: {s3}"
         );
     }
@@ -7335,7 +7542,9 @@ mod tests {
             .expect("the victim Brief is present");
         let blockers = victim_row["blockers"].as_array().unwrap();
         assert!(
-            blockers.iter().all(|b| b["brief_id"] != serde_json::json!(foreign)),
+            blockers
+                .iter()
+                .all(|b| b["brief_id"] != serde_json::json!(foreign)),
             "the foreign blocker must be filtered from the victim's blockers: {victim_row}"
         );
     }
@@ -7347,8 +7556,15 @@ mod tests {
         let reg = echo_registry();
         agents
             .create_agent(
-                "Eng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"eng"), "medium", "default",
+                "Eng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"eng"),
+                "medium",
+                "default",
             )
             .unwrap();
         let pid = json_of(ok_body(handle_prime_propose(
@@ -7369,10 +7585,18 @@ mod tests {
         // start finds nothing newly ready — idempotent (no double-work). The
         // status remains coherent across both.
         let _ = ok_body(handle_prime_start(
-            &agents, &spine, &task, &reg, &fake_ctx(pid.as_bytes()),
+            &agents,
+            &spine,
+            &task,
+            &reg,
+            &fake_ctx(pid.as_bytes()),
         ));
         let second = json_of(ok_body(handle_prime_start(
-            &agents, &spine, &task, &reg, &fake_ctx(pid.as_bytes()),
+            &agents,
+            &spine,
+            &task,
+            &reg,
+            &fake_ctx(pid.as_bytes()),
         )));
         // The second start began no NEW Shift on the already-run Brief.
         assert!(
@@ -7401,7 +7625,12 @@ mod tests {
     fn prime_status_requires_proposal_id() {
         let (agents, spine, task) = prime_stores();
         assert_eq!(
-            err_kind(handle_prime_status(&agents, &spine, &task, &fake_ctx(b"   "))),
+            err_kind(handle_prime_status(
+                &agents,
+                &spine,
+                &task,
+                &fake_ctx(b"   ")
+            )),
             error_kinds::INVALID_ARGS
         );
     }
@@ -7429,8 +7658,15 @@ mod tests {
         // is an unassigned pending hire; integration is dependency-blocked.
         agents
             .create_agent(
-                "Eng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"eng"), "medium", "default",
+                "Eng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"eng"),
+                "medium",
+                "default",
             )
             .unwrap();
         let pid = json_of(ok_body(handle_prime_propose(
@@ -7460,7 +7696,10 @@ mod tests {
             .map(|a| a["category"].as_str().unwrap())
             .collect();
         assert!(cats.contains(&"hire"), "a pending designer hire: {v}");
-        assert!(cats.contains(&"ready_to_start"), "engineer track ready: {v}");
+        assert!(
+            cats.contains(&"ready_to_start"),
+            "engineer track ready: {v}"
+        );
         assert!(cats.contains(&"blocked"), "integration blocked: {v}");
         // The hire card is machine-actionable: it names the approval API target
         // and the safe-local Rig a client should pass to make the Operative
@@ -7504,8 +7743,15 @@ mod tests {
         let reg = echo_registry();
         agents
             .create_agent(
-                "Eng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"eng"), "medium", "default",
+                "Eng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"eng"),
+                "medium",
+                "default",
             )
             .unwrap();
         let pid = json_of(ok_body(handle_prime_propose(
@@ -7580,7 +7826,8 @@ mod tests {
 
         // Once the operator reviews the run, the completed Shift must DROP out of
         // `needs_review` — a reviewed run is no longer an open action.
-        task.set_run_review(&run_id, "accepted", "looks good").unwrap();
+        task.set_run_review(&run_id, "accepted", "looks good")
+            .unwrap();
         let v2 = json_of(ok_body(handle_company_actions(
             &agents,
             &spine,
@@ -7612,8 +7859,15 @@ mod tests {
         let (agents, spine, task) = prime_stores();
         let hire = agents
             .request_hire(
-                "Des", "designer", "D", "des", "des", "founder",
-                &subject_of(b"des"), "medium", "default",
+                "Des",
+                "designer",
+                "D",
+                "des",
+                "des",
+                "founder",
+                &subject_of(b"des"),
+                "medium",
+                "default",
             )
             .unwrap();
         agents
@@ -7681,20 +7935,22 @@ mod tests {
             .create_mandate("default", "Ship v1", "the why", None, None)
             .unwrap();
         spine.propose_strategy("default", &m, "the plan").unwrap();
-        let strategy_card = |v: &serde_json::Value| -> bool {
-            v["actions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|a| a["target_type"] == "mandate" && a["target_id"] == serde_json::json!(m))
-        };
+        let strategy_card =
+            |v: &serde_json::Value| -> bool {
+                v["actions"].as_array().unwrap().iter().any(|a| {
+                    a["target_type"] == "mandate" && a["target_id"] == serde_json::json!(m)
+                })
+            };
         let before = json_of(ok_body(handle_company_actions(
             &agents,
             &spine,
             &task,
             &fake_ctx(b""),
         )));
-        assert!(strategy_card(&before), "card present while proposed: {before}");
+        assert!(
+            strategy_card(&before),
+            "card present while proposed: {before}"
+        );
         // Approve the strategy → the gate is closed.
         spine.approve_strategy("default", &m).unwrap();
         let after = json_of(ok_body(handle_company_actions(
@@ -7716,11 +7972,20 @@ mod tests {
         spine.set_guild_allowance("default", Some(10_000)).unwrap();
         let eng = agents
             .create_agent(
-                "Eng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"eng"), "medium", "default",
+                "Eng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"eng"),
+                "medium",
+                "default",
             )
             .unwrap();
-        agents.update_agent_field(&eng, "allowance", "20000").unwrap();
+        agents
+            .update_agent_field(&eng, "allowance", "20000")
+            .unwrap();
 
         let v = json_of(ok_body(handle_company_actions(
             &agents,
@@ -7766,11 +8031,20 @@ mod tests {
         let (agents, spine, task) = prime_stores();
         let eng = agents
             .create_agent(
-                "Eng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"eng"), "medium", "default",
+                "Eng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"eng"),
+                "medium",
+                "default",
             )
             .unwrap();
-        agents.update_agent_field(&eng, "allowance", "20000").unwrap();
+        agents
+            .update_agent_field(&eng, "allowance", "20000")
+            .unwrap();
         let v = json_of(ok_body(handle_company_actions(
             &agents,
             &spine,
@@ -7793,8 +8067,15 @@ mod tests {
         // An active engineer hard-stopped by a 0 Allowance.
         let eng = agents
             .create_agent(
-                "Eng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"eng"), "medium", "default",
+                "Eng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"eng"),
+                "medium",
+                "default",
             )
             .unwrap();
         agents.update_agent_field(&eng, "allowance", "0").unwrap();
@@ -7875,24 +8156,39 @@ mod tests {
         // No Guild budget set → only per-Operative spend items can fire.
         let over = agents
             .create_agent(
-                "Over", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"over"), "medium", "default",
+                "Over",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"over"),
+                "medium",
+                "default",
             )
             .unwrap();
         let near = agents
             .create_agent(
-                "Near", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"near"), "medium", "default",
+                "Near",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"near"),
+                "medium",
+                "default",
             )
             .unwrap();
-        agents.update_agent_field(&over, "allowance", "20000").unwrap();
-        agents.update_agent_field(&near, "allowance", "20000").unwrap();
+        agents
+            .update_agent_field(&over, "allowance", "20000")
+            .unwrap();
+        agents
+            .update_agent_field(&near, "allowance", "20000")
+            .unwrap();
         // over: $250 spent of $200 (125%, at/over the cap → High).
         // near: $170 spent of $200 (85% ≥ 80% band → Medium); not yet refused.
-        let spend = FakeSpend::of(&[
-            (over.as_str(), 250_000_000),
-            (near.as_str(), 170_000_000),
-        ]);
+        let spend = FakeSpend::of(&[(over.as_str(), 250_000_000), (near.as_str(), 170_000_000)]);
 
         let v = json_of(ok_body(handle_company_actions_with_spend(
             &agents,
@@ -7913,7 +8209,10 @@ mod tests {
         assert!(oreason.contains("$250.00"), "spent shown: {oreason}");
         assert!(oreason.contains("$200.00"), "cap shown: {oreason}");
         assert!(oreason.contains("125%"), "percent shown: {oreason}");
-        assert!(oreason.contains("at/over the cap"), "over phrasing: {oreason}");
+        assert!(
+            oreason.contains("at/over the cap"),
+            "over phrasing: {oreason}"
+        );
 
         let n = actions
             .iter()
@@ -7933,23 +8232,38 @@ mod tests {
         spine.set_guild_allowance("default", Some(50_000)).unwrap();
         let e1 = agents
             .create_agent(
-                "E1", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"e1"), "medium", "default",
+                "E1",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"e1"),
+                "medium",
+                "default",
             )
             .unwrap();
         let e2 = agents
             .create_agent(
-                "E2", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"e2"), "medium", "default",
+                "E2",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"e2"),
+                "medium",
+                "default",
             )
             .unwrap();
-        agents.update_agent_field(&e1, "allowance", "30000").unwrap();
-        agents.update_agent_field(&e2, "allowance", "30000").unwrap();
+        agents
+            .update_agent_field(&e1, "allowance", "30000")
+            .unwrap();
+        agents
+            .update_agent_field(&e2, "allowance", "30000")
+            .unwrap();
         // ACTUAL spend: $200 + $400 = $600 > $500 budget → company spend (120%).
-        let spend = FakeSpend::of(&[
-            (e1.as_str(), 200_000_000),
-            (e2.as_str(), 400_000_000),
-        ]);
+        let spend = FakeSpend::of(&[(e1.as_str(), 200_000_000), (e2.as_str(), 400_000_000)]);
 
         let v = json_of(ok_body(handle_company_actions_with_spend(
             &agents,
@@ -7993,11 +8307,20 @@ mod tests {
         spine.set_guild_allowance("default", Some(10_000)).unwrap();
         let eng = agents
             .create_agent(
-                "Eng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"eng"), "medium", "default",
+                "Eng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"eng"),
+                "medium",
+                "default",
             )
             .unwrap();
-        agents.update_agent_field(&eng, "allowance", "20000").unwrap();
+        agents
+            .update_agent_field(&eng, "allowance", "20000")
+            .unwrap();
         let empty = FakeSpend::of(&[]);
 
         let v = json_of(ok_body(handle_company_actions_with_spend(
@@ -8008,14 +8331,10 @@ mod tests {
             &fake_ctx(b""),
         )));
         assert!(
-            !v["actions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|a| a["id"]
-                    .as_str()
-                    .map(|s| s.starts_with("budget:spend:"))
-                    .unwrap_or(false)),
+            !v["actions"].as_array().unwrap().iter().any(|a| a["id"]
+                .as_str()
+                .map(|s| s.starts_with("budget:spend:"))
+                .unwrap_or(false)),
             "no recorded spend ⇒ no spend item: {v}"
         );
         // The committed-Allowance planning signal is unaffected (still fires).
@@ -8039,18 +8358,36 @@ mod tests {
         spine.set_guild_allowance("globex", Some(10_000)).unwrap();
         let acme_eng = agents
             .create_agent(
-                "AcmeEng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"acme-eng"), "medium", "acme",
+                "AcmeEng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"acme-eng"),
+                "medium",
+                "acme",
             )
             .unwrap();
         let globex_eng = agents
             .create_agent(
-                "GlobexEng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"globex-eng"), "medium", "globex",
+                "GlobexEng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"globex-eng"),
+                "medium",
+                "globex",
             )
             .unwrap();
-        agents.update_agent_field(&acme_eng, "allowance", "20000").unwrap();
-        agents.update_agent_field(&globex_eng, "allowance", "20000").unwrap();
+        agents
+            .update_agent_field(&acme_eng, "allowance", "20000")
+            .unwrap();
+        agents
+            .update_agent_field(&globex_eng, "allowance", "20000")
+            .unwrap();
         // ONLY acme's Operative has recorded spend ($250, over its $200 cap).
         let spend = FakeSpend::of(&[(acme_eng.as_str(), 250_000_000)]);
 
@@ -8081,14 +8418,10 @@ mod tests {
             &fake_ctx_tenant(b"", "globex"),
         )));
         assert!(
-            !g["actions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|x| x["id"]
-                    .as_str()
-                    .map(|s| s.starts_with("budget:spend:"))
-                    .unwrap_or(false)),
+            !g["actions"].as_array().unwrap().iter().any(|x| x["id"]
+                .as_str()
+                .map(|s| s.starts_with("budget:spend:"))
+                .unwrap_or(false)),
             "no cross-tenant spend leak into globex: {g}"
         );
     }
@@ -8151,18 +8484,36 @@ mod tests {
         let (agents, spine, task) = prime_stores();
         let over = agents
             .create_agent(
-                "Over", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"real-over"), "medium", "default",
+                "Over",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"real-over"),
+                "medium",
+                "default",
             )
             .unwrap();
         let near = agents
             .create_agent(
-                "Near", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"real-near"), "medium", "default",
+                "Near",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"real-near"),
+                "medium",
+                "default",
             )
             .unwrap();
-        agents.update_agent_field(&over, "allowance", "20000").unwrap();
-        agents.update_agent_field(&near, "allowance", "20000").unwrap();
+        agents
+            .update_agent_field(&over, "allowance", "20000")
+            .unwrap();
+        agents
+            .update_agent_field(&near, "allowance", "20000")
+            .unwrap();
 
         let store = crate::metrics::MetricsStore::in_memory().unwrap();
         let now = now_unix_ms();
@@ -8190,8 +8541,7 @@ mod tests {
             .unwrap();
 
         // The EXACT production type + window wired in `register_agent_capabilities`.
-        let spend =
-            MetricsSpendSource::current_month(crate::metrics::MetricsQuery::new(store));
+        let spend = MetricsSpendSource::current_month(crate::metrics::MetricsQuery::new(store));
 
         let v = json_of(ok_body(handle_company_actions_with_spend(
             &agents,
@@ -8214,7 +8564,10 @@ mod tests {
         );
         assert!(oreason.contains("$200.00"), "cap shown: {oreason}");
         assert!(oreason.contains("125%"), "percent shown: {oreason}");
-        assert!(oreason.contains("at/over the cap"), "over phrasing: {oreason}");
+        assert!(
+            oreason.contains("at/over the cap"),
+            "over phrasing: {oreason}"
+        );
 
         let n = actions
             .iter()
@@ -8237,25 +8590,42 @@ mod tests {
         let (agents, spine, task) = prime_stores();
         let acme = agents
             .create_agent(
-                "AcmeEng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"real-acme"), "medium", "acme",
+                "AcmeEng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"real-acme"),
+                "medium",
+                "acme",
             )
             .unwrap();
         let globex = agents
             .create_agent(
-                "GlobexEng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"real-globex"), "medium", "globex",
+                "GlobexEng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"real-globex"),
+                "medium",
+                "globex",
             )
             .unwrap();
-        agents.update_agent_field(&acme, "allowance", "20000").unwrap();
-        agents.update_agent_field(&globex, "allowance", "20000").unwrap();
+        agents
+            .update_agent_field(&acme, "allowance", "20000")
+            .unwrap();
+        agents
+            .update_agent_field(&globex, "allowance", "20000")
+            .unwrap();
 
         let store = crate::metrics::MetricsStore::in_memory().unwrap();
         let now = now_unix_ms();
         // Seed at the canonical month-window start so both rows count in-window
         // regardless of the wall clock (deterministic at a month boundary too).
-        let in_window =
-            crate::nodes::coordinator::heartbeat::allowance_window(now).start_ms;
+        let in_window = crate::nodes::coordinator::heartbeat::allowance_window(now).start_ms;
         // BOTH Operatives are over their $200 cap in the SHARED ledger ($250 each).
         store
             .insert_batch(&[
@@ -8263,8 +8633,7 @@ mod tests {
                 spend_row(&globex, "globex", in_window, 250_000_000),
             ])
             .unwrap();
-        let spend =
-            MetricsSpendSource::current_month(crate::metrics::MetricsQuery::new(store));
+        let spend = MetricsSpendSource::current_month(crate::metrics::MetricsQuery::new(store));
 
         // acme's feed surfaces acme's Operative ONLY.
         let a = json_of(ok_body(handle_company_actions_with_spend(
@@ -8320,14 +8689,28 @@ mod tests {
         spine.set_guild_allowance("default", Some(20_000)).unwrap();
         let a = agents
             .create_agent(
-                "A", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"gs-a"), "medium", "default",
+                "A",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"gs-a"),
+                "medium",
+                "default",
             )
             .unwrap();
         let b = agents
             .create_agent(
-                "B", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"gs-b"), "medium", "default",
+                "B",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"gs-b"),
+                "medium",
+                "default",
             )
             .unwrap();
 
@@ -8364,7 +8747,11 @@ mod tests {
         assert_eq!(v["over_budget"], serde_json::json!(true), "{v}");
         // Reset / window bookkeeping fields present + canonical.
         assert_eq!(v["window_start_ms"], serde_json::json!(win.start_ms), "{v}");
-        assert_eq!(v["resets_at_ms"], serde_json::json!(win.resets_at_ms), "{v}");
+        assert_eq!(
+            v["resets_at_ms"],
+            serde_json::json!(win.resets_at_ms),
+            "{v}"
+        );
         assert_eq!(v["now_ms"], serde_json::json!(now), "{v}");
         // Guild identity + canonical source note.
         assert_eq!(v["tenant_id"], serde_json::json!("default"), "{v}");
@@ -8381,8 +8768,15 @@ mod tests {
         // No `set_guild_allowance` → no Guild budget configured at all.
         let a = agents
             .create_agent(
-                "A", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"gs-nob"), "medium", "default",
+                "A",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"gs-nob"),
+                "medium",
+                "default",
             )
             .unwrap();
         let store = crate::metrics::MetricsStore::in_memory().unwrap();
@@ -8426,7 +8820,10 @@ mod tests {
         assert!(v["spent_cents"].is_null(), "{v}");
         // Budget + window still resolve (they don't need the ledger).
         assert_eq!(v["budget_cents"], serde_json::json!(20_000), "{v}");
-        assert!(v["remaining_cents"].is_null(), "no spend → no remaining: {v}");
+        assert!(
+            v["remaining_cents"].is_null(),
+            "no spend → no remaining: {v}"
+        );
         assert!(
             v["source"]
                 .as_str()
@@ -8443,21 +8840,34 @@ mod tests {
         spine.set_guild_allowance("globex", Some(100_000)).unwrap();
         let acme = agents
             .create_agent(
-                "AcmeEng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"gs-acme"), "medium", "acme",
+                "AcmeEng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"gs-acme"),
+                "medium",
+                "acme",
             )
             .unwrap();
         let globex = agents
             .create_agent(
-                "GlobexEng", "engineer", "SWE", "eng", "eng", "founder",
-                &subject_of(b"gs-globex"), "medium", "globex",
+                "GlobexEng",
+                "engineer",
+                "SWE",
+                "eng",
+                "eng",
+                "founder",
+                &subject_of(b"gs-globex"),
+                "medium",
+                "globex",
             )
             .unwrap();
 
         let store = crate::metrics::MetricsStore::in_memory().unwrap();
         let now = now_unix_ms();
-        let in_window =
-            crate::nodes::coordinator::heartbeat::allowance_window(now).start_ms;
+        let in_window = crate::nodes::coordinator::heartbeat::allowance_window(now).start_ms;
         // Different amounts in the SHARED ledger so a leak would be obvious.
         store
             .insert_batch(&[
@@ -8475,7 +8885,11 @@ mod tests {
             now,
             &fake_ctx_tenant(b"", "acme"),
         )));
-        assert_eq!(va["spent_micros"], serde_json::json!(250_000_000u64), "{va}");
+        assert_eq!(
+            va["spent_micros"],
+            serde_json::json!(250_000_000u64),
+            "{va}"
+        );
         assert_eq!(va["tenant_id"], serde_json::json!("acme"), "{va}");
 
         // globex's route sums ONLY globex's Operative — no acme leak.
@@ -8486,7 +8900,11 @@ mod tests {
             now,
             &fake_ctx_tenant(b"", "globex"),
         )));
-        assert_eq!(vg["spent_micros"], serde_json::json!(999_000_000u64), "{vg}");
+        assert_eq!(
+            vg["spent_micros"],
+            serde_json::json!(999_000_000u64),
+            "{vg}"
+        );
         assert_eq!(vg["tenant_id"], serde_json::json!("globex"), "{vg}");
     }
 
@@ -8496,8 +8914,15 @@ mod tests {
         // Guild "acme" gets a pending hire + a proposed-strategy Mandate.
         agents
             .request_hire(
-                "Sec", "engineer", "E", "x", "x", "founder",
-                &subject_of(b"acme-hire"), "medium", "acme",
+                "Sec",
+                "engineer",
+                "E",
+                "x",
+                "x",
+                "founder",
+                &subject_of(b"acme-hire"),
+                "medium",
+                "acme",
             )
             .unwrap();
         let m = spine
@@ -8903,7 +9328,9 @@ mod tests {
         let agents = store();
         let spine = SpineStore::in_memory().unwrap();
         // The Founder must exist for the reviewer to resolve.
-        let (founder, _) = agents.ensure_founder("", "echo", "operator", "default").unwrap();
+        let (founder, _) = agents
+            .ensure_founder("", "echo", "operator", "default")
+            .unwrap();
         let (m, _agent) = ready_team(&agents, &spine, "engineer");
         let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
         // The runnable subject Brief carries the Founder as reviewer.
@@ -9026,7 +9453,13 @@ mod tests {
     /// in `tenant`; returns its agent_id.
     fn seed_active(agents: &AgentStore, role: &str, tenant: &str) -> String {
         agents
-            .ensure_starter_operative(role, &format!("Starter {role}"), "Operative", "echo", tenant)
+            .ensure_starter_operative(
+                role,
+                &format!("Starter {role}"),
+                "Operative",
+                "echo",
+                tenant,
+            )
             .unwrap()
             .0
     }
@@ -9058,11 +9491,17 @@ mod tests {
         // The Company still has exactly its two active crew members — no
         // duplicate (pending) engineer/designer was minted.
         assert_eq!(
-            agents.list_by_role_for_tenant("engineer", "default").unwrap().len(),
+            agents
+                .list_by_role_for_tenant("engineer", "default")
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
-            agents.list_by_role_for_tenant("designer", "default").unwrap().len(),
+            agents
+                .list_by_role_for_tenant("designer", "default")
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -9078,8 +9517,15 @@ mod tests {
             &spine,
             &fake_ctx(format!("{m}|build|engineer:subj-e").as_bytes()),
         ));
-        let v = json(handle_team_readiness(&agents, &spine, &fake_ctx(m.as_bytes())));
-        assert_eq!(v["readiness"], "ready", "adopted crew makes the team ready: {v}");
+        let v = json(handle_team_readiness(
+            &agents,
+            &spine,
+            &fake_ctx(m.as_bytes()),
+        ));
+        assert_eq!(
+            v["readiness"], "ready",
+            "adopted crew makes the team ready: {v}"
+        );
         let active = v["active_agents"].as_array().unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0]["agent_id"], eng);
@@ -9097,12 +9543,20 @@ mod tests {
         seed_active(&agents, "engineer", "default");
         let arg = format!("{m}|build|engineer:subj-e,qa:subj-q");
         let v = json(handle_team_plan(&agents, &spine, &fake_ctx(arg.as_bytes())));
-        assert_eq!(v["adopted"].as_array().unwrap().len(), 1, "engineer adopted: {v}");
+        assert_eq!(
+            v["adopted"].as_array().unwrap().len(),
+            1,
+            "engineer adopted: {v}"
+        );
         let hires = v["pending_hires"].as_array().unwrap();
         assert_eq!(hires.len(), 1, "only the missing qa is hired: {v}");
         assert_eq!(hires[0]["role"], "qa");
         // Readiness: engineer ready, qa a pending hire → still staffing.
-        let r = json(handle_team_readiness(&agents, &spine, &fake_ctx(m.as_bytes())));
+        let r = json(handle_team_readiness(
+            &agents,
+            &spine,
+            &fake_ctx(m.as_bytes()),
+        ));
         assert_eq!(r["readiness"], "staffing");
         assert_eq!(r["active_agents"].as_array().unwrap().len(), 1);
         assert_eq!(r["pending_hires"].as_array().unwrap().len(), 1);
@@ -9120,12 +9574,17 @@ mod tests {
         // qa is genuinely missing → a minted (pending) hire.
         let arg = format!("{m}|build|qa:subj-q");
         json(handle_team_plan(&agents, &spine, &fake_ctx(arg.as_bytes())));
-        let r = json(handle_team_readiness(&agents, &spine, &fake_ctx(m.as_bytes())));
+        let r = json(handle_team_readiness(
+            &agents,
+            &spine,
+            &fake_ctx(m.as_bytes()),
+        ));
         let hires = r["pending_hires"].as_array().unwrap();
         assert_eq!(hires.len(), 1, "qa is a pending hire: {r}");
         assert_eq!(hires[0]["role"], "qa");
         assert_eq!(
-            hires[0]["suggested_rig"], crate::rig::SAFE_LOCAL_RIG,
+            hires[0]["suggested_rig"],
+            crate::rig::SAFE_LOCAL_RIG,
             "pending hire carries the safe-local suggested Rig: {r}"
         );
         // The suggested Rig is exactly the safe-local `echo` — never paid.
@@ -9139,7 +9598,9 @@ mod tests {
         let spine = SpineStore::in_memory().unwrap();
         // Founder present so the reviewer resolves (stamping must be preserved
         // on the adopted path exactly as on the hired path).
-        let (founder, _) = agents.ensure_founder("", "echo", "operator", "default").unwrap();
+        let (founder, _) = agents
+            .ensure_founder("", "echo", "operator", "default")
+            .unwrap();
         let m = approved_mandate(&spine);
         let eng = seed_active(&agents, "engineer", "default");
         ok_body(handle_team_plan(
@@ -9252,7 +9713,12 @@ mod tests {
             &spine,
             &fake_ctx(format!("{m}|build|engineer:subj-e,qa:subj-q").as_bytes()),
         ));
-        let v = json(handle_company_actions(&agents, &spine, &task, &fake_ctx(b"")));
+        let v = json(handle_company_actions(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(b""),
+        ));
         let hire_cards: Vec<&serde_json::Value> = v["actions"]
             .as_array()
             .unwrap()
@@ -11255,16 +11721,16 @@ mod tests {
         use crate::nodes::coordinator::agent::store::SPAWN_CLEARANCE_METHOD;
         let s = store();
         s.create_approval(
-            "agt-hire",                 // agent_id
-            "subj-hire",                // subject_id
-            SPAWN_CLEARANCE_METHOD,     // method
-            "spawn",                    // capability_category
-            "",                         // args_redacted_hash
+            "agt-hire",                  // agent_id
+            "subj-hire",                 // subject_id
+            SPAWN_CLEARANCE_METHOD,      // method
+            "spawn",                     // capability_category
+            "",                          // args_redacted_hash
             "activate the pending hire", // reason
-            &[],                        // approver_groups
-            Some("REL-7"),              // task_id
-            9999999999,                 // expires_at
-            &[],                        // authorized_approvers
+            &[],                         // approver_groups
+            Some("REL-7"),               // task_id
+            9999999999,                  // expires_at
+            &[],                         // authorized_approvers
             "default",
         )
         .unwrap();

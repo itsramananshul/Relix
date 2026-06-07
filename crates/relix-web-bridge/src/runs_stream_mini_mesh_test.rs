@@ -177,8 +177,11 @@ async fn runs_and_actions_streams_emit_initial_snapshots() {
     spawn_inbound_loop(events, dispatch.clone());
 
     let tmpdir = TempDir::new().unwrap();
-    let bundle_bytes =
-        mint_bridge_bundle_bytes(&org_root, "runs-stream-test-bridge", vec!["operators".into()]);
+    let bundle_bytes = mint_bridge_bundle_bytes(
+        &org_root,
+        "runs-stream-test-bridge",
+        vec!["operators".into()],
+    );
     let bundle_path = tmpdir.path().join("bridge.bundle");
     std::fs::write(&bundle_path, &bundle_bytes).unwrap();
     let client_key_path = tmpdir.path().join("client.key");
@@ -280,7 +283,11 @@ addr = "{addr}"
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body, runs_json(), "the list route passes the ledger through");
+    assert_eq!(
+        body,
+        runs_json(),
+        "the list route passes the ledger through"
+    );
 
     // 2. GET /v1/runs/stream?limit=1 → 200 SSE + initial `event: runs`,
     //    truncated to the single most-recent row (run_b, newest first).
@@ -307,7 +314,10 @@ addr = "{addr}"
         buf.push_str(&String::from_utf8_lossy(&bytes));
         saw_runs = buf.contains("event: runs") && buf.contains("run_b");
     }
-    assert!(saw_runs, "expected an initial `event: runs` snapshot; buf=\n{buf}");
+    assert!(
+        saw_runs,
+        "expected an initial `event: runs` snapshot; buf=\n{buf}"
+    );
     assert!(
         !buf.contains("run_a"),
         "limit=1 must truncate to the most-recent row only; buf=\n{buf}"

@@ -358,7 +358,12 @@ pub const SPEND_NEAR_PCT: u64 = 80;
 fn fmt_cents(cents: i64) -> String {
     let neg = cents < 0;
     let abs = cents.unsigned_abs();
-    format!("{}${}.{:02}", if neg { "-" } else { "" }, abs / 100, abs % 100)
+    format!(
+        "{}${}.{:02}",
+        if neg { "-" } else { "" },
+        abs / 100,
+        abs % 100
+    )
 }
 
 /// Render a micro-USD amount as `$D.CC` (the metrics ledger's `cost_micros`
@@ -612,8 +617,9 @@ pub fn strategy_item(m: &Mandate) -> ActionItem {
         category: ActionCategory::Approval,
         severity: ActionCategory::Approval.severity(),
         title: format!("Approve strategy — {}", snippet(&m.title)),
-        reason: "the Mandate strategy is proposed and must be approved before the team can be built"
-            .to_string(),
+        reason:
+            "the Mandate strategy is proposed and must be approved before the team can be built"
+                .to_string(),
         target_type: Some("mandate".to_string()),
         target_id: Some(m.mandate_id.clone()),
         target_title: Some(snippet(&m.title)),
@@ -926,7 +932,12 @@ pub fn failed_item(r: &RunRecord, has_retry_child: bool) -> ActionItem {
 mod tests {
     use super::*;
 
-    fn item(id: &str, cat: ActionCategory, target: Option<(&str, &str)>, created: Option<i64>) -> ActionItem {
+    fn item(
+        id: &str,
+        cat: ActionCategory,
+        target: Option<(&str, &str)>,
+        created: Option<i64>,
+    ) -> ActionItem {
         ActionItem {
             id: id.to_string(),
             category: cat,
@@ -964,7 +975,12 @@ mod tests {
             ActionCategory::Stale,
         ];
         for w in order.windows(2) {
-            assert!(w[0].rank() < w[1].rank(), "{:?} must rank before {:?}", w[0], w[1]);
+            assert!(
+                w[0].rank() < w[1].rank(),
+                "{:?} must rank before {:?}",
+                w[0],
+                w[1]
+            );
         }
         // The specific guarantees called out in the brief:
         assert!(ActionCategory::FailedOrRefused.rank() < ActionCategory::Stale.rank());
@@ -979,8 +995,14 @@ mod tests {
     fn severity_maps_high_medium_low() {
         assert_eq!(ActionCategory::Approval.severity(), ActionSeverity::High);
         assert_eq!(ActionCategory::Budget.severity(), ActionSeverity::High);
-        assert_eq!(ActionCategory::FailedOrRefused.severity(), ActionSeverity::High);
-        assert_eq!(ActionCategory::ReadyToStart.severity(), ActionSeverity::Medium);
+        assert_eq!(
+            ActionCategory::FailedOrRefused.severity(),
+            ActionSeverity::High
+        );
+        assert_eq!(
+            ActionCategory::ReadyToStart.severity(),
+            ActionSeverity::Medium
+        );
         assert_eq!(ActionCategory::Stale.severity(), ActionSeverity::Low);
     }
 
@@ -1029,7 +1051,11 @@ mod tests {
         assert!(over.reason.contains("over budget"));
         assert!(over.reason.contains("$150.00"));
         assert!(over.reason.contains("150%"));
-        assert!(over.reason.contains("this month"), "window stated: {}", over.reason);
+        assert!(
+            over.reason.contains("this month"),
+            "window stated: {}",
+            over.reason
+        );
 
         // $85 spent of a $100 budget → near (Medium).
         let near = company_spend_item(85_000_000, 10_000, false);
@@ -1098,7 +1124,11 @@ mod tests {
             ("adapter_unavailable", "Configure the Rig", "/settings"),
             ("over_allowance", "Raise the Allowance", "/agents"),
             ("workspace_error", "Review runtime settings", "/settings"),
-            ("workspace_context_error", "Review runtime settings", "/settings"),
+            (
+                "workspace_context_error",
+                "Review runtime settings",
+                "/settings",
+            ),
         ];
         for (reason_code, label, route) in cases {
             let it = failed_item(&run("refused", Some(reason_code), ""), false);
@@ -1122,8 +1152,15 @@ mod tests {
         r.recovery_route = Some("/runs?run=run-1".to_string());
         let it = failed_item(&r, false);
         assert_eq!(it.category, ActionCategory::FailedOrRefused);
-        assert_eq!(it.action_label, "Retry the Shift later", "label from metadata");
-        assert_eq!(it.route.as_deref(), Some("/runs?run=run-1"), "route from metadata");
+        assert_eq!(
+            it.action_label, "Retry the Shift later",
+            "label from metadata"
+        );
+        assert_eq!(
+            it.route.as_deref(),
+            Some("/runs?run=run-1"),
+            "route from metadata"
+        );
         assert_eq!(it.failure_class.as_deref(), Some("transient"));
         assert_eq!(it.retryable, Some(true));
         assert_eq!(it.retry_budget_remaining, Some(1));
@@ -1140,7 +1177,11 @@ mod tests {
         let it = failed_item(&g, false);
         assert_eq!(it.action_label, "Raise the Allowance");
         assert_eq!(it.route.as_deref(), Some("/costs"));
-        assert_eq!(it.retryable, Some(false), "a refusal card is never retryable");
+        assert_eq!(
+            it.retryable,
+            Some(false),
+            "a refusal card is never retryable"
+        );
         assert_eq!(it.failure_class.as_deref(), Some("budget"));
     }
 
@@ -1151,7 +1192,10 @@ mod tests {
         let it = failed_item(&run("refused", Some("unassigned"), ""), false);
         assert_eq!(it.action_label, "Assign an Operative");
         assert_eq!(it.route.as_deref(), Some("/briefs?brief=brief-1"));
-        assert!(it.failure_class.is_none(), "no metadata → no recovery-class chip");
+        assert!(
+            it.failure_class.is_none(),
+            "no metadata → no recovery-class chip"
+        );
         assert!(it.retryable.is_none(), "no metadata → no retryable badge");
         assert!(it.retry_budget_remaining.is_none());
         // A refusal is never retry-eligible → no retry action metadata.
@@ -1173,7 +1217,11 @@ mod tests {
             r.retry_budget_remaining = Some(1);
             let it = failed_item(&r, false);
             assert_eq!(it.category, ActionCategory::FailedOrRefused);
-            assert_eq!(it.run_id.as_deref(), Some("run-1"), "carries the source run id ({status})");
+            assert_eq!(
+                it.run_id.as_deref(),
+                Some("run-1"),
+                "carries the source run id ({status})"
+            );
             assert_eq!(
                 it.action_api.as_deref(),
                 Some("POST /v1/runs/run-1/retry"),
@@ -1207,7 +1255,10 @@ mod tests {
         not_failed.retryable = Some(true);
         not_failed.retry_budget_remaining = Some(1);
         let it = failed_item(&not_failed, false);
-        assert!(it.action_api.is_none(), "only failed/interrupted are retried");
+        assert!(
+            it.action_api.is_none(),
+            "only failed/interrupted are retried"
+        );
     }
 
     #[test]
@@ -1308,10 +1359,30 @@ mod tests {
     #[test]
     fn finalize_orders_by_rank_then_oldest_first() {
         let items = vec![
-            item("stale:1", ActionCategory::Stale, Some(("brief", "s1")), Some(10)),
-            item("ready:1", ActionCategory::ReadyToStart, Some(("brief", "r1")), Some(10)),
-            item("approval:new", ActionCategory::Approval, Some(("agent", "a2")), Some(200)),
-            item("approval:old", ActionCategory::Approval, Some(("agent", "a1")), Some(100)),
+            item(
+                "stale:1",
+                ActionCategory::Stale,
+                Some(("brief", "s1")),
+                Some(10),
+            ),
+            item(
+                "ready:1",
+                ActionCategory::ReadyToStart,
+                Some(("brief", "r1")),
+                Some(10),
+            ),
+            item(
+                "approval:new",
+                ActionCategory::Approval,
+                Some(("agent", "a2")),
+                Some(200),
+            ),
+            item(
+                "approval:old",
+                ActionCategory::Approval,
+                Some(("agent", "a1")),
+                Some(100),
+            ),
         ];
         let out = finalize(items);
         let ids: Vec<&str> = out.iter().map(|i| i.id.as_str()).collect();
@@ -1324,8 +1395,18 @@ mod tests {
         // A pending hire (rank 1) AND its spawn Clearance/approval (rank 0)
         // both target the same agent → only the approval survives.
         let items = vec![
-            item("hire:x", ActionCategory::Hire, Some(("agent", "agt-x")), Some(50)),
-            item("approval:x", ActionCategory::Approval, Some(("agent", "agt-x")), Some(40)),
+            item(
+                "hire:x",
+                ActionCategory::Hire,
+                Some(("agent", "agt-x")),
+                Some(50),
+            ),
+            item(
+                "approval:x",
+                ActionCategory::Approval,
+                Some(("agent", "agt-x")),
+                Some(40),
+            ),
         ];
         let out = finalize(items);
         assert_eq!(out.len(), 1, "the same object must not spam the operator");
@@ -1337,8 +1418,18 @@ mod tests {
     fn finalize_dedupes_brief_across_categories() {
         // A Brief that is both failed (rank 2) and stale (rank 6) → failed wins.
         let items = vec![
-            item("stale:b", ActionCategory::Stale, Some(("brief", "b1")), Some(5)),
-            item("failed:b", ActionCategory::FailedOrRefused, Some(("brief", "b1")), Some(9)),
+            item(
+                "stale:b",
+                ActionCategory::Stale,
+                Some(("brief", "b1")),
+                Some(5),
+            ),
+            item(
+                "failed:b",
+                ActionCategory::FailedOrRefused,
+                Some(("brief", "b1")),
+                Some(9),
+            ),
         ];
         let out = finalize(items);
         assert_eq!(out.len(), 1);
@@ -1357,8 +1448,18 @@ mod tests {
     #[test]
     fn finalize_is_deterministic_on_id_tiebreak() {
         // Same rank + same created_at → stable order by id.
-        let a = item("ready:z", ActionCategory::ReadyToStart, Some(("brief", "z")), Some(1));
-        let b = item("ready:a", ActionCategory::ReadyToStart, Some(("brief", "a")), Some(1));
+        let a = item(
+            "ready:z",
+            ActionCategory::ReadyToStart,
+            Some(("brief", "z")),
+            Some(1),
+        );
+        let b = item(
+            "ready:a",
+            ActionCategory::ReadyToStart,
+            Some(("brief", "a")),
+            Some(1),
+        );
         let out = finalize(vec![a, b]);
         assert_eq!(out[0].id, "ready:a");
         assert_eq!(out[1].id, "ready:z");

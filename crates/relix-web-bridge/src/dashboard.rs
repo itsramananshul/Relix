@@ -134,11 +134,23 @@ mod tests {
         assert!(ctype.starts_with("text/html"), "ctype was {ctype:?}");
         let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(body.contains("npm run build"), "notice must tell the operator how to build");
-        assert!(body.contains("dashboard-dist"), "notice should name the dist directory");
+        assert!(
+            body.contains("npm run build"),
+            "notice must tell the operator how to build"
+        );
+        assert!(
+            body.contains("dashboard-dist"),
+            "notice should name the dist directory"
+        );
         // It is NOT the React app shell, and pulls in no app bundle.
-        assert!(!body.contains("id=\"root\""), "notice must not be the React app shell");
-        assert!(!body.contains("/dashboard/assets/"), "notice must not load the app bundle");
+        assert!(
+            !body.contains("id=\"root\""),
+            "notice must not be the React app shell"
+        );
+        assert!(
+            !body.contains("/dashboard/assets/"),
+            "notice must not load the app bundle"
+        );
     }
 
     /// Phase 2 Slice 3 — generated-dist parity guard. The committed React
@@ -158,7 +170,10 @@ mod tests {
         );
         let html = std::fs::read_to_string(&index).expect("read dist index.html");
         // It must be the React shell (Vite mounts into #root).
-        assert!(html.contains("id=\"root\""), "dist index.html is not the React shell");
+        assert!(
+            html.contains("id=\"root\""),
+            "dist index.html is not the React shell"
+        );
         // Every `/dashboard/assets/<file>` reference must resolve to a real
         // file in the bundle.
         let needle = "/dashboard/assets/";
@@ -168,7 +183,10 @@ mod tests {
             rest = &rest[i + needle.len()..];
             let end = rest.find(['"', '\'']).unwrap_or(rest.len());
             let asset = &rest[..end];
-            assert!(!asset.is_empty(), "empty asset reference in dist index.html");
+            assert!(
+                !asset.is_empty(),
+                "empty asset reference in dist index.html"
+            );
             assert!(
                 dir.join("assets").join(asset).is_file(),
                 "index.html references a missing bundle asset `{asset}` — rebuild apps/dashboard so dashboard-dist is in sync"
@@ -176,7 +194,10 @@ mod tests {
             checked += 1;
             rest = &rest[end..];
         }
-        assert!(checked >= 1, "dist index.html referenced no /dashboard/assets/* bundle — the build looks wrong");
+        assert!(
+            checked >= 1,
+            "dist index.html referenced no /dashboard/assets/* bundle — the build looks wrong"
+        );
         // The resolver must pick this committed bundle up, so the bridge
         // serves React at /dashboard (not the missing-bundle notice).
         assert!(
@@ -203,7 +224,12 @@ mod tests {
         // /dashboard/ → the SPA index (text/html).
         let app: axum::Router<()> = dashboard_router();
         let resp = app
-            .oneshot(Request::builder().uri("/dashboard/").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -212,7 +238,10 @@ mod tests {
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        assert!(ctype.starts_with("text/html"), "spa index content-type: {ctype:?}");
+        assert!(
+            ctype.starts_with("text/html"),
+            "spa index content-type: {ctype:?}"
+        );
 
         // /dashboard/assets/<hashed bundle> → 200. Resolve the asset name
         // from the committed index.html so the test tracks the real build.
@@ -233,6 +262,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp2.status(), StatusCode::OK, "asset {asset} should serve 200");
+        assert_eq!(
+            resp2.status(),
+            StatusCode::OK,
+            "asset {asset} should serve 200"
+        );
     }
 }

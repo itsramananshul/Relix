@@ -78,8 +78,11 @@ pub const CATEGORY_HIRE_APPROVE: &str = "prime.hire.approve";
 pub const CATEGORY_CLEARANCE_APPROVE: &str = "prime.clearance.approve";
 
 /// The three standing-authority categories, in display order.
-pub const STANDING_AUTHORITY_CATEGORIES: &[&str] =
-    &[CATEGORY_PROPOSAL_APPROVE, CATEGORY_HIRE_APPROVE, CATEGORY_CLEARANCE_APPROVE];
+pub const STANDING_AUTHORITY_CATEGORIES: &[&str] = &[
+    CATEGORY_PROPOSAL_APPROVE,
+    CATEGORY_HIRE_APPROVE,
+    CATEGORY_CLEARANCE_APPROVE,
+];
 
 /// Default safe Rig the autonomous hire-approve binds when
 /// `RELIX_AUTONOMOUS_PRIME_HIRE_RIG` is unset — the safe-local `echo` built-in.
@@ -93,7 +96,11 @@ fn now_secs_from_ms(now_ms: i64) -> i64 {
 }
 
 /// A standing-authority match for the synthetic Prime authority in `tenant`.
-fn authority_match<'a>(tenant: &'a str, category: &'a str, now_secs: i64) -> StandingApprovalMatch<'a> {
+fn authority_match<'a>(
+    tenant: &'a str,
+    category: &'a str,
+    now_secs: i64,
+) -> StandingApprovalMatch<'a> {
     StandingApprovalMatch {
         agent_id: AUTONOMOUS_PRIME_AUTHORITY,
         category,
@@ -120,7 +127,12 @@ fn standing_active(agent_store: &AgentStore, tenant: &str, category: &str, now_s
 /// (`max_calls`/`max_cost`) is decremented; an unlimited grant returns `Some`
 /// without decrementing (existing `consume_active_standing_for` semantics). Best
 /// effort — a consume miss never undoes the action already taken.
-fn consume_standing(agent_store: &AgentStore, tenant: &str, category: &str, now_secs: i64) -> Option<String> {
+fn consume_standing(
+    agent_store: &AgentStore,
+    tenant: &str,
+    category: &str,
+    now_secs: i64,
+) -> Option<String> {
     agent_store
         .consume_active_standing_for(authority_match(tenant, category, now_secs))
         .ok()
@@ -269,7 +281,10 @@ fn brief_counts(
 /// work tracks (`prime::try_canon_role` returns `None`) and never appear here.
 fn active_crew_roles(agent_store: &AgentStore, tenant: &str) -> Vec<&'static str> {
     let mut roles: Vec<&'static str> = Vec::new();
-    for p in agent_store.list_active_for_tenant(tenant).unwrap_or_default() {
+    for p in agent_store
+        .list_active_for_tenant(tenant)
+        .unwrap_or_default()
+    {
         if let Some(canon) = prime::try_canon_role(&p.role)
             && !roles.contains(&canon)
         {
@@ -294,7 +309,12 @@ fn compute_next_step(
     };
     let tenant = ctx.tenant_id_or_default();
 
-    if let Some(pid) = args.proposal_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(pid) = args
+        .proposal_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         let row = match spine_store.get_prime_proposal(tenant, pid) {
             Ok(Some(r)) => r,
             Ok(None) => return Err(invalid(format!("proposal not found: {pid}"))),
@@ -321,7 +341,12 @@ fn compute_next_step(
         );
     }
 
-    if let Some(mid) = args.mandate_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(mid) = args
+        .mandate_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         // Tenant-gate: an unknown / cross-Guild Mandate reads as not-found.
         match spine_store.get_mandate_for_tenant(mid, tenant) {
             Ok(Some(_)) => {}
@@ -334,14 +359,26 @@ fn compute_next_step(
             .into_iter()
             .map(|c| c.task_id)
             .collect();
-        return classify_mandate(agent_store, spine_store, task_store, tenant, None, mid, brief_ids);
+        return classify_mandate(
+            agent_store,
+            spine_store,
+            task_store,
+            tenant,
+            None,
+            mid,
+            brief_ids,
+        );
     }
 
-    Err(invalid("prime.next_step: proposal_id or mandate_id required".into()))
+    Err(invalid(
+        "prime.next_step: proposal_id or mandate_id required".into(),
+    ))
 }
 
 /// The next step for a proposal that has not been approved yet.
-fn proposal_pre_approval_step(row: &crate::nodes::coordinator::spine::store::PrimeProposalRow) -> NextStep {
+fn proposal_pre_approval_step(
+    row: &crate::nodes::coordinator::spine::store::PrimeProposalRow,
+) -> NextStep {
     let pid = Some(row.proposal_id.clone());
     if row.status == "rejected" {
         return NextStep {
@@ -421,7 +458,9 @@ fn classify_mandate(
 ) -> Result<NextStep, HandlerOutcome> {
     let r: ReadinessView = compute_readiness(agent_store, spine_store, tenant, mandate_id)
         .map_err(|e| internal(format!("prime.next_step readiness: {e}")))?;
-    let strategy = spine_store.strategy_status(tenant, mandate_id).unwrap_or(None);
+    let strategy = spine_store
+        .strategy_status(tenant, mandate_id)
+        .unwrap_or(None);
     let approved = strategy.as_deref() == Some("approved");
     let counts = brief_counts(agent_store, task_store, tenant, &brief_ids);
     let plan_id = r.plan.as_ref().map(|p| p.plan_id.clone());
@@ -482,8 +521,7 @@ fn classify_mandate(
             Some("rejected") => base(
                 "blocked",
                 "Strategy rejected",
-                "The Mandate strategy was rejected. Propose a new strategy to continue."
-                    .into(),
+                "The Mandate strategy was rejected. Propose a new strategy to continue.".into(),
                 "POST /v1/spine/mandates/:id/strategy/propose",
                 "mandate.strategy.propose",
                 false,
@@ -601,7 +639,10 @@ fn classify_mandate(
             return Ok(base(
                 "running_or_done",
                 "Shifts running",
-                format!("{} Shift(s) are running — inspect progress.", counts.running),
+                format!(
+                    "{} Shift(s) are running — inspect progress.",
+                    counts.running
+                ),
                 "/runs",
                 "brief.runs",
                 false,
@@ -1054,7 +1095,13 @@ fn process_candidate(
     let step = match compute_next_step(agent_store, spine_store, task_store, &read_ctx) {
         Ok(s) => s,
         Err(_) => {
-            return mk("unknown".into(), "none", "skipped", "target not classifiable".into(), None);
+            return mk(
+                "unknown".into(),
+                "none",
+                "skipped",
+                "target not classifiable".into(),
+                None,
+            );
         }
     };
     let phase = step.phase.to_string();
@@ -1067,7 +1114,13 @@ fn process_candidate(
         && let Some(action) = step.advance_action
     {
         if *actions >= max {
-            return mk(phase, action, "skipped", "tick action budget reached".into(), mandate_id);
+            return mk(
+                phase,
+                action,
+                "skipped",
+                "tick action budget reached".into(),
+                mandate_id,
+            );
         }
         let mut adv = target.clone();
         adv["action"] = json!(action);
@@ -1085,17 +1138,36 @@ fn process_candidate(
                             &format!("autonomous Prime advanced `{action}` on mandate {mid}"),
                         );
                     }
-                    mk(phase, action, "advanced", format!("ran governed `{action}`"), mandate_id)
+                    mk(
+                        phase,
+                        action,
+                        "advanced",
+                        format!("ran governed `{action}`"),
+                        mandate_id,
+                    )
                 } else {
-                    let refused =
-                        v.get("refused").and_then(Value::as_str).unwrap_or("not_advanced").to_string();
-                    mk(phase, action, "skipped", format!("advance not applied: {refused}"), mandate_id)
+                    let refused = v
+                        .get("refused")
+                        .and_then(Value::as_str)
+                        .unwrap_or("not_advanced")
+                        .to_string();
+                    mk(
+                        phase,
+                        action,
+                        "skipped",
+                        format!("advance not applied: {refused}"),
+                        mandate_id,
+                    )
                 }
             }
             // Governance refusal / error — propagate honestly, take no credit.
-            HandlerOutcome::Err(e) => {
-                mk(phase, action, "blocked", format!("advance refused: {}", e.cause), mandate_id)
-            }
+            HandlerOutcome::Err(e) => mk(
+                phase,
+                action,
+                "blocked",
+                format!("advance refused: {}", e.cause),
+                mandate_id,
+            ),
         };
     }
 
@@ -1114,18 +1186,40 @@ fn process_candidate(
             );
         };
         if *actions >= max {
-            return mk(phase, "start", "skipped", "tick action budget reached".into(), mandate_id);
+            return mk(
+                phase,
+                "start",
+                "skipped",
+                "tick action budget reached".into(),
+                mandate_id,
+            );
         }
-        if let Err(reason) =
-            start_budget_admitted(task_store, agent_store, spine_store, metrics, tenant, &pid, now_ms)
-        {
-            return mk(phase, "start", "blocked", format!("budget hard-stop: {reason}"), mandate_id);
+        if let Err(reason) = start_budget_admitted(
+            task_store,
+            agent_store,
+            spine_store,
+            metrics,
+            tenant,
+            &pid,
+            now_ms,
+        ) {
+            return mk(
+                phase,
+                "start",
+                "blocked",
+                format!("budget hard-stop: {reason}"),
+                mandate_id,
+            );
         }
         let start_ctx = autonomous_prime_ctx(tenant, pid.clone().into_bytes());
-        return match handle_prime_start(agent_store, spine_store, task_store, registry, &start_ctx) {
+        return match handle_prime_start(agent_store, spine_store, task_store, registry, &start_ctx)
+        {
             HandlerOutcome::Ok(b) => {
                 let v: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
-                let started = v.get("started").and_then(Value::as_array).map_or(0, Vec::len);
+                let started = v
+                    .get("started")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
                 if started > 0 {
                     *actions += 1;
                     if let Some(mid) = mandate_id.as_deref() {
@@ -1138,14 +1232,30 @@ fn process_candidate(
                             ),
                         );
                     }
-                    mk(phase, "start", "started", format!("started {started} ready Shift(s)"), mandate_id)
+                    mk(
+                        phase,
+                        "start",
+                        "started",
+                        format!("started {started} ready Shift(s)"),
+                        mandate_id,
+                    )
                 } else {
-                    mk(phase, "start", "skipped", "no ready Shift actually started".into(), mandate_id)
+                    mk(
+                        phase,
+                        "start",
+                        "skipped",
+                        "no ready Shift actually started".into(),
+                        mandate_id,
+                    )
                 }
             }
-            HandlerOutcome::Err(e) => {
-                mk(phase, "start", "blocked", format!("start refused: {}", e.cause), mandate_id)
-            }
+            HandlerOutcome::Err(e) => mk(
+                phase,
+                "start",
+                "blocked",
+                format!("start refused: {}", e.cause),
+                mandate_id,
+            ),
         };
     }
 
@@ -1180,12 +1290,35 @@ fn process_candidate(
                 );
             }
             if *actions >= max {
-                return mk(phase, "clearance_approve", "skipped", "tick action budget reached".into(), mandate_id);
+                return mk(
+                    phase,
+                    "clearance_approve",
+                    "skipped",
+                    "tick action budget reached".into(),
+                    mandate_id,
+                );
             }
-            return match autonomous_approve_spawn_clearance(agent_store, tenant, cid) {
+            if !crate::rig::is_known_rig(hire_rig) {
+                return mk(
+                    phase,
+                    "clearance_approve",
+                    "skipped",
+                    format!(
+                        "configured hire rig `{hire_rig}` is not a known Rig — leaving spawn Clearance pending"
+                    ),
+                    mandate_id,
+                );
+            }
+            return match autonomous_approve_spawn_clearance(
+                agent_store,
+                tenant,
+                cid,
+                Some(hire_rig),
+            ) {
                 Ok(hire_id) => {
                     *actions += 1;
-                    let _ = consume_standing(agent_store, tenant, CATEGORY_CLEARANCE_APPROVE, now_secs);
+                    let _ =
+                        consume_standing(agent_store, tenant, CATEGORY_CLEARANCE_APPROVE, now_secs);
                     if let Some(mid) = mandate_id.as_deref() {
                         chronicle_autonomous(
                             task_store,
@@ -1196,9 +1329,21 @@ fn process_candidate(
                             ),
                         );
                     }
-                    mk(phase, "clearance_approve", "advanced", format!("greenlit spawn Clearance {cid}"), mandate_id)
+                    mk(
+                        phase,
+                        "clearance_approve",
+                        "advanced",
+                        format!("greenlit spawn Clearance {cid}"),
+                        mandate_id,
+                    )
                 }
-                Err(e) => mk(phase, "clearance_approve", "blocked", format!("clearance greenlight refused: {e}"), mandate_id),
+                Err(e) => mk(
+                    phase,
+                    "clearance_approve",
+                    "blocked",
+                    format!("clearance greenlight refused: {e}"),
+                    mandate_id,
+                ),
             };
         }
 
@@ -1226,12 +1371,20 @@ fn process_candidate(
                     phase,
                     "hire_approve",
                     "skipped",
-                    format!("configured hire rig `{hire_rig}` is not a known Rig — leaving hire pending"),
+                    format!(
+                        "configured hire rig `{hire_rig}` is not a known Rig — leaving hire pending"
+                    ),
                     mandate_id,
                 );
             }
             if *actions >= max {
-                return mk(phase, "hire_approve", "skipped", "tick action budget reached".into(), mandate_id);
+                return mk(
+                    phase,
+                    "hire_approve",
+                    "skipped",
+                    "tick action budget reached".into(),
+                    mandate_id,
+                );
             }
             return match agent_store.approve_hire_with_rig(hid, Some(hire_rig), tenant) {
                 Ok(outcome) => {
@@ -1243,12 +1396,26 @@ fn process_candidate(
                             task_store,
                             mid,
                             "prime.autonomous_hire_approve",
-                            &format!("autonomous Prime activated hire {hid} on rig {bound} for mandate {mid}"),
+                            &format!(
+                                "autonomous Prime activated hire {hid} on rig {bound} for mandate {mid}"
+                            ),
                         );
                     }
-                    mk(phase, "hire_approve", "advanced", format!("activated hire {hid} on rig {bound}"), mandate_id)
+                    mk(
+                        phase,
+                        "hire_approve",
+                        "advanced",
+                        format!("activated hire {hid} on rig {bound}"),
+                        mandate_id,
+                    )
                 }
-                Err(e) => mk(phase, "hire_approve", "blocked", format!("hire activation refused: {e}"), mandate_id),
+                Err(e) => mk(
+                    phase,
+                    "hire_approve",
+                    "blocked",
+                    format!("hire activation refused: {e}"),
+                    mandate_id,
+                ),
             };
         }
         // Fall through (no actionable item) to the human-gate record below.
@@ -1314,14 +1481,24 @@ pub fn autonomous_prime_tick(
         }
         // No authority for this proposal's Guild → leave it proposed, silently
         // (no record, so an unauthorized tenant never spams the tick summary).
-        if !standing_active(agent_store, &p.tenant_id, CATEGORY_PROPOSAL_APPROVE, now_secs) {
+        if !standing_active(
+            agent_store,
+            &p.tenant_id,
+            CATEGORY_PROPOSAL_APPROVE,
+            now_secs,
+        ) {
             continue;
         }
         let approve_ctx = autonomous_prime_ctx(&p.tenant_id, p.proposal_id.clone().into_bytes());
         let rec = match handle_prime_approve(agent_store, spine_store, task_store, &approve_ctx) {
             HandlerOutcome::Ok(b) => {
                 actions += 1;
-                let _ = consume_standing(agent_store, &p.tenant_id, CATEGORY_PROPOSAL_APPROVE, now_secs);
+                let _ = consume_standing(
+                    agent_store,
+                    &p.tenant_id,
+                    CATEGORY_PROPOSAL_APPROVE,
+                    now_secs,
+                );
                 let v: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
                 let mid = v
                     .get("mandate_id")
@@ -1333,7 +1510,10 @@ pub fn autonomous_prime_tick(
                         task_store,
                         m,
                         "prime.autonomous_approve",
-                        &format!("autonomous Prime approved proposal {} (mandate {m})", p.proposal_id),
+                        &format!(
+                            "autonomous Prime approved proposal {} (mandate {m})",
+                            p.proposal_id
+                        ),
                     );
                 }
                 PrimeAutonomyRecord {
@@ -1344,7 +1524,8 @@ pub fn autonomous_prime_tick(
                     phase: "needs_approval".to_string(),
                     action: "approve",
                     outcome: "approved",
-                    reason: "materialized proposed plan through the existing prime.approve path".to_string(),
+                    reason: "materialized proposed plan through the existing prime.approve path"
+                        .to_string(),
                 }
             }
             HandlerOutcome::Err(e) => PrimeAutonomyRecord {
@@ -1457,12 +1638,7 @@ mod tests {
         }
     }
 
-    fn advance(
-        agents: &AgentStore,
-        spine: &SpineStore,
-        tasks: &TaskStore,
-        target: Value,
-    ) -> Value {
+    fn advance(agents: &AgentStore, spine: &SpineStore, tasks: &TaskStore, target: Value) -> Value {
         let out = handle_prime_advance(agents, spine, tasks, &ctx(target));
         match out {
             HandlerOutcome::Ok(b) => serde_json::from_slice(&b).unwrap(),
@@ -1474,7 +1650,9 @@ mod tests {
         let m = spine
             .create_mandate("default", "Ship v1", "real product", None, None)
             .unwrap();
-        spine.propose_strategy("default", &m, "build a team").unwrap();
+        spine
+            .propose_strategy("default", &m, "build a team")
+            .unwrap();
         spine.approve_strategy("default", &m).unwrap();
         m
     }
@@ -1637,7 +1815,12 @@ mod tests {
         // Real Briefs were created + assigned under the Mandate.
         let cards = tasks.list_briefs_by_mandate(&m, 50).unwrap();
         assert_eq!(cards.len(), 3, "parent + role track + subject execution");
-        assert!(!r["result"]["assigned_briefs"].as_array().unwrap().is_empty());
+        assert!(
+            !r["result"]["assigned_briefs"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // 5) A stale requested advance_action refuses with NO side effects.
@@ -1739,26 +1922,33 @@ mod tests {
     /// Grant the synthetic Prime authority a bounded standing approval for
     /// `category` in `tenant` (default `max_calls` unless overridden) — the Board
     /// action the standing-authority driver consumes.
-    fn grant_standing(agents: &AgentStore, tenant: &str, category: &str, max_calls: Option<i64>) -> String {
+    fn grant_standing(
+        agents: &AgentStore,
+        tenant: &str,
+        category: &str,
+        max_calls: Option<i64>,
+    ) -> String {
         agents
-            .create_scoped_standing(crate::nodes::coordinator::agent::store::StandingApprovalCreate {
-                agent_id: AUTONOMOUS_PRIME_AUTHORITY,
-                match_category: category,
-                match_path_glob: None,
-                scope_kind: None,
-                task_id: None,
-                session_id: None,
-                method_prefix: None,
-                workspace_path_glob: None,
-                // Far-future expiry in SECONDS (standing approvals compare `now`
-                // in seconds; the tick passes `now_ms=0` → `now_secs=0`).
-                expires_at: 9_999_999_999,
-                granted_by: "operator",
-                max_calls,
-                max_cost_micros: None,
-                note: "test grant",
-                tenant_id: tenant,
-            })
+            .create_scoped_standing(
+                crate::nodes::coordinator::agent::store::StandingApprovalCreate {
+                    agent_id: AUTONOMOUS_PRIME_AUTHORITY,
+                    match_category: category,
+                    match_path_glob: None,
+                    scope_kind: None,
+                    task_id: None,
+                    session_id: None,
+                    method_prefix: None,
+                    workspace_path_glob: None,
+                    // Far-future expiry in SECONDS (standing approvals compare `now`
+                    // in seconds; the tick passes `now_ms=0` → `now_secs=0`).
+                    expires_at: 9_999_999_999,
+                    granted_by: "operator",
+                    max_calls,
+                    max_cost_micros: None,
+                    note: "test grant",
+                    tenant_id: tenant,
+                },
+            )
             .unwrap()
     }
 
@@ -1790,7 +1980,10 @@ mod tests {
         runnable_operative(&agents, "engineer", "subj-e");
 
         let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
-        let rec = recs.iter().find(|r| r.target_id == m).expect("mandate considered");
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
         assert_eq!(rec.phase, "needs_team_plan");
         assert_eq!(rec.action, "create_team_plan");
         assert_eq!(rec.outcome, "advanced");
@@ -1807,7 +2000,9 @@ mod tests {
         let reg = echo_registry();
         let m = approved_mandate(&spine);
         let agent_id = agents
-            .create_agent("W", "engineer", "W", "eng", "eng", "prime", "subj-w", "medium", "default")
+            .create_agent(
+                "W", "engineer", "W", "eng", "eng", "prime", "subj-w", "medium", "default",
+            )
             .unwrap();
         let hires = format!("[{{\"role\":\"engineer\",\"agent_id\":\"{agent_id}\"}}]");
         spine
@@ -1826,7 +2021,10 @@ mod tests {
             .unwrap();
 
         let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
-        let rec = recs.iter().find(|r| r.target_id == m).expect("mandate considered");
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
         assert_eq!(rec.phase, "needs_orchestration");
         assert_eq!(rec.action, "orchestrate_assign_ready");
         assert_eq!(rec.outcome, "advanced");
@@ -1846,7 +2044,9 @@ mod tests {
         let reg = echo_registry();
         let m = approved_mandate(&spine);
         let agent_id = agents
-            .create_agent("W", "engineer", "W", "eng", "eng", "prime", "subj-w", "medium", "default")
+            .create_agent(
+                "W", "engineer", "W", "eng", "eng", "prime", "subj-w", "medium", "default",
+            )
             .unwrap();
         let hires = format!("[{{\"role\":\"engineer\",\"agent_id\":\"{agent_id}\"}}]");
         spine
@@ -1886,7 +2086,9 @@ mod tests {
         let reg = echo_registry();
         let m = approved_mandate(&spine);
         let pending = agents
-            .request_hire("P", "engineer", "P", "eng", "eng", "prime", "subj-p", "medium", "default")
+            .request_hire(
+                "P", "engineer", "P", "eng", "eng", "prime", "subj-p", "medium", "default",
+            )
             .unwrap();
         let hires = format!("[{{\"role\":\"engineer\",\"agent_id\":\"{pending}\"}}]");
         spine
@@ -1905,12 +2107,18 @@ mod tests {
             .unwrap();
 
         let recs = tick(&agents, &spine, &tasks, &reg, 5, Some("default"));
-        let rec = recs.iter().find(|r| r.target_id == m).expect("mandate considered");
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
         assert_eq!(rec.phase, "needs_hire_approval");
         assert_eq!(rec.action, "none");
         assert_eq!(rec.outcome, "blocked");
         // The hire is still pending — the loop greenlit nothing, created no Briefs.
-        assert_eq!(agents.get_agent(&pending).unwrap().unwrap().status, "pending");
+        assert_eq!(
+            agents.get_agent(&pending).unwrap().unwrap().status,
+            "pending"
+        );
         assert!(tasks.list_briefs_by_mandate(&m, 50).unwrap().is_empty());
     }
 
@@ -2008,7 +2216,11 @@ mod tests {
             "no standing authority ⇒ no autonomous approval"
         );
         assert_eq!(
-            spine.get_prime_proposal("default", &pid).unwrap().unwrap().status,
+            spine
+                .get_prime_proposal("default", &pid)
+                .unwrap()
+                .unwrap()
+                .status,
             "proposed",
             "the proposal must remain proposed"
         );
@@ -2037,13 +2249,23 @@ mod tests {
 
         let row = spine.get_prime_proposal("default", &pid).unwrap().unwrap();
         assert_eq!(row.status, "approved");
-        assert!(!row.mandate_id.is_empty(), "approval materialized a Mandate");
+        assert!(
+            !row.mandate_id.is_empty(),
+            "approval materialized a Mandate"
+        );
         // Real Briefs were created through the governed approve path.
-        assert!(!tasks.list_briefs_by_mandate(&row.mandate_id, 50).unwrap().is_empty());
+        assert!(
+            !tasks
+                .list_briefs_by_mandate(&row.mandate_id, 50)
+                .unwrap()
+                .is_empty()
+        );
 
         // The bounded (max_calls=1) grant is now exhausted.
         assert!(
-            !agents.has_active_standing(AUTONOMOUS_PRIME_AUTHORITY, CATEGORY_PROPOSAL_APPROVE, 1).unwrap(),
+            !agents
+                .has_active_standing(AUTONOMOUS_PRIME_AUTHORITY, CATEGORY_PROPOSAL_APPROVE, 1)
+                .unwrap(),
             "a bounded standing grant is consumed when the approval is taken"
         );
     }
@@ -2066,13 +2288,18 @@ mod tests {
         assert_eq!(row1.status, "approved");
         let mandate1 = row1.mandate_id.clone();
         let briefs1 = tasks.list_briefs_by_mandate(&mandate1, 50).unwrap().len();
-        let used1 = agents.list_standing_for_tenant(AUTONOMOUS_PRIME_AUTHORITY, "default").unwrap()[0].calls_used;
+        let used1 = agents
+            .list_standing_for_tenant(AUTONOMOUS_PRIME_AUTHORITY, "default")
+            .unwrap()[0]
+            .calls_used;
         assert_eq!(used1, 1, "exactly one approval call consumed");
 
         // Re-tick: the proposal is no longer proposed, so nothing re-approves it.
         let recs2 = tick(&agents, &spine, &tasks, &reg, 5, Some("default"));
         assert!(
-            recs2.iter().all(|r| !(r.target_id == pid && r.outcome == "approved")),
+            recs2
+                .iter()
+                .all(|r| !(r.target_id == pid && r.outcome == "approved")),
             "an already-approved proposal must not be re-approved"
         );
         let row2 = spine.get_prime_proposal("default", &pid).unwrap().unwrap();
@@ -2082,7 +2309,10 @@ mod tests {
             briefs1,
             "no duplicate Briefs"
         );
-        let used2 = agents.list_standing_for_tenant(AUTONOMOUS_PRIME_AUTHORITY, "default").unwrap()[0].calls_used;
+        let used2 = agents
+            .list_standing_for_tenant(AUTONOMOUS_PRIME_AUTHORITY, "default")
+            .unwrap()[0]
+            .calls_used;
         assert_eq!(used2, 1, "the grant is not consumed again on a re-tick");
     }
 
@@ -2112,12 +2342,20 @@ mod tests {
         let _ = tick(&agents, &spine, &tasks, &reg, 10, None);
 
         assert_eq!(
-            spine.get_prime_proposal("default", &pid_default).unwrap().unwrap().status,
+            spine
+                .get_prime_proposal("default", &pid_default)
+                .unwrap()
+                .unwrap()
+                .status,
             "approved",
             "the granted Guild's proposal is approved"
         );
         assert_eq!(
-            spine.get_prime_proposal("other", &pid_other).unwrap().unwrap().status,
+            spine
+                .get_prime_proposal("other", &pid_other)
+                .unwrap()
+                .unwrap()
+                .status,
             "proposed",
             "a grant in `default` must never approve `other`'s proposal"
         );
@@ -2128,7 +2366,9 @@ mod tests {
     fn mandate_with_pending_hire(agents: &AgentStore, spine: &SpineStore) -> (String, String) {
         let m = approved_mandate(spine);
         let pending = agents
-            .request_hire("P", "engineer", "P", "eng", "eng", "prime", "subj-p", "medium", "default")
+            .request_hire(
+                "P", "engineer", "P", "eng", "eng", "prime", "subj-p", "medium", "default",
+            )
             .unwrap();
         let hires = format!("[{{\"role\":\"engineer\",\"agent_id\":\"{pending}\"}}]");
         spine
@@ -2160,16 +2400,25 @@ mod tests {
         grant_standing(&agents, "default", CATEGORY_HIRE_APPROVE, Some(1));
 
         let recs = tick_rig(&agents, &spine, &tasks, &reg, 1, Some("default"), "echo");
-        let rec = recs.iter().find(|r| r.target_id == m).expect("mandate considered");
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
         assert_eq!(rec.phase, "needs_hire_approval");
         assert_eq!(rec.action, "hire_approve");
         assert_eq!(rec.outcome, "advanced");
 
         let agent = agents.get_agent(&pending).unwrap().unwrap();
         assert_eq!(agent.status, "active", "the hire is activated");
-        assert_eq!(agent.rig.as_deref(), Some("echo"), "bound to the configured Rig");
+        assert_eq!(
+            agent.rig.as_deref(),
+            Some("echo"),
+            "bound to the configured Rig"
+        );
         assert!(
-            !agents.has_active_standing(AUTONOMOUS_PRIME_AUTHORITY, CATEGORY_HIRE_APPROVE, 1).unwrap(),
+            !agents
+                .has_active_standing(AUTONOMOUS_PRIME_AUTHORITY, CATEGORY_HIRE_APPROVE, 1)
+                .unwrap(),
             "the bounded hire grant is consumed"
         );
     }
@@ -2184,16 +2433,35 @@ mod tests {
         let (m, pending) = mandate_with_pending_hire(&agents, &spine);
         grant_standing(&agents, "default", CATEGORY_HIRE_APPROVE, Some(1));
 
-        let recs = tick_rig(&agents, &spine, &tasks, &reg, 1, Some("default"), "bogus-rig");
-        let rec = recs.iter().find(|r| r.target_id == m).expect("mandate considered");
+        let recs = tick_rig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            1,
+            Some("default"),
+            "bogus-rig",
+        );
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
         assert_eq!(rec.action, "hire_approve");
-        assert_eq!(rec.outcome, "skipped", "an unknown Rig is skipped, not bound");
+        assert_eq!(
+            rec.outcome, "skipped",
+            "an unknown Rig is skipped, not bound"
+        );
 
         let agent = agents.get_agent(&pending).unwrap().unwrap();
-        assert_eq!(agent.status, "pending", "the hire stays pending on a bad Rig");
+        assert_eq!(
+            agent.status, "pending",
+            "the hire stays pending on a bad Rig"
+        );
         assert!(agent.rig.is_none(), "no bad Rig was bound");
         assert!(
-            agents.has_active_standing(AUTONOMOUS_PRIME_AUTHORITY, CATEGORY_HIRE_APPROVE, 1).unwrap(),
+            agents
+                .has_active_standing(AUTONOMOUS_PRIME_AUTHORITY, CATEGORY_HIRE_APPROVE, 1)
+                .unwrap(),
             "a skipped action does not consume the grant"
         );
     }
@@ -2208,9 +2476,15 @@ mod tests {
         let (m, pending) = mandate_with_pending_hire(&agents, &spine);
         // No grant.
         let recs = tick(&agents, &spine, &tasks, &reg, 5, Some("default"));
-        let rec = recs.iter().find(|r| r.target_id == m).expect("mandate considered");
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
         assert_eq!(rec.outcome, "blocked");
-        assert_eq!(agents.get_agent(&pending).unwrap().unwrap().status, "pending");
+        assert_eq!(
+            agents.get_agent(&pending).unwrap().unwrap().status,
+            "pending"
+        );
     }
 
     // O) With `prime.clearance.approve` standing → an attributable pending spawn
@@ -2223,7 +2497,9 @@ mod tests {
         let reg = echo_registry();
         let m = approved_mandate(&spine);
         let pending = agents
-            .request_hire("P", "engineer", "P", "eng", "eng", "prime", "subj-cl", "medium", "default")
+            .request_hire(
+                "P", "engineer", "P", "eng", "eng", "prime", "subj-cl", "medium", "default",
+            )
             .unwrap();
         let cid = agents
             .create_spawn_clearance(&pending, "subj-cl", "spawn the hire", &[], "default")
@@ -2247,29 +2523,134 @@ mod tests {
         // An UNRELATED non-spawn approval that must remain pending.
         let arbitrary = agents
             .create_approval(
-                "subj-x", "subj-x", "tool.shell", "tool", "hash", "run a tool", &[], None, 9_999_999_999, &[],
+                "subj-x",
+                "subj-x",
+                "tool.shell",
+                "tool",
+                "hash",
+                "run a tool",
+                &[],
+                None,
+                9_999_999_999,
+                &[],
                 "default",
             )
             .unwrap();
         grant_standing(&agents, "default", CATEGORY_CLEARANCE_APPROVE, Some(1));
 
         let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
-        let rec = recs.iter().find(|r| r.target_id == m).expect("mandate considered");
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
         assert_eq!(rec.phase, "needs_hire_approval");
         assert_eq!(rec.action, "clearance_approve");
         assert_eq!(rec.outcome, "advanced");
 
-        // The spawn Clearance is approved and the hire is now active.
+        // The spawn Clearance is approved and the hire is now active+runnable.
         assert_eq!(
-            agents.get_approval_record_for_tenant(&cid, "default").unwrap().unwrap().status.as_wire(),
+            agents
+                .get_approval_record_for_tenant(&cid, "default")
+                .unwrap()
+                .unwrap()
+                .status
+                .as_wire(),
             "approved"
         );
-        assert_eq!(agents.get_agent(&pending).unwrap().unwrap().status, "active");
+        let activated = agents.get_agent(&pending).unwrap().unwrap();
+        assert_eq!(activated.status, "active");
+        assert_eq!(
+            activated.rig.as_deref(),
+            Some("echo"),
+            "autonomous Clearance approval binds the configured Rig"
+        );
         // The unrelated tool approval is untouched.
         assert_eq!(
-            agents.get_approval_record_for_tenant(&arbitrary, "default").unwrap().unwrap().status.as_wire(),
+            agents
+                .get_approval_record_for_tenant(&arbitrary, "default")
+                .unwrap()
+                .unwrap()
+                .status
+                .as_wire(),
             "pending",
             "an arbitrary non-spawn approval is never auto-approved"
+        );
+    }
+
+    #[test]
+    fn standing_clearance_approve_refuses_unknown_rig() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        let pending = agents
+            .request_hire(
+                "P",
+                "engineer",
+                "P",
+                "eng",
+                "eng",
+                "prime",
+                "subj-cl-bad",
+                "medium",
+                "default",
+            )
+            .unwrap();
+        let cid = agents
+            .create_spawn_clearance(&pending, "subj-cl-bad", "spawn the hire", &[], "default")
+            .unwrap();
+        let hires = format!("[{{\"role\":\"engineer\",\"agent_id\":\"{pending}\"}}]");
+        let clearances = format!("[\"{cid}\"]");
+        spine
+            .record_team_plan(&TeamPlanRecord {
+                tenant_id: "default",
+                mandate_id: &m,
+                actor_id: "operator",
+                description: "x",
+                proposed_roles_json: "[]",
+                pending_hires_json: &hires,
+                clearance_ids_json: &clearances,
+                denials_json: "[]",
+                next_steps_json: "[]",
+                status: "awaiting_clearance",
+            })
+            .unwrap();
+        grant_standing(&agents, "default", CATEGORY_CLEARANCE_APPROVE, Some(1));
+
+        let recs = tick_rig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            1,
+            Some("default"),
+            "bogus-rig",
+        );
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.action, "clearance_approve");
+        assert_eq!(rec.outcome, "skipped");
+
+        assert_eq!(
+            agents
+                .get_approval_record_for_tenant(&cid, "default")
+                .unwrap()
+                .unwrap()
+                .status
+                .as_wire(),
+            "pending",
+            "bad Rig config leaves the Clearance pending"
+        );
+        let agent = agents.get_agent(&pending).unwrap().unwrap();
+        assert_eq!(agent.status, "pending");
+        assert!(agent.rig.is_none());
+        assert!(
+            agents
+                .has_active_standing(AUTONOMOUS_PRIME_AUTHORITY, CATEGORY_CLEARANCE_APPROVE, 1)
+                .unwrap(),
+            "a skipped Clearance action does not consume the grant"
         );
     }
 
@@ -2295,8 +2676,14 @@ mod tests {
                 .map(|c| c["active"].as_bool().unwrap())
                 .unwrap()
         };
-        assert!(active_of(CATEGORY_HIRE_APPROVE), "the granted category is active");
-        assert!(!active_of(CATEGORY_PROPOSAL_APPROVE), "an ungranted category is inactive");
+        assert!(
+            active_of(CATEGORY_HIRE_APPROVE),
+            "the granted category is active"
+        );
+        assert!(
+            !active_of(CATEGORY_PROPOSAL_APPROVE),
+            "an ungranted category is inactive"
+        );
         assert!(!active_of(CATEGORY_CLEARANCE_APPROVE));
     }
 }

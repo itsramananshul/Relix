@@ -187,8 +187,11 @@ async fn prime_status_mini_mesh_json_and_stream() {
     spawn_inbound_loop(events, dispatch.clone());
 
     let tmpdir = TempDir::new().unwrap();
-    let bundle_bytes =
-        mint_bridge_bundle_bytes(&org_root, "prime-status-test-bridge", vec!["operators".into()]);
+    let bundle_bytes = mint_bridge_bundle_bytes(
+        &org_root,
+        "prime-status-test-bridge",
+        vec!["operators".into()],
+    );
     let bundle_path = tmpdir.path().join("bridge.bundle");
     std::fs::write(&bundle_path, &bundle_bytes).unwrap();
     let client_key_path = tmpdir.path().join("client.key");

@@ -5765,7 +5765,14 @@ pub fn execute_run_apply(
         }
     };
     // Plan event (always recorded — the preview the apply acted on).
-    let _ = store.append_run_event(run_id, "apply.plan", "relix", &outcome.plan.note, None, false);
+    let _ = store.append_run_event(
+        run_id,
+        "apply.plan",
+        "relix",
+        &outcome.plan.note,
+        None,
+        false,
+    );
     if outcome.status == "conflicted" {
         // Refused the whole apply — nothing written.
         let _ = store.set_run_apply_status(run_id, "conflicted", &outcome.plan.note, 0, 0);
@@ -5789,7 +5796,10 @@ pub fn execute_run_apply(
             None,
             false,
         );
-        let summary = format!("{} applied, {} failed", outcome.applied_files, outcome.failed_files);
+        let summary = format!(
+            "{} applied, {} failed",
+            outcome.applied_files, outcome.failed_files
+        );
         let _ = store.set_run_apply_status(
             run_id,
             outcome.status,
@@ -9855,10 +9865,14 @@ fn register_node_type_handlers(
                             } else {
                                 match st.task_tenant(&brief_id) {
                                     Ok(Some(t)) if t == tenant => st.runs_for_brief(&brief_id, 100),
-                                    Ok(None) if tenant == "default" => st.runs_for_brief(&brief_id, 100),
-                                    Ok(_) => Err(crate::nodes::coordinator::CoordinatorError::NotFound(
-                                        brief_id.clone(),
-                                    )),
+                                    Ok(None) if tenant == "default" => {
+                                        st.runs_for_brief(&brief_id, 100)
+                                    }
+                                    Ok(_) => {
+                                        Err(crate::nodes::coordinator::CoordinatorError::NotFound(
+                                            brief_id.clone(),
+                                        ))
+                                    }
                                     Err(e) => Err(e),
                                 }
                             };
@@ -9867,7 +9881,8 @@ fn register_node_type_handlers(
                                     Ok(body) => crate::dispatch::HandlerOutcome::Ok(body),
                                     Err(e) => crate::dispatch::HandlerOutcome::Err(
                                         relix_core::types::ErrorEnvelope {
-                                            kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                            kind:
+                                                relix_core::types::error_kinds::RESPONDER_INTERNAL,
                                             cause: format!("brief.runs encode: {e}"),
                                             retry_hint: 1,
                                             retry_after: None,
@@ -10046,7 +10061,8 @@ fn register_node_type_handlers(
                                     Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
                                     Err(e) => crate::dispatch::HandlerOutcome::Err(
                                         relix_core::types::ErrorEnvelope {
-                                            kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                            kind:
+                                                relix_core::types::error_kinds::RESPONDER_INTERNAL,
                                             cause: format!("run.events encode: {e}"),
                                             retry_hint: 1,
                                             retry_after: None,
@@ -10277,8 +10293,10 @@ fn register_node_type_handlers(
                             let arg = String::from_utf8_lossy(&ctx.args).to_string();
                             let mut parts = arg.splitn(2, '|');
                             let run_id = parts.next().unwrap_or("").trim().to_string();
-                            let aid: i64 =
-                                parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(-1);
+                            let aid: i64 = parts
+                                .next()
+                                .and_then(|s| s.trim().parse().ok())
+                                .unwrap_or(-1);
                             let tenant = ctx.tenant_id_or_default().to_string();
                             let invalid = |c: String| {
                                 crate::dispatch::HandlerOutcome::Err(
@@ -10301,7 +10319,7 @@ fn register_node_type_handlers(
                                 Err(e) => return invalid(format!("run.artifact_diff: {e}")),
                             };
                             use crate::nodes::coordinator::heartbeat::{
-                                read_artifact_diff, DiffOutcome,
+                                DiffOutcome, read_artifact_diff,
                             };
                             let root = st.run_workspace_config().project_root.clone();
                             let max = crate::nodes::coordinator::ARTIFACT_PREVIEW_MAX_BYTES;
@@ -10381,7 +10399,8 @@ fn register_node_type_handlers(
                                     let _ = st.append_run_event(
                                         &run_id, "review", "relix", &msg, None, false,
                                     );
-                                    let body = serde_json::json!({"run_id": run_id, "review": state});
+                                    let body =
+                                        serde_json::json!({"run_id": run_id, "review": state});
                                     match serde_json::to_vec(&body) {
                                         Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
                                         Err(e) => invalid(format!("run.review encode: {e}")),
@@ -10532,8 +10551,7 @@ fn register_node_type_handlers(
                     move |ctx: crate::dispatch::InvocationCtx| {
                         let st = st.clone();
                         async move {
-                            let agent_id =
-                                String::from_utf8_lossy(&ctx.args).trim().to_string();
+                            let agent_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
                             let tenant = ctx.tenant_id_or_default().to_string();
                             let invalid = |c: String| {
                                 crate::dispatch::HandlerOutcome::Err(
@@ -10551,9 +10569,7 @@ fn register_node_type_handlers(
                             match st.list_runtime_state(&tenant, &agent_id) {
                                 Ok(rows) => match serde_json::to_vec(&rows) {
                                     Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
-                                    Err(e) => invalid(format!(
-                                        "rig.runtime_state.get encode: {e}"
-                                    )),
+                                    Err(e) => invalid(format!("rig.runtime_state.get encode: {e}")),
                                 },
                                 Err(e) => invalid(format!("rig.runtime_state.get: {e}")),
                             }
@@ -10605,7 +10621,7 @@ fn register_node_type_handlers(
                                     Err(e) => {
                                         return invalid(format!(
                                             "rig.runtime_state.list: invalid JSON: {e}"
-                                        ))
+                                        ));
                                     }
                                 }
                             };
@@ -10614,9 +10630,9 @@ fn register_node_type_handlers(
                                     let body = serde_json::json!({ "rows": rows });
                                     match serde_json::to_vec(&body) {
                                         Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
-                                        Err(e) => invalid(format!(
-                                            "rig.runtime_state.list encode: {e}"
-                                        )),
+                                        Err(e) => {
+                                            invalid(format!("rig.runtime_state.list encode: {e}"))
+                                        }
                                     }
                                 }
                                 Err(e) => invalid(format!("rig.runtime_state.list: {e}")),
@@ -10650,15 +10666,14 @@ fn register_node_type_handlers(
                                     },
                                 )
                             };
-                            let v: serde_json::Value =
-                                match serde_json::from_slice(&ctx.args) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        return invalid(format!(
-                                            "rig.runtime_state.reset: invalid JSON: {e}"
-                                        ))
-                                    }
-                                };
+                            let v: serde_json::Value = match serde_json::from_slice(&ctx.args) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    return invalid(format!(
+                                        "rig.runtime_state.reset: invalid JSON: {e}"
+                                    ));
+                                }
+                            };
                             let agent_id = v
                                 .get("agent_id")
                                 .and_then(|x| x.as_str())
@@ -10674,8 +10689,9 @@ fn register_node_type_handlers(
                                 .map(|s| s.trim())
                                 .filter(|s| !s.is_empty());
                             let removed = match brief_key {
-                                Some(bk) => st
-                                    .reset_runtime_state_for_brief(&tenant, &agent_id, bk),
+                                Some(bk) => {
+                                    st.reset_runtime_state_for_brief(&tenant, &agent_id, bk)
+                                }
                                 None => st.reset_runtime_state(&tenant, &agent_id),
                             };
                             match removed {
@@ -10683,9 +10699,9 @@ fn register_node_type_handlers(
                                     let body = serde_json::json!({ "removed": n });
                                     match serde_json::to_vec(&body) {
                                         Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
-                                        Err(e) => invalid(format!(
-                                            "rig.runtime_state.reset encode: {e}"
-                                        )),
+                                        Err(e) => {
+                                            invalid(format!("rig.runtime_state.reset encode: {e}"))
+                                        }
                                     }
                                 }
                                 Err(e) => invalid(format!("rig.runtime_state.reset: {e}")),
@@ -10824,10 +10840,15 @@ fn register_node_type_handlers(
                             } else {
                                 match serde_json::from_slice(&ctx.args) {
                                     Ok(v) => v,
-                                    Err(e) => return invalid(format!("maintenance.prune: bad body: {e}")),
+                                    Err(e) => {
+                                        return invalid(format!(
+                                            "maintenance.prune: bad body: {e}"
+                                        ));
+                                    }
                                 }
                             };
-                            let dry_run = v.get("dry_run").and_then(|x| x.as_bool()).unwrap_or(true);
+                            let dry_run =
+                                v.get("dry_run").and_then(|x| x.as_bool()).unwrap_or(true);
                             let older_than_days = v
                                 .get("older_than_days")
                                 .and_then(|x| x.as_u64())
@@ -10837,12 +10858,18 @@ fn register_node_type_handlers(
                                 .and_then(|x| x.as_u64())
                                 .map(|n| n as usize)
                                 .unwrap_or(mnt::DEFAULT_PRUNE_KEEP_LATEST);
-                            let delete_workspaces =
-                                v.get("delete_workspaces").and_then(|x| x.as_bool()).unwrap_or(true);
-                            let delete_events =
-                                v.get("delete_events").and_then(|x| x.as_bool()).unwrap_or(false);
-                            let delete_artifacts =
-                                v.get("delete_artifacts").and_then(|x| x.as_bool()).unwrap_or(false);
+                            let delete_workspaces = v
+                                .get("delete_workspaces")
+                                .and_then(|x| x.as_bool())
+                                .unwrap_or(true);
+                            let delete_events = v
+                                .get("delete_events")
+                                .and_then(|x| x.as_bool())
+                                .unwrap_or(false);
+                            let delete_artifacts = v
+                                .get("delete_artifacts")
+                                .and_then(|x| x.as_bool())
+                                .unwrap_or(false);
 
                             // Run the prune through the SHARED engine, which
                             // records a durable audit row for EVERY attempt
@@ -10858,7 +10885,9 @@ fn register_node_type_handlers(
                                 dry_run,
                             ) {
                                 Ok(o) => o,
-                                Err(e) => return invalid(format!("maintenance.prune refused: {e}")),
+                                Err(e) => {
+                                    return invalid(format!("maintenance.prune refused: {e}"));
+                                }
                             };
                             if dry_run {
                                 tracing::info!(
@@ -10877,11 +10906,17 @@ fn register_node_type_handlers(
                                     "maintenance.prune executed"
                                 );
                             }
-                            let mut body =
-                                serde_json::to_value(&outcome.report).unwrap_or(serde_json::json!({}));
+                            let mut body = serde_json::to_value(&outcome.report)
+                                .unwrap_or(serde_json::json!({}));
                             if let Some(obj) = body.as_object_mut() {
-                                obj.insert("events_deleted".into(), serde_json::json!(outcome.events_deleted));
-                                obj.insert("artifacts_deleted".into(), serde_json::json!(outcome.artifacts_deleted));
+                                obj.insert(
+                                    "events_deleted".into(),
+                                    serde_json::json!(outcome.events_deleted),
+                                );
+                                obj.insert(
+                                    "artifacts_deleted".into(),
+                                    serde_json::json!(outcome.artifacts_deleted),
+                                );
                                 obj.insert("audit_id".into(), serde_json::json!(outcome.audit_id));
                             }
                             match serde_json::to_vec(&body) {
@@ -10913,7 +10948,8 @@ fn register_node_type_handlers(
                                     Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
                                     Err(e) => crate::dispatch::HandlerOutcome::Err(
                                         relix_core::types::ErrorEnvelope {
-                                            kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                            kind:
+                                                relix_core::types::error_kinds::RESPONDER_INTERNAL,
                                             cause: format!("maintenance.audit encode: {e}"),
                                             retry_hint: 1,
                                             retry_after: None,
@@ -10966,8 +11002,12 @@ fn register_node_type_handlers(
                                 "maintenance: scheduled autoprune tick"
                             ),
                             Ok(Ok(None)) => {}
-                            Ok(Err(e)) => tracing::warn!(error = %e, "maintenance: autoprune refused"),
-                            Err(e) => tracing::error!(error = %e, "maintenance: autoprune join error"),
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = %e, "maintenance: autoprune refused")
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "maintenance: autoprune join error")
+                            }
                         }
                     }
                 });
@@ -11233,7 +11273,9 @@ fn register_node_type_handlers(
             std::env::var("RELIX_AUTONOMOUS_RECOVERY").ok().as_deref(),
         ) {
             let recovery_max = crate::nodes::coordinator::heartbeat::parse_autonomous_recovery_max(
-                std::env::var("RELIX_AUTONOMOUS_RECOVERY_MAX").ok().as_deref(),
+                std::env::var("RELIX_AUTONOMOUS_RECOVERY_MAX")
+                    .ok()
+                    .as_deref(),
             );
             let recovery_interval_secs = std::env::var("RELIX_AUTONOMOUS_RECOVERY_INTERVAL_SECS")
                 .ok()
@@ -11268,7 +11310,9 @@ fn register_node_type_handlers(
                         // — so the autonomous lane respects the SAME budget
                         // hard-stop the autonomous dispatch does.
                         let decide = |cand: &crate::nodes::coordinator::RetryCandidate| {
-                            use crate::nodes::coordinator::heartbeat::{RetryDecision, RetryInputs, RunModelPrefs};
+                            use crate::nodes::coordinator::heartbeat::{
+                                RetryDecision, RetryInputs, RunModelPrefs,
+                            };
                             let Some(card) = ts.brief_card(&cand.brief_id).ok().flatten() else {
                                 return RetryDecision::Skip;
                             };
@@ -11298,9 +11342,7 @@ fn register_node_type_handlers(
                             ) {
                                 return RetryDecision::Skip;
                             }
-                            let charter = agent
-                                .instruction_bundle
-                                .clone();
+                            let charter = agent.instruction_bundle.clone();
                             let charter = if charter.trim().is_empty() {
                                 None
                             } else {
@@ -11391,7 +11433,8 @@ fn register_node_type_handlers(
                 // tick refuses/skips a hire on an unknown Rig rather than silently
                 // binding a bad one, so a typo surfaces as a pending hire.
                 let prime_hire_rig =
-                    crate::nodes::coordinator::agent::prime_driver::configured_autonomous_hire_rig();
+                    crate::nodes::coordinator::agent::prime_driver::configured_autonomous_hire_rig(
+                    );
                 let task_store = store.clone();
                 let ag_store = agent_store.clone();
                 let registry = rig_registry.clone();
@@ -13346,8 +13389,8 @@ mod run_apply_capability_tests {
     //! refuses the whole apply and leaves the Brief in review.
     use super::{execute_run_apply, execute_run_diff};
     use crate::nodes::coordinator::heartbeat::{
-        DEFAULT_WORKSPACE_MAX_BYTES, DEFAULT_WORKSPACE_MAX_FILES, WorkspaceConfig, WorkspaceContext,
-        run_brief_now,
+        DEFAULT_WORKSPACE_MAX_BYTES, DEFAULT_WORKSPACE_MAX_FILES, WorkspaceConfig,
+        WorkspaceContext, run_brief_now,
     };
     use crate::nodes::coordinator::{RetryPolicy, TaskStore};
 
@@ -13372,7 +13415,16 @@ mod run_apply_capability_tests {
 
     fn ready_brief(s: &TaskStore, title: &str, assignee: &str) -> String {
         let id = s
-            .create(title, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .create(
+                title,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         s.set_brief_field(&id, "assignee", assignee).unwrap();
         s.set_brief_field(&id, "reviewer", "reviewer_1").unwrap();
@@ -13386,12 +13438,20 @@ mod run_apply_capability_tests {
     /// overwrite / conflict), the strongest apply semantics, not just create.
     fn seed_modifying_rig(content: &str) -> crate::rig::RigRegistry {
         let (prog, args) = if cfg!(windows) {
-            ("cmd".to_string(), vec!["/C".to_string(), format!("echo {content}> seed.txt")])
+            (
+                "cmd".to_string(),
+                vec!["/C".to_string(), format!("echo {content}> seed.txt")],
+            )
         } else {
-            ("sh".to_string(), vec!["-c".to_string(), format!("printf '{content}' > seed.txt")])
+            (
+                "sh".to_string(),
+                vec!["-c".to_string(), format!("printf '{content}' > seed.txt")],
+            )
         };
         let mut reg = crate::rig::RigRegistry::new();
-        reg.register(std::sync::Arc::new(crate::rig::ProcessRig::new("mk", prog, args)));
+        reg.register(std::sync::Arc::new(crate::rig::ProcessRig::new(
+            "mk", prog, args,
+        )));
         reg.set_default(Some("mk".to_string()));
         reg
     }
@@ -13410,9 +13470,16 @@ mod run_apply_capability_tests {
         s.add_snag(&integrate, &track).unwrap();
 
         // Run on a real adapter that rewrites seed.txt in the scoped workspace.
-        let report =
-            run_brief_now(&s, &seed_modifying_rig("v2"), None, 300, &track, None, "go".into())
-                .unwrap();
+        let report = run_brief_now(
+            &s,
+            &seed_modifying_rig("v2"),
+            None,
+            300,
+            &track,
+            None,
+            "go".into(),
+        )
+        .unwrap();
         let run_id = report.run_id.expect("a committed run has an id");
 
         // (1) The run captured a REAL changed file as an artifact, with the
@@ -13429,7 +13496,10 @@ mod run_apply_capability_tests {
         );
 
         // The successful Shift parked the Brief in review; the dependent blocks.
-        assert_eq!(s.board_status(&track).unwrap().as_deref(), Some("in_review"));
+        assert_eq!(
+            s.board_status(&track).unwrap().as_deref(),
+            Some("in_review")
+        );
         assert!(
             s.is_blocked(&integrate).unwrap(),
             "integrate is blocked while the track awaits review"
@@ -13452,7 +13522,10 @@ mod run_apply_capability_tests {
             "v1",
             "a refused apply writes nothing"
         );
-        assert_eq!(s.board_status(&track).unwrap().as_deref(), Some("in_review"));
+        assert_eq!(
+            s.board_status(&track).unwrap().as_deref(),
+            Some("in_review")
+        );
 
         // (3) Accept → run.diff flips to eligible.
         s.set_run_review(&run_id, "accepted", "lgtm").unwrap();
@@ -13504,15 +13577,26 @@ mod run_apply_capability_tests {
         std::fs::write(proj.path().join("seed.txt"), "v1").unwrap();
         let s = store_with_project_root(ws_tmp.path(), proj.path());
         let track = ready_brief(&s, "edit the seed file", "agt_eng");
-        let report =
-            run_brief_now(&s, &seed_modifying_rig("v2"), None, 300, &track, None, "go".into())
-                .unwrap();
+        let report = run_brief_now(
+            &s,
+            &seed_modifying_rig("v2"),
+            None,
+            300,
+            &track,
+            None,
+            "go".into(),
+        )
+        .unwrap();
         let run_id = report.run_id.unwrap();
         s.set_run_review(&run_id, "accepted", "").unwrap();
 
         // The project file diverges from the run's baseline AFTER the run — a
         // real conflict the all-or-nothing apply must refuse (no three-way merge).
-        std::fs::write(proj.path().join("seed.txt"), "operator edited this meanwhile").unwrap();
+        std::fs::write(
+            proj.path().join("seed.txt"),
+            "operator edited this meanwhile",
+        )
+        .unwrap();
 
         let res = execute_run_apply(&s, &run_id, "default").unwrap();
         assert_eq!(res["apply_status"], serde_json::json!("conflicted"));
@@ -13526,7 +13610,10 @@ mod run_apply_capability_tests {
             std::fs::read_to_string(proj.path().join("seed.txt")).unwrap(),
             "operator edited this meanwhile"
         );
-        assert_eq!(s.board_status(&track).unwrap().as_deref(), Some("in_review"));
+        assert_eq!(
+            s.board_status(&track).unwrap().as_deref(),
+            Some("in_review")
+        );
         // The durable run row records the conflict.
         assert_eq!(
             s.get_run(&run_id).unwrap().unwrap().apply_status.as_deref(),
@@ -13542,9 +13629,16 @@ mod run_apply_capability_tests {
         let s = store_with_project_root(ws_tmp.path(), proj.path());
         let track = ready_brief(&s, "edit", "agt_eng");
         s.set_task_tenant(&track, "guild-a").unwrap();
-        let report =
-            run_brief_now(&s, &seed_modifying_rig("v2"), None, 300, &track, None, "go".into())
-                .unwrap();
+        let report = run_brief_now(
+            &s,
+            &seed_modifying_rig("v2"),
+            None,
+            300,
+            &track,
+            None,
+            "go".into(),
+        )
+        .unwrap();
         let run_id = report.run_id.unwrap();
 
         // Another Guild cannot diff or apply this run — it reads as not-found.
@@ -13556,8 +13650,14 @@ mod run_apply_capability_tests {
         // nothing into the project root.
         assert!(execute_run_diff(&s, &run_id, "guild-a").is_ok());
         let err = execute_run_apply(&s, &run_id, "guild-a").unwrap_err();
-        assert!(err.contains("apply refused"), "an unaccepted run is gated: {err}");
-        assert_eq!(std::fs::read_to_string(proj.path().join("seed.txt")).unwrap(), "v1");
+        assert!(
+            err.contains("apply refused"),
+            "an unaccepted run is gated: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj.path().join("seed.txt")).unwrap(),
+            "v1"
+        );
         assert_eq!(
             s.get_run(&run_id).unwrap().unwrap().apply_status.as_deref(),
             Some("blocked")

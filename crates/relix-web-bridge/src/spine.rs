@@ -596,7 +596,10 @@ async fn fetch_prime_roster(state: &AppState) -> Vec<(String, String, String)> {
 /// model is asked for a STRICT JSON object matching the validator's contract;
 /// the coordinator rejects anything that does not validate, so the prompt only
 /// needs to steer, not to be trusted.
-pub fn build_prime_ai_prompt(redacted_request: &str, roster: &[(String, String, String)]) -> String {
+pub fn build_prime_ai_prompt(
+    redacted_request: &str,
+    roster: &[(String, String, String)],
+) -> String {
     let mut roster_block = String::new();
     if roster.is_empty() {
         roster_block.push_str("(no Operatives hired yet)");
@@ -815,8 +818,8 @@ pub async fn prime_proposal_advance(
     if req.action.trim().is_empty() {
         return Err(bad("action required"));
     }
-    let arg = serde_json::json!({ "proposal_id": id.trim(), "action": req.action.trim() })
-        .to_string();
+    let arg =
+        serde_json::json!({ "proposal_id": id.trim(), "action": req.action.trim() }).to_string();
     advance_response(call_peer(&state, "prime.advance", arg.as_bytes()).await?)
 }
 
@@ -1130,7 +1133,14 @@ pub async fn strategy_status(
     if mandate_id.trim().is_empty() {
         return Err(bad("mandate_id required"));
     }
-    json_passthrough(call_peer(&state, "mandate.strategy.status", mandate_id.trim().as_bytes()).await?)
+    json_passthrough(
+        call_peer(
+            &state,
+            "mandate.strategy.status",
+            mandate_id.trim().as_bytes(),
+        )
+        .await?,
+    )
 }
 
 /// `POST /v1/spine/mandates/:id/strategy/propose` — set/replace the strategy
@@ -1166,7 +1176,14 @@ pub async fn strategy_approve(
     if mandate_id.trim().is_empty() {
         return Err(bad("mandate_id required"));
     }
-    json_passthrough(call_peer(&state, "mandate.strategy.approve", mandate_id.trim().as_bytes()).await?)
+    json_passthrough(
+        call_peer(
+            &state,
+            "mandate.strategy.approve",
+            mandate_id.trim().as_bytes(),
+        )
+        .await?,
+    )
 }
 
 /// `POST /v1/spine/mandates/:id/strategy/reject` — reject a proposed
@@ -1178,7 +1195,14 @@ pub async fn strategy_reject(
     if mandate_id.trim().is_empty() {
         return Err(bad("mandate_id required"));
     }
-    json_passthrough(call_peer(&state, "mandate.strategy.reject", mandate_id.trim().as_bytes()).await?)
+    json_passthrough(
+        call_peer(
+            &state,
+            "mandate.strategy.reject",
+            mandate_id.trim().as_bytes(),
+        )
+        .await?,
+    )
 }
 
 /// Normalise a Clearance decision into the wire value
@@ -1810,7 +1834,12 @@ pub async fn runtime_state_reset(
         return Err(bad("agent_id is required"));
     }
     let mut body = serde_json::json!({ "agent_id": req.agent_id.trim() });
-    if let Some(bk) = req.brief_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(bk) = req
+        .brief_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         body["brief_key"] = serde_json::Value::String(bk.to_string());
     }
     let arg = serde_json::to_vec(&body).map_err(|e| bad(&format!("encode: {e}")))?;
@@ -1958,7 +1987,11 @@ pub async fn maintenance_prune(
     State(state): State<AppState>,
     body: axum::body::Bytes,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
-    let bytes = if body.is_empty() { b"{}".to_vec() } else { body.to_vec() };
+    let bytes = if body.is_empty() {
+        b"{}".to_vec()
+    } else {
+        body.to_vec()
+    };
     json_passthrough(call_peer(&state, "maintenance.prune", &bytes).await?)
 }
 
@@ -2131,8 +2164,8 @@ pub async fn open_interaction(
     if req.choices.iter().any(|c| c.contains('|')) {
         return Err(bad("a choice must not contain `|`"));
     }
-    let choices_json = serde_json::to_string(&req.choices)
-        .map_err(|e| bad(&format!("choices: {e}")))?;
+    let choices_json =
+        serde_json::to_string(&req.choices).map_err(|e| bad(&format!("choices: {e}")))?;
     let arg = format!(
         "{id}|{}|{}|{}|{}",
         req.kind.trim(),
@@ -3233,15 +3266,23 @@ mod tests {
     fn run_report_real_outcomes_and_preconditions_stay_200() {
         // A live/terminal run is a 200 — the client polls /v1/runs for it.
         for status in ["running", "done", "failed", "continued"] {
-            let body = format!(r#"{{"brief_id":"REL-1","status":"{status}","rig":"echo","summary":"ok"}}"#);
+            let body = format!(
+                r#"{{"brief_id":"REL-1","status":"{status}","rig":"echo","summary":"ok"}}"#
+            );
             let resp = run_report_response(body.into_bytes()).unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "{status} must be 200");
         }
         // Precondition refusals describe a FIXABLE setup gap, not a lost race,
         // so they are deliberately NOT 409 — a client may retry after fixing
         // the cause. Only `already_running` is the never-retry conflict.
-        for status in ["unassigned", "no_adapter", "adapter_unavailable", "workspace_error"] {
-            let body = format!(r#"{{"brief_id":"REL-1","status":"{status}","rig":"","summary":"x"}}"#);
+        for status in [
+            "unassigned",
+            "no_adapter",
+            "adapter_unavailable",
+            "workspace_error",
+        ] {
+            let body =
+                format!(r#"{{"brief_id":"REL-1","status":"{status}","rig":"","summary":"x"}}"#);
             let resp = run_report_response(body.into_bytes()).unwrap();
             assert_eq!(
                 resp.status(),
@@ -3259,7 +3300,10 @@ mod tests {
         // refusal (POLICY_DENIED, kind 6) is a 403, NOT a 502 — a client
         // refusal must never look like an upstream failure.
         assert_eq!(
-            coordinator_err_status(ek::POLICY_DENIED, "assignee hint denied: out of assign scope"),
+            coordinator_err_status(
+                ek::POLICY_DENIED,
+                "assignee hint denied: out of assign scope"
+            ),
             StatusCode::FORBIDDEN,
         );
         // The rest of the governance/safety "denied" family is 403 too,
@@ -3270,7 +3314,10 @@ mod tests {
             StatusCode::FORBIDDEN,
         );
         assert_eq!(
-            coordinator_err_status(ek::SECURITY_DENIED, "content looked like a poisoning attempt"),
+            coordinator_err_status(
+                ek::SECURITY_DENIED,
+                "content looked like a poisoning attempt"
+            ),
             StatusCode::FORBIDDEN,
         );
 
@@ -3378,8 +3425,16 @@ mod tests {
     #[test]
     fn prime_ai_prompt_is_bounded_and_pipe_safe() {
         let roster = vec![
-            ("Ada".to_string(), "engineer".to_string(), "active".to_string()),
-            ("Bea".to_string(), "designer".to_string(), "pending".to_string()),
+            (
+                "Ada".to_string(),
+                "engineer".to_string(),
+                "active".to_string(),
+            ),
+            (
+                "Bea".to_string(),
+                "designer".to_string(),
+                "pending".to_string(),
+            ),
         ];
         let p = build_prime_ai_prompt("Build a | dashboard", &roster);
         // Pipes are scrubbed so the prompt is safe in any wire form.
@@ -3689,14 +3744,8 @@ mod tests {
             // §1.8 Dossier authoring + latest-load — both static `dossiers/*`
             // segments (no sibling conflict with the other `:id/...` routes;
             // `author` and `latest` are static, not params).
-            .route(
-                "/v1/spine/briefs/:id/dossiers/author",
-                post(author_dossier),
-            )
-            .route(
-                "/v1/spine/briefs/:id/dossiers/latest",
-                get(dossier_latest),
-            )
+            .route("/v1/spine/briefs/:id/dossiers/author", post(author_dossier))
+            .route("/v1/spine/briefs/:id/dossiers/latest", get(dossier_latest))
             // First-run company surfaces + the Action Center (company-model
             // §8.2) — `/company` vs `/company/actions` vs `/company/init` must
             // not collide in matchit.
@@ -3712,10 +3761,7 @@ mod tests {
             .route("/v1/spine/prime/start", post(prime_start))
             .route("/v1/spine/prime/proposals", get(prime_proposals))
             .route("/v1/spine/prime/proposals/:id", get(prime_proposal))
-            .route(
-                "/v1/spine/prime/proposals/:id/status",
-                get(prime_status),
-            )
+            .route("/v1/spine/prime/proposals/:id/status", get(prime_status))
             .route(
                 "/v1/spine/prime/proposals/:id/status/stream",
                 get(prime_status_stream),

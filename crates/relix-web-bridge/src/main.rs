@@ -85,6 +85,7 @@ async fn route_latency_log(req: Request, next: Next) -> Response {
 }
 
 mod activity;
+mod adapters;
 mod agent;
 mod agent_memory;
 mod agent_metrics;
@@ -99,12 +100,12 @@ mod approval;
 #[cfg(test)]
 mod approval_get_mini_mesh_test;
 mod audit_tenants;
-#[cfg(test)]
-mod brief_interaction_mini_mesh_test;
 mod auth;
 mod belief;
 mod blocklist;
 mod bridge_back;
+#[cfg(test)]
+mod brief_interaction_mini_mesh_test;
 mod browser_captures;
 mod browser_sessions;
 mod budget;
@@ -120,7 +121,6 @@ mod config_api;
 mod control_plane;
 mod credentials;
 mod cron;
-mod adapters;
 mod dashboard;
 mod dashboard_auth;
 mod delegate;
@@ -165,16 +165,20 @@ mod pii;
 mod planning;
 #[cfg(test)]
 mod planning_mini_mesh_test;
-#[cfg(test)]
-mod prime_status_mini_mesh_test;
 mod plugins;
 mod policy_denials;
 mod policy_simulate;
 mod policy_tenants;
+#[cfg(test)]
+mod prime_status_mini_mesh_test;
 mod provenance;
 mod rate_limit;
 mod reasoning;
 mod routing;
+#[cfg(test)]
+mod run_apply_mini_mesh_test;
+#[cfg(test)]
+mod runs_stream_mini_mesh_test;
 mod schema;
 mod secrets;
 mod secrets_available;
@@ -184,10 +188,6 @@ mod sessions_obs;
 mod skills;
 mod slack;
 mod sol_validate;
-#[cfg(test)]
-mod run_apply_mini_mesh_test;
-#[cfg(test)]
-mod runs_stream_mini_mesh_test;
 mod spine;
 mod sse;
 #[cfg(test)]
@@ -323,18 +323,27 @@ fn run_admin_reset(
 
     let was_new = existing.is_none();
     println!();
-    println!("Relix dashboard admin {} (LOCAL operator recovery).", if was_new { "created" } else { "reset" });
+    println!(
+        "Relix dashboard admin {} (LOCAL operator recovery).",
+        if was_new { "created" } else { "reset" }
+    );
     println!("  admin file : {}", admin_path.display());
     println!("  username   : {username}");
     if generated {
         println!("  password   : {password}");
-        println!("  (generated — copy it now; only the Argon2id hash is stored, so it is not shown again)");
+        println!(
+            "  (generated — copy it now; only the Argon2id hash is stored, so it is not shown again)"
+        );
     } else {
         println!("  password   : (the value you passed via --password)");
     }
     println!();
-    println!("Restart the bridge for the new credential to take effect and to drop existing sessions.");
-    println!("There is NO remote/unauthenticated reset — this command only runs locally on this machine.");
+    println!(
+        "Restart the bridge for the new credential to take effect and to drop existing sessions."
+    );
+    println!(
+        "There is NO remote/unauthenticated reset — this command only runs locally on this machine."
+    );
     Ok(())
 }
 
@@ -648,12 +657,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         // Prime guided driver v1 (mandate entry): next governed step + one-step
         // advance (company-model §5.4/§8.2 + §12.5).
-        .route("/v1/spine/mandates/:id/next-step", get(spine::mandate_next_step))
-        .route("/v1/spine/mandates/:id/advance", post(spine::mandate_advance))
-        .route("/v1/spine/mandates/:id/strategy", get(spine::strategy_status))
-        .route("/v1/spine/mandates/:id/strategy/propose", post(spine::strategy_propose))
-        .route("/v1/spine/mandates/:id/strategy/approve", post(spine::strategy_approve))
-        .route("/v1/spine/mandates/:id/strategy/reject", post(spine::strategy_reject))
+        .route(
+            "/v1/spine/mandates/:id/next-step",
+            get(spine::mandate_next_step),
+        )
+        .route(
+            "/v1/spine/mandates/:id/advance",
+            post(spine::mandate_advance),
+        )
+        .route(
+            "/v1/spine/mandates/:id/strategy",
+            get(spine::strategy_status),
+        )
+        .route(
+            "/v1/spine/mandates/:id/strategy/propose",
+            post(spine::strategy_propose),
+        )
+        .route(
+            "/v1/spine/mandates/:id/strategy/approve",
+            post(spine::strategy_approve),
+        )
+        .route(
+            "/v1/spine/mandates/:id/strategy/reject",
+            post(spine::strategy_reject),
+        )
         .route("/v1/spine/briefs/search", get(spine::brief_search))
         .route("/v1/spine/briefs/:id", get(spine::brief_detail))
         .route("/v1/spine/briefs/:id/wakeups", get(spine::brief_wakeups))
@@ -673,10 +700,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // decide route — axum/matchit gives the static path priority, so they
         // do not conflict (same shape as `…/interactions/stream` vs
         // `…/interactions/:iid`). Register before the param route for clarity.
-        .route(
-            "/v1/spine/clearances/stream",
-            get(spine::clearances_stream),
-        )
+        .route("/v1/spine/clearances/stream", get(spine::clearances_stream))
         .route(
             "/v1/spine/clearances/:approval_id/decide",
             post(spine::decide_clearance),
@@ -728,8 +752,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Persisted adapter runtime state (TG2). Static paths registered
         // before `:run_id` so they take routing precedence.
         .route("/v1/runs/runtime-state", get(spine::runtime_state_get))
-        .route("/v1/runs/runtime-state/list", get(spine::runtime_state_list))
-        .route("/v1/runs/runtime-state/reset", post(spine::runtime_state_reset))
+        .route(
+            "/v1/runs/runtime-state/list",
+            get(spine::runtime_state_list),
+        )
+        .route(
+            "/v1/runs/runtime-state/reset",
+            post(spine::runtime_state_reset),
+        )
         // Run/Brief execution event stream (TG5) — tenant-scoped SSE.
         .route("/v1/runs/events/stream", get(tasks::runs_events_stream))
         // Active Runs snapshot stream (dashboard-design §10/§11): tenant-scoped
@@ -744,8 +774,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/runs/:run_id/cancel", post(spine::run_cancel))
         .route("/v1/runs/:run_id/retry", post(spine::run_retry))
         .route("/v1/runs/:run_id/artifacts", get(spine::run_artifacts))
-        .route("/v1/runs/:run_id/artifacts/:artifact_id/preview", get(spine::run_artifact_preview))
-        .route("/v1/runs/:run_id/artifacts/:artifact_id/diff", get(spine::run_artifact_diff))
+        .route(
+            "/v1/runs/:run_id/artifacts/:artifact_id/preview",
+            get(spine::run_artifact_preview),
+        )
+        .route(
+            "/v1/runs/:run_id/artifacts/:artifact_id/diff",
+            get(spine::run_artifact_diff),
+        )
         .route("/v1/runs/:run_id/review", post(spine::run_review))
         .route("/v1/runs/:run_id/diff", get(spine::run_diff))
         .route("/v1/runs/:run_id/apply", post(spine::run_apply))
@@ -761,7 +797,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/company", get(spine::company_status))
         .route("/v1/spine/company/init", post(spine::company_init))
         // First-run safe-local on-ramp: Founder + echo starter crew (§12.6).
-        .route("/v1/spine/company/starter-crew", post(spine::company_starter_crew))
+        .route(
+            "/v1/spine/company/starter-crew",
+            post(spine::company_starter_crew),
+        )
         // Action Center: the operator's next-actions feed (company-model §8.2).
         .route("/v1/spine/company/actions", get(spine::company_actions))
         // Action Center snapshot stream (company-model §5.4/§8.2): tenant-scoped

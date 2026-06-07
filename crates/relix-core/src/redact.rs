@@ -542,15 +542,22 @@ mod tests {
     }
     fn jwt_three_segment() -> String {
         frag(&[
-            "ey", "J", "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.",
-            "ey", "J",
+            "ey",
+            "J",
+            "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.",
+            "ey",
+            "J",
             "zdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
         ])
     }
     fn jwt_no_bearer() -> String {
         frag(&[
-            "ey", "J", "abcdefghijklmnop123456.",
-            "ey", "J", "qrstuvwxyz0123456789.SflKxwRJSMeKKF2QT4fwpMeJfPO",
+            "ey",
+            "J",
+            "abcdefghijklmnop123456.",
+            "ey",
+            "J",
+            "qrstuvwxyz0123456789.SflKxwRJSMeKKF2QT4fwpMeJfPO",
         ])
     }
     fn jwt_header_segment() -> String {
@@ -834,7 +841,10 @@ mod tests {
         // Inputs are assembled at runtime (see the fixture helpers) so no
         // secret-shaped literal appears in source.
         let cases: [(String, &str); 7] = [
-            (frag(&["sk", "-abcdefghijklmnopqrstuvwxyz0"]), "[REDACTED:OPENAI_KEY]"),
+            (
+                frag(&["sk", "-abcdefghijklmnopqrstuvwxyz0"]),
+                "[REDACTED:OPENAI_KEY]",
+            ),
             (github_classic_pat(), "[REDACTED:GITHUB_PAT]"),
             (github_oauth(), "[REDACTED:GITHUB_OAUTH]"),
             (stripe_input, "[REDACTED:STRIPE_KEY]"),

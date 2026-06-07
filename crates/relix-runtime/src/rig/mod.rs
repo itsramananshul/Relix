@@ -229,7 +229,9 @@ pub struct RigRun {
 /// non-`Eq` handle has to live inside [`RigRunRequest`].
 #[derive(Default)]
 pub struct CancelRegistry {
-    map: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+    map: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    >,
 }
 
 impl CancelRegistry {
@@ -273,7 +275,10 @@ impl CancelRegistry {
         self.map
             .lock()
             .ok()
-            .and_then(|m| m.get(run_id).map(|f| f.load(std::sync::atomic::Ordering::SeqCst)))
+            .and_then(|m| {
+                m.get(run_id)
+                    .map(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+            })
             .unwrap_or(false)
     }
 
@@ -534,10 +539,7 @@ pub fn classify_readiness(sig: &ReadinessSignals) -> (&'static str, String) {
     } else {
         sig.stdout.trim()
     };
-    (
-        "probe_failed",
-        format!("readiness probe failed: {detail}"),
-    )
+    ("probe_failed", format!("readiness probe failed: {detail}"))
 }
 
 /// Auth-status output that proves the CLI is **logged out**. Checked
@@ -1088,7 +1090,9 @@ pub fn parse_claude_usage(stdout: &str) -> RunUsage {
         if let Some(usage) = v.get("usage") {
             u.input_tokens = usage.get("input_tokens").and_then(|x| x.as_i64());
             u.output_tokens = usage.get("output_tokens").and_then(|x| x.as_i64());
-            u.cached_input_tokens = usage.get("cache_read_input_tokens").and_then(|x| x.as_i64());
+            u.cached_input_tokens = usage
+                .get("cache_read_input_tokens")
+                .and_then(|x| x.as_i64());
         }
         if let Some(cost) = v.get("total_cost_usd").and_then(|c| c.as_f64()) {
             u.cost_micros = Some((cost * 1_000_000.0).round() as i64);
@@ -1212,18 +1216,13 @@ pub fn claude_events(stdout: &str, bridge_token: &str) -> Vec<RigEvent> {
                                 }
                             }
                             Some("tool_use") => {
-                                let name = block
-                                    .get("name")
-                                    .and_then(|n| n.as_str())
-                                    .unwrap_or("tool");
+                                let name =
+                                    block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                                 let input = block
                                     .get("input")
                                     .map(|i| bounded(&i.to_string(), MAX_EVENT_PAYLOAD_BYTES));
-                                let mut ev = RigEvent::new(
-                                    "tool_use",
-                                    "claude",
-                                    format!("tool: {name}"),
-                                );
+                                let mut ev =
+                                    RigEvent::new("tool_use", "claude", format!("tool: {name}"));
                                 if let Some(p) = input {
                                     ev = ev.with_payload(redact_secrets(&p, bridge_token));
                                 }
@@ -1253,11 +1252,7 @@ pub fn claude_events(stdout: &str, bridge_token: &str) -> Vec<RigEvent> {
                     ));
                 }
                 if let Some(cost) = v.get("total_cost_usd").and_then(|c| c.as_f64()) {
-                    out.push(RigEvent::new(
-                        "usage",
-                        "claude",
-                        format!("cost ${cost:.4}"),
-                    ));
+                    out.push(RigEvent::new("usage", "claude", format!("cost ${cost:.4}")));
                 }
             }
             _ => {}
@@ -1284,7 +1279,9 @@ pub fn codex_events(stdout: &str, bridge_token: &str) -> Vec<RigEvent> {
             continue;
         };
         match ty {
-            "thread.started" => out.push(RigEvent::new("thread_started", "codex", "thread started")),
+            "thread.started" => {
+                out.push(RigEvent::new("thread_started", "codex", "thread started"))
+            }
             "turn.started" => out.push(RigEvent::new("turn_started", "codex", "turn started")),
             "turn.completed" => {
                 let msg = v
@@ -1426,9 +1423,7 @@ fn argv_with_model_flags(base: &[String], extra: Vec<String>) -> Vec<String> {
 /// malformed id can never become a stray flag or a spawn of malformed argv.
 fn clean_session_id(session_id: Option<&str>) -> Option<String> {
     let v = session_id?.trim();
-    if v.is_empty()
-        || v.starts_with('-')
-        || v.chars().any(|c| c.is_whitespace() || c.is_control())
+    if v.is_empty() || v.starts_with('-') || v.chars().any(|c| c.is_whitespace() || c.is_control())
     {
         return None;
     }
@@ -1572,7 +1567,11 @@ impl ProcessRig {
     /// Configure a noninteractive readiness probe (CLI adapters). The
     /// `probe_args` (e.g. `["--version"]`) must be cheap, auth-free, and
     /// noninteractive; `login_hint` is shown when auth is the blocker.
-    pub fn with_readiness(mut self, probe_args: Vec<String>, login_hint: impl Into<String>) -> Self {
+    pub fn with_readiness(
+        mut self,
+        probe_args: Vec<String>,
+        login_hint: impl Into<String>,
+    ) -> Self {
         self.readiness = Some(ReadinessCheck {
             probe_args,
             login_hint: login_hint.into(),
@@ -1732,7 +1731,11 @@ impl Rig for ProcessRig {
 
     fn run_transcript(&self, req: &RigRunRequest) -> RigRun {
         let (outcome, events, usage) = self.execute(req);
-        RigRun { outcome, events, usage }
+        RigRun {
+            outcome,
+            events,
+            usage,
+        }
     }
 }
 
@@ -2016,12 +2019,18 @@ impl ProcessRig {
             RigOutputFormat::Raw => {
                 let mut ev = Vec::new();
                 if !capped_stdout.is_empty() {
-                    ev.push(
-                        RigEvent::new("output", self.name.clone(), bounded_line(capped_stdout)),
-                    );
+                    ev.push(RigEvent::new(
+                        "output",
+                        self.name.clone(),
+                        bounded_line(capped_stdout),
+                    ));
                 }
                 if !capped_stderr.is_empty() {
-                    ev.push(RigEvent::new("stderr", self.name.clone(), bounded_line(capped_stderr)));
+                    ev.push(RigEvent::new(
+                        "stderr",
+                        self.name.clone(),
+                        bounded_line(capped_stderr),
+                    ));
                 }
                 ev
             }
@@ -2263,7 +2272,10 @@ pub fn redact_secrets(text: &str, bridge_token: &str) -> String {
         // `NAME_(KEY|TOKEN|SECRET|PASSWORD)=value` → mask only the value.
         if let Some((name, val)) = word.split_once('=') {
             let up = name.to_ascii_uppercase();
-            if (up.contains("KEY") || up.contains("TOKEN") || up.contains("SECRET") || up.contains("PASSWORD"))
+            if (up.contains("KEY")
+                || up.contains("TOKEN")
+                || up.contains("SECRET")
+                || up.contains("PASSWORD"))
                 && val.len() >= 6
             {
                 return format!("{name}=***");
@@ -2278,7 +2290,8 @@ pub fn redact_secrets(text: &str, bridge_token: &str) -> String {
     // Walk the text emitting separators verbatim so newlines / tabs /
     // multiple spaces (i.e. the agent's formatting) survive; only the
     // word runs are inspected + possibly masked.
-    let is_word = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '=' | '.' | '/' | '+');
+    let is_word =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '=' | '.' | '/' | '+');
     let mut out = String::with_capacity(pre.len());
     let mut word = String::new();
     for c in pre.chars() {
@@ -2547,7 +2560,9 @@ pub fn claude_rig() -> ProcessRig {
     .with_structured_output(true)
     .with_output_format(RigOutputFormat::ClaudeStreamJson)
     .with_billing(RigBilling::subscription("anthropic", "5h/weekly"))
-    .with_install_hint("install Claude Code (npm i -g @anthropic-ai/claude-code), then `claude auth login`")
+    .with_install_hint(
+        "install Claude Code (npm i -g @anthropic-ai/claude-code), then `claude auth login`",
+    )
     .with_readiness(
         vec!["--version".to_string()],
         "run `claude auth login` to authenticate (check with `claude auth status --text`)",
@@ -2655,7 +2670,10 @@ mod tests {
         shipped.sort();
         let mut allowlist: Vec<String> = KNOWN_RIG_NAMES.iter().map(|s| s.to_string()).collect();
         allowlist.sort();
-        assert_eq!(shipped, allowlist, "KNOWN_RIG_NAMES drifted from the registry");
+        assert_eq!(
+            shipped, allowlist,
+            "KNOWN_RIG_NAMES drifted from the registry"
+        );
         assert!(is_known_rig("echo"));
         assert!(is_known_rig("  echo  "), "trims before checking");
         assert!(!is_known_rig("bogus"));
@@ -2755,8 +2773,14 @@ mod tests {
             .with_bridge_token("brt_secret123long_enough");
         match rig.run(&req) {
             RigOutcome::Done { summary } => {
-                assert!(!summary.contains("brt_secret123long_enough"), "token leaked: {summary:?}");
-                assert!(summary.contains("***"), "token should be redacted: {summary:?}");
+                assert!(
+                    !summary.contains("brt_secret123long_enough"),
+                    "token leaked: {summary:?}"
+                );
+                assert!(
+                    summary.contains("***"),
+                    "token should be redacted: {summary:?}"
+                );
             }
             other => panic!("expected Done, got {other:?}"),
         }
@@ -2808,7 +2832,10 @@ mod tests {
     fn sleep_cmd(secs: u32) -> (String, Vec<String>) {
         if cfg!(windows) {
             // `timeout` needs a console; `ping` is the portable sleeper.
-            ("cmd".into(), vec!["/C".into(), format!("ping -n {} 127.0.0.1 >NUL", secs + 1)])
+            (
+                "cmd".into(),
+                vec!["/C".into(), format!("ping -n {} 127.0.0.1 >NUL", secs + 1)],
+            )
         } else {
             ("sh".into(), vec!["-c".into(), format!("sleep {secs}")])
         }
@@ -2819,11 +2846,14 @@ mod tests {
         // A child that sleeps far longer than the timeout must be killed
         // and reported as a retryable timeout — not hang the worker.
         let (prog, args) = sleep_cmd(30);
-        let rig = ProcessRig::new("slow", prog, args)
-            .with_timeout(std::time::Duration::from_millis(400));
+        let rig =
+            ProcessRig::new("slow", prog, args).with_timeout(std::time::Duration::from_millis(400));
         let started = std::time::Instant::now();
         let outcome = rig.run(&RigRunRequest::new("b", "a", "g", "x"));
-        assert!(started.elapsed() < std::time::Duration::from_secs(10), "should not hang");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "should not hang"
+        );
         match outcome {
             RigOutcome::Failed { retryable, reason } => {
                 assert!(retryable);
@@ -2860,7 +2890,10 @@ mod tests {
         match rig.run(&req) {
             RigOutcome::Done { summary } => {
                 let leaf = canon.file_name().unwrap().to_string_lossy().to_string();
-                assert!(summary.contains(&leaf), "cwd {summary:?} should contain {leaf}");
+                assert!(
+                    summary.contains(&leaf),
+                    "cwd {summary:?} should contain {leaf}"
+                );
             }
             other => panic!("expected Done, got {other:?}"),
         }
@@ -2879,7 +2912,10 @@ mod tests {
         assert_eq!(rig.args(), args.as_slice());
         // And running it just echoes the literal (no `pwned`, no deletion).
         if let RigOutcome::Done { summary } = rig.run(&RigRunRequest::new("b", "a", "g", "x")) {
-            assert!(summary.contains("rm -rf"), "literal text preserved: {summary:?}");
+            assert!(
+                summary.contains("rm -rf"),
+                "literal text preserved: {summary:?}"
+            );
         }
     }
 
@@ -2896,8 +2932,14 @@ mod tests {
         let out = redact_secrets(&input, bt);
         assert!(!out.contains(bt), "bridge token leaked: {out}");
         assert!(!out.contains(&fake_key), "sk- token leaked: {out}");
-        assert!(!out.contains("supersecretvalue"), "env secret leaked: {out}");
-        assert!(out.contains("OPENAI_API_KEY=***"), "env name kept + masked: {out}");
+        assert!(
+            !out.contains("supersecretvalue"),
+            "env secret leaked: {out}"
+        );
+        assert!(
+            out.contains("OPENAI_API_KEY=***"),
+            "env name kept + masked: {out}"
+        );
         // Formatting (newlines, the safe words) survives.
         assert_eq!(out.lines().count(), input.lines().count());
         assert!(out.contains("plain word"));
@@ -2938,12 +2980,20 @@ mod tests {
     fn model_flag_args_maps_per_format() {
         // Claude: only `--model` (no headless effort flag).
         assert_eq!(
-            model_flag_args(RigOutputFormat::ClaudeStreamJson, Some("claude-sonnet-4"), Some("high")),
+            model_flag_args(
+                RigOutputFormat::ClaudeStreamJson,
+                Some("claude-sonnet-4"),
+                Some("high")
+            ),
             vec!["--model".to_string(), "claude-sonnet-4".to_string()]
         );
         // Codex: `--model` AND `-c model_reasoning_effort=<effort>`.
         assert_eq!(
-            model_flag_args(RigOutputFormat::CodexJsonl, Some("gpt-5-codex"), Some("medium")),
+            model_flag_args(
+                RigOutputFormat::CodexJsonl,
+                Some("gpt-5-codex"),
+                Some("medium")
+            ),
             vec![
                 "--model".to_string(),
                 "gpt-5-codex".to_string(),
@@ -2980,9 +3030,16 @@ mod tests {
         let base = claude_rig().args().to_vec();
         let argv = argv_with_model_flags(
             &base,
-            model_flag_args(RigOutputFormat::ClaudeStreamJson, Some("claude-sonnet-4"), None),
+            model_flag_args(
+                RigOutputFormat::ClaudeStreamJson,
+                Some("claude-sonnet-4"),
+                None,
+            ),
         );
-        assert!(argv.windows(2).any(|w| w[0] == "--model" && w[1] == "claude-sonnet-4"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--model" && w[1] == "claude-sonnet-4")
+        );
         // The original flags are preserved.
         assert!(argv.iter().any(|a| a == "--print"));
         assert!(argv.iter().any(|a| a == "stream-json"));
@@ -2994,16 +3051,32 @@ mod tests {
         // `-`, which MUST stay last; the model/effort flags are spliced in
         // just before it.
         let base = codex_rig().args().to_vec();
-        assert_eq!(base.last().map(String::as_str), Some("-"), "codex base ends with stdin marker");
+        assert_eq!(
+            base.last().map(String::as_str),
+            Some("-"),
+            "codex base ends with stdin marker"
+        );
         let argv = argv_with_model_flags(
             &base,
-            model_flag_args(RigOutputFormat::CodexJsonl, Some("gpt-5-codex"), Some("high")),
+            model_flag_args(
+                RigOutputFormat::CodexJsonl,
+                Some("gpt-5-codex"),
+                Some("high"),
+            ),
         );
-        assert_eq!(argv.last().map(String::as_str), Some("-"), "stdin marker stays last");
-        assert!(argv.windows(2).any(|w| w[0] == "--model" && w[1] == "gpt-5-codex"));
-        assert!(argv
-            .windows(2)
-            .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=high"));
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("-"),
+            "stdin marker stays last"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--model" && w[1] == "gpt-5-codex")
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=high")
+        );
         // `exec` / `--json` / sandbox flags survive.
         assert!(argv.iter().any(|a| a == "exec"));
         assert!(argv.iter().any(|a| a == "--json"));
@@ -3021,7 +3094,10 @@ mod tests {
             RigRunRequest::new("b", "a", "g", "p").with_resume_session_id(Some("   ".to_string()));
         assert_eq!(blank.resume_session_id, None);
         // A fresh request carries no resume id (backward-compatible default).
-        assert_eq!(RigRunRequest::new("b", "a", "g", "p").resume_session_id, None);
+        assert_eq!(
+            RigRunRequest::new("b", "a", "g", "p").resume_session_id,
+            None
+        );
     }
 
     #[test]
@@ -3037,8 +3113,16 @@ mod tests {
         assert_eq!(argv[1], "resume");
         let sid_at = argv.iter().position(|a| a == "thread-xyz").unwrap();
         let dash_at = argv.iter().rposition(|a| a == "-").unwrap();
-        assert_eq!(sid_at + 1, dash_at, "session id immediately precedes stdin marker");
-        assert_eq!(argv.last().map(String::as_str), Some("-"), "stdin marker stays last");
+        assert_eq!(
+            sid_at + 1,
+            dash_at,
+            "session id immediately precedes stdin marker"
+        );
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("-"),
+            "stdin marker stays last"
+        );
         // The original flags survive intact.
         assert!(argv.iter().any(|a| a == "--json"));
         assert!(argv.iter().any(|a| a == "workspace-write"));
@@ -3069,18 +3153,36 @@ mod tests {
     fn resume_argv_skips_absent_or_malformed_session() {
         let base = codex_rig().args().to_vec();
         // Absent / blank → no transformation.
-        assert_eq!(argv_with_resume(&base, RigOutputFormat::CodexJsonl, None), base);
-        assert_eq!(argv_with_resume(&base, RigOutputFormat::CodexJsonl, Some("   ")), base);
+        assert_eq!(
+            argv_with_resume(&base, RigOutputFormat::CodexJsonl, None),
+            base
+        );
+        assert_eq!(
+            argv_with_resume(&base, RigOutputFormat::CodexJsonl, Some("   ")),
+            base
+        );
         // Whitespace / control chars inside the id → skipped (never a split or
         // injected argv element).
-        assert_eq!(argv_with_resume(&base, RigOutputFormat::CodexJsonl, Some("a b")), base);
-        assert_eq!(argv_with_resume(&base, RigOutputFormat::CodexJsonl, Some("x\ty")), base);
+        assert_eq!(
+            argv_with_resume(&base, RigOutputFormat::CodexJsonl, Some("a b")),
+            base
+        );
+        assert_eq!(
+            argv_with_resume(&base, RigOutputFormat::CodexJsonl, Some("x\ty")),
+            base
+        );
         // A leading `-` (flag-injection shape) is rejected even though the id
         // is adapter state, not user input.
-        assert_eq!(argv_with_resume(&base, RigOutputFormat::CodexJsonl, Some("--dangerous")), base);
+        assert_eq!(
+            argv_with_resume(&base, RigOutputFormat::CodexJsonl, Some("--dangerous")),
+            base
+        );
         // A non-Codex `exec …` argv shape is never transformed defensively.
         let weird = vec!["notexec".to_string(), "-".to_string()];
-        assert_eq!(argv_with_resume(&weird, RigOutputFormat::CodexJsonl, Some("ok-id")), weird);
+        assert_eq!(
+            argv_with_resume(&weird, RigOutputFormat::CodexJsonl, Some("ok-id")),
+            weird
+        );
     }
 
     #[test]
@@ -3093,21 +3195,37 @@ mod tests {
         let base = codex_rig().args().to_vec();
         let with_model = argv_with_model_flags(
             &base,
-            model_flag_args(RigOutputFormat::CodexJsonl, Some("gpt-5-codex"), Some("high")),
+            model_flag_args(
+                RigOutputFormat::CodexJsonl,
+                Some("gpt-5-codex"),
+                Some("high"),
+            ),
         );
         let argv = argv_with_resume(&with_model, RigOutputFormat::CodexJsonl, Some("thread-xyz"));
         assert_eq!(&argv[0..2], &["exec", "resume"], "resume after exec");
-        assert_eq!(argv.last().map(String::as_str), Some("-"), "stdin marker stays last");
-        assert!(argv.windows(2).any(|w| w[0] == "--model" && w[1] == "gpt-5-codex"));
-        assert!(argv
-            .windows(2)
-            .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=high"));
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("-"),
+            "stdin marker stays last"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--model" && w[1] == "gpt-5-codex")
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=high")
+        );
         // The model flags land BEFORE the session id and stdin marker.
         let model_at = argv.iter().position(|a| a == "--model").unwrap();
         let sid_at = argv.iter().position(|a| a == "thread-xyz").unwrap();
         let dash_at = argv.iter().rposition(|a| a == "-").unwrap();
         assert!(model_at < sid_at, "model flag precedes the session id");
-        assert_eq!(sid_at + 1, dash_at, "session id immediately precedes stdin marker");
+        assert_eq!(
+            sid_at + 1,
+            dash_at,
+            "session id immediately precedes stdin marker"
+        );
     }
 
     #[test]
@@ -3133,7 +3251,10 @@ mod tests {
             RigOutcome::Done { summary } => {
                 assert!(summary.contains("hello-with-prefs"), "got: {summary:?}");
                 // The preference text must NOT leak into raw output as a flag.
-                assert!(!summary.contains("--model"), "raw path must not add flags: {summary:?}");
+                assert!(
+                    !summary.contains("--model"),
+                    "raw path must not add flags: {summary:?}"
+                );
             }
             other => panic!("expected Done, got {other:?}"),
         }
@@ -3231,7 +3352,10 @@ mod tests {
 
     #[test]
     fn classify_readiness_missing_binary() {
-        let s = ReadinessSignals { missing_binary: true, ..Default::default() };
+        let s = ReadinessSignals {
+            missing_binary: true,
+            ..Default::default()
+        };
         assert_eq!(classify_readiness(&s).0, "missing_binary");
     }
 
@@ -3248,7 +3372,10 @@ mod tests {
 
     #[test]
     fn classify_readiness_timeout_is_interactive_only() {
-        let s = ReadinessSignals { timed_out: true, ..Default::default() };
+        let s = ReadinessSignals {
+            timed_out: true,
+            ..Default::default()
+        };
         assert_eq!(classify_readiness(&s).0, "interactive_only");
     }
 
@@ -3298,12 +3425,25 @@ mod tests {
     fn run_readiness_probe_runs_real_command_and_captures_stdout() {
         // A real, always-available command echoes a version-like line.
         let (prog, args) = if cfg!(windows) {
-            ("cmd".to_string(), vec!["/C".to_string(), "echo".to_string(), "probe-ok 9.9".to_string()])
+            (
+                "cmd".to_string(),
+                vec![
+                    "/C".to_string(),
+                    "echo".to_string(),
+                    "probe-ok 9.9".to_string(),
+                ],
+            )
         } else {
-            ("sh".to_string(), vec!["-c".to_string(), "echo probe-ok 9.9".to_string()])
+            (
+                "sh".to_string(),
+                vec!["-c".to_string(), "echo probe-ok 9.9".to_string()],
+            )
         };
         let s = run_readiness_probe(&prog, &args, std::time::Duration::from_secs(5));
-        assert!(!s.missing_binary && !s.timed_out && s.exit_ok, "signals: {s:?}");
+        assert!(
+            !s.missing_binary && !s.timed_out && s.exit_ok,
+            "signals: {s:?}"
+        );
         assert!(s.stdout.contains("probe-ok"), "stdout: {:?}", s.stdout);
         assert_eq!(classify_readiness(&s).0, "available");
     }
@@ -3454,7 +3594,11 @@ mod tests {
             &[fb.clone()],
         )
         .unwrap();
-        assert_eq!(s, Spawnable::Direct(fb), "the real .exe fallback should win over the .cmd shim");
+        assert_eq!(
+            s,
+            Spawnable::Direct(fb),
+            "the real .exe fallback should win over the .cmd shim"
+        );
     }
 
     #[cfg(windows)]
@@ -3475,7 +3619,10 @@ mod tests {
         assert!(matches!(classify_file(&exe), Some(Spawnable::Direct(_))));
         assert!(matches!(classify_file(&cmd), Some(Spawnable::BatchShim(_))));
         assert!(matches!(classify_file(&bat), Some(Spawnable::BatchShim(_))));
-        assert!(classify_file(&noext).is_none(), "extensionless sh shim must not be Direct");
+        assert!(
+            classify_file(&noext).is_none(),
+            "extensionless sh shim must not be Direct"
+        );
         assert!(classify_file(&tmp.path().join("missing.exe")).is_none());
     }
 
@@ -3492,9 +3639,18 @@ mod tests {
         let real = fb_dir.path().join("claude.exe");
         std::fs::File::create(&real).unwrap();
         let exts = path_search_exts();
-        let s = resolve_in_dirs("claude", &[path_dir.path().to_path_buf()], &exts, &[real.clone()])
-            .unwrap();
-        assert_eq!(s, Spawnable::Direct(real), "must skip the sh shim and use the real .exe");
+        let s = resolve_in_dirs(
+            "claude",
+            &[path_dir.path().to_path_buf()],
+            &exts,
+            &[real.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            s,
+            Spawnable::Direct(real),
+            "must skip the sh shim and use the real .exe"
+        );
     }
 
     #[cfg(unix)]
@@ -3503,7 +3659,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("mytool");
         std::fs::File::create(&bin).unwrap();
-        let s = resolve_in_dirs("mytool", &[tmp.path().to_path_buf()], &[String::new()], &[]).unwrap();
+        let s =
+            resolve_in_dirs("mytool", &[tmp.path().to_path_buf()], &[String::new()], &[]).unwrap();
         assert_eq!(s, Spawnable::Direct(bin));
     }
 
@@ -3521,7 +3678,11 @@ mod tests {
     fn claude_logged_out_auth_status_is_not_authenticated() {
         let v = sig(true, "2.1.159 (Claude Code)", "");
         for auth in [
-            sig(true, "Not logged in. Run `claude auth login` to sign in.", ""),
+            sig(
+                true,
+                "Not logged in. Run `claude auth login` to sign in.",
+                "",
+            ),
             sig(false, "", "You are not signed in"),
             sig(true, "unauthenticated", ""),
         ] {
@@ -3536,7 +3697,10 @@ mod tests {
     #[test]
     fn claude_auth_status_hang_is_interactive_only() {
         let v = sig(true, "2.1.159 (Claude Code)", "");
-        let auth = ReadinessSignals { timed_out: true, ..Default::default() };
+        let auth = ReadinessSignals {
+            timed_out: true,
+            ..Default::default()
+        };
         assert_eq!(
             classify_readiness_with_auth(&v, Some(&auth)).0,
             "interactive_only"
@@ -3614,8 +3778,7 @@ mod tests {
         // Interrupted run — system lines only, no terminal result.
         let jsonl = format!(
             "{}\n{}\n",
-            r#"{"type":"system","subtype":"hook_started"}"#,
-            r#"{"type":"assistant"}"#,
+            r#"{"type":"system","subtype":"hook_started"}"#, r#"{"type":"assistant"}"#,
         );
         assert!(parse_claude_stream_json(&jsonl).is_none());
         // And junk / non-JSON lines are skipped without panicking.
@@ -3634,7 +3797,10 @@ mod tests {
         );
         match claude_test_rig().claude_outcome(&jsonl, "") {
             Some(RigOutcome::Done { summary }) => {
-                assert_eq!(summary, "Relix Claude test passed", "no JSONL noise in the summary");
+                assert_eq!(
+                    summary, "Relix Claude test passed",
+                    "no JSONL noise in the summary"
+                );
             }
             other => panic!("expected Done, got {other:?}"),
         }
@@ -3648,7 +3814,10 @@ mod tests {
         match claude_test_rig().claude_outcome(&jsonl, "") {
             Some(RigOutcome::Done { summary }) => {
                 assert!(summary.contains("permission(s) denied"), "got: {summary}");
-                assert!(summary.contains("Created the note"), "keeps the model reply: {summary}");
+                assert!(
+                    summary.contains("Created the note"),
+                    "keeps the model reply: {summary}"
+                );
             }
             other => panic!("expected Done with a denial caveat, got {other:?}"),
         }
@@ -3662,7 +3831,10 @@ mod tests {
         match claude_test_rig().claude_outcome(&jsonl, "") {
             Some(RigOutcome::Failed { reason, retryable }) => {
                 assert!(!retryable);
-                assert!(reason.contains("error_during_execution"), "reason: {reason}");
+                assert!(
+                    reason.contains("error_during_execution"),
+                    "reason: {reason}"
+                );
                 assert!(reason.contains("something went wrong"));
             }
             other => panic!("expected Failed, got {other:?}"),
@@ -3679,21 +3851,40 @@ mod tests {
 
     #[test]
     fn claude_rig_uses_stream_json_parser() {
-        assert_eq!(claude_rig().output_format, RigOutputFormat::ClaudeStreamJson);
+        assert_eq!(
+            claude_rig().output_format,
+            RigOutputFormat::ClaudeStreamJson
+        );
     }
 
     #[test]
     fn claude_rig_uses_two_step_readiness_and_windows_fallback() {
         let rig = claude_rig();
-        let r = rig.readiness.as_ref().expect("claude has a readiness check");
+        let r = rig
+            .readiness
+            .as_ref()
+            .expect("claude has a readiness check");
         assert_eq!(r.probe_args, vec!["--version".to_string()]);
         assert_eq!(
             r.auth_args.as_deref(),
-            Some(&["auth".to_string(), "status".to_string(), "--text".to_string()][..])
+            Some(
+                &[
+                    "auth".to_string(),
+                    "status".to_string(),
+                    "--text".to_string()
+                ][..]
+            )
         );
-        assert!(r.login_hint.contains("claude auth login"), "hint: {}", r.login_hint);
         assert!(
-            rig.install_hint.as_deref().unwrap().contains("claude auth login"),
+            r.login_hint.contains("claude auth login"),
+            "hint: {}",
+            r.login_hint
+        );
+        assert!(
+            rig.install_hint
+                .as_deref()
+                .unwrap()
+                .contains("claude auth login"),
             "install hint should reference auth login"
         );
         if cfg!(windows) {
@@ -3819,8 +4010,7 @@ mod tests {
     }
 
     fn codex_test_rig() -> ProcessRig {
-        ProcessRig::new("codex", "codex", vec![])
-            .with_output_format(RigOutputFormat::CodexJsonl)
+        ProcessRig::new("codex", "codex", vec![]).with_output_format(RigOutputFormat::CodexJsonl)
     }
 
     #[test]
@@ -3851,7 +4041,11 @@ mod tests {
 
     #[test]
     fn codex_outcome_none_without_events_falls_through() {
-        assert!(codex_test_rig().codex_outcome("plain text, no json", "").is_none());
+        assert!(
+            codex_test_rig()
+                .codex_outcome("plain text, no json", "")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3966,11 +4160,17 @@ mod tests {
         let reg = CancelRegistry::default();
         reg.register("run_i");
         assert!(reg.request("run_i"), "first request flips + reports active");
-        assert!(reg.request("run_i"), "second request is safe + still active");
+        assert!(
+            reg.request("run_i"),
+            "second request is safe + still active"
+        );
         assert!(reg.is_cancelled("run_i"));
         // Even after clear, a stray repeat request is harmless (inactive).
         reg.clear("run_i");
-        assert!(!reg.request("run_i"), "post-clear request is inactive, not a panic");
+        assert!(
+            !reg.request("run_i"),
+            "post-clear request is inactive, not a panic"
+        );
     }
 
     #[test]
@@ -3982,8 +4182,8 @@ mod tests {
         let run_id = "tg4-cancel-midflight";
         CancelRegistry::global().register(run_id);
         let (prog, args) = sleep_cmd(30);
-        let rig = ProcessRig::new("slow", prog, args)
-            .with_timeout(std::time::Duration::from_secs(20));
+        let rig =
+            ProcessRig::new("slow", prog, args).with_timeout(std::time::Duration::from_secs(20));
         let req = RigRunRequest::new("b", "a", "g", "x").with_run_id(run_id);
         let canceller = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(300));
@@ -3993,7 +4193,10 @@ mod tests {
         let outcome = rig.run(&req);
         let _ = canceller.join();
         CancelRegistry::global().clear(run_id);
-        assert!(started.elapsed() < std::time::Duration::from_secs(10), "must not hang");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "must not hang"
+        );
         match outcome {
             RigOutcome::Failed { retryable, reason } => {
                 assert!(!retryable, "operator cancel is non-retryable");
@@ -4010,7 +4213,9 @@ mod tests {
         let run = rig.run_transcript(&RigRunRequest::new("b", "a", "g", "x"));
         assert!(matches!(run.outcome, RigOutcome::Done { .. }));
         assert!(
-            run.events.iter().any(|e| e.kind == "output" && e.message.contains("transcript-hello")),
+            run.events
+                .iter()
+                .any(|e| e.kind == "output" && e.message.contains("transcript-hello")),
             "events: {:?}",
             run.events
         );

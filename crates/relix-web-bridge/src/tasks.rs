@@ -2205,8 +2205,11 @@ pub async fn events_stream_global(
 fn run_stream_event_name(chronicle_type: &str) -> Option<&'static str> {
     match chronicle_type {
         "brief.run_started" => Some("run_started"),
-        "brief.shift_done" | "brief.dispatch_failed" | "brief.continued"
-        | "brief.run_recovered" | "brief.run_refused" => Some("run_finished"),
+        "brief.shift_done"
+        | "brief.dispatch_failed"
+        | "brief.continued"
+        | "brief.run_recovered"
+        | "brief.run_refused" => Some("run_finished"),
         "brief.run_cancel_requested" => Some("run_cancel_requested"),
         "brief.board_moved" => Some("brief_moved"),
         "brief.run_reviewed" => Some("review_changed"),
@@ -3624,20 +3627,50 @@ mod tests {
     #[test]
     fn run_stream_event_name_maps_execution_types_and_ignores_others() {
         // Each execution chronicle type maps to its normalized SSE name.
-        assert_eq!(run_stream_event_name("brief.run_started"), Some("run_started"));
-        assert_eq!(run_stream_event_name("brief.shift_done"), Some("run_finished"));
-        assert_eq!(run_stream_event_name("brief.dispatch_failed"), Some("run_finished"));
-        assert_eq!(run_stream_event_name("brief.continued"), Some("run_finished"));
-        assert_eq!(run_stream_event_name("brief.run_recovered"), Some("run_finished"));
-        assert_eq!(run_stream_event_name("brief.run_refused"), Some("run_finished"));
+        assert_eq!(
+            run_stream_event_name("brief.run_started"),
+            Some("run_started")
+        );
+        assert_eq!(
+            run_stream_event_name("brief.shift_done"),
+            Some("run_finished")
+        );
+        assert_eq!(
+            run_stream_event_name("brief.dispatch_failed"),
+            Some("run_finished")
+        );
+        assert_eq!(
+            run_stream_event_name("brief.continued"),
+            Some("run_finished")
+        );
+        assert_eq!(
+            run_stream_event_name("brief.run_recovered"),
+            Some("run_finished")
+        );
+        assert_eq!(
+            run_stream_event_name("brief.run_refused"),
+            Some("run_finished")
+        );
         assert_eq!(
             run_stream_event_name("brief.run_cancel_requested"),
             Some("run_cancel_requested")
         );
-        assert_eq!(run_stream_event_name("brief.board_moved"), Some("brief_moved"));
-        assert_eq!(run_stream_event_name("brief.run_reviewed"), Some("review_changed"));
-        assert_eq!(run_stream_event_name("brief.run_applied"), Some("apply_changed"));
-        assert_eq!(run_stream_event_name("brief.run_discarded"), Some("apply_changed"));
+        assert_eq!(
+            run_stream_event_name("brief.board_moved"),
+            Some("brief_moved")
+        );
+        assert_eq!(
+            run_stream_event_name("brief.run_reviewed"),
+            Some("review_changed")
+        );
+        assert_eq!(
+            run_stream_event_name("brief.run_applied"),
+            Some("apply_changed")
+        );
+        assert_eq!(
+            run_stream_event_name("brief.run_discarded"),
+            Some("apply_changed")
+        );
         // Non-execution chronicle types are not forwarded on this stream.
         assert_eq!(run_stream_event_name("brief.comment"), None);
         assert_eq!(run_stream_event_name("brief.created"), None);

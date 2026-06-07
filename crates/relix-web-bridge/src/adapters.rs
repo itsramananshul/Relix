@@ -34,9 +34,7 @@ fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ApiError
 
 /// `GET /v1/adapters` — the registered agent adapters + their live
 /// availability probe.
-pub async fn list(
-    State(state): State<AppState>,
-) -> Result<Response, (StatusCode, Json<ApiError>)> {
+pub async fn list(State(state): State<AppState>) -> Result<Response, (StatusCode, Json<ApiError>)> {
     let body = call_coordinator_json(&state, "rig.describe", b"").await?;
     // `rig.describe` already emits a JSON array; pass it straight through.
     Ok((
@@ -54,10 +52,12 @@ async fn call_coordinator_json(
     method: &str,
     arg: &[u8],
 ) -> Result<Vec<u8>, (StatusCode, Json<ApiError>)> {
-    let mesh = state
-        .mesh_client
-        .as_ref()
-        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "bridge mesh client not initialized"))?;
+    let mesh = state.mesh_client.as_ref().ok_or_else(|| {
+        err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "bridge mesh client not initialized",
+        )
+    })?;
     let deadline_secs = state.cfg.transport.deadline_secs.clamp(5, 60);
     let envelope = build_request_with_tenant(
         method,

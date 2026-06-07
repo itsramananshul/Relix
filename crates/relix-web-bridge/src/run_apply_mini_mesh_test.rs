@@ -141,9 +141,15 @@ fn spawn_inbound_loop(mut events: mpsc::Receiver<Event>, bridge: Arc<DispatchBri
 /// semantics — exactly like the runtime integration test.
 fn seed_modifying_rig(content: &str) -> RigRegistry {
     let (prog, args) = if cfg!(windows) {
-        ("cmd".to_string(), vec!["/C".to_string(), format!("echo {content}> seed.txt")])
+        (
+            "cmd".to_string(),
+            vec!["/C".to_string(), format!("echo {content}> seed.txt")],
+        )
     } else {
-        ("sh".to_string(), vec!["-c".to_string(), format!("printf '{content}' > seed.txt")])
+        (
+            "sh".to_string(),
+            vec!["-c".to_string(), format!("printf '{content}' > seed.txt")],
+        )
     };
     let mut reg = RigRegistry::new();
     reg.register(std::sync::Arc::new(ProcessRig::new("mk", prog, args)));
@@ -153,7 +159,16 @@ fn seed_modifying_rig(content: &str) -> RigRegistry {
 
 fn ready_brief(s: &TaskStore, title: &str, assignee: &str) -> String {
     let id = s
-        .create(title, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
+        .create(
+            title,
+            "flows/none.sol",
+            "{}",
+            "subj",
+            RetryPolicy::None,
+            0,
+            None,
+            None,
+        )
         .unwrap();
     s.set_brief_field(&id, "assignee", assignee).unwrap();
     s.set_brief_field(&id, "reviewer", "reviewer_1").unwrap();
@@ -290,12 +305,22 @@ async fn run_diff_review_apply_mini_mesh_proves_real_file_review_to_done_over_ht
     let integrate = ready_brief(&store, "integrate", "agt_eng");
     store.add_snag(&integrate, &track).unwrap();
 
-    let report =
-        run_brief_now(&store, &seed_modifying_rig("v2"), None, 300, &track, None, "go".into())
-            .unwrap();
+    let report = run_brief_now(
+        &store,
+        &seed_modifying_rig("v2"),
+        None,
+        300,
+        &track,
+        None,
+        "go".into(),
+    )
+    .unwrap();
     let run_id = report.run_id.expect("a committed run has an id");
     // The successful Shift parked the Brief in review; the dependent blocks.
-    assert_eq!(store.board_status(&track).unwrap().as_deref(), Some("in_review"));
+    assert_eq!(
+        store.board_status(&track).unwrap().as_deref(),
+        Some("in_review")
+    );
     assert!(store.is_blocked(&integrate).unwrap());
 
     let store = Arc::new(store);
@@ -433,7 +458,10 @@ addr = "{addr}"
         "diff is ineligible before acceptance: {body}"
     );
     assert!(
-        body.pointer("/plan/changes").and_then(Value::as_u64).unwrap_or(0) >= 1,
+        body.pointer("/plan/changes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            >= 1,
         "the pending file change is previewable before acceptance: {body}"
     );
 
@@ -452,7 +480,10 @@ addr = "{addr}"
         "v1",
         "a refused apply over HTTP writes nothing"
     );
-    assert_eq!(store.board_status(&track).unwrap().as_deref(), Some("in_review"));
+    assert_eq!(
+        store.board_status(&track).unwrap().as_deref(),
+        Some("in_review")
+    );
 
     // ─── 7. POST /review accept → 200 ───
     let resp = timeout(
@@ -493,7 +524,12 @@ addr = "{addr}"
         Some("applied"),
         "the apply response field serializes back through the route: {body}"
     );
-    assert!(body.get("applied_files").and_then(Value::as_u64).unwrap_or(0) >= 1);
+    assert!(
+        body.get("applied_files")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            >= 1
+    );
     assert_eq!(
         body.get("brief_status").and_then(Value::as_str),
         Some("done"),

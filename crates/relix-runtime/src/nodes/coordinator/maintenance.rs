@@ -305,7 +305,10 @@ pub struct AutopruneConfig {
 
 fn env_bool(key: &str, default: bool) -> bool {
     match std::env::var(key) {
-        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
         Err(_) => default,
     }
 }
@@ -407,11 +410,17 @@ pub fn execute_prune(
     };
     let (events_deleted, artifacts_deleted) = if !dry_run && (delete_events || delete_artifacts) {
         let ids: Vec<String> = report.to_delete.iter().map(|i| i.run_id.clone()).collect();
-        store.prune_run_logs(&ids, delete_events, delete_artifacts).unwrap_or((0, 0))
+        store
+            .prune_run_logs(&ids, delete_events, delete_artifacts)
+            .unwrap_or((0, 0))
     } else {
         (0, 0)
     };
-    let status = if report.errors.is_empty() { "ok" } else { "failed" };
+    let status = if report.errors.is_empty() {
+        "ok"
+    } else {
+        "failed"
+    };
     let note = if dry_run {
         format!(
             "dry-run: {} candidate(s), {} bytes",
@@ -432,7 +441,12 @@ pub fn execute_prune(
         )
     };
     // Compact, secret-free payload (a sample of the run_ids + the keep tallies).
-    let sample: Vec<&str> = report.to_delete.iter().take(50).map(|i| i.run_id.as_str()).collect();
+    let sample: Vec<&str> = report
+        .to_delete
+        .iter()
+        .take(50)
+        .map(|i| i.run_id.as_str())
+        .collect();
     let payload = serde_json::json!({
         "older_than_days": older_than_days,
         "keep_latest": keep_latest,
@@ -504,7 +518,12 @@ mod tests {
         std::fs::write(p, vec![b'x'; bytes]).unwrap();
     }
     fn entry(run_id: &str, modified: i64) -> WorkspaceEntry {
-        WorkspaceEntry { run_id: run_id.to_string(), bytes: 10, files: 1, modified }
+        WorkspaceEntry {
+            run_id: run_id.to_string(),
+            bytes: 10,
+            files: 1,
+            modified,
+        }
     }
     // Build a scan over `entries` (age decoupled from real disk mtimes, so
     // the prune logic is deterministic) but the dirs are still on disk so a
@@ -552,11 +571,19 @@ mod tests {
         mkfile(&root.join("run_old").join("x"), 10);
         let now = 1_000 * DAY;
         let scan = scan_of(&root, vec![entry("run_old", now - 30 * DAY)]);
-        let policy = PrunePolicy { older_than_days: 7, keep_latest: 0, delete_workspaces: true };
-        let report = prune_run_workspaces(&root, now, &scan, &HashSet::new(), &policy, true).unwrap();
+        let policy = PrunePolicy {
+            older_than_days: 7,
+            keep_latest: 0,
+            delete_workspaces: true,
+        };
+        let report =
+            prune_run_workspaces(&root, now, &scan, &HashSet::new(), &policy, true).unwrap();
         assert_eq!(report.to_delete.len(), 1, "old workspace is eligible");
         assert_eq!(report.deleted_workspaces, 0, "dry-run deletes nothing");
-        assert!(root.join("run_old").exists(), "dir still present after dry-run");
+        assert!(
+            root.join("run_old").exists(),
+            "dir still present after dry-run"
+        );
     }
 
     #[test]
@@ -581,7 +608,11 @@ mod tests {
             ],
         );
         let running: HashSet<String> = ["run_live".to_string()].into_iter().collect();
-        let policy = PrunePolicy { older_than_days: 7, keep_latest: 0, delete_workspaces: true };
+        let policy = PrunePolicy {
+            older_than_days: 7,
+            keep_latest: 0,
+            delete_workspaces: true,
+        };
         let report = prune_run_workspaces(&root, now, &scan, &running, &policy, false).unwrap();
         assert_eq!(report.deleted_workspaces, 1, "{report:?}");
         assert_eq!(report.kept_running, 1);
@@ -607,8 +638,13 @@ mod tests {
                 entry("run_o3", now - 28 * DAY), // newest (all > 7d old)
             ],
         );
-        let policy = PrunePolicy { older_than_days: 7, keep_latest: 2, delete_workspaces: true };
-        let report = prune_run_workspaces(&root, now, &scan, &HashSet::new(), &policy, false).unwrap();
+        let policy = PrunePolicy {
+            older_than_days: 7,
+            keep_latest: 2,
+            delete_workspaces: true,
+        };
+        let report =
+            prune_run_workspaces(&root, now, &scan, &HashSet::new(), &policy, false).unwrap();
         assert_eq!(report.kept_latest, 2);
         assert_eq!(report.deleted_workspaces, 1);
         assert!(!root.join("run_o1").exists(), "oldest removed");
@@ -682,7 +718,10 @@ mod tests {
         }
         let audit = store.list_maintenance_audit(10).unwrap();
         assert_eq!(audit.len(), 3);
-        assert!(audit[0].id > audit[1].id && audit[1].id > audit[2].id, "newest first");
+        assert!(
+            audit[0].id > audit[1].id && audit[1].id > audit[2].id,
+            "newest first"
+        );
     }
 
     #[test]
@@ -691,7 +730,10 @@ mod tests {
         let cfg = resolve_autoprune_config();
         assert!(!cfg.enabled, "disabled by default");
         assert!(cfg.dry_run, "dry-run by default even if it ran");
-        assert!(cfg.delete_workspaces, "default action when a real run happens");
+        assert!(
+            cfg.delete_workspaces,
+            "default action when a real run happens"
+        );
     }
 
     #[test]

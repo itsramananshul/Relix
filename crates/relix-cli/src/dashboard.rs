@@ -607,7 +607,12 @@ mod tests {
 
     #[test]
     fn route_404_is_fail_missing_route() {
-        let c = classify_route_probe("prime.proposals", "/v1/spine/prime/proposals", Some(404), true);
+        let c = classify_route_probe(
+            "prime.proposals",
+            "/v1/spine/prime/proposals",
+            Some(404),
+            true,
+        );
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("not mounted"));
     }

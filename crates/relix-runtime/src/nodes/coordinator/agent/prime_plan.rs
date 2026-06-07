@@ -85,7 +85,10 @@ impl std::fmt::Display for PlanValidationError {
         match self {
             PlanValidationError::Empty => write!(f, "model output was empty"),
             PlanValidationError::TooLarge { bytes } => {
-                write!(f, "model output too large ({bytes} bytes, max {MAX_MODEL_OUTPUT_BYTES})")
+                write!(
+                    f,
+                    "model output too large ({bytes} bytes, max {MAX_MODEL_OUTPUT_BYTES})"
+                )
             }
             PlanValidationError::Parse(e) => write!(f, "model output was not valid plan JSON: {e}"),
             PlanValidationError::MissingTitle => write!(f, "plan had no usable Mandate title"),
@@ -441,7 +444,10 @@ mod tests {
 
     #[test]
     fn rejects_empty_and_malformed() {
-        assert_eq!(validate_model_plan("   ", REQ), Err(PlanValidationError::Empty));
+        assert_eq!(
+            validate_model_plan("   ", REQ),
+            Err(PlanValidationError::Empty)
+        );
         assert!(matches!(
             validate_model_plan("not json", REQ),
             Err(PlanValidationError::Parse(_))
@@ -451,7 +457,10 @@ mod tests {
     #[test]
     fn rejects_empty_and_too_many_briefs() {
         let none = serde_json::json!({"mandate_title": "X", "briefs": []}).to_string();
-        assert_eq!(validate_model_plan(&none, REQ), Err(PlanValidationError::NoBriefs));
+        assert_eq!(
+            validate_model_plan(&none, REQ),
+            Err(PlanValidationError::NoBriefs)
+        );
         let many: Vec<_> = (0..MAX_BRIEFS + 1)
             .map(|i| serde_json::json!({"key": format!("k{i}"), "title": format!("t{i}"), "role": "engineer"}))
             .collect();
@@ -529,7 +538,11 @@ mod tests {
         })
         .to_string();
         let p = validate_model_plan(&j, REQ).unwrap();
-        assert!(!p.mandate_title.contains("sk-abcdef"), "title: {}", p.mandate_title);
+        assert!(
+            !p.mandate_title.contains("sk-abcdef"),
+            "title: {}",
+            p.mandate_title
+        );
         assert!(p.mandate_title.contains("***"));
         assert!(!p.briefs[0].title.contains("sk-abcdef"));
         assert!(!p.risks[0].contains("sk-abcdef"));

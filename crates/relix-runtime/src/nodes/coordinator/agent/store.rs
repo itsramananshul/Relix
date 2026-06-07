@@ -956,10 +956,7 @@ impl AgentStore {
 
     /// First-run status read: the tenant's Founder, or `None` if the
     /// company has not been initialised yet.
-    pub fn find_founder(
-        &self,
-        tenant_id: &str,
-    ) -> Result<Option<AgentProfile>, AgentStoreError> {
+    pub fn find_founder(&self, tenant_id: &str) -> Result<Option<AgentProfile>, AgentStoreError> {
         let tenant = norm_tenant(tenant_id);
         let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
         let row = conn
@@ -2073,9 +2070,7 @@ impl AgentStore {
                 "hire is no longer pending; duplicate approval is a no-op".into(),
             ));
         }
-        let final_rig = rig_to_set
-            .map(|s| s.to_string())
-            .or(existing_rig);
+        let final_rig = rig_to_set.map(|s| s.to_string()).or(existing_rig);
         Ok(ApproveHireOutcome {
             rig_set: rig_to_set.is_some(),
             rig: final_rig,
@@ -3721,7 +3716,9 @@ mod tests {
         let (id1, created1) = s.ensure_founder("Ada", "echo", "owner", "default").unwrap();
         assert!(created1);
         // Second call (different name) returns the SAME founder, created=false.
-        let (id2, created2) = s.ensure_founder("Other", "claude", "owner", "default").unwrap();
+        let (id2, created2) = s
+            .ensure_founder("Other", "claude", "owner", "default")
+            .unwrap();
         assert!(!created2);
         assert_eq!(id1, id2);
         // Exactly one founder; the original name/rig are preserved.
@@ -3747,7 +3744,9 @@ mod tests {
     fn model_preference_defaults_none_then_set_read_and_clear() {
         let s = store();
         let id = s
-            .create_agent("A", "engineer", "Eng", "rd", "core", "op", "subj-mp", "low", "default")
+            .create_agent(
+                "A", "engineer", "Eng", "rd", "core", "op", "subj-mp", "low", "default",
+            )
             .unwrap();
         // Fresh row: no preferences stored.
         let p = s.get_agent(&id).unwrap().unwrap();
@@ -3757,7 +3756,8 @@ mod tests {
         // Set both (also covers the read path round-trip).
         s.update_agent_field(&id, "model_preference", "claude-sonnet-4")
             .unwrap();
-        s.update_agent_field(&id, "reasoning_effort", "high").unwrap();
+        s.update_agent_field(&id, "reasoning_effort", "high")
+            .unwrap();
         let p = s.get_agent(&id).unwrap().unwrap();
         assert_eq!(p.model_preference.as_deref(), Some("claude-sonnet-4"));
         assert_eq!(p.reasoning_effort.as_deref(), Some("high"));
@@ -3774,7 +3774,9 @@ mod tests {
     fn reasoning_effort_rejects_unknown_tier() {
         let s = store();
         let id = s
-            .create_agent("A", "engineer", "Eng", "rd", "core", "op", "subj-re", "low", "default")
+            .create_agent(
+                "A", "engineer", "Eng", "rd", "core", "op", "subj-re", "low", "default",
+            )
             .unwrap();
         let err = s
             .update_agent_field(&id, "reasoning_effort", "turbo")
@@ -3788,7 +3790,9 @@ mod tests {
     fn model_preference_aliases_and_length_cap() {
         let s = store();
         let id = s
-            .create_agent("A", "engineer", "Eng", "rd", "core", "op", "subj-al", "low", "default")
+            .create_agent(
+                "A", "engineer", "Eng", "rd", "core", "op", "subj-al", "low", "default",
+            )
             .unwrap();
         // `model` / `effort` are accepted aliases for the canonical names.
         s.update_agent_field(&id, "model", "gpt-5-codex").unwrap();
@@ -3808,10 +3812,25 @@ mod tests {
     fn model_preference_rejects_agent_wire_delimiters() {
         let s = store();
         let id = s
-            .create_agent("A", "engineer", "Eng", "rd", "core", "op", "subj-wire", "low", "default")
+            .create_agent(
+                "A",
+                "engineer",
+                "Eng",
+                "rd",
+                "core",
+                "op",
+                "subj-wire",
+                "low",
+                "default",
+            )
             .unwrap();
 
-        for bad in ["claude|sonnet", "claude\nsonnet", "claude\rsonnet", "claude\tsonnet"] {
+        for bad in [
+            "claude|sonnet",
+            "claude\nsonnet",
+            "claude\rsonnet",
+            "claude\tsonnet",
+        ] {
             assert!(
                 matches!(
                     s.update_agent_field(&id, "model_preference", bad),
@@ -3827,14 +3846,23 @@ mod tests {
     fn ensure_starter_operative_is_idempotent_active_and_rigged() {
         let s = store();
         let (id1, c1) = s
-            .ensure_starter_operative("engineer", "Starter Engineer (local · echo)", "Starter Engineer", "echo", "default")
+            .ensure_starter_operative(
+                "engineer",
+                "Starter Engineer (local · echo)",
+                "Starter Engineer",
+                "echo",
+                "default",
+            )
             .unwrap();
         assert!(c1);
         let p = s.get_agent(&id1).unwrap().unwrap();
         assert_eq!(p.status, "active");
         assert_eq!(p.rig.as_deref(), Some("echo"));
         assert_eq!(p.created_by, AgentStore::STARTER_CREATED_BY);
-        assert!(!p.can_spawn_agents && !p.can_assign_work, "a starter is a worker");
+        assert!(
+            !p.can_spawn_agents && !p.can_assign_work,
+            "a starter is a worker"
+        );
         // Re-ensuring the same role returns the same Operative (no duplicate).
         let (id2, c2) = s
             .ensure_starter_operative("engineer", "X", "Y", "echo", "default")
@@ -3847,7 +3875,8 @@ mod tests {
     #[test]
     fn ensure_starter_operative_is_per_tenant() {
         let s = store();
-        s.ensure_starter_operative("engineer", "Eng A", "Eng", "echo", "guild-a").unwrap();
+        s.ensure_starter_operative("engineer", "Eng A", "Eng", "echo", "guild-a")
+            .unwrap();
         assert_eq!(s.list_operatives_for_tenant("guild-a").unwrap().len(), 1);
         assert_eq!(s.list_operatives_for_tenant("guild-b").unwrap().len(), 0);
     }
@@ -3867,7 +3896,8 @@ mod tests {
     #[test]
     fn grant_console_authority_upgrades_only_the_console_profile() {
         let s = store();
-        s.ensure_operator_console_profile("console-subj", "default").unwrap();
+        s.ensure_operator_console_profile("console-subj", "default")
+            .unwrap();
         // A normal Operative that must NOT be touched by the grant.
         let normal = s
             .create_agent(
@@ -3875,7 +3905,9 @@ mod tests {
                 "default",
             )
             .unwrap();
-        let granted = s.grant_console_authority("console-subj", "default").unwrap();
+        let granted = s
+            .grant_console_authority("console-subj", "default")
+            .unwrap();
         assert!(granted);
         let console = s.get_by_subject("console-subj").unwrap().unwrap();
         assert!(console.can_assign_work && console.assign_scope == "any");
@@ -4059,17 +4091,25 @@ mod tests {
     fn list_active_for_tenant_is_oldest_first_active_only_and_isolated() {
         let s = store();
         let e1 = s
-            .create_agent("E1", "engineer", "E", "e", "e", "op", "subj-a1", "low", "default")
+            .create_agent(
+                "E1", "engineer", "E", "e", "e", "op", "subj-a1", "low", "default",
+            )
             .unwrap();
         let e2 = s
-            .create_agent("E2", "engineer", "E", "e", "e", "op", "subj-a2", "low", "default")
+            .create_agent(
+                "E2", "engineer", "E", "e", "e", "op", "subj-a2", "low", "default",
+            )
             .unwrap();
         // A pending hire is not active.
-        s.request_hire("E3", "engineer", "E", "e", "e", "op", "subj-a3", "low", "default")
-            .unwrap();
+        s.request_hire(
+            "E3", "engineer", "E", "e", "e", "op", "subj-a3", "low", "default",
+        )
+        .unwrap();
         // A crew member in another tenant must never appear.
-        s.create_agent("X", "engineer", "E", "e", "e", "op", "subj-x", "low", "tenant-b")
-            .unwrap();
+        s.create_agent(
+            "X", "engineer", "E", "e", "e", "op", "subj-x", "low", "tenant-b",
+        )
+        .unwrap();
 
         let ids: Vec<String> = s
             .list_active_for_tenant("default")

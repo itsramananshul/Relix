@@ -349,7 +349,11 @@ fn normalize_hint(value: Option<&str>, what: &str) -> Result<Option<String>, Str
 ///   [`MAX_SUGGESTED_CHILDREN`] (over-cap is refused, never silently
 ///   truncated — the operator must see the full set they accept).
 pub fn normalize_proposal(summary: &str, children: &[ChildSpec]) -> Result<Proposal, String> {
-    let summary: String = summary.trim().chars().take(MAX_PROPOSAL_SUMMARY_LEN).collect();
+    let summary: String = summary
+        .trim()
+        .chars()
+        .take(MAX_PROPOSAL_SUMMARY_LEN)
+        .collect();
     // Pass 1: trim titles + drop empties, remembering the original→kept
     // index mapping so an `after` (which names an *original* sibling
     // position) can be re-pointed after drops.
@@ -417,7 +421,10 @@ pub fn normalize_proposal(summary: &str, children: &[ChildSpec]) -> Result<Propo
         }
         norm.push(spec);
     }
-    Ok(Proposal { summary, children: norm })
+    Ok(Proposal {
+        summary,
+        children: norm,
+    })
 }
 
 /// A canonical, hashable fingerprint of a `suggest_tasks` proposal's
@@ -950,7 +957,10 @@ mod tests {
             ],
         )
         .expect("valid");
-        assert_eq!(p.children[0].assignee_agent_id.as_deref(), Some("agt_eng_1"));
+        assert_eq!(
+            p.children[0].assignee_agent_id.as_deref(),
+            Some("agt_eng_1")
+        );
         assert_eq!(p.children[0].assignee_role, None);
         assert_eq!(p.children[1].assignee_role.as_deref(), Some("engineer"));
         assert_eq!(p.children[1].assignee_agent_id, None);
@@ -965,7 +975,10 @@ mod tests {
             "s",
             &[child_hint("conflict", Some("agt_eng_1"), Some("engineer"))],
         );
-        assert!(out.is_err(), "an id AND a role on one child must be refused");
+        assert!(
+            out.is_err(),
+            "an id AND a role on one child must be refused"
+        );
     }
 
     #[test]
@@ -997,21 +1010,13 @@ mod tests {
     fn proposal_rejects_forward_self_and_out_of_range_after() {
         // Forward reference (#0 → #1) is refused.
         assert!(
-            normalize_proposal(
-                "p",
-                &[child_after("A", Some(1)), child_after("B", None)]
-            )
-            .is_err()
+            normalize_proposal("p", &[child_after("A", Some(1)), child_after("B", None)]).is_err()
         );
         // Self reference (#0 → #0) is refused.
         assert!(normalize_proposal("p", &[child_after("A", Some(0))]).is_err());
         // Out-of-range reference is refused.
         assert!(
-            normalize_proposal(
-                "p",
-                &[child_after("A", None), child_after("B", Some(9))]
-            )
-            .is_err()
+            normalize_proposal("p", &[child_after("A", None), child_after("B", Some(9))]).is_err()
         );
     }
 
@@ -1038,8 +1043,11 @@ mod tests {
         // Same children, different summary → SAME fingerprint (summary is
         // cosmetic and never affects what gets materialized).
         let a = normalize_proposal("Plan A", &[child("First"), child("Second")]).unwrap();
-        let b = normalize_proposal("totally different wording", &[child("First"), child("Second")])
-            .unwrap();
+        let b = normalize_proposal(
+            "totally different wording",
+            &[child("First"), child("Second")],
+        )
+        .unwrap();
         assert_eq!(proposal_fingerprint(&a), proposal_fingerprint(&b));
         // A different child set → DIFFERENT fingerprint.
         let c = normalize_proposal("Plan A", &[child("First"), child("Third")]).unwrap();
@@ -1057,24 +1065,25 @@ mod tests {
             "p",
             &[
                 child("A"),
-                ChildSpec { title: "B".into(), priority: Some("high".into()), after: None, assignee_agent_id: None, assignee_role: None },
+                ChildSpec {
+                    title: "B".into(),
+                    priority: Some("high".into()),
+                    after: None,
+                    assignee_agent_id: None,
+                    assignee_role: None,
+                },
             ],
         )
         .unwrap();
         assert_ne!(proposal_fingerprint(&base), proposal_fingerprint(&prio));
         // An `after` edge forks the fingerprint.
-        let after = normalize_proposal(
-            "p",
-            &[child_after("A", None), child_after("B", Some(0))],
-        )
-        .unwrap();
+        let after =
+            normalize_proposal("p", &[child_after("A", None), child_after("B", Some(0))]).unwrap();
         assert_ne!(proposal_fingerprint(&base), proposal_fingerprint(&after));
         // An assignee hint forks the fingerprint.
-        let hinted = normalize_proposal(
-            "p",
-            &[child("A"), child_hint("B", Some("agt_eng_1"), None)],
-        )
-        .unwrap();
+        let hinted =
+            normalize_proposal("p", &[child("A"), child_hint("B", Some("agt_eng_1"), None)])
+                .unwrap();
         assert_ne!(proposal_fingerprint(&base), proposal_fingerprint(&hinted));
         // Deterministic: hashing the same proposal twice is stable.
         assert_eq!(proposal_fingerprint(&base), proposal_fingerprint(&base));

@@ -747,7 +747,14 @@ impl SpineStore {
                  (proposal_id, tenant_id, proposer_id, message, proposal_json,
                   status, mandate_id, created_brief_ids, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, 'proposed', '', '[]', ?6, ?6)",
-            params![proposal_id, tenant, proposer_id, message, proposal_json, now],
+            params![
+                proposal_id,
+                tenant,
+                proposer_id,
+                message,
+                proposal_json,
+                now
+            ],
         )?;
         Ok(proposal_id)
     }
@@ -1854,20 +1861,40 @@ mod tests {
         assert_eq!(s.object_billing_code("acme", None, None), None);
         // Guild-level default.
         s.set_guild_billing_code("acme", Some("G")).unwrap();
-        assert_eq!(s.get_guild("acme").unwrap().unwrap().billing_code.as_deref(), Some("G"));
-        assert_eq!(s.object_billing_code("acme", None, None).as_deref(), Some("G"));
+        assert_eq!(
+            s.get_guild("acme")
+                .unwrap()
+                .unwrap()
+                .billing_code
+                .as_deref(),
+            Some("G")
+        );
+        assert_eq!(
+            s.object_billing_code("acme", None, None).as_deref(),
+            Some("G")
+        );
         // Mandate code beats the Guild default.
         let m = s.create_mandate("acme", "M", "", None, None).unwrap();
-        s.update_mandate_field(&m, "billing_code", "M-CODE").unwrap();
-        assert_eq!(s.get_mandate(&m).unwrap().unwrap().billing_code.as_deref(), Some("M-CODE"));
+        s.update_mandate_field(&m, "billing_code", "M-CODE")
+            .unwrap();
+        assert_eq!(
+            s.get_mandate(&m).unwrap().unwrap().billing_code.as_deref(),
+            Some("M-CODE")
+        );
         assert_eq!(
             s.object_billing_code("acme", Some(&m), None).as_deref(),
             Some("M-CODE")
         );
         // Campaign code beats the Mandate code.
-        let c = s.create_campaign("acme", "C", Some(&m), None, None).unwrap();
-        s.update_campaign_field(&c, "billing_code", "C-CODE").unwrap();
-        assert_eq!(s.get_campaign(&c).unwrap().unwrap().billing_code.as_deref(), Some("C-CODE"));
+        let c = s
+            .create_campaign("acme", "C", Some(&m), None, None)
+            .unwrap();
+        s.update_campaign_field(&c, "billing_code", "C-CODE")
+            .unwrap();
+        assert_eq!(
+            s.get_campaign(&c).unwrap().unwrap().billing_code.as_deref(),
+            Some("C-CODE")
+        );
         assert_eq!(
             s.object_billing_code("acme", Some(&m), Some(&c)).as_deref(),
             Some("C-CODE")

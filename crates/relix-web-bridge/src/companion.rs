@@ -512,7 +512,8 @@ fn summarize_roster(v: &serde_json::Value) -> String {
         }
     }
     let total = rows.len();
-    let mut reply = format!("{total} Operative(s) on the crew — {active} active, {pending} pending");
+    let mut reply =
+        format!("{total} Operative(s) on the crew — {active} active, {pending} pending");
     if other > 0 {
         reply.push_str(&format!(", {other} other"));
     }
@@ -584,7 +585,11 @@ async fn fetch_companion_context(state: &AppState) -> CompanionContext {
 /// trusted: `validate_model_action` re-checks every field before execution.
 fn build_companion_ai_prompt(redacted_message: &str, ctx: &CompanionContext) -> String {
     let mut context_block = String::new();
-    for line in [ctx.roster.as_str(), ctx.attention.as_str(), ctx.board.as_str()] {
+    for line in [
+        ctx.roster.as_str(),
+        ctx.attention.as_str(),
+        ctx.board.as_str(),
+    ] {
         let line = line.trim();
         if !line.is_empty() {
             context_block.push_str("- ");
@@ -651,8 +656,8 @@ fn validate_model_action(raw: &str) -> Result<CompanionAction, String> {
         return Err("model output too large".to_string());
     }
     let cleaned = strip_code_fence(raw);
-    let v: serde_json::Value =
-        serde_json::from_str(&cleaned).map_err(|_| "model did not return valid JSON".to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&cleaned)
+        .map_err(|_| "model did not return valid JSON".to_string())?;
     let obj = v
         .as_object()
         .ok_or_else(|| "model JSON was not an object".to_string())?;
@@ -849,17 +854,17 @@ async fn handle_ai(
     let ctx = fetch_companion_context(state).await;
     let prompt = build_companion_ai_prompt(&redacted, &ctx);
 
-    let (action, ai_mode, ai_reason) = match call_ai_chat(state, COMPANION_AI_SESSION, &prompt).await
-    {
-        Ok(model_output) => match validate_model_action(&model_output) {
-            Ok(action) => (action, "llm_used", None),
-            // The model answered but its choice was unusable. Reasons are the
-            // bridge's own validator strings — never raw model text.
-            Err(reason) => (parse_command(message), "fallback", Some(reason)),
-        },
-        // No model reachable — honest `unavailable`, deterministic action.
-        Err(reason) => (parse_command(message), "unavailable", Some(reason)),
-    };
+    let (action, ai_mode, ai_reason) =
+        match call_ai_chat(state, COMPANION_AI_SESSION, &prompt).await {
+            Ok(model_output) => match validate_model_action(&model_output) {
+                Ok(action) => (action, "llm_used", None),
+                // The model answered but its choice was unusable. Reasons are the
+                // bridge's own validator strings — never raw model text.
+                Err(reason) => (parse_command(message), "fallback", Some(reason)),
+            },
+            // No model reachable — honest `unavailable`, deterministic action.
+            Err(reason) => (parse_command(message), "unavailable", Some(reason)),
+        };
 
     let mut resp = execute_action(state, action, message).await?;
     resp.ai_mode = Some(ai_mode.to_string());
@@ -902,7 +907,10 @@ async fn execute_action(
         }),
         CompanionAction::Unknown => Ok(CompanionResponse {
             action: "unknown".into(),
-            reply: format!("I didn't understand \"{}\". Type help for commands.", message.trim()),
+            reply: format!(
+                "I didn't understand \"{}\". Type help for commands.",
+                message.trim()
+            ),
             result: None,
             ai_mode: None,
             ai_used: None,
@@ -1113,8 +1121,7 @@ async fn execute_action(
                 "plan_body": plan_body,
                 "children": children_json,
             });
-            let arg_bytes =
-                serde_json::to_vec(&arg).map_err(|e| bad(&format!("encode: {e}")))?;
+            let arg_bytes = serde_json::to_vec(&arg).map_err(|e| bad(&format!("encode: {e}")))?;
             let body = call_peer(state, "brief.plan_package_open", &arg_bytes).await?;
             let json = parse_json(&body);
             let confirm = json
@@ -1347,21 +1354,37 @@ mod tests {
 
     #[test]
     fn parses_blocked_intents() {
-        for m in ["what is blocked", "what's blocked?", "blocked work", "blocked"] {
+        for m in [
+            "what is blocked",
+            "what's blocked?",
+            "blocked work",
+            "blocked",
+        ] {
             assert_eq!(parse_command(m), CompanionAction::BlockedWork, "input: {m}");
         }
     }
 
     #[test]
     fn parses_running_intents() {
-        for m in ["what is running", "what's running?", "active runs", "running"] {
+        for m in [
+            "what is running",
+            "what's running?",
+            "active runs",
+            "running",
+        ] {
             assert_eq!(parse_command(m), CompanionAction::RunningWork, "input: {m}");
         }
     }
 
     #[test]
     fn parses_roster_intents() {
-        for m in ["who is on the crew", "who's on the crew?", "roster", "crew", "agents"] {
+        for m in [
+            "who is on the crew",
+            "who's on the crew?",
+            "roster",
+            "crew",
+            "agents",
+        ] {
             assert_eq!(parse_command(m), CompanionAction::Roster, "input: {m}");
         }
     }
@@ -1462,9 +1485,15 @@ mod tests {
 
     #[test]
     fn plan_package_without_brief_id_is_unknown() {
-        assert_eq!(parse_command("plan package : body => child: A"), CompanionAction::Unknown);
+        assert_eq!(
+            parse_command("plan package : body => child: A"),
+            CompanionAction::Unknown
+        );
         // No colon at all → not a plan package.
-        assert_eq!(parse_command("plan package b1 body child A"), CompanionAction::Unknown);
+        assert_eq!(
+            parse_command("plan package b1 body child A"),
+            CompanionAction::Unknown
+        );
     }
 
     #[test]
@@ -1651,28 +1680,44 @@ mod tests {
     fn validates_field_actions_into_companion_action() {
         assert_eq!(
             validate_model_action(r#"{"action":"create_brief","title":"Ship auth"}"#).unwrap(),
-            CompanionAction::CreateBrief { title: "Ship auth".into() }
+            CompanionAction::CreateBrief {
+                title: "Ship auth".into()
+            }
         );
         assert_eq!(
             validate_model_action(r#"{"action":"search","query":"login"}"#).unwrap(),
-            CompanionAction::Search { query: "login".into() }
+            CompanionAction::Search {
+                query: "login".into()
+            }
         );
         assert_eq!(
             validate_model_action(r#"{"action":"assign","id":"b1","agent":"agt_eng"}"#).unwrap(),
-            CompanionAction::Assign { id: "b1".into(), agent: "agt_eng".into() }
+            CompanionAction::Assign {
+                id: "b1".into(),
+                agent: "agt_eng".into()
+            }
         );
         // `on` defaults to true (pin); an explicit false unpins.
         assert_eq!(
             validate_model_action(r#"{"action":"pin","id":"b1"}"#).unwrap(),
-            CompanionAction::Pin { id: "b1".into(), on: true }
+            CompanionAction::Pin {
+                id: "b1".into(),
+                on: true
+            }
         );
         assert_eq!(
             validate_model_action(r#"{"action":"pin","id":"b1","on":false}"#).unwrap(),
-            CompanionAction::Pin { id: "b1".into(), on: false }
+            CompanionAction::Pin {
+                id: "b1".into(),
+                on: false
+            }
         );
         assert_eq!(
             validate_model_action(r#"{"action":"comment","id":"b1","text":"ship it"}"#).unwrap(),
-            CompanionAction::Comment { id: "b1".into(), text: "ship it".into() }
+            CompanionAction::Comment {
+                id: "b1".into(),
+                text: "ship it".into()
+            }
         );
     }
 
@@ -1680,9 +1725,14 @@ mod tests {
     fn validates_move_status_normalised_and_rejects_bad_status() {
         assert_eq!(
             validate_model_action(r#"{"action":"move","id":"b1","status":"In Progress"}"#).unwrap(),
-            CompanionAction::Move { id: "b1".into(), status: "in_progress".into() }
+            CompanionAction::Move {
+                id: "b1".into(),
+                status: "in_progress".into()
+            }
         );
-        assert!(validate_model_action(r#"{"action":"move","id":"b1","status":"nowhere"}"#).is_err());
+        assert!(
+            validate_model_action(r#"{"action":"move","id":"b1","status":"nowhere"}"#).is_err()
+        );
         assert!(validate_model_action(r#"{"action":"move","status":"done"}"#).is_err());
     }
 
@@ -1691,14 +1741,24 @@ mod tests {
         let json = r#"{"action":"plan_package","brief_id":"b1","plan_body":"do it",
             "children":[{"title":"step one"},{"title":"step two","priority":"high"}]}"#;
         match validate_model_action(json).unwrap() {
-            CompanionAction::PlanPackage { brief_id, plan_body, children } => {
+            CompanionAction::PlanPackage {
+                brief_id,
+                plan_body,
+                children,
+            } => {
                 assert_eq!(brief_id, "b1");
                 assert_eq!(plan_body, "do it");
                 assert_eq!(
                     children,
                     vec![
-                        PlanChild { title: "step one".into(), priority: "normal".into() },
-                        PlanChild { title: "step two".into(), priority: "high".into() },
+                        PlanChild {
+                            title: "step one".into(),
+                            priority: "normal".into()
+                        },
+                        PlanChild {
+                            title: "step two".into(),
+                            priority: "high".into()
+                        },
                     ]
                 );
             }
@@ -1714,10 +1774,12 @@ mod tests {
         )
         .is_err());
         // No children.
-        assert!(validate_model_action(
-            r#"{"action":"plan_package","brief_id":"b1","plan_body":"plan","children":[]}"#
-        )
-        .is_err());
+        assert!(
+            validate_model_action(
+                r#"{"action":"plan_package","brief_id":"b1","plan_body":"plan","children":[]}"#
+            )
+            .is_err()
+        );
         // Invalid priority.
         assert!(validate_model_action(
             r#"{"action":"plan_package","brief_id":"b1","plan_body":"p","children":[{"title":"x","priority":"asap"}]}"#
@@ -1756,9 +1818,15 @@ mod tests {
     #[test]
     fn validator_strips_code_fence() {
         let fenced = "```json\n{\"action\":\"roster\"}\n```";
-        assert_eq!(validate_model_action(fenced).unwrap(), CompanionAction::Roster);
+        assert_eq!(
+            validate_model_action(fenced).unwrap(),
+            CompanionAction::Roster
+        );
         let bare_fence = "```\n{\"action\":\"board\"}\n```";
-        assert_eq!(validate_model_action(bare_fence).unwrap(), CompanionAction::Board);
+        assert_eq!(
+            validate_model_action(bare_fence).unwrap(),
+            CompanionAction::Board
+        );
     }
 
     // ── AI provenance metadata ───────────────────────────────────────────────
@@ -1767,6 +1835,10 @@ mod tests {
     fn ai_fallback_note_only_on_non_llm_paths() {
         assert!(ai_fallback_note("llm_used").is_none());
         assert!(ai_fallback_note("fallback").unwrap().contains("rule-based"));
-        assert!(ai_fallback_note("unavailable").unwrap().contains("unavailable"));
+        assert!(
+            ai_fallback_note("unavailable")
+                .unwrap()
+                .contains("unavailable")
+        );
     }
 }

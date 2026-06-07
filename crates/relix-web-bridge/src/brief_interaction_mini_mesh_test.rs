@@ -204,8 +204,11 @@ async fn brief_interaction_routes_round_trip_open_list_respond() {
 
     // ─── 2. Mint bridge identity + wire a real mesh client ───
     let tmpdir = TempDir::new().unwrap();
-    let bundle_bytes =
-        mint_bridge_bundle_bytes(&org_root, "interaction-test-bridge", vec!["chat-users".into()]);
+    let bundle_bytes = mint_bridge_bundle_bytes(
+        &org_root,
+        "interaction-test-bridge",
+        vec!["chat-users".into()],
+    );
     let bundle_path = tmpdir.path().join("bridge.bundle");
     std::fs::write(&bundle_path, &bundle_bytes).unwrap();
     let client_key_path = tmpdir.path().join("client.key");
@@ -338,10 +341,7 @@ addr = "{addr}"
     let body: Value = resp.json().await.unwrap();
     let arr = body.as_array().expect("array");
     assert_eq!(arr.len(), 1);
-    assert_eq!(
-        arr[0].get("status").and_then(Value::as_str),
-        Some("open")
-    );
+    assert_eq!(arr[0].get("status").and_then(Value::as_str), Some("open"));
     assert_eq!(
         arr[0]
             .get("choices")
@@ -367,7 +367,12 @@ addr = "{addr}"
     .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
-        respond_args.lock().unwrap().last().cloned().unwrap_or_default(),
+        respond_args
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_default(),
         "task_1|bix_test|founder|resolved|yes — ship",
         "respond wire arg must be task_id|iid|responder|status|response"
     );
@@ -416,7 +421,11 @@ addr = "{addr}"
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(resp.status().as_u16(), 400, "unknown kind is rejected at the bridge");
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "unknown kind is rejected at the bridge"
+    );
 }
 
 /// §1.9 suggest_tasks round-trip across a real mesh:
@@ -559,8 +568,11 @@ async fn brief_suggestion_routes_round_trip_open_list_respond() {
     spawn_inbound_loop(events, dispatch.clone());
 
     let tmpdir = TempDir::new().unwrap();
-    let bundle_bytes =
-        mint_bridge_bundle_bytes(&org_root, "suggestion-test-bridge", vec!["chat-users".into()]);
+    let bundle_bytes = mint_bridge_bundle_bytes(
+        &org_root,
+        "suggestion-test-bridge",
+        vec!["chat-users".into()],
+    );
     let bundle_path = tmpdir.path().join("bridge.bundle");
     std::fs::write(&bundle_path, &bundle_bytes).unwrap();
     let client_key_path = tmpdir.path().join("client.key");
@@ -686,9 +698,14 @@ addr = "{addr}"
     // The coordinator received a JSON arg with the task_id + proposal.
     let seen: Value = serde_json::from_str(&open_arg.lock().unwrap()).expect("open arg is JSON");
     assert_eq!(seen.get("task_id").and_then(Value::as_str), Some("task_1"));
-    assert_eq!(seen.get("author").and_then(Value::as_str), Some("operative-1"));
     assert_eq!(
-        seen.get("children").and_then(Value::as_array).map(|a| a.len()),
+        seen.get("author").and_then(Value::as_str),
+        Some("operative-1")
+    );
+    assert_eq!(
+        seen.get("children")
+            .and_then(Value::as_array)
+            .map(|a| a.len()),
         Some(2)
     );
     // The optional `after` dependency rides through the JSON wire arg.
@@ -707,7 +724,10 @@ addr = "{addr}"
     assert_eq!(resp.status().as_u16(), 200);
     let body: Value = resp.json().await.unwrap();
     let arr = body.as_array().expect("array");
-    assert_eq!(arr[0].get("kind").and_then(Value::as_str), Some("suggest_tasks"));
+    assert_eq!(
+        arr[0].get("kind").and_then(Value::as_str),
+        Some("suggest_tasks")
+    );
     assert_eq!(
         arr[0]["proposal"]["children"].as_array().map(|a| a.len()),
         Some(2)
@@ -728,7 +748,12 @@ addr = "{addr}"
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["created"].as_array().map(|a| a.len()), Some(2));
     assert_eq!(
-        respond_args.lock().unwrap().last().cloned().unwrap_or_default(),
+        respond_args
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_default(),
         "task_1|bix_sug|founder|accept",
         "respond wire arg must be task_id|iid|responder|verdict"
     );
@@ -852,7 +877,11 @@ addr = "{addr}"
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(resp.status().as_u16(), 400, "an empty proposal is rejected at the bridge");
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "an empty proposal is rejected at the bridge"
+    );
 }
 
 /// §1.8 approval-bound plan confirm across a real mesh:
@@ -905,8 +934,11 @@ async fn brief_plan_confirm_route_opens_and_refuses_without_plan() {
     spawn_inbound_loop(events, dispatch.clone());
 
     let tmpdir = TempDir::new().unwrap();
-    let bundle_bytes =
-        mint_bridge_bundle_bytes(&org_root, "plan-confirm-test-bridge", vec!["chat-users".into()]);
+    let bundle_bytes = mint_bridge_bundle_bytes(
+        &org_root,
+        "plan-confirm-test-bridge",
+        vec!["chat-users".into()],
+    );
     let bundle_path = tmpdir.path().join("bridge.bundle");
     std::fs::write(&bundle_path, &bundle_bytes).unwrap();
     let client_key_path = tmpdir.path().join("client.key");
@@ -1015,7 +1047,12 @@ addr = "{addr}"
         Some("bix_plan")
     );
     assert_eq!(
-        open_args.lock().unwrap().last().cloned().unwrap_or_default(),
+        open_args
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_default(),
         "task_1|founder|Approve the plan?",
         "plan-confirm wire arg must be task_id|author|prompt"
     );
@@ -1030,7 +1067,12 @@ addr = "{addr}"
     .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
-        open_args.lock().unwrap().last().cloned().unwrap_or_default(),
+        open_args
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_default(),
         "task_1|operator|",
         "an absent author defaults to the local bridge identity"
     );

@@ -26,9 +26,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
 use axum::Json;
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
@@ -239,7 +239,7 @@ impl SessionStore {
         if let Ok(m) = self.inner.read() {
             match m.get(sid) {
                 Some(s) if s.expires_at > now => return Some(s.username.clone()),
-                Some(_) => {}     // expired → fall through to prune
+                Some(_) => {} // expired → fall through to prune
                 None => return None,
             }
         }
@@ -315,9 +315,7 @@ fn set_session_cookie(sid: &str) -> String {
     // form/link cannot ride it; Path=/ for the whole app. No `Secure`
     // because the operator console runs over loopback http — a reverse
     // proxy terminating TLS can re-add it.
-    format!(
-        "{SESSION_COOKIE}={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
-    )
+    format!("{SESSION_COOKIE}={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}")
 }
 
 fn clear_session_cookie() -> String {
@@ -382,7 +380,10 @@ pub async fn status(State(state): State<AppState>, req: Request) -> Response {
 pub async fn setup(State(state): State<AppState>, Json(creds): Json<Credentials>) -> Response {
     let auth = &state.dashboard_auth;
     if auth.admin.exists() {
-        return json_err(StatusCode::CONFLICT, "admin already configured — log in instead");
+        return json_err(
+            StatusCode::CONFLICT,
+            "admin already configured — log in instead",
+        );
     }
     let username = creds.username.trim();
     if username.is_empty() {
@@ -408,7 +409,10 @@ pub async fn setup(State(state): State<AppState>, Json(creds): Json<Credentials>
 pub async fn login(State(state): State<AppState>, Json(creds): Json<Credentials>) -> Response {
     let auth = &state.dashboard_auth;
     if !auth.admin.exists() {
-        return json_err(StatusCode::CONFLICT, "no admin configured — run setup first");
+        return json_err(
+            StatusCode::CONFLICT,
+            "no admin configured — run setup first",
+        );
     }
     match auth.admin.verify(creds.username.trim(), &creds.password) {
         Some(username) => {
@@ -457,7 +461,10 @@ mod tests {
         assert!(auth.admin.exists());
         assert_eq!(auth.admin.username().as_deref(), Some("ops"));
         // Correct password verifies; wrong does not.
-        assert_eq!(auth.admin.verify("ops", "hunter2pass").as_deref(), Some("ops"));
+        assert_eq!(
+            auth.admin.verify("ops", "hunter2pass").as_deref(),
+            Some("ops")
+        );
         assert!(auth.admin.verify("ops", "wrong").is_none());
         assert!(auth.admin.verify("other", "hunter2pass").is_none());
     }
@@ -471,7 +478,10 @@ mod tests {
         // A fresh handle on the same path reads the persisted admin.
         let a2 = DashboardAuth::from_token_path(&token);
         assert!(a2.admin.exists());
-        assert_eq!(a2.admin.verify("ops", "hunter2pass").as_deref(), Some("ops"));
+        assert_eq!(
+            a2.admin.verify("ops", "hunter2pass").as_deref(),
+            Some("ops")
+        );
     }
 
     #[test]
@@ -509,7 +519,10 @@ mod tests {
         // First-run setup, then verify the old password.
         let a1 = DashboardAuth::from_token_path(&token);
         a1.admin.create("ops", "oldpassword").unwrap();
-        assert_eq!(a1.admin.verify("ops", "oldpassword").as_deref(), Some("ops"));
+        assert_eq!(
+            a1.admin.verify("ops", "oldpassword").as_deref(),
+            Some("ops")
+        );
         // Reset keeps the username (read from disk) but sets a new password.
         let user = read_admin_username(&admin).unwrap();
         assert_eq!(user, "ops");
@@ -517,7 +530,10 @@ mod tests {
         // A FRESH handle (simulating a bridge restart) honors ONLY the new
         // password — the old one is gone.
         let a2 = DashboardAuth::from_token_path(&token);
-        assert_eq!(a2.admin.verify("ops", "newpassword1").as_deref(), Some("ops"));
+        assert_eq!(
+            a2.admin.verify("ops", "newpassword1").as_deref(),
+            Some("ops")
+        );
         assert!(
             a2.admin.verify("ops", "oldpassword").is_none(),
             "old password must stop working after reset"
@@ -534,7 +550,10 @@ mod tests {
         reset_admin_credential(&admin, "newadmin", "secretpass1").unwrap();
         assert_eq!(read_admin_username(&admin).as_deref(), Some("newadmin"));
         let a = DashboardAuth::from_token_path(&token);
-        assert_eq!(a.admin.verify("newadmin", "secretpass1").as_deref(), Some("newadmin"));
+        assert_eq!(
+            a.admin.verify("newadmin", "secretpass1").as_deref(),
+            Some("newadmin")
+        );
     }
 
     #[test]
@@ -548,7 +567,10 @@ mod tests {
         reset_admin_credential(&admin, "ops", "validpassword").unwrap();
         let raw = std::fs::read_to_string(&admin).unwrap();
         assert!(raw.contains("$argon2id$"), "got: {raw}");
-        assert!(!raw.contains("validpassword"), "password must not be stored in plaintext");
+        assert!(
+            !raw.contains("validpassword"),
+            "password must not be stored in plaintext"
+        );
     }
 
     #[test]
@@ -558,9 +580,7 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(session_cookie_value(&req).as_deref(), Some("abc123"));
-        let req = Request::builder()
-            .body(axum::body::Body::empty())
-            .unwrap();
+        let req = Request::builder().body(axum::body::Body::empty()).unwrap();
         assert!(session_cookie_value(&req).is_none());
     }
 

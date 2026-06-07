@@ -596,8 +596,7 @@ impl TaskStore {
             conn: Arc::new(Mutex::new(conn)),
             max_list: cfg.max_list.max(1),
             workspace_root: resolve_workspace_root(&cfg.db_path),
-            workspace_config:
-                crate::nodes::coordinator::heartbeat::resolve_workspace_config(),
+            workspace_config: crate::nodes::coordinator::heartbeat::resolve_workspace_config(),
             start_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             decomposition_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             object_billing: std::sync::OnceLock::new(),
@@ -614,10 +613,11 @@ impl TaskStore {
             conn: Arc::new(Mutex::new(conn)),
             max_list: 200,
             workspace_root: resolve_workspace_root(
-                &std::env::temp_dir().join("relix-run-workspaces").join("tasks.db"),
+                &std::env::temp_dir()
+                    .join("relix-run-workspaces")
+                    .join("tasks.db"),
             ),
-            workspace_config:
-                crate::nodes::coordinator::heartbeat::WorkspaceConfig::default(),
+            workspace_config: crate::nodes::coordinator::heartbeat::WorkspaceConfig::default(),
             start_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             decomposition_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             object_billing: std::sync::OnceLock::new(),
@@ -689,9 +689,7 @@ impl TaskStore {
 
     /// The resolved run-workspace context config (mode / project root /
     /// caps). Read by `preflight_run` to decide `empty` vs `copy_repo`.
-    pub fn run_workspace_config(
-        &self,
-    ) -> &crate::nodes::coordinator::heartbeat::WorkspaceConfig {
+    pub fn run_workspace_config(&self) -> &crate::nodes::coordinator::heartbeat::WorkspaceConfig {
         &self.workspace_config
     }
 
@@ -1541,10 +1539,7 @@ impl TaskStore {
     /// existence. The walk is cycle-safe (the `spawned` graph is acyclic —
     /// [`Self::add_brief_edge`] rejects cycles — and re-visits are pruned) and
     /// bounded by a hard expansion cap as a corrupt-graph backstop.
-    pub fn brief_delegation_depth(
-        &self,
-        brief: &str,
-    ) -> Result<Option<usize>, CoordinatorError> {
+    pub fn brief_delegation_depth(&self, brief: &str) -> Result<Option<usize>, CoordinatorError> {
         let Some(tenant) = self.task_tenant(brief)? else {
             return Ok(None);
         };
@@ -1576,8 +1571,7 @@ impl TaskStore {
             )
             .map_err(CoordinatorError::Db)?;
         const MAX_EXPANSIONS: usize = 100_000;
-        let mut best: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        let mut best: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut stack: Vec<(String, usize)> = vec![(brief.to_string(), 0)];
         let mut max_depth = 0usize;
         let mut expansions = 0usize;
@@ -1886,7 +1880,9 @@ impl TaskStore {
         let title = title.trim();
         let author = author.trim();
         if kind.is_empty() {
-            return Err(CoordinatorError::Invalid("dossier kind required".to_string()));
+            return Err(CoordinatorError::Invalid(
+                "dossier kind required".to_string(),
+            ));
         }
         if !is_safe_dossier_kind(kind) {
             return Err(CoordinatorError::Invalid(format!(
@@ -1894,7 +1890,9 @@ impl TaskStore {
             )));
         }
         if title.is_empty() {
-            return Err(CoordinatorError::Invalid("dossier title required".to_string()));
+            return Err(CoordinatorError::Invalid(
+                "dossier title required".to_string(),
+            ));
         }
         if title.chars().count() > MAX_DOSSIER_TITLE_LEN {
             return Err(CoordinatorError::Invalid(format!(
@@ -1902,7 +1900,9 @@ impl TaskStore {
             )));
         }
         if author.is_empty() {
-            return Err(CoordinatorError::Invalid("dossier author required".to_string()));
+            return Err(CoordinatorError::Invalid(
+                "dossier author required".to_string(),
+            ));
         }
         if author.chars().count() > MAX_DOSSIER_AUTHOR_LEN {
             return Err(CoordinatorError::Invalid(format!(
@@ -1910,7 +1910,9 @@ impl TaskStore {
             )));
         }
         if body.trim().is_empty() {
-            return Err(CoordinatorError::Invalid("dossier body required".to_string()));
+            return Err(CoordinatorError::Invalid(
+                "dossier body required".to_string(),
+            ));
         }
         if body.len() > MAX_DOSSIER_BODY_BYTES {
             return Err(CoordinatorError::Invalid(format!(
@@ -1995,12 +1997,9 @@ impl TaskStore {
                     ),
                     // No assertion: append on top of the current latest if one
                     // exists, else this is the first revision of the kind.
-                    (None, Some(cur)) => (
-                        Some(cur.clone()),
-                        None,
-                        "revise",
-                        "brief.dossier_revised",
-                    ),
+                    (None, Some(cur)) => {
+                        (Some(cur.clone()), None, "revise", "brief.dossier_revised")
+                    }
                     (None, None) => (None, None, "create", "brief.dossier_authored"),
                 }
             }
@@ -2049,17 +2048,19 @@ impl TaskStore {
              VALUES (?1, ?2, ?3, ?4)",
             params![task_id, now, event_type, payload],
         );
-        Ok(brief::DossierAuthorOutcome::Authored(brief::DossierAuthored {
-            doc_id,
-            task_id: task_id.to_string(),
-            kind: kind.to_string(),
-            title: title.to_string(),
-            author: Some(author.to_string()),
-            mode: mode_label.to_string(),
-            revision_number,
-            revision_of_doc_id: revision_of,
-            forked_from_doc_id: forked_from,
-        }))
+        Ok(brief::DossierAuthorOutcome::Authored(
+            brief::DossierAuthored {
+                doc_id,
+                task_id: task_id.to_string(),
+                kind: kind.to_string(),
+                title: title.to_string(),
+                author: Some(author.to_string()),
+                mode: mode_label.to_string(),
+                revision_number,
+                revision_of_doc_id: revision_of,
+                forked_from_doc_id: forked_from,
+            },
+        ))
     }
 
     /// PHASE 5 (Brief): the most recent Dossier of `kind` on a Brief
@@ -2148,17 +2149,15 @@ impl TaskStore {
     ) -> Result<Vec<brief::DossierMeta>, CoordinatorError> {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let mut stmt = conn
-            .prepare(
-                &format!(
-                    // `rowid` (monotonic insert order) as the within-second
-                    // tiebreak so the list order matches `revision_number`
-                    // (which also tiebreaks on rowid) rather than random doc_id.
-                    "SELECT doc_id, kind, title, created_at, updated_at,
+            .prepare(&format!(
+                // `rowid` (monotonic insert order) as the within-second
+                // tiebreak so the list order matches `revision_number`
+                // (which also tiebreaks on rowid) rather than random doc_id.
+                "SELECT doc_id, kind, title, created_at, updated_at,
                             author, revision_of_doc_id, forked_from_doc_id, {DOSSIER_REVNUM_SQL}
                      FROM task_documents WHERE task_id = ?1
                      ORDER BY created_at ASC, rowid ASC"
-                ),
-            )
+            ))
             .map_err(CoordinatorError::Db)?;
         let rows: Vec<brief::DossierMeta> = stmt
             .query_map(params![task_id], |r| {
@@ -2311,7 +2310,15 @@ impl TaskStore {
                  (interaction_id, task_id, kind, prompt, choices, author,
                   status, response, created_at, resolved_at, resolved_by)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', NULL, ?7, NULL, NULL)",
-            params![interaction_id, task_id, kind, prompt, choices_json, author, now],
+            params![
+                interaction_id,
+                task_id,
+                kind,
+                prompt,
+                choices_json,
+                author,
+                now
+            ],
         )
         .map_err(CoordinatorError::Db)?;
         let _ = conn.execute(
@@ -2365,16 +2372,15 @@ impl TaskStore {
         if !task_row_exists(&conn, task_id)? {
             return Err(CoordinatorError::NotFound(task_id.to_string()));
         }
-        let bound_doc_id = match latest_dossier_id_conn(&conn, task_id, "plan")
-            .map_err(CoordinatorError::Db)?
-        {
-            Some(id) => id,
-            None => {
-                return Err(CoordinatorError::Invalid(
-                    "no `plan` Dossier to confirm; attach a plan Dossier first".to_string(),
-                ));
-            }
-        };
+        let bound_doc_id =
+            match latest_dossier_id_conn(&conn, task_id, "plan").map_err(CoordinatorError::Db)? {
+                Some(id) => id,
+                None => {
+                    return Err(CoordinatorError::Invalid(
+                        "no `plan` Dossier to confirm; attach a plan Dossier first".to_string(),
+                    ));
+                }
+            };
         let interaction_id = new_interaction_id();
         let now = unix_secs();
         conn.execute(
@@ -2494,7 +2500,14 @@ impl TaskStore {
                  (interaction_id, task_id, kind, prompt, choices, author,
                   status, response, created_at, resolved_at, resolved_by, proposal)
              VALUES (?1, ?2, 'suggest_tasks', ?3, '[]', ?4, 'open', NULL, ?5, NULL, NULL, ?6)",
-            params![suggestion_id, task_id, suggest_prompt, author, now, proposal_json],
+            params![
+                suggestion_id,
+                task_id,
+                suggest_prompt,
+                author,
+                now,
+                proposal_json
+            ],
         )
         .map_err(CoordinatorError::Db)?;
         let _ = conn.execute(
@@ -2516,7 +2529,15 @@ impl TaskStore {
                   bound_doc_id, bound_doc_kind, bound_interaction_id)
              VALUES (?1, ?2, 'confirm', ?3, '[]', ?4, 'open', NULL, ?5, NULL, NULL,
                      ?6, 'plan', ?7)",
-            params![confirm_id, task_id, prompt, author, now, plan_doc_id, suggestion_id],
+            params![
+                confirm_id,
+                task_id,
+                prompt,
+                author,
+                now,
+                plan_doc_id,
+                suggestion_id
+            ],
         )
         .map_err(CoordinatorError::Db)?;
         let _ = conn.execute(
@@ -2717,8 +2738,8 @@ impl TaskStore {
         match status.as_str() {
             "open" => {
                 let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
-                let latest = latest_dossier_id_conn(&conn, task_id, "plan")
-                    .map_err(CoordinatorError::Db)?;
+                let latest =
+                    latest_dossier_id_conn(&conn, task_id, "plan").map_err(CoordinatorError::Db)?;
                 if latest.as_deref() != bound_doc_id.as_deref() {
                     // Stale: the plan changed since this confirm opened. Expire
                     // the card durably and refuse — never materialize against a
@@ -2835,8 +2856,7 @@ impl TaskStore {
         let rows: Vec<brief::Interaction> = stmt
             .query_map(params![task_id], |r| {
                 let choices_json: String = r.get(4)?;
-                let choices: Vec<String> =
-                    serde_json::from_str(&choices_json).unwrap_or_default();
+                let choices: Vec<String> = serde_json::from_str(&choices_json).unwrap_or_default();
                 let proposal: Option<String> = r.get(11)?;
                 let proposal: Option<brief::Proposal> =
                     proposal.and_then(|p| serde_json::from_str(&p).ok());
@@ -3011,8 +3031,8 @@ impl TaskStore {
                 "suggestion author required".to_string(),
             ));
         }
-        let proposal = brief::normalize_proposal(summary, children)
-            .map_err(CoordinatorError::Invalid)?;
+        let proposal =
+            brief::normalize_proposal(summary, children).map_err(CoordinatorError::Invalid)?;
         // The prompt is the summary, or a sensible default when the
         // Operative left it blank — never empty (the NOT NULL column and
         // the generic card renderer both want a line).
@@ -3073,9 +3093,7 @@ impl TaskStore {
             .optional()
             .map_err(CoordinatorError::Db)?;
         match row {
-            Some((kind, status, Some(p)))
-                if kind == "suggest_tasks" && status == "open" =>
-            {
+            Some((kind, status, Some(p))) if kind == "suggest_tasks" && status == "open" => {
                 Ok(serde_json::from_str(&p).ok())
             }
             _ => Ok(None),
@@ -3496,7 +3514,13 @@ impl TaskStore {
                      SET created_ids = ?1, updated_at = ?2
                      WHERE task_id = ?3 AND interaction_id = ?4
                        AND created_ids = ?5 AND status = 'in_progress'",
-                    params![new_joined, unix_secs(), task_id, interaction_id, prev_joined],
+                    params![
+                        new_joined,
+                        unix_secs(),
+                        task_id,
+                        interaction_id,
+                        prev_joined
+                    ],
                 )
                 .map_err(CoordinatorError::Db)?
             };
@@ -3567,7 +3591,12 @@ impl TaskStore {
             // re-resolved identically each call), so the event is honest even
             // on a resume.
             let assigned = (0..plan_len)
-                .filter(|idx| resolved_assignees.get(*idx).and_then(|o| o.as_deref()).is_some())
+                .filter(|idx| {
+                    resolved_assignees
+                        .get(*idx)
+                        .and_then(|o| o.as_deref())
+                        .is_some()
+                })
                 .count();
             conn.execute(
                 "UPDATE brief_decomposition_claims
@@ -5269,7 +5298,9 @@ impl TaskStore {
                           summary, trigger, refusal_reason)
                      SELECT ?1, ?2, ?3, ?4, 'refused', ?5, ?5, ?6, ?7, ?8
                      WHERE EXISTS (SELECT 1 FROM tasks WHERE task_id = ?2)",
-                    params![run_id, brief_id, agent_id, rig, now, summary, trigger, reason],
+                    params![
+                        run_id, brief_id, agent_id, rig, now, summary, trigger, reason
+                    ],
                 )
                 .map_err(CoordinatorError::Db)?;
             if n == 0 {
@@ -5483,7 +5514,8 @@ impl TaskStore {
         if source.retryable != Some(true) {
             return Ok(RetryPrecheck::Refused {
                 status: "not_retryable",
-                reason: "this failure is not retryable — it needs an operator fix first".to_string(),
+                reason: "this failure is not retryable — it needs an operator fix first"
+                    .to_string(),
                 brief_id: brief_opt,
             });
         }
@@ -5775,9 +5807,7 @@ impl TaskStore {
                 }
             })
         };
-        Ok(row
-            .map(|(m, c)| (norm(m), norm(c)))
-            .unwrap_or((None, None)))
+        Ok(row.map(|(m, c)| (norm(m), norm(c))).unwrap_or((None, None)))
     }
 
     /// Stamp a run row with the Brief's effective billing code at run START
@@ -6442,10 +6472,7 @@ impl TaskStore {
     }
 
     /// All artifacts for a run (the changed-files list). Ordered by path.
-    pub fn list_run_artifacts(
-        &self,
-        run_id: &str,
-    ) -> Result<Vec<RunArtifact>, CoordinatorError> {
+    pub fn list_run_artifacts(&self, run_id: &str) -> Result<Vec<RunArtifact>, CoordinatorError> {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let mut stmt = conn
             .prepare(
@@ -6916,7 +6943,9 @@ impl TaskStore {
                     params![
                         run_id,
                         now,
-                        format!("transcript capped at {MAX_RUN_EVENTS} events — further events dropped")
+                        format!(
+                            "transcript capped at {MAX_RUN_EVENTS} events — further events dropped"
+                        )
                     ],
                 );
             }
@@ -9395,8 +9424,7 @@ impl TaskStore {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let mut stmt = conn.prepare(&sql).map_err(CoordinatorError::Db)?;
         let cap_i64 = cap as i64;
-        let mut bind: Vec<&dyn rusqlite::types::ToSql> =
-            vec![&since_event_id, &tenant, &cap_i64];
+        let mut bind: Vec<&dyn rusqlite::types::ToSql> = vec![&since_event_id, &tenant, &cap_i64];
         for t in RUN_STREAM_EVENT_TYPES {
             bind.push(t);
         }
@@ -14659,9 +14687,7 @@ fn handle_brief_plan_confirm_open(store: &TaskStore, ctx: &InvocationCtx) -> Han
     };
     let parts: Vec<&str> = raw.splitn(3, '|').collect();
     if parts.len() < 2 {
-        return invalid(
-            "brief.plan_confirm_open: expected `task_id|author|prompt`".to_string(),
-        );
+        return invalid("brief.plan_confirm_open: expected `task_id|author|prompt`".to_string());
     }
     let task = parts[0].trim();
     if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.plan_confirm_open") {
@@ -14716,8 +14742,13 @@ fn handle_brief_interaction_respond(store: &TaskStore, ctx: &InvocationCtx) -> H
     if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.interaction_respond") {
         return out;
     }
-    match store.respond_interaction(task, parts[1].trim(), parts[2].trim(), parts[3].trim(), parts[4])
-    {
+    match store.respond_interaction(
+        task,
+        parts[1].trim(),
+        parts[2].trim(),
+        parts[3].trim(),
+        parts[4],
+    ) {
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(e) => map_edge_err("brief.interaction_respond", e),
     }
@@ -14982,7 +15013,11 @@ fn handle_brief_suggest_respond(
     let accept = match parts[3].trim() {
         "accept" => true,
         "reject" => false,
-        other => return invalid(format!("brief.suggest_respond: verdict must be accept|reject, got `{other}`")),
+        other => {
+            return invalid(format!(
+                "brief.suggest_respond: verdict must be accept|reject, got `{other}`"
+            ));
+        }
     };
     let interaction = parts[1].trim();
     // Resolve + assign-Key gate each proposed child's optional assignee hint
@@ -20435,7 +20470,10 @@ mod tests {
         assert!(d.claim.is_none());
         assert_eq!(d.wakeup_count, 0);
         assert!(d.chronicle.total > 0, "edits should have chronicled events");
-        assert!(!d.chronicle.recent.is_empty(), "recent chronicle tail present");
+        assert!(
+            !d.chronicle.recent.is_empty(),
+            "recent chronicle tail present"
+        );
         assert!(d.chronicle.recent.len() <= 5, "recent tail is bounded");
 
         // Unknown Brief → None.
@@ -20469,7 +20507,11 @@ mod tests {
 
         // Detail scoped to acme: foreign relations filtered, local kept.
         let d = s.brief_detail_for_tenant(&a, "acme").unwrap().unwrap();
-        assert_eq!(d.subbriefs, vec![local_child], "cross-tenant Sub-brief filtered");
+        assert_eq!(
+            d.subbriefs,
+            vec![local_child],
+            "cross-tenant Sub-brief filtered"
+        );
         assert!(d.snags.is_empty(), "cross-tenant Snag filtered");
 
         // Cross-tenant read of `a` from globex → not-found (no leak).
@@ -20534,7 +20576,11 @@ mod tests {
         assert!(lr.summary.ends_with('…'), "truncated summary marked");
 
         // Cross-tenant: globex can't see acme's Brief OR its run data.
-        assert!(s.brief_detail_for_tenant(&task, "globex").unwrap().is_none());
+        assert!(
+            s.brief_detail_for_tenant(&task, "globex")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Phase 3: a refused manual run becomes a durable `refused` Shift —
@@ -20550,7 +20596,14 @@ mod tests {
 
         // A durable refusal (`unassigned`) → one `refused` Shift + Chronicle.
         let run = s
-            .record_manual_refusal_for_tenant(&a, "acme", "", "", "unassigned", "assign an Operative first")
+            .record_manual_refusal_for_tenant(
+                &a,
+                "acme",
+                "",
+                "",
+                "unassigned",
+                "assign an Operative first",
+            )
             .unwrap();
         assert!(run.is_some(), "durable refusal recorded");
 
@@ -20574,31 +20627,50 @@ mod tests {
         assert_eq!(chron.len(), 1, "a refused chronicle event");
 
         // `already_running` / `not_found` are NOT durable → no extra rows.
-        assert!(s
-            .record_manual_refusal_for_tenant(&a, "acme", "", "", "already_running", "x")
-            .unwrap()
-            .is_none());
-        assert!(s
-            .record_manual_refusal_for_tenant(&a, "acme", "", "", "not_found", "x")
-            .unwrap()
-            .is_none());
-        assert_eq!(s.runs_for_brief(&a, 10).unwrap().len(), 1, "noise refusals not persisted");
+        assert!(
+            s.record_manual_refusal_for_tenant(&a, "acme", "", "", "already_running", "x")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.record_manual_refusal_for_tenant(&a, "acme", "", "", "not_found", "x")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            s.runs_for_brief(&a, 10).unwrap().len(),
+            1,
+            "noise refusals not persisted"
+        );
 
         // Cross-tenant + missing Brief → no row (no existence leak).
-        assert!(s
-            .record_manual_refusal_for_tenant(&a, "globex", "", "echo", "no_adapter", "x")
-            .unwrap()
-            .is_none());
-        assert!(s
-            .record_manual_refusal_for_tenant("nope", "acme", "", "echo", "no_adapter", "x")
-            .unwrap()
-            .is_none());
-        assert_eq!(s.run_count_for_brief(&a).unwrap(), 1, "cross-tenant refusal not written");
+        assert!(
+            s.record_manual_refusal_for_tenant(&a, "globex", "", "echo", "no_adapter", "x")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.record_manual_refusal_for_tenant("nope", "acme", "", "echo", "no_adapter", "x")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            s.run_count_for_brief(&a).unwrap(),
+            1,
+            "cross-tenant refusal not written"
+        );
 
         // A same-tenant adapter-unavailable refusal (with a Rig) IS persisted
         // and becomes the new latest_run.
         let r2 = s
-            .record_manual_refusal_for_tenant(&a, "acme", "agt_a", "claude", "adapter_unavailable", "claude not logged in")
+            .record_manual_refusal_for_tenant(
+                &a,
+                "acme",
+                "agt_a",
+                "claude",
+                "adapter_unavailable",
+                "claude not logged in",
+            )
             .unwrap();
         assert!(r2.is_some());
         let lr = s
@@ -20623,7 +20695,14 @@ mod tests {
         // An autonomous (heartbeat) refusal persists a durable refused Shift
         // stamped with the `heartbeat` trigger + the machine reason.
         let run = s
-            .record_refused_run(&b, "agt_a", "claude", "over_allowance", "operative over budget", "heartbeat")
+            .record_refused_run(
+                &b,
+                "agt_a",
+                "claude",
+                "over_allowance",
+                "operative over budget",
+                "heartbeat",
+            )
             .unwrap();
         assert!(run.is_some(), "durable heartbeat refusal recorded");
         let lr = s.latest_run_for_brief(&b).unwrap().expect("a run");
@@ -20638,16 +20717,22 @@ mod tests {
         assert_eq!(chron.len(), 1);
 
         // Non-durable reason → nothing written.
-        assert!(s
-            .record_refused_run(&b, "agt_a", "claude", "already_running", "x", "heartbeat")
-            .unwrap()
-            .is_none());
+        assert!(
+            s.record_refused_run(&b, "agt_a", "claude", "already_running", "x", "heartbeat")
+                .unwrap()
+                .is_none()
+        );
         // Missing Brief → guarded by WHERE EXISTS → no row (no leak).
-        assert!(s
-            .record_refused_run("nope", "agt_a", "claude", "no_adapter", "x", "heartbeat")
-            .unwrap()
-            .is_none());
-        assert_eq!(s.run_count_for_brief(&b).unwrap(), 1, "only the durable refusal persisted");
+        assert!(
+            s.record_refused_run("nope", "agt_a", "claude", "no_adapter", "x", "heartbeat")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            s.run_count_for_brief(&b).unwrap(),
+            1,
+            "only the durable refusal persisted"
+        );
     }
 
     // ── Brief/Shift recovery diagnosis (execution-and-issue §3.3b) ───────────
@@ -20658,21 +20743,66 @@ mod tests {
         // action key + the EXISTING governed route, and a refusal is NEVER
         // retryable (it needs an operator fix first).
         let cases = [
-            ("unassigned", "precondition", "assign_agent", "/briefs?brief=b1"),
-            ("no_adapter", "adapter_unavailable", "configure_rig", "/settings"),
-            ("adapter_unavailable", "adapter_unavailable", "configure_rig", "/settings"),
+            (
+                "unassigned",
+                "precondition",
+                "assign_agent",
+                "/briefs?brief=b1",
+            ),
+            (
+                "no_adapter",
+                "adapter_unavailable",
+                "configure_rig",
+                "/settings",
+            ),
+            (
+                "adapter_unavailable",
+                "adapter_unavailable",
+                "configure_rig",
+                "/settings",
+            ),
             ("over_allowance", "budget", "raise_allowance", "/agents"),
             ("over_guild_budget", "budget", "raise_allowance", "/costs"),
-            ("workspace_error", "workspace", "review_runtime", "/settings"),
-            ("workspace_context_error", "workspace", "review_runtime", "/settings"),
+            (
+                "workspace_error",
+                "workspace",
+                "review_runtime",
+                "/settings",
+            ),
+            (
+                "workspace_context_error",
+                "workspace",
+                "review_runtime",
+                "/settings",
+            ),
         ];
         for (reason, class, action, route) in cases {
             let d = RunDiagnosis::for_refusal(reason, "b1", "run-x");
-            assert_eq!(d.failure_class.as_deref(), Some(class), "class for {reason}");
-            assert_eq!(d.recovery_action.as_deref(), Some(action), "action for {reason}");
-            assert_eq!(d.recovery_route.as_deref(), Some(route), "route for {reason}");
-            assert_eq!(d.retryable, Some(false), "a refusal is not blind-retryable: {reason}");
-            assert_eq!(d.retry_budget_remaining, Some(0), "no retry budget for {reason}");
+            assert_eq!(
+                d.failure_class.as_deref(),
+                Some(class),
+                "class for {reason}"
+            );
+            assert_eq!(
+                d.recovery_action.as_deref(),
+                Some(action),
+                "action for {reason}"
+            );
+            assert_eq!(
+                d.recovery_route.as_deref(),
+                Some(route),
+                "route for {reason}"
+            );
+            assert_eq!(
+                d.retryable,
+                Some(false),
+                "a refusal is not blind-retryable: {reason}"
+            );
+            assert_eq!(
+                d.retry_budget_remaining,
+                Some(0),
+                "no retry budget for {reason}"
+            );
         }
         // An unknown reason falls back to inspect-the-run (never blank).
         let d = RunDiagnosis::for_refusal("mystery", "b1", "run-x");
@@ -20688,7 +20818,11 @@ mod tests {
         let t = RunDiagnosis::for_terminal("failed", Some(true), "r1");
         assert_eq!(t.failure_class.as_deref(), Some("transient"));
         assert_eq!(t.retryable, Some(true));
-        assert_eq!(t.retry_budget_remaining, Some(1), "retryable failure keeps a budget");
+        assert_eq!(
+            t.retry_budget_remaining,
+            Some(1),
+            "retryable failure keeps a budget"
+        );
         assert_eq!(t.recovery_action.as_deref(), Some("retry_later"));
         assert_eq!(t.recovery_route.as_deref(), Some("/runs?run=r1"));
 
@@ -20709,10 +20843,18 @@ mod tests {
         // cancelled / interrupted are classified honestly.
         let c = RunDiagnosis::for_terminal("cancelled", None, "r1");
         assert_eq!(c.failure_class.as_deref(), Some("cancelled"));
-        assert_eq!(c.retryable, Some(false), "operator cancel is not auto-retryable");
+        assert_eq!(
+            c.retryable,
+            Some(false),
+            "operator cancel is not auto-retryable"
+        );
         let i = RunDiagnosis::for_terminal("interrupted", None, "r1");
         assert_eq!(i.failure_class.as_deref(), Some("interrupted"));
-        assert_eq!(i.retryable, Some(true), "interrupted is re-claimed automatically");
+        assert_eq!(
+            i.retryable,
+            Some(true),
+            "interrupted is re-claimed automatically"
+        );
         assert_eq!(i.retry_budget_remaining, Some(1));
 
         // A clean success carries NO scary recovery-card metadata.
@@ -20720,7 +20862,10 @@ mod tests {
             let d = RunDiagnosis::for_terminal(ok, None, "r1");
             assert!(d.failure_class.is_none(), "{ok} has no failure class");
             assert_eq!(d.retryable, Some(false), "{ok} has nothing to retry");
-            assert!(d.retry_budget_remaining.is_none(), "{ok} has no retry budget");
+            assert!(
+                d.retry_budget_remaining.is_none(),
+                "{ok} has no retry budget"
+            );
             assert_eq!(d.recovery_action.as_deref(), Some("none"));
             assert!(d.recovery_route.is_none(), "{ok} has no recovery route");
         }
@@ -20765,7 +20910,10 @@ mod tests {
             .unwrap();
         s.record_run_finish("run_ok", "done", "all good").unwrap();
         let ok = s.get_run("run_ok").unwrap().unwrap();
-        assert!(ok.failure_class.is_none(), "a done run has no failure class");
+        assert!(
+            ok.failure_class.is_none(),
+            "a done run has no failure class"
+        );
         assert_eq!(ok.recovery_action.as_deref(), Some("none"));
         assert!(ok.recovery_route.is_none());
 
@@ -21157,7 +21305,8 @@ mod tests {
     fn auto_wake_children_completed_wakes_parent_only_when_all_terminal() {
         let s = store();
         let parent = mk_todo(&s, "planner-parent");
-        s.set_brief_field(&parent, "assignee", "agt_planner").unwrap();
+        s.set_brief_field(&parent, "assignee", "agt_planner")
+            .unwrap();
         let c1 = mk_todo(&s, "child-1");
         let c2 = mk_todo(&s, "child-2");
         s.link_subbrief(&parent, &c1).unwrap();
@@ -21185,7 +21334,8 @@ mod tests {
         // transition itself is the trigger — so the planner is not stranded.
         let s = store();
         let parent = mk_todo(&s, "planner-parent");
-        s.set_brief_field(&parent, "assignee", "agt_planner").unwrap();
+        s.set_brief_field(&parent, "assignee", "agt_planner")
+            .unwrap();
         let c1 = mk_todo(&s, "child-1");
         let c2 = mk_todo(&s, "child-2");
         s.link_subbrief(&parent, &c1).unwrap();
@@ -21258,7 +21408,11 @@ mod tests {
         s.add_snag(&b, &a).unwrap();
 
         drive_to_done(&s, &a);
-        assert_eq!(queued_wakeups(&s, &b).len(), 1, "first done queues one wake");
+        assert_eq!(
+            queued_wakeups(&s, &b).len(),
+            1,
+            "first done queues one wake"
+        );
 
         // Re-open A and complete it again — the second done coalesces into the
         // existing queued wake rather than opening a second queued run.
@@ -22185,7 +22339,11 @@ mod tests {
             }
             DossierAuthorOutcome::Authored(_) => panic!("stale revise must not write"),
         }
-        assert_eq!(s.list_dossiers(&id).unwrap().len(), before, "no row written");
+        assert_eq!(
+            s.list_dossiers(&id).unwrap().len(),
+            before,
+            "no row written"
+        );
         // latest unchanged.
         assert_eq!(s.latest_dossier(&id, "plan").unwrap().unwrap().doc_id, v2);
 
@@ -22253,30 +22411,120 @@ mod tests {
         let bad = |r: Result<DossierAuthorOutcome, CoordinatorError>| {
             assert!(matches!(r, Err(CoordinatorError::Invalid(_))));
         };
-        bad(s.author_dossier(&a, "", "t", "body", "u", DossierAuthorMode::Revise, None, None));
-        bad(s.author_dossier(&a, "pl an", "t", "body", "u", DossierAuthorMode::Revise, None, None));
-        bad(s.author_dossier(&a, "plan", "", "body", "u", DossierAuthorMode::Revise, None, None));
-        bad(s.author_dossier(&a, "plan", "t", "", "u", DossierAuthorMode::Revise, None, None));
-        bad(s.author_dossier(&a, "plan", "t", "body", "", DossierAuthorMode::Revise, None, None));
+        bad(s.author_dossier(
+            &a,
+            "",
+            "t",
+            "body",
+            "u",
+            DossierAuthorMode::Revise,
+            None,
+            None,
+        ));
+        bad(s.author_dossier(
+            &a,
+            "pl an",
+            "t",
+            "body",
+            "u",
+            DossierAuthorMode::Revise,
+            None,
+            None,
+        ));
+        bad(s.author_dossier(
+            &a,
+            "plan",
+            "",
+            "body",
+            "u",
+            DossierAuthorMode::Revise,
+            None,
+            None,
+        ));
+        bad(s.author_dossier(
+            &a,
+            "plan",
+            "t",
+            "",
+            "u",
+            DossierAuthorMode::Revise,
+            None,
+            None,
+        ));
+        bad(s.author_dossier(
+            &a,
+            "plan",
+            "t",
+            "body",
+            "",
+            DossierAuthorMode::Revise,
+            None,
+            None,
+        ));
         // Missing Brief.
         assert!(matches!(
-            s.author_dossier("nope", "plan", "t", "body", "u", DossierAuthorMode::Revise, None, None),
+            s.author_dossier(
+                "nope",
+                "plan",
+                "t",
+                "body",
+                "u",
+                DossierAuthorMode::Revise,
+                None,
+                None
+            ),
             Err(CoordinatorError::NotFound(_))
         ));
         // Fork with no base id.
-        bad(s.author_dossier(&a, "plan", "t", "body", "u", DossierAuthorMode::Fork, None, None));
+        bad(s.author_dossier(
+            &a,
+            "plan",
+            "t",
+            "body",
+            "u",
+            DossierAuthorMode::Fork,
+            None,
+            None,
+        ));
 
         // Seed a plan on `a`; forking it from Brief `b` must refuse (cross-Brief
         // base), and forking a different kind must refuse (cross-kind base).
         let pa = match s
-            .author_dossier(&a, "plan", "P", "pbody", "u", DossierAuthorMode::Revise, None, None)
+            .author_dossier(
+                &a,
+                "plan",
+                "P",
+                "pbody",
+                "u",
+                DossierAuthorMode::Revise,
+                None,
+                None,
+            )
             .unwrap()
         {
             DossierAuthorOutcome::Authored(x) => x.doc_id,
             _ => unreachable!(),
         };
-        bad(s.author_dossier(&b, "plan", "t", "body", "u", DossierAuthorMode::Fork, None, Some(&pa)));
-        bad(s.author_dossier(&a, "design", "t", "body", "u", DossierAuthorMode::Fork, None, Some(&pa)));
+        bad(s.author_dossier(
+            &b,
+            "plan",
+            "t",
+            "body",
+            "u",
+            DossierAuthorMode::Fork,
+            None,
+            Some(&pa),
+        ));
+        bad(s.author_dossier(
+            &a,
+            "design",
+            "t",
+            "body",
+            "u",
+            DossierAuthorMode::Fork,
+            None,
+            Some(&pa),
+        ));
     }
 
     // §1.8: the new authoring metadata surfaces on the Dossier reads, and a
@@ -22308,7 +22556,16 @@ mod tests {
 
         // Two authored plan revisions.
         let v1 = match s
-            .author_dossier(&id, "plan", "P1", "b1", "founder", DossierAuthorMode::Revise, None, None)
+            .author_dossier(
+                &id,
+                "plan",
+                "P1",
+                "b1",
+                "founder",
+                DossierAuthorMode::Revise,
+                None,
+                None,
+            )
             .unwrap()
         {
             DossierAuthorOutcome::Authored(a) => a.doc_id,
@@ -22675,15 +22932,28 @@ mod tests {
             .find(|c| c.task_id == waiter)
             .expect("waiter on the acme todo board");
         // Only the open, same-Guild blocker is shown — by its ref.
-        assert_eq!(w.blocked_by, vec![open_ref], "only the open same-Guild blocker, by ref");
-        assert!(!w.blocked_by.iter().any(|r| *r == resolved), "resolved blocker dropped");
-        assert!(!w.blocked_by.iter().any(|r| *r == foreign), "cross-Guild blocker not leaked");
+        assert_eq!(
+            w.blocked_by,
+            vec![open_ref],
+            "only the open same-Guild blocker, by ref"
+        );
+        assert!(
+            !w.blocked_by.iter().any(|r| *r == resolved),
+            "resolved blocker dropped"
+        );
+        assert!(
+            !w.blocked_by.iter().any(|r| *r == foreign),
+            "cross-Guild blocker not leaked"
+        );
 
         let c = acme_todo
             .iter()
             .find(|c| c.task_id == clear)
             .expect("clear card on the acme todo board");
-        assert!(c.blocked_by.is_empty(), "a non-blocked card carries no blockers");
+        assert!(
+            c.blocked_by.is_empty(),
+            "a non-blocked card carries no blockers"
+        );
 
         // The foreign blocker is real but isolated: globex sees no acme waiter.
         let globex_todo = s
@@ -22868,7 +23138,8 @@ mod tests {
         let holder = s.claim_holder(&id).unwrap().unwrap().0;
         let loser = if holder == "agt_a" { "agt_b" } else { "agt_a" };
         assert!(
-            !s.claim_brief_for_run(&id, loser, 300, Some("retry")).unwrap(),
+            !s.claim_brief_for_run(&id, loser, 300, Some("retry"))
+                .unwrap(),
             "retrying a 409 conflict loses again — clients must not retry"
         );
         // The winner's Claim is untouched by the loser's retry.
@@ -23923,7 +24194,13 @@ mod tests {
         assert_eq!(listed[0].resolved_by.as_deref(), Some("founder"));
         assert!(listed[0].resolved_at.is_some());
         let answered = s
-            .query_events(&b, 0, 50, Some("brief.interaction_resolved"), EventOrder::Asc)
+            .query_events(
+                &b,
+                0,
+                50,
+                Some("brief.interaction_resolved"),
+                EventOrder::Asc,
+            )
             .unwrap();
         assert_eq!(answered.len(), 1);
         assert!(answered[0].payload.contains("yes — ship"));
@@ -24032,7 +24309,13 @@ mod tests {
         assert_eq!(card.bound_doc_kind.as_deref(), Some("plan"));
         // The bound doc id is mirrored into the Chronicle.
         let opened = s
-            .query_events(&b, 0, 50, Some("brief.plan_confirm_opened"), EventOrder::Asc)
+            .query_events(
+                &b,
+                0,
+                50,
+                Some("brief.plan_confirm_opened"),
+                EventOrder::Asc,
+            )
             .unwrap();
         assert_eq!(opened.len(), 1);
         assert!(opened[0].payload.contains(&v2));
@@ -24056,9 +24339,15 @@ mod tests {
         assert_eq!(card.response.as_deref(), Some("yes — ship"));
         // A real approval event was recorded.
         assert_eq!(
-            s.query_events(&b, 0, 50, Some("brief.interaction_resolved"), EventOrder::Asc)
-                .unwrap()
-                .len(),
+            s.query_events(
+                &b,
+                0,
+                50,
+                Some("brief.interaction_resolved"),
+                EventOrder::Asc
+            )
+            .unwrap()
+            .len(),
             1
         );
         // Duplicate accept is a typed refusal, not a silent overwrite.
@@ -24092,15 +24381,27 @@ mod tests {
         assert_eq!(card.status, "expired");
         assert_eq!(card.response, None);
         assert!(
-            s.query_events(&b, 0, 50, Some("brief.interaction_resolved"), EventOrder::Asc)
-                .unwrap()
-                .is_empty(),
+            s.query_events(
+                &b,
+                0,
+                50,
+                Some("brief.interaction_resolved"),
+                EventOrder::Asc
+            )
+            .unwrap()
+            .is_empty(),
             "a stale plan must never resolve as approved"
         );
         assert_eq!(
-            s.query_events(&b, 0, 50, Some("brief.interaction_expired"), EventOrder::Asc)
-                .unwrap()
-                .len(),
+            s.query_events(
+                &b,
+                0,
+                50,
+                Some("brief.interaction_expired"),
+                EventOrder::Asc
+            )
+            .unwrap()
+            .len(),
             1
         );
     }
@@ -24141,9 +24442,15 @@ mod tests {
         assert_eq!(card.status, "expired");
         assert_eq!(card.response, None);
         assert!(
-            s.query_events(&b, 0, 50, Some("brief.interaction_resolved"), EventOrder::Asc)
-                .unwrap()
-                .is_empty(),
+            s.query_events(
+                &b,
+                0,
+                50,
+                Some("brief.interaction_resolved"),
+                EventOrder::Asc
+            )
+            .unwrap()
+            .is_empty(),
             "a stale plan must never resolve as approved"
         );
     }
@@ -24166,9 +24473,15 @@ mod tests {
         let card = listed.iter().find(|i| i.interaction_id == id).unwrap();
         assert_eq!(card.status, "expired");
         assert_eq!(
-            s.query_events(&b, 0, 50, Some("brief.interaction_expired"), EventOrder::Asc)
-                .unwrap()
-                .len(),
+            s.query_events(
+                &b,
+                0,
+                50,
+                Some("brief.interaction_expired"),
+                EventOrder::Asc
+            )
+            .unwrap()
+            .len(),
             1
         );
         // A later accept is a typed (idempotent) refusal — the comment thread
@@ -24305,16 +24618,25 @@ mod tests {
         let confirm = confirms[0];
         assert_eq!(confirm.interaction_id, pkg.confirm_id);
         assert_eq!(confirm.bound_doc_kind.as_deref(), Some("plan"));
-        assert_eq!(confirm.bound_doc_id.as_deref(), Some(pkg.plan_doc_id.as_str()));
+        assert_eq!(
+            confirm.bound_doc_id.as_deref(),
+            Some(pkg.plan_doc_id.as_str())
+        );
         assert_eq!(
             confirm.bound_interaction_id.as_deref(),
             Some(pkg.suggestion_id.as_str())
         );
         // The opening is chronicled.
         assert_eq!(
-            s.query_events(&parent, 0, 50, Some("brief.plan_package_opened"), EventOrder::Asc)
-                .unwrap()
-                .len(),
+            s.query_events(
+                &parent,
+                0,
+                50,
+                Some("brief.plan_package_opened"),
+                EventOrder::Asc
+            )
+            .unwrap()
+            .len(),
             1
         );
     }
@@ -24329,7 +24651,15 @@ mod tests {
             .unwrap();
         let pkg = open_pkg(&s, &parent, &["A", "B", "C"]);
         let res = s
-            .respond_plan_confirm("acme", "subj", &parent, &pkg.confirm_id, "founder", true, &[])
+            .respond_plan_confirm(
+                "acme",
+                "subj",
+                &parent,
+                &pkg.confirm_id,
+                "founder",
+                true,
+                &[],
+            )
             .unwrap();
         assert_eq!(res.outcome, "approved");
         assert_eq!(res.created.len(), 3);
@@ -24343,16 +24673,31 @@ mod tests {
         }
         // Both cards resolved; materialization + approval chronicled once.
         let cards = s.list_interactions(&parent).unwrap();
-        let suggestion = cards.iter().find(|c| c.interaction_id == pkg.suggestion_id).unwrap();
-        let confirm = cards.iter().find(|c| c.interaction_id == pkg.confirm_id).unwrap();
+        let suggestion = cards
+            .iter()
+            .find(|c| c.interaction_id == pkg.suggestion_id)
+            .unwrap();
+        let confirm = cards
+            .iter()
+            .find(|c| c.interaction_id == pkg.confirm_id)
+            .unwrap();
         assert_eq!(suggestion.status, "resolved");
         assert_eq!(confirm.status, "resolved");
-        assert_eq!(confirm.response.as_deref(), Some(res.created.join(",").as_str()));
+        assert_eq!(
+            confirm.response.as_deref(),
+            Some(res.created.join(",").as_str())
+        );
         assert_eq!(materialized_count(&s, &parent), 1);
         assert_eq!(
-            s.query_events(&parent, 0, 50, Some("brief.plan_confirm_approved"), EventOrder::Asc)
-                .unwrap()
-                .len(),
+            s.query_events(
+                &parent,
+                0,
+                50,
+                Some("brief.plan_confirm_approved"),
+                EventOrder::Asc
+            )
+            .unwrap()
+            .len(),
             1
         );
     }
@@ -24367,10 +24712,26 @@ mod tests {
             .unwrap();
         let pkg = open_pkg(&s, &parent, &["A", "B"]);
         let first = s
-            .respond_plan_confirm("acme", "subj", &parent, &pkg.confirm_id, "founder", true, &[])
+            .respond_plan_confirm(
+                "acme",
+                "subj",
+                &parent,
+                &pkg.confirm_id,
+                "founder",
+                true,
+                &[],
+            )
             .unwrap();
         let second = s
-            .respond_plan_confirm("acme", "subj", &parent, &pkg.confirm_id, "founder", true, &[])
+            .respond_plan_confirm(
+                "acme",
+                "subj",
+                &parent,
+                &pkg.confirm_id,
+                "founder",
+                true,
+                &[],
+            )
             .unwrap();
         assert_eq!(first.outcome, "approved");
         assert_eq!(second.outcome, "already_approved");
@@ -24384,9 +24745,15 @@ mod tests {
         assert_eq!(materialized_count(&s, &parent), 1);
         // Only one approval event despite two accepts.
         assert_eq!(
-            s.query_events(&parent, 0, 50, Some("brief.plan_confirm_approved"), EventOrder::Asc)
-                .unwrap()
-                .len(),
+            s.query_events(
+                &parent,
+                0,
+                50,
+                Some("brief.plan_confirm_approved"),
+                EventOrder::Asc
+            )
+            .unwrap()
+            .len(),
             1
         );
     }
@@ -24401,16 +24768,33 @@ mod tests {
             .unwrap();
         let pkg = open_pkg(&s, &parent, &["A", "B"]);
         let res = s
-            .respond_plan_confirm("acme", "subj", &parent, &pkg.confirm_id, "founder", false, &[])
+            .respond_plan_confirm(
+                "acme",
+                "subj",
+                &parent,
+                &pkg.confirm_id,
+                "founder",
+                false,
+                &[],
+            )
             .unwrap();
         assert_eq!(res.outcome, "rejected");
         assert!(res.created.is_empty());
         assert!(s.list_subbriefs(&parent).unwrap().is_empty(), "no children");
         let cards = s.list_interactions(&parent).unwrap();
-        let suggestion = cards.iter().find(|c| c.interaction_id == pkg.suggestion_id).unwrap();
-        let confirm = cards.iter().find(|c| c.interaction_id == pkg.confirm_id).unwrap();
+        let suggestion = cards
+            .iter()
+            .find(|c| c.interaction_id == pkg.suggestion_id)
+            .unwrap();
+        let confirm = cards
+            .iter()
+            .find(|c| c.interaction_id == pkg.confirm_id)
+            .unwrap();
         assert_eq!(confirm.status, "rejected");
-        assert_eq!(suggestion.status, "rejected", "linked suggestion closed too");
+        assert_eq!(
+            suggestion.status, "rejected",
+            "linked suggestion closed too"
+        );
         assert_eq!(materialized_count(&s, &parent), 0);
     }
 
@@ -24424,20 +24808,44 @@ mod tests {
             .unwrap();
         let pkg = open_pkg(&s, &parent, &["A", "B"]);
         // The plan changes (a newer `plan` Dossier) before the operator accepts.
-        s.add_dossier(&parent, "plan", "Plan v2", "rewritten").unwrap();
+        s.add_dossier(&parent, "plan", "Plan v2", "rewritten")
+            .unwrap();
         let err = s
-            .respond_plan_confirm("acme", "subj", &parent, &pkg.confirm_id, "founder", true, &[])
+            .respond_plan_confirm(
+                "acme",
+                "subj",
+                &parent,
+                &pkg.confirm_id,
+                "founder",
+                true,
+                &[],
+            )
             .unwrap_err();
-        assert!(matches!(err, CoordinatorError::Invalid(_)), "stale ⇒ refused");
+        assert!(
+            matches!(err, CoordinatorError::Invalid(_)),
+            "stale ⇒ refused"
+        );
         // The confirm expired; the suggestion is untouched (still open, no claim,
         // no children).
         let cards = s.list_interactions(&parent).unwrap();
-        let confirm = cards.iter().find(|c| c.interaction_id == pkg.confirm_id).unwrap();
-        let suggestion = cards.iter().find(|c| c.interaction_id == pkg.suggestion_id).unwrap();
+        let confirm = cards
+            .iter()
+            .find(|c| c.interaction_id == pkg.confirm_id)
+            .unwrap();
+        let suggestion = cards
+            .iter()
+            .find(|c| c.interaction_id == pkg.suggestion_id)
+            .unwrap();
         assert_eq!(confirm.status, "expired");
-        assert_eq!(suggestion.status, "open", "linked suggestion not materialized");
+        assert_eq!(
+            suggestion.status, "open",
+            "linked suggestion not materialized"
+        );
         assert!(s.list_subbriefs(&parent).unwrap().is_empty(), "no children");
-        assert!(decomp_claim(&s, &parent, &pkg.suggestion_id).is_none(), "no claim");
+        assert!(
+            decomp_claim(&s, &parent, &pkg.suggestion_id).is_none(),
+            "no claim"
+        );
     }
 
     // A comment that supersedes the bound confirm (flipping it to `expired`)
@@ -24450,7 +24858,8 @@ mod tests {
             .unwrap();
         let pkg = open_pkg(&s, &parent, &["A"]);
         // A comment supersedes any OPEN plan-bound confirm (§1.8) → `expired`.
-        s.comment_on_brief(&parent, "founder", "let's hold off").unwrap();
+        s.comment_on_brief(&parent, "founder", "let's hold off")
+            .unwrap();
         let confirm = s
             .list_interactions(&parent)
             .unwrap()
@@ -24460,7 +24869,15 @@ mod tests {
         assert_eq!(confirm.status, "expired", "comment supersedes the confirm");
         // Accepting the now-expired confirm refuses and never materializes.
         let err = s
-            .respond_plan_confirm("acme", "subj", &parent, &pkg.confirm_id, "founder", true, &[])
+            .respond_plan_confirm(
+                "acme",
+                "subj",
+                &parent,
+                &pkg.confirm_id,
+                "founder",
+                true,
+                &[],
+            )
             .unwrap_err();
         assert!(matches!(err, CoordinatorError::Invalid(_)));
         assert!(s.list_subbriefs(&parent).unwrap().is_empty());
@@ -24476,19 +24893,42 @@ mod tests {
             .unwrap();
         // Child #1 depends on #0 (a backward edge).
         let children = vec![
-            brief::ChildSpec { title: "First".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
-            brief::ChildSpec { title: "Second".into(), priority: None, after: Some(0), assignee_agent_id: None, assignee_role: None },
+            brief::ChildSpec {
+                title: "First".into(),
+                priority: None,
+                after: None,
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
+            brief::ChildSpec {
+                title: "Second".into(),
+                priority: None,
+                after: Some(0),
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
         ];
         let pkg = s
             .open_plan_package(&parent, "op", "Plan", "body", "ordered plan", &children, "")
             .unwrap();
         let res = s
-            .respond_plan_confirm("acme", "subj", &parent, &pkg.confirm_id, "founder", true, &[])
+            .respond_plan_confirm(
+                "acme",
+                "subj",
+                &parent,
+                &pkg.confirm_id,
+                "founder",
+                true,
+                &[],
+            )
             .unwrap();
         assert_eq!(res.created.len(), 2);
         // The second child is `blocked_on` the first.
         let snags = s.list_snags(&res.created[1]).unwrap();
-        assert!(snags.contains(&res.created[0]), "after edge wired as a Snag");
+        assert!(
+            snags.contains(&res.created[0]),
+            "after edge wired as a Snag"
+        );
     }
 
     // If the linked suggestion already materialized/closed (e.g. accepted
@@ -24503,21 +24943,50 @@ mod tests {
         let pkg = open_pkg(&s, &parent, &["A", "B"]);
         // The linked suggestion is accepted directly (a separate route).
         let created = s
-            .respond_suggestion("acme", "subj", &parent, &pkg.suggestion_id, "founder", true, &[])
+            .respond_suggestion(
+                "acme",
+                "subj",
+                &parent,
+                &pkg.suggestion_id,
+                "founder",
+                true,
+                &[],
+            )
             .unwrap();
         assert_eq!(created.len(), 2);
         // Rejecting the confirm now is honest: confirm rejected, suggestion left
         // intact (still resolved, children unharmed).
         let res = s
-            .respond_plan_confirm("acme", "subj", &parent, &pkg.confirm_id, "founder", false, &[])
+            .respond_plan_confirm(
+                "acme",
+                "subj",
+                &parent,
+                &pkg.confirm_id,
+                "founder",
+                false,
+                &[],
+            )
             .unwrap();
         assert_eq!(res.outcome, "rejected_proposal_already_closed");
         let cards = s.list_interactions(&parent).unwrap();
-        let suggestion = cards.iter().find(|c| c.interaction_id == pkg.suggestion_id).unwrap();
-        let confirm = cards.iter().find(|c| c.interaction_id == pkg.confirm_id).unwrap();
+        let suggestion = cards
+            .iter()
+            .find(|c| c.interaction_id == pkg.suggestion_id)
+            .unwrap();
+        let confirm = cards
+            .iter()
+            .find(|c| c.interaction_id == pkg.confirm_id)
+            .unwrap();
         assert_eq!(confirm.status, "rejected");
-        assert_eq!(suggestion.status, "resolved", "materialized suggestion untouched");
-        assert_eq!(s.list_subbriefs(&parent).unwrap().len(), 2, "children intact");
+        assert_eq!(
+            suggestion.status, "resolved",
+            "materialized suggestion untouched"
+        );
+        assert_eq!(
+            s.list_subbriefs(&parent).unwrap().len(),
+            2,
+            "children intact"
+        );
     }
 
     // A plain confirm / standalone plan confirm has no linked proposal — the
@@ -24533,7 +25002,9 @@ mod tests {
         s.add_dossier(&parent, "plan", "Plan", "body").unwrap();
         let standalone = s.open_plan_confirm(&parent, "op", "").unwrap();
         assert!(
-            s.plan_confirm_linked_suggestion(&parent, &standalone).unwrap().is_none(),
+            s.plan_confirm_linked_suggestion(&parent, &standalone)
+                .unwrap()
+                .is_none(),
             "standalone confirm carries no linked proposal"
         );
         let err = s
@@ -24552,7 +25023,13 @@ mod tests {
             .create_brief("acme", "Parent epic", "subj", None, None, None, None)
             .unwrap();
         let children = vec![
-            brief::ChildSpec { title: "Design the API".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
+            brief::ChildSpec {
+                title: "Design the API".into(),
+                priority: None,
+                after: None,
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
             brief::ChildSpec {
                 title: "Wire the store".into(),
                 priority: Some("high".into()),
@@ -24566,7 +25043,13 @@ mod tests {
             .unwrap();
         // The opening is chronicled and the card lists with its proposal.
         let opened = s
-            .query_events(&parent, 0, 50, Some("brief.suggestion_opened"), EventOrder::Asc)
+            .query_events(
+                &parent,
+                0,
+                50,
+                Some("brief.suggestion_opened"),
+                EventOrder::Asc,
+            )
             .unwrap();
         assert_eq!(opened.len(), 1);
         let listed = s.list_interactions(&parent).unwrap();
@@ -24582,7 +25065,10 @@ mod tests {
         assert_eq!(subs.len(), 2);
         for c in &created {
             assert!(subs.contains(c), "{c} must be a Sub-brief of the parent");
-            assert!(s.get(c).unwrap().is_some(), "{c} must exist as a real Brief");
+            assert!(
+                s.get(c).unwrap().is_some(),
+                "{c} must exist as a real Brief"
+            );
         }
         // The high-priority child kept its priority.
         let hi = s.brief_fields(&created[1]).unwrap().unwrap();
@@ -24590,7 +25076,10 @@ mod tests {
         // The card is resolved with the created ids; materialization chronicled.
         let listed = s.list_interactions(&parent).unwrap();
         assert_eq!(listed[0].status, "resolved");
-        assert_eq!(listed[0].response.as_deref(), Some(created.join(",").as_str()));
+        assert_eq!(
+            listed[0].response.as_deref(),
+            Some(created.join(",").as_str())
+        );
         let mat = s
             .query_events(
                 &parent,
@@ -24620,11 +25109,24 @@ mod tests {
                 None,
             )
             .unwrap();
-        s.set_brief_field(&parent, "reviewer", "agent_reviewer").unwrap();
+        s.set_brief_field(&parent, "reviewer", "agent_reviewer")
+            .unwrap();
 
         let children = vec![
-            brief::ChildSpec { title: "Child one".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
-            brief::ChildSpec { title: "Child two".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
+            brief::ChildSpec {
+                title: "Child one".into(),
+                priority: None,
+                after: None,
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
+            brief::ChildSpec {
+                title: "Child two".into(),
+                priority: None,
+                after: None,
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
         ];
         let id = s
             .open_suggestion(&parent, "operative-1", "Break it down", &children)
@@ -24635,7 +25137,11 @@ mod tests {
         assert_eq!(created.len(), 2);
         for c in &created {
             let f = s.brief_fields(c).unwrap().unwrap();
-            assert_eq!(f.mandate_id.as_deref(), Some("mandate_x"), "mandate inherited");
+            assert_eq!(
+                f.mandate_id.as_deref(),
+                Some("mandate_x"),
+                "mandate inherited"
+            );
             assert_eq!(
                 f.campaign_id.as_deref(),
                 Some("campaign_y"),
@@ -24792,8 +25298,20 @@ mod tests {
             .unwrap();
         // child #1 depends on child #0 (a backward edge).
         let children = vec![
-            brief::ChildSpec { title: "Prerequisite".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
-            brief::ChildSpec { title: "Dependent".into(), priority: None, after: Some(0), assignee_agent_id: None, assignee_role: None },
+            brief::ChildSpec {
+                title: "Prerequisite".into(),
+                priority: None,
+                after: None,
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
+            brief::ChildSpec {
+                title: "Dependent".into(),
+                priority: None,
+                after: Some(0),
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
         ];
         let id = s
             .open_suggestion(&parent, "op", "Ordered plan", &children)
@@ -24804,8 +25322,15 @@ mod tests {
         assert_eq!(created.len(), 2);
         // The dependent (#1) is blocked_on the prerequisite (#0).
         let snags = s.list_snags(&created[1]).unwrap();
-        assert_eq!(snags, vec![created[0].clone()], "dependent → prerequisite Snag");
-        assert!(s.is_blocked(&created[1]).unwrap(), "dependent starts blocked");
+        assert_eq!(
+            snags,
+            vec![created[0].clone()],
+            "dependent → prerequisite Snag"
+        );
+        assert!(
+            s.is_blocked(&created[1]).unwrap(),
+            "dependent starts blocked"
+        );
         // The prerequisite has no Snag of its own.
         assert!(s.list_snags(&created[0]).unwrap().is_empty());
         // The dependency materialization is named in the Chronicle.
@@ -24851,8 +25376,20 @@ mod tests {
             .unwrap();
         // #0 → #1 is a forward reference: rejected at open.
         let children = vec![
-            brief::ChildSpec { title: "A".into(), priority: None, after: Some(1), assignee_agent_id: None, assignee_role: None },
-            brief::ChildSpec { title: "B".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
+            brief::ChildSpec {
+                title: "A".into(),
+                priority: None,
+                after: Some(1),
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
+            brief::ChildSpec {
+                title: "B".into(),
+                priority: None,
+                after: None,
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
         ];
         let out = s.open_suggestion(&parent, "op", "Bad order", &children);
         assert!(matches!(out, Err(CoordinatorError::Invalid(_))));
@@ -24873,7 +25410,13 @@ mod tests {
                 &parent,
                 "operative-1",
                 "Some plan",
-                &[brief::ChildSpec { title: "Do a thing".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None }],
+                &[brief::ChildSpec {
+                    title: "Do a thing".into(),
+                    priority: None,
+                    after: None,
+                    assignee_agent_id: None,
+                    assignee_role: None,
+                }],
             )
             .unwrap();
         let created = s
@@ -24901,8 +25444,20 @@ mod tests {
                 "op",
                 "Plan",
                 &[
-                    brief::ChildSpec { title: "A".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
-                    brief::ChildSpec { title: "B".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
+                    brief::ChildSpec {
+                        title: "A".into(),
+                        priority: None,
+                        after: None,
+                        assignee_agent_id: None,
+                        assignee_role: None,
+                    },
+                    brief::ChildSpec {
+                        title: "B".into(),
+                        priority: None,
+                        after: None,
+                        assignee_agent_id: None,
+                        assignee_role: None,
+                    },
                 ],
             )
             .unwrap();
@@ -24934,7 +25489,13 @@ mod tests {
                 &parent,
                 "op",
                 "Plan",
-                &[brief::ChildSpec { title: "A".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None }],
+                &[brief::ChildSpec {
+                    title: "A".into(),
+                    priority: None,
+                    after: None,
+                    assignee_agent_id: None,
+                    assignee_role: None,
+                }],
             )
             .unwrap();
         let out = s.respond_interaction(&parent, &id, "founder", "resolved", "yes");
@@ -25012,13 +25573,7 @@ mod tests {
         let astore = agent::AgentStore::in_memory().unwrap();
         // One active engineer in the Guild — the role hint resolves to it.
         let (eng, _) = astore
-            .ensure_starter_operative(
-                "engineer",
-                "Eng (local · echo)",
-                "Engineer",
-                "echo",
-                "acme",
-            )
+            .ensure_starter_operative("engineer", "Eng (local · echo)", "Engineer", "echo", "acme")
             .unwrap();
         let parent = s
             .create_brief("acme", "Parent", "subj", None, None, None, None)
@@ -25064,7 +25619,10 @@ mod tests {
             Some(eng.as_str())
         );
         assert_eq!(
-            s.brief_fields(&created[1]).unwrap().unwrap().assignee_agent_id,
+            s.brief_fields(&created[1])
+                .unwrap()
+                .unwrap()
+                .assignee_agent_id,
             None
         );
     }
@@ -25154,7 +25712,10 @@ mod tests {
         let out = handle_brief_plan_confirm_respond(
             &s,
             Some(&astore),
-            &ctx_op_tenant(format!("{parent}|{}|founder|accept", pkg.confirm_id).as_bytes(), "acme"),
+            &ctx_op_tenant(
+                format!("{parent}|{}|founder|accept", pkg.confirm_id).as_bytes(),
+                "acme",
+            ),
         );
         let body = match out {
             HandlerOutcome::Ok(b) => b,
@@ -25186,14 +25747,29 @@ mod tests {
         let out = handle_brief_plan_confirm_respond(
             &s,
             Some(&astore),
-            &ctx_op_tenant(format!("{parent}|{}|founder|accept", pkg.confirm_id).as_bytes(), "acme"),
+            &ctx_op_tenant(
+                format!("{parent}|{}|founder|accept", pkg.confirm_id).as_bytes(),
+                "acme",
+            ),
         );
-        assert!(matches!(out, HandlerOutcome::Err(_)), "bad hint refuses accept");
+        assert!(
+            matches!(out, HandlerOutcome::Err(_)),
+            "bad hint refuses accept"
+        );
         // No child created; both linked cards stay open (a retry is possible).
-        assert!(s.list_subbriefs(&parent).unwrap().is_empty(), "no partial creation");
+        assert!(
+            s.list_subbriefs(&parent).unwrap().is_empty(),
+            "no partial creation"
+        );
         let cards = s.list_interactions(&parent).unwrap();
-        let confirm = cards.iter().find(|c| c.interaction_id == pkg.confirm_id).unwrap();
-        let suggestion = cards.iter().find(|c| c.interaction_id == pkg.suggestion_id).unwrap();
+        let confirm = cards
+            .iter()
+            .find(|c| c.interaction_id == pkg.confirm_id)
+            .unwrap();
+        let suggestion = cards
+            .iter()
+            .find(|c| c.interaction_id == pkg.suggestion_id)
+            .unwrap();
         assert_eq!(confirm.status, "open", "confirm not approved on a bad hint");
         assert_eq!(suggestion.status, "open", "suggestion not materialized");
     }
@@ -25219,12 +25795,7 @@ mod tests {
             HandlerOutcome::Err(_)
         ));
         // Same-tenant open succeeds.
-        let pkg = open_pkg_handler(
-            &s,
-            &parent,
-            "acme",
-            serde_json::json!([{ "title": "A" }]),
-        );
+        let pkg = open_pkg_handler(&s, &parent, "acme", serde_json::json!([{ "title": "A" }]));
         // Cross-tenant accept is refused (not-found on the owning Brief), and
         // nothing materializes.
         let out = handle_brief_plan_confirm_respond(
@@ -25411,8 +25982,7 @@ mod tests {
                     .unwrap()
             }));
         }
-        let results: Vec<Vec<String>> =
-            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let results: Vec<Vec<String>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
         // Both accepts see the SAME materialized plan (same ordered child ids).
         assert_eq!(
@@ -25423,7 +25993,11 @@ mod tests {
 
         // Exactly the five planned children are linked as Sub-briefs — no dup.
         let subs = s.list_subbriefs(&parent).unwrap();
-        assert_eq!(subs.len(), 5, "exactly the planned children, none duplicated");
+        assert_eq!(
+            subs.len(),
+            5,
+            "exactly the planned children, none duplicated"
+        );
         for c in &results[0] {
             assert!(subs.contains(c), "{c} must be linked under the parent");
         }
@@ -25476,7 +26050,10 @@ mod tests {
             .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
             .unwrap();
         assert_eq!(created.len(), 3, "the full ordered list, exactly once");
-        assert_eq!(created[0], child_a, "the pre-crash child is reused, not re-created");
+        assert_eq!(
+            created[0], child_a,
+            "the pre-crash child is reused, not re-created"
+        );
         let subs = s.list_subbriefs(&parent).unwrap();
         assert_eq!(subs.len(), 3, "all three linked, none duplicated");
         for c in &created {
@@ -25485,9 +26062,15 @@ mod tests {
         // Exactly one resume event + one final materialized event.
         assert_eq!(materialized_count(&s, &parent), 1);
         assert_eq!(
-            s.query_events(&parent, 0, 200, Some("brief.suggestion_resumed"), EventOrder::Asc)
-                .unwrap()
-                .len(),
+            s.query_events(
+                &parent,
+                0,
+                200,
+                Some("brief.suggestion_resumed"),
+                EventOrder::Asc
+            )
+            .unwrap()
+            .len(),
             1
         );
         let (_, ids, fstatus) = decomp_claim(&s, &parent, &id).unwrap();
@@ -25505,9 +26088,27 @@ mod tests {
             .unwrap();
         // A, B(after A), C(after B).
         let children = vec![
-            brief::ChildSpec { title: "A".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
-            brief::ChildSpec { title: "B".into(), priority: None, after: Some(0), assignee_agent_id: None, assignee_role: None },
-            brief::ChildSpec { title: "C".into(), priority: None, after: Some(1), assignee_agent_id: None, assignee_role: None },
+            brief::ChildSpec {
+                title: "A".into(),
+                priority: None,
+                after: None,
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
+            brief::ChildSpec {
+                title: "B".into(),
+                priority: None,
+                after: Some(0),
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
+            brief::ChildSpec {
+                title: "C".into(),
+                priority: None,
+                after: Some(1),
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
         ];
         let id = s
             .open_suggestion(&parent, "op", "ordered plan", &children)
@@ -25565,13 +26166,20 @@ mod tests {
         let err = s
             .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
             .unwrap_err();
-        assert!(matches!(err, CoordinatorError::Invalid(_)), "fork must refuse");
+        assert!(
+            matches!(err, CoordinatorError::Invalid(_)),
+            "fork must refuse"
+        );
         // The claim is untouched: same fingerprint + same cursor, no new children.
         let (fp_after, ids_after, status) = decomp_claim(&s, &parent, &id).unwrap();
         assert_eq!(fp_after, fp_before, "fingerprint unchanged");
         assert_eq!(ids_after, ids_before, "cursor unchanged — no fork created");
         assert_eq!(status, "in_progress");
-        assert_eq!(split_csv_ids(&ids_after).len(), 1, "only the original partial child");
+        assert_eq!(
+            split_csv_ids(&ids_after).len(),
+            1,
+            "only the original partial child"
+        );
     }
 
     // Owner takeover (§1.7): the SAME responder always resumes its own
@@ -25600,9 +26208,15 @@ mod tests {
         assert_eq!(fstatus, "complete");
         // No takeover event was emitted (same owner is never a takeover).
         assert_eq!(
-            s.query_events(&parent, 0, 200, Some("brief.suggestion_taken_over"), EventOrder::Asc)
-                .unwrap()
-                .len(),
+            s.query_events(
+                &parent,
+                0,
+                200,
+                Some("brief.suggestion_taken_over"),
+                EventOrder::Asc
+            )
+            .unwrap()
+            .len(),
             0
         );
     }
@@ -25667,9 +26281,15 @@ mod tests {
         let (owner, _) = decomp_owner(&s, &parent, &id).unwrap();
         assert_eq!(owner, "rescuer", "ownership transferred to the taker");
         assert_eq!(
-            s.query_events(&parent, 0, 200, Some("brief.suggestion_taken_over"), EventOrder::Asc)
-                .unwrap()
-                .len(),
+            s.query_events(
+                &parent,
+                0,
+                200,
+                Some("brief.suggestion_taken_over"),
+                EventOrder::Asc
+            )
+            .unwrap()
+            .len(),
             1,
             "exactly one takeover event"
         );
@@ -25718,7 +26338,10 @@ mod tests {
         let err = s
             .respond_suggestion("acme", "subj", &parent, &id, "rescuer", true, &[])
             .unwrap_err();
-        assert!(matches!(err, CoordinatorError::Invalid(_)), "fork must refuse");
+        assert!(
+            matches!(err, CoordinatorError::Invalid(_)),
+            "fork must refuse"
+        );
         // Claim untouched: same fingerprint, same cursor, still owned by founder
         // (the fork check refused BEFORE any takeover reassignment).
         let (fp_after, ids_after, status) = decomp_claim(&s, &parent, &id).unwrap();
@@ -25747,7 +26370,11 @@ mod tests {
             .respond_suggestion("acme", "subj", &parent, &id, "someone-else", true, &[])
             .unwrap();
         assert_eq!(first, second, "completed claim no-ops for any responder");
-        assert_eq!(s.list_subbriefs(&parent).unwrap().len(), 2, "no new children");
+        assert_eq!(
+            s.list_subbriefs(&parent).unwrap().len(),
+            2,
+            "no new children"
+        );
         assert_eq!(materialized_count(&s, &parent), 1);
         let (owner, _) = decomp_owner(&s, &parent, &id).unwrap();
         assert_eq!(owner, "founder", "a no-op never reassigns ownership");
@@ -25816,7 +26443,10 @@ mod tests {
             ),
             HandlerOutcome::Err(_)
         ));
-        assert!(s.list_subbriefs(&a).unwrap().is_empty(), "no children leaked");
+        assert!(
+            s.list_subbriefs(&a).unwrap().is_empty(),
+            "no children leaked"
+        );
         assert!(
             decomp_claim(&s, &a, &id).is_none(),
             "no claim created by a cross-tenant accept"
@@ -30489,8 +31119,17 @@ mod tests {
     // ── Boot recovery for stale running runs (TG3) ──────────────────
 
     fn brief(s: &TaskStore, title: &str) -> String {
-        s.create(title, "flows/none.sol", "{}", "subj", RetryPolicy::None, 0, None, None)
-            .unwrap()
+        s.create(
+            title,
+            "flows/none.sol",
+            "{}",
+            "subj",
+            RetryPolicy::None,
+            0,
+            None,
+            None,
+        )
+        .unwrap()
     }
     fn running_run(s: &TaskStore, run_id: &str, brief_id: &str, agent: &str) {
         s.record_run_start(
@@ -30509,23 +31148,38 @@ mod tests {
         let s = store();
         let b = brief(&s, "stale work");
         // Claim the Brief + open a running run (simulating a crashed run).
-        assert!(s.claim_brief_for_run(&b, "agt_a", 300, Some("run_x")).unwrap());
+        assert!(
+            s.claim_brief_for_run(&b, "agt_a", 300, Some("run_x"))
+                .unwrap()
+        );
         running_run(&s, "run_x", &b, "agt_a");
-        assert!(s.claim_holder(&b).unwrap().is_some(), "claim held before recovery");
+        assert!(
+            s.claim_holder(&b).unwrap().is_some(),
+            "claim held before recovery"
+        );
 
         // Fresh boot → empty live set, no age threshold → the run is stale.
-        let recovered = s.recover_stale_runs(&std::collections::HashSet::new(), 0).unwrap();
+        let recovered = s
+            .recover_stale_runs(&std::collections::HashSet::new(), 0)
+            .unwrap();
         assert_eq!(recovered, vec!["run_x".to_string()]);
 
         // The run is now terminally `interrupted` (NOT `failed`) with an
         // honest reason.
         let run = s.get_run("run_x").unwrap().unwrap();
         assert_eq!(run.status, "interrupted");
-        assert!(run.summary.contains("Run interrupted"), "got: {}", run.summary);
+        assert!(
+            run.summary.contains("Run interrupted"),
+            "got: {}",
+            run.summary
+        );
         assert!(run.finished_at.is_some());
 
         // The Brief Claim is released (re-dispatchable).
-        assert!(s.claim_holder(&b).unwrap().is_none(), "claim released after recovery");
+        assert!(
+            s.claim_holder(&b).unwrap().is_none(),
+            "claim released after recovery"
+        );
 
         // A `recovered` run-transcript event + a Chronicle note were recorded.
         let kinds: Vec<String> = s
@@ -30564,10 +31218,14 @@ mod tests {
         let s = store();
         let b = brief(&s, "double recover");
         running_run(&s, "run_y", &b, "agt_a");
-        let first = s.recover_stale_runs(&std::collections::HashSet::new(), 0).unwrap();
+        let first = s
+            .recover_stale_runs(&std::collections::HashSet::new(), 0)
+            .unwrap();
         assert_eq!(first.len(), 1);
         // Second pass finds nothing (the run is now terminal).
-        let second = s.recover_stale_runs(&std::collections::HashSet::new(), 0).unwrap();
+        let second = s
+            .recover_stale_runs(&std::collections::HashSet::new(), 0)
+            .unwrap();
         assert!(second.is_empty(), "idempotent: {second:?}");
     }
 
@@ -30598,7 +31256,10 @@ mod tests {
             .recover_stale_runs(&std::collections::HashSet::new(), 300)
             .unwrap();
         assert_eq!(recovered, vec!["run_fresh".to_string()]);
-        assert_eq!(s.get_run("run_fresh").unwrap().unwrap().status, "interrupted");
+        assert_eq!(
+            s.get_run("run_fresh").unwrap().unwrap().status,
+            "interrupted"
+        );
     }
 
     #[test]
@@ -30610,15 +31271,26 @@ mod tests {
         running_run(&s, "run_old", &b, "agt_a");
         // A newer run re-claims the Brief (Claim now points to run_new). Only
         // the stale `running` row (run_old) is iterated by recovery.
-        assert!(s.claim_brief_for_run(&b, "agt_a", 300, Some("run_new")).unwrap());
+        assert!(
+            s.claim_brief_for_run(&b, "agt_a", 300, Some("run_new"))
+                .unwrap()
+        );
 
-        let recovered = s.recover_stale_runs(&std::collections::HashSet::new(), 0).unwrap();
-        assert!(recovered.contains(&"run_old".to_string()), "got: {recovered:?}");
+        let recovered = s
+            .recover_stale_runs(&std::collections::HashSet::new(), 0)
+            .unwrap();
+        assert!(
+            recovered.contains(&"run_old".to_string()),
+            "got: {recovered:?}"
+        );
 
         // The Claim still belongs to run_new → recovering run_old must NOT have
         // released it.
         let holder = s.claim_holder(&b).unwrap();
-        assert!(holder.is_some(), "claim for the newer run must survive run_old recovery");
+        assert!(
+            holder.is_some(),
+            "claim for the newer run must survive run_old recovery"
+        );
     }
 
     // ── Stale-run adoption by terminal evidence (execution §1.4/§7.1) ──
@@ -30631,10 +31303,16 @@ mod tests {
         // the Claim be reclaimed immediately.
         let s = store();
         let b = brief(&s, "dangling terminal claim");
-        assert!(s.claim_brief_for_run(&b, "agt_a", 300, Some("run_x")).unwrap());
+        assert!(
+            s.claim_brief_for_run(&b, "agt_a", 300, Some("run_x"))
+                .unwrap()
+        );
         running_run(&s, "run_x", &b, "agt_a");
         s.record_run_finish("run_x", "done", "ok").unwrap(); // terminal, Claim still live
-        assert!(s.claim_holder(&b).unwrap().is_some(), "claim live before reclaim");
+        assert!(
+            s.claim_holder(&b).unwrap().is_some(),
+            "claim live before reclaim"
+        );
 
         let released = s.reclaim_terminal_claim(&b).unwrap();
         assert_eq!(released.as_deref(), Some("run_x"));
@@ -30660,7 +31338,10 @@ mod tests {
         // SAFETY: never release a Claim that still backs a `running` run.
         let s = store();
         let b = brief(&s, "live run claim");
-        assert!(s.claim_brief_for_run(&b, "agt_a", 300, Some("run_live")).unwrap());
+        assert!(
+            s.claim_brief_for_run(&b, "agt_a", 300, Some("run_live"))
+                .unwrap()
+        );
         running_run(&s, "run_live", &b, "agt_a"); // still running
         assert!(
             s.reclaim_terminal_claim(&b).unwrap().is_none(),
@@ -30677,7 +31358,10 @@ mod tests {
         let b = brief(&s, "mismatched evidence");
         // The Claim points to run_x (which has no run row); a DIFFERENT run_y
         // is the one that is terminal.
-        assert!(s.claim_brief_for_run(&b, "agt_a", 300, Some("run_x")).unwrap());
+        assert!(
+            s.claim_brief_for_run(&b, "agt_a", 300, Some("run_x"))
+                .unwrap()
+        );
         running_run(&s, "run_y", &b, "agt_a");
         s.record_run_finish("run_y", "failed", "boom").unwrap();
         assert!(
@@ -30695,10 +31379,14 @@ mod tests {
         let s = store();
         let b = brief(&s, "re-claimed before reclaim");
         running_run(&s, "run_old", &b, "agt_a");
-        s.record_run_finish("run_old", "interrupted", "gone").unwrap(); // old run terminal
+        s.record_run_finish("run_old", "interrupted", "gone")
+            .unwrap(); // old run terminal
         // A newer run re-claims the Brief and is running; the Claim now points
         // at run_new, not the terminal run_old.
-        assert!(s.claim_brief_for_run(&b, "agt_a", 300, Some("run_new")).unwrap());
+        assert!(
+            s.claim_brief_for_run(&b, "agt_a", 300, Some("run_new"))
+                .unwrap()
+        );
         running_run(&s, "run_new", &b, "agt_a");
         assert!(
             s.reclaim_terminal_claim(&b).unwrap().is_none(),
@@ -30734,8 +31422,12 @@ mod tests {
         assert_eq!(run.cost_micros, Some(12_300));
         assert_eq!(run.session_id.as_deref(), Some("sess-1"));
         // Empty usage must not clobber the stored values.
-        s.set_run_usage("run_u", &crate::rig::RunUsage::default()).unwrap();
-        assert_eq!(s.get_run("run_u").unwrap().unwrap().provider.as_deref(), Some("anthropic"));
+        s.set_run_usage("run_u", &crate::rig::RunUsage::default())
+            .unwrap();
+        assert_eq!(
+            s.get_run("run_u").unwrap().unwrap().provider.as_deref(),
+            Some("anthropic")
+        );
     }
 
     // ── Issue-tree cost rollup + billing attribution (company-model §6.6) ──
@@ -30758,7 +31450,14 @@ mod tests {
                  (run_id, brief_id, agent_id, rig, status, started_at, summary,
                   trigger, cost_micros, billing_code)
              VALUES (?1, ?2, 'agt', 'echo', ?3, ?4, '', 'manual', ?5, ?6)",
-            params![run_id, brief_id, status, started_at, cost_micros, billing_code],
+            params![
+                run_id,
+                brief_id,
+                status,
+                started_at,
+                cost_micros,
+                billing_code
+            ],
         )
         .unwrap();
     }
@@ -30826,7 +31525,8 @@ mod tests {
         let child = brief(&s, "child inherits code");
         s.link_subbrief(&parent, &child).unwrap();
         // Parent carries the code; child has none → inherits the parent's.
-        s.set_brief_field(&parent, "billing_code", "PROJ-X").unwrap();
+        s.set_brief_field(&parent, "billing_code", "PROJ-X")
+            .unwrap();
         assert_eq!(
             s.effective_billing_code(&parent).unwrap().as_deref(),
             Some("PROJ-X")
@@ -30900,8 +31600,10 @@ mod tests {
     /// A TaskStore wired with an in-memory SpineStore as its object-level
     /// billing-code resolver — returned alongside the spine so a test can
     /// create/mutate Mandates/Campaigns/Guilds.
-    fn store_with_spine() -> (TaskStore, std::sync::Arc<crate::nodes::coordinator::spine::SpineStore>)
-    {
+    fn store_with_spine() -> (
+        TaskStore,
+        std::sync::Arc<crate::nodes::coordinator::spine::SpineStore>,
+    ) {
         let s = store();
         let spine =
             std::sync::Arc::new(crate::nodes::coordinator::spine::SpineStore::in_memory().unwrap());
@@ -30928,50 +31630,84 @@ mod tests {
         // Nothing set anywhere → no code.
         assert_eq!(s.effective_billing_code(&b).unwrap(), None);
         // Only the Guild has a code → Brief inherits the Guild default.
-        spine.set_guild_billing_code("default", Some("GUILD")).unwrap();
-        assert_eq!(s.effective_billing_code(&b).unwrap().as_deref(), Some("GUILD"));
+        spine
+            .set_guild_billing_code("default", Some("GUILD"))
+            .unwrap();
+        assert_eq!(
+            s.effective_billing_code(&b).unwrap().as_deref(),
+            Some("GUILD")
+        );
         // Linked Mandate with a code beats the Guild.
-        let m = spine.create_mandate("default", "M", "", None, None).unwrap();
-        spine.update_mandate_field(&m, "billing_code", "MAND").unwrap();
+        let m = spine
+            .create_mandate("default", "M", "", None, None)
+            .unwrap();
+        spine
+            .update_mandate_field(&m, "billing_code", "MAND")
+            .unwrap();
         s.set_brief_field(&b, "mandate", &m).unwrap();
-        assert_eq!(s.effective_billing_code(&b).unwrap().as_deref(), Some("MAND"));
+        assert_eq!(
+            s.effective_billing_code(&b).unwrap().as_deref(),
+            Some("MAND")
+        );
         // Linked Campaign with a code beats the Mandate.
         let c = spine
             .create_campaign("default", "C", Some(&m), None, None)
             .unwrap();
-        spine.update_campaign_field(&c, "billing_code", "CAMP").unwrap();
+        spine
+            .update_campaign_field(&c, "billing_code", "CAMP")
+            .unwrap();
         s.set_brief_field(&b, "campaign", &c).unwrap();
-        assert_eq!(s.effective_billing_code(&b).unwrap().as_deref(), Some("CAMP"));
+        assert_eq!(
+            s.effective_billing_code(&b).unwrap().as_deref(),
+            Some("CAMP")
+        );
     }
 
     #[test]
     fn effective_billing_code_precedence_brief_over_ancestor_over_object() {
         let (s, spine) = store_with_spine();
-        spine.set_guild_billing_code("default", Some("GUILD")).unwrap();
-        let m = spine.create_mandate("default", "M", "", None, None).unwrap();
-        spine.update_mandate_field(&m, "billing_code", "MAND").unwrap();
+        spine
+            .set_guild_billing_code("default", Some("GUILD"))
+            .unwrap();
+        let m = spine
+            .create_mandate("default", "M", "", None, None)
+            .unwrap();
+        spine
+            .update_mandate_field(&m, "billing_code", "MAND")
+            .unwrap();
         let parent = brief(&s, "parent");
         let child = brief(&s, "child");
         s.link_subbrief(&parent, &child).unwrap();
         s.set_brief_field(&child, "mandate", &m).unwrap();
         // No Brief code anywhere → object fallback (Mandate beats Guild).
-        assert_eq!(s.effective_billing_code(&child).unwrap().as_deref(), Some("MAND"));
+        assert_eq!(
+            s.effective_billing_code(&child).unwrap().as_deref(),
+            Some("MAND")
+        );
         // An ancestor Brief code beats the linked object code.
-        s.set_brief_field(&parent, "billing_code", "ANCESTOR").unwrap();
+        s.set_brief_field(&parent, "billing_code", "ANCESTOR")
+            .unwrap();
         assert_eq!(
             s.effective_billing_code(&child).unwrap().as_deref(),
             Some("ANCESTOR")
         );
         // The Brief's OWN code beats the ancestor.
         s.set_brief_field(&child, "billing_code", "OWN").unwrap();
-        assert_eq!(s.effective_billing_code(&child).unwrap().as_deref(), Some("OWN"));
+        assert_eq!(
+            s.effective_billing_code(&child).unwrap().as_deref(),
+            Some("OWN")
+        );
     }
 
     #[test]
     fn object_code_change_after_run_start_does_not_rewrite_stamp() {
         let (s, spine) = store_with_spine();
-        let m = spine.create_mandate("default", "M", "", None, None).unwrap();
-        spine.update_mandate_field(&m, "billing_code", "OLD").unwrap();
+        let m = spine
+            .create_mandate("default", "M", "", None, None)
+            .unwrap();
+        spine
+            .update_mandate_field(&m, "billing_code", "OLD")
+            .unwrap();
         let b = brief(&s, "stamped from mandate");
         s.set_brief_field(&b, "mandate", &m).unwrap();
         // Run starts → stamp the effective (object) code point-in-time.
@@ -30979,7 +31715,9 @@ mod tests {
         s.stamp_run_billing_code("r1", &b).unwrap();
         assert_eq!(run_billing_code(&s, "r1").as_deref(), Some("OLD"));
         // Later object-code change must NOT rewrite the past run's bill.
-        spine.update_mandate_field(&m, "billing_code", "NEW").unwrap();
+        spine
+            .update_mandate_field(&m, "billing_code", "NEW")
+            .unwrap();
         assert_eq!(
             run_billing_code(&s, "r1").as_deref(),
             Some("OLD"),
@@ -30995,13 +31733,21 @@ mod tests {
     fn object_code_does_not_leak_across_guilds() {
         let (s, spine) = store_with_spine();
         // Guild-b carries codes at every object level.
-        spine.set_guild_billing_code("guild-b", Some("B-GUILD")).unwrap();
-        let mb = spine.create_mandate("guild-b", "MB", "", None, None).unwrap();
-        spine.update_mandate_field(&mb, "billing_code", "B-MAND").unwrap();
+        spine
+            .set_guild_billing_code("guild-b", Some("B-GUILD"))
+            .unwrap();
+        let mb = spine
+            .create_mandate("guild-b", "MB", "", None, None)
+            .unwrap();
+        spine
+            .update_mandate_field(&mb, "billing_code", "B-MAND")
+            .unwrap();
         let cb = spine
             .create_campaign("guild-b", "CB", Some(&mb), None, None)
             .unwrap();
-        spine.update_campaign_field(&cb, "billing_code", "B-CAMP").unwrap();
+        spine
+            .update_campaign_field(&cb, "billing_code", "B-CAMP")
+            .unwrap();
         // A Brief in guild-a mis-linked to guild-b's Campaign + Mandate ids.
         let b = brief(&s, "guild-a brief, cross-Guild links");
         s.set_task_tenant(&b, "guild-a").unwrap();
@@ -31014,7 +31760,10 @@ mod tests {
         let bb = brief(&s, "guild-b brief");
         s.set_task_tenant(&bb, "guild-b").unwrap();
         s.set_brief_field(&bb, "campaign", &cb).unwrap();
-        assert_eq!(s.effective_billing_code(&bb).unwrap().as_deref(), Some("B-CAMP"));
+        assert_eq!(
+            s.effective_billing_code(&bb).unwrap().as_deref(),
+            Some("B-CAMP")
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -31166,7 +31915,10 @@ mod tests {
         let local_grandchild = brief(&s, "grandchild guild-b");
         s.set_task_tenant(&local_grandchild, "guild-b").unwrap();
         s.link_subbrief(&foreign_child, &local_grandchild).unwrap();
-        assert_eq!(s.brief_delegation_depth(&local_grandchild).unwrap(), Some(1));
+        assert_eq!(
+            s.brief_delegation_depth(&local_grandchild).unwrap(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -31231,15 +31983,13 @@ mod tests {
     fn runtime_state_unknown_run_is_noop() {
         let s = store();
         // No such run → resolves to nothing → no row created, no error.
-        s.record_run_runtime_state(
-            "nope",
-            &crate::rig::RunUsage::default(),
-            "done",
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(s.list_runtime_state("default", "agt_rt").unwrap().is_empty());
+        s.record_run_runtime_state("nope", &crate::rig::RunUsage::default(), "done", None, None)
+            .unwrap();
+        assert!(
+            s.list_runtime_state("default", "agt_rt")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -31254,18 +32004,33 @@ mod tests {
             session_id: Some("s".into()),
             ..Default::default()
         };
-        s.record_run_runtime_state("rs1", &u, "done", None, None).unwrap();
-        s.record_run_runtime_state("rs2", &u, "done", None, None).unwrap();
-        s.record_run_runtime_state("rs3", &u, "done", None, None).unwrap();
+        s.record_run_runtime_state("rs1", &u, "done", None, None)
+            .unwrap();
+        s.record_run_runtime_state("rs2", &u, "done", None, None)
+            .unwrap();
+        s.record_run_runtime_state("rs3", &u, "done", None, None)
+            .unwrap();
 
         assert_eq!(s.list_runtime_state("default", "agt_x").unwrap().len(), 2);
         assert_eq!(s.list_runtime_state("default", "agt_y").unwrap().len(), 1);
 
         // Reset just (agt_x, b1) → leaves agt_x/b2 and agt_y alone.
-        assert_eq!(s.reset_runtime_state_for_brief("default", "agt_x", &b1).unwrap(), 1);
+        assert_eq!(
+            s.reset_runtime_state_for_brief("default", "agt_x", &b1)
+                .unwrap(),
+            1
+        );
         assert_eq!(s.list_runtime_state("default", "agt_x").unwrap().len(), 1);
-        assert!(s.get_runtime_state("default", "agt_x", "echo", &b1).unwrap().is_none());
-        assert!(s.get_runtime_state("default", "agt_x", "echo", &b2).unwrap().is_some());
+        assert!(
+            s.get_runtime_state("default", "agt_x", "echo", &b1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.get_runtime_state("default", "agt_x", "echo", &b2)
+                .unwrap()
+                .is_some()
+        );
 
         // Reset all of agt_x → removes the remaining row; agt_y untouched.
         assert_eq!(s.reset_runtime_state("default", "agt_x").unwrap(), 1);
@@ -31287,15 +32052,19 @@ mod tests {
         running_run(&s, "gl1", &b1, "agt_a");
         running_run(&s, "gl2", &b2, "agt_a");
         running_run(&s, "gl3", &b1, "agt_b");
-        s.record_run_runtime_state("gl1", &u, "done", None, None).unwrap();
-        s.record_run_runtime_state("gl2", &u, "done", None, None).unwrap();
-        s.record_run_runtime_state("gl3", &u, "done", None, None).unwrap();
+        s.record_run_runtime_state("gl1", &u, "done", None, None)
+            .unwrap();
+        s.record_run_runtime_state("gl2", &u, "done", None, None)
+            .unwrap();
+        s.record_run_runtime_state("gl3", &u, "done", None, None)
+            .unwrap();
 
         // A foreign-Guild row that must never leak into the default list.
         let bf = brief(&s, "gl foreign");
         s.set_task_tenant(&bf, "guild-b").unwrap();
         running_run(&s, "glf", &bf, "agt_foreign");
-        s.record_run_runtime_state("glf", &u, "done", None, None).unwrap();
+        s.record_run_runtime_state("glf", &u, "done", None, None)
+            .unwrap();
 
         // Global list for `default` sees all three default rows across both
         // agents — and not the foreign-Guild row.
@@ -31335,17 +32104,29 @@ mod tests {
             let b = brief(&s, &format!("lim b{i}"));
             let run = format!("lim{i}");
             running_run(&s, &run, &b, &format!("agt_{i}"));
-            s.record_run_runtime_state(&run, &u, "done", None, None).unwrap();
+            s.record_run_runtime_state(&run, &u, "done", None, None)
+                .unwrap();
         }
         // A caller limit is honoured exactly.
-        assert_eq!(s.list_runtime_state_for_tenant("default", 2).unwrap().len(), 2);
-        assert_eq!(s.list_runtime_state_for_tenant("default", 5).unwrap().len(), 5);
+        assert_eq!(
+            s.list_runtime_state_for_tenant("default", 2).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            s.list_runtime_state_for_tenant("default", 5).unwrap().len(),
+            5
+        );
         // `0` means "the default page" (clamped to the max), not "no rows".
-        assert_eq!(s.list_runtime_state_for_tenant("default", 0).unwrap().len(), 5);
+        assert_eq!(
+            s.list_runtime_state_for_tenant("default", 0).unwrap().len(),
+            5
+        );
         // An oversized limit is clamped to the defensive max but still returns
         // every available row (there are fewer rows than the cap here).
         assert_eq!(
-            s.list_runtime_state_for_tenant("default", 100_000).unwrap().len(),
+            s.list_runtime_state_for_tenant("default", 100_000)
+                .unwrap()
+                .len(),
             5
         );
     }
@@ -31356,34 +32137,67 @@ mod tests {
         let b = brief(&s, "resume brief");
         // Seed a finished run's runtime state for an EXACT pairing.
         let seed = |run_id: &str, brief_id: &str, agent: &str, rig: &str, session: &str| {
-            s.record_run_start(run_id, brief_id, agent, rig, "manual", &RunWorkspaceInfo::default())
-                .unwrap();
+            s.record_run_start(
+                run_id,
+                brief_id,
+                agent,
+                rig,
+                "manual",
+                &RunWorkspaceInfo::default(),
+            )
+            .unwrap();
             let u = crate::rig::RunUsage {
                 session_id: Some(session.into()),
                 provider: Some("openai".into()),
                 ..Default::default()
             };
-            s.record_run_runtime_state(run_id, &u, "done", None, None).unwrap();
+            s.record_run_runtime_state(run_id, &u, "done", None, None)
+                .unwrap();
         };
         seed("r_match", &b, "agt_a", "codex", "sess-keep");
 
         // Exact (tenant, Operative, Rig, Brief) → the stored session.
         assert_eq!(
-            s.resume_session_for(&b, "agt_a", "codex").unwrap().as_deref(),
+            s.resume_session_for(&b, "agt_a", "codex")
+                .unwrap()
+                .as_deref(),
             Some("sess-keep")
         );
         // A different Operative, Rig, or Brief never matches.
-        assert_eq!(s.resume_session_for(&b, "agt_other", "codex").unwrap(), None);
+        assert_eq!(
+            s.resume_session_for(&b, "agt_other", "codex").unwrap(),
+            None
+        );
         assert_eq!(s.resume_session_for(&b, "agt_a", "claude").unwrap(), None);
-        assert_eq!(s.resume_session_for("brief_missing", "agt_a", "codex").unwrap(), None);
+        assert_eq!(
+            s.resume_session_for("brief_missing", "agt_a", "codex")
+                .unwrap(),
+            None
+        );
 
         // A row whose session_id is NULL yields None (nothing to resume).
         let b_nosess = brief(&s, "no session brief");
-        s.record_run_start("r_nosess", &b_nosess, "agt_a", "codex", "manual", &RunWorkspaceInfo::default())
-            .unwrap();
-        s.record_run_runtime_state("r_nosess", &crate::rig::RunUsage::default(), "done", None, None)
-            .unwrap();
-        assert_eq!(s.resume_session_for(&b_nosess, "agt_a", "codex").unwrap(), None);
+        s.record_run_start(
+            "r_nosess",
+            &b_nosess,
+            "agt_a",
+            "codex",
+            "manual",
+            &RunWorkspaceInfo::default(),
+        )
+        .unwrap();
+        s.record_run_runtime_state(
+            "r_nosess",
+            &crate::rig::RunUsage::default(),
+            "done",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            s.resume_session_for(&b_nosess, "agt_a", "codex").unwrap(),
+            None
+        );
 
         // Cross-tenant isolation: a session under a FOREIGN Guild is only
         // reachable when looking up that Guild's own Brief (the tenant is
@@ -31393,12 +32207,16 @@ mod tests {
         s.set_task_tenant(&bf, "guild-b").unwrap();
         seed("r_foreign", &bf, "agt_a", "codex", "sess-foreign");
         assert_eq!(
-            s.resume_session_for(&bf, "agt_a", "codex").unwrap().as_deref(),
+            s.resume_session_for(&bf, "agt_a", "codex")
+                .unwrap()
+                .as_deref(),
             Some("sess-foreign")
         );
         // The default-tenant Brief still only sees its own session.
         assert_eq!(
-            s.resume_session_for(&b, "agt_a", "codex").unwrap().as_deref(),
+            s.resume_session_for(&b, "agt_a", "codex")
+                .unwrap()
+                .as_deref(),
             Some("sess-keep")
         );
     }
@@ -31415,10 +32233,13 @@ mod tests {
             .unwrap();
         // Execution-lifecycle events on each + a non-execution event that
         // must be filtered out of the run stream.
-        s.append_event(&acme, "brief.run_started", "a start").unwrap();
+        s.append_event(&acme, "brief.run_started", "a start")
+            .unwrap();
         s.append_event(&acme, "brief.shift_done", "a done").unwrap();
-        s.append_event(&acme, "brief.comment", "not execution").unwrap();
-        s.append_event(&globex, "brief.run_started", "g start").unwrap();
+        s.append_event(&acme, "brief.comment", "not execution")
+            .unwrap();
+        s.append_event(&globex, "brief.run_started", "g start")
+            .unwrap();
 
         // acme sees ONLY its own execution events — not the comment, not
         // globex. (Creating + placing a Brief also emits a `brief.board_moved`
@@ -31431,13 +32252,20 @@ mod tests {
             .collect();
         assert!(types.contains(&"brief.run_started"));
         assert!(types.contains(&"brief.shift_done"));
-        assert!(!types.contains(&"brief.comment"), "comment must be filtered");
+        assert!(
+            !types.contains(&"brief.comment"),
+            "comment must be filtered"
+        );
 
         // Tenant isolation: globex never sees any of acme's events.
         let globex_rows = s.recent_run_events("globex", 0, 100).unwrap();
         assert!(!globex_rows.is_empty());
         assert!(globex_rows.iter().all(|(tid, _)| tid == &globex));
-        assert!(globex_rows.iter().all(|(_, e)| e.event_type != "brief.shift_done"));
+        assert!(
+            globex_rows
+                .iter()
+                .all(|(_, e)| e.event_type != "brief.shift_done")
+        );
 
         // Cursor: resume after the newest acme execution event → nothing newer.
         let newest = acme_rows.iter().map(|(_, e)| e.event_id).max().unwrap();

@@ -999,7 +999,9 @@ fn is_excluded_file(name: &str) -> bool {
 }
 
 fn is_excluded_dir(name: &str) -> bool {
-    EXCLUDED_DIR_NAMES.iter().any(|d| d.eq_ignore_ascii_case(name))
+    EXCLUDED_DIR_NAMES
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case(name))
 }
 
 /// Best-effort `.gitignore` "respect where practical": read the project
@@ -1068,8 +1070,8 @@ fn copy_repo_into(
     let mut bytes = 0u64;
     let mut stack = vec![src_root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|e| format!("read {}: {e}", dir.display()))?;
+        let entries =
+            std::fs::read_dir(&dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
         for entry in entries {
             let entry = entry.map_err(|e| format!("entry: {e}"))?;
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -1299,7 +1301,11 @@ fn file_sig(path: &std::path::Path, size: u64) -> FileSig {
         is_text = looks_text(&head);
         None
     };
-    FileSig { size, hash, is_text }
+    FileSig {
+        size,
+        hash,
+        is_text,
+    }
 }
 
 /// Walk a run workspace and build its [`WorkspaceManifest`], reusing the
@@ -1367,7 +1373,10 @@ pub struct ArtifactChange {
 /// deleted), sorted by path. `unchanged` files are intentionally NOT
 /// returned — only what the run actually touched (so `BRIEF.md`, copied
 /// context, etc. don't show up unless the agent edited them).
-pub fn diff_manifests(before: &WorkspaceManifest, after: &WorkspaceManifest) -> Vec<ArtifactChange> {
+pub fn diff_manifests(
+    before: &WorkspaceManifest,
+    after: &WorkspaceManifest,
+) -> Vec<ArtifactChange> {
     let mut out = Vec::new();
     for (rel, sig) in &after.files {
         match before.files.get(rel) {
@@ -1433,9 +1442,10 @@ pub fn read_artifact_preview(
         return PreviewOutcome::Binary;
     }
     let path = std::path::Path::new(workspace).join(rel_path);
-    let (Ok(ws_canon), Ok(file_canon)) =
-        (std::fs::canonicalize(workspace), std::fs::canonicalize(&path))
-    else {
+    let (Ok(ws_canon), Ok(file_canon)) = (
+        std::fs::canonicalize(workspace),
+        std::fs::canonicalize(&path),
+    ) else {
         return PreviewOutcome::Missing;
     };
     if !file_canon.starts_with(&ws_canon) {
@@ -1529,17 +1539,17 @@ pub fn read_artifact_diff(
             PreviewOutcome::Binary => {
                 return DiffOutcome::Unavailable {
                     reason: "binary or non-text file — no diff".into(),
-                }
+                };
             }
             PreviewOutcome::Missing => {
                 return DiffOutcome::Unavailable {
                     reason: "file no longer exists in the workspace".into(),
-                }
+                };
             }
             PreviewOutcome::Unsafe => {
                 return DiffOutcome::Unavailable {
                     reason: "path refused (outside workspace)".into(),
-                }
+                };
             }
         }
     };
@@ -1575,14 +1585,14 @@ pub fn read_artifact_diff(
                         reason: "the project file changed since this run — diff unavailable; \
                                  preview the run output instead"
                             .into(),
-                    }
+                    };
                 }
             }
         }
         other => {
             return DiffOutcome::Unavailable {
                 reason: format!("unknown change kind: {other}"),
-            }
+            };
         }
     };
     // Diff the bounded, redacted sides. `diffy` emits a unified diff.
@@ -1761,10 +1771,24 @@ fn plan_one(root_canon: &std::path::Path, art: &super::RunArtifact) -> ApplyPlan
     };
 
     if !apply_rel_path_is_safe(&rel) {
-        return mk("refuse", false, false, "unsafe path (absolute / traversal / drive / UNC)".into(), 0, false);
+        return mk(
+            "refuse",
+            false,
+            false,
+            "unsafe path (absolute / traversal / drive / UNC)".into(),
+            0,
+            false,
+        );
     }
     if apply_path_excluded(&rel) {
-        return mk("refuse", false, false, "excluded path (vcs/build/secret) — never applied".into(), 0, false);
+        return mk(
+            "refuse",
+            false,
+            false,
+            "excluded path (vcs/build/secret) — never applied".into(),
+            0,
+            false,
+        );
     }
     let target = match resolve_apply_target(root_canon, &rel) {
         Ok(t) => t,
@@ -1780,39 +1804,112 @@ fn plan_one(root_canon: &std::path::Path, art: &super::RunArtifact) -> ApplyPlan
     match kind.as_str() {
         "created" => {
             if !source_is_file {
-                return mk("refuse", false, false, "source file missing in the run workspace".into(), source_size, target_exists);
+                return mk(
+                    "refuse",
+                    false,
+                    false,
+                    "source file missing in the run workspace".into(),
+                    source_size,
+                    target_exists,
+                );
             }
             if !target_exists {
-                return mk("create", true, false, "new file — will be created".into(), source_size, false);
+                return mk(
+                    "create",
+                    true,
+                    false,
+                    "new file — will be created".into(),
+                    source_size,
+                    false,
+                );
             }
             match (art.hash.as_deref(), target_hash.as_deref()) {
-                (Some(s), Some(t)) if s == t => {
-                    mk("noop", true, false, "already present with identical content".into(), source_size, true)
-                }
-                _ => mk("refuse", false, true, "target already exists with different content".into(), source_size, true),
+                (Some(s), Some(t)) if s == t => mk(
+                    "noop",
+                    true,
+                    false,
+                    "already present with identical content".into(),
+                    source_size,
+                    true,
+                ),
+                _ => mk(
+                    "refuse",
+                    false,
+                    true,
+                    "target already exists with different content".into(),
+                    source_size,
+                    true,
+                ),
             }
         }
         "modified" => {
             if !source_is_file {
-                return mk("refuse", false, false, "source file missing in the run workspace".into(), source_size, target_exists);
+                return mk(
+                    "refuse",
+                    false,
+                    false,
+                    "source file missing in the run workspace".into(),
+                    source_size,
+                    target_exists,
+                );
             }
             let Some(src_hash) = art.hash.as_deref() else {
-                return mk("refuse", false, false, "source too large to verify safely".into(), source_size, target_exists);
+                return mk(
+                    "refuse",
+                    false,
+                    false,
+                    "source too large to verify safely".into(),
+                    source_size,
+                    target_exists,
+                );
             };
             if !target_exists {
-                return mk("refuse", false, true, "target missing — cannot safely modify".into(), source_size, false);
+                return mk(
+                    "refuse",
+                    false,
+                    true,
+                    "target missing — cannot safely modify".into(),
+                    source_size,
+                    false,
+                );
             }
             let Some(tgt_hash) = target_hash.as_deref() else {
-                return mk("refuse", false, true, "target unreadable / too large to verify".into(), source_size, true);
+                return mk(
+                    "refuse",
+                    false,
+                    true,
+                    "target unreadable / too large to verify".into(),
+                    source_size,
+                    true,
+                );
             };
             if tgt_hash == src_hash {
-                return mk("noop", true, false, "already updated (identical content)".into(), source_size, true);
+                return mk(
+                    "noop",
+                    true,
+                    false,
+                    "already updated (identical content)".into(),
+                    source_size,
+                    true,
+                );
             }
             match art.baseline_hash.as_deref() {
-                Some(base) if base == tgt_hash => {
-                    mk("overwrite", true, false, "target matches the run baseline — safe to overwrite".into(), source_size, true)
-                }
-                _ => mk("refuse", false, true, "target changed since the run started (or baseline unverifiable)".into(), source_size, true),
+                Some(base) if base == tgt_hash => mk(
+                    "overwrite",
+                    true,
+                    false,
+                    "target matches the run baseline — safe to overwrite".into(),
+                    source_size,
+                    true,
+                ),
+                _ => mk(
+                    "refuse",
+                    false,
+                    true,
+                    "target changed since the run started (or baseline unverifiable)".into(),
+                    source_size,
+                    true,
+                ),
             }
         }
         "deleted" => {
@@ -1820,16 +1917,42 @@ fn plan_one(root_canon: &std::path::Path, art: &super::RunArtifact) -> ApplyPlan
                 return mk("noop", true, false, "already absent".into(), 0, false);
             }
             let Some(tgt_hash) = target_hash.as_deref() else {
-                return mk("refuse", false, true, "target unreadable / too large to verify before delete".into(), 0, true);
+                return mk(
+                    "refuse",
+                    false,
+                    true,
+                    "target unreadable / too large to verify before delete".into(),
+                    0,
+                    true,
+                );
             };
             match art.baseline_hash.as_deref() {
-                Some(base) if base == tgt_hash => {
-                    mk("delete", true, false, "target matches the run baseline — safe to delete".into(), 0, true)
-                }
-                _ => mk("refuse", false, true, "target differs from the run baseline — refusing to delete".into(), 0, true),
+                Some(base) if base == tgt_hash => mk(
+                    "delete",
+                    true,
+                    false,
+                    "target matches the run baseline — safe to delete".into(),
+                    0,
+                    true,
+                ),
+                _ => mk(
+                    "refuse",
+                    false,
+                    true,
+                    "target differs from the run baseline — refusing to delete".into(),
+                    0,
+                    true,
+                ),
             }
         }
-        other => mk("refuse", false, false, format!("unknown change kind: {other}"), source_size, target_exists),
+        other => mk(
+            "refuse",
+            false,
+            false,
+            format!("unknown change kind: {other}"),
+            source_size,
+            target_exists,
+        ),
     }
 }
 
@@ -2212,7 +2335,9 @@ pub fn open_retry_child_with_provenance(
                 );
             }
             let target = brief_id.as_deref().unwrap_or(run_id);
-            return Ok(RetryOpen::Refused(RunReport::refuse(target, status, reason)));
+            return Ok(RetryOpen::Refused(RunReport::refuse(
+                target, status, reason,
+            )));
         }
         RetryPrecheck::Eligible {
             brief_id,
@@ -2608,10 +2733,7 @@ pub fn preflight_run_with_prefs(
     // reclaiming that is stale-run adoption, a separate slice — so it does not
     // match here.) The conflict surfaces as `already_running` → HTTP 409; the
     // client must NEVER retry a 409 while the holder is live.
-    if store
-        .live_run_by_agent(&card.task_id, &assignee)?
-        .is_some()
-    {
+    if store.live_run_by_agent(&card.task_id, &assignee)?.is_some() {
         return Ok(Preflight::Refused(RunReport {
             brief_id: brief_id.to_string(),
             status: "already_running".to_string(),
@@ -2933,14 +3055,28 @@ fn execute_ready_inner(
     // process was killed, so report the run `cancelled`, not `failed`.
     let was_cancelled = crate::rig::CancelRegistry::global().is_cancelled(&run_id);
     crate::rig::CancelRegistry::global().clear(&run_id);
-    let _ = store.append_run_event(&run_id, "process_exited", "relix", "process exited", None, false);
+    let _ = store.append_run_event(
+        &run_id,
+        "process_exited",
+        "relix",
+        "process exited",
+        None,
+        false,
+    );
 
     // Detect what the agent changed in the scoped workspace (the
     // reviewable result). Only scopes-runs are scanned — `inherit` mode
     // has no scoped dir and we NEVER scan the repo. Failures are surfaced
     // as a transcript event, never swallowed silently.
     if let Some(ws) = &workspace {
-        let _ = store.append_run_event(&run_id, "artifacts.scan_started", "relix", "scanning the workspace for changes", None, false);
+        let _ = store.append_run_event(
+            &run_id,
+            "artifacts.scan_started",
+            "relix",
+            "scanning the workspace for changes",
+            None,
+            false,
+        );
         let after = scan_workspace_manifest(std::path::Path::new(ws));
         let changes = diff_manifests(&baseline, &after);
         let total = changes.len();
@@ -2964,7 +3100,14 @@ fn execute_ready_inner(
                     break;
                 }
                 Err(e) => {
-                    let _ = store.append_run_event(&run_id, "artifacts.scan_failed", "relix", &format!("could not record an artifact: {e}"), None, false);
+                    let _ = store.append_run_event(
+                        &run_id,
+                        "artifacts.scan_failed",
+                        "relix",
+                        &format!("could not record an artifact: {e}"),
+                        None,
+                        false,
+                    );
                     truncated = true;
                     break;
                 }
@@ -3057,7 +3200,13 @@ fn execute_ready_inner(
     // (execution-and-issue §3.3b). `done` / `continued` / `cancelled` /
     // `interrupted` are already classified honestly from the status alone.
     if status == "failed" {
-        let rig_retryable = matches!(&outcome, RigOutcome::Failed { retryable: true, .. });
+        let rig_retryable = matches!(
+            &outcome,
+            RigOutcome::Failed {
+                retryable: true,
+                ..
+            }
+        );
         let diag = super::RunDiagnosis::for_terminal(status, Some(rig_retryable), &run_id);
         let _ = store.set_run_diagnosis(&run_id, &diag);
     }
@@ -3389,7 +3538,11 @@ mod tests {
         .unwrap();
         assert_eq!(records.len(), 1);
         let got = seen.lock().unwrap().clone().expect("the rig ran");
-        assert_eq!(got.0.as_deref(), Some("gpt-5-codex"), "model pref reached the request");
+        assert_eq!(
+            got.0.as_deref(),
+            Some("gpt-5-codex"),
+            "model pref reached the request"
+        );
         assert_eq!(got.1.as_deref(), Some("high"), "effort reached the request");
     }
 
@@ -3445,7 +3598,14 @@ mod tests {
     /// (default-tenant, agent, rig, brief) pairing → a resumable session id.
     /// The run is finished so it is not a `live` run that would block a new
     /// start.
-    fn seed_session(s: &TaskStore, run_id: &str, brief: &str, agent: &str, rig: &str, session: &str) {
+    fn seed_session(
+        s: &TaskStore,
+        run_id: &str,
+        brief: &str,
+        agent: &str,
+        rig: &str,
+        session: &str,
+    ) {
         s.record_run_start(
             run_id,
             brief,
@@ -3460,7 +3620,8 @@ mod tests {
             provider: Some("openai".to_string()),
             ..Default::default()
         };
-        s.record_run_runtime_state(run_id, &u, "done", None, None).unwrap();
+        s.record_run_runtime_state(run_id, &u, "done", None, None)
+            .unwrap();
         s.record_run_finish(run_id, "done", "seeded").unwrap();
     }
 
@@ -3503,7 +3664,14 @@ mod tests {
         let b = ready_brief(&s, "target", "agt_r");
         // Sessions stored under a DIFFERENT Operative or a DIFFERENT Rig — the
         // run for (agt_r, capture, b) must NOT pick either up.
-        seed_session(&s, "seed_other_agent", &b, "agt_other", "capture", "sess-agent");
+        seed_session(
+            &s,
+            "seed_other_agent",
+            &b,
+            "agt_other",
+            "capture",
+            "sess-agent",
+        );
         seed_session(&s, "seed_other_rig", &b, "agt_r", "claude", "sess-rig");
 
         let records = dispatch_batch_with_policy(
@@ -3521,7 +3689,10 @@ mod tests {
         .unwrap();
         assert_eq!(records.len(), 1);
         let got = seen.lock().unwrap().clone().expect("the rig ran");
-        assert_eq!(got, None, "no incompatible session crosses agent or rig scope");
+        assert_eq!(
+            got, None,
+            "no incompatible session crosses agent or rig scope"
+        );
     }
 
     // ── Allowance / budget hard-stop (company-model §3.6/§5.2D) ──
@@ -3656,9 +3827,7 @@ mod tests {
         );
         // At/over the budget → refuse, tagged as the Guild stop.
         match guild_allowance_admits(Some(100), 1_000_000) {
-            BudgetAdmission::Refuse {
-                event, status, ..
-            } => {
+            BudgetAdmission::Refuse { event, status, .. } => {
                 assert_eq!(event, GUILD_BUDGET_EVENT);
                 assert_eq!(status, GUILD_BUDGET_STATUS);
             }
@@ -3680,9 +3849,15 @@ mod tests {
         // Any instant inside January 2021 → the whole of January is the window.
         let mid_jan = JAN_2021 + 10 * MS_PER_DAY + 12 * 3_600_000; // Jan 11 12:00Z
         let w = allowance_window(mid_jan);
-        assert_eq!(w.start_ms, JAN_2021, "window opens at the month's first instant");
+        assert_eq!(
+            w.start_ms, JAN_2021,
+            "window opens at the month's first instant"
+        );
         assert_eq!(w.cutoff_ms, mid_jan, "cutoff is the supplied now");
-        assert_eq!(w.resets_at_ms, FEB_2021, "reset edge is next month's first instant");
+        assert_eq!(
+            w.resets_at_ms, FEB_2021,
+            "reset edge is next month's first instant"
+        );
         assert_eq!(w.start_ms % MS_PER_DAY, 0, "start aligns to a UTC midnight");
 
         // The first instant of the month is INCLUSIVE (matches `cost_since`'s
@@ -3713,7 +3888,10 @@ mod tests {
         const JAN_2024: i64 = 1_704_067_200_000; // 2024-01-01
         let dec = allowance_window(DEC_2023 + 14 * MS_PER_DAY); // Dec 15 2023
         assert_eq!(dec.start_ms, DEC_2023);
-        assert_eq!(dec.resets_at_ms, JAN_2024, "December resets into the next January");
+        assert_eq!(
+            dec.resets_at_ms, JAN_2024,
+            "December resets into the next January"
+        );
     }
 
     /// A priced AI invocation row attributed to `agent_id` in `tenant` — the
@@ -3802,7 +3980,9 @@ mod tests {
         }
 
         // Raise the budget above spend → the SAME autonomous dispatch is allowed.
-        spine.set_guild_allowance("guild-a", Some(1_000_000)).unwrap();
+        spine
+            .set_guild_allowance("guild-a", Some(1_000_000))
+            .unwrap();
         assert_eq!(
             dispatch_budget_admits(&card, &s, &agents, Some(&spine), Some(&mq), now_ms()),
             BudgetAdmission::Allow,
@@ -4043,7 +4223,12 @@ mod tests {
         spine.set_guild_allowance("guild-a", Some(20_000)).unwrap();
         let mstore = crate::metrics::MetricsStore::in_memory().unwrap();
         mstore
-            .insert_batch(&[guild_spend_row(&eng, "guild-a", now_ms() - 1_000, 250_000_000)])
+            .insert_batch(&[guild_spend_row(
+                &eng,
+                "guild-a",
+                now_ms() - 1_000,
+                250_000_000,
+            )])
             .unwrap();
         let mq = crate::metrics::MetricsQuery::new(mstore);
         assert!(
@@ -4407,7 +4592,8 @@ mod tests {
         assert_eq!(run.trigger.as_deref(), Some("heartbeat"));
         let arts = s.list_run_artifacts(&run.run_id).unwrap();
         assert!(
-            arts.iter().any(|x| x.rel_path == "auto_note.txt" && x.kind == "created"),
+            arts.iter()
+                .any(|x| x.rel_path == "auto_note.txt" && x.kind == "created"),
             "heartbeat run must record the file it created: {arts:?}"
         );
     }
@@ -4417,8 +4603,16 @@ mod tests {
         let (s, _tmp) = store_ws();
         // Manual run via the dashboard "Start" path.
         let m = ready_brief(&s, "manual one", "agt_m");
-        let report =
-            run_brief_now(&s, &echo_registry(), None, 300, &m, Some("echo"), "x".into()).unwrap();
+        let report = run_brief_now(
+            &s,
+            &echo_registry(),
+            None,
+            300,
+            &m,
+            Some("echo"),
+            "x".into(),
+        )
+        .unwrap();
         let mrun = s.get_run(&report.run_id.unwrap()).unwrap().unwrap();
         assert_eq!(mrun.trigger.as_deref(), Some("manual"));
 
@@ -4503,12 +4697,18 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 1, "exactly one (refused) row");
         assert_eq!(rows[0].status, "refused");
-        assert_eq!(rows[0].refusal_reason.as_deref(), Some("adapter_unavailable"));
+        assert_eq!(
+            rows[0].refusal_reason.as_deref(),
+            Some("adapter_unavailable")
+        );
         assert_eq!(rows[0].trigger.as_deref(), Some("heartbeat"));
         assert_eq!(rows[0].rig, "down");
         // No executed run exists (refused is not an execution).
         assert!(
-            !s.list_runs(50).unwrap().iter().any(|r| r.brief_id == a && r.status == "running"),
+            !s.list_runs(50)
+                .unwrap()
+                .iter()
+                .any(|r| r.brief_id == a && r.status == "running"),
             "an unavailable adapter must not open a running run row"
         );
         assert!(records.iter().any(|r| r.brief_id == a
@@ -4538,7 +4738,10 @@ mod tests {
             .unwrap();
         // Autonomous runs are review-gated exactly like manual runs — no
         // apply happens automatically.
-        assert!(run.apply_status.is_none(), "autonomous run must NOT auto-apply");
+        assert!(
+            run.apply_status.is_none(),
+            "autonomous run must NOT auto-apply"
+        );
         assert_eq!(run.review.as_deref(), Some("pending_review"));
         assert!(
             run_apply_eligibility(&run).is_err(),
@@ -4552,9 +4755,10 @@ mod tests {
         let reg = crate::rig::RigRegistry::with_builtins();
         let a = ready_brief(&s, "contended", "agt_a");
         // Another worker already holds a live Claim on the Brief.
-        assert!(s
-            .claim_brief_for_run(&a, "other_agent", 300, Some("other_run"))
-            .unwrap());
+        assert!(
+            s.claim_brief_for_run(&a, "other_agent", 300, Some("other_run"))
+                .unwrap()
+        );
 
         // A heartbeat tick must NOT start a second concurrent run on it.
         let records = heartbeat_tick(&s, reg.get("echo"), None);
@@ -4625,8 +4829,16 @@ mod tests {
         let id = s
             .create("u", "f", "{}", "subj", RetryPolicy::None, 0, None, None)
             .unwrap();
-        let report = run_brief_now(&s, &echo_registry(), None, 300, &id, Some("echo"), "x".into())
-            .unwrap();
+        let report = run_brief_now(
+            &s,
+            &echo_registry(),
+            None,
+            300,
+            &id,
+            Some("echo"),
+            "x".into(),
+        )
+        .unwrap();
         assert_eq!(report.status, "unassigned");
     }
 
@@ -4656,7 +4868,10 @@ mod tests {
         let report = run_brief_now(&s, &reg, None, 300, &id, None, "x".into()).unwrap();
         assert_eq!(report.status, "adapter_unavailable", "got: {report:?}");
         assert_eq!(report.rig, "ghost");
-        assert_eq!(report.install_hint.as_deref(), Some("install the ghost adapter"));
+        assert_eq!(
+            report.install_hint.as_deref(),
+            Some("install the ghost adapter")
+        );
         // It must NOT have moved the board (no run happened).
         assert_eq!(s.board_status(&id).unwrap().as_deref(), Some("todo"));
     }
@@ -4664,9 +4879,16 @@ mod tests {
     #[test]
     fn run_brief_now_reports_not_found_for_unknown_brief() {
         let s = store();
-        let report =
-            run_brief_now(&s, &echo_registry(), None, 300, "nope", Some("echo"), "x".into())
-                .unwrap();
+        let report = run_brief_now(
+            &s,
+            &echo_registry(),
+            None,
+            300,
+            "nope",
+            Some("echo"),
+            "x".into(),
+        )
+        .unwrap();
         assert_eq!(report.status, "not_found");
     }
 
@@ -4869,7 +5091,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.status(), "workspace_context_error");
-        assert!(err.message().contains("file-count cap"), "got: {}", err.message());
+        assert!(
+            err.message().contains("file-count cap"),
+            "got: {}",
+            err.message()
+        );
         // The partial workspace was cleaned up (no half-copied tree).
         assert!(!dst_root.path().join("runs").join("run_cap1").exists());
     }
@@ -4908,13 +5134,27 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.status(), "workspace_context_error");
-        assert!(err.message().contains("project root"), "got: {}", err.message());
+        assert!(
+            err.message().contains("project root"),
+            "got: {}",
+            err.message()
+        );
     }
 
     #[test]
     fn workspace_rejects_path_traversal_run_ids() {
         assert!(run_id_is_safe("run_1f75a50e-ee53-4771-8d01-294fde5b623d"));
-        for bad in ["..", ".", "a/b", "a\\b", "../escape", "run_/..", "", "a b", "x/../y"] {
+        for bad in [
+            "..",
+            ".",
+            "a/b",
+            "a\\b",
+            "../escape",
+            "run_/..",
+            "",
+            "a b",
+            "x/../y",
+        ] {
             assert!(!run_id_is_safe(bad), "{bad:?} must be rejected");
         }
         // And prepare refuses an unsafe id (never touches the filesystem
@@ -4923,7 +5163,11 @@ mod tests {
         let err = prepare_run_workspace(tmp.path(), "../escape", "b", "t", "c", &empty_cfg())
             .unwrap_err();
         assert_eq!(err.status(), "workspace_error");
-        assert!(err.message().contains("unsafe run id"), "got: {}", err.message());
+        assert!(
+            err.message().contains("unsafe run id"),
+            "got: {}",
+            err.message()
+        );
     }
 
     #[test]
@@ -4950,7 +5194,10 @@ mod tests {
         // and it is the per-run scoped dir.
         let runs = s.runs_for_brief(&id, 5).unwrap();
         let ws = runs[0].workspace.as_deref().expect("workspace recorded");
-        assert!(ws.ends_with(&run_id), "ledger workspace {ws} ends with {run_id}");
+        assert!(
+            ws.ends_with(&run_id),
+            "ledger workspace {ws} ends with {run_id}"
+        );
         assert_eq!(report.workspace.as_deref(), Some(ws));
         // The child's printed cwd is UNDER that scoped workspace root. (The
         // run_id segment itself is redacted in the summary because it is a
@@ -4978,7 +5225,10 @@ mod tests {
         s.set_run_workspace_config(copy_repo_cfg(proj.path()));
         let id = ready_brief(&s, "ls my workspace", "agt_a");
         let (prog, args) = if cfg!(windows) {
-            ("cmd".to_string(), vec!["/C".to_string(), "dir".to_string(), "/b".to_string()])
+            (
+                "cmd".to_string(),
+                vec!["/C".to_string(), "dir".to_string(), "/b".to_string()],
+            )
         } else {
             ("sh".to_string(), vec!["-c".to_string(), "ls".to_string()])
         };
@@ -4991,9 +5241,20 @@ mod tests {
         let report = run_brief_now(&s, &reg, None, 300, &id, None, "x".into()).unwrap();
         assert_eq!(report.status, "done", "got: {report:?}");
         // The cwd listing shows the copied files (proving copy + cwd).
-        assert!(report.summary.contains("main.rs"), "ls {:?}", report.summary);
-        assert!(report.summary.contains("BRIEF.md"), "ls {:?}", report.summary);
-        assert!(!report.summary.contains(".git"), "excluded dirs not present");
+        assert!(
+            report.summary.contains("main.rs"),
+            "ls {:?}",
+            report.summary
+        );
+        assert!(
+            report.summary.contains("BRIEF.md"),
+            "ls {:?}",
+            report.summary
+        );
+        assert!(
+            !report.summary.contains(".git"),
+            "excluded dirs not present"
+        );
         // Ledger + report carry the context mode + copy stats.
         assert_eq!(report.workspace_context.as_deref(), Some("copy_repo"));
         assert_eq!(report.workspace_files, Some(3));
@@ -5111,7 +5372,11 @@ mod tests {
             Preflight::Ready(r) => *r,
             Preflight::Refused(r) => panic!("a post-completion start must be allowed, got {r:?}"),
         };
-        assert_ne!(r3.workspace.as_deref(), Some(w1.as_str()), "fresh workspace");
+        assert_ne!(
+            r3.workspace.as_deref(),
+            Some(w1.as_str()),
+            "fresh workspace"
+        );
         assert_eq!(s.runs_for_brief(&id, 10).unwrap().len(), 2);
     }
 
@@ -5161,7 +5426,11 @@ mod tests {
             matches!(retry, Preflight::Refused(r) if r.status == "already_running"),
             "a retry of a 409 conflict loses again — clients must not retry"
         );
-        assert_eq!(s.runs_for_brief(&id, 10).unwrap().len(), 1, "still one run row");
+        assert_eq!(
+            s.runs_for_brief(&id, 10).unwrap().len(),
+            1,
+            "still one run row"
+        );
     }
 
     #[test]
@@ -5174,15 +5443,16 @@ mod tests {
         let reg = echo_registry();
         let id = ready_brief(&s, "contended manual start", "agt_a");
         // A different worker already holds a live Claim on the Brief.
-        assert!(s
-            .claim_brief_for_run(&id, "other_agent", 300, Some("other_run"))
-            .unwrap());
+        assert!(
+            s.claim_brief_for_run(&id, "other_agent", 300, Some("other_run"))
+                .unwrap()
+        );
 
-        let report = match preflight_run(&s, &reg, None, 300, &id, Some("echo"), "x".into()).unwrap()
-        {
-            Preflight::Refused(r) => r,
-            Preflight::Ready(_) => panic!("expected a conflict refusal, got a ready run"),
-        };
+        let report =
+            match preflight_run(&s, &reg, None, 300, &id, Some("echo"), "x".into()).unwrap() {
+                Preflight::Refused(r) => r,
+                Preflight::Ready(_) => panic!("expected a conflict refusal, got a ready run"),
+            };
         assert_eq!(report.status, "already_running", "got: {report:?}");
         assert!(report.run_id.is_none(), "a conflict opens no run row");
         // The other worker's Claim is untouched — the loser never stole it.
@@ -5203,9 +5473,10 @@ mod tests {
         let reg = echo_registry();
         let id = ready_brief(&s, "stale terminal claim", "agt_a");
         // A previous owner holds a LIVE Claim pointing at run_prev...
-        assert!(s
-            .claim_brief_for_run(&id, "agt_prev", 300, Some("run_prev"))
-            .unwrap());
+        assert!(
+            s.claim_brief_for_run(&id, "agt_prev", 300, Some("run_prev"))
+                .unwrap()
+        );
         // ...but run_prev has already finished terminal (`done`).
         s.record_run_start(
             "run_prev",
@@ -5218,13 +5489,13 @@ mod tests {
         .unwrap();
         s.record_run_finish("run_prev", "done", "ok").unwrap();
 
-        let ready = match preflight_run(&s, &reg, None, 300, &id, Some("echo"), "go".into()).unwrap()
-        {
-            Preflight::Ready(r) => *r,
-            Preflight::Refused(r) => {
-                panic!("terminal evidence should let the start proceed, got {r:?}")
-            }
-        };
+        let ready =
+            match preflight_run(&s, &reg, None, 300, &id, Some("echo"), "go".into()).unwrap() {
+                Preflight::Ready(r) => *r,
+                Preflight::Refused(r) => {
+                    panic!("terminal evidence should let the start proceed, got {r:?}")
+                }
+            };
         // The new start owns the Brief now; exactly one fresh `running` row.
         assert_eq!(s.claim_holder(&id).unwrap().unwrap().0, "agt_a");
         let runs = s.runs_for_brief(&id, 10).unwrap();
@@ -5259,9 +5530,10 @@ mod tests {
         let (s, _tmp) = store_ws();
         let reg = echo_registry();
         let id = ready_brief(&s, "live other run", "agt_a");
-        assert!(s
-            .claim_brief_for_run(&id, "agt_prev", 300, Some("run_prev"))
-            .unwrap());
+        assert!(
+            s.claim_brief_for_run(&id, "agt_prev", 300, Some("run_prev"))
+                .unwrap()
+        );
         s.record_run_start(
             "run_prev",
             &id,
@@ -5291,8 +5563,7 @@ mod tests {
             "no duplicate run row"
         );
         // NEVER retry a 409: a retry while the owner runs loses again.
-        let retry =
-            preflight_run(&s, &reg, None, 300, &id, Some("echo"), "y".into()).unwrap();
+        let retry = preflight_run(&s, &reg, None, 300, &id, Some("echo"), "y".into()).unwrap();
         assert!(
             matches!(retry, Preflight::Refused(r) if r.status == "already_running"),
             "a retry of a 409 conflict loses again — clients must not retry"
@@ -5307,14 +5578,11 @@ mod tests {
 
     /// Seed a Brief whose LIVE Claim (held by `holder`) dangles on a `run_id`
     /// that has already finished in the durable ledger with terminal `status`.
-    fn dangling_terminal_claim(
-        s: &TaskStore,
-        id: &str,
-        holder: &str,
-        run_id: &str,
-        status: &str,
-    ) {
-        assert!(s.claim_brief_for_run(id, holder, 300, Some(run_id)).unwrap());
+    fn dangling_terminal_claim(s: &TaskStore, id: &str, holder: &str, run_id: &str, status: &str) {
+        assert!(
+            s.claim_brief_for_run(id, holder, 300, Some(run_id))
+                .unwrap()
+        );
         s.record_run_start(
             run_id,
             id,
@@ -5324,7 +5592,8 @@ mod tests {
             &crate::nodes::coordinator::RunWorkspaceInfo::default(),
         )
         .unwrap();
-        s.record_run_finish(run_id, status, "prior shift ended").unwrap();
+        s.record_run_finish(run_id, status, "prior shift ended")
+            .unwrap();
     }
 
     fn reclaim_chronicle_count(s: &TaskStore, id: &str) -> usize {
@@ -5368,7 +5637,11 @@ mod tests {
         .unwrap();
 
         // The Brief was dispatched this same tick.
-        assert_eq!(records.len(), 1, "the adopted Brief dispatched: {records:?}");
+        assert_eq!(
+            records.len(),
+            1,
+            "the adopted Brief dispatched: {records:?}"
+        );
         assert_eq!(records[0].brief_id, id);
         assert!(matches!(records[0].outcome, RigOutcome::Done { .. }));
         // Exactly one reclaim was chronicled (the adoption), and the board
@@ -5397,9 +5670,10 @@ mod tests {
         let (s, _tmp) = store_ws();
         let reg = echo_registry();
         let id = ready_brief(&s, "live owner", "agt_a");
-        assert!(s
-            .claim_brief_for_run(&id, "agt_live", 300, Some("run_live"))
-            .unwrap());
+        assert!(
+            s.claim_brief_for_run(&id, "agt_live", 300, Some("run_live"))
+                .unwrap()
+        );
         s.record_run_start(
             "run_live",
             &id,
@@ -5451,12 +5725,14 @@ mod tests {
             &crate::nodes::coordinator::RunWorkspaceInfo::default(),
         )
         .unwrap();
-        s.record_run_finish("run_old", "interrupted", "gone").unwrap();
+        s.record_run_finish("run_old", "interrupted", "gone")
+            .unwrap();
         // ...but a newer run re-claimed the Brief and is running; the Claim now
         // points at run_new, not the terminal run_old.
-        assert!(s
-            .claim_brief_for_run(&id, "agt_a", 300, Some("run_new"))
-            .unwrap());
+        assert!(
+            s.claim_brief_for_run(&id, "agt_a", 300, Some("run_new"))
+                .unwrap()
+        );
         s.record_run_start(
             "run_new",
             &id,
@@ -5488,8 +5764,9 @@ mod tests {
         let id = ready_brief(&s, "adopt once", "agt_a");
         dangling_terminal_claim(&s, &id, "agt_dead", "run_prev", "failed");
         // A wake that arrived while the dead Claim was live is sitting deferred.
-        let deferred =
-            s.request_brief_wakeup(&id, "agt_a", "assignment", "assigned", None).unwrap();
+        let deferred = s
+            .request_brief_wakeup(&id, "agt_a", "assignment", "assigned", None)
+            .unwrap();
         assert_eq!(deferred.status, "deferred", "queued behind the live Claim");
 
         let first = s.reclaim_terminal_claims_ready(50).unwrap();
@@ -5506,7 +5783,11 @@ mod tests {
 
         let second = s.reclaim_terminal_claims_ready(50).unwrap();
         assert!(second.is_empty(), "second pass finds nothing to reclaim");
-        assert_eq!(reclaim_chronicle_count(&s, &id), 1, "no duplicate reclaim note");
+        assert_eq!(
+            reclaim_chronicle_count(&s, &id),
+            1,
+            "no duplicate reclaim note"
+        );
         // Still exactly one queued wake — the no-op second pass added none.
         let still_queued = s
             .list_brief_wakeups(&id, 50)
@@ -5514,7 +5795,10 @@ mod tests {
             .into_iter()
             .filter(|w| w.status == "queued")
             .count();
-        assert_eq!(still_queued, 1, "no duplicate wake from the idempotent re-run");
+        assert_eq!(
+            still_queued, 1,
+            "no duplicate wake from the idempotent re-run"
+        );
     }
 
     #[test]
@@ -5529,9 +5813,10 @@ mod tests {
 
         let b = ready_brief(&s, "guild b live", "agt_b");
         s.set_task_tenant(&b, "guild_b").unwrap();
-        assert!(s
-            .claim_brief_for_run(&b, "agt_b", 300, Some("run_b"))
-            .unwrap());
+        assert!(
+            s.claim_brief_for_run(&b, "agt_b", 300, Some("run_b"))
+                .unwrap()
+        );
         s.record_run_start(
             "run_b",
             &b,
@@ -5543,7 +5828,11 @@ mod tests {
         .unwrap(); // still `running` in Guild B
 
         let reclaimed = s.reclaim_terminal_claims_ready(50).unwrap();
-        assert_eq!(reclaimed, vec![a.clone()], "only Guild A's stale Claim adopted");
+        assert_eq!(
+            reclaimed,
+            vec![a.clone()],
+            "only Guild A's stale Claim adopted"
+        );
         assert!(s.claim_holder(&a).unwrap().is_none(), "Guild A released");
         assert_eq!(
             s.claim_holder(&b).unwrap().unwrap().0,
@@ -5655,7 +5944,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(records.len(), 1, "adopted + re-dispatched this tick: {records:?}");
+        assert_eq!(
+            records.len(),
+            1,
+            "adopted + re-dispatched this tick: {records:?}"
+        );
         assert_eq!(records[0].brief_id, id);
         assert!(matches!(records[0].outcome, RigOutcome::Done { .. }));
         assert_eq!(
@@ -5670,7 +5963,10 @@ mod tests {
         );
         // A fresh terminal run beyond the adopted one, none left running.
         let runs = s.runs_for_brief(&id, 10).unwrap();
-        assert!(runs.len() >= 2, "the new run plus the prior terminal one: {runs:?}");
+        assert!(
+            runs.len() >= 2,
+            "the new run plus the prior terminal one: {runs:?}"
+        );
         assert_eq!(
             runs.iter().filter(|r| r.status == "running").count(),
             0,
@@ -5684,7 +5980,10 @@ mod tests {
             .into_iter()
             .filter(|w| matches!(w.status.as_str(), "queued" | "running"))
             .count();
-        assert_eq!(live_wakes, 0, "no leftover queued/running wake after re-dispatch");
+        assert_eq!(
+            live_wakes, 0,
+            "no leftover queued/running wake after re-dispatch"
+        );
     }
 
     #[test]
@@ -5724,7 +6023,11 @@ mod tests {
         assert_eq!(dec_b.status, "queued");
 
         let reclaimed = s.reclaim_terminal_claims_ready(50).unwrap();
-        assert_eq!(reclaimed, vec![a.clone()], "only a's terminal-stale Claim adopted");
+        assert_eq!(
+            reclaimed,
+            vec![a.clone()],
+            "only a's terminal-stale Claim adopted"
+        );
         // b's queued wake is untouched (different Brief, different run id).
         let b_queued = s
             .list_brief_wakeups(&b, 50)
@@ -5732,7 +6035,10 @@ mod tests {
             .into_iter()
             .filter(|w| w.status == "queued")
             .count();
-        assert_eq!(b_queued, 1, "the unrelated queued wake survives the reclaim");
+        assert_eq!(
+            b_queued, 1,
+            "the unrelated queued wake survives the reclaim"
+        );
     }
 
     #[test]
@@ -5748,9 +6054,10 @@ mod tests {
         let id = ready_brief(&s, "race", "agt_a");
         // An external worker holds the live Claim, so BOTH contenders below
         // (which resolve the Brief's assignee, agt_a) must lose deterministically.
-        assert!(s
-            .claim_brief_for_run(&id, "other_agent", 300, Some("other_run"))
-            .unwrap());
+        assert!(
+            s.claim_brief_for_run(&id, "other_agent", 300, Some("other_run"))
+                .unwrap()
+        );
 
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let mut handles = Vec::new();
@@ -5769,7 +6076,10 @@ mod tests {
             .iter()
             .filter(|o| matches!(o, Preflight::Refused(r) if r.status == "already_running"))
             .count();
-        assert_eq!(conflicts, 2, "both contenders lose to the live external Claim");
+        assert_eq!(
+            conflicts, 2,
+            "both contenders lose to the live external Claim"
+        );
         // No run rows were opened; the external Claim still stands.
         assert!(s.runs_for_brief(&id, 5).unwrap().is_empty());
         assert_eq!(s.claim_holder(&id).unwrap().unwrap().0, "other_agent");
@@ -5788,8 +6098,16 @@ mod tests {
     fn run_records_a_lifecycle_transcript() {
         let (s, _tmp) = store_ws();
         let id = ready_brief(&s, "transcript", "agt_a");
-        let report =
-            run_brief_now(&s, &echo_registry(), None, 300, &id, Some("echo"), "work".into()).unwrap();
+        let report = run_brief_now(
+            &s,
+            &echo_registry(),
+            None,
+            300,
+            &id,
+            Some("echo"),
+            "work".into(),
+        )
+        .unwrap();
         let run_id = report.run_id.unwrap();
         let kinds: Vec<String> = s
             .list_run_events(&run_id, 100)
@@ -5799,7 +6117,13 @@ mod tests {
             .collect();
         // The lifecycle is present + chronological (accepted first).
         assert_eq!(kinds.first().map(String::as_str), Some("accepted"));
-        for k in ["accepted", "workspace_prepared", "process_started", "process_exited", "result"] {
+        for k in [
+            "accepted",
+            "workspace_prepared",
+            "process_started",
+            "process_exited",
+            "result",
+        ] {
             assert!(kinds.contains(&k.to_string()), "missing {k}: {kinds:?}");
         }
         // get_run returns the same run.
@@ -5819,7 +6143,8 @@ mod tests {
         assert_eq!(events.len() as i64, cap + 1);
         assert_eq!(events.last().unwrap().kind, "truncated");
         // A second overflow does NOT add another marker.
-        s.append_run_event("run_t", "tick", "relix", "more", None, false).unwrap();
+        s.append_run_event("run_t", "tick", "relix", "more", None, false)
+            .unwrap();
         let again = s.list_run_events("run_t", cap + 50).unwrap();
         assert_eq!(again.len() as i64, cap + 1);
     }
@@ -5831,12 +6156,20 @@ mod tests {
         let (s, _tmp) = store_ws();
         let id = ready_brief(&s, "stoppable", "agt_a");
         let (prog, args) = if cfg!(windows) {
-            ("cmd".to_string(), vec!["/C".to_string(), "echo".to_string(), "hi".to_string()])
+            (
+                "cmd".to_string(),
+                vec!["/C".to_string(), "echo".to_string(), "hi".to_string()],
+            )
         } else {
-            ("sh".to_string(), vec!["-c".to_string(), "echo hi".to_string()])
+            (
+                "sh".to_string(),
+                vec!["-c".to_string(), "echo hi".to_string()],
+            )
         };
         let mut reg = crate::rig::RigRegistry::new();
-        reg.register(std::sync::Arc::new(crate::rig::ProcessRig::new("p", prog, args)));
+        reg.register(std::sync::Arc::new(crate::rig::ProcessRig::new(
+            "p", prog, args,
+        )));
         reg.set_default(Some("p".to_string()));
 
         let ready = match preflight_run(&s, &reg, None, 300, &id, None, "x".into()).unwrap() {
@@ -5874,7 +6207,9 @@ mod tests {
             )
         };
         let mut reg = crate::rig::RigRegistry::new();
-        reg.register(std::sync::Arc::new(crate::rig::ProcessRig::new("mk", prog, args)));
+        reg.register(std::sync::Arc::new(crate::rig::ProcessRig::new(
+            "mk", prog, args,
+        )));
         reg.set_default(Some("mk".to_string()));
         reg
     }
@@ -5883,16 +6218,31 @@ mod tests {
     fn artifact_scan_records_created_file_empty_mode() {
         let (s, _tmp) = store_ws();
         let id = ready_brief(&s, "make a file", "agt_a");
-        let report =
-            run_brief_now(&s, &file_creating_rig("note.txt", "hello"), None, 300, &id, None, "x".into())
-                .unwrap();
+        let report = run_brief_now(
+            &s,
+            &file_creating_rig("note.txt", "hello"),
+            None,
+            300,
+            &id,
+            None,
+            "x".into(),
+        )
+        .unwrap();
         let run_id = report.run_id.unwrap();
         let arts = s.list_run_artifacts(&run_id).unwrap();
         // note.txt is recorded as created; BRIEF.md (unchanged) is NOT.
-        assert!(arts.iter().any(|a| a.rel_path == "note.txt" && a.kind == "created"));
+        assert!(
+            arts.iter()
+                .any(|a| a.rel_path == "note.txt" && a.kind == "created")
+        );
         assert!(!arts.iter().any(|a| a.rel_path == "BRIEF.md"));
         // The transcript announces the scan + counts.
-        let kinds: Vec<String> = s.list_run_events(&run_id, 200).unwrap().into_iter().map(|e| e.kind).collect();
+        let kinds: Vec<String> = s
+            .list_run_events(&run_id, 200)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
         assert!(kinds.contains(&"artifacts.scan_started".to_string()));
         assert!(kinds.contains(&"artifacts.detected".to_string()));
     }
@@ -5920,8 +6270,18 @@ mod tests {
         let paths: Vec<&String> = m.files.keys().collect();
         assert!(m.files.contains_key("keep.txt"));
         assert!(m.files.contains_key("sub/nested.rs"));
-        for bad in [".git/HEAD", "target/out", "node_modules/d.js", "dev-data/tasks.db", ".env", "api.key"] {
-            assert!(!m.files.contains_key(bad), "{bad} should be excluded; got {paths:?}");
+        for bad in [
+            ".git/HEAD",
+            "target/out",
+            "node_modules/d.js",
+            "dev-data/tasks.db",
+            ".env",
+            "api.key",
+        ] {
+            assert!(
+                !m.files.contains_key(bad),
+                "{bad} should be excluded; got {paths:?}"
+            );
         }
     }
 
@@ -5938,8 +6298,10 @@ mod tests {
         std::fs::write(p.join("c.txt"), "c").unwrap();
         let after = scan_workspace_manifest(p);
         let changes = diff_manifests(&before, &after);
-        let by: std::collections::HashMap<_, _> =
-            changes.iter().map(|c| (c.rel_path.as_str(), c.kind)).collect();
+        let by: std::collections::HashMap<_, _> = changes
+            .iter()
+            .map(|c| (c.rel_path.as_str(), c.kind))
+            .collect();
         assert_eq!(by.get("a.txt"), Some(&"modified"));
         assert_eq!(by.get("b.txt"), Some(&"deleted"));
         assert_eq!(by.get("c.txt"), Some(&"created"));
@@ -5961,9 +6323,15 @@ mod tests {
         }
         // binary (NUL byte) → refused
         std::fs::write(tmp.path().join("b.bin"), [0u8, 1, 2, 3]).unwrap();
-        assert_eq!(read_artifact_preview(&ws, "b.bin", false, 1024), PreviewOutcome::Binary);
+        assert_eq!(
+            read_artifact_preview(&ws, "b.bin", false, 1024),
+            PreviewOutcome::Binary
+        );
         // a flagged-text file that is actually binary → still refused
-        assert_eq!(read_artifact_preview(&ws, "b.bin", true, 1024), PreviewOutcome::Binary);
+        assert_eq!(
+            read_artifact_preview(&ws, "b.bin", true, 1024),
+            PreviewOutcome::Binary
+        );
         // large text → truncated
         std::fs::write(tmp.path().join("big.txt"), "x".repeat(5000)).unwrap();
         match read_artifact_preview(&ws, "big.txt", true, 1000) {
@@ -5990,7 +6358,11 @@ mod tests {
         // created → diff against an EMPTY baseline (all additions).
         std::fs::write(ws.path().join("new.txt"), "line1\nline2\n").unwrap();
         match read_artifact_diff(&wss, proj.path(), "new.txt", "created", true, None, max) {
-            DiffOutcome::Unified { diff, baseline, truncated } => {
+            DiffOutcome::Unified {
+                diff,
+                baseline,
+                truncated,
+            } => {
                 assert_eq!(baseline, "empty");
                 assert!(!truncated);
                 assert!(diff.contains("+line1"), "diff: {diff}");
@@ -6026,7 +6398,10 @@ mod tests {
         std::fs::write(proj.path().join("m.txt"), "DIVERGED\n").unwrap();
         match read_artifact_diff(&wss, proj.path(), "m.txt", "modified", true, Some(&bh), max) {
             DiffOutcome::Unavailable { reason } => {
-                assert!(reason.contains("changed since this run"), "reason: {reason}")
+                assert!(
+                    reason.contains("changed since this run"),
+                    "reason: {reason}"
+                )
             }
             DiffOutcome::Unified { .. } => panic!("expected unavailable (baseline moved)"),
         }
@@ -6038,7 +6413,15 @@ mod tests {
         }
 
         // path traversal → refused before any read.
-        match read_artifact_diff(&wss, proj.path(), "../escape.txt", "created", true, None, max) {
+        match read_artifact_diff(
+            &wss,
+            proj.path(),
+            "../escape.txt",
+            "created",
+            true,
+            None,
+            max,
+        ) {
             DiffOutcome::Unavailable { reason } => assert!(reason.contains("path refused")),
             DiffOutcome::Unified { .. } => panic!("traversal must be refused"),
         }
@@ -6046,7 +6429,9 @@ mod tests {
         // large output → truncated + bounded.
         std::fs::write(ws.path().join("big.txt"), "y\n".repeat(50_000)).unwrap();
         match read_artifact_diff(&wss, proj.path(), "big.txt", "created", true, None, 1000) {
-            DiffOutcome::Unified { diff, truncated, .. } => {
+            DiffOutcome::Unified {
+                diff, truncated, ..
+            } => {
                 assert!(truncated);
                 assert!(diff.len() <= 1000);
             }
@@ -6058,13 +6443,27 @@ mod tests {
     fn review_only_accepts_done_runs() {
         let (s, _tmp) = store_ws();
         let id = ready_brief(&s, "reviewable", "agt_a");
-        let report =
-            run_brief_now(&s, &echo_registry(), None, 300, &id, Some("echo"), "x".into()).unwrap();
+        let report = run_brief_now(
+            &s,
+            &echo_registry(),
+            None,
+            300,
+            &id,
+            Some("echo"),
+            "x".into(),
+        )
+        .unwrap();
         let run_id = report.run_id.unwrap();
         // A done run opens pending_review.
-        assert_eq!(s.get_run(&run_id).unwrap().unwrap().review.as_deref(), Some("pending_review"));
+        assert_eq!(
+            s.get_run(&run_id).unwrap().unwrap().review.as_deref(),
+            Some("pending_review")
+        );
         // accept it.
-        assert_eq!(s.set_run_review(&run_id, "accepted", "looks good").unwrap(), "accepted");
+        assert_eq!(
+            s.set_run_review(&run_id, "accepted", "looks good").unwrap(),
+            "accepted"
+        );
         let rec = s.get_run(&run_id).unwrap().unwrap();
         assert_eq!(rec.review.as_deref(), Some("accepted"));
         assert_eq!(rec.review_note.as_deref(), Some("looks good"));
@@ -6077,8 +6476,16 @@ mod tests {
     fn discard_run_marks_discarded_rejects_review_and_refuses_running() {
         let (s, _tmp) = store_ws();
         let id = ready_brief(&s, "discardable", "agt_a");
-        let report =
-            run_brief_now(&s, &echo_registry(), None, 300, &id, Some("echo"), "x".into()).unwrap();
+        let report = run_brief_now(
+            &s,
+            &echo_registry(),
+            None,
+            300,
+            &id,
+            Some("echo"),
+            "x".into(),
+        )
+        .unwrap();
         let run_id = report.run_id.unwrap();
 
         // Discard a `done` run → apply_status `discarded` + review `rejected`.
@@ -6141,8 +6548,14 @@ mod tests {
         )
         .unwrap();
         assert!(s.run_belongs_to_tenant("run_xyz", "guild-a").unwrap());
-        assert!(!s.run_belongs_to_tenant("run_xyz", "guild-b").unwrap(), "no cross-tenant access");
-        assert!(!s.run_belongs_to_tenant("run_missing", "guild-a").unwrap(), "missing run = false");
+        assert!(
+            !s.run_belongs_to_tenant("run_xyz", "guild-b").unwrap(),
+            "no cross-tenant access"
+        );
+        assert!(
+            !s.run_belongs_to_tenant("run_missing", "guild-a").unwrap(),
+            "missing run = false"
+        );
     }
 
     // ── Safe-apply tests ───────────────────────────────────────────────
@@ -6171,7 +6584,16 @@ mod tests {
     /// `(run_id, brief_id)`.
     fn accepted_run(s: &TaskStore, ws: &std::path::Path) -> (String, String) {
         let brief = s
-            .create("apply brief", "f", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .create(
+                "apply brief",
+                "f",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         let run_id = "run_apply".to_string();
         let wss = ws.to_string_lossy().into_owned();
@@ -6181,7 +6603,8 @@ mod tests {
             files: None,
             bytes: None,
         };
-        s.record_run_start(&run_id, &brief, "agt", "echo", "manual", &info).unwrap();
+        s.record_run_start(&run_id, &brief, "agt", "echo", "manual", &info)
+            .unwrap();
         s.record_run_finish(&run_id, "done", "ok").unwrap();
         s.set_run_review(&run_id, "accepted", "").unwrap();
         (run_id, brief)
@@ -6209,8 +6632,18 @@ mod tests {
         let hash = content.map(content_hash);
         let size = content.map(|c| c.len() as i64).unwrap_or(0);
         let wss = ws.to_string_lossy().into_owned();
-        s.record_run_artifact(run_id, brief, &wss, rel, kind, size, hash.as_deref(), baseline, true)
-            .unwrap();
+        s.record_run_artifact(
+            run_id,
+            brief,
+            &wss,
+            rel,
+            kind,
+            size,
+            hash.as_deref(),
+            baseline,
+            true,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -6227,7 +6660,8 @@ mod tests {
             files: None,
             bytes: None,
         };
-        s.record_run_start("r1", &brief, "a", "echo", "manual", &info).unwrap();
+        s.record_run_start("r1", &brief, "a", "echo", "manual", &info)
+            .unwrap();
         // running → ineligible
         assert!(run_apply_eligibility(&s.get_run("r1").unwrap().unwrap()).is_err());
         // done but pending_review → ineligible
@@ -6240,8 +6674,15 @@ mod tests {
         s.set_run_review("r1", "rejected", "nah").unwrap();
         assert!(run_apply_eligibility(&s.get_run("r1").unwrap().unwrap()).is_err());
         // inherit-mode (no scoped workspace) done+accepted → ineligible
-        s.record_run_start("r2", &brief, "a", "echo", "manual", &crate::nodes::coordinator::RunWorkspaceInfo::default())
-            .unwrap();
+        s.record_run_start(
+            "r2",
+            &brief,
+            "a",
+            "echo",
+            "manual",
+            &crate::nodes::coordinator::RunWorkspaceInfo::default(),
+        )
+        .unwrap();
         s.record_run_finish("r2", "done", "ok").unwrap();
         s.set_run_review("r2", "accepted", "").unwrap();
         assert!(
@@ -6265,7 +6706,16 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let proj = tempfile::tempdir().unwrap();
         let (run, brief) = accepted_run(&s, ws.path());
-        put_artifact(&s, &run, &brief, ws.path(), "out/new.txt", "created", Some(b"hello"), None);
+        put_artifact(
+            &s,
+            &run,
+            &brief,
+            ws.path(),
+            "out/new.txt",
+            "created",
+            Some(b"hello"),
+            None,
+        );
         let arts = s.list_run_artifacts(&run).unwrap();
 
         let plan = build_apply_plan(proj.path(), &arts).unwrap();
@@ -6275,13 +6725,19 @@ mod tests {
         let out = apply_run(proj.path(), &arts).unwrap();
         assert_eq!(out.status, "applied");
         assert_eq!(out.applied_files, 1);
-        assert_eq!(std::fs::read_to_string(proj.path().join("out/new.txt")).unwrap(), "hello");
+        assert_eq!(
+            std::fs::read_to_string(proj.path().join("out/new.txt")).unwrap(),
+            "hello"
+        );
 
         // Re-apply: target now identical → all noop, nothing rewritten.
         let out2 = apply_run(proj.path(), &arts).unwrap();
         assert_eq!(out2.status, "applied");
         assert_eq!(out2.applied_files, 0);
-        assert_eq!(std::fs::read_to_string(proj.path().join("out/new.txt")).unwrap(), "hello");
+        assert_eq!(
+            std::fs::read_to_string(proj.path().join("out/new.txt")).unwrap(),
+            "hello"
+        );
     }
 
     #[test]
@@ -6290,7 +6746,16 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let proj = tempfile::tempdir().unwrap();
         let (run, brief) = accepted_run(&s, ws.path());
-        put_artifact(&s, &run, &brief, ws.path(), "f.txt", "created", Some(b"new"), None);
+        put_artifact(
+            &s,
+            &run,
+            &brief,
+            ws.path(),
+            "f.txt",
+            "created",
+            Some(b"new"),
+            None,
+        );
         std::fs::write(proj.path().join("f.txt"), "OLD different").unwrap();
         let arts = s.list_run_artifacts(&run).unwrap();
 
@@ -6302,7 +6767,10 @@ mod tests {
         let out = apply_run(proj.path(), &arts).unwrap();
         assert_eq!(out.status, "conflicted");
         assert_eq!(out.applied_files, 0);
-        assert_eq!(std::fs::read_to_string(proj.path().join("f.txt")).unwrap(), "OLD different");
+        assert_eq!(
+            std::fs::read_to_string(proj.path().join("f.txt")).unwrap(),
+            "OLD different"
+        );
     }
 
     #[test]
@@ -6313,7 +6781,16 @@ mod tests {
         let (run, brief) = accepted_run(&s, ws.path());
         std::fs::write(proj.path().join("m.txt"), "old").unwrap();
         // No baseline hash recorded → cannot prove the target is unchanged.
-        put_artifact(&s, &run, &brief, ws.path(), "m.txt", "modified", Some(b"new"), None);
+        put_artifact(
+            &s,
+            &run,
+            &brief,
+            ws.path(),
+            "m.txt",
+            "modified",
+            Some(b"new"),
+            None,
+        );
         let arts = s.list_run_artifacts(&run).unwrap();
 
         let plan = build_apply_plan(proj.path(), &arts).unwrap();
@@ -6329,7 +6806,16 @@ mod tests {
         let (run, brief) = accepted_run(&s, ws.path());
         std::fs::write(proj.path().join("m.txt"), "old").unwrap();
         let base = content_hash(b"old");
-        put_artifact(&s, &run, &brief, ws.path(), "m.txt", "modified", Some(b"new"), Some(&base));
+        put_artifact(
+            &s,
+            &run,
+            &brief,
+            ws.path(),
+            "m.txt",
+            "modified",
+            Some(b"new"),
+            Some(&base),
+        );
         let arts = s.list_run_artifacts(&run).unwrap();
 
         let plan = build_apply_plan(proj.path(), &arts).unwrap();
@@ -6338,7 +6824,10 @@ mod tests {
 
         let out = apply_run(proj.path(), &arts).unwrap();
         assert_eq!(out.status, "applied");
-        assert_eq!(std::fs::read_to_string(proj.path().join("m.txt")).unwrap(), "new");
+        assert_eq!(
+            std::fs::read_to_string(proj.path().join("m.txt")).unwrap(),
+            "new"
+        );
     }
 
     #[test]
@@ -6350,7 +6839,16 @@ mod tests {
         // Target diverged from the run's baseline → refuse to delete.
         std::fs::write(proj.path().join("d.txt"), "current").unwrap();
         let base = content_hash(b"original");
-        put_artifact(&s, &run, &brief, ws.path(), "d.txt", "deleted", None, Some(&base));
+        put_artifact(
+            &s,
+            &run,
+            &brief,
+            ws.path(),
+            "d.txt",
+            "deleted",
+            None,
+            Some(&base),
+        );
         let arts = s.list_run_artifacts(&run).unwrap();
 
         let plan = build_apply_plan(proj.path(), &arts).unwrap();
@@ -6358,7 +6856,10 @@ mod tests {
         assert_eq!(plan.conflicts, 1);
         let out = apply_run(proj.path(), &arts).unwrap();
         assert_eq!(out.status, "conflicted");
-        assert!(proj.path().join("d.txt").exists(), "target must survive a refused delete");
+        assert!(
+            proj.path().join("d.txt").exists(),
+            "target must survive a refused delete"
+        );
     }
 
     #[test]
@@ -6369,7 +6870,16 @@ mod tests {
         let (run, brief) = accepted_run(&s, ws.path());
         std::fs::write(proj.path().join("d.txt"), "original").unwrap();
         let base = content_hash(b"original");
-        put_artifact(&s, &run, &brief, ws.path(), "d.txt", "deleted", None, Some(&base));
+        put_artifact(
+            &s,
+            &run,
+            &brief,
+            ws.path(),
+            "d.txt",
+            "deleted",
+            None,
+            Some(&base),
+        );
         let arts = s.list_run_artifacts(&run).unwrap();
 
         let out = apply_run(proj.path(), &arts).unwrap();
@@ -6390,14 +6900,33 @@ mod tests {
         let proj = tempfile::tempdir().unwrap();
         let (run, brief) = accepted_run(&s, ws.path());
         let wss = ws.path().to_string_lossy().into_owned();
-        for rel in ["../escape.txt", "C:/windows/x", ".git/config", "node_modules/x.js", ".env"] {
-            s.record_run_artifact(&run, &brief, &wss, rel, "created", 1, Some("dead"), None, true)
-                .unwrap();
+        for rel in [
+            "../escape.txt",
+            "C:/windows/x",
+            ".git/config",
+            "node_modules/x.js",
+            ".env",
+        ] {
+            s.record_run_artifact(
+                &run,
+                &brief,
+                &wss,
+                rel,
+                "created",
+                1,
+                Some("dead"),
+                None,
+                true,
+            )
+            .unwrap();
         }
         let arts = s.list_run_artifacts(&run).unwrap();
         let plan = build_apply_plan(proj.path(), &arts).unwrap();
         assert!(!plan.applicable);
-        assert!(plan.items.iter().all(|i| !i.can_apply), "every unsafe/excluded path is refused");
+        assert!(
+            plan.items.iter().all(|i| !i.can_apply),
+            "every unsafe/excluded path is refused"
+        );
         assert_eq!(plan.changes, 0);
     }
 
@@ -6413,7 +6942,16 @@ mod tests {
         if make_symlink(&outside, &link).is_err() {
             return; // platform can't create symlinks here — skip.
         }
-        put_artifact(&s, &run, &brief, ws.path(), "link.txt", "created", Some(b"new"), None);
+        put_artifact(
+            &s,
+            &run,
+            &brief,
+            ws.path(),
+            "link.txt",
+            "created",
+            Some(b"new"),
+            None,
+        );
         let arts = s.list_run_artifacts(&run).unwrap();
         let plan = build_apply_plan(proj.path(), &arts).unwrap();
         assert!(!plan.applicable, "must refuse writing through a symlink");
@@ -6426,7 +6964,8 @@ mod tests {
         let s = store();
         let ws = tempfile::tempdir().unwrap();
         let (run, _) = accepted_run(&s, ws.path());
-        s.set_run_apply_status(&run, "applied", "2 applied, 0 failed", 2, 0).unwrap();
+        s.set_run_apply_status(&run, "applied", "2 applied, 0 failed", 2, 0)
+            .unwrap();
         let r = s.get_run(&run).unwrap().unwrap();
         assert_eq!(r.apply_status.as_deref(), Some("applied"));
         assert_eq!(r.applied_files, Some(2));
@@ -6443,13 +6982,23 @@ mod tests {
         // proves idempotency. The deterministic equivalent of the live smoke.
         let (s, _tmp) = store_ws();
         let id = ready_brief(&s, "write a note", "agt_a");
-        let report =
-            run_brief_now(&s, &file_creating_rig("applied_note.txt", "hello"), None, 300, &id, None, "x".into())
-                .unwrap();
+        let report = run_brief_now(
+            &s,
+            &file_creating_rig("applied_note.txt", "hello"),
+            None,
+            300,
+            &id,
+            None,
+            "x".into(),
+        )
+        .unwrap();
         let run_id = report.run_id.unwrap();
         // The run produced a real created artifact in its scoped workspace.
         let arts = s.list_run_artifacts(&run_id).unwrap();
-        assert!(arts.iter().any(|a| a.rel_path == "applied_note.txt" && a.kind == "created"));
+        assert!(
+            arts.iter()
+                .any(|a| a.rel_path == "applied_note.txt" && a.kind == "created")
+        );
 
         // Accept it, then apply into a disposable project root.
         s.set_run_review(&run_id, "accepted", "ok").unwrap();
@@ -6457,14 +7006,20 @@ mod tests {
         let proj = tempfile::tempdir().unwrap();
 
         let plan = build_apply_plan(proj.path(), &arts).unwrap();
-        assert!(plan.applicable, "a clean created file must be applicable: {plan:?}");
+        assert!(
+            plan.applicable,
+            "a clean created file must be applicable: {plan:?}"
+        );
         assert!(plan.changes >= 1);
 
         let out = apply_run(proj.path(), &arts).unwrap();
         assert_eq!(out.status, "applied");
         assert!(out.applied_files >= 1);
         let landed = proj.path().join("applied_note.txt");
-        assert!(landed.exists(), "the file must land in the disposable project root");
+        assert!(
+            landed.exists(),
+            "the file must land in the disposable project root"
+        );
         let body = std::fs::read(&landed).unwrap();
         assert!(!body.is_empty());
 
@@ -6472,7 +7027,11 @@ mod tests {
         let out2 = apply_run(proj.path(), &arts).unwrap();
         assert_eq!(out2.status, "applied");
         assert_eq!(out2.applied_files, 0);
-        assert_eq!(std::fs::read(&landed).unwrap(), body, "idempotent re-apply must not corrupt");
+        assert_eq!(
+            std::fs::read(&landed).unwrap(),
+            body,
+            "idempotent re-apply must not corrupt"
+        );
     }
 
     #[test]
@@ -6482,11 +7041,21 @@ mod tests {
             .create("t", "f", "{}", "subj", RetryPolicy::None, 0, None, None)
             .unwrap();
         s.set_task_tenant(&brief, "guild-a").unwrap();
-        s.record_run_start("rA", &brief, "a", "echo", "manual", &crate::nodes::coordinator::RunWorkspaceInfo::default())
-            .unwrap();
+        s.record_run_start(
+            "rA",
+            &brief,
+            "a",
+            "echo",
+            "manual",
+            &crate::nodes::coordinator::RunWorkspaceInfo::default(),
+        )
+        .unwrap();
         // The diff/apply capabilities gate on this exact check.
         assert!(s.run_belongs_to_tenant("rA", "guild-a").unwrap());
-        assert!(!s.run_belongs_to_tenant("rA", "guild-b").unwrap(), "guild-b cannot diff/apply guild-a's run");
+        assert!(
+            !s.run_belongs_to_tenant("rA", "guild-b").unwrap(),
+            "guild-b cannot diff/apply guild-a's run"
+        );
     }
 
     // ── STAGE-2 guarded operator retry (execution-and-issue §3.3b) ──
@@ -6496,8 +7065,15 @@ mod tests {
     /// transient (retryable) vs permanent (non-retryable) `failed` run.
     fn failed_source(s: &TaskStore, brief: &str, agent: &str, run_id: &str, retryable: bool) {
         use crate::nodes::coordinator::{RunDiagnosis, RunWorkspaceInfo};
-        s.record_run_start(run_id, brief, agent, "echo", "manual", &RunWorkspaceInfo::default())
-            .unwrap();
+        s.record_run_start(
+            run_id,
+            brief,
+            agent,
+            "echo",
+            "manual",
+            &RunWorkspaceInfo::default(),
+        )
+        .unwrap();
         s.record_run_finish(run_id, "failed", "boom").unwrap();
         // `record_run_finish` stamps a conservative non-retryable diagnosis; for
         // the retryable case re-stamp it as a transient (retry-may-help) failure.
@@ -6559,7 +7135,11 @@ mod tests {
         assert_ne!(child, src, "the child is a distinct run");
         assert_eq!(attempt, 1, "first retry is attempt 1");
         let cr = s.get_run(&child).unwrap().unwrap();
-        assert_eq!(cr.retried_from_run_id.as_deref(), Some(src), "lineage linked");
+        assert_eq!(
+            cr.retried_from_run_id.as_deref(),
+            Some(src),
+            "lineage linked"
+        );
         assert_eq!(cr.retry_attempt, Some(1));
         assert_eq!(
             s.existing_retry_child(src).unwrap().as_deref(),
@@ -6588,10 +7168,24 @@ mod tests {
         let src = "run_src2";
         failed_source(&s, &brief, "agt_a", src, true);
 
-        let child1 = match open_retry_child(&s, &reg, None, 300, src, "default", "p".into(), Some("echo"), RunModelPrefs::default())
-            .unwrap()
+        let child1 = match open_retry_child(
+            &s,
+            &reg,
+            None,
+            300,
+            src,
+            "default",
+            "p".into(),
+            Some("echo"),
+            RunModelPrefs::default(),
+        )
+        .unwrap()
         {
-            RetryOpen::Ready { child_run_id, ready, .. } => {
+            RetryOpen::Ready {
+                child_run_id,
+                ready,
+                ..
+            } => {
                 let _ = execute_ready(&s, None, *ready);
                 child_run_id
             }
@@ -6600,7 +7194,19 @@ mod tests {
 
         // Second retry of the SAME source: the duplicate guard returns the
         // existing child id and opens NO new run.
-        match open_retry_child(&s, &reg, None, 300, src, "default", "p".into(), Some("echo"), RunModelPrefs::default()).unwrap() {
+        match open_retry_child(
+            &s,
+            &reg,
+            None,
+            300,
+            src,
+            "default",
+            "p".into(),
+            Some("echo"),
+            RunModelPrefs::default(),
+        )
+        .unwrap()
+        {
             RetryOpen::AlreadyRetried { child_run_id } => assert_eq!(child_run_id, child1),
             _ => panic!("a duplicate retry must return the existing child"),
         }
@@ -6621,7 +7227,19 @@ mod tests {
             RetryPrecheck::Refused { status, .. } => assert_eq!(status, "not_retryable"),
             _ => panic!("a permanent failure must refuse retry"),
         }
-        match open_retry_child(&s, &reg, None, 300, src, "default", "p".into(), Some("echo"), RunModelPrefs::default()).unwrap() {
+        match open_retry_child(
+            &s,
+            &reg,
+            None,
+            300,
+            src,
+            "default",
+            "p".into(),
+            Some("echo"),
+            RunModelPrefs::default(),
+        )
+        .unwrap()
+        {
             RetryOpen::Refused(report) => assert_eq!(report.status, "not_retryable"),
             _ => panic!("open_retry_child must surface the refusal"),
         }
@@ -6644,8 +7262,15 @@ mod tests {
         s.set_task_tenant(&brief, "guild-a").unwrap();
         s.set_brief_field(&brief, "assignee", "agt_a").unwrap();
         let src = "run_iso";
-        s.record_run_start(src, &brief, "agt_a", "echo", "manual", &RunWorkspaceInfo::default())
-            .unwrap();
+        s.record_run_start(
+            src,
+            &brief,
+            "agt_a",
+            "echo",
+            "manual",
+            &RunWorkspaceInfo::default(),
+        )
+        .unwrap();
         s.record_run_finish(src, "failed", "boom").unwrap();
         s.set_run_diagnosis(src, &RunDiagnosis::for_terminal("failed", Some(true), src))
             .unwrap();
@@ -6656,8 +7281,23 @@ mod tests {
             RetryPrecheck::Eligible { .. }
         ));
         // Cross Guild: reads as not-found — no existence leak, no dispatch.
-        assert_eq!(s.retry_precheck(src, "guild-b").unwrap(), RetryPrecheck::NotFound);
-        match open_retry_child(&s, &reg, None, 300, src, "guild-b", "p".into(), Some("echo"), RunModelPrefs::default()).unwrap() {
+        assert_eq!(
+            s.retry_precheck(src, "guild-b").unwrap(),
+            RetryPrecheck::NotFound
+        );
+        match open_retry_child(
+            &s,
+            &reg,
+            None,
+            300,
+            src,
+            "guild-b",
+            "p".into(),
+            Some("echo"),
+            RunModelPrefs::default(),
+        )
+        .unwrap()
+        {
             RetryOpen::NotFound => {}
             _ => panic!("a cross-tenant retry must read as not-found"),
         }
@@ -6687,7 +7327,10 @@ mod tests {
             "default",
             "retry prompt".into(),
             Some("capture"),
-            RunModelPrefs::new(Some("claude-sonnet-4".to_string()), Some("high".to_string())),
+            RunModelPrefs::new(
+                Some("claude-sonnet-4".to_string()),
+                Some("high".to_string()),
+            ),
         )
         .unwrap()
         {
@@ -6696,9 +7339,21 @@ mod tests {
             }
             _ => panic!("a retryable failed Shift must open a retry child"),
         }
-        let got = seen.lock().unwrap().clone().expect("the retry child ran the Rig");
-        assert_eq!(got.0.as_deref(), Some("claude-sonnet-4"), "retry child inherits the model pref");
-        assert_eq!(got.1.as_deref(), Some("high"), "retry child inherits the reasoning effort");
+        let got = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the retry child ran the Rig");
+        assert_eq!(
+            got.0.as_deref(),
+            Some("claude-sonnet-4"),
+            "retry child inherits the model pref"
+        );
+        assert_eq!(
+            got.1.as_deref(),
+            Some("high"),
+            "retry child inherits the reasoning effort"
+        );
     }
 
     #[test]
@@ -6732,7 +7387,11 @@ mod tests {
             }
             _ => panic!("a retryable failed Shift must open a retry child"),
         }
-        let got = seen.lock().unwrap().clone().expect("the retry child ran the Rig");
+        let got = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the retry child ran the Rig");
         assert_eq!(got.0, None, "no model pref when the Operative has none");
         assert_eq!(got.1, None, "no effort when the Operative has none");
     }
@@ -6742,8 +7401,7 @@ mod tests {
     /// A `decide` closure that always retries a candidate on the built-in echo
     /// Rig with a fixed prompt + no model prefs — the test stand-in for the
     /// controller's agent-store/budget-aware policy.
-    fn proceed_on_echo(
-    ) -> impl Fn(&crate::nodes::coordinator::RetryCandidate) -> RetryDecision {
+    fn proceed_on_echo() -> impl Fn(&crate::nodes::coordinator::RetryCandidate) -> RetryDecision {
         |_cand| {
             RetryDecision::Proceed(RetryInputs {
                 preferred_rig: Some("echo".to_string()),
@@ -6803,9 +7461,17 @@ mod tests {
 
         // (2) A retryable INTERRUPTED Shift → INCLUDED.
         let b_int = ready_brief(&s, "interrupted", "agt_a");
-        s.record_run_start("run_int", &b_int, "agt_a", "echo", "manual", &RunWorkspaceInfo::default())
+        s.record_run_start(
+            "run_int",
+            &b_int,
+            "agt_a",
+            "echo",
+            "manual",
+            &RunWorkspaceInfo::default(),
+        )
+        .unwrap();
+        s.record_run_finish("run_int", "interrupted", "stalled")
             .unwrap();
-        s.record_run_finish("run_int", "interrupted", "stalled").unwrap();
         s.set_run_diagnosis(
             "run_int",
             &RunDiagnosis {
@@ -6849,15 +7515,32 @@ mod tests {
 
         // (7) A clean DONE Shift → EXCLUDED.
         let b_done = ready_brief(&s, "done", "agt_a");
-        s.record_run_start("run_done", &b_done, "agt_a", "echo", "manual", &RunWorkspaceInfo::default())
-            .unwrap();
+        s.record_run_start(
+            "run_done",
+            &b_done,
+            "agt_a",
+            "echo",
+            "manual",
+            &RunWorkspaceInfo::default(),
+        )
+        .unwrap();
         s.record_run_finish("run_done", "done", "shipped").unwrap();
 
         // (8) A retryable failed Shift that ALREADY has a retry child → EXCLUDED.
         let b_dup = ready_brief(&s, "already", "agt_a");
         failed_source(&s, &b_dup, "agt_a", "run_dup", true);
-        match open_retry_child(&s, &reg, None, 300, "run_dup", "default", "p".into(), Some("echo"), RunModelPrefs::default())
-            .unwrap()
+        match open_retry_child(
+            &s,
+            &reg,
+            None,
+            300,
+            "run_dup",
+            "default",
+            "p".into(),
+            Some("echo"),
+            RunModelPrefs::default(),
+        )
+        .unwrap()
         {
             RetryOpen::Ready { ready, .. } => {
                 let _ = execute_ready(&s, None, *ready);
@@ -6871,9 +7554,14 @@ mod tests {
             .into_iter()
             .map(|c| c.run_id)
             .collect();
-        let expected: std::collections::BTreeSet<String> =
-            ["run_ok", "run_int"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(picked, expected, "only the retryable, in-budget, un-retried, non-discarded failed/interrupted runs are candidates");
+        let expected: std::collections::BTreeSet<String> = ["run_ok", "run_int"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            picked, expected,
+            "only the retryable, in-budget, un-retried, non-discarded failed/interrupted runs are candidates"
+        );
     }
 
     #[test]
@@ -6886,29 +7574,54 @@ mod tests {
         failed_source(&s, &brief, "agt_a", src, true);
 
         // First tick: opens + executes EXACTLY one child, chronicled as autonomous.
-        let recs = autonomous_recovery_tick(&s, &reg, None, 300, 3, None, proceed_on_echo()).unwrap();
+        let recs =
+            autonomous_recovery_tick(&s, &reg, None, 300, 3, None, proceed_on_echo()).unwrap();
         assert_eq!(recs.len(), 1, "one candidate retried");
         assert_eq!(recs[0].outcome, "opened");
         assert_eq!(recs[0].source_run_id, src);
         let child = recs[0].child_run_id.clone().expect("a child was opened");
         assert_eq!(count_children(&s, src), 1, "exactly one child");
         let cr = s.get_run(&child).unwrap().unwrap();
-        assert_eq!(cr.retried_from_run_id.as_deref(), Some(src), "lineage linked like operator retry");
+        assert_eq!(
+            cr.retried_from_run_id.as_deref(),
+            Some(src),
+            "lineage linked like operator retry"
+        );
         // The autonomous lane chronicles a DISTINCT event kind (not operator).
         let auto = s
-            .query_events(&brief, 0, 50, Some("brief.autonomous_retry"), crate::nodes::coordinator::EventOrder::Desc)
+            .query_events(
+                &brief,
+                0,
+                50,
+                Some("brief.autonomous_retry"),
+                crate::nodes::coordinator::EventOrder::Desc,
+            )
             .unwrap();
         assert_eq!(auto.len(), 1, "autonomous retry is chronicled distinctly");
         let op = s
-            .query_events(&brief, 0, 50, Some("brief.retry_requested"), crate::nodes::coordinator::EventOrder::Desc)
+            .query_events(
+                &brief,
+                0,
+                50,
+                Some("brief.retry_requested"),
+                crate::nodes::coordinator::EventOrder::Desc,
+            )
             .unwrap();
-        assert!(op.is_empty(), "the autonomous lane is NOT chronicled as an operator retry");
+        assert!(
+            op.is_empty(),
+            "the autonomous lane is NOT chronicled as an operator retry"
+        );
 
         // Second tick: the source now has a child, so it is no longer a
         // candidate — no second child, idempotent.
-        let recs2 = autonomous_recovery_tick(&s, &reg, None, 300, 3, None, proceed_on_echo()).unwrap();
+        let recs2 =
+            autonomous_recovery_tick(&s, &reg, None, 300, 3, None, proceed_on_echo()).unwrap();
         assert!(recs2.is_empty(), "a second tick finds no new candidate");
-        assert_eq!(count_children(&s, src), 1, "still exactly one child after a second tick");
+        assert_eq!(
+            count_children(&s, src),
+            1,
+            "still exactly one child after a second tick"
+        );
     }
 
     #[test]
@@ -6924,12 +7637,28 @@ mod tests {
         failed_source(&s, &brief, "agt_a", src, true);
 
         if parse_autonomous_recovery_enabled(None) {
-            let _ = autonomous_recovery_tick(&s, &reg, None, 300, parse_autonomous_recovery_max(None), None, proceed_on_echo()).unwrap();
+            let _ = autonomous_recovery_tick(
+                &s,
+                &reg,
+                None,
+                300,
+                parse_autonomous_recovery_max(None),
+                None,
+                proceed_on_echo(),
+            )
+            .unwrap();
         }
-        assert_eq!(count_children(&s, src), 0, "no retry is created while the lane is disabled");
+        assert_eq!(
+            count_children(&s, src),
+            0,
+            "no retry is created while the lane is disabled"
+        );
         // And an eligible candidate DOES exist — proving it was the switch, not
         // a lack of work, that held the retry back.
-        assert_eq!(s.list_autonomous_retry_candidates(None, 10).unwrap().len(), 1);
+        assert_eq!(
+            s.list_autonomous_retry_candidates(None, 10).unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -6953,10 +7682,16 @@ mod tests {
 
         // A recovery tick scoped to guild-a retries guild-a's run only; guild-b
         // is never touched.
-        let recs = autonomous_recovery_tick(&s, &reg, None, 300, 5, Some("guild-a"), proceed_on_echo()).unwrap();
+        let recs =
+            autonomous_recovery_tick(&s, &reg, None, 300, 5, Some("guild-a"), proceed_on_echo())
+                .unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].source_run_id, "run_ga");
         assert_eq!(count_children(&s, "run_ga"), 1, "guild-a's run was retried");
-        assert_eq!(count_children(&s, "run_gb"), 0, "guild-b's run was NOT retried by guild-a's tick");
+        assert_eq!(
+            count_children(&s, "run_gb"),
+            0,
+            "guild-b's run was NOT retried by guild-a's tick"
+        );
     }
 }

@@ -205,14 +205,35 @@ fn classify(message: &str) -> (&'static str, Vec<&'static str>) {
     let m = message.to_ascii_lowercase();
     let has = |kw: &[&str]| kw.iter().any(|k| m.contains(k));
 
-    let intent = if has(&["fix", "bug", "debug", "broken", "error", "crash", "regression"]) {
+    let intent = if has(&[
+        "fix",
+        "bug",
+        "debug",
+        "broken",
+        "error",
+        "crash",
+        "regression",
+    ]) {
         "fix"
     } else if has(&[
-        "research", "investigate", "explore", "analyze", "analyse", "compare", "evaluate", "spike",
+        "research",
+        "investigate",
+        "explore",
+        "analyze",
+        "analyse",
+        "compare",
+        "evaluate",
+        "spike",
     ]) {
         "research"
     } else if has(&[
-        "build", "create", "make", "ship", "implement", "develop", "launch",
+        "build",
+        "create",
+        "make",
+        "ship",
+        "implement",
+        "develop",
+        "launch",
     ]) {
         "build"
     } else {
@@ -226,7 +247,15 @@ fn classify(message: &str) -> (&'static str, Vec<&'static str>) {
         }
     };
     if has(&[
-        "dashboard", "web", "website", "site", "app", "frontend", "ui", "page", "interface",
+        "dashboard",
+        "web",
+        "website",
+        "site",
+        "app",
+        "frontend",
+        "ui",
+        "page",
+        "interface",
         "screen",
     ]) {
         push(&mut roles, "engineer");
@@ -241,7 +270,13 @@ fn classify(message: &str) -> (&'static str, Vec<&'static str>) {
         push(&mut roles, "designer");
     }
     if has(&[
-        "research", "investigate", "analyze", "analyse", "compare", "evaluate", "spike",
+        "research",
+        "investigate",
+        "analyze",
+        "analyse",
+        "compare",
+        "evaluate",
+        "spike",
     ]) {
         push(&mut roles, "researcher");
     }
@@ -279,11 +314,39 @@ fn derive_title(message: &str) -> String {
     let mut t = message.trim().to_string();
     let lower = t.to_ascii_lowercase();
     for prefix in [
-        "build me an ", "build me a ", "build me ", "build an ", "build a ", "build ",
-        "create me an ", "create me a ", "create an ", "create a ", "create ", "make me an ",
-        "make me a ", "make an ", "make a ", "make ", "i want to ", "i want an ", "i want a ",
-        "i need an ", "i need a ", "i need to ", "please ", "can you ", "could you ", "help me ",
-        "let's ", "lets ", "implement ", "ship ", "develop ", "set up ", "setup ",
+        "build me an ",
+        "build me a ",
+        "build me ",
+        "build an ",
+        "build a ",
+        "build ",
+        "create me an ",
+        "create me a ",
+        "create an ",
+        "create a ",
+        "create ",
+        "make me an ",
+        "make me a ",
+        "make an ",
+        "make a ",
+        "make ",
+        "i want to ",
+        "i want an ",
+        "i want a ",
+        "i need an ",
+        "i need a ",
+        "i need to ",
+        "please ",
+        "can you ",
+        "could you ",
+        "help me ",
+        "let's ",
+        "lets ",
+        "implement ",
+        "ship ",
+        "develop ",
+        "set up ",
+        "setup ",
     ] {
         if lower.starts_with(prefix) {
             // Prefixes are ASCII, so the byte offset is a valid char boundary.
@@ -775,7 +838,11 @@ mod tests {
         // role tracks + an integration brief (because >1 track).
         assert!(p.briefs.iter().any(|b| b.key == "track:engineer"));
         assert!(p.briefs.iter().any(|b| b.key == "track:designer"));
-        let integ = p.briefs.iter().find(|b| b.key == "integrate").expect("integration brief");
+        let integ = p
+            .briefs
+            .iter()
+            .find(|b| b.key == "integrate")
+            .expect("integration brief");
         assert!(integ.depends_on.contains(&"track:engineer".to_string()));
         assert!(integ.depends_on.contains(&"track:designer".to_string()));
         // Title strips the leading imperative.
@@ -809,12 +876,18 @@ mod tests {
 
     #[test]
     fn fix_and_research_intents_classify() {
-        assert_eq!(generate_proposal("Fix the broken login bug", &[]).intent, "fix");
+        assert_eq!(
+            generate_proposal("Fix the broken login bug", &[]).intent,
+            "fix"
+        );
         assert_eq!(
             generate_proposal("Research the best auth provider", &[]).intent,
             "research"
         );
-        assert_eq!(generate_proposal("Tidy up the kitchen", &[]).intent, "generic");
+        assert_eq!(
+            generate_proposal("Tidy up the kitchen", &[]).intent,
+            "generic"
+        );
     }
 
     #[test]
@@ -823,7 +896,12 @@ mod tests {
         assert!(p.risks.iter().any(|r| r.contains("No active Operatives")));
         assert!(p.risks.iter().any(|r| r.contains("No Prime")));
         // Nothing-runs-automatically is always the final next action.
-        assert!(p.next_actions.last().unwrap().contains("Nothing runs automatically"));
+        assert!(
+            p.next_actions
+                .last()
+                .unwrap()
+                .contains("Nothing runs automatically")
+        );
     }
 
     #[test]
@@ -926,7 +1004,8 @@ mod tests {
 
     #[test]
     fn model_plan_is_llm_used_and_crew_matched_authoritatively() {
-        let plan: ValidatedPlan = validate_model_plan(&model_json(), "Build a billing system").unwrap();
+        let plan: ValidatedPlan =
+            validate_model_plan(&model_json(), "Build a billing system").unwrap();
         // Only an active engineer exists — designer must still be a hire (the
         // model never decides crew).
         let crew = vec![member("engineer", "active")];

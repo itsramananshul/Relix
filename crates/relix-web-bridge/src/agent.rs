@@ -532,8 +532,7 @@ pub async fn approve_hire(
     let req: ApproveHireRequest = if body.is_empty() {
         ApproveHireRequest::default()
     } else {
-        serde_json::from_slice(&body)
-            .map_err(|e| bad(format!("invalid JSON body: {e}")))?
+        serde_json::from_slice(&body).map_err(|e| bad(format!("invalid JSON body: {e}")))?
     };
     let rig = req.rig.as_deref().map(str::trim).filter(|s| !s.is_empty());
     if let Some(r) = rig
@@ -547,8 +546,7 @@ pub async fn approve_hire(
         Some(r) => format!("{agent_id}|{r}"),
         None => agent_id.clone(),
     };
-    let resp =
-        call_peer_string(&state, DEFAULT_PEER, "agent.approve_hire", arg.as_bytes()).await?;
+    let resp = call_peer_string(&state, DEFAULT_PEER, "agent.approve_hire", arg.as_bytes()).await?;
     let wire: ApproveHireWire = serde_json::from_str(resp.trim()).map_err(|e| {
         (
             StatusCode::BAD_GATEWAY,
@@ -573,7 +571,13 @@ pub async fn reject_hire(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<ApiError>)> {
-    let _ = call_peer_string(&state, DEFAULT_PEER, "agent.reject_hire", agent_id.as_bytes()).await?;
+    let _ = call_peer_string(
+        &state,
+        DEFAULT_PEER,
+        "agent.reject_hire",
+        agent_id.as_bytes(),
+    )
+    .await?;
     Ok(Json(OkResponse {
         ok: true,
         task_id: None,
