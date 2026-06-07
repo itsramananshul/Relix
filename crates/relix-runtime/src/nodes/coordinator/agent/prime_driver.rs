@@ -72,12 +72,24 @@ const ADVANCE_ORCHESTRATE: &str = "orchestrate_assign_ready";
 /// standing grant) to approve before team planning unlocks.
 const ADVANCE_PROPOSE_STRATEGY: &str = "propose_strategy";
 
+/// Prime Shift Disposition v1 (company-model §12.6 — the review→apply tail). A
+/// completed Shift awaiting review acceptance, or an accepted run awaiting apply,
+/// is a real governed next step. These phases are grant-AGNOSTIC in the classifier
+/// — [`attemptable_action`] gates the actual autonomous action on the matching
+/// SEPARATE standing grant (`prime.run.review_accept` / `prime.run.apply`); with
+/// no grant the step stays a human review/apply gate (recorded, never acted on).
+const PHASE_NEEDS_REVIEW: &str = "needs_review";
+const PHASE_NEEDS_APPLY: &str = "needs_apply";
+/// The autonomous disposition actions (distinct from any mandate-advance key).
+const ACTION_REVIEW_ACCEPT: &str = "review_accept";
+const ACTION_APPLY_RUN: &str = "apply_run";
+
 // ── PRIME STANDING AUTHORITY (v1) ──────────────────────────────────────────
 // The Board can grant the autonomous Prime loop bounded power to take specific
 // governed APPROVAL actions on its behalf — but ONLY through an explicit
 // `standing_approvals` row in the tenant, never from env alone. The grant is
 // recorded against a SYNTHETIC authority subject (not a real Operative) and one
-// of four narrow categories. This is "within powers you granted it", not a
+// of the narrow categories. This is "within powers you granted it", not a
 // hidden bypass: with no standing row the loop leaves every approval gate to the
 // human, exactly as before. (company-model standing-approval semantics.)
 
@@ -104,13 +116,28 @@ pub const CATEGORY_CLEARANCE_APPROVE: &str = "prime.clearance.approve";
 /// REJECTION stays final — the store only flips `proposed` → `approved`, so a
 /// rejected / missing strategy is never approved and never re-proposed here.
 pub const CATEGORY_STRATEGY_APPROVE: &str = "prime.strategy.approve";
+/// Standing-authority category: autonomous ACCEPTANCE of a COMPLETED Shift's
+/// review for a Brief in the candidate Mandate/proposal's OWN Brief set (drives
+/// the existing review path — `TaskStore::set_run_review` with `accepted`). Only
+/// a `done` + `pending_review` run is ever accepted; acceptance is SEPARATE from
+/// apply (the distinct grant below) — a single tick accepts XOR applies one run.
+pub const CATEGORY_RUN_REVIEW_ACCEPT: &str = "prime.run.review_accept";
+/// Standing-authority category: autonomous APPLY of an already-ACCEPTED run
+/// through the EXISTING safe apply machinery (`controller_runtime::execute_run_apply`
+/// — `run_apply_eligibility`, baseline/conflict checks, `complete_reviewed_brief`
+/// review-to-done). A run that is not `done` + `accepted` + apply-eligible is
+/// never applied, and a conflicted/failed apply NEVER marks the Brief done. Apply
+/// is SEPARATE from review acceptance (the grant above).
+pub const CATEGORY_RUN_APPLY: &str = "prime.run.apply";
 
-/// The four standing-authority categories, in display order.
+/// The six standing-authority categories, in display order.
 pub const STANDING_AUTHORITY_CATEGORIES: &[&str] = &[
     CATEGORY_PROPOSAL_APPROVE,
     CATEGORY_HIRE_APPROVE,
     CATEGORY_CLEARANCE_APPROVE,
     CATEGORY_STRATEGY_APPROVE,
+    CATEGORY_RUN_REVIEW_ACCEPT,
+    CATEGORY_RUN_APPLY,
 ];
 
 /// Default safe Rig the autonomous hire-approve binds when
@@ -264,6 +291,10 @@ pub(crate) struct NextStep {
     advance_action: Option<&'static str>,
     proposal_id: Option<String>,
     mandate_id: Option<String>,
+    /// The completed run targeted by a `needs_review` / `needs_apply` disposition
+    /// step (the deterministic oldest eligible run in the Mandate's Brief set).
+    /// `None` for every other phase. Re-validated at execution time.
+    run_id: Option<String>,
     plan_id: Option<String>,
     strategy_status: Option<String>,
     missing_roles: Vec<String>,
@@ -284,6 +315,7 @@ impl NextStep {
             "advance_action": self.advance_action,
             "proposal_id": self.proposal_id,
             "mandate_id": self.mandate_id,
+            "run_id": self.run_id,
             "plan_id": self.plan_id,
             "strategy_status": self.strategy_status,
             "missing_roles": self.missing_roles,
@@ -794,6 +826,7 @@ fn proposal_pre_approval_step(
             advance_action: None,
             proposal_id: pid,
             mandate_id: None,
+            run_id: None,
             plan_id: None,
             strategy_status: None,
             missing_roles: Vec::new(),
@@ -815,6 +848,7 @@ fn proposal_pre_approval_step(
         advance_action: None,
         proposal_id: pid,
         mandate_id: None,
+        run_id: None,
         plan_id: None,
         strategy_status: None,
         missing_roles: Vec::new(),
@@ -836,6 +870,7 @@ fn unknown_step(proposal_id: Option<String>, mandate_id: Option<String>) -> Next
         advance_action: None,
         proposal_id,
         mandate_id,
+        run_id: None,
         plan_id: None,
         strategy_status: None,
         missing_roles: Vec::new(),
@@ -843,6 +878,75 @@ fn unknown_step(proposal_id: Option<String>, mandate_id: Option<String>) -> Next
         pending_clearances: Vec::new(),
         counts: BriefCounts::default(),
     }
+}
+
+/// The next completed-Shift disposition over a Mandate's OWN Brief set (Prime
+/// Shift Disposition v1, company-model §12.6). Deterministic + tenant-scoped:
+///
+///   - APPLY takes precedence over a fresh review acceptance — an already-accepted
+///     run is finished (applied) before a new one is accepted, so half-integrated
+///     work is closed first.
+///   - Within each kind the OLDEST eligible run wins, stable by `(started_at,
+///     run_id)`, so the order is reproducible and testable.
+///
+/// Eligible for `review_accept`: the Brief's LATEST run is exactly `done` with
+/// review exactly `pending_review` (which by construction excludes
+/// failed/refused/interrupted/running/cancelled/continued and any
+/// rejected/discarded/accepted/applied/conflicted/failed-apply run).
+///
+/// Eligible for `apply_run`: the latest run is `done`, review `accepted`, apply
+/// status NOT already `applied`/`discarded`/`conflicted`/`failed`, and the
+/// existing [`heartbeat::run_apply_eligibility`] passes.
+///
+/// Cross-tenant runs are invisible: the Brief ids are already this Guild's, and
+/// each run id is re-checked with [`TaskStore::run_belongs_to_tenant`] so a
+/// mis-attributed row is never selected. Returns `(phase, run_id)` or `None`.
+fn disposition_candidate(
+    task_store: &TaskStore,
+    tenant: &str,
+    brief_ids: &[String],
+) -> Option<(&'static str, String)> {
+    let mut apply: Vec<(i64, String)> = Vec::new();
+    let mut review: Vec<(i64, String)> = Vec::new();
+    for bid in brief_ids {
+        let Some(run) = task_store.latest_run_for_brief(bid).ok().flatten() else {
+            continue;
+        };
+        // Cross-tenant invisibility — never select or touch another Guild's run.
+        if !task_store
+            .run_belongs_to_tenant(&run.run_id, tenant)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if run.status != "done" {
+            continue;
+        }
+        match run.review.as_deref() {
+            Some("accepted") => {
+                let terminal_apply = matches!(
+                    run.apply_status.as_deref(),
+                    Some("applied" | "discarded" | "conflicted" | "failed")
+                );
+                if !terminal_apply
+                    && crate::nodes::coordinator::heartbeat::run_apply_eligibility(&run).is_ok()
+                {
+                    apply.push((run.started_at, run.run_id.clone()));
+                }
+            }
+            Some("pending_review") => review.push((run.started_at, run.run_id.clone())),
+            // rejected / discarded / anything else — a human decision, never auto.
+            _ => {}
+        }
+    }
+    let oldest = |mut v: Vec<(i64, String)>| -> Option<String> {
+        v.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        v.into_iter().next().map(|(_, id)| id)
+    };
+    if let Some(id) = oldest(apply) {
+        return Some((PHASE_NEEDS_APPLY, id));
+    }
+    oldest(review).map(|id| (PHASE_NEEDS_REVIEW, id))
 }
 
 /// Classify the next governed step for an approved Mandate (proposal- or
@@ -887,6 +991,7 @@ fn classify_mandate(
             advance_action,
             proposal_id: proposal_id.clone(),
             mandate_id: Some(mid.clone()),
+            run_id: None,
             plan_id: plan_id.clone(),
             strategy_status: strategy.clone(),
             missing_roles: r.missing_roles.clone(),
@@ -1052,6 +1157,39 @@ fn classify_mandate(
                 false,
                 None,
             ));
+        }
+        // Prime Shift Disposition v1 (company-model §12.6 — the review→apply
+        // tail). A completed Shift awaiting review acceptance (or an accepted run
+        // awaiting apply) is a real governed next step over this Mandate's OWN
+        // Brief set. Grant-AGNOSTIC here: `attemptable_action` gates the actual
+        // autonomous action on the matching SEPARATE standing grant; with no grant
+        // it stays a human gate. APPLY is surfaced before review, and before the
+        // "all done" terminal, so accepted-not-applied work is never mistaken for
+        // finished. The run id is carried on the step and re-validated at exec time.
+        if let Some((phase, run_id)) = disposition_candidate(task_store, tenant, &brief_ids) {
+            let (label, reason, api) = if phase == PHASE_NEEDS_APPLY {
+                (
+                    "Apply an accepted Shift",
+                    format!(
+                        "A completed Shift (run {run_id}) was accepted and is ready to apply \
+                         through the existing safe apply path."
+                    ),
+                    "run.apply",
+                )
+            } else {
+                (
+                    "Review a completed Shift",
+                    format!(
+                        "A completed Shift (run {run_id}) is awaiting review acceptance before \
+                         it can be applied."
+                    ),
+                    "run.review",
+                )
+            };
+            return Ok(NextStep {
+                run_id: Some(run_id),
+                ..base(phase, label, reason, "/runs", api, false, None)
+            });
         }
         if counts.needs_review > 0 {
             return Ok(base(
@@ -1285,7 +1423,7 @@ pub fn configured_autonomous_hire_rig() -> String {
 }
 
 /// `prime.standing_authority` — READ-ONLY. The Prime standing-authority state
-/// for the caller's Guild: whether each of the four categories is currently
+/// for the caller's Guild: whether each of the categories is currently
 /// active (a non-expired, non-exhausted `standing_approvals` row exists for the
 /// synthetic authority subject in this tenant), plus the synthetic authority id,
 /// the grantable categories, and the configured autonomous hire Rig. Mutates
@@ -1310,6 +1448,8 @@ pub fn handle_prime_standing_authority(
         "Autonomously activate a pending hire created by Prime/company planning, bound to the configured safe Rig.",
         "Autonomously greenlight a pending spawn Clearance tied to Prime/company planning.",
         "Autonomously approve a proposed Mandate strategy through the existing mandate.strategy.approve path (a rejected/missing strategy is never approved).",
+        "Autonomously accept a completed Shift's review for a Brief in this Guild's own Mandate/proposal set, through the existing review path (only a done + pending_review run; this never applies).",
+        "Autonomously apply an already-accepted run through the existing safe apply machinery (run_apply_eligibility, conflict/baseline checks, review-to-done); a conflicted/failed apply never marks the Brief done.",
     ];
     let categories: Vec<Value> = STANDING_AUTHORITY_CATEGORIES
         .iter()
@@ -1860,6 +2000,9 @@ fn intended_action(step: &NextStep) -> Option<&'static str> {
         {
             Some("approve_strategy")
         }
+        // Shift disposition — only actionable with a concrete classified run id.
+        PHASE_NEEDS_REVIEW => step.run_id.as_ref().map(|_| ACTION_REVIEW_ACCEPT),
+        PHASE_NEEDS_APPLY => step.run_id.as_ref().map(|_| ACTION_APPLY_RUN),
         _ => None,
     }
 }
@@ -1964,7 +2107,8 @@ pub struct PrimeAutonomyRecord {
     /// The action attempted: `create_team_plan` / `orchestrate_assign_ready` /
     /// `propose_strategy` / `approve_strategy` / `approve` / `hire_approve` /
     /// `clearance_approve` / `start` (approved proposal) / `start_mandate` (bare
-    /// Mandate ready work) / `none`.
+    /// Mandate ready work) / `review_accept` (accept a completed Shift's review) /
+    /// `apply_run` (apply an accepted run) / `none`.
     pub action: &'static str,
     /// `advanced` / `started` / `skipped` / `blocked`.
     pub outcome: &'static str,
@@ -3026,6 +3170,175 @@ fn process_candidate_inner(
         };
     }
 
+    // (B4) needs_review / needs_apply — STANDING-AUTHORITY Shift disposition (Prime
+    // Shift Disposition v1, company-model §12.6). A completed Shift awaiting review
+    // acceptance, or an accepted run awaiting apply, is normally a human gate (left
+    // `blocked`), but when the Board granted the matching SEPARATE standing
+    // authority for THIS Guild the loop may close it on the Board's behalf through
+    // the EXISTING review/apply paths. Review (`prime.run.review_accept`) and apply
+    // (`prime.run.apply`) are DISTINCT grants and DISTINCT ticks — a single tick
+    // accepts XOR applies the one classified run (the classifier surfaces apply only
+    // once a run is accepted, so the same run is never both in one tick). The run id
+    // is re-validated at execution time (the review path rejects a non-`done` run;
+    // `execute_run_apply` re-runs `run_apply_eligibility` + conflict/baseline checks
+    // and only a clean `applied` advances the Brief), so a stale classification is
+    // refused honestly with no credit taken. Tenant-scoped, bounded by the action
+    // budget, and consumes exactly ONE call of the bounded grant on success.
+    if step.phase == PHASE_NEEDS_REVIEW || step.phase == PHASE_NEEDS_APPLY {
+        let now_secs = now_secs_from_ms(now_ms);
+        let Some(run_id) = step.run_id.clone() else {
+            return mk(
+                phase,
+                "none",
+                "skipped",
+                "disposition step carries no run id".into(),
+                mandate_id,
+            );
+        };
+
+        if step.phase == PHASE_NEEDS_REVIEW {
+            if !standing_active(agent_store, tenant, CATEGORY_RUN_REVIEW_ACCEPT, now_secs) {
+                return mk(
+                    phase,
+                    "none",
+                    "blocked",
+                    "completed Shift awaiting review — no prime.run.review_accept standing authority for this Guild".into(),
+                    mandate_id,
+                );
+            }
+            if *actions >= max {
+                return mk(
+                    phase,
+                    ACTION_REVIEW_ACCEPT,
+                    "skipped",
+                    "tick action budget reached".into(),
+                    mandate_id,
+                );
+            }
+            // Route through the EXISTING review path (`set_run_review`) — the same
+            // store call the manual `run.review` accept makes (which records the
+            // `brief.run_reviewed` event). Acceptance does NOT apply or advance the
+            // Brief; the apply tick (next) does, under its own separate grant.
+            return match task_store.set_run_review(
+                &run_id,
+                "accepted",
+                "accepted by autonomous Prime under standing authority",
+            ) {
+                Ok(_) => {
+                    *actions += 1;
+                    let _ =
+                        consume_standing(agent_store, tenant, CATEGORY_RUN_REVIEW_ACCEPT, now_secs);
+                    if let Some(mid) = mandate_id.as_deref() {
+                        chronicle_autonomous(
+                            task_store,
+                            mid,
+                            "prime.autonomous_review_accept",
+                            &format!(
+                                "autonomous Prime accepted review of run {run_id} on mandate {mid} via standing authority"
+                            ),
+                        );
+                    }
+                    mk(
+                        phase,
+                        ACTION_REVIEW_ACCEPT,
+                        "advanced",
+                        format!(
+                            "accepted review of run {run_id} via prime.run.review_accept standing authority"
+                        ),
+                        mandate_id,
+                    )
+                }
+                // The run is no longer `done` / reviewable — propagate honestly,
+                // take no credit, consume nothing.
+                Err(e) => mk(
+                    phase,
+                    ACTION_REVIEW_ACCEPT,
+                    "blocked",
+                    format!("review accept refused: {e}"),
+                    mandate_id,
+                ),
+            };
+        }
+
+        // PHASE_NEEDS_APPLY — apply an already-accepted run through the EXISTING
+        // safe apply machinery. NEVER a hand-rolled copy: `execute_run_apply`
+        // re-runs `run_apply_eligibility`, the baseline-hash / conflict / artifact
+        // safety checks, and (only on a clean `applied`) the review-to-done
+        // `complete_reviewed_brief`. A conflicted/failed apply leaves the durable
+        // apply state recorded and the Brief NOT done — we record `blocked` and do
+        // NOT retry in this tick (the next tick's classifier excludes the now-
+        // terminal apply run, so there is no blind retry loop).
+        if !standing_active(agent_store, tenant, CATEGORY_RUN_APPLY, now_secs) {
+            return mk(
+                phase,
+                "none",
+                "blocked",
+                "accepted Shift awaiting apply — no prime.run.apply standing authority for this Guild".into(),
+                mandate_id,
+            );
+        }
+        if *actions >= max {
+            return mk(
+                phase,
+                ACTION_APPLY_RUN,
+                "skipped",
+                "tick action budget reached".into(),
+                mandate_id,
+            );
+        }
+        return match crate::controller_runtime::execute_run_apply(task_store, &run_id, tenant) {
+            Ok(v) => {
+                let apply_status = v
+                    .get("apply_status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if apply_status == "applied" {
+                    *actions += 1;
+                    let _ = consume_standing(agent_store, tenant, CATEGORY_RUN_APPLY, now_secs);
+                    if let Some(mid) = mandate_id.as_deref() {
+                        chronicle_autonomous(
+                            task_store,
+                            mid,
+                            "prime.autonomous_apply",
+                            &format!(
+                                "autonomous Prime applied run {run_id} on mandate {mid} via standing authority"
+                            ),
+                        );
+                    }
+                    mk(
+                        phase,
+                        ACTION_APPLY_RUN,
+                        "advanced",
+                        format!("applied run {run_id} via prime.run.apply standing authority"),
+                        mandate_id,
+                    )
+                } else {
+                    // conflicted / failed — apply machinery already recorded the
+                    // durable apply state; the Brief is NOT done. Block, no retry,
+                    // no grant consumed.
+                    mk(
+                        phase,
+                        ACTION_APPLY_RUN,
+                        "blocked",
+                        format!(
+                            "apply did not complete (apply_status={apply_status}) — left for human"
+                        ),
+                        mandate_id,
+                    )
+                }
+            }
+            // Eligibility / store refusal — propagate honestly, take no credit.
+            Err(e) => mk(
+                phase,
+                ACTION_APPLY_RUN,
+                "blocked",
+                format!("apply refused: {e}"),
+                mandate_id,
+            ),
+        };
+    }
+
     // (C) Everything else needs a human gate, or is already running / done —
     // record it, act on nothing, write no event.
     let outcome = match step.phase {
@@ -3104,6 +3417,12 @@ fn attemptable_action(
         Some("approve_strategy") => {
             standing_active(agent_store, tenant, CATEGORY_STRATEGY_APPROVE, now_secs)
                 .then_some("approve_strategy")
+        }
+        Some(a @ "review_accept") => {
+            standing_active(agent_store, tenant, CATEGORY_RUN_REVIEW_ACCEPT, now_secs).then_some(a)
+        }
+        Some(a @ "apply_run") => {
+            standing_active(agent_store, tenant, CATEGORY_RUN_APPLY, now_secs).then_some(a)
         }
         _ => None,
     }
@@ -7277,5 +7596,432 @@ in force.\n";
             }
             HandlerOutcome::Ok(_) => panic!("malformed body must be refused"),
         }
+    }
+
+    // ── PRIME SHIFT DISPOSITION v1 (review_accept / apply_run) ─────────────────
+    // Autonomous Prime closing the §12.6 review→apply tail under the two SEPARATE
+    // standing grants. Both default OFF, both grant-gated, never combined.
+
+    /// A `tenant` Mandate (approved strategy, ready team) with ONE assigned Brief
+    /// whose latest Shift completed `done` and is parked in `pending_review` (the
+    /// Brief moved to `in_review`). A scoped workspace is stamped so the run can
+    /// later become apply-eligible. Returns `(mandate_id, brief_id, run_id)`.
+    fn mandate_with_pending_review_shift(
+        agents: &AgentStore,
+        spine: &SpineStore,
+        tasks: &Arc<TaskStore>,
+        tenant: &str,
+    ) -> (String, String, String) {
+        let eng = agents
+            .ensure_starter_operative("engineer", "Eng", "Operative", "echo", tenant)
+            .unwrap()
+            .0;
+        let m = spine
+            .create_mandate(tenant, "Ship the login page", "wire it to auth", None, None)
+            .unwrap();
+        spine.propose_strategy(tenant, &m, "build a team").unwrap();
+        spine.approve_strategy(tenant, &m).unwrap();
+        spine
+            .record_team_plan(&TeamPlanRecord {
+                tenant_id: tenant,
+                mandate_id: &m,
+                actor_id: "operator",
+                description: "build it",
+                proposed_roles_json: "[\"engineer\"]",
+                pending_hires_json: "[]",
+                clearance_ids_json: "[]",
+                denials_json: "[]",
+                next_steps_json: "[]",
+                status: "ready",
+            })
+            .unwrap();
+        let brief = tasks
+            .create_brief(
+                tenant,
+                "Wire login to auth",
+                "operator",
+                Some(&eng),
+                Some(&m),
+                None,
+                None,
+            )
+            .unwrap();
+        let run_id = format!("run-{brief}");
+        tasks
+            .record_run_start(
+                &run_id,
+                &brief,
+                &eng,
+                "echo",
+                "heartbeat",
+                &crate::nodes::coordinator::RunWorkspaceInfo {
+                    path: Some("ws"),
+                    context: Some("empty"),
+                    files: Some(0),
+                    bytes: Some(0),
+                },
+            )
+            .unwrap();
+        // A `done` run opens `pending_review`; the completed Shift parks the Brief
+        // in review (through the legal board path todo → in_progress → in_review;
+        // `in_review` requires a stamped reviewer).
+        tasks.record_run_finish(&run_id, "done", "ok").unwrap();
+        tasks.set_brief_field(&brief, "reviewer", &eng).unwrap();
+        tasks.set_board_status(&brief, "in_progress").unwrap();
+        tasks.set_board_status(&brief, "in_review").unwrap();
+        (m, brief, run_id)
+    }
+
+    fn run_of(tasks: &Arc<TaskStore>, run_id: &str) -> crate::nodes::coordinator::RunRecord {
+        tasks.get_run(run_id).unwrap().expect("run row")
+    }
+
+    // SD-1) A `done` + `pending_review` run on a same-tenant Mandate Brief + a
+    //       `prime.run.review_accept` grant → one tick ACCEPTS the review through
+    //       the existing review path, consumes the bounded grant, records
+    //       `review_accept`/`advanced`, and DOES NOT apply (apply state untouched).
+    #[test]
+    fn disposition_review_accept_with_grant_accepts_run() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, _brief, run_id) =
+            mandate_with_pending_review_shift(&agents, &spine, &tasks, "default");
+        grant_standing(&agents, "default", CATEGORY_RUN_REVIEW_ACCEPT, Some(1));
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.phase, PHASE_NEEDS_REVIEW);
+        assert_eq!(rec.action, ACTION_REVIEW_ACCEPT);
+        assert_eq!(rec.outcome, "advanced");
+
+        // Accepted through the existing review path — but NOT applied.
+        let run = run_of(&tasks, &run_id);
+        assert_eq!(run.review.as_deref(), Some("accepted"));
+        assert_ne!(run.apply_status.as_deref(), Some("applied"));
+        // The bounded (max_calls=1) review grant is consumed; the apply grant
+        // (never granted) is not invented.
+        assert!(
+            !agents
+                .has_active_standing(AUTONOMOUS_PRIME_AUTHORITY, CATEGORY_RUN_REVIEW_ACCEPT, 1)
+                .unwrap(),
+            "a bounded review_accept grant is consumed on a real acceptance"
+        );
+    }
+
+    // SD-2) An already-accepted, apply-eligible run + a `prime.run.apply` grant →
+    //       one tick APPLIES through the existing apply machinery, advances the
+    //       Brief to `done`, consumes the grant, and records `apply_run`/`advanced`.
+    #[test]
+    fn disposition_apply_with_grant_applies_and_advances_brief() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief, run_id) =
+            mandate_with_pending_review_shift(&agents, &spine, &tasks, "default");
+        // Pre-accept the run (the review tick already happened); now only apply
+        // remains. A zero-artifact run applies cleanly (no-op) through the real path.
+        tasks.set_run_review(&run_id, "accepted", "ok").unwrap();
+        grant_standing(&agents, "default", CATEGORY_RUN_APPLY, Some(1));
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.phase, PHASE_NEEDS_APPLY);
+        assert_eq!(rec.action, ACTION_APPLY_RUN);
+        assert_eq!(rec.outcome, "advanced");
+
+        // Applied through the existing machinery → the Brief advanced to done.
+        let run = run_of(&tasks, &run_id);
+        assert_eq!(run.apply_status.as_deref(), Some("applied"));
+        assert_eq!(
+            tasks.board_status(&brief).unwrap().as_deref(),
+            Some("done"),
+            "a clean apply closes the review-to-done on the board"
+        );
+        assert!(
+            !agents
+                .has_active_standing(AUTONOMOUS_PRIME_AUTHORITY, CATEGORY_RUN_APPLY, 1)
+                .unwrap(),
+            "a bounded apply grant is consumed on a real apply"
+        );
+    }
+
+    // SD-3) NO grant → the completed Shift is a human gate: the tick records
+    //       blocked and the run is left exactly as it was (pending_review, no
+    //       apply), and NO disposition action is taken.
+    #[test]
+    fn disposition_no_grant_leaves_completed_shift_untouched() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief, run_id) =
+            mandate_with_pending_review_shift(&agents, &spine, &tasks, "default");
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.phase, PHASE_NEEDS_REVIEW);
+        assert_eq!(rec.action, "none");
+        assert_eq!(rec.outcome, "blocked");
+
+        let run = run_of(&tasks, &run_id);
+        assert_eq!(run.review.as_deref(), Some("pending_review"));
+        assert_ne!(run.apply_status.as_deref(), Some("applied"));
+        assert_eq!(
+            tasks.board_status(&brief).unwrap().as_deref(),
+            Some("in_review"),
+            "no grant ⇒ the Brief stays in review"
+        );
+    }
+
+    // SD-4) Rejected / already-applied / non-`done` (failed, running) latest runs
+    //       are NEVER selected for disposition even with BOTH grants live.
+    #[test]
+    fn disposition_skips_rejected_failed_running_and_applied_runs() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief, run_id) =
+            mandate_with_pending_review_shift(&agents, &spine, &tasks, "default");
+        grant_standing(&agents, "default", CATEGORY_RUN_REVIEW_ACCEPT, Some(5));
+        grant_standing(&agents, "default", CATEGORY_RUN_APPLY, Some(5));
+
+        // (a) rejected — a human decision, never auto-touched.
+        tasks.set_run_review(&run_id, "rejected", "no").unwrap();
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec = recs.iter().find(|r| r.target_id == m).unwrap();
+        assert_ne!(rec.action, ACTION_REVIEW_ACCEPT);
+        assert_ne!(rec.action, ACTION_APPLY_RUN);
+        assert_eq!(run_of(&tasks, &run_id).review.as_deref(), Some("rejected"));
+
+        // (b) accepted + already applied — terminal apply, never re-applied.
+        tasks.set_run_review(&run_id, "accepted", "ok").unwrap();
+        tasks
+            .set_run_apply_status(&run_id, "applied", "done", 0, 0)
+            .unwrap();
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec = recs.iter().find(|r| r.target_id == m).unwrap();
+        assert_ne!(rec.action, ACTION_APPLY_RUN);
+
+        // (c) a non-`done` latest run (failed) is invisible to disposition. A
+        //     fresh later run supersedes the prior one as the Brief's latest.
+        let run2 = format!("{run_id}-2");
+        tasks
+            .record_run_start(
+                &run2,
+                &brief,
+                "agent",
+                "echo",
+                "heartbeat",
+                &crate::nodes::coordinator::RunWorkspaceInfo {
+                    path: Some("ws"),
+                    context: Some("empty"),
+                    files: Some(0),
+                    bytes: Some(0),
+                },
+            )
+            .unwrap();
+        tasks.record_run_finish(&run2, "failed", "boom").unwrap();
+        assert!(
+            disposition_candidate(&tasks, "default", &[brief.clone()]).is_none(),
+            "a failed latest run is never a disposition candidate"
+        );
+        // And a still-running latest run is likewise invisible.
+        let run3 = format!("{run_id}-3");
+        tasks
+            .record_run_start(
+                &run3,
+                &brief,
+                "agent",
+                "echo",
+                "heartbeat",
+                &crate::nodes::coordinator::RunWorkspaceInfo {
+                    path: Some("ws"),
+                    context: Some("empty"),
+                    files: Some(0),
+                    bytes: Some(0),
+                },
+            )
+            .unwrap();
+        assert!(
+            disposition_candidate(&tasks, "default", &[brief]).is_none(),
+            "a running latest run is never a disposition candidate"
+        );
+    }
+
+    // SD-5) Cross-tenant invisibility: a run is never selected under another
+    //       Guild's tenant, and a default-scoped tick with a default grant never
+    //       touches Guild "other"'s completed Shift.
+    #[test]
+    fn disposition_candidate_is_tenant_scoped() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (_m, brief, run_id) =
+            mandate_with_pending_review_shift(&agents, &spine, &tasks, "other");
+
+        // The helper guards each run with `run_belongs_to_tenant`: a "default"
+        // view never sees Guild "other"'s run.
+        assert!(
+            disposition_candidate(&tasks, "default", &[brief.clone()]).is_none(),
+            "cross-tenant run is invisible to a different Guild's disposition"
+        );
+        assert_eq!(
+            disposition_candidate(&tasks, "other", &[brief]),
+            Some((PHASE_NEEDS_REVIEW, run_id.clone())),
+            "the owning Guild does see it"
+        );
+
+        // A default-scoped tick (even holding a default review grant) never drives
+        // the "other" Guild's Mandate or accepts its run.
+        grant_standing(&agents, "default", CATEGORY_RUN_REVIEW_ACCEPT, Some(5));
+        let recs = tick(&agents, &spine, &tasks, &reg, 5, Some("default"));
+        assert!(
+            recs.iter().all(|r| r.tenant != "other"),
+            "a default-scoped tick never processes the other Guild"
+        );
+        assert_eq!(
+            run_of(&tasks, &run_id).review.as_deref(),
+            Some("pending_review"),
+            "the other Guild's run is untouched"
+        );
+    }
+
+    // SD-6) An apply that conflicts (unsafe/missing-source plan) records `blocked`,
+    //       does NOT mark the Brief done, and does NOT consume the apply grant —
+    //       and there is no blind in-tick retry.
+    #[test]
+    fn disposition_apply_conflict_blocks_and_does_not_mark_brief_done() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief, run_id) =
+            mandate_with_pending_review_shift(&agents, &spine, &tasks, "default");
+        tasks.set_run_review(&run_id, "accepted", "ok").unwrap();
+        // A `created` artifact whose source file is missing in the (bogus) run
+        // workspace makes the safe-apply plan non-applicable → conflicted. The plan
+        // is read-only, so nothing is written to the project root.
+        tasks
+            .record_run_artifact(
+                &run_id,
+                &brief,
+                "relix-nonexistent-disposition-ws",
+                "relix_disposition_missing_source.txt",
+                "created",
+                1,
+                Some("deadbeef"),
+                None,
+                true,
+            )
+            .unwrap();
+        grant_standing(&agents, "default", CATEGORY_RUN_APPLY, Some(1));
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.phase, PHASE_NEEDS_APPLY);
+        assert_eq!(rec.action, ACTION_APPLY_RUN);
+        assert_eq!(rec.outcome, "blocked");
+
+        // The Brief is NOT done, and the bounded apply grant is NOT consumed.
+        assert_ne!(
+            tasks.board_status(&brief).unwrap().as_deref(),
+            Some("done"),
+            "a conflicted apply never closes review-to-done"
+        );
+        assert_ne!(
+            run_of(&tasks, &run_id).apply_status.as_deref(),
+            Some("applied")
+        );
+        assert!(
+            agents
+                .has_active_standing(AUTONOMOUS_PRIME_AUTHORITY, CATEGORY_RUN_APPLY, 1)
+                .unwrap(),
+            "a blocked apply does not consume the grant"
+        );
+    }
+
+    // SD-7) LLM `none` / hold causes ZERO disposition side effects even with the
+    //       grant live: the run stays pending_review and nothing is accepted.
+    #[test]
+    fn disposition_llm_hold_causes_zero_side_effects() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, _brief, run_id) =
+            mandate_with_pending_review_shift(&agents, &spine, &tasks, "default");
+        grant_standing(&agents, "default", CATEGORY_RUN_REVIEW_ACCEPT, Some(1));
+
+        let decider = ScriptedDecider {
+            reply: Ok(r#"{"action":"none","reason":"hold for human review"}"#.to_string()),
+        };
+        let recs = tick_ai(&agents, &spine, &tasks, &reg, 1, Some("default"), &decider);
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.action, "none");
+        assert_eq!(rec.outcome, "skipped");
+        assert_eq!(rec.ai_mode.as_deref(), Some("llm_used"));
+
+        // ZERO side effects — the run is not accepted and the grant is not consumed.
+        assert_eq!(
+            run_of(&tasks, &run_id).review.as_deref(),
+            Some("pending_review")
+        );
+        assert!(
+            agents
+                .has_active_standing(AUTONOMOUS_PRIME_AUTHORITY, CATEGORY_RUN_REVIEW_ACCEPT, 1)
+                .unwrap(),
+            "a held tick consumes no grant"
+        );
+    }
+
+    // SD-8) Review and apply are SEPARATE ticks: with both grants live, tick 1
+    //       accepts the pending_review run (no apply yet); tick 2 applies the now-
+    //       accepted run and advances the Brief. A single tick never does both.
+    #[test]
+    fn disposition_review_then_apply_over_two_ticks() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief, run_id) =
+            mandate_with_pending_review_shift(&agents, &spine, &tasks, "default");
+        grant_standing(&agents, "default", CATEGORY_RUN_REVIEW_ACCEPT, Some(5));
+        grant_standing(&agents, "default", CATEGORY_RUN_APPLY, Some(5));
+
+        // Tick 1 — accept only.
+        let recs1 = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec1 = recs1.iter().find(|r| r.target_id == m).unwrap();
+        assert_eq!(rec1.action, ACTION_REVIEW_ACCEPT);
+        assert_eq!(rec1.outcome, "advanced");
+        assert_eq!(run_of(&tasks, &run_id).review.as_deref(), Some("accepted"));
+        assert_ne!(
+            run_of(&tasks, &run_id).apply_status.as_deref(),
+            Some("applied"),
+            "tick 1 accepts but never applies the same run"
+        );
+        assert_ne!(tasks.board_status(&brief).unwrap().as_deref(), Some("done"));
+
+        // Tick 2 — apply the now-accepted run.
+        let recs2 = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec2 = recs2.iter().find(|r| r.target_id == m).unwrap();
+        assert_eq!(rec2.action, ACTION_APPLY_RUN);
+        assert_eq!(rec2.outcome, "advanced");
+        assert_eq!(
+            run_of(&tasks, &run_id).apply_status.as_deref(),
+            Some("applied")
+        );
+        assert_eq!(tasks.board_status(&brief).unwrap().as_deref(), Some("done"));
     }
 }

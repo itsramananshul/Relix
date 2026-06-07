@@ -39,6 +39,8 @@ pub const KNOWN_ACTIONS: &[&str] = &[
     "start_mandate",
     "hire_approve",
     "clearance_approve",
+    "review_accept",
+    "apply_run",
 ];
 
 /// Hard cap on a model reason we will accept (chars). An overlong reason is

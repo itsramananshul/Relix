@@ -161,7 +161,13 @@ text preview, bounded unified diff), **reviewed** (accept/reject),
 **applied** back into the configured project root, or **discarded**. A clean
 apply is the operator's **review-to-done** (company-model §12.5B/§12.6): it
 advances the run's Brief from `in_review` to `done`, so dependents unblock
-without a separate manual `brief.move done`. What it does **not** do:
+without a separate manual `brief.move done`. **Review acceptance and apply are a
+human's by default**, but can now be done **autonomously by Prime under two
+SEPARATE, default-OFF standing grants** (`prime.run.review_accept` /
+`prime.run.apply`, below in "Prime is autonomous over approved work") — each
+acting only for a run in the candidate Mandate/proposal's own Brief set, through
+these exact review/apply paths and safety checks, never a hand-rolled copy. What
+it does **not** do:
 
 - **Diff needs an intact baseline.** The unified diff
   (`/v1/runs/:id/artifacts/:aid/diff`) reconstructs the "before" side from
@@ -362,7 +368,7 @@ the approved work is already ready. What it does **not** do:
     when — the Board has granted a bounded **standing approval** in the Guild, the
     same loop may also take the specific *approval* action the grant covers. This
     is **not a loop-toggle bypass**: turning the loop on wakes the driver, but
-    each of the four approval categories acts **only** while a
+    each of the six approval categories acts **only** while a
     `standing_approvals` row exists for the synthetic authority subject
     `__relix_autonomous_prime__` in that tenant. The categories are:
     `prime.proposal.approve` (autonomously approve a **proposed** Prime proposal
@@ -384,7 +390,21 @@ the approved work is already ready. What it does **not** do:
     status='proposed'`), so a **rejected or missing** strategy is never approved
     and never re-proposed: a human **strategy rejection stays final**, and once a
     strategy is approved the next step is no longer the approval gate so a re-tick
-    neither re-approves nor double-consumes). Each autonomous approval **consumes** one
+    neither re-approves nor double-consumes), and the two **Shift-disposition**
+    categories `prime.run.review_accept` (autonomously **accept** a completed
+    Shift's review — a `done` + `pending_review` run that belongs to the
+    candidate Mandate/proposal's own Brief set — through the existing review path
+    `TaskStore::set_run_review`; only `done`/`pending_review` runs are ever
+    accepted, never a rejected/discarded/accepted/applied run, and acceptance does
+    **not** apply) and `prime.run.apply` (autonomously **apply** an already-
+    `accepted` run through the existing safe apply machinery
+    `controller_runtime::execute_run_apply` — `run_apply_eligibility`,
+    baseline-hash / conflict / artifact-safety checks, and the review-to-done
+    `complete_reviewed_brief` — never a hand-rolled copy; a conflicted/failed
+    apply records `blocked` and **never** marks the Brief done, and is not retried
+    in the same tick). **Review and apply are SEPARATE grants and SEPARATE ticks**
+    — a single tick accepts XOR applies one run (the first tick accepts; the next
+    applies), so neither can be combined into one broad superpower. Each autonomous approval **consumes** one
     call of a bounded grant (`max_calls` / `max_cost_micros`); an unlimited grant
     is not decremented (existing standing-approval semantics). It is **tenant-safe**
     (a grant in Guild A never approves Guild B's proposal/hire/Clearance/strategy — the
@@ -394,7 +414,7 @@ the approved work is already ready. What it does **not** do:
     (`POST`/`DELETE /v1/agents/__relix_autonomous_prime__/standing-approvals`) —
     the same routes real Operatives use, so **no duplicate approval system was
     invented**. **The Settings page is now an operator control surface, not
-    read-only:** each of the four categories shows enabled/disabled with a
+    read-only:** each of the six categories shows enabled/disabled with a
     **Grant** (when disabled) / **Revoke** (when enabled) button. Granting creates
     a bounded standing approval for the synthetic authority (default `expires_at =
     now + 24h`, `max_calls = 25`, no cost cap); revoking deletes every row for that

@@ -686,7 +686,11 @@ and applies it, and a clean accept-gated **`run.apply` advances the Brief from
 `in_review` to `done`** (resolving its dependents' blockers) — so no separate
 manual `brief.move done` is needed. Apply stays the file-integration step;
 it advances the board only on a clean apply and only for a Brief genuinely
-awaiting review.)
+awaiting review. **By default that accept + apply is a human's** — but under the
+two separate, default-OFF standing grants of **§12.5G (Prime Shift Disposition
+v1)** the autonomous loop may accept and apply a completed Shift on the Board's
+behalf, through these exact review/apply paths and safety, never combined into one
+power.)
 
 ### C. Prime Deliberation v1 — a model may CHOOSE among governed actions (opt-in)
 
@@ -879,6 +883,56 @@ NOT the permission system**, exactly as in §C/§D/§E:
   text is byte-for-byte the deterministic v1, and the **direct one-click**
   `mandate.orchestrate` / `prime.advance {action:"orchestrate_assign_ready"}` route stays
   deterministic (it never builds a blueprint).
+
+### G. Prime Shift Disposition v1 — autonomous review-accept + apply (opt-in, grant-gated)
+
+**The gap.** The autonomous Prime loop could plan, staff, orchestrate, prioritize,
+and **start** ready work, but a *completed* Shift (a `done` run sitting in
+`pending_review`) stopped dead waiting on a human to accept its review and apply
+it — the review→done tail (§12.6, the `run.apply` review-to-done above) was
+always a human's. So "Prime is autonomous" still had a visible seam at the end of
+every Shift.
+
+**The contract.** Under **two SEPARATE, default-OFF standing authorities** the
+loop may now close that tail on the Board's behalf — but only through the EXISTING
+review/apply code paths and all their safety, never a hand-rolled file copy, and
+never combined into one broad power:
+
+- **Two separable grants.** `prime.run.review_accept` lets the loop **accept** a
+  completed Shift's review; `prime.run.apply` lets it **apply** an already-accepted
+  run. They are distinct `standing_approvals` categories on the synthetic
+  `__relix_autonomous_prime__` authority, granted/revoked through the SAME
+  `agent.standing_approval.*` routes + Settings card as the other categories. Both
+  default OFF. **Review and apply are separate ticks:** a single tick accepts XOR
+  applies one run (the first tick accepts; the next applies).
+- **Only attributable runs.** A candidate run must belong to the candidate
+  Mandate/proposal's **own Brief set** (tenant-scoped by construction + an explicit
+  `run_belongs_to_tenant` guard), so a cross-tenant run is **invisible** and an
+  arbitrary Action Center run is never selected. Selection is deterministic
+  (oldest-first by `(started_at, run_id)`; apply takes precedence over a fresh
+  accept so half-integrated work closes first).
+- **Eligibility is computed, never modelled.** `review_accept` requires the Brief's
+  latest run to be exactly `done` + `pending_review` (so a
+  failed/refused/interrupted/running/cancelled/continued or
+  rejected/discarded/accepted/applied run is never accepted). `apply_run` requires
+  `done` + `accepted` + apply status not already `applied`/`discarded`/`conflicted`/
+  `failed` + the existing `run_apply_eligibility` to pass.
+- **Execution reuses the exact manual paths + safety.** Accept goes through the
+  existing review path (`TaskStore::set_run_review` with `accepted`); apply goes
+  through the EXACT manual `run.apply` body (`execute_run_apply`) — re-running
+  `run_apply_eligibility`, the baseline-hash / conflict / artifact-safety plan, and
+  (only on a clean `applied`) the review-to-done `complete_reviewed_brief`. A
+  **conflicted or failed apply records `blocked`, never marks the Brief done,
+  consumes no grant, and is not retried in the same tick.**
+- **Same model seam as §C/§E.** The optional deliberation/prioritization layers may
+  only confirm/hold/order these already-computed legal actions — the model never
+  decides eligibility, invents a run id, bypasses a grant, or bypasses apply safety.
+  A `none`/hold causes zero side effects. Each successful action consumes one bounded
+  grant call and chronicles `prime.autonomous_review_accept` / `prime.autonomous_apply`.
+
+With neither grant, the review and apply gates stay a human's exactly as before —
+this only *adds* the closing power when the Board has explicitly granted it, inside
+the bound it set.
 
 ---
 

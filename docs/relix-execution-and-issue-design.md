@@ -51,6 +51,8 @@ This "permissive target-validation + guarded side-effects" approach is simpler a
 
 A second Paperclip rule worth copying: **status is set by checkout/lifecycle, not poked directly.** An agent enters `in_progress` by *checking the issue out*, not by patching status. "Please review" + assigning yourself is **not** a valid review path — `in_review` requires a real reviewer (a human owner, a typed review participant, a linked approval, a pending interaction, or a scheduled monitor). This is what keeps the board honest.
 
+**Closing the review tail (`in_review → done`).** A completed Shift opens its *run* review (`done` + `pending_review`) and parks its Brief in `in_review`; the Brief reaches board `done` only when the run is **accepted** and a clean **`run.apply`** integrates it (the review-to-done — see company-model §12.5B/§12.6). That accept + apply is a **human's by default**. Under two SEPARATE, default-OFF standing grants (**Prime Shift Disposition v1**, company-model §12.5G — `prime.run.review_accept` and `prime.run.apply`), the autonomous Prime loop may close this tail on the Board's behalf for a run in the candidate Mandate/proposal's **own** Brief set, through the EXACT existing review/apply paths and all their eligibility/baseline/conflict/artifact safety — never a hand-rolled copy, never combined into one power, and a conflicted/failed apply records `blocked` and **never** marks the Brief `done`. With neither grant, the gate stays a human's exactly as before.
+
 ## 1.4 Single assignee + atomic checkout (the no-double-work lock)
 
 This is the most important mechanic in the whole product, and Paperclip's implementation is worth reproducing precisely (in spirit):

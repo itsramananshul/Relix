@@ -648,6 +648,27 @@ ledger entry or design section.
    (`author_orchestration_blueprint` + record provenance + loop wiring + tests), `…/agent/mod.rs`,
    `controller_runtime.rs` (both tick wiring sites), `apps/dashboard/src/pages/Settings.tsx` + rebuilt
    `dashboard-dist`.
+   **Prime Shift Disposition v1 — SHIPPED (opt-in, default OFF, two SEPARATE grants):** closes the last
+   autonomy seam at the end of a Shift — a completed run (`done` + `pending_review`) no longer waits on a human
+   to accept and apply it. Two new standing-authority categories `prime.run.review_accept` (autonomously
+   **accept** a completed Shift's review through the existing review path `TaskStore::set_run_review`) and
+   `prime.run.apply` (autonomously **apply** an already-accepted run through the EXACT manual apply body
+   `controller_runtime::execute_run_apply` — `run_apply_eligibility`, baseline-hash/conflict/artifact safety,
+   and the review-to-done `complete_reviewed_brief`). **Both default OFF, separately grantable, never combined:**
+   review and apply are distinct grants and distinct ticks (first tick accepts; next applies). Candidate
+   selection is deterministic + tenant-scoped (`disposition_candidate` over the Mandate/proposal's OWN Brief
+   set, oldest-first by `(started_at, run_id)`, apply before fresh accept, with a `run_belongs_to_tenant` guard
+   so a cross-tenant run is **invisible** and an arbitrary Action Center run is never selected); eligibility is
+   computed, never modelled (review = latest run `done`+`pending_review`; apply = `done`+`accepted`, apply
+   status not already `applied`/`discarded`/`conflicted`/`failed`, `run_apply_eligibility` ok). A
+   conflicted/failed apply records `blocked`, **never** marks the Brief done, consumes no grant, and is not
+   retried in the tick. `review_accept`/`apply_run` are added to `KNOWN_ACTIONS` so the optional
+   deliberation/prioritization layers may only confirm/hold/order them — the model never decides eligibility,
+   invents a run id, bypasses a grant, or bypasses apply safety; a `none`/hold causes zero side effects. With
+   neither grant, accept + apply stay a human's exactly as before. *Files:*
+   `…/agent/prime_driver.rs` (categories, `disposition_candidate`, classifier phases, executor (B4), 8 tests),
+   `…/agent/prime_deliberation.rs` (`KNOWN_ACTIONS`), `apps/dashboard/src/pages/Settings.tsx`
+   (two category labels) + rebuilt `dashboard-dist`.
    *Still deferred:* a true end-to-end no-grant autonomous driver that also **approves** on its own (propose →
    **approve** → staff → orchestrate with nothing granted) — intentionally not built; **freeform tool-calling**
    remains deferred (deliberation only confirms-or-holds a computed action; prioritization only reorders the

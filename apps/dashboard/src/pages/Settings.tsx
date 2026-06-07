@@ -746,6 +746,8 @@ const CATEGORY_LABELS: Record<string, string> = {
   "prime.hire.approve": "Approve pending hires",
   "prime.clearance.approve": "Greenlight spawn Clearances",
   "prime.strategy.approve": "Approve proposed strategies",
+  "prime.run.review_accept": "Accept completed Shifts",
+  "prime.run.apply": "Apply accepted Shifts",
 };
 function categoryLabel(cat: string): string {
   return CATEGORY_LABELS[cat] ?? cat;
