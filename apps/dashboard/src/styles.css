@@ -426,6 +426,48 @@ a > .stat-card:hover { border-color: var(--text-faint); }
 .roster-tier { display: flex; flex-direction: column; min-width: 92px; }
 .roster-tier .stat { font-size: 26px; }
 
+/* ── The Lattice (org chart) — dashboard-design §9 ─────────────────────────
+   A dense reports-to tree: an SVG edge layer + absolutely-positioned node
+   cards on a scrollable stage that zooms via a CSS transform. B&W; semantic
+   color only (the status dot + the live pill). Full drag-pan/pinch is deferred
+   — the overflow:auto wrapper is the pan, with explicit −/reset/+ controls. */
+.lattice-zoom { display: inline-flex; gap: 4px; align-items: center; }
+.lattice-card { padding: 10px; }
+/* The pan viewport: scroll to move around a tree larger than the frame. */
+.lattice-stage-wrap {
+  overflow: auto; max-height: calc(100vh - 220px); min-height: 280px;
+  border: 1px solid var(--border-soft); border-radius: 6px; background: var(--bg);
+}
+/* The unscaled coordinate space the layout places nodes/edges into; scaled
+   as a whole for zoom (top-left origin so scroll math stays predictable). */
+.lattice-stage { position: relative; transform-origin: 0 0; padding: 18px; }
+.lattice-edges { position: absolute; top: 18px; left: 18px; pointer-events: none; overflow: visible; }
+.lattice-edge { stroke: var(--border); stroke-width: 1.5; }
+/* Node card — a flat bordered button (it IS the click target). No nesting. */
+.lattice-node {
+  position: absolute; text-align: left; cursor: pointer;
+  background: var(--bg-raised); border: 1px solid var(--border); border-radius: 7px;
+  padding: 8px 10px; color: var(--text); display: flex; flex-direction: column; gap: 5px;
+  overflow: hidden;
+}
+.lattice-node:hover { border-color: var(--text-faint); }
+.lattice-node.selected { border-color: var(--info); box-shadow: 0 0 0 1px var(--info) inset; }
+.lattice-node .ln-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.lattice-node .ln-name { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lattice-node .ln-live {
+  margin-left: auto; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px;
+  color: var(--ok); border: 1px solid rgba(63,185,80,0.4); border-radius: 999px; padding: 0 5px; flex: 0 0 auto;
+}
+.lattice-node .ln-meta { display: flex; align-items: center; gap: 5px; min-width: 0; flex-wrap: nowrap; overflow: hidden; }
+.lattice-node .ln-count { font-size: 10px; color: var(--text-faint); white-space: nowrap; }
+.lattice-node .dot, .lattice-legend .dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); display: inline-block; flex: 0 0 auto;
+}
+.lattice-node .dot.on, .lattice-legend .dot.on { background: var(--ok); }
+.lattice-node .dot.warn, .lattice-legend .dot.warn { background: var(--warn); }
+.lattice-legend { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; font-size: 11px; margin-top: 10px; }
+.lattice-legend > span { display: inline-flex; align-items: center; gap: 5px; }
+
 /* Per-Operative governance panel (Keys + capability powers + standing approvals).
    Grouped, read-only; stacks cleanly inside cards and table-expansion rows. */
 .op-detail { display: flex; flex-direction: column; gap: 14px; }

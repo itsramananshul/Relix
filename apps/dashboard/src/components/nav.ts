@@ -19,7 +19,9 @@ export const PRIMARY: NavEntry[] = [
 
 export const ORG: NavEntry[] = [
   { to: "/agents", label: "Crew", icon: "◍" },
+  { to: "/lattice", label: "Lattice", icon: "⬡" },
   { to: "/company", label: "Company", icon: "▦" },
+  { to: "/costs", label: "Costs", icon: "$" },
   { to: "/assign", label: "Assign Work", icon: "➜" },
 ];
 

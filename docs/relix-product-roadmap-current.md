@@ -265,13 +265,25 @@ ledger entry or design section.
    that would render depth.
 
 **P2 — product-feel surfaces (mostly frontend on data that already exists)**
-4. **[FE] The Lattice (org chart)** — pan/zoom org-tree view is **not started**
-   (`dashboard-design §9`; ledger "Missing surfaces"). The Roster (Agents.tsx) exists; the
-   *visual org* that sells "a company" does not.
-5. **[FE] Full Costs surface** — spend by Guild/Operative/Campaign/Brief with budget
-   progress + incident cards + tree rollup (`dashboard-design §10`). Data exists (metrics +
-   Allowance) and the **Brief-tree rollup backend now ships** (`brief.cost_rollup` →
-   `GET /v1/spine/briefs/:id/cost`, §P1 slice 3b); there is still no dedicated Costs page.
+4. **[FE] The Lattice (org chart)** — **FRONTEND SHIPPED (partial)** (`dashboard-design §9`).
+   `apps/dashboard/src/pages/Lattice.tsx` (nav `/lattice`) renders the live `reports_to`
+   forest from `/v1/spine/operatives` (+ `/v1/spine/company` for apex order) as an SVG-edge +
+   node-card tree, role/status/rig chips + direct-report counts, a live pill driven by
+   `/v1/runs`, and click → a per-Operative detail (Keys + allowance + risk ceiling via
+   `/v1/spine/keys/:id` + `/v1/agents/:id`). *Partial (honest):* full drag-pan/pinch is
+   **deferred** — the surface ships a scrollable stage (overflow:auto = pan) with explicit
+   −/reset/+ zoom controls instead, to stay CSP-clean and dependency-free.
+5. **[FE] Full Costs surface** — **FRONTEND SHIPPED (partial)** (`dashboard-design §10`).
+   `apps/dashboard/src/pages/Costs.tsx` (nav `/costs`): Guild budget (cap from
+   `/v1/spine/guild/detail` vs committed Allowance from `/v1/spine/allowance/committed`),
+   per-Operative allowance (Keys) + observed spend (`/v1/metrics/agents`, windowed), the
+   Brief-tree rollup (`brief.cost_rollup` → `GET /v1/spine/briefs/:id/cost`) with own/descendant
+   split + per-billing-code breakdown, and budget/over-cap incidents (the `budget`-category
+   Action Center items, which carry the authoritative live $ figures). *Partial (honest):* the
+   canonical month-to-date **Guild** spend is not exposed as a number by any route (only as
+   text in the Action Center `reason`), so per-agent observed spend is shown from the
+   observability **metrics window** (24h/7d/30d), explicitly distinguished from the governance
+   calendar-month; metrics↔Operative join is best-effort by agent name/id.
 6. **[FE] Run transcript renderer** — block-grouped "nice"/"raw" transcript view, live-tailed
    (`dashboard-design §8`). SSE + `run_events` exist; the rich renderer does not.
 7. **[FE] Streaming Brief thread** — the workroom is request/response; the design wants the
@@ -380,16 +392,30 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    deferred: the frontend Costs surface.)*
 
 3. **The Lattice org-chart view** — `dashboard-design.md §9`.
-   *Files:* new `apps/dashboard/src/pages/Lattice.tsx` (or extend Agents.tsx), `nav.ts`;
-   reads `company.status` reports-to tree. *Adds:* pan/zoom SVG tree, click → Operative
-   detail; B&W aesthetic (§12). *Verify:* rebuild `dashboard-dist` (dist-parity gate),
-   live-smoke shell loads the view, screenshot.
+   **✅ DONE (partial).** *Files changed:* new `apps/dashboard/src/pages/Lattice.tsx`,
+   `apps/dashboard/src/App.tsx` (route `/lattice`), `apps/dashboard/src/components/nav.ts`
+   (ORG entry) + `Layout.tsx` (title), `apps/dashboard/src/styles.css` (lattice stage/node/
+   edge/zoom styles), rebuilt `crates/relix-web-bridge/dashboard-dist`. *Adds:* a live SVG-edge
+   + node-card `reports_to` tree from `/v1/spine/operatives` (apex order from
+   `/v1/spine/company`), role/status/rig chips, direct-report counts, a live pill from
+   `/v1/runs`, click → per-Operative Keys/allowance/risk-ceiling detail; B&W aesthetic (§12).
+   *Partial:* full drag-pan/pinch **deferred** — ships a scrollable stage (overflow:auto = pan)
+   + explicit −/reset/+ zoom controls (CSP-clean, no SVG-pan dependency). *Verify:* `npm run
+   build` green; dist rebuilt + committed (dist-parity gate); `git diff --check` clean.
 
 4. **Costs surface** — `dashboard-design.md §10`.
-   *Files:* new `apps/dashboard/src/pages/Costs.tsx`, `nav.ts`; reads metrics + Allowance
-   (the same source the Action Center uses). *Adds:* spend by Guild/Operative/Campaign,
-   budget progress bars, over-cap incident cards. *Verify:* rebuild dist; manual against a
-   smoke mesh with a completed Shift.
+   **✅ DONE (partial).** *Files changed:* new `apps/dashboard/src/pages/Costs.tsx`,
+   `apps/dashboard/src/api.ts` (typed `briefCost.rollup` client for `GET
+   /v1/spine/briefs/:id/cost`), `App.tsx` (route `/costs`), `nav.ts` (ORG entry) + `Layout.tsx`
+   (title), rebuilt `dashboard-dist`. *Adds:* Guild budget (cap from `/v1/spine/guild/detail`
+   vs committed Allowance), per-Operative allowance (Keys) + observed spend
+   (`/v1/metrics/agents`, 24h/7d/30d window), the Brief-tree rollup (own/descendant + per-
+   billing-code breakdown), and budget/over-cap incident cards (the `budget`-category Action
+   Center items). All real data; honest unavailable states (route + reason) where a figure
+   isn't exposed — no fabricated zeroes. *Partial:* canonical month-to-date **Guild** spend has
+   no numeric route, so observed spend uses the metrics window, labelled distinct from the
+   governance calendar-month. *Verify:* `npm run build` green; dist rebuilt + committed; `git
+   diff --check` clean.
 
 5. **Run transcript renderer (nice/raw)** — `dashboard-design.md §8`.
    *Files:* `apps/dashboard/src/pages/Runs.tsx` + new transcript component; reads

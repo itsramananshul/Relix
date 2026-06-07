@@ -6,7 +6,9 @@ import { Overview } from "./pages/Overview";
 import { Briefs } from "./pages/Briefs";
 import { Mandates } from "./pages/Mandates";
 import { Agents } from "./pages/Agents";
+import { Lattice } from "./pages/Lattice";
 import { Company } from "./pages/Company";
+import { Costs } from "./pages/Costs";
 import { Assign } from "./pages/Assign";
 import { Runs } from "./pages/Runs";
 import { Chat } from "./pages/Chat";
@@ -32,7 +34,9 @@ export function App() {
         <Route path="/mandates" element={<Mandates />} />
         <Route path="/briefs" element={<Briefs />} />
         <Route path="/agents" element={<Agents />} />
+        <Route path="/lattice" element={<Lattice />} />
         <Route path="/company" element={<Company />} />
+        <Route path="/costs" element={<Costs />} />
         <Route path="/assign" element={<Assign />} />
         <Route path="/runs" element={<Runs />} />
         <Route path="/chat" element={<Chat />} />

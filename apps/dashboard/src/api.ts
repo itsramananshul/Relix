@@ -286,6 +286,57 @@ export const briefSuggestions = {
     ),
 };
 
+// ── Brief-tree cost rollup (brief.cost_rollup) ────────────────────────────
+// The §6.6 issue-tree cost rollup: sum the durable `brief_runs` ledger over a
+// Brief AND its same-Guild Sub-brief tree, with own-vs-descendant totals, tree
+// counts, and a per-billing-code breakdown (dashboard-design §10;
+// company-model §6.6). All figures are REAL run cost — micro-USD from the
+// ledger, never UI data. Windowed on the canonical Allowance month unless
+// since/until (unix SECONDS) are supplied. Hits `GET /v1/spine/briefs/:id/cost`.
+
+// One billing-code's slice of a Brief-tree's cost. `billing_code:""` = unattributed.
+export interface BillingCodeCost {
+  billing_code: string;
+  run_count: number;
+  cost_micros: number;
+}
+
+export interface BriefCostRollup {
+  brief_id: string;
+  tenant_id: string;
+  // Resolved window the rollup billed against (unix SECONDS).
+  since_secs: number;
+  until_secs: number;
+  // Whole same-Guild tree (root Brief + descendants).
+  brief_count: number;
+  run_count: number;
+  cost_micros: number;
+  // Just the root Brief.
+  own_run_count: number;
+  own_cost_micros: number;
+  // Descendant Sub-briefs (= tree − own).
+  descendant_run_count: number;
+  descendant_cost_micros: number;
+  by_billing_code: BillingCodeCost[];
+}
+
+export const briefCost = {
+  // The Brief-tree rollup. `since`/`until` are unix SECONDS — omit both for the
+  // canonical current-calendar-month window the dispatch gate uses. Reports the
+  // failure (via `tryGetReport`) so the Costs page shows an honest unavailable
+  // state with the route/reason instead of fabricated zeroes.
+  rollup: (briefId: string, since?: number, until?: number) => {
+    const qs = new URLSearchParams();
+    if (since != null) qs.set("since", String(since));
+    if (until != null) qs.set("until", String(until));
+    const q = qs.toString();
+    return tryGetReport<BriefCostRollup | null>(
+      `/v1/spine/briefs/${encodeURIComponent(briefId)}/cost${q ? `?${q}` : ""}`,
+      null,
+    );
+  },
+};
+
 // ── Live run-event stream (SSE) ───────────────────────────────────────────
 // Subscribe to the bridge's `/v1/runs/events/stream` execution feed so the
 // Runs page + Brief detail can refresh the moment a Shift starts, finishes,
