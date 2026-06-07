@@ -904,6 +904,16 @@ export interface CompanyActionItem {
   route?: string;
   action_api?: string;
   suggested_rig?: string;
+  // Recovery diagnosis (execution-and-issue §3.3b) — set on `failed_or_refused`
+  // cards built from a run's durable diagnosis.
+  failure_class?: string;
+  retryable?: boolean;
+  retry_budget_remaining?: number;
+  // Guarded retry target — set on a `failed_or_refused` card ONLY when the
+  // source run is retry-eligible (retryable + budget + no existing child). Pairs
+  // with `action_api` = `POST /v1/runs/<run_id>/retry` so the Action Center can
+  // open one guarded retry directly. Absent when not safely retryable from here.
+  run_id?: string;
 }
 export interface CompanyActionsFeed {
   actions?: CompanyActionItem[];

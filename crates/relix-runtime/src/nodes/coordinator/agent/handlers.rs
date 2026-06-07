@@ -1543,6 +1543,15 @@ pub fn handle_company_actions_with_spend(
     //        Brief only (runs are newest-first), so an old failed Shift and a
     //        newer done Shift on the same Brief don't both spam the feed.
     if let Ok(runs) = task_store.list_runs_for_tenant(tenant, 200) {
+        // Source run ids that already have a guarded retry child in this list, so
+        // an already-retried failed Shift never offers a duplicate retry action
+        // from the Action Center (mirrors `retry_precheck`'s duplicate guard +
+        // the Runs page's `retriedSources`). Belt-and-suspenders alongside the
+        // latest-run-per-Brief dedupe below.
+        let retried_sources: std::collections::HashSet<&str> = runs
+            .iter()
+            .filter_map(|r| r.retried_from_run_id.as_deref())
+            .collect();
         let mut seen_brief: std::collections::HashSet<String> = std::collections::HashSet::new();
         for r in &runs {
             if !seen_brief.insert(r.brief_id.clone()) {
@@ -1553,7 +1562,8 @@ pub fn handle_company_actions_with_spend(
             if needs_review {
                 items.push(action_center::needs_review_item(r));
             } else if matches!(r.status.as_str(), "failed" | "refused" | "interrupted") {
-                items.push(action_center::failed_item(r));
+                let has_retry_child = retried_sources.contains(r.run_id.as_str());
+                items.push(action_center::failed_item(r, has_retry_child));
             }
         }
     }

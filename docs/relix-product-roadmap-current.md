@@ -433,10 +433,17 @@ ledger entry or design section.
    governance) and stamp the lineage + chronicle `brief.retry_requested` / `retry_started`. Honest
    HTTP mapping: started/`already_retried` → 200 (idempotent, returns the existing child), claim
    conflict → 409, precondition refusal → 400, not-found/cross-tenant → 404 (no leak). The Runs page
-   shows a **Retry Shift** button only when eligible (+ lineage links); the Action Center is left
-   unchanged (its card carries no run id). *Honest scope:* operator-triggered only — **no autonomous
-   retry on the heartbeat path**, **no LLM diagnostic pass / Inbox card** (Block/Reassign/Investigate
-   not built), **no provider quota polling**.
+   shows a **Retry Shift** button only when eligible (+ lineage links); the **Action Center recovery
+   card now carries the exact source run id + the safe retry action where possible**, so the operator
+   can retry from the cockpit — `failed_item` emits `run_id` + `action_api = POST /v1/runs/<run_id>/retry`
+   only when the run mirrors `retry_precheck` eligibility (failed/interrupted + retryable + budget) AND
+   the handler sees no existing retry child (`retried_sources`, like the Runs page), so it never offers
+   a retry the route would refuse; `Overview.tsx` renders a compact **Retry Shift** button beside the
+   intact inspect-in-Runs link and follows the child run on success (links the existing child on
+   `already_retried`). *Honest scope:* operator-triggered only — **no blind auto-retry** (every retry is
+   one explicit click through the governed re-checking route), **no autonomous retry on the heartbeat
+   path**, **no LLM diagnostic pass / Inbox card** (Block/Reassign/Investigate not built), **no provider
+   quota polling**.
 
 **P3 — depth / autonomy**
 9b. **[BE/FE] Prime guided driver v1** — **SHIPPED (bounded one-step guide, NOT an autonomous CEO).**

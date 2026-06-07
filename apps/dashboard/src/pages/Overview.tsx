@@ -75,6 +75,12 @@ interface ActionItem {
   // The safe-local Rig to pass when acting on this item (the `hire` card
   // suggests `echo` so the approved Operative is immediately runnable).
   suggested_rig?: string;
+  // Guarded retry target — set on a `failed_or_refused` card ONLY when the
+  // source run is retry-eligible (retryable + budget + no existing retry child).
+  // Pairs with `action_api` = `POST /v1/runs/<run_id>/retry`, the already-
+  // implemented guarded route, so the Action Center can open one guarded retry
+  // directly. Absent when not safely retryable from here.
+  run_id?: string;
 }
 interface CompanyActions {
   actions?: ActionItem[];
@@ -798,7 +804,11 @@ function ActionCenter({
   // Which item is mid-decision (its target_id), and the last inline result —
   // so a hire can be approved/rejected without leaving the Inbox (design §5).
   const [acting, setActing] = useState<string | null>(null);
-  const [note, setNote] = useState<{ kind: string; msg: string } | null>(null);
+  // The note may carry an optional deep link (e.g. a retry's child run) so the
+  // operator can jump to the new run without leaving the cockpit.
+  const [note, setNote] = useState<{ kind: string; msg: string; to?: string; toLabel?: string } | null>(null);
+  // Which recovery item's retry is in flight (its source run_id).
+  const [retrying, setRetrying] = useState<string | null>(null);
 
   // Approve a pending hire inline with its suggested safe-local Rig so the
   // Operative is immediately runnable (company-model §12.6); a clearance-gated
@@ -830,6 +840,46 @@ function ActionCenter({
     }
   }
 
+  // Guarded operator retry of a failed/interrupted Shift, straight from the
+  // Action Center (execution-and-issue §3.3b). Calls the SAME already-implemented
+  // guarded route the Runs page uses (`POST /v1/runs/:id/retry`); the runtime
+  // re-checks every precondition (terminal failure-like + retryable + budget +
+  // no existing child) and refuses honestly if unsafe — this is NOT a blind
+  // auto-retry. On success we follow the child run; an already-retried source
+  // returns its existing child (200) and we link to it; any refusal surfaces
+  // verbatim (we never hide the failure). The card also keeps its deep link to
+  // Runs so the operator can still inspect.
+  async function retryShift(a: ActionItem) {
+    if (!a.run_id) return;
+    setRetrying(a.run_id);
+    setNote(null);
+    try {
+      const r = await api.post<{ status?: string; run_id?: string; retry_attempt?: number }>(
+        `/v1/runs/${encodeURIComponent(a.run_id)}/retry`,
+        {},
+      );
+      const child = r.run_id;
+      const to = child ? `/runs?run=${encodeURIComponent(child)}` : undefined;
+      setNote({
+        kind: "ok",
+        msg:
+          r.status === "already_retried"
+            ? `This Shift was already retried — child run ${child ?? "?"}.`
+            : `Retry started — child run ${child ?? "?"}${r.retry_attempt ? ` (attempt ${r.retry_attempt})` : ""}.`,
+        to,
+        toLabel: "Open run →",
+      });
+      onActed();
+      // A retry opens a child run and may move the Brief — refresh those surfaces
+      // (dashboard-design §11). `onActed` already refreshes this feed + Overview.
+      invalidate(["briefs", "mandates"]);
+    } catch (e) {
+      setNote({ kind: "err", msg: e instanceof Error ? e.message : "Retry failed" });
+    } finally {
+      setRetrying(null);
+    }
+  }
+
   async function rejectHire(a: ActionItem) {
     if (!a.target_id) return;
     setActing(a.target_id);
@@ -856,7 +906,12 @@ function ActionCenter({
         <div className="row" style={{ marginBottom: 6, alignItems: "center" }}>
           <h3 style={{ margin: 0 }}>Action Center</h3>
         </div>
-        {note && <div className={"banner " + note.kind} style={{ fontSize: 12 }}>{note.msg}</div>}
+        {note && (
+          <div className={"banner " + note.kind} style={{ fontSize: 12 }}>
+            {note.msg}
+            {note.to && <Link to={note.to} className="link" style={{ marginLeft: 8 }}>{note.toLabel ?? "Open →"}</Link>}
+          </div>
+        )}
         <div className="empty">Nothing needs you right now — the company is moving on its own.</div>
       </div>
     );
@@ -883,7 +938,12 @@ function ActionCenter({
         <div className="spacer" style={{ flex: 1 }} />
         <span className="muted" style={{ fontSize: 12 }}>computed from live state</span>
       </div>
-      {note && <div className={"banner " + note.kind} style={{ fontSize: 12 }}>{note.msg}</div>}
+      {note && (
+        <div className={"banner " + note.kind} style={{ fontSize: 12 }}>
+          {note.msg}
+          {note.to && <Link to={note.to} className="link" style={{ marginLeft: 8 }}>{note.toLabel ?? "Open →"}</Link>}
+        </div>
+      )}
       <div className="table-scroll">
       <table className="table compact">
         <tbody>
@@ -893,6 +953,12 @@ function ActionCenter({
             // leaving the Inbox (design §5: "inline Approve/Reject").
             const inlineHire = a.category === "hire" && !!a.action_api && !!a.target_id;
             const isActing = acting === a.target_id;
+            // A retryable failed/interrupted Shift carries an explicit retry
+            // target (`run_id`) ONLY when the backend judged it safe (retryable +
+            // budget + no existing child). Render a guarded Retry Shift button —
+            // never for items without this explicit recovery metadata.
+            const canRetry = a.category === "failed_or_refused" && !!a.run_id;
+            const isRetrying = retrying === a.run_id;
             return (
             <tr key={a.id ?? i}>
               <td style={{ width: 64 }}>
@@ -923,6 +989,19 @@ function ActionCenter({
                     >
                       Reject
                     </button>
+                  </span>
+                ) : canRetry ? (
+                  // Guarded retry + the existing deep link to inspect the run.
+                  <span className="btn-group" style={{ justifyContent: "flex-end" }}>
+                    <button
+                      className="btn sm"
+                      disabled={isRetrying}
+                      title="Open one guarded retry of this Shift through the same governed run path. The runtime re-checks every precondition and refuses if unsafe — this is not a blind auto-retry."
+                      onClick={() => retryShift(a)}
+                    >
+                      {isRetrying ? "…" : "Retry Shift"}
+                    </button>
+                    {a.route && <Link to={a.route} className="btn ghost sm">{a.action_label ?? "Inspect"} →</Link>}
                   </span>
                 ) : a.route ? (
                   <Link to={a.route} className="btn sm ghost">{a.action_label ?? "Open"} →</Link>

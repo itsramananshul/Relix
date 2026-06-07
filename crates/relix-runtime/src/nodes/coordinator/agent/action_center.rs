@@ -184,6 +184,15 @@ pub struct ActionItem {
     /// Omitted on non-recovery cards.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_budget_remaining: Option<i64>,
+    /// **Guarded retry target** (execution-and-issue §3.3b) — the source run id a
+    /// `failed_or_refused` recovery card points at. Set ONLY on a recovery card
+    /// for a failed/interrupted run that is retry-eligible (retryable + budget +
+    /// no known retry child), so the dashboard can call the guarded
+    /// `POST /v1/runs/<run_id>/retry` route directly from the Action Center.
+    /// Omitted on every non-recovery card and on recovery cards that are not
+    /// safely retryable from here. Pairs with [`ActionItem::action_api`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 impl ActionItem {
@@ -296,6 +305,7 @@ pub fn approval_item(a: &ApprovalRecord) -> ActionItem {
         failure_class: None,
         retryable: None,
         retry_budget_remaining: None,
+        run_id: None,
     }
 }
 
@@ -328,6 +338,7 @@ pub fn hire_item(p: &AgentProfile) -> ActionItem {
         failure_class: None,
         retryable: None,
         retry_budget_remaining: None,
+        run_id: None,
     }
 }
 
@@ -411,6 +422,7 @@ pub fn budget_committed_item(committed_cents: i64, budget_cents: i64, over: bool
         failure_class: None,
         retryable: None,
         retry_budget_remaining: None,
+        run_id: None,
     }
 }
 
@@ -440,6 +452,7 @@ pub fn allowance_hardstop_item(p: &AgentProfile) -> ActionItem {
         failure_class: None,
         retryable: None,
         retry_budget_remaining: None,
+        run_id: None,
     }
 }
 
@@ -526,6 +539,7 @@ pub fn operative_spend_item(
         failure_class: None,
         retryable: None,
         retry_budget_remaining: None,
+        run_id: None,
     }
 }
 
@@ -586,6 +600,7 @@ pub fn company_spend_item(spend_micros: u64, budget_cents: i64, over: bool) -> A
         failure_class: None,
         retryable: None,
         retry_budget_remaining: None,
+        run_id: None,
     }
 }
 
@@ -614,6 +629,7 @@ pub fn strategy_item(m: &Mandate) -> ActionItem {
         failure_class: None,
         retryable: None,
         retry_budget_remaining: None,
+        run_id: None,
     }
 }
 
@@ -640,6 +656,7 @@ pub fn ready_item(c: &BriefCard) -> ActionItem {
         failure_class: None,
         retryable: None,
         retry_budget_remaining: None,
+        run_id: None,
     }
 }
 
@@ -680,6 +697,7 @@ pub fn blocked_item(c: &BriefCard, unassigned: bool) -> ActionItem {
         failure_class: None,
         retryable: None,
         retry_budget_remaining: None,
+        run_id: None,
     }
 }
 
@@ -707,6 +725,7 @@ pub fn stale_item(c: &BriefCard) -> ActionItem {
         failure_class: None,
         retryable: None,
         retry_budget_remaining: None,
+        run_id: None,
     }
 }
 
@@ -731,6 +750,7 @@ pub fn needs_review_item(r: &RunRecord) -> ActionItem {
         failure_class: None,
         retryable: None,
         retry_budget_remaining: None,
+        run_id: None,
     }
 }
 
@@ -834,7 +854,21 @@ fn action_label_for(key: &str) -> String {
 /// When the metadata is absent (legacy rows) it falls back to the refusal-reason
 /// mapping in [`recovery_reco`]. CONSERVATIVE: the card never invents a retry —
 /// it surfaces the diagnosis and the EXISTING governed route that fixes it.
-pub fn failed_item(r: &RunRecord) -> ActionItem {
+///
+/// **Guarded retry surfacing (execution-and-issue §3.3b).** When the source run
+/// is retry-eligible from its OWN durable diagnosis — a terminal failure-like
+/// status (`failed`/`interrupted`), `retryable == true`, a positive
+/// `retry_budget_remaining` — AND the caller reports no existing retry child
+/// (`has_retry_child == false`), the card carries the source `run_id` + an `action_api` for the
+/// already-implemented guarded `POST /v1/runs/<run_id>/retry` route, so the
+/// dashboard can open one governed retry directly from the Action Center. This
+/// MIRRORS the runtime's `retry_precheck` eligibility (status + retryable +
+/// budget + no child) so the card never offers a retry the route would refuse.
+/// It is NOT a blind auto-retry: the runtime re-checks every precondition and
+/// the duplicate guard is enforced atomically when the child is opened. A
+/// refused / non-retryable / no-budget / already-retried run carries NO retry
+/// action — only its diagnosis + the existing deep link to Runs.
+pub fn failed_item(r: &RunRecord, has_retry_child: bool) -> ActionItem {
     // Plain-language reason (always from the run's own state — the durable
     // diagnosis classifies, it does not author prose).
     let (reason, fallback_label, fallback_route) = recovery_reco(r);
@@ -845,6 +879,24 @@ pub fn failed_item(r: &RunRecord) -> ActionItem {
         .map(action_label_for)
         .unwrap_or(fallback_label);
     let route = r.recovery_route.clone().unwrap_or(fallback_route);
+    // Retry-eligibility from the run's OWN durable fields, mirroring
+    // `Coordinator::retry_precheck`: a terminal failure-like Shift the diagnosis
+    // marked retryable, with budget left, and no retry child already opened. Only
+    // then do we hand the dashboard a direct, guarded retry action.
+    let retry_safe = !has_retry_child
+        && matches!(r.status.as_str(), "failed" | "interrupted")
+        && r.retryable == Some(true)
+        && r.retry_budget_remaining.unwrap_or(0) > 0;
+    let (run_id, action_api) = if retry_safe {
+        (
+            Some(r.run_id.clone()),
+            // Same shape as the hire card's `action_api` (`POST <path>`); the
+            // path is the already-implemented guarded retry route.
+            Some(format!("POST /v1/runs/{}/retry", r.run_id)),
+        )
+    } else {
+        (None, None)
+    };
     ActionItem {
         id: format!("failed:{}", r.run_id),
         category: ActionCategory::FailedOrRefused,
@@ -858,7 +910,7 @@ pub fn failed_item(r: &RunRecord) -> ActionItem {
         route: Some(route),
         created_at: Some(r.started_at),
         updated_at: r.finished_at,
-        action_api: None,
+        action_api,
         suggested_rig: None,
         // Carry the diagnosis so the dashboard renders a recovery-class chip +
         // retryable badge + remaining retry budget (conservative — only what the
@@ -866,6 +918,7 @@ pub fn failed_item(r: &RunRecord) -> ActionItem {
         failure_class: r.failure_class.clone(),
         retryable: r.retryable,
         retry_budget_remaining: r.retry_budget_remaining,
+        run_id,
     }
 }
 
@@ -892,6 +945,7 @@ mod tests {
             failure_class: None,
             retryable: None,
             retry_budget_remaining: None,
+            run_id: None,
         }
     }
 
@@ -1047,7 +1101,7 @@ mod tests {
             ("workspace_context_error", "Review runtime settings", "/settings"),
         ];
         for (reason_code, label, route) in cases {
-            let it = failed_item(&run("refused", Some(reason_code), ""));
+            let it = failed_item(&run("refused", Some(reason_code), ""), false);
             assert_eq!(it.category, ActionCategory::FailedOrRefused);
             assert_eq!(it.action_label, label, "label for {reason_code}");
             assert_eq!(it.route.as_deref(), Some(route), "route for {reason_code}");
@@ -1066,7 +1120,7 @@ mod tests {
         r.retry_budget_remaining = Some(1);
         r.recovery_action = Some("retry_later".to_string());
         r.recovery_route = Some("/runs?run=run-1".to_string());
-        let it = failed_item(&r);
+        let it = failed_item(&r, false);
         assert_eq!(it.category, ActionCategory::FailedOrRefused);
         assert_eq!(it.action_label, "Retry the Shift later", "label from metadata");
         assert_eq!(it.route.as_deref(), Some("/runs?run=run-1"), "route from metadata");
@@ -1083,7 +1137,7 @@ mod tests {
         g.retry_budget_remaining = Some(0);
         g.recovery_action = Some("raise_allowance".to_string());
         g.recovery_route = Some("/costs".to_string());
-        let it = failed_item(&g);
+        let it = failed_item(&g, false);
         assert_eq!(it.action_label, "Raise the Allowance");
         assert_eq!(it.route.as_deref(), Some("/costs"));
         assert_eq!(it.retryable, Some(false), "a refusal card is never retryable");
@@ -1094,12 +1148,82 @@ mod tests {
     fn failed_card_falls_back_to_refusal_mapping_without_metadata() {
         // A legacy run with NO durable diagnosis still produces the old,
         // refusal-reason-driven card (back-compat) and carries no badges.
-        let it = failed_item(&run("refused", Some("unassigned"), ""));
+        let it = failed_item(&run("refused", Some("unassigned"), ""), false);
         assert_eq!(it.action_label, "Assign an Operative");
         assert_eq!(it.route.as_deref(), Some("/briefs?brief=brief-1"));
         assert!(it.failure_class.is_none(), "no metadata → no recovery-class chip");
         assert!(it.retryable.is_none(), "no metadata → no retryable badge");
         assert!(it.retry_budget_remaining.is_none());
+        // A refusal is never retry-eligible → no retry action metadata.
+        assert!(it.run_id.is_none(), "a refusal carries no retry target");
+        assert!(it.action_api.is_none(), "a refusal carries no retry action");
+    }
+
+    #[test]
+    fn failed_card_carries_guarded_retry_action_when_retry_eligible() {
+        // A terminal failure-like Shift the diagnosis marked retryable, with
+        // budget left and NO existing retry child, hands the dashboard a direct,
+        // guarded retry action: the source run id + the `POST /v1/runs/<id>/retry`
+        // endpoint (the already-implemented guarded route). This MIRRORS
+        // `Coordinator::retry_precheck` so the card never offers a retry the route
+        // would refuse.
+        for status in ["failed", "interrupted"] {
+            let mut r = run(status, None, "timed out");
+            r.retryable = Some(true);
+            r.retry_budget_remaining = Some(1);
+            let it = failed_item(&r, false);
+            assert_eq!(it.category, ActionCategory::FailedOrRefused);
+            assert_eq!(it.run_id.as_deref(), Some("run-1"), "carries the source run id ({status})");
+            assert_eq!(
+                it.action_api.as_deref(),
+                Some("POST /v1/runs/run-1/retry"),
+                "carries the guarded retry endpoint ({status})",
+            );
+            // The deep link to Runs is left intact so the operator can still inspect.
+            assert_eq!(it.route.as_deref(), Some("/runs?run=run-1"));
+        }
+    }
+
+    #[test]
+    fn failed_card_omits_retry_action_when_not_eligible() {
+        // Not retryable, no budget, and a missing retryable verdict each suppress
+        // the retry action — the card still surfaces the diagnosis + inspect link.
+        let mut not_retryable = run("failed", None, "boom");
+        not_retryable.retryable = Some(false);
+        not_retryable.retry_budget_remaining = Some(1);
+        let it = failed_item(&not_retryable, false);
+        assert!(it.run_id.is_none(), "non-retryable → no retry target");
+        assert!(it.action_api.is_none(), "non-retryable → no retry action");
+
+        let mut no_budget = run("failed", None, "boom");
+        no_budget.retryable = Some(true);
+        no_budget.retry_budget_remaining = Some(0);
+        let it = failed_item(&no_budget, false);
+        assert!(it.run_id.is_none(), "no budget → no retry target");
+        assert!(it.action_api.is_none(), "no budget → no retry action");
+
+        // A retryable run on a non-failure-like status (defensive) is not offered.
+        let mut not_failed = run("done", None, "ok");
+        not_failed.retryable = Some(true);
+        not_failed.retry_budget_remaining = Some(1);
+        let it = failed_item(&not_failed, false);
+        assert!(it.action_api.is_none(), "only failed/interrupted are retried");
+    }
+
+    #[test]
+    fn failed_card_suppresses_retry_action_when_a_child_already_exists() {
+        // Duplicate guard: an otherwise-eligible source that already has a retry
+        // child carries NO retry action (the route would idempotently return
+        // `already_retried`). The card still shows its diagnosis.
+        let mut r = run("failed", None, "timed out");
+        r.retryable = Some(true);
+        r.retry_budget_remaining = Some(1);
+        let it = failed_item(&r, true);
+        assert!(it.run_id.is_none(), "already retried → no retry target");
+        assert!(it.action_api.is_none(), "already retried → no retry action");
+        // The diagnosis badges still ride along.
+        assert_eq!(it.retryable, Some(true));
+        assert_eq!(it.retry_budget_remaining, Some(1));
     }
 
     #[test]
@@ -1165,18 +1289,18 @@ mod tests {
 
     #[test]
     fn recovery_card_failed_carries_summary_reason_and_inspect() {
-        let it = failed_item(&run("failed", None, "compiler error: E0277"));
+        let it = failed_item(&run("failed", None, "compiler error: E0277"), false);
         assert_eq!(it.action_label, "Inspect the run");
         assert_eq!(it.route.as_deref(), Some("/runs?run=run-1"));
         assert!(it.reason.contains("E0277"));
 
         // Interrupted explains auto-reclaim + inspect.
-        let it = failed_item(&run("interrupted", None, ""));
+        let it = failed_item(&run("interrupted", None, ""), false);
         assert!(it.reason.contains("interrupted"));
         assert_eq!(it.action_label, "Inspect the run");
 
         // Unknown refusal reason still produces a non-empty reason + inspect.
-        let it = failed_item(&run("refused", Some("mystery"), ""));
+        let it = failed_item(&run("refused", Some("mystery"), ""), false);
         assert!(it.reason.contains("mystery"));
         assert_eq!(it.action_label, "Inspect the run");
     }
