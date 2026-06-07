@@ -718,6 +718,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/runs/:run_id", get(spine::run_get))
         .route("/v1/runs/:run_id/events", get(spine::run_events))
         .route("/v1/runs/:run_id/cancel", post(spine::run_cancel))
+        .route("/v1/runs/:run_id/retry", post(spine::run_retry))
         .route("/v1/runs/:run_id/artifacts", get(spine::run_artifacts))
         .route("/v1/runs/:run_id/artifacts/:artifact_id/preview", get(spine::run_artifact_preview))
         .route("/v1/runs/:run_id/artifacts/:artifact_id/diff", get(spine::run_artifact_diff))

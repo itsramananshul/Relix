@@ -2058,6 +2058,133 @@ pub fn preflight_and_spawn(
     }
 }
 
+/// Outcome of [`open_retry_child`] — the synchronous part of a guarded
+/// operator retry (everything up to, but not including, the background adapter
+/// run). The caller (the `run.retry` capability) maps each variant to an
+/// honest response and, on [`Self::Ready`], spawns the blocking execute.
+pub enum RetryOpen {
+    /// The source run is unknown / cross-Guild — surfaced as not-found.
+    NotFound,
+    /// The source already has a retry child; carries the EXISTING child id (no
+    /// second run was opened).
+    AlreadyRetried { child_run_id: String },
+    /// A precondition refused (ineligible source, or the shared preflight
+    /// refused — adapter unavailable / `already_running` Claim conflict /
+    /// workspace). Carries the structured [`RunReport`] so the caller surfaces
+    /// the honest reason + status.
+    Refused(RunReport),
+    /// A retry child Brief run was committed (Claim won, ledger row opened,
+    /// lineage stamped, retry chronicled). The caller spawns `execute_ready`.
+    Ready {
+        ready: Box<ReadyRun>,
+        source_run_id: String,
+        child_run_id: String,
+        attempt: i64,
+    },
+}
+
+/// Open a **guarded operator retry** of a source failed Shift
+/// (execution-and-issue §3.3b / §7.4 LOCKED conservative recovery). This is the
+/// synchronous chokepoint shared by the `run.retry` capability and the runtime
+/// tests; it does NOT run the adapter (the caller spawns that on a background
+/// thread so the bridge returns quickly).
+///
+/// It is a **one-click operator action, NOT a blind auto-retry loop**: the
+/// runtime REFUSES unless [`TaskStore::retry_precheck`] proves the source is
+/// terminal-and-failure-like, retryable, has budget, links a still-present
+/// in-tenant Brief, and has no existing retry child. Eligible ⇒ it reuses the
+/// EXISTING [`preflight_run`] path (same adapter resolution, Claim, workspace
+/// prep, ledger row, governance) — never duplicating Rig execution logic — and
+/// only AFTER the child's Claim is won + its row opened does it stamp the
+/// retry lineage and chronicle `brief.retry_requested` (Brief) + `retry_started`
+/// (child run). A still-running Claim by another live run surfaces as the
+/// preflight `already_running` refusal (single-owner, enforced in one place).
+#[allow(clippy::too_many_arguments)]
+pub fn open_retry_child(
+    store: &TaskStore,
+    registry: &crate::rig::RigRegistry,
+    bridge_tokens: Option<&BridgeTokenStore>,
+    lease_secs: i64,
+    run_id: &str,
+    tenant: &str,
+    prompt: String,
+    preferred_rig: Option<&str>,
+) -> Result<RetryOpen, CoordinatorError> {
+    use crate::nodes::coordinator::RetryPrecheck;
+    let (brief_id, next_attempt) = match store.retry_precheck(run_id, tenant)? {
+        RetryPrecheck::NotFound => return Ok(RetryOpen::NotFound),
+        RetryPrecheck::AlreadyRetried { child_run_id } => {
+            return Ok(RetryOpen::AlreadyRetried { child_run_id });
+        }
+        RetryPrecheck::Refused {
+            status,
+            reason,
+            brief_id,
+        } => {
+            // Chronicle the refusal for audit when we know the Brief (best-effort).
+            if let Some(b) = &brief_id {
+                let _ = store.append_event(
+                    b,
+                    "brief.retry_refused",
+                    &format!("retry of run {run_id} refused: {status} — {reason}"),
+                );
+            }
+            let target = brief_id.as_deref().unwrap_or(run_id);
+            return Ok(RetryOpen::Refused(RunReport::refuse(target, status, reason)));
+        }
+        RetryPrecheck::Eligible {
+            brief_id,
+            next_attempt,
+            ..
+        } => (brief_id, next_attempt),
+    };
+    // Eligible: commit the child through the SHARED preflight path (adapter
+    // resolution + Claim + workspace prep + ledger row + governance). A Claim
+    // conflict / adapter-unavailable / workspace refusal returns a structured
+    // RunReport WITHOUT opening a child row.
+    match preflight_run(
+        store,
+        registry,
+        bridge_tokens,
+        lease_secs,
+        &brief_id,
+        preferred_rig,
+        prompt,
+    )? {
+        Preflight::Refused(report) => Ok(RetryOpen::Refused(report)),
+        Preflight::Ready(ready) => {
+            let child_run_id = ready.run_id.clone();
+            // Stamp the retry lineage on the just-opened child row (the Claim is
+            // already won — never a lineage row without a run). The partial
+            // UNIQUE index makes a double-link to the same source fail loudly.
+            store.link_retry_child(&child_run_id, run_id, next_attempt)?;
+            // Chronicle the retry on the Brief + the child run transcript so the
+            // Chronicle and `/v1/runs/:id/events` both record the source + attempt.
+            let _ = store.append_event(
+                &brief_id,
+                "brief.retry_requested",
+                &format!(
+                    "operator retried source run {run_id} → child {child_run_id} (attempt {next_attempt})"
+                ),
+            );
+            let _ = store.append_run_event(
+                &child_run_id,
+                "retry_started",
+                "relix",
+                &format!("retry of source run {run_id} (attempt {next_attempt})"),
+                None,
+                false,
+            );
+            Ok(RetryOpen::Ready {
+                ready,
+                source_run_id: run_id.to_string(),
+                child_run_id,
+                attempt: next_attempt,
+            })
+        }
+    }
+}
+
 /// Pre-flight one Brief run: resolve the Operative's Rig, refuse clearly
 /// when it is unavailable (never spawns), and — only once the run is
 /// committed (adapter available + Claim won) — open the durable run
@@ -5764,5 +5891,179 @@ mod tests {
         // The diff/apply capabilities gate on this exact check.
         assert!(s.run_belongs_to_tenant("rA", "guild-a").unwrap());
         assert!(!s.run_belongs_to_tenant("rA", "guild-b").unwrap(), "guild-b cannot diff/apply guild-a's run");
+    }
+
+    // ── STAGE-2 guarded operator retry (execution-and-issue §3.3b) ──
+
+    /// Record a terminal source Shift with an explicit recovery diagnosis so a
+    /// retry pre-check has something honest to read. `retryable` chooses a
+    /// transient (retryable) vs permanent (non-retryable) `failed` run.
+    fn failed_source(s: &TaskStore, brief: &str, agent: &str, run_id: &str, retryable: bool) {
+        use crate::nodes::coordinator::{RunDiagnosis, RunWorkspaceInfo};
+        s.record_run_start(run_id, brief, agent, "echo", "manual", &RunWorkspaceInfo::default())
+            .unwrap();
+        s.record_run_finish(run_id, "failed", "boom").unwrap();
+        // `record_run_finish` stamps a conservative non-retryable diagnosis; for
+        // the retryable case re-stamp it as a transient (retry-may-help) failure.
+        if retryable {
+            s.set_run_diagnosis(
+                run_id,
+                &RunDiagnosis::for_terminal("failed", Some(true), run_id),
+            )
+            .unwrap();
+        }
+    }
+
+    fn count_children(s: &TaskStore, source: &str) -> i64 {
+        let conn = s.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM brief_runs WHERE retried_from_run_id = ?1",
+            rusqlite::params![source],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn retry_opens_exactly_one_child_and_links_lineage() {
+        use crate::rig::RigRegistry;
+        let (s, _tmp) = store_ws();
+        let reg = RigRegistry::with_builtins();
+        let brief = ready_brief(&s, "ship it", "agt_a");
+        let src = "run_src1";
+        failed_source(&s, &brief, "agt_a", src, true);
+
+        let (child, attempt) = match open_retry_child(
+            &s,
+            &reg,
+            None,
+            300,
+            src,
+            "default",
+            "retry prompt".into(),
+            Some("echo"),
+        )
+        .unwrap()
+        {
+            RetryOpen::Ready {
+                child_run_id,
+                attempt,
+                ready,
+                source_run_id,
+            } => {
+                assert_eq!(source_run_id, src);
+                // Finish the child so the Claim is released (echo → done).
+                let _ = execute_ready(&s, None, *ready);
+                (child_run_id, attempt)
+            }
+            _ => panic!("a retryable failed Shift must open a retry child"),
+        };
+
+        assert_ne!(child, src, "the child is a distinct run");
+        assert_eq!(attempt, 1, "first retry is attempt 1");
+        let cr = s.get_run(&child).unwrap().unwrap();
+        assert_eq!(cr.retried_from_run_id.as_deref(), Some(src), "lineage linked");
+        assert_eq!(cr.retry_attempt, Some(1));
+        assert_eq!(
+            s.existing_retry_child(src).unwrap().as_deref(),
+            Some(child.as_str())
+        );
+        assert_eq!(count_children(&s, src), 1, "exactly one child opened");
+        // The retry was chronicled on the Brief.
+        let evs = s
+            .query_events(
+                &brief,
+                0,
+                50,
+                Some("brief.retry_requested"),
+                crate::nodes::coordinator::EventOrder::Desc,
+            )
+            .unwrap();
+        assert_eq!(evs.len(), 1, "the retry is chronicled on the Brief");
+    }
+
+    #[test]
+    fn duplicate_retry_returns_existing_child_without_spawning_another() {
+        use crate::rig::RigRegistry;
+        let (s, _tmp) = store_ws();
+        let reg = RigRegistry::with_builtins();
+        let brief = ready_brief(&s, "x", "agt_a");
+        let src = "run_src2";
+        failed_source(&s, &brief, "agt_a", src, true);
+
+        let child1 = match open_retry_child(&s, &reg, None, 300, src, "default", "p".into(), Some("echo"))
+            .unwrap()
+        {
+            RetryOpen::Ready { child_run_id, ready, .. } => {
+                let _ = execute_ready(&s, None, *ready);
+                child_run_id
+            }
+            _ => panic!("first retry must open a child"),
+        };
+
+        // Second retry of the SAME source: the duplicate guard returns the
+        // existing child id and opens NO new run.
+        match open_retry_child(&s, &reg, None, 300, src, "default", "p".into(), Some("echo")).unwrap() {
+            RetryOpen::AlreadyRetried { child_run_id } => assert_eq!(child_run_id, child1),
+            _ => panic!("a duplicate retry must return the existing child"),
+        }
+        assert_eq!(count_children(&s, src), 1, "no second child was spawned");
+    }
+
+    #[test]
+    fn non_retryable_failed_run_refuses_retry() {
+        use crate::nodes::coordinator::RetryPrecheck;
+        use crate::rig::RigRegistry;
+        let (s, _tmp) = store_ws();
+        let reg = RigRegistry::with_builtins();
+        let brief = ready_brief(&s, "x", "agt_a");
+        let src = "run_perm";
+        failed_source(&s, &brief, "agt_a", src, false); // permanent → not retryable
+
+        match s.retry_precheck(src, "default").unwrap() {
+            RetryPrecheck::Refused { status, .. } => assert_eq!(status, "not_retryable"),
+            _ => panic!("a permanent failure must refuse retry"),
+        }
+        match open_retry_child(&s, &reg, None, 300, src, "default", "p".into(), Some("echo")).unwrap() {
+            RetryOpen::Refused(report) => assert_eq!(report.status, "not_retryable"),
+            _ => panic!("open_retry_child must surface the refusal"),
+        }
+        assert!(
+            s.existing_retry_child(src).unwrap().is_none(),
+            "a refused retry opens no child"
+        );
+        assert_eq!(count_children(&s, src), 0);
+    }
+
+    #[test]
+    fn cross_tenant_retry_denied_as_not_found() {
+        use crate::nodes::coordinator::{RetryPrecheck, RunDiagnosis, RunWorkspaceInfo};
+        use crate::rig::RigRegistry;
+        let (s, _tmp) = store_ws();
+        let reg = RigRegistry::with_builtins();
+        let brief = s
+            .create("t", "f", "{}", "subj", RetryPolicy::None, 0, None, None)
+            .unwrap();
+        s.set_task_tenant(&brief, "guild-a").unwrap();
+        s.set_brief_field(&brief, "assignee", "agt_a").unwrap();
+        let src = "run_iso";
+        s.record_run_start(src, &brief, "agt_a", "echo", "manual", &RunWorkspaceInfo::default())
+            .unwrap();
+        s.record_run_finish(src, "failed", "boom").unwrap();
+        s.set_run_diagnosis(src, &RunDiagnosis::for_terminal("failed", Some(true), src))
+            .unwrap();
+
+        // Same Guild: eligible.
+        assert!(matches!(
+            s.retry_precheck(src, "guild-a").unwrap(),
+            RetryPrecheck::Eligible { .. }
+        ));
+        // Cross Guild: reads as not-found — no existence leak, no dispatch.
+        assert_eq!(s.retry_precheck(src, "guild-b").unwrap(), RetryPrecheck::NotFound);
+        match open_retry_child(&s, &reg, None, 300, src, "guild-b", "p".into(), Some("echo")).unwrap() {
+            RetryOpen::NotFound => {}
+            _ => panic!("a cross-tenant retry must read as not-found"),
+        }
+        assert!(s.existing_retry_child(src).unwrap().is_none());
     }
 }

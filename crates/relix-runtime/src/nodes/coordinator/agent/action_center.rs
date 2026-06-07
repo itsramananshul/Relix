@@ -1028,6 +1028,8 @@ mod tests {
             retry_budget_remaining: None,
             recovery_action: None,
             recovery_route: None,
+            retried_from_run_id: None,
+            retry_attempt: None,
         }
     }
 

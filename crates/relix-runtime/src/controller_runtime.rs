@@ -9556,6 +9556,180 @@ fn register_node_type_handlers(
                 )),
             );
         }
+        {
+            // `run.retry` — STAGE-2 guarded operator retry of a source failed
+            // Shift (`POST /v1/runs/:run_id/retry`, execution-and-issue §3.3b).
+            // A one-click operator recovery action, NOT a blind auto-retry loop:
+            // the runtime REFUSES unless the source is terminal-and-failure-like,
+            // retryable, has budget, links a still-present in-tenant Brief, and
+            // has no existing retry child. Eligible ⇒ it opens exactly ONE child
+            // run through the SAME preflight/execute path as `brief.run` (shared
+            // adapter resolution, Claim, workspace prep, ledger, governance) and
+            // links it back to the source. Arg: the source run id.
+            let reg = rig_registry.clone();
+            let st = store.clone();
+            let ags = agent_store.clone();
+            bridge.register(
+                "run.retry",
+                std::sync::Arc::new(crate::dispatch::FnHandler(
+                    move |ctx: crate::dispatch::InvocationCtx| {
+                        let reg = reg.clone();
+                        let st = st.clone();
+                        let ags = ags.clone();
+                        async move {
+                            let run_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
+                            let tenant = ctx.tenant_id_or_default().to_string();
+                            let internal = |c: String| {
+                                crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                        cause: c,
+                                        retry_hint: 1,
+                                        retry_after: None,
+                                    },
+                                )
+                            };
+                            // Cross-Guild / unknown run id → a generic not-found
+                            // (no existence leak). The bridge maps a "not found"
+                            // cause onto 404.
+                            let not_found = || {
+                                crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                        cause: format!("run not found: {run_id}"),
+                                        retry_hint: 0,
+                                        retry_after: None,
+                                    },
+                                )
+                            };
+                            if run_id.is_empty() {
+                                return crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                        cause: "run.retry: run_id required".into(),
+                                        retry_hint: 0,
+                                        retry_after: None,
+                                    },
+                                );
+                            }
+                            // Early tenant gate — refuse a cross-Guild/unknown run
+                            // before any prompt work (defense in depth; the
+                            // precheck inside `open_retry_child` re-gates).
+                            match st.run_belongs_to_tenant(&run_id, &tenant) {
+                                Ok(true) => {}
+                                Ok(false) => return not_found(),
+                                Err(e) => return internal(format!("run.retry: {e}")),
+                            }
+                            // Resolve the source's Brief + the assignee's Rig /
+                            // charter, and compose the retry prompt — IDENTICAL to
+                            // `brief.run` so a retry runs exactly like a fresh run.
+                            let brief_id = match st.get_run(&run_id) {
+                                Ok(Some(r)) => r.brief_id,
+                                Ok(None) => return not_found(),
+                                Err(e) => return internal(format!("run.retry: {e}")),
+                            };
+                            let (preferred, charter) = match st.brief_card(&brief_id) {
+                                Ok(Some(card)) => {
+                                    let agent = card
+                                        .assignee_agent_id
+                                        .as_deref()
+                                        .and_then(|a| ags.get_agent(a).ok().flatten());
+                                    (
+                                        agent.as_ref().and_then(|a| a.rig.clone()),
+                                        agent
+                                            .map(|a| a.instruction_bundle)
+                                            .filter(|c| !c.trim().is_empty()),
+                                    )
+                                }
+                                _ => (None, None),
+                            };
+                            let prompt = st.compose_brief_prompt_with_charter(
+                                &brief_id,
+                                10,
+                                charter.as_deref(),
+                            );
+                            let bridge_tokens = crate::rig::bridge::BridgeTokenStore::global();
+                            match crate::nodes::coordinator::heartbeat::open_retry_child(
+                                &st,
+                                &reg,
+                                Some(&bridge_tokens),
+                                300,
+                                &run_id,
+                                &tenant,
+                                prompt,
+                                preferred.as_deref(),
+                            ) {
+                                Err(e) => internal(format!("run.retry: {e}")),
+                                Ok(outcome) => {
+                                    use crate::nodes::coordinator::heartbeat::RetryOpen;
+                                    let body = match outcome {
+                                        RetryOpen::NotFound => return not_found(),
+                                        RetryOpen::AlreadyRetried { child_run_id } => {
+                                            // Idempotent: return the EXISTING child
+                                            // id (mapped to 200) — no second run.
+                                            serde_json::json!({
+                                                "status": "already_retried",
+                                                "run_id": child_run_id,
+                                                "retried_from_run_id": run_id.clone(),
+                                                "message": "this Shift was already retried — returning the existing child run",
+                                            })
+                                        }
+                                        RetryOpen::Refused(report) => {
+                                            // Honest refusal — `status` drives the
+                                            // bridge status code; `error` surfaces
+                                            // the reason to the dashboard.
+                                            serde_json::json!({
+                                                "status": report.status,
+                                                "error": report.summary,
+                                                "reason": report.summary,
+                                                "brief_id": report.brief_id,
+                                                "rig": report.rig,
+                                            })
+                                        }
+                                        RetryOpen::Ready {
+                                            ready,
+                                            source_run_id,
+                                            child_run_id,
+                                            attempt,
+                                        } => {
+                                            // Committed: report `running` now + run
+                                            // the blocking adapter on a background
+                                            // thread (never freeze the bridge).
+                                            let rig = ready.rig_name.clone();
+                                            let workspace = ready.workspace.clone();
+                                            let st_bg = st.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                let bt =
+                                                    crate::rig::bridge::BridgeTokenStore::global();
+                                                let _ = crate::nodes::coordinator::heartbeat::execute_ready(
+                                                    &st_bg,
+                                                    Some(&bt),
+                                                    *ready,
+                                                );
+                                            });
+                                            serde_json::json!({
+                                                "status": "running",
+                                                "run_id": child_run_id,
+                                                "retried_from_run_id": source_run_id,
+                                                "retry_attempt": attempt,
+                                                "brief_id": brief_id,
+                                                "rig": rig,
+                                                "workspace": workspace,
+                                                "summary": "retry started",
+                                            })
+                                        }
+                                    };
+                                    match serde_json::to_vec(&body) {
+                                        Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
+                                        Err(e) => internal(format!("run.retry encode: {e}")),
+                                    }
+                                }
+                            }
+                        }
+                    },
+                )),
+            );
+        }
         if let Some(spine) = spine_store_for_agent_caps.clone() {
             // `prime.start` — Start-to-Shift (company-model §12.5B). Turns an
             // APPROVED Prime proposal's READY Briefs into real Shifts through

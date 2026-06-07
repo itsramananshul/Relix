@@ -1432,6 +1432,28 @@ pub async fn run_cancel(
     json_passthrough(call_peer(&state, "run.cancel", run_id.as_bytes()).await?)
 }
 
+/// `POST /v1/runs/:run_id/retry` — STAGE-2 guarded operator retry of a source
+/// failed Shift (execution-and-issue §3.3b). A one-click operator recovery
+/// action, NOT a blind auto-retry: the runtime refuses unless the source is
+/// terminal-and-failure-like, retryable, has budget, links a still-present
+/// in-tenant Brief, and has no existing retry child. Outcomes map honestly:
+///   - **accepted / running** → `200` with the new child `run_id` +
+///     `retried_from_run_id` + `retry_attempt`;
+///   - **already retried** → `200` (idempotent) with the EXISTING child
+///     `run_id` (never a second run) — chosen over 409 so the dashboard can
+///     navigate straight to the existing child;
+///   - **claim conflict** (`already_running`) → `409` — never retry blindly;
+///   - **not retryable / no budget / missing precondition** → `400` with the
+///     refusal reason;
+///   - **not found / cross tenant** → `404` (not-found style, no existence leak).
+pub async fn run_retry(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let resp = call_peer(&state, "run.retry", run_id.as_bytes()).await?;
+    retry_response(resp)
+}
+
 /// `GET /v1/runs/:run_id/artifacts` — the changed files a run produced.
 pub async fn run_artifacts(
     State(state): State<AppState>,
@@ -2569,6 +2591,30 @@ fn run_report_response(body: Vec<u8>) -> Result<Response, (StatusCode, Json<ApiE
     }
 }
 
+/// Map a `run.retry` body onto an honest HTTP status from its `status` field
+/// (mirrors [`run_report_response`]). A successful retry (`running`) and the
+/// idempotent `already_retried` are `200`; a Claim conflict (`already_running`)
+/// is `409`; every other status is a refusal (not retryable / no budget /
+/// adapter unavailable / missing precondition) → `400`. A not-found / cross-
+/// tenant source never reaches here — the capability returns a not-found error
+/// envelope that `call_peer` maps to `404`.
+fn retry_response(body: Vec<u8>) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let status = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("status")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    match status.as_deref() {
+        Some("running") | Some("already_retried") => json_passthrough(body),
+        Some(RUN_CONFLICT_STATUS) => json_with_status(StatusCode::CONFLICT, body),
+        // Any other status is a precondition refusal — a 400 carrying the body
+        // (`error` = the reason) so the dashboard surfaces why it refused.
+        _ => json_with_status(StatusCode::BAD_REQUEST, body),
+    }
+}
+
 /// The `prime.advance` body field set when the driver REFUSED a one-step
 /// advance because the requested action is no longer the current next step. The
 /// capability returns it as an `Ok` body (not a mesh error), so the bridge
@@ -2837,6 +2883,60 @@ mod tests {
             StatusCode::OK,
             "a successful author must be 200"
         );
+    }
+
+    #[test]
+    fn retry_response_maps_each_outcome_to_an_honest_status() {
+        // STAGE-2 guarded operator retry (execution-and-issue §3.3b): the
+        // `run.retry` body's `status` field drives the HTTP code honestly.
+        // A started retry and the idempotent already-retried are 200 (the
+        // dashboard navigates to the child); a Claim conflict is 409 (never
+        // retry blindly); every precondition refusal is 400 carrying the reason.
+        let started = retry_response(
+            br#"{"status":"running","run_id":"run_child","retried_from_run_id":"run_src","retry_attempt":1}"#
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(started.status(), StatusCode::OK, "a started retry is 200");
+
+        let dup = retry_response(
+            br#"{"status":"already_retried","run_id":"run_child","retried_from_run_id":"run_src"}"#
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            dup.status(),
+            StatusCode::OK,
+            "already_retried is idempotent 200 carrying the existing child"
+        );
+
+        let conflict = retry_response(
+            br#"{"status":"already_running","error":"another run holds the Claim"}"#.to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            conflict.status(),
+            StatusCode::CONFLICT,
+            "a live-Claim conflict must be 409 — never retry blindly"
+        );
+
+        // Every precondition refusal → 400 with the reason in the body.
+        for status in [
+            "not_failed",
+            "not_retryable",
+            "no_retry_budget",
+            "no_brief",
+            "brief_missing",
+            "adapter_unavailable",
+        ] {
+            let body = format!(r#"{{"status":"{status}","error":"nope"}}"#);
+            let resp = retry_response(body.into_bytes()).unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{status} is a precondition refusal → 400"
+            );
+        }
     }
 
     #[test]

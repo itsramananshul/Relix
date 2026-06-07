@@ -5376,6 +5376,156 @@ impl TaskStore {
         Ok(())
     }
 
+    // ── STAGE-2 guarded operator retry (execution-and-issue §3.3b) ──
+
+    /// The existing retry CHILD of a source run, if one was already opened
+    /// (`brief_runs.retried_from_run_id = source`). `None` when the source has
+    /// never been retried. This is the durable duplicate guard: a second retry
+    /// of the same source returns this id instead of spawning another run.
+    pub fn existing_retry_child(
+        &self,
+        source_run_id: &str,
+    ) -> Result<Option<String>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let child: Option<String> = conn
+            .query_row(
+                "SELECT run_id FROM brief_runs WHERE retried_from_run_id = ?1 LIMIT 1",
+                params![source_run_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        Ok(child)
+    }
+
+    /// Stamp a CHILD run's retry lineage: link it back to the `source_run_id`
+    /// it was retried from and record its `attempt` number. Called AFTER the
+    /// child's Claim is won and its `brief_runs` row opened (so a child row is
+    /// never created without a won Claim). The partial UNIQUE index
+    /// `brief_runs_retry_lineage` makes a second link to the SAME source fail,
+    /// enforcing at-most-one-child-per-source even under a race. No-op when the
+    /// child run id is unknown.
+    pub fn link_retry_child(
+        &self,
+        child_run_id: &str,
+        source_run_id: &str,
+        attempt: i64,
+    ) -> Result<(), CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        conn.execute(
+            "UPDATE brief_runs SET retried_from_run_id = ?1, retry_attempt = ?2
+             WHERE run_id = ?3",
+            params![source_run_id, attempt, child_run_id],
+        )
+        .map_err(CoordinatorError::Db)?;
+        Ok(())
+    }
+
+    /// Pure pre-check for the **guarded operator retry** of a source run
+    /// (execution-and-issue §3.3b / §7.4 LOCKED conservative recovery). Reads
+    /// the source `brief_runs` row, tenant-scoped EXACTLY like other run reads
+    /// (a cross-Guild or unknown run id reads as [`RetryPrecheck::NotFound`] —
+    /// no existence leak), and returns a verdict WITHOUT mutating anything or
+    /// spawning a run. Eligibility requires ALL of:
+    ///   - terminal **failure-like** status (`failed` / `interrupted`); a clean
+    ///     `done`/`continued`, an operator `cancelled`, a `refused` (Stage-1
+    ///     marks refusals non-retryable), or a still-`running` row refuses;
+    ///   - the durable diagnosis marks it `retryable == true`;
+    ///   - `retry_budget_remaining > 0`;
+    ///   - a non-empty `brief_id` that still names a Brief in the SAME Guild;
+    ///   - no existing retry child for this source (else [`RetryPrecheck::AlreadyRetried`]).
+    ///
+    /// The duplicate check runs FIRST so an already-retried source always
+    /// returns its existing child, even if its preconditions would otherwise
+    /// refuse. Whether the Brief is currently claimed/running by another live
+    /// run is NOT decided here — that is enforced atomically by the shared
+    /// preflight Claim when the child is actually opened (a conflict surfaces as
+    /// `already_running` → 409), keeping the single-owner rule in one place.
+    pub fn retry_precheck(
+        &self,
+        run_id: &str,
+        tenant: &str,
+    ) -> Result<RetryPrecheck, CoordinatorError> {
+        // Tenant-gate the source run id FIRST — a cross-Guild / unknown id reads
+        // as not-found, never leaking another Guild's run existence.
+        if !self.run_belongs_to_tenant(run_id, tenant)? {
+            return Ok(RetryPrecheck::NotFound);
+        }
+        let Some(source) = self.get_run(run_id)? else {
+            return Ok(RetryPrecheck::NotFound);
+        };
+        // Duplicate guard FIRST: an already-retried source always returns its
+        // existing child (idempotent), regardless of its own preconditions.
+        if let Some(child) = self.existing_retry_child(run_id)? {
+            return Ok(RetryPrecheck::AlreadyRetried {
+                child_run_id: child,
+            });
+        }
+        let brief_id = source.brief_id.trim().to_string();
+        let brief_opt = if brief_id.is_empty() {
+            None
+        } else {
+            Some(brief_id.clone())
+        };
+        // Terminal + failure-like only. `failed`/`interrupted` are the accepted
+        // cases; everything else (success, cancelled, refused, running) refuses.
+        if !matches!(source.status.as_str(), "failed" | "interrupted") {
+            return Ok(RetryPrecheck::Refused {
+                status: "not_failed",
+                reason: format!(
+                    "run is `{}` — only a failed or interrupted Shift can be retried",
+                    source.status
+                ),
+                brief_id: brief_opt,
+            });
+        }
+        // Honest retryable verdict from the durable Stage-1 diagnosis.
+        if source.retryable != Some(true) {
+            return Ok(RetryPrecheck::Refused {
+                status: "not_retryable",
+                reason: "this failure is not retryable — it needs an operator fix first".to_string(),
+                brief_id: brief_opt,
+            });
+        }
+        if source.retry_budget_remaining.unwrap_or(0) <= 0 {
+            return Ok(RetryPrecheck::Refused {
+                status: "no_retry_budget",
+                reason: "no retry budget remaining for this Shift".to_string(),
+                brief_id: brief_opt,
+            });
+        }
+        // A retry needs a Brief to run.
+        let Some(brief_id) = brief_opt else {
+            return Ok(RetryPrecheck::Refused {
+                status: "no_brief",
+                reason: "the source run has no Brief to retry".to_string(),
+                brief_id: None,
+            });
+        };
+        // The Brief must still exist in the SAME Guild (it could have been
+        // deleted / moved). Tenant-checked — no cross-Guild dispatch.
+        if !self.task_in_tenant(&brief_id, tenant)? {
+            return Ok(RetryPrecheck::Refused {
+                status: "brief_missing",
+                reason: "the Brief no longer exists in this Guild".to_string(),
+                brief_id: Some(brief_id),
+            });
+        }
+        // Resolve the assignee (may be empty; preflight will refuse `unassigned`
+        // honestly, but we carry what we know). The child attempt = source
+        // attempt + 1 (a fresh source has attempt NULL ⇒ child attempt 1).
+        let assignee = self
+            .brief_card(&brief_id)?
+            .and_then(|c| c.assignee_agent_id)
+            .unwrap_or_default();
+        let next_attempt = source.retry_attempt.unwrap_or(0) + 1;
+        Ok(RetryPrecheck::Eligible {
+            brief_id,
+            assignee,
+            next_attempt,
+        })
+    }
+
     /// Persist the usage/cost/session captured from a run's adapter output
     /// (TG6). A no-op when nothing was captured (echo / raw / no usage), so
     /// absent fields stay NULL — never faked. Best-effort.
@@ -6444,7 +6594,8 @@ impl TaskStore {
                         trigger, provider, model, input_tokens, output_tokens,
                         cached_input_tokens, cost_micros, session_id, refusal_reason,
                         failure_class, retryable, retry_budget_remaining,
-                        recovery_action, recovery_route
+                        recovery_action, recovery_route,
+                        retried_from_run_id, retry_attempt
                  FROM brief_runs
                  ORDER BY started_at DESC, rowid DESC
                  LIMIT ?1",
@@ -6484,7 +6635,8 @@ impl TaskStore {
                         r.trigger, r.provider, r.model, r.input_tokens, r.output_tokens,
                         r.cached_input_tokens, r.cost_micros, r.session_id, r.refusal_reason,
                         r.failure_class, r.retryable, r.retry_budget_remaining,
-                        r.recovery_action, r.recovery_route
+                        r.recovery_action, r.recovery_route,
+                        r.retried_from_run_id, r.retry_attempt
                  FROM brief_runs r
                  JOIN tasks t ON t.task_id = r.brief_id
                  WHERE COALESCE(t.tenant_id, 'default') = ?1
@@ -6520,7 +6672,8 @@ impl TaskStore {
                         trigger, provider, model, input_tokens, output_tokens,
                         cached_input_tokens, cost_micros, session_id, refusal_reason,
                         failure_class, retryable, retry_budget_remaining,
-                        recovery_action, recovery_route
+                        recovery_action, recovery_route,
+                        retried_from_run_id, retry_attempt
                  FROM brief_runs
                  WHERE brief_id = ?1
                  ORDER BY started_at DESC, rowid DESC
@@ -6581,7 +6734,8 @@ impl TaskStore {
                         trigger, provider, model, input_tokens, output_tokens,
                         cached_input_tokens, cost_micros, session_id, refusal_reason,
                         failure_class, retryable, retry_budget_remaining,
-                        recovery_action, recovery_route
+                        recovery_action, recovery_route,
+                        retried_from_run_id, retry_attempt
                  FROM brief_runs WHERE run_id = ?1",
                 params![run_id],
                 RunRecord::from_row,
@@ -11462,6 +11616,16 @@ pub struct RunRecord {
     /// `/agents` / `/costs` / `/runs?run=<id>`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_route: Option<String>,
+    /// STAGE-2 GUARDED OPERATOR RETRY lineage: when this run is a retry CHILD,
+    /// the source failed run it was started from. `None` on a fresh / non-retry
+    /// run. Lets the dashboard show "already retried → child X" and a run's
+    /// provenance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retried_from_run_id: Option<String>,
+    /// The retry attempt number on a child run (source attempt + 1). `None` on a
+    /// fresh first-time run / legacy row. NOT an auto-retry tally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_attempt: Option<i64>,
 }
 
 /// One reviewable run artifact (`run_artifacts`) — metadata about a file
@@ -11661,8 +11825,43 @@ impl RunRecord {
             retry_budget_remaining: r.get(31)?,
             recovery_action: r.get(32)?,
             recovery_route: r.get(33)?,
+            retried_from_run_id: r.get(34)?,
+            retry_attempt: r.get(35)?,
         })
     }
+}
+
+/// Verdict of the **Stage-2 guarded operator retry** pre-check
+/// ([`TaskStore::retry_precheck`], execution-and-issue §3.3b). A pure,
+/// side-effect-free classification of whether a source run MAY be retried —
+/// it spawns nothing. The capability handler turns an [`Self::Eligible`]
+/// verdict into a real child run through the EXISTING preflight/execute path;
+/// every other verdict is an honest refusal the bridge maps to a status code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryPrecheck {
+    /// The run id is unknown or in another Guild — surfaced as not-found, no
+    /// existence leak.
+    NotFound,
+    /// The source already has a retry child — return that EXISTING child id
+    /// instead of spawning a second run (the durable duplicate guard).
+    AlreadyRetried { child_run_id: String },
+    /// The source is terminal-and-failure-like, marked retryable, has budget,
+    /// links a Brief that still exists in-tenant, and has no retry child yet.
+    /// Carries the Brief + assignee to dispatch and the child's attempt number.
+    Eligible {
+        brief_id: String,
+        assignee: String,
+        next_attempt: i64,
+    },
+    /// A precondition failed; `status` is the stable refusal key
+    /// (`not_failed` / `not_retryable` / `no_retry_budget` / `no_brief` /
+    /// `brief_missing`) and `reason` the operator-facing explanation. The Brief
+    /// id (when known) lets the caller chronicle the refusal.
+    Refused {
+        status: &'static str,
+        reason: String,
+        brief_id: Option<String>,
+    },
 }
 
 /// The recovery DIAGNOSIS of a run (execution-and-issue §3.3b) — a PURE,
@@ -17304,6 +17503,17 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             retry_budget_remaining INTEGER,
             recovery_action        TEXT,
             recovery_route         TEXT,
+            -- STAGE-2 GUARDED OPERATOR RETRY (execution-and-issue §3.3b / §7.4):
+            -- durable lineage linking a retry CHILD run back to the source failed
+            -- run it was started from. `retried_from_run_id` is the source run's
+            -- id (set on the child only); `retry_attempt` is the child's attempt
+            -- number (source attempt + 1; a fresh first-time run is NULL). Both
+            -- NULL on every non-retry run / legacy row. The partial UNIQUE index
+            -- below enforces AT-MOST-ONE child per source run — the duplicate
+            -- guard. This is lineage + a one-click operator retry, NOT a live
+            -- auto-retry counter and NOT a blind retry loop.
+            retried_from_run_id    TEXT,
+            retry_attempt          INTEGER,
             FOREIGN KEY (brief_id) REFERENCES tasks(task_id)
         );
         CREATE INDEX IF NOT EXISTS brief_runs_by_brief
@@ -17631,6 +17841,13 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         "ALTER TABLE brief_runs ADD COLUMN retry_budget_remaining INTEGER",
         "ALTER TABLE brief_runs ADD COLUMN recovery_action TEXT",
         "ALTER TABLE brief_runs ADD COLUMN recovery_route TEXT",
+        // STAGE-2 GUARDED OPERATOR RETRY (execution-and-issue §3.3b): durable
+        // lineage so a retry child links back to the source failed run. Additive
+        // + nullable — existing rows stay NULL (no retry lineage). The partial
+        // UNIQUE index `brief_runs_retry_lineage` (created with the table) is the
+        // at-most-one-child-per-source duplicate guard.
+        "ALTER TABLE brief_runs ADD COLUMN retried_from_run_id TEXT",
+        "ALTER TABLE brief_runs ADD COLUMN retry_attempt INTEGER",
         // DOSSIER AUTHORING / REVISION-LOCK / FORK (execution-and-issue §1.8):
         // additive + nullable authoring metadata on Dossier rows. Legacy rows
         // and `brief.dossier_add` / plan-package rows carry NULL; only the
@@ -17651,6 +17868,17 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
     // so the column exists; idempotent.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS tasks_source_marker ON tasks(source_marker)",
+        [],
+    )
+    .map_err(CoordinatorError::Db)?;
+    // At most ONE retry child per source run (the Stage-2 duplicate-retry guard
+    // at the DB level). Partial so the many NULL (non-retry) rows are exempt.
+    // Runs AFTER the ALTER so `retried_from_run_id` exists on upgraded DBs;
+    // idempotent.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS brief_runs_retry_lineage
+            ON brief_runs(retried_from_run_id)
+            WHERE retried_from_run_id IS NOT NULL",
         [],
     )
     .map_err(CoordinatorError::Db)?;

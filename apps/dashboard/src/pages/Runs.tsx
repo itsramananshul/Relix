@@ -60,6 +60,23 @@ interface RunRecord {
   retry_budget_remaining?: number;
   recovery_action?: string;
   recovery_route?: string;
+  // STAGE-2 guarded operator retry lineage: when this run is a retry CHILD,
+  // the source failed run it was started from; its attempt number. Absent on a
+  // fresh / non-retry run.
+  retried_from_run_id?: string;
+  retry_attempt?: number;
+}
+
+// A failed/interrupted Shift is retry-eligible from the durable diagnosis
+// fields alone (terminal failure-like + retryable + budget). The duplicate
+// guard is enforced server-side; the UI also hides the button once a child is
+// surfaced in the runs list (see `retriedSources`).
+function retryEligible(r: RunRecord): boolean {
+  return (
+    (r.status === "failed" || r.status === "interrupted") &&
+    r.retryable === true &&
+    (r.retry_budget_remaining ?? 0) > 0
+  );
 }
 
 // One file in a safe-apply plan (`/v1/runs/:id/diff` → plan.items).
@@ -465,7 +482,41 @@ export function Runs() {
     }
   }
 
+  // Guarded operator retry of a failed/interrupted Shift (execution-and-issue
+  // §3.3b). On success the backend opens exactly one child run and we navigate
+  // to it; an already-retried source returns its existing child (200); any
+  // refusal (not retryable / no budget / claim conflict) surfaces honestly —
+  // we never hide the failure.
+  async function retry(runId: string) {
+    setBanner(null);
+    try {
+      const r = await api.post<{ status?: string; run_id?: string; retry_attempt?: number }>(
+        `/v1/runs/${encodeURIComponent(runId)}/retry`,
+        {},
+      );
+      setBanner(
+        r.status === "already_retried"
+          ? `This Shift was already retried — child run ${r.run_id}.`
+          : `Retry started — child run ${r.run_id}${r.retry_attempt ? ` (attempt ${r.retry_attempt})` : ""}.`,
+      );
+      reload();
+      invalidate(["briefs", "brief"], { briefId: data?.runs?.find((x) => x.run_id === runId)?.brief_id });
+      // Follow the retry: open the child run (the URL-sync effect loads it).
+      if (r.run_id) setRunParam(r.run_id);
+    } catch (e) {
+      setBanner(e instanceof Error ? e.message : "Retry failed");
+    }
+  }
+
   const allRuns = data?.runs ?? [];
+  // Surface retry lineage: map each source run id → its retry child (from the
+  // child rows in the list), so a retried source hides its Retry button and
+  // links to the child instead.
+  const childOf = new Map<string, string>();
+  for (const r of allRuns) {
+    if (r.retried_from_run_id && r.run_id) childOf.set(r.retried_from_run_id, r.run_id);
+  }
+  const retriedSources = new Set(childOf.keys());
   // The expanded run is ALWAYS shown (so a deep link survives the filters);
   // everything else respects the status + trigger filters.
   const runs = allRuns.filter(
@@ -634,6 +685,9 @@ export function Runs() {
                               {r.review && <span className={"badge " + (r.review === "accepted" ? "done" : r.review === "rejected" ? "blocked" : "in_progress")} style={{ fontSize: 9 }}>{r.review}</span>}
                               {r.apply_status && <span className={"badge " + (APPLY_STATUS_TONE[r.apply_status] ?? "todo")} style={{ fontSize: 9 }}>apply: {r.apply_status}</span>}
                               <span className="muted mono" style={{ fontSize: 11 }}>{rid}</span>
+                              {r.retried_from_run_id && (
+                                <Link to={`/runs?run=${encodeURIComponent(r.retried_from_run_id)}`} className="muted" style={{ fontSize: 11 }} title="this run is a retry of an earlier failed Shift" onClick={(e) => e.stopPropagation()}>retry of {r.retried_from_run_id.slice(0, 8)}{r.retry_attempt ? ` · attempt ${r.retry_attempt}` : ""} ↗</Link>
+                              )}
                               {r.brief_id && <Link to="/briefs" className="link" style={{ fontSize: 11 }} onClick={(e) => e.stopPropagation()}>brief {r.brief_id.slice(0, 8)} ↗</Link>}
                               <div className="spacer" style={{ flex: 1 }} />
                               <button className="btn ghost sm" title="Copy a shareable link to this run" onClick={(e) => { e.stopPropagation(); copyRunLink(rid); }}>{copied ? "✓ copied" : "Copy link"}</button>
@@ -667,6 +721,16 @@ export function Runs() {
                                   )}
                                   {r.recovery_route && r.recovery_action !== "inspect_run" && r.recovery_action !== "none" && (
                                     <Link to={r.recovery_route} className="btn ghost sm" onClick={(e) => e.stopPropagation()}>Fix setup ↗</Link>
+                                  )}
+                                  {/* One-click guarded retry — only for a retryable failed/interrupted
+                                      Shift with budget that hasn't already been retried. The runtime
+                                      re-checks every precondition and refuses if unsafe; this is NOT a
+                                      blind auto-retry. */}
+                                  {retryEligible(r) && !retriedSources.has(rid) && (
+                                    <button className="btn sm" title="Open a fresh retry of this Shift through the same governed run path" onClick={(e) => { e.stopPropagation(); retry(rid); }}>Retry Shift</button>
+                                  )}
+                                  {retriedSources.has(rid) && (
+                                    <Link to={`/runs?run=${encodeURIComponent(childOf.get(rid)!)}`} className="muted" style={{ fontSize: 11 }} onClick={(e) => e.stopPropagation()}>already retried → {childOf.get(rid)!.slice(0, 12)} ↗</Link>
                                   )}
                                 </div>
                               )}

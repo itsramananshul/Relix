@@ -82,12 +82,26 @@ does **not** do:
     budget (0 or 1, **not** an auto-retry counter), and a recommended
     action + dashboard route. It surfaces on `RunRecord` / `brief.runs` /
     the Brief detail's `latest_run` and drives the Action Center
-    `failed_or_refused` recovery card + the Runs-page recovery strip. What
-    it is **NOT**: it is **diagnosis + operator guidance only** — there is
-    **no autonomous retry orchestration**, **no blind auto-retry loop**,
-    and **no provider quota polling**; the operator still clicks the
-    recommended fix. The task-level `task.retry` recovery (a separate
-    layer on the Task ledger) is unchanged.
+    `failed_or_refused` recovery card + the Runs-page recovery strip.
+  - **Guarded operator Shift retry (Stage-2, v1) — SHIPPED.** A
+    retryable failed/interrupted Shift now has a **one-click operator
+    retry**: `POST /v1/runs/:run_id/retry` (capability `run.retry`)
+    opens **exactly one** child Shift through the SAME governed
+    preflight/execute path (same assignee/adapter checks, Claim,
+    workspace prep, run ledger, events) and links it to the source via
+    durable lineage (`brief_runs.retried_from_run_id` / `retry_attempt`,
+    with a partial UNIQUE index enforcing at-most-one child per source).
+    The runtime **refuses** unless the source is terminal-and-failure-like,
+    `retryable`, has budget, links a still-present in-tenant Brief, and has
+    no existing retry child; a Claim conflict surfaces as `already_running`
+    (409) and a second retry returns the EXISTING child (`already_retried`,
+    no second run). The Runs page shows a **Retry Shift** button only when
+    eligible. What this is still **NOT**: it is a **guarded one-click
+    operator action, NOT a blind auto-retry loop** — there is **no
+    autonomous retry orchestration**, **no LLM diagnostic pass**, and **no
+    provider quota polling**; the operator decides and clicks. The
+    task-level `task.retry` recovery (a separate layer on the Task ledger)
+    is unchanged.
 
 ### Run-workspace review/apply is inspect-and-copy, not a full VCS workflow
 
@@ -347,13 +361,17 @@ when you click Start. What it does **not** do:
     refusal-reason → action/route map for legacy rows), and rides the
     failure-class + retryable + remaining-budget along so the dashboard shows an
     honest recovery-class + retryable badge. It is **conservative**: a refusal is
-    never marked retryable (it needs an operator fix first), and the card still
-    invents **no retry button** — it points at the EXISTING governed route.
+    never marked retryable (it needs an operator fix first), and the Action
+    Center card still mints **no retry button** — it points at the EXISTING
+    governed route (the one-click Shift retry lives on the **Runs page**, which
+    carries the run id safely; see "Guarded operator Shift retry" above).
   - What it still does **not** do: classify the finer `blocked` sub-reasons as
-    distinct reasons; run **autonomous** retry/recovery (the diagnosis informs
-    the operator, it does not act); poll provider quotas; or push every field in
-    hard-realtime (the refresh is event-trigger + poll; the feed is capped at 60
-    with an honest `truncated` flag).
+    distinct reasons; run **autonomous** retry/recovery (the Stage-2 retry is an
+    **operator-triggered** one-click action, not an autonomous loop — the
+    diagnosis still only informs, the runtime never retries on its own); poll
+    provider quotas; or push every field in hard-realtime (the refresh is
+    event-trigger + poll; the feed is capped at 60 with an honest `truncated`
+    flag).
 
 In short: the *governance rails* of a company are in place and tenant-safe,
 the Shift Room makes the post-start loop legible (what ran / finished / is

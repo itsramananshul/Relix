@@ -421,6 +421,22 @@ ledger entry or design section.
    ONLY — **no autonomous retry orchestration**, **no blind auto-retry loop**, **no provider quota
    polling**, and **no fake retry button** (it points at the EXISTING governed route). The task-level
    `task.retry` recovery is a separate, unchanged layer.
+3e. **[BE/FE] Guarded operator Shift retry (Stage-2, bounded)** — **SHIPPED** (`execution-and-issue
+   §3.3b` Stage-2b *Retry now*). Turns the Stage-1 retryable verdict into a real **one-click**
+   operator recovery — **NOT** a blind auto-retry loop and **NOT** an autonomous CEO. Additive
+   `brief_runs.retried_from_run_id` / `retry_attempt` lineage + a partial UNIQUE index enforcing
+   at-most-one child per source (the duplicate guard). New capability `run.retry` + route
+   `POST /v1/runs/:run_id/retry`: a pure tenant-scoped `retry_precheck` refuses unless the source is
+   terminal-and-failure-like (`failed`/`interrupted`), `retryable`, has budget, and links a
+   still-present in-tenant Brief with no existing child; eligible runs open **exactly one** child
+   through the SAME `preflight_run` path as `brief.run` (shared adapter/Claim/workspace/ledger/
+   governance) and stamp the lineage + chronicle `brief.retry_requested` / `retry_started`. Honest
+   HTTP mapping: started/`already_retried` → 200 (idempotent, returns the existing child), claim
+   conflict → 409, precondition refusal → 400, not-found/cross-tenant → 404 (no leak). The Runs page
+   shows a **Retry Shift** button only when eligible (+ lineage links); the Action Center is left
+   unchanged (its card carries no run id). *Honest scope:* operator-triggered only — **no autonomous
+   retry on the heartbeat path**, **no LLM diagnostic pass / Inbox card** (Block/Reassign/Investigate
+   not built), **no provider quota polling**.
 
 **P3 — depth / autonomy**
 9b. **[BE/FE] Prime guided driver v1** — **SHIPPED (bounded one-step guide, NOT an autonomous CEO).**
