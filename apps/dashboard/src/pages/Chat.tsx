@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, subscribePrimeStatus, type StatusStreamConn } from "../api";
+import {
+  api,
+  primeDriver,
+  subscribePrimeStatus,
+  type PrimeNextStep,
+  type StatusStreamConn,
+} from "../api";
 
 // ── Prime Assistant proposal shapes (from /v1/spine/prime/propose) ──────────
 interface CrewSlot { role?: string; have?: boolean; agent_name?: string }
@@ -442,6 +448,18 @@ function ShiftRoom({ proposalId }: { proposalId: string }) {
   const [err, setErr] = useState<string | null>(null);
   const [acting, setActing] = useState<string | null>(null);
   const [conn, setConn] = useState<StatusStreamConn>("connecting");
+  const [nextStep, setNextStep] = useState<PrimeNextStep | null>(null);
+  const [advancing, setAdvancing] = useState(false);
+
+  // The guided-driver next step — READ-ONLY; refreshed alongside status.
+  const loadNextStep = useCallback(async () => {
+    try {
+      setNextStep(await primeDriver.nextStep(proposalId));
+    } catch {
+      // The driver is an optional overlay — a failure here must not blank the
+      // Shift Room. Leave the prior next step (or none).
+    }
+  }, [proposalId]);
 
   const refresh = useCallback(async () => {
     try {
@@ -451,7 +469,25 @@ function ShiftRoom({ proposalId }: { proposalId: string }) {
     } catch (e) {
       setErr(e instanceof Error ? e.message : "status failed");
     }
-  }, [proposalId]);
+    await loadNextStep();
+  }, [proposalId, loadNextStep]);
+
+  // Run ONE safe governed step the driver offered, then re-read. A stale request
+  // (409) or a governance refusal just re-reads so the operator sees the truth —
+  // the driver never fakes a success.
+  async function advanceStep() {
+    if (!nextStep?.can_advance || !nextStep.advance_action) return;
+    setAdvancing(true);
+    try {
+      await primeDriver.advance(proposalId, nextStep.advance_action);
+      setErr(null);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "advance failed");
+    } finally {
+      await refresh();
+      setAdvancing(false);
+    }
+  }
 
   // One immediate fetch for instant data + a fallback if the stream never
   // connects (e.g. SSE unsupported behind a proxy).
@@ -468,6 +504,8 @@ function ShiftRoom({ proposalId }: { proposalId: string }) {
         (s) => {
           setStatus(s as SessionStatus);
           setErr(null);
+          // Keep the driver's next step in lock-step with each pushed change.
+          loadNextStep();
         },
         (c) => setConn(c),
         () => setErr("This work session is no longer available."),
@@ -521,6 +559,41 @@ function ShiftRoom({ proposalId }: { proposalId: string }) {
           Refresh
         </button>
       </div>
+
+      {/* Prime guided driver — the ONE next governed step. When the driver may
+          safely take it (create the Team Plan / orchestrate-assign a ready team),
+          a restrained "Advance one step" runs it through the existing gated
+          route. Otherwise it shows the route to take by hand — approvals, hires,
+          and Start stay explicit operator decisions. */}
+      {nextStep && (
+        <div className="shift-room-row" style={{ marginTop: 8, alignItems: "flex-start" }}>
+          <span className="badge todo" style={{ fontSize: 9, minWidth: 64, textAlign: "center" }}>
+            next step
+          </span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 12 }}>{nextStep.label}</div>
+            <div className="muted" style={{ fontSize: 10 }}>{nextStep.reason}</div>
+            {!nextStep.can_advance && nextStep.route && (
+              <div className="muted" style={{ fontSize: 10, marginTop: 2 }}>
+                Route: <span className="mono">{nextStep.route}</span>
+              </div>
+            )}
+          </div>
+          {nextStep.can_advance && nextStep.advance_action ? (
+            <button
+              className="btn"
+              style={{ fontSize: 11, padding: "2px 8px" }}
+              disabled={advancing}
+              onClick={advanceStep}
+              title="Run this one governed step now through the existing gated route. The driver advances at most one step and never approves a strategy, hire, or budget gate."
+            >
+              {advancing ? "Advancing…" : "Advance one step"}
+            </button>
+          ) : (
+            <span className="muted" style={{ fontSize: 10 }}>operator step</span>
+          )}
+        </div>
+      )}
 
       {/* Roll-up counts — only the non-zero buckets, so it reads at a glance. */}
       <div className="row wrap" style={{ gap: 6, marginTop: 8 }}>

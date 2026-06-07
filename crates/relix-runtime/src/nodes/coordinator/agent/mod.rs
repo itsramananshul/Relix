@@ -18,6 +18,7 @@ pub mod action_center;
 pub mod handlers;
 pub mod keys;
 pub mod prime;
+pub mod prime_driver;
 pub mod prime_plan;
 pub mod store;
 

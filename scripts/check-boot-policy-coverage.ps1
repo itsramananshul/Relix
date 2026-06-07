@@ -70,8 +70,9 @@ $RequiredCapabilities = @(
     'guild.counts', 'guild.get', 'guild.spend',
     # Company / Founder bootstrap (company.* routes)
     'company.status', 'company.actions', 'company.starter_crew', 'company.bootstrap_founder',
-    # Prime hiring path + status (incl. the status-stream dependencies)
+    # Prime hiring path + status (incl. the status-stream dependencies) + guided driver v1
     'prime.propose', 'prime.approve', 'prime.start', 'prime.status', 'prime.proposals', 'prime.proposal',
+    'prime.next_step', 'prime.advance',
     # Mandate + strategy gate
     'mandate.create', 'mandate.list', 'mandate.tree', 'mandate.orchestrate',
     'mandate.strategy.propose', 'mandate.strategy.approve', 'mandate.strategy.reject', 'mandate.strategy.status',

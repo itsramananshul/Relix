@@ -619,6 +619,53 @@ export function subscribeRunEvents(
   };
 }
 
+// ── Prime guided driver v1 (next governed step + one-step advance) ──────────
+// The READ-ONLY next step for a Prime work session, plus the bounded one-step
+// advance. The advance runs AT MOST ONE safe governed step through the existing
+// gated route; a stale request returns HTTP 409 (re-read and try again). It
+// never auto-approves a strategy / hire / spawn / budget gate.
+
+export interface PrimeNextStep {
+  phase: string;
+  label: string;
+  reason: string;
+  route: string;
+  action_api: string;
+  can_advance: boolean;
+  advance_action: string | null;
+  proposal_id: string | null;
+  mandate_id: string | null;
+  plan_id: string | null;
+  strategy_status: string | null;
+  missing_roles: string[];
+  pending_hires: unknown[];
+  pending_clearances: unknown[];
+  counts: Record<string, number>;
+}
+
+export interface PrimeAdvanceResult {
+  advanced: boolean;
+  refused?: string;
+  requested_action?: string;
+  action?: string;
+  reason?: string;
+  mandate_id?: string;
+  result?: unknown;
+  next_step: PrimeNextStep | null;
+}
+
+export const primeDriver = {
+  nextStep: (proposalId: string) =>
+    api.get<PrimeNextStep>(
+      `/v1/spine/prime/proposals/${encodeURIComponent(proposalId)}/next-step`,
+    ),
+  advance: (proposalId: string, action: string) =>
+    api.post<PrimeAdvanceResult>(
+      `/v1/spine/prime/proposals/${encodeURIComponent(proposalId)}/advance`,
+      { action },
+    ),
+};
+
 // ── Dedicated Prime Shift-Room status stream (SSE) ─────────────────────────
 // Subscribe to the bridge's dedicated `/v1/spine/prime/proposals/:id/status/
 // stream` feed so the Shift Room renders the live session status pushed by the

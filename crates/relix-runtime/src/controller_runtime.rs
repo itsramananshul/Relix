@@ -3346,6 +3346,48 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // PRIME GUIDED DRIVER v1 (company-model §5.4/§8.2 — the Action Center's
+    // "next governed step" focused onto a single Prime work session; §12.5/§12.5B
+    // — the Prime planner + prime.start). `prime.next_step` is READ-ONLY (classify
+    // the one next step for a proposal/mandate over live state); `prime.advance`
+    // executes AT MOST ONE safe, explicitly-requested governed step
+    // (`create_team_plan` / `orchestrate_assign_ready`) by re-reading state and
+    // refusing if it is stale — it NEVER auto-approves a strategy/hire/spawn/budget
+    // gate and NEVER runs a real adapter. Both tenant-scoped.
+    if let Some(spine) = spine_store.clone() {
+        let s = agent_store.clone();
+        let ts = task_store.clone();
+        bridge.register(
+            "prime.next_step",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let spine = spine.clone();
+                let ts = ts.clone();
+                async move {
+                    crate::nodes::coordinator::agent::prime_driver::handle_prime_next_step(
+                        &s, &spine, &ts, &ctx,
+                    )
+                }
+            })),
+        );
+    }
+    if let Some(spine) = spine_store.clone() {
+        let s = agent_store.clone();
+        let ts = task_store.clone();
+        bridge.register(
+            "prime.advance",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let spine = spine.clone();
+                let ts = ts.clone();
+                async move {
+                    crate::nodes::coordinator::agent::prime_driver::handle_prime_advance(
+                        &s, &spine, &ts, &ctx,
+                    )
+                }
+            })),
+        );
+    }
     // ACTION CENTER (company-model §5.4 / §8.2): one READ-ONLY feed of the
     // operator's next actions, computed from existing live state (approvals,
     // hires, the Brief board, the run ledger, the strategy gate). Tenant-scoped;

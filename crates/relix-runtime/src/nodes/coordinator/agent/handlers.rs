@@ -1001,12 +1001,12 @@ pub fn handle_prime_start(
 /// One created Brief's live state in the Shift Room (PART A). Read-only — it
 /// joins the Brief card, its open blockers, and its latest Shift (run) from the
 /// existing stores. No new state is invented.
-struct BriefStatus {
-    json: serde_json::Value,
+pub(crate) struct BriefStatus {
+    pub(crate) json: serde_json::Value,
     /// The bucket this Brief counts toward (`running` / `done` / `blocked` /
     /// `needs_review` / `refused` / `failed` / `ready` / `unassigned` /
     /// `not_ready` / `missing`).
-    bucket: &'static str,
+    pub(crate) bucket: &'static str,
 }
 
 /// Compose one created Brief's live Shift-Room row. PURE w.r.t. the stores it
@@ -1014,7 +1014,7 @@ struct BriefStatus {
 /// `tenant`'s Guild; `tenant` is threaded through so the open-blocker read is
 /// itself tenant-scoped — a legacy `blocked_on` edge that crosses Guilds can
 /// never surface a cross-tenant blocker here.
-fn brief_status_row(
+pub(crate) fn brief_status_row(
     agent_store: &AgentStore,
     task_store: &TaskStore,
     tenant: &str,
@@ -4935,7 +4935,7 @@ pub fn handle_standing_revoke(store: &AgentStore, ctx: &InvocationCtx) -> Handle
 
 // ── helpers ──────────────────────────────────────────────
 
-fn invalid(cause: String) -> HandlerOutcome {
+pub(crate) fn invalid(cause: String) -> HandlerOutcome {
     HandlerOutcome::Err(ErrorEnvelope {
         kind: error_kinds::INVALID_ARGS,
         cause,
@@ -4944,7 +4944,7 @@ fn invalid(cause: String) -> HandlerOutcome {
     })
 }
 
-fn internal(cause: String) -> HandlerOutcome {
+pub(crate) fn internal(cause: String) -> HandlerOutcome {
     HandlerOutcome::Err(ErrorEnvelope {
         kind: error_kinds::RESPONDER_INTERNAL,
         cause,

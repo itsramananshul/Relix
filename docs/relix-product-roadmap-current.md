@@ -94,6 +94,21 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
 - **Orchestration** — `mandate.orchestrate` (`plan_only` / `create_briefs` /
   `assign_ready`) builds a deterministic, idempotent 3-tier Brief tree; missing/pending/
   blocked roles get durable placeholder tracks.
+- **Prime guided driver v1** (company-model §5.4/§8.2 + §12.5/§12.5B) — `prime.next_step`
+  (READ-ONLY) classifies the ONE next governed step for a Prime proposal or a Mandate over
+  live state (approval → strategy gate → team plan + live readiness → Brief board → run
+  ledger), with a `phase` / `label` / `reason` / `route` / `can_advance` / `advance_action`.
+  `prime.advance` runs **at most one** safe, explicitly-requested step
+  (`create_team_plan` — plan from the Mandate's existing active crew, adopts active
+  Operatives + mints **no** hires; or `orchestrate_assign_ready` — existing
+  `mandate.orchestrate` in `assign_ready` mode), re-reading state and **refusing as stale
+  (HTTP 409, no side effects)** when the requested action is no longer current, through the
+  same governed handler + Keys as the manual route. It is **not** an autonomous CEO: no
+  blind loop, never auto-approves a strategy/hire/spawn/budget gate, never runs a real
+  adapter (Start stays the explicit button), one click = one step. Bridge:
+  `GET /v1/spine/{prime/proposals,mandates}/:id/next-step` +
+  `POST …/advance`; dashboard: the Chat Shift Room shows the next step + a restrained
+  **Advance one step** button when `can_advance`, else the route to take by hand.
 
 ### Briefs / Workroom (`relix-execution-and-issue-design.md` §1, §1.9)
 - **Two-pointer Claim** — `checkout_run` + `execution_run`, self-refresh, lease/release,
@@ -372,6 +387,18 @@ ledger entry or design section.
    `task.retry` recovery is a separate, unchanged layer.
 
 **P3 — depth / autonomy**
+9b. **[BE/FE] Prime guided driver v1** — **SHIPPED (bounded one-step guide, NOT an autonomous CEO).**
+   Closes part of the long-standing "the Prime/company flow is governed but not a driver" gap honestly.
+   `prime.next_step` (READ-ONLY) names the ONE next governed step for a proposal/Mandate from live
+   state; `prime.advance` runs **one** safe, explicitly-requested step (`create_team_plan` /
+   `orchestrate_assign_ready`) through the existing gated handler, re-reading state and **refusing as
+   stale (409) with no side effects** on mismatch. It **never** auto-approves a strategy/hire/spawn/
+   budget gate, **never** runs a real adapter (Start stays the explicit button), and is **not** a blind
+   loop — one click advances one step. *Files:* `crates/relix-runtime/src/nodes/coordinator/agent/prime_driver.rs`
+   (+ `controller_runtime.rs` registration, `handlers.rs` reuse), `crates/relix-web-bridge/src/{spine.rs,main.rs}`
+   (4 routes + 409 mapping), `apps/dashboard/src/{api.ts,pages/Chat.tsx}`, the boot scripts +
+   coverage manifest, rebuilt `dashboard-dist`. *Still deferred:* a true end-to-end autonomous driver
+   (propose → approve → staff → orchestrate → run on its own) — out of scope and intentionally not built.
 9. **[BE/FE] Smarter companion** — **BACKEND SHIPPED (now AI-assisted action selection, opt-in +
    validated + fallback; still one-turn / one-action, NOT autonomous).**
    The `POST /v1/spine/companion` parser is a **company-aware action spine**

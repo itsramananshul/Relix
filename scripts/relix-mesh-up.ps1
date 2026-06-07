@@ -1532,6 +1532,14 @@ name = "spine_prime_status"
 method = "prime.status"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_prime_next_step"
+method = "prime.next_step"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_prime_advance"
+method = "prime.advance"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_mandate_team_plan"
 method = "mandate.team_plan"
 allow_groups = ["chat-users"]

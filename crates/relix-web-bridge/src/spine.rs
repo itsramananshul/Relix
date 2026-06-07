@@ -664,6 +664,80 @@ pub async fn prime_status(
     json_passthrough(call_peer(&state, "prime.status", id.as_bytes()).await?)
 }
 
+/// Body for a one-step advance: the exact action the driver returned.
+#[derive(Debug, Deserialize)]
+pub struct AdvanceRequest {
+    pub action: String,
+}
+
+/// `GET /v1/spine/prime/proposals/:id/next-step` — the Prime guided driver's
+/// READ-ONLY next governed step for a Prime work session (company-model
+/// §5.4/§8.2 + §12.5). Proxies `prime.next_step`. Tenant-scoped: an unknown /
+/// cross-Guild proposal reads as not-found.
+pub async fn prime_proposal_next_step(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if id.trim().is_empty() {
+        return Err(bad("proposal_id required"));
+    }
+    let arg = serde_json::json!({ "proposal_id": id.trim() }).to_string();
+    json_passthrough(call_peer(&state, "prime.next_step", arg.as_bytes()).await?)
+}
+
+/// `GET /v1/spine/mandates/:id/next-step` — the driver's next governed step for
+/// a Mandate. Proxies `prime.next_step`. Tenant-scoped.
+pub async fn mandate_next_step(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if id.trim().is_empty() {
+        return Err(bad("mandate_id required"));
+    }
+    let arg = serde_json::json!({ "mandate_id": id.trim() }).to_string();
+    json_passthrough(call_peer(&state, "prime.next_step", arg.as_bytes()).await?)
+}
+
+/// `POST /v1/spine/prime/proposals/:id/advance` — execute ONE safe, explicitly-
+/// requested governed step for a Prime work session. Body `{ "action": … }`.
+/// Proxies `prime.advance`, which re-reads state and refuses (no side effects)
+/// if the requested action is no longer the current next step — a stale refusal
+/// is mapped to an honest **409**, not a 502. Tenant-scoped.
+pub async fn prime_proposal_advance(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AdvanceRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if id.trim().is_empty() {
+        return Err(bad("proposal_id required"));
+    }
+    if req.action.trim().is_empty() {
+        return Err(bad("action required"));
+    }
+    let arg = serde_json::json!({ "proposal_id": id.trim(), "action": req.action.trim() })
+        .to_string();
+    advance_response(call_peer(&state, "prime.advance", arg.as_bytes()).await?)
+}
+
+/// `POST /v1/spine/mandates/:id/advance` — execute ONE governed step for a
+/// Mandate. Body `{ "action": … }`. Proxies `prime.advance`; a stale refusal is
+/// mapped to **409**. Tenant-scoped.
+pub async fn mandate_advance(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AdvanceRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if id.trim().is_empty() {
+        return Err(bad("mandate_id required"));
+    }
+    if req.action.trim().is_empty() {
+        return Err(bad("action required"));
+    }
+    let arg =
+        serde_json::json!({ "mandate_id": id.trim(), "action": req.action.trim() }).to_string();
+    advance_response(call_peer(&state, "prime.advance", arg.as_bytes()).await?)
+}
+
 /// Forced `prime.status` refresh interval — a poll fallback so the Shift Room
 /// converges even if a run event is missed or the run-event source is absent.
 /// Low enough to feel live, high enough not to spin.
@@ -2465,6 +2539,34 @@ fn run_report_response(body: Vec<u8>) -> Result<Response, (StatusCode, Json<ApiE
     }
 }
 
+/// The `prime.advance` body field set when the driver REFUSED a one-step
+/// advance because the requested action is no longer the current next step. The
+/// capability returns it as an `Ok` body (not a mesh error), so the bridge
+/// inspects the body and maps it onto a **409 Conflict** — a stale, retry-after-
+/// re-read condition, not an upstream failure. Mirrors `run_report_response`.
+const ADVANCE_STALE_STATUS: &str = "stale_action";
+
+/// Map a `prime.advance` body onto an honest HTTP status. A stale refusal
+/// (`refused == "stale_action"`) becomes **409 Conflict** carrying the structured
+/// body (so the dashboard sees the fresh `next_step`); a successful advance
+/// (`advanced == true`) and everything else pass through unchanged as `200`.
+fn advance_response(body: Vec<u8>) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let is_stale = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("refused")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some(ADVANCE_STALE_STATUS);
+    if is_stale {
+        json_with_status(StatusCode::CONFLICT, body)
+    } else {
+        json_passthrough(body)
+    }
+}
+
 /// Map a coordinator error envelope (`kind` + `cause`) onto an honest
 /// HTTP status for the dashboard. Narrow + consistent with the bridge's
 /// other routes (see `agent.rs`'s `SECURITY_DENIED → 403`) and the
@@ -3094,6 +3196,48 @@ mod tests {
             .route(
                 "/v1/spine/prime/proposals/:id/status/stream",
                 get(prime_status_stream),
-            );
+            )
+            // Prime guided driver v1: next governed step + one-step advance,
+            // for both the proposal and the mandate entry. Static `next-step` /
+            // `advance` segments must not collide with the sibling `:id/...`
+            // params (they do not).
+            .route(
+                "/v1/spine/prime/proposals/:id/next-step",
+                get(prime_proposal_next_step),
+            )
+            .route(
+                "/v1/spine/prime/proposals/:id/advance",
+                post(prime_proposal_advance),
+            )
+            .route("/v1/spine/mandates/:id/next-step", get(mandate_next_step))
+            .route("/v1/spine/mandates/:id/advance", post(mandate_advance));
+    }
+
+    #[test]
+    fn advance_stale_refusal_is_a_409_never_a_retryable_200() {
+        // A stale one-step advance (`refused == "stale_action"`) is a
+        // re-read-then-retry condition, NOT an upstream failure: it must surface
+        // as 409 Conflict carrying the fresh next_step, never a 200 the dashboard
+        // blindly treats as success.
+        let stale = advance_response(
+            br#"{"advanced":false,"refused":"stale_action",
+                 "requested_action":"orchestrate_assign_ready",
+                 "next_step":{"phase":"needs_hire_approval"}}"#
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            stale.status(),
+            StatusCode::CONFLICT,
+            "a stale advance must be 409, not a retryable 200"
+        );
+
+        // A successful advance passes through as 200.
+        let ok = advance_response(
+            br#"{"advanced":true,"action":"create_team_plan","next_step":{"phase":"needs_orchestration"}}"#
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
     }
 }

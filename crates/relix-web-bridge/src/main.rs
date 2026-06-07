@@ -644,6 +644,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/spine/mandates/:id/orchestration/latest",
             get(spine::orchestration_latest),
         )
+        // Prime guided driver v1 (mandate entry): next governed step + one-step
+        // advance (company-model §5.4/§8.2 + §12.5).
+        .route("/v1/spine/mandates/:id/next-step", get(spine::mandate_next_step))
+        .route("/v1/spine/mandates/:id/advance", post(spine::mandate_advance))
         .route("/v1/spine/mandates/:id/strategy", get(spine::strategy_status))
         .route("/v1/spine/mandates/:id/strategy/propose", post(spine::strategy_propose))
         .route("/v1/spine/mandates/:id/strategy/approve", post(spine::strategy_approve))
@@ -681,6 +685,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/v1/spine/prime/proposals/:id/status",
             get(spine::prime_status),
+        )
+        // Prime guided driver v1 (proposal entry): next governed step + one-step
+        // advance. The advance maps a stale refusal to 409.
+        .route(
+            "/v1/spine/prime/proposals/:id/next-step",
+            get(spine::prime_proposal_next_step),
+        )
+        .route(
+            "/v1/spine/prime/proposals/:id/advance",
+            post(spine::prime_proposal_advance),
         )
         // Composite Desk/Inbox + Brief live-thread payloads.
         .route("/v1/spine/inbox", get(spine::inbox))

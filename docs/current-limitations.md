@@ -188,9 +188,26 @@ when you click Start. What it does **not** do:
   (company-model §12.5B) closes the loop — it turns the approved Mandate's
   ready Briefs into real Shifts through the same governed run path as a manual
   run (approved-only, ready-only, every skipped Brief reported with a reason) —
-  but it is still an operator-initiated gate, not an auto-pilot. There is no
-  driver that takes a goal end-to-end (propose → approve → staff → orchestrate
-  → run) on its own.
+  but it is still an operator-initiated gate, not an auto-pilot.
+- **There is a bounded "guided driver" (v1), NOT a full autonomous driver.**
+  `prime.next_step` (READ-ONLY) classifies the ONE next governed step for a
+  proposal or Mandate over live state — approval, strategy gate, team plan + live
+  readiness (hires / Clearances), the Brief board, and the run ledger
+  (company-model §5.4/§8.2, the Action Center's "next step" focused onto a single
+  work session). `prime.advance` then runs **at most one** safe, explicitly-
+  requested step: `create_team_plan` (record a Team Plan from the Mandate's
+  existing active crew — adopts active Operatives, mints **no** hires) or
+  `orchestrate_assign_ready` (the existing `mandate.orchestrate` in `assign_ready`
+  mode). It re-reads state and **refuses (no side effects, HTTP 409) when the
+  requested action is no longer the current next step**, executes through the same
+  governed handler + Keys as the manual route, and surfaces every governance
+  refusal honestly. What it explicitly does **NOT** do: there is **no blind
+  autonomous loop**; it **never** auto-approves a strategy / hire / spawn / budget
+  gate (those stay human); it **never** runs a real adapter — `start_work` is
+  routed to the existing explicit Prime **Start** button, not auto-advanced; and a
+  single click advances **one** step only. So there is still no driver that takes
+  a goal end-to-end (propose → approve → staff → orchestrate → run) on its own —
+  this is one-step, operator-clicked advancement through existing governed routes.
 - **Hiring is request → approve only.** Prime suggests *which roles* are
   missing and files them as `pending` hire requests on approval, but it does
   not decide *which person/identity* to hire, and a pending hire is inert until
@@ -330,11 +347,15 @@ when you click Start. What it does **not** do:
 In short: the *governance rails* of a company are in place and tenant-safe,
 the Shift Room makes the post-start loop legible (what ran / finished / is
 blocked / needs review, with the next action one click away) over a dedicated
-low-latency status stream (polling fallback, honest badge), and a model can
-now draft the plan **opt-in** behind a server-authoritative validator — but the
-default Prime is still rules, the model only shapes the *interpretation* (never
-crew/governance), and there is no autonomous driver that reasons about strategy +
-team + work end to end.
+low-latency status stream (polling fallback, honest badge), a model can
+now draft the plan **opt-in** behind a server-authoritative validator, and a
+bounded **guided driver (v1)** now names the ONE next governed step and can
+advance **one** safe step at a time on explicit operator click (`prime.next_step`
+/ `prime.advance` — `create_team_plan` / `orchestrate_assign_ready` only, stale-
+safe, governance unchanged) — but the default Prime is still rules, the model
+only shapes the *interpretation* (never crew/governance), approvals + hire
+decisions + Start stay human, and there is still no **autonomous** driver that
+reasons about strategy + team + work end to end on its own.
 
 ### Bridge persists every chat as a Task (fail-soft)
 
