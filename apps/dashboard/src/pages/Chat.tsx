@@ -31,7 +31,15 @@ interface ApproveResponse {
   hire_requests?: string[];
   already_approved?: boolean;
 }
-interface CompanionResponse { action?: string; reply?: string; result?: unknown }
+interface CompanionResponse {
+  action?: string;
+  reply?: string;
+  result?: unknown;
+  /** "llm_used" | "fallback" | "unavailable" (only present for mode:"ai") */
+  ai_mode?: string;
+  ai_used?: boolean;
+  ai_reason?: string;
+}
 // Start-to-Shift (POST /v1/spine/prime/start).
 interface StartedShift { brief_id?: string; run_id?: string; rig?: string; status?: string }
 interface SkippedBrief { brief_id?: string; reason?: string }
@@ -211,7 +219,9 @@ export function Chat() {
     }
   }
 
-  // Quick companion command (the rule-based single-action path).
+  // Quick companion command (single governed action). With "Use AI" checked the
+  // model SELECTS the action (validated server-side into the same governed path);
+  // otherwise the deterministic parser chooses it. Either way it's one action.
   async function send() {
     const message = text.trim();
     if (!message || busy) return;
@@ -219,7 +229,8 @@ export function Chat() {
     setLog((l) => [...l, { role: "user", kind: "text", text: message }]);
     setBusy(true);
     try {
-      const res = await api.post<CompanionResponse>("/v1/spine/companion", { message });
+      const body = useAi ? { message, mode: "ai" } : { message };
+      const res = await api.post<CompanionResponse>("/v1/spine/companion", body);
       const reply =
         res.reply ||
         (res.action ? `Done: ${res.action}` : "OK.") +

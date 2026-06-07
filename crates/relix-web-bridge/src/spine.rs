@@ -419,7 +419,7 @@ pub struct PrimeProposeRequest {
 /// The AI node's mesh alias (the chat flow already routes `remote_call("ai",
 /// …)` here). Overridable for non-default topologies; absence simply means the
 /// model path reports `unavailable` and the deterministic plan is used.
-fn ai_peer_alias() -> String {
+pub(crate) fn ai_peer_alias() -> String {
     std::env::var("RELIX_PRIME_AI_PEER").unwrap_or_else(|_| "ai".to_string())
 }
 
@@ -457,7 +457,7 @@ pub async fn prime_propose(
     let roster = fetch_prime_roster(&state).await;
     let prompt = build_prime_ai_prompt(&redacted, &roster);
 
-    let coord_arg = match call_ai_chat(&state, &prompt).await {
+    let coord_arg = match call_ai_chat(&state, "prime-planner", &prompt).await {
         Ok(model_output) => serde_json::json!({
             "message": msg,
             "model_output": model_output,
@@ -528,15 +528,21 @@ Operator request: {redacted_request}"
 
 /// Call `ai.chat` on the AI peer with the JSON arg form (pipe-safe). Returns the
 /// model's reply text, or a short honest reason on any failure (the caller
-/// turns that into `ai_mode = unavailable`). Never surfaces secrets.
-async fn call_ai_chat(state: &AppState, prompt: &str) -> Result<String, String> {
+/// turns that into `ai_mode = unavailable`). Never surfaces secrets. `session_id`
+/// scopes the model conversation (e.g. `prime-planner`, `companion-actions`) so
+/// distinct request-time AI seams don't share a session.
+pub(crate) async fn call_ai_chat(
+    state: &AppState,
+    session_id: &str,
+    prompt: &str,
+) -> Result<String, String> {
     let mesh = state
         .mesh_client
         .as_ref()
         .ok_or_else(|| "bridge mesh client not initialized".to_string())?;
     let deadline_secs = state.cfg.transport.deadline_secs.clamp(5, 60);
     let arg = serde_json::json!({
-        "session_id": "prime-planner",
+        "session_id": session_id,
         "prompt": prompt,
         "history": "",
     });

@@ -340,8 +340,9 @@ ledger entry or design section.
    `agent_id`), so there is no global session list.
 
 **P3 — depth / autonomy**
-9. **[BE/FE] Smarter companion** — **BACKEND SHIPPED (partial; still deterministic, not an LLM).**
-   The `POST /v1/spine/companion` parser is now a **company-aware action spine**
+9. **[BE/FE] Smarter companion** — **BACKEND SHIPPED (now AI-assisted action selection, opt-in +
+   validated + fallback; still one-turn / one-action, NOT autonomous).**
+   The `POST /v1/spine/companion` parser is a **company-aware action spine**
    (`relix-dashboard-design.md` §13): beyond create/move/comment, it reads live company state in
    plain language — `what needs attention` → `company.actions` (ranked next actions),
    `what is blocked` → `brief.blocked_list`, `what is running` → `brief.runs` (active Shifts),
@@ -350,9 +351,20 @@ ledger entry or design section.
    (`plan package <brief_id>: <body> => child: <t>; child high: <t>`) via `brief.plan_package_open`,
    refusing an empty body or zero children and **never** bypassing the approval-bound confirm
    (priorities only, no assignee hints). Every read/write goes through the SAME mesh capabilities +
-   governance the dashboard uses. `prime.propose` AI mode is still opt-in and rule-validated;
-   replacing the deterministic parser with an LLM driving these SAME governed spine APIs remains
-   future (`current-limitations.md`; ledger "Mandate orchestration" still not autonomous).
+   governance the dashboard uses. **New: an opt-in `mode:"ai"` adds model-assisted *action
+   selection*** (mirroring the Prime planner seam): the bridge sends the AI peer a bounded,
+   secret-redacted prompt (the operator message + a few company-context summary lines, never a JSON
+   dump) and the model may ONLY return ONE strict-JSON action from a fixed allowlist. The bridge
+   **validates** that choice into the existing `CompanionAction` enum — enforcing the same
+   constraints as the parser (no unsafe pipes, valid board statuses, valid priorities, plan packages
+   need a body + ≥1 child, no smuggled assignee hints) — and then runs it through the **exact same
+   governed handler** as the deterministic path. The model never calls a tool, never has freeform
+   text executed, and never picks a capability. On AI unavailable / invalid JSON / disallowed action
+   / unsafe fields, it **falls back to the deterministic parser** with an honest `ai_mode`
+   (`llm_used` / `fallback` / `unavailable`) + a safe reason, and the reply says so — it never fakes
+   an AI success. The dashboard's "Use AI" checkbox now drives the Command button too. **Still one
+   turn → one validated action; no autonomous planner/agent loop** (`current-limitations.md`; ledger
+   "Mandate orchestration" still not autonomous).
 10. **[BE] Exactly-once decomposition + auto-wake promotion** — **both parts are now BACKEND
     SHIPPED** (exactly-once decomposition partial; see below). **Auto-wake promotion**
     (`execution §1.6/§3.1`; see §5 slice 12). When a Brief reaches a
