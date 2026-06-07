@@ -697,9 +697,13 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
     `brief.plan_package_open` links an approval-bound confirm to a `plan` Dossier **and** a
     `suggest_tasks` proposal (new `bound_interaction_id` column); `brief.plan_confirm_respond` accept
     re-checks the plan is latest then materializes the linked proposal exactly once through the
-    resumable ledger (idempotent duplicate accept; reject closes both). *Still deferred:* full issue
-    document authoring / revision-locking / forking (§1.8), a dashboard plan-package editor (only the
-    safe response path ships), and an autonomous LLM planner.
+    resumable ledger (idempotent duplicate accept; reject closes both). **The dashboard now has a
+    minimal manual plan-package composer** (plan title/body + approval prompt + a child-task list with
+    optional priority and an earlier-sibling `after` dependency) wired to `briefPlanConfirms.open`, so
+    a human can open a plan package from the workroom; the created bound confirm is then approved
+    through the already-safe response path. *Still deferred:* full issue document authoring /
+    revision-locking / forking (§1.8) and an autonomous LLM planner — the composer is a manual editor,
+    not a full document editor or LLM planner.
 
 > After completing a slice: re-open the cited section, update the implementation map /
 > divergence ledger in `product-spine-implementation.md`, and update this file's §2/§3 so

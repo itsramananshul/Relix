@@ -11,6 +11,7 @@ import {
   briefPlanConfirms,
   type RunDiff,
   type BriefInteraction,
+  type SuggestChild,
 } from "../api";
 import { useAuth } from "../auth";
 import { Badge, useAsync } from "./common";
@@ -79,6 +80,21 @@ const IX_STATUS_TONE: Record<string, string> = {
   rejected: "blocked",
   expired: "todo",
 };
+
+// Plan-package composer (§1.7/§1.8/§3.1): the priority options a child task
+// may carry — the same `low|normal|high|urgent` set the proposal validator
+// accepts (`brief::normalize_proposal`); empty ⇒ the child opens at the default.
+const PRIORITY_OPTS = ["low", "normal", "high", "urgent"];
+
+// One editable child-task row in the composer. `id` is a stable local key so a
+// dependency (`afterId`) survives reorders/removals without index drift; it is
+// resolved to the proposal's 0-based `after` index only at submit time.
+interface ComposerChild {
+  id: number;
+  title: string;
+  priority: string; // "" = default (omit)
+  afterId: number | null; // local id of an EARLIER sibling, or null
+}
 
 // Run status → badge tone (mirrors the Runs page).
 const RUN_TONE: Record<string, string> = {
@@ -204,6 +220,29 @@ export function BriefDetail({
   const [ixDraft, setIxDraft] = useState<Record<string, string>>({});
   // Busy flag while a plan-approval confirm is being opened (§1.8).
   const [planBusy, setPlanBusy] = useState(false);
+  // Plan-package composer state (§1.7/§1.8/§3.1). A minimal MANUAL composer —
+  // a plan title/body + an approval prompt + a small child-task list — that
+  // opens a plan package (plan Dossier + suggest_tasks proposal + bound
+  // confirm) through `briefPlanConfirms.open`. Collapsed by default to keep the
+  // workroom calm; the created bound confirm then answers through the already-
+  // safe response path in Requests.
+  const [composerOpen, setComposerOpen] = useState(false);
+  const [composerBusy, setComposerBusy] = useState(false);
+  const [planTitle, setPlanTitle] = useState("");
+  const [planBody, setPlanBody] = useState("");
+  const [planPrompt, setPlanPrompt] = useState("");
+  const childSeq = useRef(0);
+  const newChild = (): ComposerChild => ({
+    id: childSeq.current++,
+    title: "",
+    priority: "",
+    afterId: null,
+  });
+  const [planChildren, setPlanChildren] = useState<ComposerChild[]>(() => [newChild()]);
+  const updateChild = (id: number, patch: Partial<ComposerChild>) =>
+    setPlanChildren((cs) => cs.map((c) => (c.id === id ? { ...c, ...patch } : c)));
+  const removeChild = (id: number) =>
+    setPlanChildren((cs) => (cs.length === 1 ? cs : cs.filter((c) => c.id !== id)));
 
   // Load the Brief detail AND the fuller Chronicle timeline together. The
   // detail carries only a bounded `chronicle.recent`; the dedicated `/events`
@@ -351,6 +390,77 @@ export function BriefDetail({
       });
     } finally {
       setPlanBusy(false);
+    }
+  }
+
+  // Open a plan package from the dashboard (§1.7/§1.8/§3.1): a `plan` Dossier
+  // revision + a `suggest_tasks` proposal + an approval-bound `confirm` linked
+  // to both, in one call through the shipped `brief.plan_package_open`. This is
+  // a MANUAL composer — not a document editor or LLM planner — that makes the
+  // shipped backend usable from the dashboard. Validates locally (non-empty
+  // plan body, ≥1 child with a title) before submit; `after` is offered only
+  // for an EARLIER titled sibling, so a self/forward dependency can't be
+  // expressed in the UI. On success the bound confirm appears in Requests and
+  // is approved through the already-safe `briefPlanConfirms.respond` path
+  // (which materializes the proposal exactly once).
+  async function submitPlanPackage() {
+    const body = planBody.trim();
+    const rows = planChildren.filter((c) => c.title.trim());
+    if (!body) {
+      setBanner({ kind: "err", msg: "A plan package needs a plan body." });
+      return;
+    }
+    if (rows.length === 0) {
+      setBanner({ kind: "err", msg: "Add at least one child task with a title." });
+      return;
+    }
+    // Resolve each child's local `afterId` to a 0-based index over the KEPT
+    // (titled) rows, and only when it points at an earlier sibling — a row whose
+    // referenced task was left untitled or removed simply drops its dependency.
+    const idToIndex = new Map(rows.map((c, i) => [c.id, i] as const));
+    const childrenPayload: SuggestChild[] = rows.map((c, selfIdx) => {
+      const out: SuggestChild = { title: c.title.trim() };
+      if (c.priority) out.priority = c.priority;
+      if (c.afterId != null && idToIndex.has(c.afterId)) {
+        const depIdx = idToIndex.get(c.afterId)!;
+        if (depIdx < selfIdx) out.after = depIdx;
+      }
+      return out;
+    });
+    setComposerBusy(true);
+    setBanner(null);
+    try {
+      const r = await briefPlanConfirms.open(briefId, {
+        author: status?.username || "operator",
+        plan_title: planTitle.trim() || "Plan",
+        plan_body: body,
+        prompt: planPrompt.trim() || undefined,
+        children: childrenPayload,
+      });
+      const n = childrenPayload.length;
+      setBanner({
+        kind: "ok",
+        msg:
+          `Plan package created — ${n} task${n === 1 ? "" : "s"} proposed. ` +
+          `Approve the bound confirm (${r.confirm_id}) in Requests below to materialize them.`,
+      });
+      // Reset + close the composer for the next plan.
+      setPlanTitle("");
+      setPlanBody("");
+      setPlanPrompt("");
+      childSeq.current = 0;
+      setPlanChildren([newChild()]);
+      setComposerOpen(false);
+      reload();
+      // A new open confirm + proposal can add Action Center items (§1.9).
+      invalidate(["briefs", "actions"], { briefId });
+    } catch (e) {
+      setBanner({
+        kind: "err",
+        msg: e instanceof Error ? e.message : "Could not create the plan package",
+      });
+    } finally {
+      setComposerBusy(false);
     }
   }
 
@@ -786,6 +896,156 @@ export function BriefDetail({
           {planBusy ? "…" : "Request approval"}
         </button>
       </div>
+
+      {/* Plan package composer (§1.7/§1.8/§3.1; dashboard-design §7 planning
+          mode). A minimal MANUAL composer — NOT a document editor or LLM
+          planner — that opens a plan package (an immutable `plan` Dossier
+          revision + a `suggest_tasks` proposal + an approval-bound `confirm`
+          linked to both) through the shipped `brief.plan_package_open`. The
+          created bound confirm then appears in Requests and is approved through
+          the already-safe response path (which materializes the proposal
+          exactly once). Collapsed by default; uses the workroom section style
+          (no card-in-card nesting). */}
+      <div
+        className="row"
+        style={{ marginTop: 14, gap: 8, alignItems: "baseline", flexWrap: "wrap" }}
+      >
+        <strong style={{ fontSize: 12 }}>Plan package</strong>
+        <span className="muted" style={{ fontSize: 11 }}>
+          Draft a plan + child tasks for approval — materializes on Yes.
+        </span>
+        <div className="spacer" style={{ flex: 1 }} />
+        <button
+          className="btn ghost sm"
+          onClick={() => setComposerOpen((v) => !v)}
+          aria-expanded={composerOpen}
+        >
+          {composerOpen ? "Cancel" : "New plan package"}
+        </button>
+      </div>
+
+      {composerOpen && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
+          <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <span className="muted" style={{ fontSize: 11 }}>Plan title (optional)</span>
+            <input
+              className="input"
+              style={{ boxSizing: "border-box" }}
+              placeholder="Plan"
+              value={planTitle}
+              onChange={(e) => setPlanTitle(e.target.value)}
+            />
+          </label>
+          <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <span className="muted" style={{ fontSize: 11 }}>Plan body (required)</span>
+            <textarea
+              className="input"
+              style={{ width: "100%", minHeight: 72, resize: "vertical", boxSizing: "border-box" }}
+              placeholder="Describe the plan to be approved…"
+              value={planBody}
+              onChange={(e) => setPlanBody(e.target.value)}
+            />
+          </label>
+          <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <span className="muted" style={{ fontSize: 11 }}>Approval prompt (optional)</span>
+            <input
+              className="input"
+              style={{ boxSizing: "border-box" }}
+              placeholder="Approve this plan?"
+              value={planPrompt}
+              onChange={(e) => setPlanPrompt(e.target.value)}
+            />
+          </label>
+
+          <div className="row" style={{ marginTop: 2 }}>
+            <strong style={{ fontSize: 12 }}>Child tasks</strong>
+            <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>
+              {planChildren.filter((c) => c.title.trim()).length} with a title
+            </span>
+          </div>
+          {planChildren.map((c, i) => {
+            // `after` may reference only an EARLIER titled sibling — so a
+            // self/forward/cyclic dependency can't be expressed in the UI.
+            const earlier = planChildren.slice(0, i).filter((p) => p.title.trim());
+            const afterValue =
+              c.afterId != null && earlier.some((p) => p.id === c.afterId)
+                ? String(c.afterId)
+                : "";
+            return (
+              <div key={c.id} className="row wrap" style={{ gap: 6, alignItems: "center" }}>
+                <span className="muted mono" style={{ fontSize: 11, width: 22 }}>#{i + 1}</span>
+                <input
+                  className="input"
+                  style={{ flex: "2 1 160px", minWidth: 0, width: "auto", boxSizing: "border-box" }}
+                  placeholder={`Task ${i + 1} title`}
+                  value={c.title}
+                  onChange={(e) => updateChild(c.id, { title: e.target.value })}
+                />
+                <select
+                  className="input"
+                  style={{ flex: "0 1 110px", minWidth: 0, width: "auto", boxSizing: "border-box" }}
+                  value={c.priority}
+                  onChange={(e) => updateChild(c.id, { priority: e.target.value })}
+                  title="Priority (optional)"
+                >
+                  <option value="">priority…</option>
+                  {PRIORITY_OPTS.map((p) => (
+                    <option key={p} value={p}>{p}</option>
+                  ))}
+                </select>
+                <select
+                  className="input"
+                  style={{ flex: "1 1 130px", minWidth: 0, width: "auto", boxSizing: "border-box" }}
+                  value={afterValue}
+                  onChange={(e) =>
+                    updateChild(c.id, { afterId: e.target.value ? Number(e.target.value) : null })
+                  }
+                  disabled={earlier.length === 0}
+                  title="Optional dependency: start after an earlier task is done"
+                >
+                  <option value="">after…</option>
+                  {earlier.map((p) => (
+                    <option key={p.id} value={String(p.id)}>
+                      after #{planChildren.indexOf(p) + 1}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="btn ghost sm"
+                  title="Remove this task"
+                  onClick={() => removeChild(c.id)}
+                  disabled={planChildren.length === 1}
+                >
+                  ✕
+                </button>
+              </div>
+            );
+          })}
+          <div className="row wrap" style={{ gap: 8 }}>
+            <button
+              className="btn ghost sm"
+              onClick={() => setPlanChildren((cs) => [...cs, newChild()])}
+            >
+              + Add task
+            </button>
+            <div className="spacer" style={{ flex: 1 }} />
+            <span className="muted" style={{ fontSize: 11 }}>
+              Opens a plan Dossier + a bound approval confirm.
+            </span>
+            <button
+              className="btn"
+              onClick={submitPlanPackage}
+              disabled={
+                composerBusy ||
+                !planBody.trim() ||
+                planChildren.filter((c) => c.title.trim()).length === 0
+              }
+            >
+              {composerBusy ? "…" : "Create plan package"}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Requests — answerable interaction cards (§1.9; dashboard-design §7).
           Open ask/confirm cards an Operative or the companion raised sit above
