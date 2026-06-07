@@ -32,6 +32,8 @@ interface RunConfig {
   inherit?: boolean;
   heartbeat_enabled?: boolean;
   heartbeat_interval_secs?: number;
+  autonomous_recovery_enabled?: boolean;
+  autonomous_recovery_max?: number;
 }
 
 function extractProviders(v: unknown): Provider[] {
@@ -227,12 +229,36 @@ export function Settings() {
                   : "manual — a Brief runs only when you click Run on the board"}
               </td>
             </tr>
+            <tr>
+              <td className="muted">Autonomous recovery</td>
+              <td>
+                <span className={"badge " + (runConfig.autonomous_recovery_enabled ? "done" : "backlog")}>
+                  {runConfig.autonomous_recovery_enabled ? "enabled" : "disabled"}
+                </span>
+                {runConfig.autonomous_recovery_enabled && (
+                  <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>
+                    up to {runConfig.autonomous_recovery_max ?? 1} retry/tick
+                  </span>
+                )}
+              </td>
+            </tr>
+            <tr>
+              <td className="muted" />
+              <td className="muted" style={{ fontSize: 12 }}>
+                {runConfig.autonomous_recovery_enabled
+                  ? "retryable failed/interrupted Shifts (already diagnosed retryable, with budget) re-run themselves once through the same guarded retry path — bounded per tick, never refusals/budget-stops/non-retryable"
+                  : "failed Shifts wait for an operator to click Retry on the Runs page"}
+              </td>
+            </tr>
           </tbody>
         </table>
         <p className="muted" style={{ fontSize: 11, marginTop: 8 }}>
-          Toggle via <span className="mono">RELIX_HEARTBEAT_ENABLED</span> (off by default); pacing via{" "}
-          <span className="mono">RELIX_HEARTBEAT_INTERVAL_SECS</span>. Autonomous runs still honor adapter
-          readiness, per-Operative wake/concurrency caps, and budget hard-stops.
+          Toggle the heartbeat via <span className="mono">RELIX_HEARTBEAT_ENABLED</span> (off by default);
+          pacing via <span className="mono">RELIX_HEARTBEAT_INTERVAL_SECS</span>. The opt-in autonomous
+          retry lane is <span className="mono">RELIX_AUTONOMOUS_RECOVERY</span> (off by default), bounded by{" "}
+          <span className="mono">RELIX_AUTONOMOUS_RECOVERY_MAX</span>. Autonomous runs still honor adapter
+          readiness, per-Operative wake/concurrency caps, and budget hard-stops. No LLM diagnosis or
+          provider-quota polling.
         </p>
       </div>
 

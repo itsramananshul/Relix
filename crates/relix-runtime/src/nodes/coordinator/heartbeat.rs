@@ -2111,6 +2111,42 @@ pub enum RetryOpen {
 /// retry lineage and chronicle `brief.retry_requested` (Brief) + `retry_started`
 /// (child run). A still-running Claim by another live run surfaces as the
 /// preflight `already_running` refusal (single-owner, enforced in one place).
+/// Who opened a retry child — recorded on the Chronicle so a Brief's timeline
+/// reads which lane retried it. The retry MECHANISM is identical for both (the
+/// shared [`retry_precheck`](crate::nodes::coordinator::TaskStore::retry_precheck)
+/// gate + preflight/execute path); only the provenance note differs, so the
+/// autonomous lane is never a second retry path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryProvenance {
+    /// A human operator clicked Retry (`run.retry`, `POST /v1/runs/:id/retry`).
+    Operator,
+    /// The opt-in autonomous recovery lane re-woke a retryable failed Shift
+    /// (`RELIX_AUTONOMOUS_RECOVERY`, default OFF).
+    Autonomous,
+}
+
+impl RetryProvenance {
+    /// Human label for the Chronicle / transcript message.
+    fn label(self) -> &'static str {
+        match self {
+            RetryProvenance::Operator => "operator",
+            RetryProvenance::Autonomous => "autonomous recovery",
+        }
+    }
+
+    /// The Brief Chronicle event KIND, distinct per lane so the timeline reads
+    /// honestly which path retried (operator one-click vs autonomous lane).
+    fn brief_event_kind(self) -> &'static str {
+        match self {
+            RetryProvenance::Operator => "brief.retry_requested",
+            RetryProvenance::Autonomous => "brief.autonomous_retry",
+        }
+    }
+}
+
+/// Operator-provenance entry point — preserved verbatim for the `run.retry`
+/// capability and existing callers/tests. Delegates to
+/// [`open_retry_child_with_provenance`] with [`RetryProvenance::Operator`].
 #[allow(clippy::too_many_arguments)]
 pub fn open_retry_child(
     store: &TaskStore,
@@ -2122,6 +2158,39 @@ pub fn open_retry_child(
     prompt: String,
     preferred_rig: Option<&str>,
     prefs: RunModelPrefs,
+) -> Result<RetryOpen, CoordinatorError> {
+    open_retry_child_with_provenance(
+        store,
+        registry,
+        bridge_tokens,
+        lease_secs,
+        run_id,
+        tenant,
+        prompt,
+        preferred_rig,
+        prefs,
+        RetryProvenance::Operator,
+    )
+}
+
+/// Open a guarded retry of a source failed Shift, recording `provenance` on the
+/// Chronicle. This is the ONE shared retry chokepoint behind BOTH the operator
+/// one-click ([`open_retry_child`]) and the opt-in autonomous recovery lane
+/// ([`autonomous_recovery_tick`]) — same `retry_precheck` gate, same Claim /
+/// workspace / ledger / model-prefs / Codex-resume behavior, same
+/// duplicate-child guard. Only the chronicled provenance differs.
+#[allow(clippy::too_many_arguments)]
+pub fn open_retry_child_with_provenance(
+    store: &TaskStore,
+    registry: &crate::rig::RigRegistry,
+    bridge_tokens: Option<&BridgeTokenStore>,
+    lease_secs: i64,
+    run_id: &str,
+    tenant: &str,
+    prompt: String,
+    preferred_rig: Option<&str>,
+    prefs: RunModelPrefs,
+    provenance: RetryProvenance,
 ) -> Result<RetryOpen, CoordinatorError> {
     use crate::nodes::coordinator::RetryPrecheck;
     let (brief_id, next_attempt) = match store.retry_precheck(run_id, tenant)? {
@@ -2176,19 +2245,24 @@ pub fn open_retry_child(
             // UNIQUE index makes a double-link to the same source fail loudly.
             store.link_retry_child(&child_run_id, run_id, next_attempt)?;
             // Chronicle the retry on the Brief + the child run transcript so the
-            // Chronicle and `/v1/runs/:id/events` both record the source + attempt.
+            // Chronicle and `/v1/runs/:id/events` both record the source + attempt
+            // + which lane (operator vs autonomous) opened it.
             let _ = store.append_event(
                 &brief_id,
-                "brief.retry_requested",
+                provenance.brief_event_kind(),
                 &format!(
-                    "operator retried source run {run_id} → child {child_run_id} (attempt {next_attempt})"
+                    "{} retried source run {run_id} → child {child_run_id} (attempt {next_attempt})",
+                    provenance.label()
                 ),
             );
             let _ = store.append_run_event(
                 &child_run_id,
                 "retry_started",
                 "relix",
-                &format!("retry of source run {run_id} (attempt {next_attempt})"),
+                &format!(
+                    "{} retry of source run {run_id} (attempt {next_attempt})",
+                    provenance.label()
+                ),
                 None,
                 false,
             );
@@ -2200,6 +2274,191 @@ pub fn open_retry_child(
             })
         }
     }
+}
+
+// ── Stage-2 OPT-IN autonomous retry lane (execution-and-issue §3.3 / §3.3b) ──
+//
+// This is the autonomous side of the SAME guarded retry the operator one-click
+// already drives. It is **default OFF** (`RELIX_AUTONOMOUS_RECOVERY`), **bounded
+// per tick**, **idempotent** (the durable duplicate-child guard means a second
+// tick never opens a second child), and **conservative**: it retries ONLY runs
+// already diagnosed `retryable` with budget remaining — never a refusal, a
+// budget hard-stop, a missing assignee/adapter, a permission/auth failure, a
+// manual reject, a discarded run, or an exhausted-budget run. There is **no LLM
+// diagnostic pass and no provider quota polling** in this slice — a run lacking
+// durable diagnosis or with an ambiguous verdict is simply not retried.
+
+/// Pure eligibility predicate for the autonomous retry lane — mirrors
+/// [`retry_precheck`](crate::nodes::coordinator::TaskStore::retry_precheck)'s
+/// eligibility so the lane never diverges from the guarded operator path.
+/// `has_retry_child` is the durable duplicate guard (true ⇒ a child already
+/// exists ⇒ never retry again). Side-effect-free and DB-free, so it is unit-
+/// testable in isolation; the production selection runs the SAME logic as a
+/// bounded SQL pre-filter ([`list_autonomous_retry_candidates`]).
+pub fn autonomous_retry_eligible(
+    run: &crate::nodes::coordinator::RunRecord,
+    has_retry_child: bool,
+) -> bool {
+    !has_retry_child
+        && matches!(run.status.as_str(), "failed" | "interrupted")
+        && run.retryable == Some(true)
+        && run.retry_budget_remaining.unwrap_or(0) > 0
+        && !run.brief_id.trim().is_empty()
+        && run.apply_status.as_deref() != Some("discarded")
+}
+
+/// Parse the opt-in autonomous-recovery switch (`RELIX_AUTONOMOUS_RECOVERY`).
+/// **Default OFF** — the lane never runs unless explicitly enabled, so a fresh
+/// deployment is exactly as conservative as before this slice. Accepts the same
+/// truthy spellings as the heartbeat switch (`1`/`true`/`yes`/`on`).
+pub fn parse_autonomous_recovery_enabled(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// Parse the per-tick bound (`RELIX_AUTONOMOUS_RECOVERY_MAX`). Default 1,
+/// clamped to `1..=10` so a tick can never stampede or spin — it opens at most
+/// this many child retries per tick.
+pub fn parse_autonomous_recovery_max(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, 10)
+}
+
+/// The per-candidate decision the recovery tick asks its caller to make. Keeps
+/// the agent-store / budget policy in the caller (as [`dispatch_batch`] does
+/// with its closures), so the tick itself stays decoupled and unit-testable.
+pub enum RetryDecision {
+    /// Do NOT retry this candidate now — the Operative is paused/terminated, its
+    /// timer wake is off, or it is over budget. Quiet (no event), so the lane
+    /// never spams the Chronicle every tick.
+    Skip,
+    /// Retry it with these resolved inputs (the assignee's Rig + charter-aware
+    /// prompt + model/effort prefs — IDENTICAL to what the operator retry
+    /// composes), through the shared `open_retry_child` path.
+    Proceed(RetryInputs),
+}
+
+/// The resolved inputs for one autonomous retry — the same three things the
+/// `run.retry` handler resolves before calling `open_retry_child`.
+pub struct RetryInputs {
+    pub preferred_rig: Option<String>,
+    pub prompt: String,
+    pub prefs: RunModelPrefs,
+}
+
+/// What the recovery tick did with one candidate (for logging / tests). The
+/// lane records `opened` on the Chronicle via `open_retry_child` itself; this
+/// is the in-memory tick summary, not a durable event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryRecord {
+    pub source_run_id: String,
+    pub brief_id: String,
+    /// `opened` / `skipped` / `already_retried` / `refused` / `not_found`.
+    pub outcome: &'static str,
+    /// The child run id when a retry was opened (`opened` / `already_retried`).
+    pub child_run_id: Option<String>,
+    /// A short reason for `refused` / `skipped` (no secrets).
+    pub detail: Option<String>,
+}
+
+/// Run ONE opt-in autonomous recovery tick: select up to `max` retryable failed
+/// Shifts (tenant-aware) and, for each the caller approves, open EXACTLY ONE
+/// child retry through the SHARED [`open_retry_child_with_provenance`] path and
+/// execute it synchronously (this is called from inside `spawn_blocking`, like
+/// the heartbeat dispatch loop). Returns one [`RecoveryRecord`] per candidate.
+///
+/// Idempotent: the duplicate-child guard inside the shared precheck means a
+/// second tick over the same source returns `already_retried` and opens no
+/// second run. Bounded: `max` caps work per tick. Tenant-safe: each candidate
+/// carries its OWN Guild and is retried under that tenant only — `tenant=None`
+/// recovers all Guilds (each under its own tenant), `tenant=Some(g)` scopes to
+/// one Guild.
+pub fn autonomous_recovery_tick<F>(
+    store: &TaskStore,
+    registry: &crate::rig::RigRegistry,
+    bridge_tokens: Option<&BridgeTokenStore>,
+    lease_secs: i64,
+    max: usize,
+    tenant: Option<&str>,
+    decide: F,
+) -> Result<Vec<RecoveryRecord>, CoordinatorError>
+where
+    F: Fn(&crate::nodes::coordinator::RetryCandidate) -> RetryDecision,
+{
+    if max == 0 {
+        return Ok(Vec::new());
+    }
+    let candidates = store.list_autonomous_retry_candidates(tenant, max)?;
+    let mut records = Vec::with_capacity(candidates.len());
+    for cand in candidates {
+        let inputs = match decide(&cand) {
+            RetryDecision::Skip => {
+                records.push(RecoveryRecord {
+                    source_run_id: cand.run_id,
+                    brief_id: cand.brief_id,
+                    outcome: "skipped",
+                    child_run_id: None,
+                    detail: None,
+                });
+                continue;
+            }
+            RetryDecision::Proceed(inputs) => inputs,
+        };
+        match open_retry_child_with_provenance(
+            store,
+            registry,
+            bridge_tokens,
+            lease_secs,
+            &cand.run_id,
+            &cand.tenant,
+            inputs.prompt,
+            inputs.preferred_rig.as_deref(),
+            inputs.prefs,
+            RetryProvenance::Autonomous,
+        )? {
+            RetryOpen::NotFound => records.push(RecoveryRecord {
+                source_run_id: cand.run_id,
+                brief_id: cand.brief_id,
+                outcome: "not_found",
+                child_run_id: None,
+                detail: None,
+            }),
+            RetryOpen::AlreadyRetried { child_run_id } => records.push(RecoveryRecord {
+                source_run_id: cand.run_id,
+                brief_id: cand.brief_id,
+                outcome: "already_retried",
+                child_run_id: Some(child_run_id),
+                detail: None,
+            }),
+            RetryOpen::Refused(report) => records.push(RecoveryRecord {
+                source_run_id: cand.run_id,
+                brief_id: cand.brief_id,
+                outcome: "refused",
+                child_run_id: None,
+                detail: Some(report.summary),
+            }),
+            RetryOpen::Ready {
+                ready,
+                child_run_id,
+                ..
+            } => {
+                // Committed: run the blocking adapter synchronously (the tick
+                // runs inside `spawn_blocking`, exactly like `dispatch_batch`).
+                let _ = execute_ready(store, bridge_tokens, *ready);
+                records.push(RecoveryRecord {
+                    source_run_id: cand.run_id,
+                    brief_id: cand.brief_id,
+                    outcome: "opened",
+                    child_run_id: Some(child_run_id),
+                    detail: None,
+                });
+            }
+        }
+    }
+    Ok(records)
 }
 
 /// The assigned Operative's stored per-run model hints, threaded from the
@@ -6456,5 +6715,209 @@ mod tests {
         let got = seen.lock().unwrap().clone().expect("the retry child ran the Rig");
         assert_eq!(got.0, None, "no model pref when the Operative has none");
         assert_eq!(got.1, None, "no effort when the Operative has none");
+    }
+
+    // ── Stage-2 OPT-IN autonomous retry lane (execution-and-issue §3.3 / §3.3b) ──
+
+    /// A `decide` closure that always retries a candidate on the built-in echo
+    /// Rig with a fixed prompt + no model prefs — the test stand-in for the
+    /// controller's agent-store/budget-aware policy.
+    fn proceed_on_echo(
+    ) -> impl Fn(&crate::nodes::coordinator::RetryCandidate) -> RetryDecision {
+        |_cand| {
+            RetryDecision::Proceed(RetryInputs {
+                preferred_rig: Some("echo".to_string()),
+                prompt: "autonomous retry".to_string(),
+                prefs: RunModelPrefs::default(),
+            })
+        }
+    }
+
+    #[test]
+    fn autonomous_recovery_switch_is_off_and_bounded_by_default() {
+        // Default OFF — the lane never runs unless explicitly enabled.
+        assert!(!parse_autonomous_recovery_enabled(None));
+        assert!(!parse_autonomous_recovery_enabled(Some("")));
+        assert!(!parse_autonomous_recovery_enabled(Some("0")));
+        assert!(!parse_autonomous_recovery_enabled(Some("off")));
+        assert!(parse_autonomous_recovery_enabled(Some("1")));
+        assert!(parse_autonomous_recovery_enabled(Some("true")));
+        assert!(parse_autonomous_recovery_enabled(Some(" On ")));
+        // Bounded — default 1, clamped to 1..=10 (never 0, never unbounded).
+        assert_eq!(parse_autonomous_recovery_max(None), 1);
+        assert_eq!(parse_autonomous_recovery_max(Some("3")), 3);
+        assert_eq!(parse_autonomous_recovery_max(Some("0")), 1);
+        assert_eq!(parse_autonomous_recovery_max(Some("999")), 10);
+        assert_eq!(parse_autonomous_recovery_max(Some("nope")), 1);
+    }
+
+    #[test]
+    fn autonomous_recovery_selection_only_includes_eligible_runs() {
+        use crate::nodes::coordinator::{RunDiagnosis, RunWorkspaceInfo};
+        use crate::rig::RigRegistry;
+        let (s, _tmp) = store_ws();
+        let reg = RigRegistry::with_builtins();
+
+        // (1) A retryable failed Shift → INCLUDED.
+        let b_ok = ready_brief(&s, "ok", "agt_a");
+        failed_source(&s, &b_ok, "agt_a", "run_ok", true);
+
+        // (2) A retryable INTERRUPTED Shift → INCLUDED.
+        let b_int = ready_brief(&s, "interrupted", "agt_a");
+        s.record_run_start("run_int", &b_int, "agt_a", "echo", "manual", &RunWorkspaceInfo::default())
+            .unwrap();
+        s.record_run_finish("run_int", "interrupted", "stalled").unwrap();
+        s.set_run_diagnosis(
+            "run_int",
+            &RunDiagnosis {
+                failure_class: Some("interrupted".into()),
+                retryable: Some(true),
+                retry_budget_remaining: Some(1),
+                recovery_action: None,
+                recovery_route: None,
+            },
+        )
+        .unwrap();
+
+        // (3) A non-retryable (permanent) failure → EXCLUDED.
+        let b_perm = ready_brief(&s, "perm", "agt_a");
+        failed_source(&s, &b_perm, "agt_a", "run_perm", false);
+
+        // (4) Retryable but EXHAUSTED budget (0) → EXCLUDED.
+        let b_exh = ready_brief(&s, "exhausted", "agt_a");
+        failed_source(&s, &b_exh, "agt_a", "run_exh", true);
+        s.set_run_diagnosis(
+            "run_exh",
+            &RunDiagnosis {
+                failure_class: Some("transient".into()),
+                retryable: Some(true),
+                retry_budget_remaining: Some(0),
+                recovery_action: None,
+                recovery_route: None,
+            },
+        )
+        .unwrap();
+
+        // (5) A refusal (status `refused`) → EXCLUDED (refusals are never retryable).
+        let b_ref = ready_brief(&s, "refused", "agt_a");
+        s.record_refused_run(&b_ref, "agt_a", "", "no_adapter", "no Rig", "heartbeat")
+            .unwrap();
+
+        // (6) A retryable failed Shift that was operator-DISCARDED → EXCLUDED.
+        let b_disc = ready_brief(&s, "discarded", "agt_a");
+        failed_source(&s, &b_disc, "agt_a", "run_disc", true);
+        s.discard_run("run_disc").unwrap();
+
+        // (7) A clean DONE Shift → EXCLUDED.
+        let b_done = ready_brief(&s, "done", "agt_a");
+        s.record_run_start("run_done", &b_done, "agt_a", "echo", "manual", &RunWorkspaceInfo::default())
+            .unwrap();
+        s.record_run_finish("run_done", "done", "shipped").unwrap();
+
+        // (8) A retryable failed Shift that ALREADY has a retry child → EXCLUDED.
+        let b_dup = ready_brief(&s, "already", "agt_a");
+        failed_source(&s, &b_dup, "agt_a", "run_dup", true);
+        match open_retry_child(&s, &reg, None, 300, "run_dup", "default", "p".into(), Some("echo"), RunModelPrefs::default())
+            .unwrap()
+        {
+            RetryOpen::Ready { ready, .. } => {
+                let _ = execute_ready(&s, None, *ready);
+            }
+            _ => panic!("setup: run_dup must open a child"),
+        }
+
+        let picked: std::collections::BTreeSet<String> = s
+            .list_autonomous_retry_candidates(None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.run_id)
+            .collect();
+        let expected: std::collections::BTreeSet<String> =
+            ["run_ok", "run_int"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(picked, expected, "only the retryable, in-budget, un-retried, non-discarded failed/interrupted runs are candidates");
+    }
+
+    #[test]
+    fn autonomous_recovery_tick_opens_one_child_and_is_idempotent() {
+        use crate::rig::RigRegistry;
+        let (s, _tmp) = store_ws();
+        let reg = RigRegistry::with_builtins();
+        let brief = ready_brief(&s, "ship it", "agt_a");
+        let src = "run_auto1";
+        failed_source(&s, &brief, "agt_a", src, true);
+
+        // First tick: opens + executes EXACTLY one child, chronicled as autonomous.
+        let recs = autonomous_recovery_tick(&s, &reg, None, 300, 3, None, proceed_on_echo()).unwrap();
+        assert_eq!(recs.len(), 1, "one candidate retried");
+        assert_eq!(recs[0].outcome, "opened");
+        assert_eq!(recs[0].source_run_id, src);
+        let child = recs[0].child_run_id.clone().expect("a child was opened");
+        assert_eq!(count_children(&s, src), 1, "exactly one child");
+        let cr = s.get_run(&child).unwrap().unwrap();
+        assert_eq!(cr.retried_from_run_id.as_deref(), Some(src), "lineage linked like operator retry");
+        // The autonomous lane chronicles a DISTINCT event kind (not operator).
+        let auto = s
+            .query_events(&brief, 0, 50, Some("brief.autonomous_retry"), crate::nodes::coordinator::EventOrder::Desc)
+            .unwrap();
+        assert_eq!(auto.len(), 1, "autonomous retry is chronicled distinctly");
+        let op = s
+            .query_events(&brief, 0, 50, Some("brief.retry_requested"), crate::nodes::coordinator::EventOrder::Desc)
+            .unwrap();
+        assert!(op.is_empty(), "the autonomous lane is NOT chronicled as an operator retry");
+
+        // Second tick: the source now has a child, so it is no longer a
+        // candidate — no second child, idempotent.
+        let recs2 = autonomous_recovery_tick(&s, &reg, None, 300, 3, None, proceed_on_echo()).unwrap();
+        assert!(recs2.is_empty(), "a second tick finds no new candidate");
+        assert_eq!(count_children(&s, src), 1, "still exactly one child after a second tick");
+    }
+
+    #[test]
+    fn autonomous_recovery_disabled_lane_creates_no_retry() {
+        // The production loop only calls the tick when the switch is on; with the
+        // switch OFF (default) the tick is never invoked, so an eligible run is
+        // left untouched. This proves the default-off contract end-to-end.
+        use crate::rig::RigRegistry;
+        let (s, _tmp) = store_ws();
+        let reg = RigRegistry::with_builtins();
+        let brief = ready_brief(&s, "ship it", "agt_a");
+        let src = "run_off";
+        failed_source(&s, &brief, "agt_a", src, true);
+
+        if parse_autonomous_recovery_enabled(None) {
+            let _ = autonomous_recovery_tick(&s, &reg, None, 300, parse_autonomous_recovery_max(None), None, proceed_on_echo()).unwrap();
+        }
+        assert_eq!(count_children(&s, src), 0, "no retry is created while the lane is disabled");
+        // And an eligible candidate DOES exist — proving it was the switch, not
+        // a lack of work, that held the retry back.
+        assert_eq!(s.list_autonomous_retry_candidates(None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn autonomous_recovery_is_tenant_isolated() {
+        use crate::rig::RigRegistry;
+        let (s, _tmp) = store_ws();
+        let reg = RigRegistry::with_builtins();
+        let a = ready_brief_in_tenant(&s, "guild-a work", "agt_a", "guild-a");
+        let b = ready_brief_in_tenant(&s, "guild-b work", "agt_b", "guild-b");
+        failed_source(&s, &a, "agt_a", "run_ga", true);
+        failed_source(&s, &b, "agt_b", "run_gb", true);
+
+        // Scoped selection returns ONLY the named Guild's candidate.
+        let only_a: Vec<String> = s
+            .list_autonomous_retry_candidates(Some("guild-a"), 50)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.run_id)
+            .collect();
+        assert_eq!(only_a, vec!["run_ga".to_string()]);
+
+        // A recovery tick scoped to guild-a retries guild-a's run only; guild-b
+        // is never touched.
+        let recs = autonomous_recovery_tick(&s, &reg, None, 300, 5, Some("guild-a"), proceed_on_echo()).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].source_run_id, "run_ga");
+        assert_eq!(count_children(&s, "run_ga"), 1, "guild-a's run was retried");
+        assert_eq!(count_children(&s, "run_gb"), 0, "guild-b's run was NOT retried by guild-a's tick");
     }
 }

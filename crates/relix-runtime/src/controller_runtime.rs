@@ -9910,6 +9910,17 @@ fn register_node_type_handlers(
                             .and_then(|v| v.trim().parse::<u64>().ok())
                             .filter(|n| *n >= 1)
                             .unwrap_or(10);
+                            // Stage-2 opt-in autonomous retry lane
+                            // (execution-and-issue §3.3b). Default OFF + bounded;
+                            // surfaced so Settings can show it like the heartbeat.
+                            let autonomous_recovery_enabled =
+                                crate::nodes::coordinator::heartbeat::parse_autonomous_recovery_enabled(
+                                    std::env::var("RELIX_AUTONOMOUS_RECOVERY").ok().as_deref(),
+                                );
+                            let autonomous_recovery_max =
+                                crate::nodes::coordinator::heartbeat::parse_autonomous_recovery_max(
+                                    std::env::var("RELIX_AUTONOMOUS_RECOVERY_MAX").ok().as_deref(),
+                                );
                             let body = serde_json::json!({
                                 "context": cfg.context.as_str(),
                                 "project_root": cfg.project_root.to_string_lossy(),
@@ -9919,6 +9930,8 @@ fn register_node_type_handlers(
                                 "inherit": inherit,
                                 "heartbeat_enabled": heartbeat_enabled,
                                 "heartbeat_interval_secs": heartbeat_interval_secs,
+                                "autonomous_recovery_enabled": autonomous_recovery_enabled,
+                                "autonomous_recovery_max": autonomous_recovery_max,
                             });
                             match serde_json::to_vec(&body) {
                                 Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
@@ -11162,6 +11175,147 @@ fn register_node_type_handlers(
                 interval_secs,
                 batch,
                 "coordinator startup: heartbeat dispatch loop spawned (RELIX_HEARTBEAT_ENABLED)"
+            );
+        }
+        // STAGE-2 OPT-IN autonomous retry lane (execution-and-issue §3.3 /
+        // §3.3b Stage-2a). Default OFF via RELIX_AUTONOMOUS_RECOVERY so it never
+        // surprises an operator. When on, a timer selects retryable failed/
+        // interrupted Shifts (already diagnosed `retryable` with budget
+        // remaining) and re-opens EXACTLY ONE child each through the SAME guarded
+        // `open_retry_child` path the operator one-click uses (same Claim,
+        // workspace, ledger, model prefs, Codex resume, duplicate-child guard) —
+        // NOT a second retry path. Bounded per tick (RELIX_AUTONOMOUS_RECOVERY_MAX,
+        // default 1, clamp 1..=10) and idempotent (the duplicate guard means a
+        // re-tick opens no second child). Independent of RELIX_HEARTBEAT_ENABLED.
+        // NO LLM diagnostic pass + NO provider quota polling in this slice.
+        if crate::nodes::coordinator::heartbeat::parse_autonomous_recovery_enabled(
+            std::env::var("RELIX_AUTONOMOUS_RECOVERY").ok().as_deref(),
+        ) {
+            let recovery_max = crate::nodes::coordinator::heartbeat::parse_autonomous_recovery_max(
+                std::env::var("RELIX_AUTONOMOUS_RECOVERY_MAX").ok().as_deref(),
+            );
+            let recovery_interval_secs = std::env::var("RELIX_AUTONOMOUS_RECOVERY_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(30);
+            let lease_secs: i64 = 300;
+            let task_store = store.clone();
+            let ag_store = agent_store.clone();
+            let registry = rig_registry.clone();
+            let metrics_query = metrics.map(|m| m.query.clone());
+            let spine_store_rec = spine_store_for_agent_caps.clone();
+            let bridge_tokens = crate::rig::bridge::BridgeTokenStore::global();
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_secs(recovery_interval_secs));
+                loop {
+                    ticker.tick().await;
+                    let ts = task_store.clone();
+                    let ags = ag_store.clone();
+                    let reg = registry.clone();
+                    let bt = bridge_tokens.clone();
+                    let mq = metrics_query.clone();
+                    let spine = spine_store_rec.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        // Per-candidate policy (decoupled from the tick, exactly
+                        // like the heartbeat's resolve_rig/build_prompt closures):
+                        // resolve the assignee's Rig + charter-aware prompt +
+                        // model prefs IDENTICALLY to the operator retry, and SKIP
+                        // (no retry, quietly) when the Operative is paused/
+                        // terminated, its timer wake is off, or it is over budget
+                        // — so the autonomous lane respects the SAME budget
+                        // hard-stop the autonomous dispatch does.
+                        let decide = |cand: &crate::nodes::coordinator::RetryCandidate| {
+                            use crate::nodes::coordinator::heartbeat::{RetryDecision, RetryInputs, RunModelPrefs};
+                            let Some(card) = ts.brief_card(&cand.brief_id).ok().flatten() else {
+                                return RetryDecision::Skip;
+                            };
+                            let Some(assignee) = card.assignee_agent_id.as_deref() else {
+                                return RetryDecision::Skip;
+                            };
+                            let Some(agent) = ags.get_agent(assignee).ok().flatten() else {
+                                return RetryDecision::Skip;
+                            };
+                            if agent.status != "active" || !agent.wake_on_timer {
+                                return RetryDecision::Skip;
+                            }
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0);
+                            if !matches!(
+                                crate::nodes::coordinator::heartbeat::dispatch_budget_admits(
+                                    &card,
+                                    &ts,
+                                    &ags,
+                                    spine.as_deref(),
+                                    mq.as_ref(),
+                                    now_ms,
+                                ),
+                                crate::nodes::coordinator::heartbeat::BudgetAdmission::Allow
+                            ) {
+                                return RetryDecision::Skip;
+                            }
+                            let charter = agent
+                                .instruction_bundle
+                                .clone();
+                            let charter = if charter.trim().is_empty() {
+                                None
+                            } else {
+                                Some(charter)
+                            };
+                            let prompt = ts.compose_brief_prompt_with_charter(
+                                &card.task_id,
+                                10,
+                                charter.as_deref(),
+                            );
+                            RetryDecision::Proceed(RetryInputs {
+                                preferred_rig: agent.rig.clone(),
+                                prompt,
+                                prefs: RunModelPrefs::new(
+                                    agent.model_preference.clone(),
+                                    agent.reasoning_effort.clone(),
+                                ),
+                            })
+                        };
+                        // tenant=None: recover all Guilds, each candidate retried
+                        // under its OWN derived tenant (no cross-Guild leak).
+                        crate::nodes::coordinator::heartbeat::autonomous_recovery_tick(
+                            &ts,
+                            &reg,
+                            Some(&bt),
+                            lease_secs,
+                            recovery_max,
+                            None,
+                            decide,
+                        )
+                    })
+                    .await;
+                    match outcome {
+                        Ok(Ok(records)) => {
+                            let opened = records.iter().filter(|r| r.outcome == "opened").count();
+                            if opened > 0 {
+                                tracing::info!(
+                                    opened,
+                                    considered = records.len(),
+                                    "autonomous recovery: opened child retries"
+                                );
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "autonomous recovery: tick failed")
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "autonomous recovery: tick join error")
+                        }
+                    }
+                }
+            });
+            tracing::info!(
+                interval_secs = recovery_interval_secs,
+                max = recovery_max,
+                "coordinator startup: autonomous retry lane spawned (RELIX_AUTONOMOUS_RECOVERY)"
             );
         }
         // NOT-DONE 2: spawn the legacy-token orphaned-task fail

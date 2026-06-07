@@ -120,12 +120,38 @@ does **not** do:
     no existing retry child; a Claim conflict surfaces as `already_running`
     (409) and a second retry returns the EXISTING child (`already_retried`,
     no second run). The Runs page shows a **Retry Shift** button only when
-    eligible. What this is still **NOT**: it is a **guarded one-click
-    operator action, NOT a blind auto-retry loop** — there is **no
-    autonomous retry orchestration**, **no LLM diagnostic pass**, and **no
-    provider quota polling**; the operator decides and clicks. The
-    task-level `task.retry` recovery (a separate layer on the Task ledger)
-    is unchanged.
+    eligible. The task-level `task.retry` recovery (a separate layer on the
+    Task ledger) is unchanged.
+  - **Opt-in autonomous retry lane (Stage-2a, v1) — SHIPPED, default OFF.**
+    A bounded **autonomous** recovery loop now exists behind an explicit
+    switch (`RELIX_AUTONOMOUS_RECOVERY`, **off by default**, pace via
+    `RELIX_AUTONOMOUS_RECOVERY_INTERVAL_SECS`, bound per tick via
+    `RELIX_AUTONOMOUS_RECOVERY_MAX`, default `1`, clamp `1..=10`). When on,
+    a timer selects retryable failed/interrupted Shifts (a tenant-aware SQL
+    pre-filter whose eligibility **mirrors `retry_precheck` exactly**) and
+    re-opens **exactly one** child each through the **same guarded
+    `open_retry_child` path** the operator one-click uses — same tenant
+    gates, duplicate-child prevention, model prefs, Codex session resume,
+    workspace prep, ledger/transcript, and budget/refusal semantics. It is
+    **not** a second retry path. It is **conservative**: it retries **only**
+    runs already diagnosed `retryable` with budget remaining, and **never**
+    a refusal, a budget hard-stop, a missing assignee/adapter, a
+    permission/auth failure, a manual reject, a discarded run, or an
+    exhausted-budget run. Each tick is **bounded** and **idempotent** (the
+    duplicate-child guard means a re-tick opens no second child), retries
+    each candidate **under its own Guild** (no cross-tenant leak), respects
+    the **same per-Operative + Guild budget hard-stop** the autonomous
+    dispatch enforces (over budget ⇒ skipped, quietly, no spam), and only
+    runs for an **active** Operative whose **timer wake** is on. It
+    chronicles a distinct `brief.autonomous_retry` event when it opens a
+    child. What this is still **NOT**: there is **no LLM diagnostic pass**
+    (a run lacking durable diagnosis or with an ambiguous verdict is simply
+    not retried) and **no provider quota polling**; the diagnosis is still
+    the pure Stage-1 classifier, and the autonomous lane never reclassifies
+    or re-diagnoses. The retry **child** is committed through the shared
+    preflight, so it is stamped with the shared run trigger exactly like the
+    operator retry child — the autonomous provenance lives in the Chronicle
+    event, not a distinct run-trigger value.
 
 ### Run-workspace review/apply is inspect-and-copy, not a full VCS workflow
 
@@ -427,12 +453,14 @@ when you click Start. What it does **not** do:
     governed route (the one-click Shift retry lives on the **Runs page**, which
     carries the run id safely; see "Guarded operator Shift retry" above).
   - What it still does **not** do: classify the finer `blocked` sub-reasons as
-    distinct reasons; run **autonomous** retry/recovery (the Stage-2 retry is an
-    **operator-triggered** one-click action, not an autonomous loop — the
-    diagnosis still only informs, the runtime never retries on its own); poll
-    provider quotas; or push every field in hard-realtime (the refresh is
+    distinct reasons; run an **LLM diagnostic pass** or poll provider quotas (the
+    diagnosis is still the pure Stage-1 classifier — see the opt-in autonomous
+    retry lane above, which retries already-diagnosed-retryable Shifts but never
+    re-diagnoses); or push every field in hard-realtime (the refresh is
     event-trigger + poll; the feed is capped at 60 with an honest `truncated`
-    flag).
+    flag). The Action Center card itself still mints **no retry button** —
+    autonomous retries happen on the timer (opt-in), and the operator one-click
+    lives on the Runs page.
 
 In short: the *governance rails* of a company are in place and tenant-safe,
 the Shift Room makes the post-start loop legible (what ran / finished / is

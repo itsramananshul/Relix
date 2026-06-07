@@ -5526,6 +5526,105 @@ impl TaskStore {
         })
     }
 
+    /// Pre-select source runs eligible for the **opt-in autonomous retry lane**
+    /// (execution-and-issue §3.3 / §3.3b Stage-2a). A cheap, bounded, tenant-aware
+    /// SQL pre-filter whose WHERE clause mirrors [`Self::retry_precheck`]'s
+    /// eligibility EXACTLY so the autonomous lane never diverges from the guarded
+    /// operator path. A candidate row satisfies ALL of:
+    ///   - terminal **failure-like** status (`failed` / `interrupted`) — never a
+    ///     clean `done`/`continued`, a `cancelled` (operator reject), a `refused`
+    ///     (Stage-1 marks every refusal non-retryable), or a still-`running` row;
+    ///   - the durable Stage-1 diagnosis marks it `retryable == true` — so a
+    ///     governance / permanent / auth / budget hard-stop failure is excluded;
+    ///   - `retry_budget_remaining > 0` (a small operator-facing budget, NOT an
+    ///     auto-retry tally — so a source is retried at most once by the lane);
+    ///   - a non-empty `brief_id` whose Brief still EXISTS (the `JOIN tasks`
+    ///     drops a deleted Brief, mirroring `retry_precheck`'s `brief_missing`);
+    ///   - the run is NOT operator-`discarded`;
+    ///   - **no existing retry child** — the durable duplicate guard, so a second
+    ///     tick can never open a second child (idempotent).
+    ///
+    /// `tenant = Some(g)` scopes to ONE Guild (no cross-Guild candidate ever
+    /// appears); `tenant = None` returns candidates across all Guilds, EACH
+    /// carrying its own Brief's tenant so the caller retries it under that Guild
+    /// only. Ordered oldest-failure-first (FIFO fairness) and clamped to a small
+    /// page — this is a pre-filter, the real per-candidate gate is the shared
+    /// `open_retry_child` the lane drives.
+    pub fn list_autonomous_retry_candidates(
+        &self,
+        tenant: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RetryCandidate>, CoordinatorError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = (limit as i64).clamp(1, 100);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let map = |r: &rusqlite::Row<'_>| -> rusqlite::Result<RetryCandidate> {
+            Ok(RetryCandidate {
+                run_id: r.get(0)?,
+                brief_id: r.get(1)?,
+                tenant: r.get(2)?,
+            })
+        };
+        let mut out = Vec::new();
+        match tenant {
+            Some(t) => {
+                let t = norm_tenant(t).to_string();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT r.run_id, r.brief_id, COALESCE(t.tenant_id,'default') AS tenant
+                         FROM brief_runs r
+                         JOIN tasks t ON t.task_id = r.brief_id
+                         WHERE r.status IN ('failed','interrupted')
+                           AND r.retryable = 1
+                           AND COALESCE(r.retry_budget_remaining, 0) > 0
+                           AND TRIM(COALESCE(r.brief_id,'')) != ''
+                           AND COALESCE(r.apply_status,'') != 'discarded'
+                           AND COALESCE(t.tenant_id,'default') = ?1
+                           AND NOT EXISTS (
+                               SELECT 1 FROM brief_runs c WHERE c.retried_from_run_id = r.run_id
+                           )
+                         ORDER BY r.started_at ASC, r.rowid ASC
+                         LIMIT ?2",
+                    )
+                    .map_err(CoordinatorError::Db)?;
+                let rows = stmt
+                    .query_map(params![t, limit], map)
+                    .map_err(CoordinatorError::Db)?;
+                for row in rows {
+                    out.push(row.map_err(CoordinatorError::Db)?);
+                }
+            }
+            None => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT r.run_id, r.brief_id, COALESCE(t.tenant_id,'default') AS tenant
+                         FROM brief_runs r
+                         JOIN tasks t ON t.task_id = r.brief_id
+                         WHERE r.status IN ('failed','interrupted')
+                           AND r.retryable = 1
+                           AND COALESCE(r.retry_budget_remaining, 0) > 0
+                           AND TRIM(COALESCE(r.brief_id,'')) != ''
+                           AND COALESCE(r.apply_status,'') != 'discarded'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM brief_runs c WHERE c.retried_from_run_id = r.run_id
+                           )
+                         ORDER BY r.started_at ASC, r.rowid ASC
+                         LIMIT ?1",
+                    )
+                    .map_err(CoordinatorError::Db)?;
+                let rows = stmt
+                    .query_map(params![limit], map)
+                    .map_err(CoordinatorError::Db)?;
+                for row in rows {
+                    out.push(row.map_err(CoordinatorError::Db)?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Persist the usage/cost/session captured from a run's adapter output
     /// (TG6). A no-op when nothing was captured (echo / raw / no usage), so
     /// absent fields stay NULL — never faked. Best-effort.
@@ -11898,6 +11997,21 @@ pub enum RetryPrecheck {
         reason: String,
         brief_id: Option<String>,
     },
+}
+
+/// One source run pre-selected for the **opt-in autonomous retry lane**
+/// (execution-and-issue §3.3 / §3.3b Stage-2a). A cheap, tenant-aware
+/// candidate row: the source `run_id`, its `brief_id`, and the Brief's own
+/// `tenant` (so the recovery tick retries each candidate under its OWN Guild,
+/// never cross-tenant). It is ONLY a pre-filter — the authoritative gate is the
+/// shared [`retry_precheck`](TaskStore::retry_precheck) /
+/// [`open_retry_child`](crate::nodes::coordinator::heartbeat::open_retry_child)
+/// path the lane drives, NOT this struct.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RetryCandidate {
+    pub run_id: String,
+    pub brief_id: String,
+    pub tenant: String,
 }
 
 /// The recovery DIAGNOSIS of a run (execution-and-issue §3.3b) — a PURE,
