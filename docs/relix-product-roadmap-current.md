@@ -340,8 +340,18 @@ ledger entry or design section.
    `agent_id`), so there is no global session list.
 
 **P3 — depth / autonomy**
-9. **[BE/FE] Smarter companion** — `prime.propose` AI mode is opt-in and rule-validated;
-   replacing the deterministic planner with an LLM driving the governed spine APIs is
+9. **[BE/FE] Smarter companion** — **BACKEND SHIPPED (partial; still deterministic, not an LLM).**
+   The `POST /v1/spine/companion` parser is now a **company-aware action spine**
+   (`relix-dashboard-design.md` §13): beyond create/move/comment, it reads live company state in
+   plain language — `what needs attention` → `company.actions` (ranked next actions),
+   `what is blocked` → `brief.blocked_list`, `what is running` → `brief.runs` (active Shifts),
+   `who is on the crew` → `agent.operatives` (roster) — replying with the top-3 titles / counts while
+   keeping the raw JSON in `result`. It can also open a **governed plan package** from one line
+   (`plan package <brief_id>: <body> => child: <t>; child high: <t>`) via `brief.plan_package_open`,
+   refusing an empty body or zero children and **never** bypassing the approval-bound confirm
+   (priorities only, no assignee hints). Every read/write goes through the SAME mesh capabilities +
+   governance the dashboard uses. `prime.propose` AI mode is still opt-in and rule-validated;
+   replacing the deterministic parser with an LLM driving these SAME governed spine APIs remains
    future (`current-limitations.md`; ledger "Mandate orchestration" still not autonomous).
 10. **[BE] Exactly-once decomposition + auto-wake promotion** — **both parts are now BACKEND
     SHIPPED** (exactly-once decomposition partial; see below). **Auto-wake promotion**
