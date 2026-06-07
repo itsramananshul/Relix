@@ -1412,6 +1412,14 @@ name = "spine_brief_suggest_respond"
 method = "brief.suggest_respond"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_brief_plan_package_open"
+method = "brief.plan_package_open"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_plan_confirm_respond"
+method = "brief.plan_confirm_respond"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_brief_snag"
 method = "brief.snag"
 allow_groups = ["chat-users"]

@@ -2150,6 +2150,421 @@ impl TaskStore {
         Ok(interaction_id)
     }
 
+    /// §1.7/§1.8/§3.1 (**plan package**): open a plan package on a Brief in one
+    /// atomic step — the planner pattern's front door. Creates, together under
+    /// one connection lock so a partial package can never leak:
+    ///   1. an **immutable `plan` Dossier revision** (`plan_title` defaults to
+    ///      "Plan"; `plan_body` is required — a plan package without a plan body
+    ///      is not a plan);
+    ///   2. a **structured `suggest_tasks` proposal** (validated + size-capped by
+    ///      [`brief::normalize_proposal`], same governance as a standalone
+    ///      `brief.suggest_open`);
+    ///   3. an **approval-bound `confirm`** linked to BOTH — `bound_doc_id` is
+    ///      the exact plan revision, `bound_interaction_id` is the proposal's
+    ///      interaction id.
+    ///
+    /// Accepting the confirm ([`Self::respond_plan_confirm`]) re-checks the plan
+    /// is still latest and then materializes the linked proposal through the
+    /// resumable, exactly-once decomposition ledger; rejecting it closes the
+    /// proposal without creating children. The proposal is normalized BEFORE any
+    /// row is written, so a bad proposal refuses with no orphan plan Dossier.
+    /// The Brief must exist; tenant scoping is enforced by the caller against the
+    /// owning Brief (like [`Self::open_suggestion`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_plan_package(
+        &self,
+        task_id: &str,
+        author: &str,
+        plan_title: &str,
+        plan_body: &str,
+        summary: &str,
+        children: &[brief::ChildSpec],
+        prompt: &str,
+    ) -> Result<brief::PlanPackage, CoordinatorError> {
+        let author = author.trim();
+        if author.is_empty() {
+            return Err(CoordinatorError::Invalid(
+                "plan package author required".to_string(),
+            ));
+        }
+        let plan_title = {
+            let t = plan_title.trim();
+            if t.is_empty() {
+                "Plan".to_string()
+            } else {
+                t.to_string()
+            }
+        };
+        if plan_body.trim().is_empty() {
+            return Err(CoordinatorError::Invalid(
+                "plan package plan_body required (a plan package needs a plan)".to_string(),
+            ));
+        }
+        // Validate + normalize the proposal up front (pure) so a bad proposal
+        // refuses BEFORE any row is written — no orphan plan Dossier / card.
+        let proposal =
+            brief::normalize_proposal(summary, children).map_err(CoordinatorError::Invalid)?;
+        let proposal_json = serde_json::to_string(&proposal)
+            .map_err(|e| CoordinatorError::Invalid(format!("proposal encode: {e}")))?;
+        let prompt = {
+            let p = prompt.trim();
+            if p.is_empty() {
+                "Approve this plan and create the proposed tasks?".to_string()
+            } else {
+                p.to_string()
+            }
+        };
+        let suggest_prompt = if proposal.summary.is_empty() {
+            format!("Proposed {} task(s)", proposal.children.len())
+        } else {
+            proposal.summary.clone()
+        };
+
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, task_id)? {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let now = unix_secs();
+        // 1. Immutable `plan` Dossier revision.
+        let plan_doc_id = new_doc_id();
+        conn.execute(
+            "INSERT INTO task_documents
+                 (doc_id, task_id, kind, title, body, created_at, updated_at)
+             VALUES (?1, ?2, 'plan', ?3, ?4, ?5, ?5)",
+            params![plan_doc_id, task_id, plan_title, plan_body, now],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let _ = conn.execute(
+            "INSERT INTO task_events (task_id, ts, event_type, payload)
+             VALUES (?1, ?2, 'brief.dossier_added', ?3)",
+            params![task_id, now, format!("plan: {plan_title}")],
+        );
+        // 2. The `suggest_tasks` proposal card (open, awaiting the confirm gate).
+        let suggestion_id = new_interaction_id();
+        conn.execute(
+            "INSERT INTO brief_interactions
+                 (interaction_id, task_id, kind, prompt, choices, author,
+                  status, response, created_at, resolved_at, resolved_by, proposal)
+             VALUES (?1, ?2, 'suggest_tasks', ?3, '[]', ?4, 'open', NULL, ?5, NULL, NULL, ?6)",
+            params![suggestion_id, task_id, suggest_prompt, author, now, proposal_json],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let _ = conn.execute(
+            "INSERT INTO task_events (task_id, ts, event_type, payload)
+             VALUES (?1, ?2, 'brief.suggestion_opened', ?3)",
+            params![
+                task_id,
+                now,
+                format!("{}: {} task(s)", author, proposal.children.len())
+            ],
+        );
+        // 3. The approval-bound `confirm`, linked to BOTH the plan revision
+        //    (`bound_doc_id`) and the proposal (`bound_interaction_id`).
+        let confirm_id = new_interaction_id();
+        conn.execute(
+            "INSERT INTO brief_interactions
+                 (interaction_id, task_id, kind, prompt, choices, author,
+                  status, response, created_at, resolved_at, resolved_by,
+                  bound_doc_id, bound_doc_kind, bound_interaction_id)
+             VALUES (?1, ?2, 'confirm', ?3, '[]', ?4, 'open', NULL, ?5, NULL, NULL,
+                     ?6, 'plan', ?7)",
+            params![confirm_id, task_id, prompt, author, now, plan_doc_id, suggestion_id],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let _ = conn.execute(
+            "INSERT INTO task_events (task_id, ts, event_type, payload)
+             VALUES (?1, ?2, 'brief.plan_package_opened', ?3)",
+            params![
+                task_id,
+                now,
+                format!(
+                    "{author}: plan package — plan {plan_doc_id} + {} task(s), gated by confirm {confirm_id}",
+                    proposal.children.len()
+                )
+            ],
+        );
+        Ok(brief::PlanPackage {
+            plan_doc_id,
+            suggestion_id,
+            confirm_id,
+        })
+    }
+
+    /// The linked `suggest_tasks` interaction id of a **plan-package confirm**
+    /// (§1.7/§1.8), if `confirm_id` is one: a `confirm` card with
+    /// `bound_doc_kind = 'plan'` AND a non-empty `bound_interaction_id`. `None`
+    /// otherwise — a plain/standalone confirm, a non-confirm card, or a missing
+    /// id. The wire handler uses this to fetch + assign-Key gate the linked
+    /// proposal's hints BEFORE the (materializing) accept, so an invalid hint
+    /// refuses the whole accept with no partial child creation.
+    pub fn plan_confirm_linked_suggestion(
+        &self,
+        task_id: &str,
+        confirm_id: &str,
+    ) -> Result<Option<String>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let row: Option<(String, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT kind, bound_doc_kind, bound_interaction_id FROM brief_interactions
+                 WHERE interaction_id = ?1 AND task_id = ?2",
+                params![confirm_id, task_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        match row {
+            Some((kind, bound_kind, Some(linked)))
+                if kind == "confirm"
+                    && bound_kind.as_deref() == Some("plan")
+                    && !linked.trim().is_empty() =>
+            {
+                Ok(Some(linked))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// §1.7/§1.8/§3.1 (**plan package**): answer the approval-bound `confirm`
+    /// that gates a linked `suggest_tasks` proposal — this is the primitive that
+    /// ties bound-plan approval into the decomposition trigger.
+    ///
+    /// On **accept**, in order:
+    ///   1. **stale guard** — re-check the bound `plan` Dossier is still the
+    ///      latest `plan` revision (the same check as [`Self::respond_interaction`]).
+    ///      A newer `plan` Dossier — or a comment that already flipped this card
+    ///      to `expired` — refuses **without materializing**; the card never
+    ///      resolves as approved against a superseded plan;
+    ///   2. **materialize** the linked proposal through [`Self::respond_suggestion`]
+    ///      (the existing exactly-once / resumable decomposition ledger) using
+    ///      the `resolved_assignees` the caller already validated through the
+    ///      assign-Key gate. A materialization error propagates and the confirm
+    ///      stays open — no partial-approval lie;
+    ///   3. only on success flip the confirm `open → resolved` and Chronicle
+    ///      `brief.plan_confirm_approved`.
+    ///
+    /// A **duplicate accept is idempotent**: the decomposition ledger no-ops and
+    /// the SAME child ids are returned (`already_approved`), never duplicated.
+    ///
+    /// On **reject**, flip the confirm `open → rejected`; if the linked proposal
+    /// is still open (no decomposition under way), reject it too (no children).
+    /// If the linked proposal already materialized/closed it is left intact and
+    /// the outcome says so honestly (`rejected_proposal_already_closed`).
+    ///
+    /// The card must be a plan-package confirm belonging to `task_id` (a
+    /// `confirm` with `bound_doc_kind='plan'` and a `bound_interaction_id`),
+    /// else `NotFound` / `Invalid`. Tenant scoping is enforced by the caller
+    /// against the owning Brief, and the linked materialization is itself
+    /// tenant-stamped through `respond_suggestion`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn respond_plan_confirm(
+        &self,
+        tenant: &str,
+        owner_subject_id: &str,
+        task_id: &str,
+        confirm_id: &str,
+        responder: &str,
+        accept: bool,
+        resolved_assignees: &[Option<String>],
+    ) -> Result<brief::PlanConfirmResult, CoordinatorError> {
+        let responder = responder.trim();
+        if responder.is_empty() {
+            return Err(CoordinatorError::Invalid(
+                "plan confirm responder required".to_string(),
+            ));
+        }
+        // Read + validate the confirm card under a short lock.
+        let (status, kind, bound_doc_id, bound_doc_kind, linked): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = {
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            let row = conn
+                .query_row(
+                    "SELECT status, kind, bound_doc_id, bound_doc_kind, bound_interaction_id
+                     FROM brief_interactions WHERE interaction_id = ?1 AND task_id = ?2",
+                    params![confirm_id, task_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()
+                .map_err(CoordinatorError::Db)?;
+            match row {
+                None => return Err(CoordinatorError::NotFound(confirm_id.to_string())),
+                Some(v) => v,
+            }
+        };
+        // Must be a plan-package confirm: a `confirm` bound to a `plan` Dossier
+        // AND linked to a `suggest_tasks` proposal. A plain/standalone confirm is
+        // answered through `respond_interaction`, not here.
+        let linked = match (kind.as_str(), bound_doc_kind.as_deref(), linked) {
+            ("confirm", Some("plan"), Some(s)) if !s.trim().is_empty() => s,
+            _ => {
+                return Err(CoordinatorError::Invalid(
+                    "not a plan-package confirm (no linked proposal) — answer it via \
+                     brief.interaction_respond"
+                        .to_string(),
+                ));
+            }
+        };
+
+        // ── REJECT ──
+        if !accept {
+            {
+                let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+                if status != "open" {
+                    return Err(CoordinatorError::Invalid(format!(
+                        "plan confirm already {status}"
+                    )));
+                }
+                let now = unix_secs();
+                let changed = conn
+                    .execute(
+                        "UPDATE brief_interactions
+                         SET status = 'rejected', resolved_at = ?1, resolved_by = ?2
+                         WHERE interaction_id = ?3 AND task_id = ?4 AND status = 'open'",
+                        params![now, responder, confirm_id, task_id],
+                    )
+                    .map_err(CoordinatorError::Db)?;
+                if changed == 0 {
+                    return Err(CoordinatorError::Invalid(
+                        "plan confirm already answered".to_string(),
+                    ));
+                }
+                let _ = conn.execute(
+                    "INSERT INTO task_events (task_id, ts, event_type, payload)
+                     VALUES (?1, ?2, 'brief.plan_confirm_rejected', ?3)",
+                    params![task_id, now, format!("{responder}: plan rejected")],
+                );
+            }
+            // Close the linked proposal if it is still open with no decomposition
+            // under way. `respond_suggestion(accept=false)` returns `Ok` when it
+            // rejected an open, unclaimed card (no children), and `Err` when the
+            // card is no longer open OR a decomposition claim exists (already
+            // materializing/materialized) — in which case we leave it intact and
+            // report honestly. Either way the confirm is already rejected.
+            let outcome = match self.respond_suggestion(
+                tenant,
+                owner_subject_id,
+                task_id,
+                &linked,
+                responder,
+                false,
+                &[],
+            ) {
+                Ok(_) => "rejected",
+                Err(_) => "rejected_proposal_already_closed",
+            };
+            return Ok(brief::PlanConfirmResult {
+                outcome: outcome.to_string(),
+                suggestion_id: linked,
+                created: Vec::new(),
+            });
+        }
+
+        // ── ACCEPT ──
+        // 1. Status gate + stale guard (only the `open` path checks staleness;
+        //    a `resolved` confirm is an idempotent duplicate accept).
+        match status.as_str() {
+            "open" => {
+                let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+                let latest = latest_dossier_id_conn(&conn, task_id, "plan")
+                    .map_err(CoordinatorError::Db)?;
+                if latest.as_deref() != bound_doc_id.as_deref() {
+                    // Stale: the plan changed since this confirm opened. Expire
+                    // the card durably and refuse — never materialize against a
+                    // superseded plan.
+                    let now = unix_secs();
+                    let _ = conn.execute(
+                        "UPDATE brief_interactions
+                         SET status = 'expired', resolved_at = ?1, resolved_by = ?2
+                         WHERE interaction_id = ?3 AND task_id = ?4 AND status = 'open'",
+                        params![now, responder, confirm_id, task_id],
+                    );
+                    let _ = conn.execute(
+                        "INSERT INTO task_events (task_id, ts, event_type, payload)
+                         VALUES (?1, ?2, 'brief.interaction_expired', ?3)",
+                        params![
+                            task_id,
+                            now,
+                            format!(
+                                "{responder}: plan changed since this plan confirm opened — stale"
+                            )
+                        ],
+                    );
+                    return Err(CoordinatorError::Invalid(
+                        "plan confirmation is stale: the plan changed since it was opened"
+                            .to_string(),
+                    ));
+                }
+            }
+            "resolved" => { /* idempotent duplicate accept — materialize no-ops */ }
+            other => {
+                return Err(CoordinatorError::Invalid(format!(
+                    "plan confirm already {other}"
+                )));
+            }
+        }
+
+        // 2. Materialize the linked proposal exactly once through the resumable
+        //    decomposition ledger. On the `open` path this creates the children;
+        //    on a `resolved` duplicate accept the claim is already `complete`, so
+        //    this no-ops and returns the recorded ids. A materialization error
+        //    propagates here, leaving an `open` confirm un-flipped (no partial
+        //    approval lie).
+        let created = self.respond_suggestion(
+            tenant,
+            owner_subject_id,
+            task_id,
+            &linked,
+            responder,
+            true,
+            resolved_assignees,
+        )?;
+
+        // 3. Flip the confirm to resolved (only reached when materialization
+        //    succeeded). The guard on `status='open'` makes a duplicate accept
+        //    idempotent: the first flips + Chronicles `approved`, a later one
+        //    sees 0 rows changed and reports `already_approved` without a second
+        //    event or any new child.
+        let outcome = {
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            let now = unix_secs();
+            let joined = created.join(",");
+            let changed = conn
+                .execute(
+                    "UPDATE brief_interactions
+                     SET status = 'resolved', resolved_at = ?1, resolved_by = ?2, response = ?3
+                     WHERE interaction_id = ?4 AND task_id = ?5 AND status = 'open'",
+                    params![now, responder, joined, confirm_id, task_id],
+                )
+                .map_err(CoordinatorError::Db)?;
+            if changed > 0 {
+                let _ = conn.execute(
+                    "INSERT INTO task_events (task_id, ts, event_type, payload)
+                     VALUES (?1, ?2, 'brief.plan_confirm_approved', ?3)",
+                    params![
+                        task_id,
+                        now,
+                        format!(
+                            "{responder}: plan approved — materialized {} task(s): {joined}",
+                            created.len()
+                        )
+                    ],
+                );
+                "approved"
+            } else {
+                "already_approved"
+            }
+        };
+        Ok(brief::PlanConfirmResult {
+            outcome: outcome.to_string(),
+            suggestion_id: linked,
+            created,
+        })
+    }
+
     /// §1.9: list a Brief's thread interactions (oldest first), open
     /// and resolved alike, so the workroom can show open cards above
     /// the Conversation and mark resolved ones. Does not check Brief
@@ -2164,7 +2579,7 @@ impl TaskStore {
             .prepare(
                 "SELECT interaction_id, task_id, kind, prompt, choices, author,
                         status, response, created_at, resolved_at, resolved_by,
-                        proposal, bound_doc_id, bound_doc_kind
+                        proposal, bound_doc_id, bound_doc_kind, bound_interaction_id
                  FROM brief_interactions WHERE task_id = ?1
                  ORDER BY created_at ASC, rowid ASC",
             )
@@ -2192,6 +2607,7 @@ impl TaskStore {
                     proposal,
                     bound_doc_id: r.get(12)?,
                     bound_doc_kind: r.get(13)?,
+                    bound_interaction_id: r.get(14)?,
                 })
             })
             .map_err(CoordinatorError::Db)?
@@ -11457,6 +11873,32 @@ pub fn register(
             })),
         );
     }
+    // §1.7/§1.8/§3.1 (plan package): open a plan package (plan Dossier +
+    // suggest_tasks proposal + approval-bound confirm linked to both), and
+    // accept/reject the confirm — an accept materializes the linked proposal
+    // through the resumable, exactly-once decomposition ledger.
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.plan_package_open",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_plan_package_open(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        let a = agent_store.clone();
+        bridge.register(
+            "brief.plan_confirm_respond",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let a = a.clone();
+                async move { handle_brief_plan_confirm_respond(&s, a.as_deref(), &ctx) }
+            })),
+        );
+    }
     // PHASE 1 (Brief): Dossiers — durable artifacts on a Brief.
     {
         let s = store.clone();
@@ -13279,6 +13721,202 @@ fn handle_brief_suggest_open(store: &TaskStore, ctx: &InvocationCtx) -> HandlerO
     }
 }
 
+/// Resolve + assign-Key gate each proposed child's optional assignee hint on a
+/// `suggest_tasks` card (§1.9), shared by `brief.suggest_respond` and the
+/// plan-package `brief.plan_confirm_respond` accept path. Runs BEFORE the
+/// (claiming) materialization, so an invalid / cross-Guild / inactive / ungated
+/// hint refuses the **whole** accept (`Err(HandlerOutcome)`) with no partial
+/// child creation. A `None` slot (or absent hint) opens that child unassigned —
+/// today's default. Returns an empty vec when the card is absent / not open /
+/// unparsable, leaving the precise typed error to the subsequent
+/// `respond_suggestion` call. `cap` names the calling capability for messages.
+fn resolve_suggestion_assignees(
+    store: &TaskStore,
+    agent_store: Option<&agent::AgentStore>,
+    ctx: &InvocationCtx,
+    task: &str,
+    interaction: &str,
+    cap: &str,
+) -> Result<Vec<Option<String>>, HandlerOutcome> {
+    match store.suggestion_proposal(task, interaction) {
+        Ok(Some(proposal)) => {
+            let mut out: Vec<Option<String>> = Vec::with_capacity(proposal.children.len());
+            for c in &proposal.children {
+                let has_hint = c.assignee_agent_id.is_some() || c.assignee_role.is_some();
+                match agent_store {
+                    Some(astore) => match agent::handlers::resolve_assignee_hint(
+                        astore,
+                        ctx,
+                        c.assignee_agent_id.as_deref(),
+                        c.assignee_role.as_deref(),
+                    ) {
+                        Ok(a) => out.push(a),
+                        // Refuse the whole accept — the card stays `open`, no
+                        // child is created.
+                        Err(denial) => return Err(denial),
+                    },
+                    // No agent store wired (not the bridge path): a hint can't
+                    // be governance-validated, so refuse to honour it rather than
+                    // assign ungated. No hint → unassigned.
+                    None => {
+                        if has_hint {
+                            return Err(internal(format!(
+                                "{cap}: assignee hint present but the agent store is unavailable"
+                            )));
+                        }
+                        out.push(None);
+                    }
+                }
+            }
+            Ok(out)
+        }
+        // Card not found / not open / unparsable proposal: fall through — the
+        // caller's `respond_suggestion` produces the precise typed error.
+        Ok(None) => Ok(Vec::new()),
+        Err(e) => Err(map_edge_err(cap, e)),
+    }
+}
+
+/// The JSON arg shape for `brief.plan_package_open` (§1.7/§1.8/§3.1). Opens a
+/// plan package: a `plan` Dossier revision + a `suggest_tasks` proposal + an
+/// approval-bound `confirm` linked to both.
+#[derive(serde::Deserialize)]
+struct PlanPackageOpenArg {
+    task_id: String,
+    author: String,
+    #[serde(default)]
+    plan_title: String,
+    plan_body: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    children: Vec<brief::ChildSpec>,
+    #[serde(default)]
+    prompt: String,
+}
+
+/// `brief.plan_package_open` — open a plan package on a Brief (§1.7/§1.8/§3.1).
+/// JSON arg `{task_id, author, plan_title?, plan_body, summary?, children:[…],
+/// prompt?}`. Creates the immutable `plan` Dossier, the `suggest_tasks`
+/// proposal, and the approval-bound `confirm` linked to both, atomically.
+/// Returns JSON `{plan_doc_id, suggestion_id, confirm_id}`. The proposal is
+/// bounded + governance-normalized in the store; tenant scoping is on the
+/// owning Brief.
+fn handle_brief_plan_package_open(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let arg: PlanPackageOpenArg = match serde_json::from_slice(&ctx.args) {
+        Ok(a) => a,
+        Err(e) => return invalid(format!("brief.plan_package_open arg: {e}")),
+    };
+    let task = arg.task_id.trim();
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.plan_package_open") {
+        return out;
+    }
+    match store.open_plan_package(
+        task,
+        arg.author.trim(),
+        &arg.plan_title,
+        &arg.plan_body,
+        &arg.summary,
+        &arg.children,
+        &arg.prompt,
+    ) {
+        Ok(pkg) => match serde_json::to_vec(&pkg) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.plan_package_open encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.plan_package_open", e),
+    }
+}
+
+/// `brief.plan_confirm_respond` — accept or reject a **plan-package confirm**
+/// (§1.7/§1.8/§3.1): the approval-bound `confirm` that gates a linked
+/// `suggest_tasks` proposal. Arg `task_id|confirm_id|responder|verdict`, where
+/// `verdict` is `accept` (re-check the plan is latest, then materialize the
+/// linked proposal through the resumable decomposition ledger) or `reject`
+/// (close the confirm + the still-open linked proposal). Needs the agent store
+/// to validate the linked proposal's assignee hints (same gate as
+/// `brief.suggest_respond`). Returns JSON `{outcome, suggestion_id, created:[…]}`.
+fn handle_brief_plan_confirm_respond(
+    store: &TaskStore,
+    agent_store: Option<&agent::AgentStore>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.plan_confirm_respond utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.split('|').collect();
+    if parts.len() != 4 {
+        return invalid(
+            "brief.plan_confirm_respond: expected `task_id|confirm_id|responder|verdict`"
+                .to_string(),
+        );
+    }
+    let task = parts[0].trim();
+    // Tenant scoping is on the owning Brief: a cross-Guild Brief id reads as
+    // not-found before any card row is touched.
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.plan_confirm_respond") {
+        return out;
+    }
+    let confirm = parts[1].trim();
+    let accept = match parts[3].trim() {
+        "accept" => true,
+        "reject" => false,
+        other => {
+            return invalid(format!(
+                "brief.plan_confirm_respond: verdict must be accept|reject, got `{other}`"
+            ));
+        }
+    };
+    // Resolve the linked proposal so we can assign-Key gate its hints BEFORE the
+    // (materializing) accept. A non-plan-package confirm refuses here cleanly.
+    let linked = match store.plan_confirm_linked_suggestion(task, confirm) {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            return invalid(
+                "brief.plan_confirm_respond: not a plan-package confirm (no linked proposal) — \
+                 answer a plain confirm via brief.interaction_respond"
+                    .to_string(),
+            );
+        }
+        Err(e) => return map_edge_err("brief.plan_confirm_respond", e),
+    };
+    // Validate assignee hints on accept (the reject path needs none). On a
+    // duplicate accept the linked proposal is no longer open → empty vec, which
+    // the resumable ledger no-ops over.
+    let resolved: Vec<Option<String>> = if accept {
+        match resolve_suggestion_assignees(
+            store,
+            agent_store,
+            ctx,
+            task,
+            &linked,
+            "brief.plan_confirm_respond",
+        ) {
+            Ok(v) => v,
+            Err(out) => return out,
+        }
+    } else {
+        Vec::new()
+    };
+    let owner = ctx.caller.subject_id.to_string();
+    match store.respond_plan_confirm(
+        ctx.tenant_id_or_default(),
+        &owner,
+        task,
+        confirm,
+        parts[2].trim(),
+        accept,
+        &resolved,
+    ) {
+        Ok(result) => match serde_json::to_vec(&result) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.plan_confirm_respond encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.plan_confirm_respond", e),
+    }
+}
+
 /// `brief.suggest_respond` — accept or reject a `suggest_tasks` card
 /// (§1.9). Arg `task_id|interaction_id|responder|verdict`, where
 /// `verdict` is `accept` (materialize children) or `reject` (close, no
@@ -13318,45 +13956,16 @@ fn handle_brief_suggest_respond(
     // A `None` slot (or absent hint) opens that child unassigned — today's
     // default. The reject path carries no assignees.
     let resolved: Vec<Option<String>> = if accept {
-        match store.suggestion_proposal(task, interaction) {
-            Ok(Some(proposal)) => {
-                let mut out: Vec<Option<String>> = Vec::with_capacity(proposal.children.len());
-                for c in &proposal.children {
-                    let has_hint =
-                        c.assignee_agent_id.is_some() || c.assignee_role.is_some();
-                    match agent_store {
-                        Some(astore) => {
-                            match agent::handlers::resolve_assignee_hint(
-                                astore,
-                                ctx,
-                                c.assignee_agent_id.as_deref(),
-                                c.assignee_role.as_deref(),
-                            ) {
-                                Ok(a) => out.push(a),
-                                // Refuse the whole accept — the card stays
-                                // `open`, no child is created.
-                                Err(denial) => return denial,
-                            }
-                        }
-                        // No agent store wired (not the bridge path): a hint
-                        // can't be governance-validated, so refuse to honour
-                        // it rather than assign ungated. No hint → unassigned.
-                        None => {
-                            if has_hint {
-                                return internal(
-                                    "brief.suggest_respond: assignee hint present but the agent store is unavailable".to_string(),
-                                );
-                            }
-                            out.push(None);
-                        }
-                    }
-                }
-                out
-            }
-            // Card not found / not open / unparsable proposal: fall through —
-            // `respond_suggestion` produces the precise typed error.
-            Ok(None) => Vec::new(),
-            Err(e) => return map_edge_err("brief.suggest_respond", e),
+        match resolve_suggestion_assignees(
+            store,
+            agent_store,
+            ctx,
+            task,
+            interaction,
+            "brief.suggest_respond",
+        ) {
+            Ok(v) => v,
+            Err(out) => return out,
         }
     } else {
         Vec::new()
@@ -15784,6 +16393,14 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             -- its kind (e.g. `plan`). NULL for plain ask/confirm/suggest cards.
             bound_doc_id   TEXT,
             bound_doc_kind TEXT,
+            -- Plan package (execution-and-issue §1.7/§1.8/§3.1): when a `confirm`
+            -- card is opened as part of a plan package (a `plan` Dossier + a
+            -- `suggest_tasks` proposal + this approval-bound confirm), the exact
+            -- linked `suggest_tasks` interaction id. Accepting the confirm
+            -- materializes THAT proposal through the resumable decomposition
+            -- ledger. NULL for plain ask/confirm/suggest cards and for a
+            -- standalone (unlinked) plan confirm.
+            bound_interaction_id TEXT,
             FOREIGN KEY (task_id) REFERENCES tasks(task_id)
         );
         CREATE INDEX IF NOT EXISTS brief_interactions_by_task
@@ -16198,6 +16815,12 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         // + nullable — existing cards are simply unbound plain confirms.
         "ALTER TABLE brief_interactions ADD COLUMN bound_doc_id TEXT",
         "ALTER TABLE brief_interactions ADD COLUMN bound_doc_kind TEXT",
+        // Plan package (execution-and-issue §1.7/§1.8/§3.1): link an
+        // approval-bound `confirm` to the exact `suggest_tasks` proposal it
+        // gates, so accepting the confirm materializes that proposal through the
+        // resumable decomposition ledger. Additive + nullable — existing cards
+        // (incl. standalone plan confirms) carry no link.
+        "ALTER TABLE brief_interactions ADD COLUMN bound_interaction_id TEXT",
         // ISSUE-TREE COST ROLLUP + BILLING ATTRIBUTION (company-model §6.6):
         // an optional billing code on a Brief so its (and its descendant
         // Sub-briefs') run cost attributes to the requesting team. Additive +
@@ -21925,6 +22548,299 @@ mod tests {
         assert_eq!(card.status, "open");
     }
 
+    // ── Plan package (§1.7/§1.8/§3.1): tie bound-plan approval into the
+    //    decomposition trigger. Opening a plan package creates a plan Dossier +
+    //    a suggest_tasks proposal + an approval-bound confirm linked to both;
+    //    accepting the confirm materializes the linked proposal exactly once. ──
+
+    // Helper: open a plan package on `parent` with the given child titles.
+    fn open_pkg(s: &TaskStore, parent: &str, titles: &[&str]) -> brief::PlanPackage {
+        let children: Vec<brief::ChildSpec> = titles
+            .iter()
+            .map(|t| brief::ChildSpec {
+                title: (*t).into(),
+                priority: None,
+                after: None,
+                assignee_agent_id: None,
+                assignee_role: None,
+            })
+            .collect();
+        s.open_plan_package(
+            parent,
+            "operative-1",
+            "Plan",
+            "the plan body",
+            "Break it down",
+            &children,
+            "",
+        )
+        .unwrap()
+    }
+
+    // Opening a plan package creates exactly one plan Dossier, one linked
+    // suggest_tasks card, and one confirm bound to BOTH (the plan revision +
+    // the proposal interaction id).
+    #[test]
+    fn plan_package_open_creates_plan_suggestion_and_bound_confirm() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let pkg = open_pkg(&s, &parent, &["A", "B"]);
+        // Exactly one `plan` Dossier, and it is the bound revision.
+        let docs = s.list_dossiers(&parent).unwrap();
+        assert_eq!(docs.iter().filter(|d| d.kind == "plan").count(), 1);
+        assert_eq!(docs[0].doc_id, pkg.plan_doc_id);
+        // Exactly one suggest_tasks card + one confirm card.
+        let cards = s.list_interactions(&parent).unwrap();
+        let suggests: Vec<_> = cards.iter().filter(|c| c.kind == "suggest_tasks").collect();
+        let confirms: Vec<_> = cards.iter().filter(|c| c.kind == "confirm").collect();
+        assert_eq!(suggests.len(), 1);
+        assert_eq!(confirms.len(), 1);
+        assert_eq!(suggests[0].interaction_id, pkg.suggestion_id);
+        assert_eq!(suggests[0].proposal.as_ref().unwrap().children.len(), 2);
+        // The confirm is bound to the exact plan revision AND linked to the
+        // exact proposal.
+        let confirm = confirms[0];
+        assert_eq!(confirm.interaction_id, pkg.confirm_id);
+        assert_eq!(confirm.bound_doc_kind.as_deref(), Some("plan"));
+        assert_eq!(confirm.bound_doc_id.as_deref(), Some(pkg.plan_doc_id.as_str()));
+        assert_eq!(
+            confirm.bound_interaction_id.as_deref(),
+            Some(pkg.suggestion_id.as_str())
+        );
+        // The opening is chronicled.
+        assert_eq!(
+            s.query_events(&parent, 0, 50, Some("brief.plan_package_opened"), EventOrder::Asc)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    // Accepting the linked confirm materializes the children exactly once and
+    // resolves BOTH the confirm and the linked suggestion appropriately.
+    #[test]
+    fn plan_confirm_accept_materializes_and_resolves_both() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let pkg = open_pkg(&s, &parent, &["A", "B", "C"]);
+        let res = s
+            .respond_plan_confirm("acme", "subj", &parent, &pkg.confirm_id, "founder", true, &[])
+            .unwrap();
+        assert_eq!(res.outcome, "approved");
+        assert_eq!(res.created.len(), 3);
+        assert_eq!(res.suggestion_id, pkg.suggestion_id);
+        // Real, linked Sub-briefs — exactly the created set (no orphans).
+        let subs = s.list_subbriefs(&parent).unwrap();
+        assert_eq!(subs.len(), 3);
+        for c in &res.created {
+            assert!(subs.contains(c));
+            assert!(s.get(c).unwrap().is_some());
+        }
+        // Both cards resolved; materialization + approval chronicled once.
+        let cards = s.list_interactions(&parent).unwrap();
+        let suggestion = cards.iter().find(|c| c.interaction_id == pkg.suggestion_id).unwrap();
+        let confirm = cards.iter().find(|c| c.interaction_id == pkg.confirm_id).unwrap();
+        assert_eq!(suggestion.status, "resolved");
+        assert_eq!(confirm.status, "resolved");
+        assert_eq!(confirm.response.as_deref(), Some(res.created.join(",").as_str()));
+        assert_eq!(materialized_count(&s, &parent), 1);
+        assert_eq!(
+            s.query_events(&parent, 0, 50, Some("brief.plan_confirm_approved"), EventOrder::Asc)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    // Accepting twice does not duplicate children and leaves no orphans — the
+    // second accept is idempotent (`already_approved`) and returns the SAME ids.
+    #[test]
+    fn plan_confirm_accept_twice_is_idempotent() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let pkg = open_pkg(&s, &parent, &["A", "B"]);
+        let first = s
+            .respond_plan_confirm("acme", "subj", &parent, &pkg.confirm_id, "founder", true, &[])
+            .unwrap();
+        let second = s
+            .respond_plan_confirm("acme", "subj", &parent, &pkg.confirm_id, "founder", true, &[])
+            .unwrap();
+        assert_eq!(first.outcome, "approved");
+        assert_eq!(second.outcome, "already_approved");
+        assert_eq!(first.created, second.created, "same ids on re-accept");
+        // No duplicate children, and every Sub-brief is one we created.
+        let subs = s.list_subbriefs(&parent).unwrap();
+        assert_eq!(subs.len(), 2, "no duplicate children");
+        for c in &subs {
+            assert!(first.created.contains(c), "no orphan child {c}");
+        }
+        assert_eq!(materialized_count(&s, &parent), 1);
+        // Only one approval event despite two accepts.
+        assert_eq!(
+            s.query_events(&parent, 0, 50, Some("brief.plan_confirm_approved"), EventOrder::Asc)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    // Rejecting the confirm rejects the linked suggestion and creates no
+    // children.
+    #[test]
+    fn plan_confirm_reject_closes_linked_suggestion_no_children() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let pkg = open_pkg(&s, &parent, &["A", "B"]);
+        let res = s
+            .respond_plan_confirm("acme", "subj", &parent, &pkg.confirm_id, "founder", false, &[])
+            .unwrap();
+        assert_eq!(res.outcome, "rejected");
+        assert!(res.created.is_empty());
+        assert!(s.list_subbriefs(&parent).unwrap().is_empty(), "no children");
+        let cards = s.list_interactions(&parent).unwrap();
+        let suggestion = cards.iter().find(|c| c.interaction_id == pkg.suggestion_id).unwrap();
+        let confirm = cards.iter().find(|c| c.interaction_id == pkg.confirm_id).unwrap();
+        assert_eq!(confirm.status, "rejected");
+        assert_eq!(suggestion.status, "rejected", "linked suggestion closed too");
+        assert_eq!(materialized_count(&s, &parent), 0);
+    }
+
+    // A newer `plan` Dossier before accept expires the confirm and does NOT
+    // materialize the linked suggestion (no approval against a superseded plan).
+    #[test]
+    fn plan_confirm_stale_plan_expires_and_does_not_materialize() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let pkg = open_pkg(&s, &parent, &["A", "B"]);
+        // The plan changes (a newer `plan` Dossier) before the operator accepts.
+        s.add_dossier(&parent, "plan", "Plan v2", "rewritten").unwrap();
+        let err = s
+            .respond_plan_confirm("acme", "subj", &parent, &pkg.confirm_id, "founder", true, &[])
+            .unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)), "stale ⇒ refused");
+        // The confirm expired; the suggestion is untouched (still open, no claim,
+        // no children).
+        let cards = s.list_interactions(&parent).unwrap();
+        let confirm = cards.iter().find(|c| c.interaction_id == pkg.confirm_id).unwrap();
+        let suggestion = cards.iter().find(|c| c.interaction_id == pkg.suggestion_id).unwrap();
+        assert_eq!(confirm.status, "expired");
+        assert_eq!(suggestion.status, "open", "linked suggestion not materialized");
+        assert!(s.list_subbriefs(&parent).unwrap().is_empty(), "no children");
+        assert!(decomp_claim(&s, &parent, &pkg.suggestion_id).is_none(), "no claim");
+    }
+
+    // A comment that supersedes the bound confirm (flipping it to `expired`)
+    // also blocks materialization through the plan-confirm accept path.
+    #[test]
+    fn plan_confirm_comment_supersede_blocks_materialization() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let pkg = open_pkg(&s, &parent, &["A"]);
+        // A comment supersedes any OPEN plan-bound confirm (§1.8) → `expired`.
+        s.comment_on_brief(&parent, "founder", "let's hold off").unwrap();
+        let confirm = s
+            .list_interactions(&parent)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.interaction_id == pkg.confirm_id)
+            .unwrap();
+        assert_eq!(confirm.status, "expired", "comment supersedes the confirm");
+        // Accepting the now-expired confirm refuses and never materializes.
+        let err = s
+            .respond_plan_confirm("acme", "subj", &parent, &pkg.confirm_id, "founder", true, &[])
+            .unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)));
+        assert!(s.list_subbriefs(&parent).unwrap().is_empty());
+    }
+
+    // `after` dependencies still wire as Snags after accept through the plan
+    // confirm (the same intra-proposal edges as a standalone suggestion accept).
+    #[test]
+    fn plan_confirm_accept_wires_after_dependencies() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        // Child #1 depends on #0 (a backward edge).
+        let children = vec![
+            brief::ChildSpec { title: "First".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
+            brief::ChildSpec { title: "Second".into(), priority: None, after: Some(0), assignee_agent_id: None, assignee_role: None },
+        ];
+        let pkg = s
+            .open_plan_package(&parent, "op", "Plan", "body", "ordered plan", &children, "")
+            .unwrap();
+        let res = s
+            .respond_plan_confirm("acme", "subj", &parent, &pkg.confirm_id, "founder", true, &[])
+            .unwrap();
+        assert_eq!(res.created.len(), 2);
+        // The second child is `blocked_on` the first.
+        let snags = s.list_snags(&res.created[1]).unwrap();
+        assert!(snags.contains(&res.created[0]), "after edge wired as a Snag");
+    }
+
+    // If the linked suggestion already materialized/closed (e.g. accepted
+    // directly), rejecting the confirm does NOT corrupt it — the confirm is
+    // rejected and the outcome is honest.
+    #[test]
+    fn plan_confirm_reject_after_suggestion_materialized_is_honest() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let pkg = open_pkg(&s, &parent, &["A", "B"]);
+        // The linked suggestion is accepted directly (a separate route).
+        let created = s
+            .respond_suggestion("acme", "subj", &parent, &pkg.suggestion_id, "founder", true, &[])
+            .unwrap();
+        assert_eq!(created.len(), 2);
+        // Rejecting the confirm now is honest: confirm rejected, suggestion left
+        // intact (still resolved, children unharmed).
+        let res = s
+            .respond_plan_confirm("acme", "subj", &parent, &pkg.confirm_id, "founder", false, &[])
+            .unwrap();
+        assert_eq!(res.outcome, "rejected_proposal_already_closed");
+        let cards = s.list_interactions(&parent).unwrap();
+        let suggestion = cards.iter().find(|c| c.interaction_id == pkg.suggestion_id).unwrap();
+        let confirm = cards.iter().find(|c| c.interaction_id == pkg.confirm_id).unwrap();
+        assert_eq!(confirm.status, "rejected");
+        assert_eq!(suggestion.status, "resolved", "materialized suggestion untouched");
+        assert_eq!(s.list_subbriefs(&parent).unwrap().len(), 2, "children intact");
+    }
+
+    // A plain confirm / standalone plan confirm has no linked proposal — the
+    // plan-confirm respond path refuses it (it is answered via interaction
+    // respond instead). Guards the additive-only contract.
+    #[test]
+    fn plan_confirm_respond_refuses_unlinked_confirm() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        // A standalone plan confirm (bound to a plan Dossier but NOT linked).
+        s.add_dossier(&parent, "plan", "Plan", "body").unwrap();
+        let standalone = s.open_plan_confirm(&parent, "op", "").unwrap();
+        assert!(
+            s.plan_confirm_linked_suggestion(&parent, &standalone).unwrap().is_none(),
+            "standalone confirm carries no linked proposal"
+        );
+        let err = s
+            .respond_plan_confirm("acme", "subj", &parent, &standalone, "founder", true, &[])
+            .unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)));
+    }
+
     // §1.9 (suggest_tasks): accepting a suggestion materializes the
     // proposed children as real Sub-briefs, links them to the parent, and
     // resolves the card with the created ids + a Chronicle entry.
@@ -22492,6 +23408,142 @@ mod tests {
         );
         let listed = s.list_interactions(&parent).unwrap();
         assert_eq!(listed[0].status, "open", "card stays open after refusal");
+    }
+
+    // ── Plan package wire handlers (§1.7/§1.8/§3.1) ──
+
+    // Helper: open a plan package through the wire handler, returning the pkg.
+    fn open_pkg_handler(
+        s: &TaskStore,
+        parent: &str,
+        tenant: &str,
+        children: serde_json::Value,
+    ) -> brief::PlanPackage {
+        let arg = serde_json::json!({
+            "task_id": parent,
+            "author": "op",
+            "plan_title": "Plan",
+            "plan_body": "the plan body",
+            "summary": "Break it down",
+            "children": children,
+        });
+        let bytes = serde_json::to_vec(&arg).unwrap();
+        match handle_brief_plan_package_open(s, &ctx_op_tenant(&bytes, tenant)) {
+            HandlerOutcome::Ok(b) => serde_json::from_slice(&b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("plan_package_open: {} {}", e.kind, e.cause),
+        }
+    }
+
+    // End-to-end through the wire handler: a plan package accept resolves the
+    // confirm and materializes the linked proposal exactly once, returning a
+    // typed outcome + the created ids.
+    #[test]
+    fn plan_confirm_handler_accept_materializes() {
+        let s = TaskStore::in_memory().unwrap();
+        let astore = agent::AgentStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let pkg = open_pkg_handler(
+            &s,
+            &parent,
+            "acme",
+            serde_json::json!([{ "title": "A" }, { "title": "B" }]),
+        );
+        let out = handle_brief_plan_confirm_respond(
+            &s,
+            Some(&astore),
+            &ctx_op_tenant(format!("{parent}|{}|founder|accept", pkg.confirm_id).as_bytes(), "acme"),
+        );
+        let body = match out {
+            HandlerOutcome::Ok(b) => b,
+            HandlerOutcome::Err(e) => panic!("accept: {} {}", e.kind, e.cause),
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["outcome"], "approved");
+        assert_eq!(v["created"].as_array().unwrap().len(), 2);
+        assert_eq!(s.list_subbriefs(&parent).unwrap().len(), 2);
+    }
+
+    // §1.9 hint gate on the plan-confirm path: an unhonourable assignee hint on
+    // a linked child refuses the WHOLE accept BEFORE the confirm is approved and
+    // BEFORE any child is created — the confirm stays open for a retry.
+    #[test]
+    fn plan_confirm_handler_invalid_hint_refused_no_partial() {
+        let s = TaskStore::in_memory().unwrap();
+        let astore = agent::AgentStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let pkg = open_pkg_handler(
+            &s,
+            &parent,
+            "acme",
+            // Second child names a role with no active Operative → unhonourable.
+            serde_json::json!([{ "title": "A" }, { "title": "B", "assignee_role": "ghost" }]),
+        );
+        let out = handle_brief_plan_confirm_respond(
+            &s,
+            Some(&astore),
+            &ctx_op_tenant(format!("{parent}|{}|founder|accept", pkg.confirm_id).as_bytes(), "acme"),
+        );
+        assert!(matches!(out, HandlerOutcome::Err(_)), "bad hint refuses accept");
+        // No child created; both linked cards stay open (a retry is possible).
+        assert!(s.list_subbriefs(&parent).unwrap().is_empty(), "no partial creation");
+        let cards = s.list_interactions(&parent).unwrap();
+        let confirm = cards.iter().find(|c| c.interaction_id == pkg.confirm_id).unwrap();
+        let suggestion = cards.iter().find(|c| c.interaction_id == pkg.suggestion_id).unwrap();
+        assert_eq!(confirm.status, "open", "confirm not approved on a bad hint");
+        assert_eq!(suggestion.status, "open", "suggestion not materialized");
+    }
+
+    // Tenant isolation: a cross-Guild caller can neither open a plan package nor
+    // accept a plan confirm for another Guild — the owning Brief reads as
+    // not-found (no existence leak).
+    #[test]
+    fn plan_package_denied_across_tenant() {
+        let s = TaskStore::in_memory().unwrap();
+        let astore = agent::AgentStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        // Cross-tenant open is refused.
+        let open_arg = serde_json::json!({
+            "task_id": parent, "author": "op", "plan_body": "b",
+            "summary": "s", "children": [{ "title": "A" }],
+        });
+        let open_bytes = serde_json::to_vec(&open_arg).unwrap();
+        assert!(matches!(
+            handle_brief_plan_package_open(&s, &ctx_op_tenant(&open_bytes, "globex")),
+            HandlerOutcome::Err(_)
+        ));
+        // Same-tenant open succeeds.
+        let pkg = open_pkg_handler(
+            &s,
+            &parent,
+            "acme",
+            serde_json::json!([{ "title": "A" }]),
+        );
+        // Cross-tenant accept is refused (not-found on the owning Brief), and
+        // nothing materializes.
+        let out = handle_brief_plan_confirm_respond(
+            &s,
+            Some(&astore),
+            &ctx_op_tenant(
+                format!("{parent}|{}|hacker|accept", pkg.confirm_id).as_bytes(),
+                "globex",
+            ),
+        );
+        assert!(matches!(out, HandlerOutcome::Err(_)));
+        assert!(s.list_subbriefs(&parent).unwrap().is_empty());
+        // Still open for the owning Guild.
+        let confirm = s
+            .list_interactions(&parent)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.interaction_id == pkg.confirm_id)
+            .unwrap();
+        assert_eq!(confirm.status, "open");
     }
 
     // ── Exactly-once plan decomposition (§1.7): the durable decomposition

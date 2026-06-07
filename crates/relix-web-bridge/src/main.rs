@@ -755,6 +755,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/spine/briefs/:id/suggestions/:iid/respond",
             post(spine::respond_suggestion),
         )
+        // §1.7/§1.8/§3.1 plan package: open a plan Dossier + suggest_tasks
+        // proposal + approval-bound confirm linked to both, then accept/reject
+        // the confirm. Accepting materializes the linked proposal through the
+        // resumable, exactly-once decomposition ledger.
+        .route(
+            "/v1/spine/briefs/:id/plan-package",
+            post(spine::open_plan_package),
+        )
+        .route(
+            "/v1/spine/briefs/:id/plan-confirms/:cid/respond",
+            post(spine::respond_plan_confirm),
+        )
         .route("/v1/spine/briefs/:id/due", post(spine::set_due))
         .route("/v1/spine/briefs/:id/set", post(spine::set_field))
         .route("/v1/spine/briefs/:id/snag", post(spine::add_snag))

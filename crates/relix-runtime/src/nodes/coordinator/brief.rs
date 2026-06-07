@@ -93,6 +93,19 @@ pub struct Interaction {
     /// unbound. Paired with [`Self::bound_doc_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_doc_kind: Option<String>,
+    /// **Plan package** (relix-execution-and-issue-design §1.7/§1.8/§3.1): when
+    /// this `confirm` card was opened as part of a *plan package* (a `plan`
+    /// Dossier + a `suggest_tasks` proposal + this approval-bound confirm, all
+    /// created together by `brief.plan_package_open`), the exact `suggest_tasks`
+    /// interaction id this confirm is linked to. Accepting this confirm
+    /// **materializes that exact proposal** through the existing resumable,
+    /// exactly-once decomposition ledger; rejecting it closes the linked
+    /// proposal without creating children. `None` for a plain
+    /// `ask`/`confirm`/`suggest_tasks` and for a standalone
+    /// `brief.plan_confirm_open` confirm (those behave exactly as before — no
+    /// linked proposal, answered through `brief.interaction_respond`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_interaction_id: Option<String>,
 }
 
 /// One proposed child Brief inside a `suggest_tasks` interaction (§1.9):
@@ -151,6 +164,47 @@ pub struct ChildSpec {
 pub struct Proposal {
     pub summary: String,
     pub children: Vec<ChildSpec>,
+}
+
+/// The three artifacts a **plan package** creates together
+/// (relix-execution-and-issue-design §1.7/§1.8/§3.1): an immutable `plan`
+/// Dossier revision, the structured `suggest_tasks` proposal, and the
+/// approval-bound `confirm` linked to BOTH. Returned by
+/// [`super::TaskStore::open_plan_package`]. Accepting the confirm materializes
+/// the linked proposal through the resumable, exactly-once decomposition
+/// ledger; rejecting it closes the proposal without creating children.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanPackage {
+    /// The immutable `plan` Dossier revision the confirm is bound to (its id IS
+    /// the revision — Dossiers are append-only rows).
+    pub plan_doc_id: String,
+    /// The `suggest_tasks` interaction carrying the proposal the confirm gates.
+    pub suggestion_id: String,
+    /// The approval-bound `confirm` interaction linked to the plan revision and
+    /// the proposal.
+    pub confirm_id: String,
+}
+
+/// The honest, typed outcome of answering a plan-package confirm
+/// (relix-execution-and-issue-design §1.7/§1.8). It carries *what actually
+/// happened* so a caller never has to infer approval from a bare 200.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanConfirmResult {
+    /// One of:
+    /// - `approved` — the confirm resolved and the linked proposal materialized
+    ///   on this call;
+    /// - `already_approved` — idempotent duplicate accept: the children already
+    ///   existed and the SAME ids are returned (never duplicated);
+    /// - `rejected` — the confirm and its still-open linked proposal were both
+    ///   closed, no children created;
+    /// - `rejected_proposal_already_closed` — the confirm was rejected, but the
+    ///   linked proposal had already materialized/closed and was left intact.
+    pub outcome: String,
+    /// The linked `suggest_tasks` interaction id.
+    pub suggestion_id: String,
+    /// The child Brief ids created by materializing the linked proposal (empty
+    /// on reject). On a duplicate accept these are the SAME ids — never doubled.
+    pub created: Vec<String>,
 }
 
 /// Hard caps on a `suggest_tasks` proposal — the proposal is bounded

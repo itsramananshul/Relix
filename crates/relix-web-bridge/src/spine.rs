@@ -1889,6 +1889,116 @@ pub async fn respond_suggestion(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct OpenPlanPackageRequest {
+    pub author: String,
+    /// The `plan` Dossier title; the coordinator defaults it to "Plan" when
+    /// empty.
+    #[serde(default)]
+    pub plan_title: String,
+    /// The `plan` Dossier body — required (a plan package without a plan body is
+    /// not a plan); the coordinator refuses an empty body.
+    pub plan_body: String,
+    /// The `suggest_tasks` proposal summary line.
+    #[serde(default)]
+    pub summary: String,
+    /// The proposed child Briefs (same shape + governance as a standalone
+    /// `suggest_tasks` card).
+    #[serde(default)]
+    pub children: Vec<SuggestChild>,
+    /// Optional prompt text shown on the approval-bound confirm; the coordinator
+    /// supplies a default line when empty.
+    #[serde(default)]
+    pub prompt: String,
+}
+
+/// `POST /v1/spine/briefs/:id/plan-package` — open a **plan package**
+/// (relix-execution-and-issue-design §1.7/§1.8/§3.1) in one atomic step: an
+/// immutable `plan` Dossier revision, a `suggest_tasks` proposal, and an
+/// approval-bound `confirm` linked to both. Accepting the confirm (via the
+/// `…/plan-confirms/:cid/respond` route) materializes the linked proposal
+/// through the resumable, exactly-once decomposition ledger. The proposal is
+/// JSON (a pipe-delimited string can't carry a child list), so the bridge
+/// forwards a JSON arg the coordinator validates + size-caps. Returns
+/// `{plan_doc_id, suggestion_id, confirm_id}`.
+pub async fn open_plan_package(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<OpenPlanPackageRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if req.author.trim().is_empty() {
+        return Err(bad("author required"));
+    }
+    if req.plan_body.trim().is_empty() {
+        return Err(bad("plan_body required (a plan package needs a plan)"));
+    }
+    if req.children.is_empty() {
+        return Err(bad("at least one proposed task is required"));
+    }
+    let children: Vec<serde_json::Value> = req
+        .children
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "title": c.title,
+                "priority": c.priority,
+                "after": c.after,
+                "assignee_agent_id": c.assignee_agent_id,
+                "assignee_role": c.assignee_role,
+            })
+        })
+        .collect();
+    let arg = serde_json::json!({
+        "task_id": id,
+        "author": req.author.trim(),
+        "plan_title": req.plan_title,
+        "plan_body": req.plan_body,
+        "summary": req.summary,
+        "children": children,
+        "prompt": req.prompt,
+    });
+    let arg_bytes = serde_json::to_vec(&arg).map_err(|e| bad(&format!("encode: {e}")))?;
+    let body = call_peer(&state, "brief.plan_package_open", &arg_bytes).await?;
+    json_passthrough(body)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RespondPlanConfirmRequest {
+    pub responder: String,
+    /// `true` accepts (re-checks the plan is latest, then materializes the
+    /// linked proposal through the decomposition ledger); `false` rejects
+    /// (closes the confirm + the still-open linked proposal, no children).
+    pub accept: bool,
+}
+
+/// `POST /v1/spine/briefs/:id/plan-confirms/:cid/respond` — answer a
+/// **plan-package confirm** (relix-execution-and-issue-design §1.7/§1.8/§3.1):
+/// the approval-bound `confirm` that gates a linked `suggest_tasks` proposal.
+/// Accept re-checks the bound `plan` Dossier is still latest, then materializes
+/// the linked proposal exactly once through the resumable decomposition ledger;
+/// reject closes the confirm and its still-open proposal with no children.
+/// Returns `{outcome, suggestion_id, created:[ids]}`. A non-plan-package confirm
+/// is refused here (it is answered through the generic
+/// `…/interactions/:iid/respond` route instead). A duplicate accept is
+/// idempotent and returns the SAME child ids.
+pub async fn respond_plan_confirm(
+    State(state): State<AppState>,
+    Path((id, cid)): Path<(String, String)>,
+    Json(req): Json<RespondPlanConfirmRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if req.responder.trim().is_empty() {
+        return Err(bad("responder required"));
+    }
+    // responder is a positional wire field, so it must not carry a `|`.
+    if req.responder.contains('|') {
+        return Err(bad("responder must not contain `|`"));
+    }
+    let verdict = if req.accept { "accept" } else { "reject" };
+    let arg = format!("{id}|{cid}|{}|{verdict}", req.responder.trim());
+    let body = call_peer(&state, "brief.plan_confirm_respond", arg.as_bytes()).await?;
+    json_passthrough(body)
+}
+
+#[derive(Debug, Deserialize)]
 pub struct SetFieldRequest {
     pub field: String,
     #[serde(default)]

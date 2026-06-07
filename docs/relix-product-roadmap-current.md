@@ -125,7 +125,10 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   expires the card and never resolves as approved. Now usable from the dashboard: a
   `POST /v1/spine/briefs/:id/plan-confirm` bridge route + a workroom **Request approval**
   control open the bound confirm, the `expired` status renders distinctly from `rejected`,
-  and a "bound to plan" cue shows on the card.
+  and a "bound to plan" cue shows on the card. **Plan packages** (`brief.plan_package_open`,
+  §1.7/§1.8/§3.1) go one step further — a confirm linked to **both** a `plan` Dossier and a
+  `suggest_tasks` proposal (`bound_interaction_id`); accepting it via `brief.plan_confirm_respond`
+  materializes the linked proposal exactly once through the resumable decomposition ledger.
 - **Desk / Inbox reads** — `/v1/spine/inbox`, `/v1/spine/briefs/:id/thread`,
   `/v1/spine/unassigned`; board cards surface unresolved same-Guild blockers.
 - **Supervisory auto-wake** (`execution §1.6/§3.1`) — the central `set_board_status`
@@ -391,11 +394,22 @@ ledger entry or design section.
     tenant-isolated (cross-Guild reads as not-found). **Dashboard control now shipped:** a
     `POST /v1/spine/briefs/:id/plan-confirm` bridge route proxies the capability and the Brief
     workroom carries a **Request approval** control (against the latest `plan` Dossier), renders
-    `expired` distinctly from `rejected`, and shows a "bound to plan" cue. *Still deferred:* tying
-    that bound-plan approval into the decomposition trigger (decomposition still keys on the
-    `suggest_tasks` interaction id, **not** the bound plan revision), and full issue **document
-    authoring / per-doc revision-locking / forking** (`execution §1.8`) plus wiring this into the
-    autonomous planner flow. (The `owner`-liveness takeover gap is now **closed** — see the
+    `expired` distinctly from `rejected`, and shows a "bound to plan" cue. **Bound-plan approval now
+    triggers decomposition — SHIPPED (backend + bridge; dashboard safe-response path; `execution
+    §1.7/§1.8/§3.1`):** a new **`brief.plan_package_open`** capability creates, atomically, a *plan
+    package* — an immutable `plan` Dossier + a `suggest_tasks` proposal + an approval-bound `confirm`
+    linked to **both** (the new nullable `bound_interaction_id` column carries the proposal link). A
+    companion **`brief.plan_confirm_respond`** answers that confirm: **accept** re-checks the plan is
+    still latest and then **materializes the linked proposal exactly once through the resumable
+    `brief_decomposition_claims` ledger** (assignee hints pre-validated through the assign-Key gate;
+    duplicate accept idempotent → same ids), **reject** closes the confirm and its still-open
+    proposal. Bridge routes `POST /v1/spine/briefs/:id/plan-package` + `…/plan-confirms/:cid/respond`
+    and boot-policy allow rules/coverage shipped; the workroom routes a plan-package confirm (one
+    carrying `bound_interaction_id`) through the safe response path so **Yes** triggers decomposition
+    exactly once. *Still deferred:* full issue **document authoring / per-doc revision-locking /
+    forking** (`execution §1.8`), a dashboard plan-package **editor** (only the safe response path
+    ships; the open route exists), and wiring this into an **autonomous (LLM) planner** flow (no
+    agent auto-authors the plan or auto-fires it). (The `owner`-liveness takeover gap is now **closed** — see the
     owner-takeover note above; for these synchronous operator interactions the honest model is
     operator-resumable with stale-age takeover, not a heartbeat-backed live run.)
 
@@ -679,9 +693,13 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
     slice 10). **Approval-bound plan *confirm* is now backend-shipped (first slice, §1.8):**
     `brief.plan_confirm_open` binds a `confirm` to the latest `plan` Dossier revision; a stale accept
     (after a newer plan revision or a superseding comment) expires the card and never resolves as
-    approved. *Still deferred:* tying that bound-plan approval into the decomposition trigger
-    (decomposition still keys on the interaction id) and full issue document authoring /
-    revision-locking / forking (§1.8).
+    approved. **Bound-plan approval now triggers decomposition (§1.7/§1.8/§3.1, backend + bridge):**
+    `brief.plan_package_open` links an approval-bound confirm to a `plan` Dossier **and** a
+    `suggest_tasks` proposal (new `bound_interaction_id` column); `brief.plan_confirm_respond` accept
+    re-checks the plan is latest then materializes the linked proposal exactly once through the
+    resumable ledger (idempotent duplicate accept; reject closes both). *Still deferred:* full issue
+    document authoring / revision-locking / forking (§1.8), a dashboard plan-package editor (only the
+    safe response path ships), and an autonomous LLM planner.
 
 > After completing a slice: re-open the cited section, update the implementation map /
 > divergence ledger in `product-spine-implementation.md`, and update this file's §2/§3 so

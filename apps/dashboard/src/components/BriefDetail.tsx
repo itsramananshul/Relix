@@ -8,6 +8,7 @@ import {
   runControls,
   briefInteractions,
   briefSuggestions,
+  briefPlanConfirms,
   type RunDiff,
   type BriefInteraction,
 } from "../api";
@@ -365,6 +366,35 @@ export function BriefDetail({
     setIxBusy(it.interaction_id);
     setBanner(null);
     try {
+      // Plan-package confirm (§1.7/§1.8/§3.1): a `confirm` linked to a
+      // `suggest_tasks` proposal (`bound_interaction_id`). Answering it through
+      // the generic interaction respond would resolve the card WITHOUT
+      // materializing the proposal; the safe plan-confirm route ties approval to
+      // the decomposition trigger (accept materializes the linked proposal
+      // exactly once through the resumable ledger; reject closes both).
+      if (it.bound_interaction_id) {
+        const accept = verdict === "resolved";
+        const r = await briefPlanConfirms.respond(briefId, it.interaction_id, {
+          responder: status?.username || "operator",
+          accept,
+        });
+        const n = r?.created?.length ?? 0;
+        setBanner({
+          kind: "ok",
+          msg: accept
+            ? `Plan approved — ${n} Sub-brief${n === 1 ? "" : "s"} created` +
+              (r?.outcome === "already_approved"
+                ? " (already approved — no duplicates)."
+                : ".")
+            : r?.outcome === "rejected_proposal_already_closed"
+              ? "Plan declined (the proposal had already materialized)."
+              : "Plan declined.",
+        });
+        setIxDraft((m) => ({ ...m, [it.interaction_id]: "" }));
+        reload();
+        invalidate(["briefs", "actions"], { briefId });
+        return;
+      }
       await briefInteractions.respond(briefId, it.interaction_id, {
         responder: status?.username || "operator",
         status: verdict,

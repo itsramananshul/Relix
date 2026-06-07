@@ -248,6 +248,13 @@ export interface BriefInteraction {
   // `expired`.
   bound_doc_id?: string | null;
   bound_doc_kind?: string | null;
+  // Plan package (§1.7/§1.8/§3.1): when this `confirm` was opened as part of a
+  // plan package, the exact linked `suggest_tasks` interaction id it gates.
+  // Present only on a plan-package confirm; accepting such a confirm must go
+  // through the safe `briefPlanConfirms.respond` path (not the generic
+  // interaction respond) so approval materializes the linked proposal exactly
+  // once through the decomposition ledger.
+  bound_interaction_id?: string | null;
 }
 
 export const briefInteractions = {
@@ -321,6 +328,47 @@ export const briefSuggestions = {
     api.post<{ created: string[] }>(
       `/v1/spine/briefs/${encodeURIComponent(briefId)}/suggestions/${encodeURIComponent(
         interactionId,
+      )}/respond`,
+      body,
+    ),
+};
+
+// ── Plan-package confirms (approval-bound, linked to a proposal) ───────────
+// A plan package (relix-execution-and-issue-design §1.7/§1.8/§3.1) opens a
+// `plan` Dossier + a `suggest_tasks` proposal + an approval-bound `confirm`
+// linked to both (the confirm carries `bound_interaction_id`). Accepting the
+// confirm must use this safe route, not the generic interaction respond, so the
+// linked proposal materializes exactly once through the resumable decomposition
+// ledger; rejecting closes the confirm and its still-open proposal.
+export const briefPlanConfirms = {
+  // Open a plan package. Returns the three artifact ids. (Exposed for
+  // completeness / companion use; the dashboard has no package editor yet.)
+  open: (
+    briefId: string,
+    body: {
+      author: string;
+      plan_title?: string;
+      plan_body: string;
+      summary?: string;
+      children: SuggestChild[];
+      prompt?: string;
+    },
+  ) =>
+    api.post<{ plan_doc_id: string; suggestion_id: string; confirm_id: string }>(
+      `/v1/spine/briefs/${encodeURIComponent(briefId)}/plan-package`,
+      body,
+    ),
+  // Accept (re-check the plan is latest, then materialize the linked proposal)
+  // or reject a plan-package confirm. Returns the typed outcome + created child
+  // ids. A duplicate accept is idempotent and returns the SAME ids.
+  respond: (
+    briefId: string,
+    confirmId: string,
+    body: { responder: string; accept: boolean },
+  ) =>
+    api.post<{ outcome: string; suggestion_id: string; created: string[] }>(
+      `/v1/spine/briefs/${encodeURIComponent(briefId)}/plan-confirms/${encodeURIComponent(
+        confirmId,
       )}/respond`,
       body,
     ),

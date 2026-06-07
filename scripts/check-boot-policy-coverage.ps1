@@ -84,6 +84,9 @@ $RequiredCapabilities = @(
     'brief.plan_confirm_open',
     # Brief suggest_tasks cards (propose + accept/reject a child-Brief tree, §1.9)
     'brief.suggest_open', 'brief.suggest_respond',
+    # Plan package: plan Dossier + proposal + approval-bound confirm; accepting
+    # the confirm materializes the linked proposal (§1.7/§1.8/§3.1)
+    'brief.plan_package_open', 'brief.plan_confirm_respond',
     'task.events', 'task.recent_events',
     # Bridge-back operative callbacks (per-Shift brt_* token at the bridge, but
     # the bridge still calls the mesh as chat-users, so each needs an allow rule)
