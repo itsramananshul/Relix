@@ -568,9 +568,23 @@ ledger entry or design section.
    cross-Guild leak); the **same autonomous budget hard-stop** (`dispatch_budget_admits` per ready Brief)
    blocks the whole start with **zero** runs if any is over budget; an already-claimed/running Brief is never
    double-started; and it counts exactly one tick action when ≥1 run starts. Starting is **not** an approval
-   gate, so this needs **no** standing grant. *Still deferred:* a true end-to-end no-grant autonomous driver
-   that also **approves** on its own (propose → **approve** → staff → orchestrate with nothing granted) —
-   intentionally not built; **model-reasoned** strategy remains deferred (the draft + approval are deterministic).
+   gate, so this needs **no** standing grant. **Prime Deliberation v1 — SHIPPED (opt-in, default OFF):** the
+   autonomous loop is no longer a hardcoded deterministic state machine — behind
+   `RELIX_PRIME_LLM_DELIBERATION` a model may **CHOOSE among the already-computed governed actions** for a
+   candidate (confirm the single legal next action, or HOLD `none` this tick), but **the model is not the
+   permission system**: a strict server-side validator (`prime_deliberation::parse_prime_decision`) bounds its
+   choice to `[<computed action>, none]`, every confirmed action still flows through the same governed handler +
+   standing authority + budget + Claim + adapter + tenant gates, and any malformed/disallowed/unavailable output
+   falls back deterministically with an honest `ai_mode` (`deterministic_only`/`llm_used`/`fallback`/`unavailable`,
+   surfaced on `prime.autonomy_tick_now`). The live decider performs only the existing `ai.chat` mesh call to the
+   AI peer (`RELIX_PRIME_AI_PEER`/`RELIX_PRIME_LLM_SESSION`) — **no provider key in the coordinator / web bridge /
+   dashboard**. *Files:* `crates/relix-runtime/src/nodes/coordinator/agent/prime_deliberation.rs` (new pure
+   module + 16 tests), `…/agent/prime_driver.rs` (wrapper + `MeshAiDecider` + 8 loop tests), `…/agent/mod.rs`,
+   `controller_runtime.rs` (live wiring), `apps/dashboard/src/pages/Settings.tsx` + rebuilt `dashboard-dist`.
+   *Still deferred:* a true end-to-end no-grant autonomous driver that also **approves** on its own (propose →
+   **approve** → staff → orchestrate with nothing granted) — intentionally not built; **freeform tool-calling /
+   model-reasoned strategy authoring** remains deferred (deliberation only confirms-or-holds a computed action;
+   the strategy draft + approval are still deterministic).
 9. **[BE/FE] Smarter companion** — **BACKEND SHIPPED (now AI-assisted action selection, opt-in +
    validated + fallback; still one-turn / one-action, NOT autonomous).**
    The `POST /v1/spine/companion` parser is a **company-aware action spine**

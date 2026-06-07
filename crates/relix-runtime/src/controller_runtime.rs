@@ -11515,6 +11515,18 @@ fn register_node_type_handlers(
             let ag_store = agent_store.clone();
             let registry = rig_registry.clone();
             let metrics_query = metrics.map(|m| m.query.clone());
+            // Prime Deliberation v1 wiring. The loop reuses the coordinator's
+            // EXISTING outbound mesh client (the one the alert sink wires from
+            // `[peers]`) to reach the AI peer — no provider key ever enters the
+            // coordinator; this is just the existing governed `ai.chat` call. The
+            // AI-peer alias + session are read once at boot; the
+            // `RELIX_PRIME_LLM_DELIBERATION` switch is re-read each tick (like the
+            // env override). When the mesh cell is absent / unpopulated, the loop
+            // passes no decider and every tick is deterministic.
+            let prime_alert_cell = metrics.map(|m| m.alert_mesh_cell.clone());
+            let prime_ai_peer = crate::nodes::coordinator::agent::prime_driver::prime_ai_peer();
+            let prime_llm_session =
+                crate::nodes::coordinator::agent::prime_driver::prime_llm_session();
             tokio::spawn(async move {
                 let mut ticker =
                     tokio::time::interval(std::time::Duration::from_secs(prime_interval_secs));
@@ -11526,11 +11538,44 @@ fn register_node_type_handlers(
                     let mq = metrics_query.clone();
                     let spine = spine_arc.clone();
                     let hire_rig = prime_hire_rig.clone();
+                    // Captured for the live deliberation decider built inside the
+                    // blocking tick (it bridges the async mesh call via this handle).
+                    let prime_handle = tokio::runtime::Handle::current();
+                    let prime_alert_cell = prime_alert_cell.clone();
+                    let prime_ai_peer = prime_ai_peer.clone();
+                    let prime_llm_session = prime_llm_session.clone();
                     let outcome = tokio::task::spawn_blocking(move || {
+                        use crate::nodes::coordinator::agent::prime_deliberation::PrimeAiDecider;
                         use crate::nodes::coordinator::agent::prime_driver::{
-                            AutonomyDrive, RUNTIME_KEY_AUTONOMOUS_PRIME, autonomous_prime_tick,
+                            AutonomyDrive, MeshAiDecider, RUNTIME_KEY_AUTONOMOUS_PRIME,
+                            autonomous_prime_tick, parse_prime_llm_deliberation,
                             plan_autonomy_drive,
                         };
+                        // Re-read the deliberation switch each tick. When on AND a
+                        // populated coordinator mesh client exists, build the live
+                        // decider; otherwise leave it None (deterministic).
+                        let prime_llm = parse_prime_llm_deliberation(
+                            std::env::var("RELIX_PRIME_LLM_DELIBERATION")
+                                .ok()
+                                .as_deref(),
+                        );
+                        let prime_decider = if prime_llm {
+                            prime_alert_cell.as_ref().and_then(|c| c.get()).map(|ctx| {
+                                MeshAiDecider::new(
+                                    prime_handle.clone(),
+                                    ctx.mesh.clone(),
+                                    ctx.identity.clone(),
+                                    prime_ai_peer.clone(),
+                                    prime_llm_session.clone(),
+                                    30,
+                                    None,
+                                )
+                            })
+                        } else {
+                            None
+                        };
+                        let prime_ai: Option<&dyn PrimeAiDecider> =
+                            prime_decider.as_ref().map(|d| d as &dyn PrimeAiDecider);
                         let now_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as i64)
@@ -11568,6 +11613,8 @@ fn register_node_type_handlers(
                                     prime_max,
                                     None,
                                     &hire_rig,
+                                    prime_ai,
+                                    prime_llm,
                                 )?;
                                 records.append(&mut r);
                             }
@@ -11585,6 +11632,8 @@ fn register_node_type_handlers(
                                         prime_max,
                                         Some(&t),
                                         &hire_rig,
+                                        prime_ai,
+                                        prime_llm,
                                     )?;
                                     records.append(&mut r);
                                 }

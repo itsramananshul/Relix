@@ -337,8 +337,15 @@ export function Settings() {
           works as a global boot override, paced by{" "}
           <span className="mono">RELIX_AUTONOMOUS_PRIME_INTERVAL_SECS</span> and bounded by{" "}
           <span className="mono">RELIX_AUTONOMOUS_PRIME_MAX</span>. Autonomous runs still honor adapter
-          readiness, per-Operative wake/concurrency caps, and budget hard-stops. No LLM diagnosis or
-          provider-quota polling.
+          readiness, per-Operative wake/concurrency caps, and budget hard-stops.{" "}
+          <strong>Prime Deliberation</strong> is opt-in via{" "}
+          <span className="mono">RELIX_PRIME_LLM_DELIBERATION</span> (off by default): when on, a model
+          may only <em>choose among the already-computed governed actions</em> — confirming the one legal
+          next step or holding this tick — and never approves a gate, invents an action, or bypasses
+          budget/Claim/adapter checks; it falls back deterministically if the model is unavailable or its
+          output is invalid (each tick record shows the provenance: <span className="mono">deterministic_only</span>
+          {" / "}<span className="mono">llm_used</span> / <span className="mono">fallback</span> /{" "}
+          <span className="mono">unavailable</span>).
         </p>
       </div>
 

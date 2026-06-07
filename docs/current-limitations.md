@@ -447,8 +447,43 @@ the approved work is already ready. What it does **not** do:
     body is a structured objective / constraints / team-tracks / execution /
     review-apply / risk-and-approval doc derived from the Mandate, sanitized for the
     pipe-delimited wire and length-bounded. **No new provider/key system was added.**
-  - What this still does **NOT** do: there is **no LLM/strategy reasoning** — the
-    autonomous driver only executes the deterministic next governed step, and the
+  - **Prime Deliberation (v1) — the autonomous loop is no longer a hardcoded
+    deterministic state machine; an opt-in model may CHOOSE among the already-computed
+    governed actions (default OFF).** Behind `RELIX_PRIME_LLM_DELIBERATION`
+    (`1|true|yes|on`, off by default) each autonomous tick still computes the SINGLE
+    legal next governed action for a candidate exactly as before, then asks an opt-in
+    model — as an advisory pre-pass — to either CONFIRM that action or HOLD (`none`)
+    this tick. **The model is NOT the permission system.** Its choice is constrained
+    to `[<computed action>, none]` by a strict server-side validator
+    (`prime_deliberation::parse_prime_decision`): an unknown action, an action outside
+    the candidate's allowed set, malformed/array/scalar/over-long JSON, an over-long or
+    control-char reason, or model prose all degrade to the deterministic behaviour with
+    an honest mode. A `none` skips the candidate this tick with **zero side effects**;
+    a confirm runs the EXACT SAME governed handler + standing authority + budget gate +
+    Claim + adapter probe + tenant isolation as before — the model can never invent an
+    action, widen the legal set, approve a gate it lacks a standing grant for, or
+    bypass any budget/Claim/adapter check. Every tick record carries the provenance
+    (`ai_mode` ∈ {`deterministic_only`,`llm_used`,`fallback`,`unavailable`} +
+    `ai_reason`), surfaced on `prime.autonomy_tick_now`. The live decider performs only
+    the EXISTING `ai.chat` mesh call to the AI peer (alias `RELIX_PRIME_AI_PEER`,
+    default `ai`; session `RELIX_PRIME_LLM_SESSION`, default `prime-autonomy`) using the
+    same `{session_id,prompt,history}` shape as the bridge — **no provider key ever
+    enters the coordinator, web bridge config, or dashboard**. A missing mesh / AI peer
+    produces `unavailable` and falls back deterministically; the per-call deadline is
+    clamped to 5–60s so the loop never blocks. **Honest scope:** this is *constrained
+    deliberation over the existing action menu*, NOT freeform tool-calling Prime — the
+    model confirms-or-holds a single computed action and attaches a reason; it does not
+    author strategy, invent goals, pick identities to hire, or call tools. The
+    live bridge→model→coordinator round trip is **not** integration-tested in CI (it
+    needs a real provider; the validator + the deterministic fallback that bound it are
+    fully unit/loop tested with scripted output), and the **manual** tick
+    (`prime.autonomy_tick_now`) carries no mesh client, so with deliberation ON it
+    honestly reports `unavailable` and runs deterministically — the background timer is
+    the live deliberation path.
+  - What this still does **NOT** do: there is **no freeform model reasoning or
+    tool-calling** — the deliberation above is constrained to confirm-or-hold the ONE
+    computed governed action (it cannot author strategy, invent a goal, or call a
+    tool), and the
     strategy it drafts (above) is a **deterministic** doc, never a model-reasoned
     one; it **drafts a strategy proposal and — by default — does not approve it,
     does not decide which person/identity to hire, and does not invent a goal from
@@ -687,9 +722,18 @@ ceiling stay human, raw goal creation still starts from a submitted
 goal/proposal. Prime now **drafts** a deterministic Mandate strategy and proposes
 it (Prime Strategy Drafting v1, above) — but that is a *draft*, left `proposed`
 for a human to approve, not a driver that **reasons about strategy itself** or
-takes a goal from raw intent to done autonomously. Autonomy operates strictly
-**inside** the Board's gates — after a human approval, or within an explicit
-standing grant.
+takes a goal from raw intent to done autonomously. With **Prime Deliberation v1**
+(opt-in, `RELIX_PRIME_LLM_DELIBERATION`, off by default) the autonomous loop is no
+longer a hardcoded deterministic state machine: a model may **choose among the
+already-computed governed actions** (confirm the one legal next action or hold), but
+the model is **not** the permission system — a strict server-side validator bounds
+its choice to `[<computed action>, none]`, every confirmed action still flows through
+the same governed handlers + standing authority + budget + Claim + adapter + tenant
+gates, and any malformed/disallowed/unavailable output falls back deterministically
+with an honest `ai_mode`. No provider key enters the coordinator / web bridge /
+dashboard (the live path only makes the existing `ai.chat` mesh call). Autonomy
+operates strictly **inside** the Board's gates — after a human approval, or within an
+explicit standing grant.
 
 ### Bridge persists every chat as a Task (fail-soft)
 

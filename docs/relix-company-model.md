@@ -688,6 +688,51 @@ manual `brief.move done` is needed. Apply stays the file-integration step;
 it advances the board only on a clean apply and only for a Brief genuinely
 awaiting review.)
 
+### C. Prime Deliberation v1 — a model may CHOOSE among governed actions (opt-in)
+
+**The gap.** The opt-in autonomous Prime loop (§5.4 / §8.2) was a *hardcoded
+deterministic state machine*: each tick computed the single legal next governed
+action and took it. Useful and honest, but the loop itself never reasoned — the
+only model seam in the whole Prime flow was the request-time `prime.propose`
+draft (§A), never the autonomous loop's per-tick choice.
+
+**The contract.** Behind an explicit, default-OFF switch
+(`RELIX_PRIME_LLM_DELIBERATION`), the loop may consult a model to **choose among
+the actions it has already computed** — but **the model is NOT the permission
+system.** The security invariant is absolute and unchanged:
+
+- **Compute first, then ask.** Each tick still computes the SINGLE legal next
+  governed action for a candidate exactly as before. The model is offered ONLY
+  `[<computed action>, none]` and is asked to **confirm** the computed action or
+  **HOLD** (`none`) this tick. It can never invent an action, name an action
+  outside the candidate's allowed set, or widen the menu.
+- **Strict server-side validation.** The model's reply must be strict JSON
+  `{"action":…,"reason":…}`; a strict validator
+  (`prime_deliberation::parse_prime_decision`) rejects unknown / disallowed
+  actions, malformed / array / scalar / over-long output, and unsafe
+  (over-long / control-char) reasons. Any rejection degrades to the
+  deterministic action.
+- **Execution is unchanged and fully governed.** A confirm runs the EXACT SAME
+  governed handler the deterministic loop runs — standing authority, budget
+  hard-stop, Claim, adapter probe, and tenant isolation all still apply. A
+  model can never approve a gate it lacks a standing grant for, nor bypass a
+  budget/Claim/adapter check. A `none` skips with zero side effects.
+- **Honest provenance.** Every tick record carries `ai_mode`
+  (`deterministic_only` / `llm_used` / `fallback` / `unavailable`) + `ai_reason`,
+  surfaced on `prime.autonomy_tick_now`, so the operator always sees how the
+  action was chosen and degradation is never hidden as model output.
+- **No keys in the coordinator.** The live decider performs ONLY the existing
+  `ai.chat` mesh call to the AI peer (alias `RELIX_PRIME_AI_PEER` default `ai`;
+  session `RELIX_PRIME_LLM_SESSION` default `prime-autonomy`), using the SAME
+  `{session_id,prompt,history}` shape as the bridge — no provider key enters the
+  coordinator, the web bridge config, or the dashboard; a missing mesh / AI peer
+  reads `unavailable` and falls back deterministically.
+
+**It is not freeform Prime.** This is *constrained deliberation over the existing
+action menu* — confirm-or-hold one computed action with a short reason. It does
+not author strategy, invent a goal, pick which identity to hire, or call tools;
+the strategy draft (§A) and its approval remain deterministic / governed.
+
 ---
 
 ## 12.6 First-run company bootstrap + starter crew (the empty-company on-ramp)

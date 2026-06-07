@@ -41,6 +41,10 @@ use crate::nodes::coordinator::agent::handlers::{
     policy_denied,
 };
 use crate::nodes::coordinator::agent::prime;
+use crate::nodes::coordinator::agent::prime_deliberation::{
+    ACTION_NONE, PrimeAiDecider, PrimeDeliberationInput, PrimeDeliberationMode,
+    build_prime_deliberation_prompt, parse_prime_decision,
+};
 use crate::nodes::coordinator::agent::store::{AgentStore, StandingApprovalMatch};
 use crate::nodes::coordinator::spine::SpineStore;
 
@@ -1215,6 +1219,10 @@ fn prime_autonomy_record_json(r: &PrimeAutonomyRecord) -> Value {
         "action": r.action,
         "outcome": r.outcome,
         "reason": r.reason,
+        // Prime Deliberation v1 provenance: legacy/no-choice rows read as
+        // deterministic_only so the operator always sees how the action was chosen.
+        "ai_mode": r.ai_mode.as_deref().unwrap_or("deterministic_only"),
+        "ai_reason": r.ai_reason,
     })
 }
 
@@ -1271,6 +1279,17 @@ pub fn handle_prime_autonomy_tick_now(
         .unwrap_or(0);
     // Tenant-scoped (`Some(tenant)`): this wakes ONLY the caller's Guild, never
     // all Guilds — even if the env override is on for the background timer.
+    // The manual wake-up does not carry a coordinator mesh client, so it never
+    // performs the live `ai.chat` deliberation call: it passes no decider. With
+    // `RELIX_PRIME_LLM_DELIBERATION` on, each candidate's record honestly reads
+    // `unavailable` (the deterministic action still runs); with it off, the
+    // records read `deterministic_only`. The background timer is the live
+    // deliberation path.
+    let llm_enabled = parse_prime_llm_deliberation(
+        std::env::var("RELIX_PRIME_LLM_DELIBERATION")
+            .ok()
+            .as_deref(),
+    );
     let records = match autonomous_prime_tick(
         agent_store,
         spine_store,
@@ -1281,6 +1300,8 @@ pub fn handle_prime_autonomy_tick_now(
         max,
         Some(tenant),
         &hire_rig,
+        None,
+        llm_enabled,
     ) {
         Ok(r) => r,
         Err(e) => return internal(format!("prime.autonomy_tick_now: {e}")),
@@ -1323,6 +1344,255 @@ pub fn handle_prime_autonomy_tick_now(
 // (each candidate is processed under its OWN Guild).
 // ─────────────────────────────────────────────────────────────────────────
 
+// ── PRIME DELIBERATION v1 (opt-in constrained model choice) ─────────────────
+// The autonomous loop is no longer a hardcoded deterministic state machine when
+// `RELIX_PRIME_LLM_DELIBERATION` is on: for each candidate the loop computes the
+// SINGLE legal next governed action (exactly as before), then — only as an
+// advisory pre-pass — asks an opt-in model to either CONFIRM that action or HOLD
+// (`none`) this tick. THE MODEL IS NOT THE PERMISSION SYSTEM: it can only pick
+// from `[<computed action>, none]`, it can never invent an action or pick one
+// outside the candidate's allowed set, and every action it confirms still flows
+// through the same governed handler + standing authority + budget gate + claim +
+// adapter probe + tenant isolation. Malformed / disallowed / unavailable model
+// output degrades to the deterministic behaviour with an honest mode. No
+// provider key ever enters the coordinator: the live decider only performs the
+// existing `ai.chat` mesh call to the AI peer.
+
+/// Parse `RELIX_PRIME_LLM_DELIBERATION` (`1|true|yes|on`, case-insensitive) into
+/// the deliberation-enabled flag. Default OFF — absent/blank/anything else.
+pub fn parse_prime_llm_deliberation(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// The AI-peer mesh alias the live deliberation decider calls: `RELIX_PRIME_AI_PEER`,
+/// default `ai` (the same alias the bridge's chat seam uses).
+pub fn prime_ai_peer() -> String {
+    std::env::var("RELIX_PRIME_AI_PEER")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ai".to_string())
+}
+
+/// The `ai.chat` session id the live deliberation decider scopes its model
+/// conversation under: `RELIX_PRIME_LLM_SESSION`, default `prime-autonomy`.
+pub fn prime_llm_session() -> String {
+    std::env::var("RELIX_PRIME_LLM_SESSION")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "prime-autonomy".to_string())
+}
+
+/// The live AI decision provider: bridges the synchronous tick (it runs inside
+/// `spawn_blocking`) to the async mesh `ai.chat` call, using the SAME
+/// `{session_id, prompt, history}` JSON shape as the bridge's `call_ai_chat` and
+/// the SAME governed mesh client the coordinator already holds. It performs NO
+/// governed action — it only returns the model's raw reply for the validator to
+/// vet. A missing peer / transport failure surfaces as an honest error so the
+/// loop records `unavailable` and falls back deterministically. Construction
+/// requires a coordinator mesh client + identity bundle; when those are absent
+/// the loop simply passes `None` and every tick is deterministic.
+pub struct MeshAiDecider {
+    handle: tokio::runtime::Handle,
+    mesh: crate::manifest::MeshClient,
+    identity: relix_core::bundle::Bundle,
+    alias: String,
+    session: String,
+    deadline_secs: i64,
+    tenant: Option<String>,
+}
+
+impl MeshAiDecider {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        handle: tokio::runtime::Handle,
+        mesh: crate::manifest::MeshClient,
+        identity: relix_core::bundle::Bundle,
+        alias: String,
+        session: String,
+        deadline_secs: i64,
+        tenant: Option<String>,
+    ) -> Self {
+        Self {
+            handle,
+            mesh,
+            identity,
+            alias,
+            session,
+            // Clamp to the same 5..=60s band the bridge's chat seam uses so a
+            // misconfigured deadline can never block the loop forever.
+            deadline_secs: deadline_secs.clamp(5, 60),
+            tenant,
+        }
+    }
+}
+
+impl PrimeAiDecider for MeshAiDecider {
+    fn deliberate(&self, prompt: &str) -> Result<String, String> {
+        let arg = json!({
+            "session_id": self.session,
+            "prompt": prompt,
+            "history": "",
+        });
+        let arg_bytes = serde_json::to_vec(&arg).map_err(|e| format!("encode ai.chat arg: {e}"))?;
+        let envelope = crate::dispatch::build_request_with_tenant(
+            "ai.chat",
+            arg_bytes,
+            self.identity.clone(),
+            self.deadline_secs,
+            None,
+            None,
+            None,
+            self.tenant.clone(),
+        );
+        let mesh = self.mesh.clone();
+        let alias = self.alias.clone();
+        // Bridge the async mesh call into this synchronous (spawn_blocking) tick.
+        let resp_bytes = self
+            .handle
+            .block_on(async move { mesh.call(&alias, envelope).await })
+            .map_err(|e| format!("ai peer unreachable: {e}"))?;
+        let resp = crate::dispatch::decode_response(&resp_bytes)
+            .map_err(|e| format!("ai.chat decode: {e}"))?;
+        match resp.res {
+            crate::transport::envelope::ResponseResult::Ok(body) => {
+                let text = String::from_utf8_lossy(&body).trim().to_string();
+                if text.is_empty() {
+                    Err("model returned an empty reply".to_string())
+                } else {
+                    Ok(text)
+                }
+            }
+            crate::transport::envelope::ResponseResult::Err(env) => {
+                Err(format!("ai.chat responder error: {}", env.cause))
+            }
+            crate::transport::envelope::ResponseResult::StreamHandle(_) => {
+                Err("ai.chat returned a stream handle".to_string())
+            }
+        }
+    }
+}
+
+/// The ONE governed action the deterministic classifier would take for a
+/// classified step — the only positive choice the deliberation layer may offer
+/// the model (alongside `none`). `None` for a step that is a pure human gate /
+/// running / done state where the loop takes no autonomous action.
+fn intended_action(step: &NextStep) -> Option<&'static str> {
+    // Auto-advanceable steps carry their explicit advance key
+    // (create_team_plan / orchestrate_assign_ready / propose_strategy).
+    if step.can_advance {
+        return step.advance_action;
+    }
+    match step.phase {
+        "ready_to_start" => Some(if step.proposal_id.is_some() {
+            "start"
+        } else {
+            "start_mandate"
+        }),
+        "needs_hire_approval" => {
+            if !step.pending_clearances.is_empty() {
+                Some("clearance_approve")
+            } else if !step.pending_hires.is_empty() {
+                Some("hire_approve")
+            } else {
+                None
+            }
+        }
+        "needs_approval"
+            if step.action_api == "mandate.strategy.approve"
+                && step.strategy_status.as_deref() == Some("proposed") =>
+        {
+            Some("approve_strategy")
+        }
+        _ => None,
+    }
+}
+
+/// Build the bounded, secret-free deliberation snapshot from a classified step.
+fn snapshot_from_step(
+    tenant: &str,
+    kind: &str,
+    target_id: &str,
+    step: &NextStep,
+    action: &str,
+) -> PrimeDeliberationInput {
+    PrimeDeliberationInput {
+        tenant: tenant.to_string(),
+        target_kind: kind.to_string(),
+        target_id: target_id.to_string(),
+        mandate_id: step.mandate_id.clone(),
+        phase: step.phase.to_string(),
+        computed_action: action.to_string(),
+        reason: step.reason.clone(),
+        strategy_status: step.strategy_status.clone(),
+        total_briefs: step.counts.total,
+        ready: step.counts.ready,
+        unassigned: step.counts.unassigned,
+        running: step.counts.running,
+        needs_review: step.counts.needs_review,
+        blocked: step.counts.blocked,
+        missing_roles: step.missing_roles.len(),
+        pending_hires: step.pending_hires.len(),
+        pending_clearances: step.pending_clearances.len(),
+    }
+}
+
+/// The outcome of consulting the deliberation layer for one candidate action.
+enum Deliberation {
+    /// The model chose `none` — HOLD this tick: execute nothing.
+    Hold {
+        mode: PrimeDeliberationMode,
+        reason: Option<String>,
+    },
+    /// Proceed with the deterministic action (model confirmed it, or fell back).
+    Proceed {
+        mode: PrimeDeliberationMode,
+        reason: Option<String>,
+    },
+}
+
+fn non_empty(s: String) -> Option<String> {
+    if s.trim().is_empty() { None } else { Some(s) }
+}
+
+/// Consult the optional model for ONE candidate action. The model may only
+/// confirm `snap.computed_action` or choose `none`; anything else is rejected and
+/// degrades to Proceed (deterministic). Never executes a governed action.
+fn deliberate(ai: Option<&dyn PrimeAiDecider>, snap: &PrimeDeliberationInput) -> Deliberation {
+    let Some(decider) = ai else {
+        return Deliberation::Proceed {
+            mode: PrimeDeliberationMode::Unavailable,
+            reason: Some("no AI decider wired for this tick".to_string()),
+        };
+    };
+    let prompt = build_prime_deliberation_prompt(snap);
+    match decider.deliberate(&prompt) {
+        Ok(raw) => match parse_prime_decision(&raw, &snap.allowed_actions()) {
+            Ok(d) if d.action == ACTION_NONE => Deliberation::Hold {
+                mode: PrimeDeliberationMode::LlmUsed,
+                reason: non_empty(d.reason),
+            },
+            // A valid choice equal to the computed action — confirmed.
+            Ok(d) => Deliberation::Proceed {
+                mode: PrimeDeliberationMode::LlmUsed,
+                reason: non_empty(d.reason),
+            },
+            Err(e) => Deliberation::Proceed {
+                mode: PrimeDeliberationMode::Fallback,
+                reason: Some(format!("model output rejected: {e}")),
+            },
+        },
+        Err(e) => Deliberation::Proceed {
+            mode: PrimeDeliberationMode::Unavailable,
+            reason: Some(format!("model unavailable: {e}")),
+        },
+    }
+}
+
 /// What one autonomous Prime tick did with one candidate (for logs + tests).
 /// Durable provenance for an actual action lives in the Chronicle event the
 /// handler / this driver writes; this is the in-memory tick summary.
@@ -1348,6 +1618,13 @@ pub struct PrimeAutonomyRecord {
     pub outcome: &'static str,
     /// A short, secret-free reason for the outcome.
     pub reason: String,
+    /// How this tick's action choice was made (Prime Deliberation v1):
+    /// `deterministic_only` / `llm_used` / `fallback` / `unavailable`. `None` is
+    /// treated as `deterministic_only` by the renderer (legacy rows).
+    pub ai_mode: Option<String>,
+    /// The model's short reason when it participated (`llm_used`), or the honest
+    /// reason it was not used (`fallback` / `unavailable`). Secret-free.
+    pub ai_reason: Option<String>,
 }
 
 /// Build the synthetic **autonomous Prime** invocation context for `tenant`.
@@ -1586,14 +1863,97 @@ fn start_bare_mandate_ready(
     }
 }
 
-/// Process ONE autonomous candidate: classify its next governed step and, when
-/// it is a safe auto-advanceable step (a ready-to-start approved proposal, or a
-/// ready-to-start BARE Mandate), execute exactly that one step through the
-/// existing governed handler / shared run pipeline. Counts a real mutation
-/// against `actions` (so the tick stays bounded by `max`); a human gate /
-/// already-running / done step records and acts on nothing.
+/// Process ONE autonomous candidate (Prime Deliberation v1 wrapper). First
+/// computes the SINGLE legal next governed action exactly as before, then — when
+/// `llm_enabled` and the candidate has a positive action — optionally lets the
+/// model CONFIRM that action or HOLD (`none`) this tick. The model can never
+/// widen the choice or bypass a gate: a `none` skips with zero side effects; a
+/// confirm (or any malformed/unavailable output) runs the deterministic
+/// [`process_candidate_inner`], whose governed handlers + standing authority +
+/// budget + claims + adapter probes are unchanged. Stamps the deliberation
+/// provenance (`ai_mode` / `ai_reason`) on the record.
 #[allow(clippy::too_many_arguments)]
 fn process_candidate(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &Arc<TaskStore>,
+    registry: &crate::rig::RigRegistry,
+    metrics: Option<&crate::metrics::MetricsQuery>,
+    now_ms: i64,
+    tenant: &str,
+    kind: &'static str,
+    target_id: &str,
+    target: Value,
+    actions: &mut usize,
+    max: usize,
+    hire_rig: &str,
+    ai: Option<&dyn PrimeAiDecider>,
+    llm_enabled: bool,
+) -> PrimeAutonomyRecord {
+    let mut delib_mode = PrimeDeliberationMode::DeterministicOnly;
+    let mut delib_reason: Option<String> = None;
+    if llm_enabled {
+        let read_ctx = autonomous_prime_ctx(tenant, target.to_string().into_bytes());
+        if let Ok(step) = compute_next_step(agent_store, spine_store, task_store, &read_ctx)
+            && let Some(action) = intended_action(&step)
+        {
+            let snap = snapshot_from_step(tenant, kind, target_id, &step, action);
+            match deliberate(ai, &snap) {
+                // The model declined to act this tick — execute NOTHING.
+                Deliberation::Hold { mode, reason } => {
+                    return PrimeAutonomyRecord {
+                        tenant: tenant.to_string(),
+                        target_kind: kind,
+                        target_id: target_id.to_string(),
+                        mandate_id: step.mandate_id.clone(),
+                        phase: step.phase.to_string(),
+                        action: "none",
+                        outcome: "skipped",
+                        reason: match &reason {
+                            Some(r) => format!("model chose to hold (none): {r}"),
+                            None => "model chose to hold (none)".to_string(),
+                        },
+                        ai_mode: Some(mode.as_str().to_string()),
+                        ai_reason: reason,
+                    };
+                }
+                Deliberation::Proceed { mode, reason } => {
+                    delib_mode = mode;
+                    delib_reason = reason;
+                }
+            }
+        }
+    }
+
+    let mut rec = process_candidate_inner(
+        agent_store,
+        spine_store,
+        task_store,
+        registry,
+        metrics,
+        now_ms,
+        tenant,
+        kind,
+        target_id,
+        target,
+        actions,
+        max,
+        hire_rig,
+    );
+    rec.ai_mode = Some(delib_mode.as_str().to_string());
+    rec.ai_reason = delib_reason;
+    rec
+}
+
+/// The deterministic body: classify the candidate's next governed step and,
+/// when it is a safe auto-advanceable / ready-to-start / grant-covered step,
+/// execute exactly that one step through the existing governed handler / shared
+/// run pipeline. Counts a real mutation against `actions` (so the tick stays
+/// bounded by `max`); a human gate / already-running / done step records and acts
+/// on nothing. UNCHANGED by deliberation — the wrapper only chooses whether to
+/// call it.
+#[allow(clippy::too_many_arguments)]
+fn process_candidate_inner(
     agent_store: &AgentStore,
     spine_store: &SpineStore,
     task_store: &Arc<TaskStore>,
@@ -1623,6 +1983,10 @@ fn process_candidate(
             action,
             outcome,
             reason,
+            // The wrapper [`process_candidate`] stamps the real deliberation
+            // provenance; the deterministic inner defaults to none.
+            ai_mode: None,
+            ai_reason: None,
         }
     };
 
@@ -2123,6 +2487,8 @@ pub fn autonomous_prime_tick(
     max: usize,
     tenant: Option<&str>,
     hire_rig: &str,
+    ai: Option<&dyn PrimeAiDecider>,
+    llm_enabled: bool,
 ) -> Result<Vec<PrimeAutonomyRecord>, String> {
     if max == 0 {
         return Ok(Vec::new());
@@ -2159,8 +2525,62 @@ pub fn autonomous_prime_tick(
         ) {
             continue;
         }
+        // Prime Deliberation v1: let the model CONFIRM this autonomous approval or
+        // HOLD (`none`) this tick. The standing grant is still required and is
+        // consumed only on a real approval below; a HOLD records `skipped` and
+        // consumes nothing.
+        let mut pass0_mode = PrimeDeliberationMode::DeterministicOnly;
+        let mut pass0_reason: Option<String> = None;
+        if llm_enabled {
+            let snap = PrimeDeliberationInput {
+                tenant: p.tenant_id.clone(),
+                target_kind: "proposal".to_string(),
+                target_id: p.proposal_id.clone(),
+                mandate_id: None,
+                phase: "needs_approval".to_string(),
+                computed_action: "approve".to_string(),
+                reason:
+                    "approve the proposed plan via the prime.proposal.approve standing authority"
+                        .to_string(),
+                strategy_status: None,
+                total_briefs: 0,
+                ready: 0,
+                unassigned: 0,
+                running: 0,
+                needs_review: 0,
+                blocked: 0,
+                missing_roles: 0,
+                pending_hires: 0,
+                pending_clearances: 0,
+            };
+            match deliberate(ai, &snap) {
+                Deliberation::Hold { mode, reason } => {
+                    records.push(PrimeAutonomyRecord {
+                        tenant: p.tenant_id.clone(),
+                        target_kind: "proposal",
+                        target_id: p.proposal_id.clone(),
+                        mandate_id: None,
+                        phase: "needs_approval".to_string(),
+                        action: "approve",
+                        outcome: "skipped",
+                        reason: match &reason {
+                            Some(r) => format!("model chose to hold (none): {r}"),
+                            None => "model chose to hold (none)".to_string(),
+                        },
+                        ai_mode: Some(mode.as_str().to_string()),
+                        ai_reason: reason,
+                    });
+                    continue;
+                }
+                Deliberation::Proceed { mode, reason } => {
+                    pass0_mode = mode;
+                    pass0_reason = reason;
+                }
+            }
+        }
         let approve_ctx = autonomous_prime_ctx(&p.tenant_id, p.proposal_id.clone().into_bytes());
-        let rec = match handle_prime_approve(agent_store, spine_store, task_store, &approve_ctx) {
+        let mut rec = match handle_prime_approve(agent_store, spine_store, task_store, &approve_ctx)
+        {
             HandlerOutcome::Ok(b) => {
                 actions += 1;
                 let _ = consume_standing(
@@ -2196,6 +2616,8 @@ pub fn autonomous_prime_tick(
                     outcome: "approved",
                     reason: "materialized proposed plan through the existing prime.approve path"
                         .to_string(),
+                    ai_mode: None,
+                    ai_reason: None,
                 }
             }
             HandlerOutcome::Err(e) => PrimeAutonomyRecord {
@@ -2207,8 +2629,12 @@ pub fn autonomous_prime_tick(
                 action: "approve",
                 outcome: "blocked",
                 reason: format!("autonomous approve refused: {}", e.cause),
+                ai_mode: None,
+                ai_reason: None,
             },
         };
+        rec.ai_mode = Some(pass0_mode.as_str().to_string());
+        rec.ai_reason = pass0_reason;
         records.push(rec);
     }
 
@@ -2240,6 +2666,8 @@ pub fn autonomous_prime_tick(
             &mut actions,
             max,
             hire_rig,
+            ai,
+            llm_enabled,
         ));
     }
 
@@ -2269,6 +2697,8 @@ pub fn autonomous_prime_tick(
                 &mut actions,
                 max,
                 hire_rig,
+                ai,
+                llm_enabled,
             ));
         }
     }
@@ -2694,7 +3124,10 @@ mod tests {
         max: usize,
         tenant: Option<&str>,
     ) -> Vec<PrimeAutonomyRecord> {
-        autonomous_prime_tick(agents, spine, tasks, reg, None, 0, max, tenant, "echo").unwrap()
+        autonomous_prime_tick(
+            agents, spine, tasks, reg, None, 0, max, tenant, "echo", None, false,
+        )
+        .unwrap()
     }
 
     /// Like [`tick`], but with an explicit hire Rig so the standing-authority
@@ -2708,7 +3141,251 @@ mod tests {
         tenant: Option<&str>,
         hire_rig: &str,
     ) -> Vec<PrimeAutonomyRecord> {
-        autonomous_prime_tick(agents, spine, tasks, reg, None, 0, max, tenant, hire_rig).unwrap()
+        autonomous_prime_tick(
+            agents, spine, tasks, reg, None, 0, max, tenant, hire_rig, None, false,
+        )
+        .unwrap()
+    }
+
+    // ── PRIME DELIBERATION v1 (scripted decider) ───────────────────────────
+    // A test-only `PrimeAiDecider` that returns a fixed, scripted model reply so
+    // the deliberation path is exercised end-to-end without a mesh or provider.
+
+    /// Always returns the same raw model reply text (or a scripted unavailable
+    /// error). Used to drive the deliberation layer deterministically in tests.
+    struct ScriptedDecider {
+        reply: Result<String, String>,
+    }
+    impl crate::nodes::coordinator::agent::prime_deliberation::PrimeAiDecider for ScriptedDecider {
+        fn deliberate(&self, _prompt: &str) -> Result<String, String> {
+            self.reply.clone()
+        }
+    }
+
+    /// Run an autonomous Prime tick with deliberation ON and a scripted decider.
+    fn tick_ai(
+        agents: &AgentStore,
+        spine: &SpineStore,
+        tasks: &Arc<TaskStore>,
+        reg: &crate::rig::RigRegistry,
+        max: usize,
+        tenant: Option<&str>,
+        decider: &dyn crate::nodes::coordinator::agent::prime_deliberation::PrimeAiDecider,
+    ) -> Vec<PrimeAutonomyRecord> {
+        autonomous_prime_tick(
+            agents,
+            spine,
+            tasks,
+            reg,
+            None,
+            0,
+            max,
+            tenant,
+            "echo",
+            Some(decider),
+            true,
+        )
+        .unwrap()
+    }
+
+    // DLB-1) A scripted `none` HOLDS the candidate: an otherwise auto-advanceable
+    //        Mandate is skipped with ZERO side effects and the record reads
+    //        llm_used.
+    #[test]
+    fn deliberation_none_holds_with_zero_side_effects() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        runnable_operative(&agents, "engineer", "subj-e");
+
+        let decider = ScriptedDecider {
+            reply: Ok(r#"{"action":"none","reason":"hold for human review"}"#.to_string()),
+        };
+        let recs = tick_ai(&agents, &spine, &tasks, &reg, 1, Some("default"), &decider);
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.phase, "needs_team_plan");
+        assert_eq!(rec.action, "none");
+        assert_eq!(rec.outcome, "skipped");
+        assert_eq!(rec.ai_mode.as_deref(), Some("llm_used"));
+        assert!(rec.reason.contains("hold"));
+        // ZERO side effects — no Team Plan was recorded.
+        assert!(spine.latest_team_plan("default", &m).unwrap().is_none());
+    }
+
+    // DLB-2) A scripted confirm of the computed action EXECUTES the governed
+    //        action and the record reads llm_used.
+    #[test]
+    fn deliberation_confirm_executes_governed_action_llm_used() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        runnable_operative(&agents, "engineer", "subj-e");
+
+        let decider = ScriptedDecider {
+            reply: Ok(r#"{"action":"create_team_plan","reason":"crew is ready"}"#.to_string()),
+        };
+        let recs = tick_ai(&agents, &spine, &tasks, &reg, 1, Some("default"), &decider);
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.action, "create_team_plan");
+        assert_eq!(rec.outcome, "advanced");
+        assert_eq!(rec.ai_mode.as_deref(), Some("llm_used"));
+        // The governed action really ran.
+        assert!(spine.latest_team_plan("default", &m).unwrap().is_some());
+    }
+
+    // DLB-3) Malformed / prose model output FALLS BACK deterministically: the
+    //        legal deterministic action still executes and the record reads
+    //        fallback.
+    #[test]
+    fn deliberation_malformed_output_falls_back_deterministically() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        runnable_operative(&agents, "engineer", "subj-e");
+
+        let decider = ScriptedDecider {
+            reply: Ok("Sure! I think you should plan the team now.".to_string()),
+        };
+        let recs = tick_ai(&agents, &spine, &tasks, &reg, 1, Some("default"), &decider);
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.action, "create_team_plan");
+        assert_eq!(rec.outcome, "advanced");
+        assert_eq!(rec.ai_mode.as_deref(), Some("fallback"));
+        // The deterministic action was NOT blocked by the bad model output.
+        assert!(spine.latest_team_plan("default", &m).unwrap().is_some());
+    }
+
+    // DLB-4) A disallowed (known but out-of-set) action also falls back — the
+    //        model cannot widen the legal choice.
+    #[test]
+    fn deliberation_disallowed_action_falls_back() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        runnable_operative(&agents, "engineer", "subj-e");
+
+        // `start` is a real action but not legal for a needs_team_plan candidate.
+        let decider = ScriptedDecider {
+            reply: Ok(r#"{"action":"start","reason":"go"}"#.to_string()),
+        };
+        let recs = tick_ai(&agents, &spine, &tasks, &reg, 1, Some("default"), &decider);
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.action, "create_team_plan");
+        assert_eq!(rec.outcome, "advanced");
+        assert_eq!(rec.ai_mode.as_deref(), Some("fallback"));
+        assert!(spine.latest_team_plan("default", &m).unwrap().is_some());
+    }
+
+    // DLB-5) Model unavailable (decider returns an error) → deterministic action
+    //        still executes and the record reads unavailable.
+    #[test]
+    fn deliberation_unavailable_runs_deterministically() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        runnable_operative(&agents, "engineer", "subj-e");
+
+        let decider = ScriptedDecider {
+            reply: Err("ai peer unreachable: timeout".to_string()),
+        };
+        let recs = tick_ai(&agents, &spine, &tasks, &reg, 1, Some("default"), &decider);
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.action, "create_team_plan");
+        assert_eq!(rec.outcome, "advanced");
+        assert_eq!(rec.ai_mode.as_deref(), Some("unavailable"));
+        assert!(spine.latest_team_plan("default", &m).unwrap().is_some());
+    }
+
+    // DLB-6) With deliberation ON but NO decider wired, the loop is honestly
+    //        `unavailable` and the deterministic action still executes (the manual
+    //        tick / missing-mesh shape).
+    #[test]
+    fn deliberation_enabled_without_decider_is_unavailable() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        runnable_operative(&agents, "engineer", "subj-e");
+
+        let recs = autonomous_prime_tick(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            None,
+            0,
+            1,
+            Some("default"),
+            "echo",
+            None,
+            true,
+        )
+        .unwrap();
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.outcome, "advanced");
+        assert_eq!(rec.ai_mode.as_deref(), Some("unavailable"));
+        assert!(spine.latest_team_plan("default", &m).unwrap().is_some());
+    }
+
+    // DLB-7) Deliberation OFF leaves the record at deterministic_only (the loop is
+    //        byte-for-byte the old behaviour).
+    #[test]
+    fn deliberation_off_is_deterministic_only() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        runnable_operative(&agents, "engineer", "subj-e");
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.outcome, "advanced");
+        assert_eq!(rec.ai_mode.as_deref(), Some("deterministic_only"));
+    }
+
+    // DLB-8) The env flag parser honours the documented truthy set and defaults
+    //        OFF.
+    #[test]
+    fn prime_llm_deliberation_flag_parsing() {
+        for on in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert!(
+                parse_prime_llm_deliberation(Some(on)),
+                "`{on}` should enable"
+            );
+        }
+        for off in ["0", "false", "no", "off", "", "maybe"] {
+            assert!(
+                !parse_prime_llm_deliberation(Some(off)),
+                "`{off}` should not"
+            );
+        }
+        assert!(!parse_prime_llm_deliberation(None));
     }
 
     /// Grant the synthetic Prime authority a bounded standing approval for
@@ -3219,6 +3896,8 @@ mod tests {
             5,
             Some("default"),
             "echo",
+            None,
+            false,
         )
         .unwrap();
         let rec = recs
