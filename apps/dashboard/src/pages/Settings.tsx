@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { runtimeState, tryGet, type RuntimeStateRow } from "../api";
+import { api, runtimeState, tryGet, type RuntimeStateRow } from "../api";
 import { useAuth } from "../auth";
 import { asArray, Empty, useAsync } from "../components/common";
 import { MaintenancePanel } from "../components/MaintenancePanel";
@@ -307,47 +307,7 @@ export function Settings() {
         </p>
       </div>
 
-      <div className="card" style={{ gridColumn: "1 / -1" }}>
-        <h3>Prime standing authority</h3>
-        <p className="muted" style={{ marginTop: -2, marginBottom: 12 }}>
-          Bounded powers the Board can grant the autonomous Prime to act on its behalf at specific
-          approval gates. These are <strong>standing approvals, not env bypasses</strong>: enabling{" "}
-          <span className="mono">RELIX_AUTONOMOUS_PRIME</span> only runs the loop — each category below
-          acts <em>only</em> while a standing-approval row exists for this Guild. Granted/revoked via{" "}
-          <span className="mono">/v1/agents/{primeAuthority.authority_id ?? "__relix_autonomous_prime__"}/standing-approvals</span>.
-        </p>
-        {loading ? (
-          <div className="loading">Loading…</div>
-        ) : (
-          <table className="table">
-            <tbody>
-              {(primeAuthority.categories ?? []).map((c) => (
-                <tr key={c.category}>
-                  <td className="mono" style={{ fontSize: 12 }}>{c.category}</td>
-                  <td>
-                    <span className={"badge " + (c.active ? "done" : "backlog")}>
-                      {c.active ? "enabled" : "disabled"}
-                    </span>
-                    <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>{c.description}</span>
-                  </td>
-                </tr>
-              ))}
-              {(primeAuthority.categories ?? []).length === 0 && (
-                <tr><td className="muted">Prime standing-authority state unavailable.</td></tr>
-              )}
-              <tr>
-                <td className="muted">Hire Rig</td>
-                <td>
-                  <span className="mono" style={{ fontSize: 12 }}>{primeAuthority.hire_rig ?? "echo"}</span>
-                  {primeAuthority.hire_rig_valid === false && (
-                    <span className="badge todo" style={{ marginLeft: 8 }}>unknown Rig — hires will be skipped</span>
-                  )}
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        )}
-      </div>
+      <PrimeStandingAuthorityPanel authority={primeAuthority} loading={loading} onChanged={reload} />
 
       <AdminRecoveryPanel />
 
@@ -411,6 +371,183 @@ export function Settings() {
         )}
       </div>
       </div>
+    </div>
+  );
+}
+
+// Prime standing authority (company-model standing-approval semantics): the
+// operator control surface for the bounded powers the Board grants the
+// autonomous Prime to act on its behalf at specific approval gates. These are
+// STANDING APPROVALS, not env bypasses — enabling RELIX_AUTONOMOUS_PRIME only
+// runs the loop; each category acts ONLY while a `standing_approvals` row exists
+// for the synthetic `__relix_autonomous_prime__` authority in this Guild. Grant
+// creates a bounded row through the EXISTING standing-approval routes
+// (`POST /v1/agents/:id/standing-approvals`); Revoke deletes the matching rows
+// (`GET` the list → `DELETE /v1/standing-approvals/:standing_id`). After either,
+// the standing-authority read surface is refreshed. No new mutation route was
+// invented — the synthetic authority reuses the same routes real Operatives use.
+
+const AUTONOMOUS_PRIME_AUTHORITY = "__relix_autonomous_prime__";
+// Bounded, safe-but-usable grant defaults (a practical ops default, not an open
+// blank cheque): expires 24h out, capped at 25 autonomous calls, no cost cap
+// (these categories are $0-but-tracked governance actions, not paid spend).
+const GRANT_TTL_SECS = 24 * 60 * 60;
+const GRANT_MAX_CALLS = 25;
+
+interface StandingListRow {
+  standing_id?: string;
+  match_category?: string;
+}
+
+function PrimeStandingAuthorityPanel({
+  authority,
+  loading,
+  onChanged,
+}: {
+  authority: StandingAuthority;
+  loading: boolean;
+  onChanged: () => void;
+}) {
+  const authorityId = authority.authority_id ?? AUTONOMOUS_PRIME_AUTHORITY;
+  const categories = authority.categories ?? [];
+  // The category currently being granted/revoked (disables just its button), and
+  // a single success/error banner for the last action.
+  const [busy, setBusy] = useState<string | null>(null);
+  const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
+
+  async function grant(category: string) {
+    setBusy(category);
+    setBanner(null);
+    try {
+      const expires_at = Math.floor(Date.now() / 1000) + GRANT_TTL_SECS;
+      await api.post(`/v1/agents/${encodeURIComponent(authorityId)}/standing-approvals`, {
+        category,
+        expires_at,
+        max_calls: GRANT_MAX_CALLS,
+        granted_by: "operator",
+        note: "Granted from Settings · Prime standing authority",
+      });
+      setBanner({
+        kind: "ok",
+        msg: `Granted ${category} — bounded to ${GRANT_MAX_CALLS} autonomous calls, expires in 24h.`,
+      });
+      onChanged();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Grant failed" });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function revoke(category: string) {
+    setBusy(category);
+    setBanner(null);
+    try {
+      // The read surface reports active/inactive but not the row id, so list the
+      // synthetic authority's standing approvals and revoke every row for THIS
+      // category (an exhausted row alongside a fresh one are both cleared).
+      const list = await api.get<{ standing?: StandingListRow[] }>(
+        `/v1/agents/${encodeURIComponent(authorityId)}/standing-approvals`,
+      );
+      const rows = (list?.standing ?? []).filter(
+        (r) => r.match_category === category && r.standing_id,
+      );
+      if (rows.length === 0) {
+        setBanner({ kind: "err", msg: `No standing grant found for ${category} to revoke.` });
+        onChanged();
+        return;
+      }
+      for (const r of rows) {
+        await api.del(`/v1/standing-approvals/${encodeURIComponent(r.standing_id!)}`);
+      }
+      setBanner({
+        kind: "ok",
+        msg: `Revoked ${category} (${rows.length} grant${rows.length > 1 ? "s" : ""}).`,
+      });
+      onChanged();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Revoke failed" });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="card" style={{ gridColumn: "1 / -1" }}>
+      <h3>Prime standing authority</h3>
+      <p className="muted" style={{ marginTop: -2, marginBottom: 12 }}>
+        Bounded powers the Board can grant the autonomous Prime to act on its behalf at specific
+        approval gates. These are <strong>standing approvals, not env bypasses</strong>: granting a
+        category here does <em>not</em> enable autonomy on its own — the loop only acts when{" "}
+        <span className="mono">RELIX_AUTONOMOUS_PRIME</span> is also on, and even then a category
+        acts <em>only</em> while its grant is live. Granting creates a bounded row (25 calls, expires
+        in 24h) for the synthetic{" "}
+        <span className="mono">{authorityId}</span> authority in this Guild; revoking removes it.
+      </p>
+      {authority.driver_enabled === false && (
+        <div className="banner" style={{ fontSize: 12 }}>
+          The autonomous Prime loop is <strong>off</strong> (<span className="mono">RELIX_AUTONOMOUS_PRIME</span>{" "}
+          is not set). Grants below are recorded but stay inert until the loop is enabled — they never
+          run autonomy by themselves.
+        </div>
+      )}
+      {banner && <div className={"banner " + banner.kind} style={{ fontSize: 12 }}>{banner.msg}</div>}
+      {loading ? (
+        <div className="loading">Loading…</div>
+      ) : (
+        <table className="table">
+          <tbody>
+            {categories.map((c) => {
+              const active = !!c.active;
+              const cat = c.category ?? "";
+              const inFlight = busy === cat;
+              return (
+                <tr key={cat}>
+                  <td className="mono" style={{ fontSize: 12 }}>{cat}</td>
+                  <td>
+                    <span className={"badge " + (active ? "done" : "backlog")}>
+                      {active ? "enabled" : "disabled"}
+                    </span>
+                    <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>{c.description}</span>
+                  </td>
+                  <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+                    {active ? (
+                      <button
+                        className="btn ghost sm"
+                        disabled={busy !== null}
+                        onClick={() => void revoke(cat)}
+                      >
+                        {inFlight ? "…" : "Revoke"}
+                      </button>
+                    ) : (
+                      <button
+                        className="btn sm"
+                        disabled={busy !== null}
+                        onClick={() => void grant(cat)}
+                      >
+                        {inFlight ? "…" : "Grant"}
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+            {categories.length === 0 && (
+              <tr><td className="muted" colSpan={3}>Prime standing-authority state unavailable.</td></tr>
+            )}
+            <tr>
+              <td className="muted">Hire Rig</td>
+              <td>
+                <span className="mono" style={{ fontSize: 12 }}>{authority.hire_rig ?? "echo"}</span>
+                {authority.hire_rig_valid === false && (
+                  <span className="badge todo" style={{ marginLeft: 8 }}>unknown Rig — hires will be skipped</span>
+                )}
+              </td>
+              <td />
+            </tr>
+          </tbody>
+        </table>
+      )}
     </div>
   );
 }

@@ -86,6 +86,7 @@ export const api = {
   post: <T = unknown>(path: string, body?: unknown) => request("POST", path, body) as Promise<T>,
   put: <T = unknown>(path: string, body?: unknown) => request("PUT", path, body) as Promise<T>,
   patch: <T = unknown>(path: string, body?: unknown) => request("PATCH", path, body) as Promise<T>,
+  del: <T = unknown>(path: string) => request("DELETE", path) as Promise<T>,
 };
 
 // Best-effort GET that resolves to a fallback instead of throwing, so a

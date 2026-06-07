@@ -334,12 +334,23 @@ the approved work is already ready. What it does **not** do:
     check is per the candidate's own Guild), **bounded** (still ≤
     `RELIX_AUTONOMOUS_PRIME_MAX` actions/tick), and **idempotent**. Grants are
     made/revoked through the EXISTING `agent.standing_approval.*` routes
-    (`POST`/`DELETE /v1/agents/__relix_autonomous_prime__/standing-approvals`);
-    the live per-Guild category state is surfaced **read-only** in Settings and at
+    (`POST`/`DELETE /v1/agents/__relix_autonomous_prime__/standing-approvals`) —
+    the same routes real Operatives use, so **no duplicate approval system was
+    invented**. **The Settings page is now an operator control surface, not
+    read-only:** each of the three categories shows enabled/disabled with a
+    **Grant** (when disabled) / **Revoke** (when enabled) button. Granting creates
+    a bounded standing approval for the synthetic authority (default `expires_at =
+    now + 24h`, `max_calls = 25`, no cost cap); revoking deletes every row for that
+    category. The same bounded grant is scriptable from the CLI
+    (`relix-cli agent standing-approval-grant --agent-id __relix_autonomous_prime__
+    --category prime.proposal.approve --expires-in 24h`) or `curl` against the same
+    routes. The live per-Guild category state is still reflected at
     `GET /v1/spine/prime/standing-authority`. **The normal approval system is not
-    weakened**: with no standing grant, every approval gate stays human exactly as
-    before — autonomy here only *adds* power when the Board has explicitly granted
-    it.
+    weakened**: granting in the dashboard does **not** enable autonomy — the loop
+    only acts when `RELIX_AUTONOMOUS_PRIME` is *also* set, and even then a category
+    acts only while its grant is live. With no standing grant, every approval gate
+    stays human exactly as before — autonomy here only *adds* power when the Board
+    has explicitly granted it, inside the bound it set.
   - What this still does **NOT** do: there is **no LLM/strategy reasoning** — the
     autonomous driver only executes the deterministic next governed step; it
     **does not author strategy, decide which person/identity to hire, or invent a

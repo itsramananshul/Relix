@@ -2686,4 +2686,93 @@ mod tests {
         );
         assert!(!active_of(CATEGORY_CLEARANCE_APPROVE));
     }
+
+    // Q) The operator grant/revoke control path (the Settings "Grant"/"Revoke"
+    //    buttons): a standing grant CREATED through the EXISTING
+    //    `agent.standing_approval.create` handler for the synthetic Prime
+    //    authority flips the read-only `prime.standing_authority` surface to
+    //    active, is LISTABLE by category through `agent.standing_approval.list`,
+    //    and REVOKING that row through `agent.standing_approval.revoke` flips the
+    //    surface back to inactive — proving the dashboard reuses the same
+    //    handler/store path real Operatives use, with no bespoke route.
+    #[test]
+    fn standing_authority_grant_list_revoke_through_handlers() {
+        use crate::nodes::coordinator::agent::handlers::{
+            handle_standing_create, handle_standing_list, handle_standing_revoke,
+        };
+        let (agents, _spine, _tasks) = stores();
+
+        let active_of = |cat: &str| -> bool {
+            let out = handle_prime_standing_authority(
+                &agents,
+                &fake_ctx_with_role(b"", "operator", b"caller"),
+            );
+            let v: Value = match out {
+                HandlerOutcome::Ok(b) => serde_json::from_slice(&b).unwrap(),
+                HandlerOutcome::Err(e) => panic!("standing_authority errored: {}", e.cause),
+            };
+            v["categories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["category"] == cat)
+                .map(|c| c["active"].as_bool().unwrap_or(false))
+                .unwrap_or(false)
+        };
+
+        // Initially ungranted ⇒ inactive.
+        assert!(!active_of(CATEGORY_PROPOSAL_APPROVE));
+
+        // GRANT through the create handler using the bridge's POST forward shape
+        // (the synthetic authority id + the bounded defaults the Settings panel
+        // sends: a far-future expiry in seconds, a 25-call cap, no cost cap).
+        let grant = json!({
+            "agent_id": AUTONOMOUS_PRIME_AUTHORITY,
+            "category": CATEGORY_PROPOSAL_APPROVE,
+            "expires_at": 9_999_999_999i64,
+            "granted_by": "operator",
+            "max_calls": 25,
+            "note": "from settings",
+        });
+        let standing_id = match handle_standing_create(
+            &agents,
+            &fake_ctx_with_role(grant.to_string().as_bytes(), "operator", b"caller"),
+        ) {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap().trim().to_string(),
+            HandlerOutcome::Err(e) => panic!("standing create errored: {}", e.cause),
+        };
+        assert!(!standing_id.is_empty());
+        assert!(
+            active_of(CATEGORY_PROPOSAL_APPROVE),
+            "a grant flips the read surface active"
+        );
+
+        // LIST through the list handler returns the row for the synthetic
+        // authority (the id the dashboard revoke resolves from the category).
+        let list = match handle_standing_list(
+            &agents,
+            &fake_ctx_with_role(AUTONOMOUS_PRIME_AUTHORITY.as_bytes(), "operator", b"caller"),
+        ) {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("standing list errored: {}", e.cause),
+        };
+        assert!(
+            list.contains(&standing_id),
+            "listing surfaces the granted row"
+        );
+        assert!(list.contains(CATEGORY_PROPOSAL_APPROVE));
+
+        // REVOKE that row through the revoke handler ⇒ surface back to inactive.
+        match handle_standing_revoke(
+            &agents,
+            &fake_ctx_with_role(standing_id.as_bytes(), "operator", b"caller"),
+        ) {
+            HandlerOutcome::Ok(_) => {}
+            HandlerOutcome::Err(e) => panic!("standing revoke errored: {}", e.cause),
+        };
+        assert!(
+            !active_of(CATEGORY_PROPOSAL_APPROVE),
+            "revoking the row flips the read surface inactive"
+        );
+    }
 }
