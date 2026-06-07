@@ -45,6 +45,10 @@ use crate::nodes::coordinator::agent::prime_deliberation::{
     ACTION_NONE, PrimeAiDecider, PrimeDeliberationInput, PrimeDeliberationMode,
     build_prime_deliberation_prompt, parse_prime_decision,
 };
+use crate::nodes::coordinator::agent::prime_priority::{
+    MAX_PRIORITY_CANDIDATES, PrimePriorityCandidate, PrimePriorityMode, build_priority_prompt,
+    parse_priority_order,
+};
 use crate::nodes::coordinator::agent::prime_strategy::{
     PrimeStrategyDraftMode, PrimeStrategyDraftResult, PrimeStrategySnapshot,
     build_strategy_draft_prompt, validate_strategy_draft,
@@ -1297,6 +1301,13 @@ fn prime_autonomy_record_json(r: &PrimeAutonomyRecord) -> Value {
         // an LLM-authored proposed strategy from a deterministic one.
         "strategy_ai_mode": r.strategy_ai_mode,
         "strategy_ai_reason": r.strategy_ai_reason,
+        // Prime Executive Prioritization v1 provenance: how the tick's candidate
+        // ORDER was chosen, plus this candidate's rank in that order. Legacy/no-
+        // choice rows read as deterministic_only so the operator always sees
+        // whether the queue order was model-picked or deterministic.
+        "priority_ai_mode": r.priority_ai_mode.as_deref().unwrap_or("deterministic_only"),
+        "priority_ai_reason": r.priority_ai_reason,
+        "priority_rank": r.priority_rank,
     })
 }
 
@@ -1348,6 +1359,11 @@ pub fn handle_prime_autonomy_tick_now(
             .ok()
             .as_deref(),
     );
+    let prioritization_enabled = parse_prime_llm_prioritization(
+        std::env::var("RELIX_PRIME_LLM_PRIORITIZATION")
+            .ok()
+            .as_deref(),
+    );
     handle_prime_autonomy_tick_now_with_ai(
         agent_store,
         spine_store,
@@ -1358,6 +1374,7 @@ pub fn handle_prime_autonomy_tick_now(
         None,
         llm_enabled,
         strategy_llm_enabled,
+        prioritization_enabled,
     )
 }
 
@@ -1388,6 +1405,7 @@ pub fn handle_prime_autonomy_tick_now_with_ai(
     ai: Option<&dyn PrimeAiDecider>,
     llm_enabled: bool,
     strategy_llm_enabled: bool,
+    prioritization_enabled: bool,
 ) -> HandlerOutcome {
     // Same Board-only gate as the runtime toggle: a worker subject can never
     // wake the autonomous Prime driver, even though this takes no new authority.
@@ -1428,6 +1446,7 @@ pub fn handle_prime_autonomy_tick_now_with_ai(
         ai,
         llm_enabled,
         strategy_llm_enabled,
+        prioritization_enabled,
     ) {
         Ok(r) => r,
         Err(e) => return internal(format!("prime.autonomy_tick_now: {e}")),
@@ -1774,6 +1793,21 @@ pub struct PrimeAutonomyRecord {
     /// reason on `llm_used`, or the honest fallback/unavailable reason). `None`
     /// when no strategy was drafted.
     pub strategy_ai_reason: Option<String>,
+    /// Prime Executive Prioritization v1 provenance — how this tick's CANDIDATE
+    /// ORDER (which legal candidate the bounded tick spent its action budget on)
+    /// was chosen: `deterministic_only` / `llm_used` / `fallback` / `unavailable`.
+    /// `None` is treated as `deterministic_only` by the renderer (legacy rows).
+    /// This is distinct from `ai_mode` (the per-candidate action-choice
+    /// provenance) and `strategy_ai_mode` (the strategy-body author).
+    pub priority_ai_mode: Option<String>,
+    /// The model's short reason for the queue order when it participated
+    /// (`llm_used`), or the honest reason it was not used (`fallback` /
+    /// `unavailable`). Secret-free. Shared across every record in the same tick.
+    pub priority_ai_reason: Option<String>,
+    /// The candidate's 1-based rank in the chosen execution order when the model
+    /// picked the order (`priority_ai_mode == llm_used`); `None` in deterministic
+    /// modes or for a candidate that was not part of the offered actionable menu.
+    pub priority_rank: Option<usize>,
 }
 
 /// Build the synthetic **autonomous Prime** invocation context for `tenant`.
@@ -2067,6 +2101,9 @@ fn process_candidate(
                         ai_reason: reason,
                         strategy_ai_mode: None,
                         strategy_ai_reason: None,
+                        priority_ai_mode: None,
+                        priority_ai_reason: None,
+                        priority_rank: None,
                     };
                 }
                 Deliberation::Proceed { mode, reason } => {
@@ -2146,6 +2183,10 @@ fn process_candidate_inner(
             // Set only on the propose_strategy arm below (the strategy author).
             strategy_ai_mode: None,
             strategy_ai_reason: None,
+            // The tick's prioritization layer stamps these after execution.
+            priority_ai_mode: None,
+            priority_ai_reason: None,
+            priority_rank: None,
         }
     };
 
@@ -2709,19 +2750,436 @@ fn process_candidate_inner(
     mk(phase, "none", outcome, step.reason.clone(), mandate_id)
 }
 
+/// Parse `RELIX_PRIME_LLM_PRIORITIZATION` (`1|true|yes|on`, case-insensitive) into
+/// the model-prioritization flag (Prime Executive Prioritization v1). Default OFF.
+/// Independent of the deliberation / strategy-draft switches: a Guild may let the
+/// model ORDER the legal candidate queue while keeping deterministic per-candidate
+/// action choice + strategy authoring (or any combination). It never widens the
+/// menu — only the already-legal, already-attemptable candidates are reordered.
+pub fn parse_prime_llm_prioritization(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// One discovered autonomous candidate, in deterministic discovery order (the
+/// prioritization FALLBACK order). Carries just enough to (a) classify it
+/// read-only for the prioritization menu and (b) execute exactly the governed step
+/// it would run today.
+enum AutoCandidate {
+    /// PASS 0 — a PROPOSED Prime proposal whose Guild granted the
+    /// `prime.proposal.approve` standing authority (already filtered).
+    ProposalApprove(crate::nodes::coordinator::spine::store::PrimeProposalRow),
+    /// An approved Prime proposal → `process_candidate("proposal")`.
+    Proposal { tenant: String, proposal_id: String },
+    /// A bare active Mandate (no owning proposal) → `process_candidate("mandate")`.
+    Mandate { tenant: String, mandate_id: String },
+}
+
+impl AutoCandidate {
+    /// The record `target_kind` (`proposal` / `mandate`).
+    fn kind(&self) -> &'static str {
+        match self {
+            AutoCandidate::ProposalApprove(_) | AutoCandidate::Proposal { .. } => "proposal",
+            AutoCandidate::Mandate { .. } => "mandate",
+        }
+    }
+}
+
+/// The ONE governed action the deterministic classifier would actually ATTEMPT
+/// for a classified step THIS tick — the gate for offering a candidate to the
+/// prioritization model. Differs from [`intended_action`] in that an approval-
+/// category action (hire / clearance / strategy) is only "attemptable" when the
+/// Guild holds the matching live standing authority (and, for hire/clearance, a
+/// known hire Rig); otherwise it is a pure human gate this tick and is NOT
+/// offered. `None` for a human gate / running / done step the loop cannot action.
+fn attemptable_action(
+    step: &NextStep,
+    agent_store: &AgentStore,
+    tenant: &str,
+    now_secs: i64,
+    hire_rig: &str,
+) -> Option<&'static str> {
+    if step.can_advance {
+        return step.advance_action;
+    }
+    match intended_action(step) {
+        Some(a @ ("start" | "start_mandate")) => Some(a),
+        Some("hire_approve") => {
+            (standing_active(agent_store, tenant, CATEGORY_HIRE_APPROVE, now_secs)
+                && crate::rig::is_known_rig(hire_rig))
+            .then_some("hire_approve")
+        }
+        Some("clearance_approve") => {
+            (standing_active(agent_store, tenant, CATEGORY_CLEARANCE_APPROVE, now_secs)
+                && crate::rig::is_known_rig(hire_rig))
+            .then_some("clearance_approve")
+        }
+        Some("approve_strategy") => {
+            standing_active(agent_store, tenant, CATEGORY_STRATEGY_APPROVE, now_secs)
+                .then_some("approve_strategy")
+        }
+        _ => None,
+    }
+}
+
+/// Build the bounded, secret-free prioritization-menu summary for a Proposal /
+/// Mandate candidate, or `None` when its next governed step is NOT an attemptable
+/// action this tick (a pure human gate / running / done). READ-ONLY.
+#[allow(clippy::too_many_arguments)]
+fn menu_from_target(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &Arc<TaskStore>,
+    now_secs: i64,
+    hire_rig: &str,
+    key: &str,
+    tenant: &str,
+    kind: &str,
+    target_id: &str,
+    target: Value,
+) -> Option<PrimePriorityCandidate> {
+    let read_ctx = autonomous_prime_ctx(tenant, target.to_string().into_bytes());
+    let step = compute_next_step(agent_store, spine_store, task_store, &read_ctx).ok()?;
+    let action = attemptable_action(&step, agent_store, tenant, now_secs, hire_rig)?;
+    Some(PrimePriorityCandidate {
+        key: key.to_string(),
+        tenant: tenant.to_string(),
+        target_kind: kind.to_string(),
+        target_id: target_id.to_string(),
+        mandate_id: step.mandate_id.clone(),
+        phase: step.phase.to_string(),
+        computed_action: action.to_string(),
+        reason: step.reason.clone(),
+        strategy_status: step.strategy_status.clone(),
+        total_briefs: step.counts.total,
+        ready: step.counts.ready,
+        unassigned: step.counts.unassigned,
+        running: step.counts.running,
+        needs_review: step.counts.needs_review,
+        blocked: step.counts.blocked,
+        missing_roles: step.missing_roles.len(),
+        pending_hires: step.pending_hires.len(),
+        pending_clearances: step.pending_clearances.len(),
+    })
+}
+
+/// The prioritization-menu summary for a discovered candidate, or `None` when it
+/// has no attemptable action this tick. A PASS-0 `ProposalApprove` is always
+/// attemptable (it was discovered only with a live `prime.proposal.approve`
+/// grant). READ-ONLY.
+fn candidate_menu_entry(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &Arc<TaskStore>,
+    now_secs: i64,
+    hire_rig: &str,
+    key: &str,
+    cand: &AutoCandidate,
+) -> Option<PrimePriorityCandidate> {
+    match cand {
+        AutoCandidate::ProposalApprove(p) => Some(PrimePriorityCandidate {
+            key: key.to_string(),
+            tenant: p.tenant_id.clone(),
+            target_kind: "proposal".to_string(),
+            target_id: p.proposal_id.clone(),
+            mandate_id: None,
+            phase: "needs_approval".to_string(),
+            computed_action: "approve".to_string(),
+            reason: "approve the proposed plan via the prime.proposal.approve standing authority"
+                .to_string(),
+            strategy_status: None,
+            total_briefs: 0,
+            ready: 0,
+            unassigned: 0,
+            running: 0,
+            needs_review: 0,
+            blocked: 0,
+            missing_roles: 0,
+            pending_hires: 0,
+            pending_clearances: 0,
+        }),
+        AutoCandidate::Proposal {
+            tenant,
+            proposal_id,
+        } => menu_from_target(
+            agent_store,
+            spine_store,
+            task_store,
+            now_secs,
+            hire_rig,
+            key,
+            tenant,
+            "proposal",
+            proposal_id,
+            json!({ "proposal_id": proposal_id }),
+        ),
+        AutoCandidate::Mandate { tenant, mandate_id } => menu_from_target(
+            agent_store,
+            spine_store,
+            task_store,
+            now_secs,
+            hire_rig,
+            key,
+            tenant,
+            "mandate",
+            mandate_id,
+            json!({ "mandate_id": mandate_id }),
+        ),
+    }
+}
+
+/// Execute the PASS-0 standing-authority approval of a PROPOSED Prime proposal —
+/// the existing `prime.approve` path, optionally pre-confirmed by the Prime
+/// Deliberation layer. Bounded by a self-guard on the action budget so it stays
+/// safe in the prioritized (non-break) execution order. Returns the record with
+/// the deliberation provenance stamped; the caller stamps the prioritization
+/// provenance.
+#[allow(clippy::too_many_arguments)]
+fn exec_proposal_approve(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &Arc<TaskStore>,
+    now_secs: i64,
+    p: &crate::nodes::coordinator::spine::store::PrimeProposalRow,
+    actions: &mut usize,
+    max: usize,
+    ai: Option<&dyn PrimeAiDecider>,
+    llm_enabled: bool,
+) -> PrimeAutonomyRecord {
+    let base = |outcome: &'static str,
+                reason: String,
+                mandate_id: Option<String>,
+                ai_mode: Option<String>,
+                ai_reason: Option<String>|
+     -> PrimeAutonomyRecord {
+        PrimeAutonomyRecord {
+            tenant: p.tenant_id.clone(),
+            target_kind: "proposal",
+            target_id: p.proposal_id.clone(),
+            mandate_id,
+            phase: "needs_approval".to_string(),
+            action: "approve",
+            outcome,
+            reason,
+            ai_mode,
+            ai_reason,
+            strategy_ai_mode: None,
+            strategy_ai_reason: None,
+            priority_ai_mode: None,
+            priority_ai_reason: None,
+            priority_rank: None,
+        }
+    };
+
+    // Budget guard — in the deterministic order the caller breaks first, but the
+    // prioritized order relies on this self-guard to stay bounded by `max`.
+    if *actions >= max {
+        return base(
+            "skipped",
+            "tick action budget reached".to_string(),
+            None,
+            None,
+            None,
+        );
+    }
+
+    // Prime Deliberation v1: let the model CONFIRM this autonomous approval or HOLD
+    // (`none`) this tick. The standing grant is still required and is consumed only
+    // on a real approval below; a HOLD records `skipped` and consumes nothing.
+    let mut pass0_mode = PrimeDeliberationMode::DeterministicOnly;
+    let mut pass0_reason: Option<String> = None;
+    if llm_enabled {
+        let snap = PrimeDeliberationInput {
+            tenant: p.tenant_id.clone(),
+            target_kind: "proposal".to_string(),
+            target_id: p.proposal_id.clone(),
+            mandate_id: None,
+            phase: "needs_approval".to_string(),
+            computed_action: "approve".to_string(),
+            reason: "approve the proposed plan via the prime.proposal.approve standing authority"
+                .to_string(),
+            strategy_status: None,
+            total_briefs: 0,
+            ready: 0,
+            unassigned: 0,
+            running: 0,
+            needs_review: 0,
+            blocked: 0,
+            missing_roles: 0,
+            pending_hires: 0,
+            pending_clearances: 0,
+        };
+        match deliberate(ai, &snap) {
+            Deliberation::Hold { mode, reason } => {
+                return base(
+                    "skipped",
+                    match &reason {
+                        Some(r) => format!("model chose to hold (none): {r}"),
+                        None => "model chose to hold (none)".to_string(),
+                    },
+                    None,
+                    Some(mode.as_str().to_string()),
+                    reason,
+                );
+            }
+            Deliberation::Proceed { mode, reason } => {
+                pass0_mode = mode;
+                pass0_reason = reason;
+            }
+        }
+    }
+
+    let approve_ctx = autonomous_prime_ctx(&p.tenant_id, p.proposal_id.clone().into_bytes());
+    let mut rec = match handle_prime_approve(agent_store, spine_store, task_store, &approve_ctx) {
+        HandlerOutcome::Ok(b) => {
+            *actions += 1;
+            let _ = consume_standing(
+                agent_store,
+                &p.tenant_id,
+                CATEGORY_PROPOSAL_APPROVE,
+                now_secs,
+            );
+            let v: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
+            let mid = v
+                .get("mandate_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            if let Some(m) = mid.as_deref() {
+                chronicle_autonomous(
+                    task_store,
+                    m,
+                    "prime.autonomous_approve",
+                    &format!(
+                        "autonomous Prime approved proposal {} (mandate {m})",
+                        p.proposal_id
+                    ),
+                );
+            }
+            base(
+                "approved",
+                "materialized proposed plan through the existing prime.approve path".to_string(),
+                mid,
+                None,
+                None,
+            )
+        }
+        HandlerOutcome::Err(e) => base(
+            "blocked",
+            format!("autonomous approve refused: {}", e.cause),
+            None,
+            None,
+            None,
+        ),
+    };
+    rec.ai_mode = Some(pass0_mode.as_str().to_string());
+    rec.ai_reason = pass0_reason;
+    rec
+}
+
+/// Dispatch ONE discovered candidate to its governed executor (the SAME governed
+/// handlers + gates the manual route uses). PASS-0 approvals run `prime.approve`;
+/// every other candidate runs through [`process_candidate`] (which itself carries
+/// the per-candidate deliberation + strategy-authoring layers). Stamps the
+/// deliberation/strategy provenance; the caller stamps the prioritization
+/// provenance.
+#[allow(clippy::too_many_arguments)]
+fn execute_candidate(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &Arc<TaskStore>,
+    registry: &crate::rig::RigRegistry,
+    metrics: Option<&crate::metrics::MetricsQuery>,
+    now_ms: i64,
+    now_secs: i64,
+    hire_rig: &str,
+    cand: &AutoCandidate,
+    actions: &mut usize,
+    max: usize,
+    ai: Option<&dyn PrimeAiDecider>,
+    llm_enabled: bool,
+    strategy_llm_enabled: bool,
+) -> PrimeAutonomyRecord {
+    match cand {
+        AutoCandidate::ProposalApprove(p) => exec_proposal_approve(
+            agent_store,
+            spine_store,
+            task_store,
+            now_secs,
+            p,
+            actions,
+            max,
+            ai,
+            llm_enabled,
+        ),
+        AutoCandidate::Proposal {
+            tenant,
+            proposal_id,
+        } => process_candidate(
+            agent_store,
+            spine_store,
+            task_store,
+            registry,
+            metrics,
+            now_ms,
+            tenant,
+            "proposal",
+            proposal_id,
+            json!({ "proposal_id": proposal_id }),
+            actions,
+            max,
+            hire_rig,
+            ai,
+            llm_enabled,
+            strategy_llm_enabled,
+        ),
+        AutoCandidate::Mandate { tenant, mandate_id } => process_candidate(
+            agent_store,
+            spine_store,
+            task_store,
+            registry,
+            metrics,
+            now_ms,
+            tenant,
+            "mandate",
+            mandate_id,
+            json!({ "mandate_id": mandate_id }),
+            actions,
+            max,
+            hire_rig,
+            ai,
+            llm_enabled,
+            strategy_llm_enabled,
+        ),
+    }
+}
+
 /// Run ONE opt-in autonomous Prime tick: discover up to a bounded set of
-/// candidates (approved Prime proposals first — they carry Start — then live
-/// Mandates not already covered by a proposal) and apply at most `max` safe
-/// governed actions across them, returning one [`PrimeAutonomyRecord`] per
-/// candidate considered. Pure of any sleeping/timer — the controller calls it on
-/// an interval inside `spawn_blocking`.
+/// candidates (standing-approvable PROPOSED proposals first, then approved Prime
+/// proposals — they carry Start — then live Mandates not already covered by a
+/// proposal) and apply at most `max` safe governed actions across them, returning
+/// one [`PrimeAutonomyRecord`] per candidate considered. Pure of any sleeping /
+/// timer — the controller calls it on an interval inside `spawn_blocking`.
+///
+/// Prime Executive Prioritization v1: when `prioritization_enabled` and a live
+/// decider is wired AND there are ≥2 *attemptable* candidates, an opt-in model is
+/// asked ONLY to ORDER the already-legal candidate menu (or HOLD the whole queue
+/// this tick). THE MODEL IS NOT THE PERMISSION SYSTEM — it can never invent a
+/// candidate, add an action to the menu, widen a candidate's action, or bypass any
+/// standing-authority / budget / claim / adapter / tenant gate; only the
+/// deterministic classifier's already-attemptable candidates are offered, and any
+/// malformed / out-of-set / unavailable output degrades to the deterministic
+/// discovery order with an honest mode. With prioritization off (or <2
+/// candidates) the discovery order is byte-for-byte the legacy behaviour.
 ///
 /// Tenant-safe: `tenant=None` spans **all** Guilds (each candidate carries its
 /// own `tenant_id` and is processed under it); `tenant=Some(g)` scopes to one
 /// Guild. Idempotent: each tick re-classifies live state, so a team plan /
 /// orchestration tree / started Shift is never duplicated and an already-
 /// running Brief is never double-started. Bounded: `max` caps actions per tick.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn autonomous_prime_tick(
     agent_store: &AgentStore,
     spine_store: &SpineStore,
@@ -2735,228 +3193,277 @@ pub fn autonomous_prime_tick(
     ai: Option<&dyn PrimeAiDecider>,
     llm_enabled: bool,
     strategy_llm_enabled: bool,
+    prioritization_enabled: bool,
 ) -> Result<Vec<PrimeAutonomyRecord>, String> {
     if max == 0 {
         return Ok(Vec::new());
     }
-    let mut records: Vec<PrimeAutonomyRecord> = Vec::new();
-    let mut actions = 0usize;
     // Bounded discovery — never an unbounded table scan.
     let discover_cap = max.saturating_mul(4).clamp(max, 50);
     let now_secs = now_secs_from_ms(now_ms);
 
-    // PASS 0 — STANDING-AUTHORITY PROPOSAL APPROVAL. Only for a Guild that
-    // granted the `prime.proposal.approve` standing authority: approve PROPOSED
-    // Prime proposals through the EXISTING `prime.approve` path (which creates
-    // the Mandate + Briefs + crew assignments + pending hires). The proposed list
-    // is status-filtered (`status='proposed'`) and tenant-stamped, so a
-    // rejected / already-approved / cross-Guild proposal is never approved here,
-    // and the standing check is per the proposal's OWN Guild (no cross-tenant
-    // grant leak). Idempotent: once approved, the proposal leaves the proposed
-    // set, so a re-tick neither re-approves it nor consumes the grant again.
+    // ── DISCOVER — build the deterministic candidate queue (the prioritization
+    // FALLBACK order). PASS-0 proposals are filtered to a live
+    // `prime.proposal.approve` grant here, so an unauthorized proposal is left
+    // proposed silently (never queued, never recorded) — exactly the legacy skip.
+    let mut queue: Vec<AutoCandidate> = Vec::new();
     let proposed = spine_store
         .list_proposed_prime_proposals(tenant, discover_cap)
         .map_err(|e| format!("autonomous prime: list proposed: {e}"))?;
     for p in proposed {
-        if actions >= max {
-            break;
-        }
-        // No authority for this proposal's Guild → leave it proposed, silently
-        // (no record, so an unauthorized tenant never spams the tick summary).
-        if !standing_active(
+        if standing_active(
             agent_store,
             &p.tenant_id,
             CATEGORY_PROPOSAL_APPROVE,
             now_secs,
         ) {
+            queue.push(AutoCandidate::ProposalApprove(p));
+        }
+    }
+    let proposals = spine_store
+        .list_approved_prime_proposals(tenant, discover_cap)
+        .map_err(|e| format!("autonomous prime: list proposals: {e}"))?;
+    // Mandate ids already covered by a proposal — so the bare-Mandate pass does
+    // not double-process the same Mandate.
+    let mut seen_mandates: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in proposals {
+        if !p.mandate_id.is_empty() {
+            seen_mandates.insert(p.mandate_id.clone());
+        }
+        queue.push(AutoCandidate::Proposal {
+            tenant: p.tenant_id,
+            proposal_id: p.proposal_id,
+        });
+    }
+    let mandates = spine_store
+        .list_active_mandates(tenant, discover_cap)
+        .map_err(|e| format!("autonomous prime: list mandates: {e}"))?;
+    for m in mandates {
+        if seen_mandates.contains(&m.mandate_id) {
             continue;
         }
-        // Prime Deliberation v1: let the model CONFIRM this autonomous approval or
-        // HOLD (`none`) this tick. The standing grant is still required and is
-        // consumed only on a real approval below; a HOLD records `skipped` and
-        // consumes nothing.
-        let mut pass0_mode = PrimeDeliberationMode::DeterministicOnly;
-        let mut pass0_reason: Option<String> = None;
-        if llm_enabled {
-            let snap = PrimeDeliberationInput {
-                tenant: p.tenant_id.clone(),
-                target_kind: "proposal".to_string(),
-                target_id: p.proposal_id.clone(),
-                mandate_id: None,
-                phase: "needs_approval".to_string(),
-                computed_action: "approve".to_string(),
-                reason:
-                    "approve the proposed plan via the prime.proposal.approve standing authority"
-                        .to_string(),
-                strategy_status: None,
-                total_briefs: 0,
-                ready: 0,
-                unassigned: 0,
-                running: 0,
-                needs_review: 0,
-                blocked: 0,
-                missing_roles: 0,
-                pending_hires: 0,
-                pending_clearances: 0,
-            };
-            match deliberate(ai, &snap) {
-                Deliberation::Hold { mode, reason } => {
-                    records.push(PrimeAutonomyRecord {
-                        tenant: p.tenant_id.clone(),
-                        target_kind: "proposal",
-                        target_id: p.proposal_id.clone(),
-                        mandate_id: None,
-                        phase: "needs_approval".to_string(),
-                        action: "approve",
-                        outcome: "skipped",
-                        reason: match &reason {
-                            Some(r) => format!("model chose to hold (none): {r}"),
-                            None => "model chose to hold (none)".to_string(),
-                        },
-                        ai_mode: Some(mode.as_str().to_string()),
-                        ai_reason: reason,
-                        strategy_ai_mode: None,
-                        strategy_ai_reason: None,
-                    });
-                    continue;
-                }
-                Deliberation::Proceed { mode, reason } => {
-                    pass0_mode = mode;
-                    pass0_reason = reason;
+        queue.push(AutoCandidate::Mandate {
+            tenant: m.tenant_id,
+            mandate_id: m.mandate_id,
+        });
+    }
+
+    // Stable, opaque per-tick keys the prioritization model may reorder.
+    let keys: Vec<String> = (0..queue.len())
+        .map(|i| format!("cand-{}", i + 1))
+        .collect();
+
+    // ── CLASSIFY (READ-ONLY) — the attemptable-action menu: candidates whose next
+    // governed step is a positive action the loop could actually take this tick.
+    // Pure human-gate / running / done candidates are NOT offered to the model
+    // (they are still recorded deterministically below). Bounded.
+    let mut menu: Vec<(usize, PrimePriorityCandidate)> = Vec::new();
+    for (i, cand) in queue.iter().enumerate() {
+        if menu.len() >= MAX_PRIORITY_CANDIDATES {
+            break;
+        }
+        if let Some(entry) = candidate_menu_entry(
+            agent_store,
+            spine_store,
+            task_store,
+            now_secs,
+            hire_rig,
+            &keys[i],
+            cand,
+        ) {
+            menu.push((i, entry));
+        }
+    }
+
+    // ── DECIDE the execution order. The model may ONLY reorder the already-legal
+    // menu (or hold the whole queue); anything else degrades to the deterministic
+    // discovery order with an honest mode. Only consulted with ≥2 attemptable
+    // candidates — there is nothing to order otherwise.
+    let mut priority_mode = PrimePriorityMode::DeterministicOnly;
+    let mut priority_reason: Option<String> = None;
+    let mut ranked: Vec<usize> = menu.iter().map(|(i, _)| *i).collect();
+    let mut hold = false;
+
+    if prioritization_enabled && menu.len() >= 2 {
+        match ai {
+            None => {
+                priority_mode = PrimePriorityMode::Unavailable;
+                priority_reason = Some("no AI decider wired for prioritization".to_string());
+            }
+            Some(decider) => {
+                let offered: Vec<PrimePriorityCandidate> =
+                    menu.iter().map(|(_, c)| c.clone()).collect();
+                let offered_keys: Vec<String> = offered.iter().map(|c| c.key.clone()).collect();
+                let prompt = build_priority_prompt(&offered);
+                match decider.deliberate(&prompt) {
+                    Ok(raw) => match parse_priority_order(&raw, &offered_keys) {
+                        Ok(order) => {
+                            priority_mode = PrimePriorityMode::LlmUsed;
+                            priority_reason = non_empty(order.reason);
+                            if order.order.is_empty() {
+                                hold = true;
+                            } else {
+                                let key_to_index: std::collections::HashMap<&str, usize> =
+                                    menu.iter().map(|(i, c)| (c.key.as_str(), *i)).collect();
+                                let listed: std::collections::HashSet<&str> =
+                                    order.order.iter().map(String::as_str).collect();
+                                let mut new_ranked: Vec<usize> = Vec::with_capacity(menu.len());
+                                for k in &order.order {
+                                    if let Some(&idx) = key_to_index.get(k.as_str()) {
+                                        new_ranked.push(idx);
+                                    }
+                                }
+                                // Append any un-listed menu candidate (the model
+                                // deprioritized it, not dropped it) in det. order.
+                                for (i, c) in &menu {
+                                    if !listed.contains(c.key.as_str()) {
+                                        new_ranked.push(*i);
+                                    }
+                                }
+                                ranked = new_ranked;
+                            }
+                        }
+                        Err(e) => {
+                            priority_mode = PrimePriorityMode::Fallback;
+                            priority_reason = Some(format!("model priority output rejected: {e}"));
+                        }
+                    },
+                    Err(e) => {
+                        priority_mode = PrimePriorityMode::Unavailable;
+                        priority_reason = Some(format!("model unavailable: {e}"));
+                    }
                 }
             }
         }
-        let approve_ctx = autonomous_prime_ctx(&p.tenant_id, p.proposal_id.clone().into_bytes());
-        let mut rec = match handle_prime_approve(agent_store, spine_store, task_store, &approve_ctx)
-        {
-            HandlerOutcome::Ok(b) => {
-                actions += 1;
-                let _ = consume_standing(
-                    agent_store,
-                    &p.tenant_id,
-                    CATEGORY_PROPOSAL_APPROVE,
-                    now_secs,
-                );
-                let v: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
-                let mid = v
-                    .get("mandate_id")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string);
-                if let Some(m) = mid.as_deref() {
-                    chronicle_autonomous(
-                        task_store,
-                        m,
-                        "prime.autonomous_approve",
-                        &format!(
-                            "autonomous Prime approved proposal {} (mandate {m})",
-                            p.proposal_id
-                        ),
-                    );
-                }
-                PrimeAutonomyRecord {
-                    tenant: p.tenant_id.clone(),
-                    target_kind: "proposal",
-                    target_id: p.proposal_id.clone(),
-                    mandate_id: mid,
-                    phase: "needs_approval".to_string(),
-                    action: "approve",
-                    outcome: "approved",
-                    reason: "materialized proposed plan through the existing prime.approve path"
-                        .to_string(),
-                    ai_mode: None,
-                    ai_reason: None,
-                    strategy_ai_mode: None,
-                    strategy_ai_reason: None,
-                }
-            }
-            HandlerOutcome::Err(e) => PrimeAutonomyRecord {
-                tenant: p.tenant_id.clone(),
-                target_kind: "proposal",
-                target_id: p.proposal_id.clone(),
-                mandate_id: None,
-                phase: "needs_approval".to_string(),
-                action: "approve",
-                outcome: "blocked",
-                reason: format!("autonomous approve refused: {}", e.cause),
+    }
+
+    let priority_mode_str = priority_mode.as_str().to_string();
+    let mut records: Vec<PrimeAutonomyRecord> = Vec::new();
+    let mut actions = 0usize;
+
+    // ── HOLD — the model declined to act on any candidate this tick. Record every
+    // offered candidate as held (ZERO side effects); still record the non-offered
+    // human-gate candidates deterministically (read-only).
+    if hold {
+        let menu_idx: std::collections::HashSet<usize> = menu.iter().map(|(i, _)| *i).collect();
+        for (rank0, (i, c)) in menu.iter().enumerate() {
+            records.push(PrimeAutonomyRecord {
+                tenant: c.tenant.clone(),
+                target_kind: queue[*i].kind(),
+                target_id: c.target_id.clone(),
+                mandate_id: c.mandate_id.clone(),
+                phase: c.phase.clone(),
+                action: "none",
+                outcome: "skipped",
+                reason: match &priority_reason {
+                    Some(r) => format!("model chose to hold the queue: {r}"),
+                    None => "model chose to hold the queue".to_string(),
+                },
                 ai_mode: None,
                 ai_reason: None,
                 strategy_ai_mode: None,
                 strategy_ai_reason: None,
-            },
-        };
-        rec.ai_mode = Some(pass0_mode.as_str().to_string());
-        rec.ai_reason = pass0_reason;
-        records.push(rec);
-    }
-
-    let proposals = spine_store
-        .list_approved_prime_proposals(tenant, discover_cap)
-        .map_err(|e| format!("autonomous prime: list proposals: {e}"))?;
-    // Mandate ids already covered by a processed proposal — so the bare-Mandate
-    // pass does not double-process the same Mandate.
-    let mut seen_mandates: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for p in proposals {
-        if actions >= max {
-            break;
+                priority_ai_mode: Some(priority_mode_str.clone()),
+                priority_ai_reason: priority_reason.clone(),
+                priority_rank: Some(rank0 + 1),
+            });
         }
-        if !p.mandate_id.is_empty() {
-            seen_mandates.insert(p.mandate_id.clone());
-        }
-        let target = json!({ "proposal_id": p.proposal_id.clone() });
-        records.push(process_candidate(
-            agent_store,
-            spine_store,
-            task_store,
-            registry,
-            metrics,
-            now_ms,
-            &p.tenant_id,
-            "proposal",
-            &p.proposal_id,
-            target,
-            &mut actions,
-            max,
-            hire_rig,
-            ai,
-            llm_enabled,
-            strategy_llm_enabled,
-        ));
-    }
-
-    if actions < max {
-        let mandates = spine_store
-            .list_active_mandates(tenant, discover_cap)
-            .map_err(|e| format!("autonomous prime: list mandates: {e}"))?;
-        for m in mandates {
-            if actions >= max {
-                break;
-            }
-            if seen_mandates.contains(&m.mandate_id) {
+        for (i, cand) in queue.iter().enumerate() {
+            if menu_idx.contains(&i) {
                 continue;
             }
-            let target = json!({ "mandate_id": m.mandate_id.clone() });
-            records.push(process_candidate(
+            let mut rec = execute_candidate(
                 agent_store,
                 spine_store,
                 task_store,
                 registry,
                 metrics,
                 now_ms,
-                &m.tenant_id,
-                "mandate",
-                &m.mandate_id,
-                target,
+                now_secs,
+                hire_rig,
+                cand,
                 &mut actions,
                 max,
-                hire_rig,
                 ai,
                 llm_enabled,
                 strategy_llm_enabled,
-            ));
+            );
+            rec.priority_ai_mode = Some(priority_mode_str.clone());
+            rec.priority_ai_reason = priority_reason.clone();
+            records.push(rec);
         }
+        return Ok(records);
     }
 
+    // ── EXECUTE in the model-picked order (only when the model actually picked
+    // one). Run the ranked menu first — each candidate self-guards on the action
+    // budget, so candidates beyond `max` record `skipped` with their rank — then
+    // the remaining (non-menu / over-cap) candidates in deterministic order.
+    if priority_mode == PrimePriorityMode::LlmUsed {
+        let rank_of: std::collections::HashMap<usize, usize> = ranked
+            .iter()
+            .enumerate()
+            .map(|(r, &i)| (i, r + 1))
+            .collect();
+        let in_ranked: std::collections::HashSet<usize> = ranked.iter().copied().collect();
+        let mut exec_order: Vec<usize> = ranked.clone();
+        for i in 0..queue.len() {
+            if !in_ranked.contains(&i) {
+                exec_order.push(i);
+            }
+        }
+        for &i in &exec_order {
+            let mut rec = execute_candidate(
+                agent_store,
+                spine_store,
+                task_store,
+                registry,
+                metrics,
+                now_ms,
+                now_secs,
+                hire_rig,
+                &queue[i],
+                &mut actions,
+                max,
+                ai,
+                llm_enabled,
+                strategy_llm_enabled,
+            );
+            rec.priority_ai_mode = Some(priority_mode_str.clone());
+            rec.priority_ai_reason = priority_reason.clone();
+            rec.priority_rank = rank_of.get(&i).copied();
+            records.push(rec);
+        }
+        return Ok(records);
+    }
+
+    // ── DETERMINISTIC ORDER (off / fallback / unavailable / <2 candidates):
+    // byte-for-byte the legacy discovery order with break-on-budget, only stamped
+    // with the prioritization provenance.
+    for cand in &queue {
+        if actions >= max {
+            break;
+        }
+        let mut rec = execute_candidate(
+            agent_store,
+            spine_store,
+            task_store,
+            registry,
+            metrics,
+            now_ms,
+            now_secs,
+            hire_rig,
+            cand,
+            &mut actions,
+            max,
+            ai,
+            llm_enabled,
+            strategy_llm_enabled,
+        );
+        rec.priority_ai_mode = Some(priority_mode_str.clone());
+        rec.priority_ai_reason = priority_reason.clone();
+        records.push(rec);
+    }
     Ok(records)
 }
 
@@ -3379,7 +3886,7 @@ mod tests {
         tenant: Option<&str>,
     ) -> Vec<PrimeAutonomyRecord> {
         autonomous_prime_tick(
-            agents, spine, tasks, reg, None, 0, max, tenant, "echo", None, false, false,
+            agents, spine, tasks, reg, None, 0, max, tenant, "echo", None, false, false, false,
         )
         .unwrap()
     }
@@ -3396,7 +3903,7 @@ mod tests {
         hire_rig: &str,
     ) -> Vec<PrimeAutonomyRecord> {
         autonomous_prime_tick(
-            agents, spine, tasks, reg, None, 0, max, tenant, hire_rig, None, false, false,
+            agents, spine, tasks, reg, None, 0, max, tenant, hire_rig, None, false, false, false,
         )
         .unwrap()
     }
@@ -3438,6 +3945,7 @@ mod tests {
             "echo",
             Some(decider),
             true,
+            false,
             false,
         )
         .unwrap()
@@ -3595,6 +4103,7 @@ mod tests {
             None,
             true,
             false,
+            false,
         )
         .unwrap();
         let rec = recs
@@ -3674,6 +4183,7 @@ mod tests {
             Some(decider),
             false,
             true,
+            false,
         )
         .unwrap()
     }
@@ -3777,7 +4287,7 @@ in force.\n";
         let reg = echo_registry();
         let m = bare_mandate(&spine);
 
-        // Strategy ON (last arg) but ai = None.
+        // Strategy ON but ai = None.
         let recs = autonomous_prime_tick(
             &agents,
             &spine,
@@ -3791,6 +4301,7 @@ in force.\n";
             None,
             false,
             true,
+            false,
         )
         .unwrap();
         let rec = recs.iter().find(|r| r.target_id == m).unwrap();
@@ -3892,6 +4403,345 @@ in force.\n";
             );
         }
         assert!(!parse_prime_llm_strategy_draft(None));
+    }
+
+    // ── PRIME EXECUTIVE PRIORITIZATION v1 (scripted prioritization decider) ──
+    // These exercise the QUEUE-ORDER layer (separate from action deliberation and
+    // strategy authoring): both of those are OFF, so each candidate's action is
+    // chosen deterministically; only the ORDER the tick spends its action budget
+    // in is model-picked (or falls back).
+
+    /// Run an autonomous Prime tick with PRIORITIZATION ON (deliberation +
+    /// strategy authoring OFF) and an optional scripted decider — so the candidate
+    /// ORDER is model-picked (or, with `None`/invalid output, deterministic).
+    fn tick_prio(
+        agents: &AgentStore,
+        spine: &SpineStore,
+        tasks: &Arc<TaskStore>,
+        reg: &crate::rig::RigRegistry,
+        max: usize,
+        tenant: Option<&str>,
+        decider: Option<&dyn crate::nodes::coordinator::agent::prime_deliberation::PrimeAiDecider>,
+    ) -> Vec<PrimeAutonomyRecord> {
+        autonomous_prime_tick(
+            agents, spine, tasks, reg, None, 0, max, tenant, "echo", decider, false, false, true,
+        )
+        .unwrap()
+    }
+
+    /// Two approved Mandates A (created first) and B (created second), each at
+    /// `needs_team_plan` with `create_team_plan` attemptable. Discovery order is
+    /// creation order, so the menu keys are `cand-1`=A, `cand-2`=B.
+    fn two_actionable_mandates(agents: &AgentStore, spine: &SpineStore) -> (String, String) {
+        runnable_operative(agents, "engineer", "subj-e");
+        let a = approved_mandate(spine);
+        let b = approved_mandate(spine);
+        (a, b)
+    }
+
+    // PRI-1) Parser-level coverage lives in `prime_priority::tests`. PRI-2..7 below
+    //        are the end-to-end loop behaviours.
+
+    // PRI-2) Two actionable Mandates, max=1, the model picks the SECOND candidate →
+    //        only the second advances; the first is left unchanged (skipped on the
+    //        action budget) and the records read llm_used with a clear rank/order.
+    #[test]
+    fn prioritization_model_picks_second_only_second_advances() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (a, b) = two_actionable_mandates(&agents, &spine);
+
+        // cand-2 == B (created second). The model elevates it above the
+        // deterministic first.
+        let decider = ScriptedDecider {
+            reply: Ok(r#"{"order":["cand-2"],"reason":"ship B first"}"#.to_string()),
+        };
+        let recs = tick_prio(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            1,
+            Some("default"),
+            Some(&decider),
+        );
+
+        let rec_b = recs
+            .iter()
+            .find(|r| r.target_id == b)
+            .expect("B considered");
+        assert_eq!(rec_b.action, "create_team_plan");
+        assert_eq!(rec_b.outcome, "advanced");
+        assert_eq!(rec_b.priority_ai_mode.as_deref(), Some("llm_used"));
+        assert_eq!(rec_b.priority_rank, Some(1));
+        // ONLY B was advanced — its Team Plan exists.
+        assert!(spine.latest_team_plan("default", &b).unwrap().is_some());
+
+        let rec_a = recs
+            .iter()
+            .find(|r| r.target_id == a)
+            .expect("A considered");
+        assert_eq!(rec_a.outcome, "skipped");
+        assert!(rec_a.reason.contains("budget"), "A skipped on the budget");
+        assert_eq!(rec_a.priority_ai_mode.as_deref(), Some("llm_used"));
+        assert_eq!(rec_a.priority_rank, Some(2));
+        // A is UNCHANGED — no Team Plan was recorded.
+        assert!(spine.latest_team_plan("default", &a).unwrap().is_none());
+    }
+
+    // PRI-3) Invalid model output (prose) FALLS BACK to the deterministic order:
+    //        the FIRST candidate advances and every record reads fallback.
+    #[test]
+    fn prioritization_invalid_output_falls_back_to_first() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (a, b) = two_actionable_mandates(&agents, &spine);
+
+        let decider = ScriptedDecider {
+            reply: Ok("Sure — I'd do B then A.".to_string()),
+        };
+        let recs = tick_prio(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            1,
+            Some("default"),
+            Some(&decider),
+        );
+
+        // Deterministic first candidate (A) advanced; B is untouched.
+        let rec_a = recs
+            .iter()
+            .find(|r| r.target_id == a)
+            .expect("A considered");
+        assert_eq!(rec_a.outcome, "advanced");
+        assert_eq!(rec_a.priority_ai_mode.as_deref(), Some("fallback"));
+        assert!(spine.latest_team_plan("default", &a).unwrap().is_some());
+        assert!(spine.latest_team_plan("default", &b).unwrap().is_none());
+    }
+
+    // PRI-4) Unavailable model (decider errors) FALLS BACK to the deterministic
+    //        order and records unavailable.
+    #[test]
+    fn prioritization_unavailable_model_falls_back_deterministic() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (a, b) = two_actionable_mandates(&agents, &spine);
+
+        let decider = ScriptedDecider {
+            reply: Err("ai peer unreachable: timeout".to_string()),
+        };
+        let recs = tick_prio(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            1,
+            Some("default"),
+            Some(&decider),
+        );
+
+        let rec_a = recs
+            .iter()
+            .find(|r| r.target_id == a)
+            .expect("A considered");
+        assert_eq!(rec_a.outcome, "advanced");
+        assert_eq!(rec_a.priority_ai_mode.as_deref(), Some("unavailable"));
+        assert!(spine.latest_team_plan("default", &a).unwrap().is_some());
+        assert!(spine.latest_team_plan("default", &b).unwrap().is_none());
+
+        // With prioritization ON but NO decider wired the loop is also honestly
+        // `unavailable` and runs deterministically.
+        let (agents2, spine2, tasks2) = stores();
+        let tasks2 = Arc::new(tasks2);
+        let (a2, _b2) = two_actionable_mandates(&agents2, &spine2);
+        let recs2 = tick_prio(&agents2, &spine2, &tasks2, &reg, 1, Some("default"), None);
+        let rec_a2 = recs2.iter().find(|r| r.target_id == a2).unwrap();
+        assert_eq!(rec_a2.outcome, "advanced");
+        assert_eq!(rec_a2.priority_ai_mode.as_deref(), Some("unavailable"));
+    }
+
+    // PRI-5) An EMPTY order HOLDS the whole queue this tick: ZERO side effects,
+    //        every offered candidate recorded skipped with llm_used.
+    #[test]
+    fn prioritization_empty_order_holds_zero_side_effects() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (a, b) = two_actionable_mandates(&agents, &spine);
+
+        let decider = ScriptedDecider {
+            reply: Ok(r#"{"order":[],"reason":"hold for human review"}"#.to_string()),
+        };
+        let recs = tick_prio(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            1,
+            Some("default"),
+            Some(&decider),
+        );
+
+        for id in [&a, &b] {
+            let rec = recs
+                .iter()
+                .find(|r| &r.target_id == id)
+                .expect("considered");
+            assert_eq!(rec.action, "none");
+            assert_eq!(rec.outcome, "skipped");
+            assert_eq!(rec.priority_ai_mode.as_deref(), Some("llm_used"));
+            assert!(rec.reason.contains("hold"));
+            // ZERO side effects — neither Mandate was planned.
+            assert!(spine.latest_team_plan("default", id).unwrap().is_none());
+        }
+    }
+
+    // PRI-6) A tenant-scoped tick only offers / acts on its OWN Guild's candidates;
+    //        a candidate in another Guild is never discovered, offered, or touched.
+    #[test]
+    fn prioritization_is_tenant_scoped() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (_a, b) = two_actionable_mandates(&agents, &spine); // tenant "default"
+        // A bare Mandate in another Guild — discoverable only under "other".
+        let other = spine
+            .create_mandate("other", "Other goal", "do not touch", None, None)
+            .unwrap();
+
+        let decider = ScriptedDecider {
+            reply: Ok(r#"{"order":["cand-2"]}"#.to_string()),
+        };
+        let recs = tick_prio(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            1,
+            Some("default"),
+            Some(&decider),
+        );
+
+        // No record belongs to another Guild.
+        assert!(
+            recs.iter().all(|r| r.tenant == "default"),
+            "tenant-scoped tick must only consider its own Guild"
+        );
+        // The model's in-Guild pick (B) advanced…
+        assert!(spine.latest_team_plan("default", &b).unwrap().is_some());
+        // …and the other Guild's Mandate is completely untouched (no strategy, no plan).
+        assert!(spine.strategy_status("other", &other).unwrap().is_none());
+        assert!(spine.latest_team_plan("other", &other).unwrap().is_none());
+    }
+
+    // PRI-7) A PROPOSED Prime proposal is offered to the prioritization model ONLY
+    //        when the Guild holds the `prime.proposal.approve` standing authority;
+    //        without it the proposal is never offered (and stays proposed); with it
+    //        the model may prioritize it.
+    #[test]
+    fn prioritization_offers_proposal_only_with_standing() {
+        // Without standing → the proposal is never offered. The lone actionable
+        // candidate (the approved Mandate) is driven deterministically (menu < 2),
+        // and the proposal stays proposed.
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let pid = propose_pid(&agents, &spine);
+        let m = approved_mandate(&spine);
+
+        let decider = ScriptedDecider {
+            reply: Ok(r#"{"order":["cand-1"]}"#.to_string()),
+        };
+        let recs = tick_prio(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            1,
+            Some("default"),
+            Some(&decider),
+        );
+        // The proposal was not offered/approved — no proposal-approve record, and it
+        // is still proposed.
+        assert!(
+            !recs
+                .iter()
+                .any(|r| r.target_id == pid && r.outcome == "approved"),
+            "an unauthorized proposal is never approved"
+        );
+        assert_eq!(
+            spine
+                .get_prime_proposal("default", &pid)
+                .unwrap()
+                .unwrap()
+                .status,
+            "proposed"
+        );
+        // The approved Mandate is still driven (deterministically — only one
+        // attemptable candidate, so the model is not consulted).
+        let rec_m = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec_m.outcome, "advanced");
+
+        // With standing → the proposal IS offered, and the model may prioritize it.
+        let (agents2, spine2, tasks2) = stores();
+        let tasks2 = Arc::new(tasks2);
+        let pid2 = propose_pid(&agents2, &spine2);
+        let _m2 = approved_mandate(&spine2);
+        grant_standing(&agents2, "default", CATEGORY_PROPOSAL_APPROVE, Some(1));
+        // cand-1 is the PASS-0 proposal (discovered first). The model elevates it.
+        let decider2 = ScriptedDecider {
+            reply: Ok(r#"{"order":["cand-1"],"reason":"materialize the plan first"}"#.to_string()),
+        };
+        let recs2 = tick_prio(
+            &agents2,
+            &spine2,
+            &tasks2,
+            &reg,
+            1,
+            Some("default"),
+            Some(&decider2),
+        );
+        let rec_p = recs2
+            .iter()
+            .find(|r| r.target_id == pid2 && r.outcome == "approved")
+            .expect("the prioritized proposal is approved");
+        assert_eq!(rec_p.action, "approve");
+        assert_eq!(rec_p.priority_ai_mode.as_deref(), Some("llm_used"));
+        assert_eq!(rec_p.priority_rank, Some(1));
+        assert_eq!(
+            spine2
+                .get_prime_proposal("default", &pid2)
+                .unwrap()
+                .unwrap()
+                .status,
+            "approved"
+        );
+    }
+
+    // PRI-8) The prioritization env flag parser honours the truthy set, defaults OFF.
+    #[test]
+    fn prime_llm_prioritization_flag_parsing() {
+        for on in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert!(
+                parse_prime_llm_prioritization(Some(on)),
+                "`{on}` should enable"
+            );
+        }
+        for off in ["0", "false", "no", "off", "", "maybe"] {
+            assert!(
+                !parse_prime_llm_prioritization(Some(off)),
+                "`{off}` should not"
+            );
+        }
+        assert!(!parse_prime_llm_prioritization(None));
     }
 
     /// Grant the synthetic Prime authority a bounded standing approval for
@@ -4405,6 +5255,7 @@ in force.\n";
             None,
             false,
             false,
+            false,
         )
         .unwrap();
         let rec = recs
@@ -4698,7 +5549,9 @@ in force.\n";
             &ctx,
             ai,
             llm_enabled,
-            // Strategy authoring off for the deliberation-focused manual-tick tests.
+            // Strategy authoring + prioritization off for the deliberation-focused
+            // manual-tick tests.
+            false,
             false,
         )
     }

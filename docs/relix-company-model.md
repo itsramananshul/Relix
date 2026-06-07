@@ -786,6 +786,51 @@ exactly as in §C:
   autonomous loop and the manual **Run Prime now** tick only; the operator one-click
   `prime.advance {action:"propose_strategy"}` route remains deterministic by design.
 
+### E. Prime Executive Prioritization v1 — a model may CHOOSE the candidate ORDER (opt-in)
+
+**The gap.** Candidate discovery/order was fixed-deterministic: standing-approvable
+proposals first, then approved proposals, then bare Mandates, in store order. With
+`RELIX_AUTONOMOUS_PRIME_MAX=1` the loop spent its single tick action on the *first*
+deterministic candidate even when another already-legal candidate was more important.
+
+**The contract.** Behind an explicit, default-OFF switch
+(`RELIX_PRIME_LLM_PRIORITIZATION`), when the autonomous/manual-tick loop has ≥2
+candidates carrying a positive **attemptable** action and a live mesh decider is
+available, a model may choose the **order** in which the bounded tick spends its
+action budget — but **the model is NOT the permission system**, exactly as in §C/§D:
+
+- **Reorder (or hold) only — never widen.** The loop first builds the SAME
+  deterministic candidate queue as before (the fallback order) and classifies each
+  candidate **read-only** into the one next governed action it would run today. Only
+  candidates with a positive *attemptable* action are offered (an approval-category
+  action — hire / clearance / strategy / proposal-approve — is attemptable only with
+  the matching live standing grant + known Rig; a pure human gate / running / done
+  candidate is recorded deterministically but never offered). The model may only
+  reorder the offered candidate keys, or return an **empty** order to HOLD the whole
+  queue this tick. It can never invent a candidate, add an action to the menu, change
+  a candidate's action, approve a gate it lacks a standing grant for, or bypass any
+  budget / Claim / adapter / tenant gate — every executed step still flows through the
+  EXACT SAME governed handler + gates.
+- **Strict server-side validation.** The reply is validated by
+  `prime_priority::parse_priority_order` against the offered keys only: an unknown key,
+  a duplicate, a non-array / missing `order`, more keys than offered, a non-string key,
+  malformed/array/scalar/over-long JSON or prose, or an over-long / control-char reason
+  all degrade to the deterministic discovery order. An empty order is honoured as a
+  hold (zero side effects) only when the output is otherwise valid.
+- **Bounded execution.** The validated order is executed until `RELIX_AUTONOMOUS_PRIME_MAX`
+  actions are spent; remaining attemptable candidates record `skipped` with their rank,
+  and a held queue records every offered candidate `skipped` with no side effects.
+- **Honest provenance.** Each tick record carries `priority_ai_mode`
+  (`deterministic_only` / `llm_used` / `fallback` / `unavailable`) + `priority_ai_reason`
+  + this candidate's `priority_rank`, distinct from the action-choice `ai_mode` and the
+  strategy-body `strategy_ai_mode`, surfaced on `prime.autonomy_tick_now`.
+- **No keys in the coordinator + independent of §C/§D.** It reuses the SAME `ai.chat`
+  mesh path + decider (AI peer `RELIX_PRIME_AI_PEER`, session `RELIX_PRIME_LLM_SESSION`)
+  as §C/§D — no provider key enters the coordinator, web bridge, or dashboard; an
+  unavailable peer falls back deterministically. The three switches are independent: a
+  Guild may enable any combination. With this switch off (or <2 attemptable candidates)
+  the discovery order is byte-for-byte the legacy behaviour.
+
 ---
 
 ## 12.6 First-run company bootstrap + starter crew (the empty-company on-ramp)

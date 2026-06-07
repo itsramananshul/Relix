@@ -522,9 +522,48 @@ the approved work is already ready. What it does **not** do:
     **populated coordinator mesh client and a reachable AI peer** — when the mesh cell
     is unpopulated or the peer is unreachable the manual tick honestly reports
     `unavailable` and runs deterministically.
+  - **Prime Executive Prioritization (v1) — candidate discovery/order is no longer
+    fixed-deterministic-only; an opt-in model may CHOOSE the ORDER in which a bounded
+    tick spends its action budget across the already-computed legal candidates
+    (default OFF).** Behind `RELIX_PRIME_LLM_PRIORITIZATION` (`1|true|yes|on`, off by
+    default) the loop first builds the SAME deterministic candidate queue as before
+    (the FALLBACK order) and classifies each candidate **read-only** into the same
+    next governed action it would run today, then — only when ≥2 candidates carry a
+    positive **attemptable** action — asks an opt-in model to ORDER the offered
+    candidate keys (or return an empty order to HOLD the whole queue this tick).
+    **The model is NOT the permission system.** Its order is constrained to the
+    offered keys by a strict server-side validator
+    (`prime_priority::parse_priority_order`): an unknown key, a duplicate, a
+    non-array/missing `order`, more keys than offered, a non-string key,
+    malformed/array/scalar/over-long JSON or prose, or an over-long/control-char
+    reason all degrade to the deterministic discovery order with an honest mode. The
+    model can never invent a candidate, add an action to the menu, widen a
+    candidate's allowed action, approve a gate it lacks a standing grant for, or
+    bypass any budget/Claim/adapter/tenant scope — only the deterministic
+    classifier's already-attemptable candidates are offered, and each executed step
+    flows through the EXACT SAME governed handler + gates as before. An empty order
+    holds the queue with **zero side effects**; with `MAX=1` the model can now elevate
+    the genuinely-most-important legal candidate above the deterministic first.
+    Every tick record carries the provenance (`priority_ai_mode` ∈
+    {`deterministic_only`,`llm_used`,`fallback`,`unavailable`} + `priority_ai_reason`
+    + this candidate's `priority_rank`), surfaced on `prime.autonomy_tick_now` and the
+    Settings tick table (`ord:`). The live decider reuses the SAME `MeshAiDecider` /
+    AI peer / session the deliberation + strategy layers use (built when ANY of the
+    three switches is on) — **no provider key enters the coordinator, web bridge, or
+    dashboard**; a missing mesh / AI peer produces `unavailable` and falls back
+    deterministically. **Honest scope:** this is *queue prioritization among the
+    already-computed legal candidates*, NOT freeform goal invention or arbitrary
+    tool-calling — the model reorders (or holds) the attemptable menu; it does not
+    author actions, invent goals, pick identities to hire, approve gates, or call
+    tools. With the switch off (or <2 attemptable candidates) the discovery order is
+    byte-for-byte the legacy behaviour. The live bridge→model→coordinator round trip
+    is **not** integration-tested in CI (the parser + deterministic fallback that
+    bound it are fully unit/loop tested with scripted output).
   - What this still does **NOT** do: there is **no freeform model reasoning or
     tool-calling** — the deliberation above is constrained to confirm-or-hold the ONE
-    computed governed action (it cannot invent a goal or call a tool). A model **may**
+    computed governed action, and the prioritization above only reorders (or holds)
+    the already-computed legal candidate queue (neither can invent a goal or call a
+    tool). A model **may**
     now author the *text* of a PROPOSED strategy (Prime Strategy Authoring, above)
     when its switch is on, but only the **body** of a `proposed` doc — it does not
     approve the strategy, choose the action, pick which person/identity to hire, or
@@ -778,7 +817,14 @@ the model is **not** the permission system — a strict server-side validator bo
 its choice to `[<computed action>, none]`, every confirmed action still flows through
 the same governed handlers + standing authority + budget + Claim + adapter + tenant
 gates, and any malformed/disallowed/unavailable output falls back deterministically
-with an honest `ai_mode`. No provider key enters the coordinator / web bridge /
+with an honest `ai_mode`. With **Prime Executive Prioritization v1** (opt-in,
+`RELIX_PRIME_LLM_PRIORITIZATION`, off by default) candidate discovery/order is no
+longer fixed-deterministic-only: a model may choose only the **order** in which a
+bounded tick spends its action budget across the already-computed legal candidates
+(or hold the queue), validated to the offered candidate keys only — it cannot invent
+a candidate, add or widen an action, or bypass any gate, and invalid/unavailable
+output falls back to the deterministic discovery order with an honest
+`priority_ai_mode`. No provider key enters the coordinator / web bridge /
 dashboard (the live path only makes the existing `ai.chat` mesh call). Autonomy
 operates strictly **inside** the Board's gates — after a human approval, or within an
 explicit standing grant.

@@ -605,10 +605,29 @@ ledger entry or design section.
    (`draft_strategy_doc` + record provenance + loop wiring + tests), `…/agent/mod.rs`,
    `…/spine/store.rs` (`strategy_doc` read accessor), `controller_runtime.rs` (both tick wiring sites),
    `apps/dashboard/src/pages/Settings.tsx` + rebuilt `dashboard-dist`.
+   **Prime Executive Prioritization v1 — SHIPPED (opt-in, default OFF):** behind `RELIX_PRIME_LLM_PRIORITIZATION`,
+   when the autonomous/manual-tick loop has ≥2 candidates carrying a positive **attemptable** action and a live
+   mesh decider is available, a model chooses only the **order** in which the bounded tick spends its action
+   budget across the already-computed legal candidates (or returns an empty order to **hold** the queue). The
+   reply is validated to the offered candidate keys only (`prime_priority::parse_priority_order` — rejects
+   unknown/duplicate keys, non-array/missing `order`, too-many-keys, non-string keys, malformed/over-long JSON or
+   prose, over-long/control-char reason); invalid/unavailable/disabled output falls back to the byte-for-byte
+   deterministic discovery order with honest provenance (`priority_ai_mode`/`priority_ai_reason`/`priority_rank`,
+   distinct from `ai_mode`/`strategy_ai_mode`). **The model is NOT the permission system** — it only reorders
+   (or holds) the deterministic classifier's attemptable menu and can never invent a candidate, add or widen an
+   action, approve a gate it lacks a standing grant for, or bypass budget/Claim/adapter/tenant scope; each
+   executed step flows through the SAME governed handler + gates. Closes the "candidate order is fixed-
+   deterministic — with `MAX=1` the loop spends the tick on the first deterministic candidate even if another
+   legal candidate is more important" gap. It reuses the deliberation layer's `MeshAiDecider`/AI peer/session —
+   **no provider key in the coordinator / web bridge / dashboard.** *Files:* `…/agent/prime_priority.rs` (new
+   pure module + tests), `…/agent/prime_driver.rs` (tick refactor + record provenance + loop wiring + tests),
+   `…/agent/mod.rs`, `controller_runtime.rs` (both tick wiring sites), `apps/dashboard/src/pages/Settings.tsx` +
+   rebuilt `dashboard-dist`.
    *Still deferred:* a true end-to-end no-grant autonomous driver that also **approves** on its own (propose →
    **approve** → staff → orchestrate with nothing granted) — intentionally not built; **freeform tool-calling**
-   remains deferred (deliberation only confirms-or-holds a computed action; the model may now author a
-   *proposed* strategy's body but never approves it, chooses the action, or invents a goal).
+   remains deferred (deliberation only confirms-or-holds a computed action; prioritization only reorders the
+   already-computed legal candidate queue; the model may now author a *proposed* strategy's body but never
+   approves it, invents a goal, or calls a tool).
 9. **[BE/FE] Smarter companion** — **BACKEND SHIPPED (now AI-assisted action selection, opt-in +
    validated + fallback; still one-turn / one-action, NOT autonomous).**
    The `POST /v1/spine/companion` parser is a **company-aware action spine**

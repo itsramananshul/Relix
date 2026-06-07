@@ -21,6 +21,7 @@ pub mod prime;
 pub mod prime_deliberation;
 pub mod prime_driver;
 pub mod prime_plan;
+pub mod prime_priority;
 pub mod prime_strategy;
 pub mod store;
 

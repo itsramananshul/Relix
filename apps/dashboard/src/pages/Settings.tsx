@@ -75,13 +75,18 @@ interface TickRecord {
   action?: string;
   outcome?: string;
   reason?: string;
-  // Provenance: how the action was chosen (ai_mode) and, on a propose_strategy
-  // row, how the proposed strategy *body* was authored (strategy_ai_mode). Both ∈
-  // deterministic_only / llm_used / fallback / unavailable.
+  // Provenance: how the action was chosen (ai_mode), how the proposed strategy
+  // *body* was authored on a propose_strategy row (strategy_ai_mode), and how the
+  // tick's candidate ORDER was chosen (priority_ai_mode) with this candidate's rank
+  // in that order (priority_rank). All ∈ deterministic_only / llm_used / fallback /
+  // unavailable.
   ai_mode?: string;
   ai_reason?: string | null;
   strategy_ai_mode?: string | null;
   strategy_ai_reason?: string | null;
+  priority_ai_mode?: string | null;
+  priority_ai_reason?: string | null;
+  priority_rank?: number | null;
 }
 interface TickResult {
   tenant?: string;
@@ -345,23 +350,29 @@ export function Settings() {
           <span className="mono">RELIX_AUTONOMOUS_PRIME_INTERVAL_SECS</span> and bounded by{" "}
           <span className="mono">RELIX_AUTONOMOUS_PRIME_MAX</span>. Autonomous runs still honor adapter
           readiness, per-Operative wake/concurrency caps, and budget hard-stops.{" "}
-          Prime has <strong>two independent, opt-in LLM switches</strong>, both off by default and both
-          falling back deterministically — <em>neither ever approves a gate</em>.{" "}
+          Prime has <strong>three independent, opt-in LLM switches</strong>, all off by default and all
+          falling back deterministically — <em>none ever approves a gate</em>.{" "}
           <strong>Prime Deliberation</strong> (<span className="mono">RELIX_PRIME_LLM_DELIBERATION</span>):
-          when on, a model may only <em>choose among the already-computed governed actions</em> —
-          confirming the one legal next step or holding this tick — and never approves a gate, invents an
-          action, or bypasses budget/Claim/adapter checks.{" "}
+          when on, a model may only <em>confirm or hold</em> the one already-computed legal next step for a
+          candidate — never approving a gate, inventing an action, or bypassing budget/Claim/adapter checks.{" "}
           <strong>Prime Strategy Draft authoring</strong> (
           <span className="mono">RELIX_PRIME_LLM_STRATEGY_DRAFT</span>): when on, a model may <em>author the
           text of a PROPOSED Mandate strategy</em> from a bounded, secret-free snapshot (title / status /
           description / active roles / readiness); the body is re-validated + sanitized server-side and is
           only ever <em>proposed</em> — the human <span className="mono">mandate.strategy.approve</span> gate
-          is unchanged, and an existing proposed/approved/rejected strategy is never overwritten. Either
-          switch falls back deterministically if the model is unavailable or its output is invalid. Each
-          tick record shows the provenance — action choice (<span className="mono">act:</span>) and, on a
-          strategy draft, the body author (<span className="mono">strat:</span>) — each ∈{" "}
+          is unchanged, and an existing proposed/approved/rejected strategy is never overwritten.{" "}
+          <strong>Prime Prioritization</strong> (
+          <span className="mono">RELIX_PRIME_LLM_PRIORITIZATION</span>): when on, a model may only{" "}
+          <em>choose the ORDER</em> in which a bounded tick spends its action budget among the candidates the
+          deterministic classifier has ALREADY computed as legal — or hold the whole queue this tick. It
+          cannot invent a candidate, add an action, widen any candidate's action, or bypass standing-
+          authority / budget / Claim / adapter / tenant gates; only already-attemptable candidates are
+          offered. Any switch falls back deterministically if the model is unavailable or its output is
+          invalid. Each tick record shows the provenance — action choice (<span className="mono">act:</span>),
+          on a strategy draft the body author (<span className="mono">strat:</span>), and the queue order with
+          this candidate's rank (<span className="mono">ord:</span>) — each ∈{" "}
           <span className="mono">deterministic_only</span> / <span className="mono">llm_used</span> /{" "}
-          <span className="mono">fallback</span> / <span className="mono">unavailable</span>. Both reuse the
+          <span className="mono">fallback</span> / <span className="mono">unavailable</span>. All reuse the
           existing governed <span className="mono">ai.chat</span> mesh path; no provider key enters the
           coordinator, web bridge, or dashboard. Explicit one-click{" "}
           <span className="mono">prime.advance</span> strategy drafting stays deterministic.
@@ -574,9 +585,9 @@ function AutonomousPrimeSwitchPanel({
               Wakes <strong>exactly one</strong> bounded tick for this Guild (up to{" "}
               {autonomy.autonomous_prime_max ?? 1} action). It does <strong>not</strong> require the
               loop to be on and does <strong>not</strong> bypass standing approvals or budgets.{" "}
-              <strong>Run Prime now</strong> uses the same deliberation and strategy-draft layers (when
-              their switches are on) whenever the coordinator mesh AI peer is available; otherwise it falls
-              back deterministically.
+              <strong>Run Prime now</strong> uses the same deliberation, strategy-draft, and prioritization
+              layers (when their switches are on) whenever the coordinator mesh AI peer is available;
+              otherwise it falls back deterministically.
             </span>
           </div>
 
@@ -618,8 +629,9 @@ function AutonomousPrimeSwitchPanel({
                         </span>
                       </td>
                       <td className="mono" style={{ fontSize: 11 }}>
-                        {/* Action-choice provenance (deliberation), plus the
-                            strategy-body author on a propose_strategy row. */}
+                        {/* Action-choice provenance (deliberation), the strategy-body
+                            author on a propose_strategy row, and the tick's queue-order
+                            provenance + this candidate's rank. */}
                         <span title={r.ai_reason ?? undefined}>act:{r.ai_mode ?? "deterministic_only"}</span>
                         {r.strategy_ai_mode ? (
                           <>
@@ -629,6 +641,11 @@ function AutonomousPrimeSwitchPanel({
                             </span>
                           </>
                         ) : null}
+                        <br />
+                        <span title={r.priority_ai_reason ?? undefined}>
+                          ord:{r.priority_ai_mode ?? "deterministic_only"}
+                          {typeof r.priority_rank === "number" ? `#${r.priority_rank}` : ""}
+                        </span>
                       </td>
                       <td className="muted">{r.reason ?? ""}</td>
                     </tr>
