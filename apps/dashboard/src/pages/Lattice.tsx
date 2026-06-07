@@ -586,7 +586,10 @@ export function Lattice() {
               )}
 
               <div className="row" style={{ marginTop: 12, gap: 8 }}>
-                <Link to="/agents" className="link" style={{ fontSize: 12 }}>Manage on Crew →</Link>
+                {/* Deep link straight to THIS Operative's governance detail on
+                    the Crew page (`/agents?agent=<id>`) — selected, scrolled
+                    into view, permissions panel open — not the generic roster. */}
+                <Link to={`/agents?agent=${encodeURIComponent(selId)}`} className="link" style={{ fontSize: 12 }}>Govern on Crew →</Link>
                 <Link to="/costs" className="link" style={{ fontSize: 12 }}>Costs →</Link>
               </div>
             </div>

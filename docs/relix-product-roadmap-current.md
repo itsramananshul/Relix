@@ -359,7 +359,15 @@ ledger entry or design section.
    node-card tree, role/title/status/rig chips + direct-report counts, a live pill driven by
    `/v1/runs`, and click → a per-Operative detail (Keys + allowance + risk ceiling via
    `/v1/spine/keys/:id` + `/v1/agents/:id`, now with a clickable direct-reports list to walk
-   the tree). **Full pan/zoom/pinch + Fit/Reset now ship** (the previously-deferred gap is
+   the tree). **Exact Operative deep links now ship across the Lattice + Crew (Agents):** a
+   selected Lattice node's detail panel links **Govern on Crew →** to `/agents?agent=<id>`, and
+   the Crew page is URL-driven (`/agents?agent=<id>`) — opening that Operative's governance
+   panel automatically, highlighting + scrolling its row/card into view, with View/Hide and a
+   Copy-link affordance writing the query param so refresh/back/forward preserve the selection
+   (an unknown id renders an honest "no Operative matches …" banner, not a crash). *Remaining
+   gap:* there is still **no full, separate agent-detail tabbed route** (Overview/Instructions/
+   Skills/Runs/Budget per `dashboard-design §9`) — the governance panel is the inline §9
+   permission face, not the dedicated multi-tab agent page. **Full pan/zoom/pinch + Fit/Reset now ship** (the previously-deferred gap is
    closed): the stage is one CSS `transform: translate() scale()` viewport driven by native
    PointerEvent (drag-pan + two-finger pinch) and a non-passive WheelEvent (cursor-anchored
    zoom), with explicit −/+/Fit/Reset controls, an auto-fit-once on first render (no jump on

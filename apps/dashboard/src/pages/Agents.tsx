@@ -1,5 +1,5 @@
-import { Fragment, useState } from "react";
-import { Link } from "react-router-dom";
+import { Fragment, useEffect, useRef, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import { api, tryGet } from "../api";
 import { asArray, Badge, Empty, extractList, Section, useAsync } from "../components/common";
 
@@ -131,10 +131,27 @@ export function Agents() {
   const [busy, setBusy] = useState(false);
   const [founderName, setFounderName] = useState("Founder");
   const [founderRig, setFounderRig] = useState("echo");
-  // Per-Operative governance panel: which row is expanded + a small cache so
-  // re-opening is instant. An entry present (even with null parts) = loaded.
-  const [openId, setOpenId] = useState<string | null>(null);
+  // Per-Operative governance panel: the open Operative is URL-driven
+  // (`/agents?agent=<id>`) so Lattice/Agents deep links land on the exact
+  // Operative — selected, highlighted, and scrolled into view — and refresh/
+  // back/forward preserve the selection (mirrors the Briefs `?brief=` pattern).
+  // A small cache keeps re-opening instant; an entry present (even with null
+  // parts) = loaded.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const openId = searchParams.get("agent");
   const [detailCache, setDetailCache] = useState<Record<string, OpDetail>>({});
+  // Writing the param preserves any other query params already present.
+  function setOpen(id: string | null) {
+    const next = new URLSearchParams(searchParams);
+    if (id) next.set("agent", id);
+    else next.delete("agent");
+    setSearchParams(next, { replace: true });
+  }
+  // In-flight guard so the load effect never starts a duplicate fetch for the
+  // same Operative before its cache entry lands.
+  const inflightRef = useRef<Set<string>>(new Set());
+  // The currently-selected row/card, scrolled into view like Briefs deep links.
+  const selectedRef = useRef<HTMLElement | null>(null);
 
   const { data, loading, error, reload } = useAsync(async () => {
     const work: Card[] = [];
@@ -163,27 +180,50 @@ export function Agents() {
     };
   }, []);
 
-  // Expand one Operative's governance panel, fetching its three reads in
-  // parallel (Keys + capability detail + standing approvals). Each read
-  // degrades to a null/empty fallback so one unavailable surface shows an
-  // honest empty state instead of blanking the panel.
-  async function toggleDetail(agentId: string) {
-    if (openId === agentId) {
-      setOpenId(null);
-      return;
-    }
-    setOpenId(agentId);
-    if (!(agentId in detailCache)) {
-      const enc = encodeURIComponent(agentId);
-      const [keys, detail, standing] = await Promise.all([
-        tryGet<Keys | null>(`/v1/spine/keys/${enc}`, null),
-        tryGet<AgentDetail | null>(`/v1/agents/${enc}`, null),
-        tryGet<unknown>(`/v1/agents/${enc}/standing-approvals`, {}),
-      ]);
-      setDetailCache((m) => ({
-        ...m,
-        [agentId]: { keys, detail, standing: extractList<Standing>(standing, ["standing"]) },
-      }));
+  // Load one Operative's governance detail — its three reads in parallel
+  // (Keys + capability detail + standing approvals). Each read degrades to a
+  // null/empty fallback so one unavailable surface shows an honest empty state
+  // instead of blanking the panel. Guarded by the cache + an in-flight set so a
+  // URL-driven open and a row click never double-fetch.
+  async function loadDetail(agentId: string) {
+    if (!agentId || agentId in detailCache || inflightRef.current.has(agentId)) return;
+    inflightRef.current.add(agentId);
+    const enc = encodeURIComponent(agentId);
+    const [keys, detail, standing] = await Promise.all([
+      tryGet<Keys | null>(`/v1/spine/keys/${enc}`, null),
+      tryGet<AgentDetail | null>(`/v1/agents/${enc}`, null),
+      tryGet<unknown>(`/v1/agents/${enc}/standing-approvals`, {}),
+    ]);
+    setDetailCache((m) => ({
+      ...m,
+      [agentId]: { keys, detail, standing: extractList<Standing>(standing, ["standing"]) },
+    }));
+    inflightRef.current.delete(agentId);
+  }
+
+  // Toggle the governance panel through the URL: clicking View/Hide writes (or
+  // clears) `?agent=<id>`. The load + scroll happen in the effects below, so an
+  // open from the URL (deep link / refresh / back-forward) behaves identically
+  // to a click.
+  function toggleDetail(agentId: string) {
+    setOpen(openId === agentId ? null : agentId);
+  }
+
+  // Fetch the selected Operative's detail when the selection changes — whether
+  // it came from a click or straight from the URL on first render.
+  useEffect(() => {
+    if (openId) loadDetail(openId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openId]);
+
+  // Copy a shareable deep link to this Operative's governance detail.
+  async function copyLink(agentId: string) {
+    const url = `${window.location.origin}${window.location.pathname}?agent=${encodeURIComponent(agentId)}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      setBanner({ kind: "ok", msg: "Deep link copied to clipboard." });
+    } catch {
+      setBanner({ kind: "info", msg: url });
     }
   }
 
@@ -196,6 +236,20 @@ export function Agents() {
   const byName = new Map(adapters.map((a) => [a.name ?? "", a]));
   const availCount = adapters.filter((a) => a.probe?.status === "available").length;
   const initialized = company.initialized ?? agents.length > 0;
+  // The Operative the URL points at (if any). When `?agent=` names an id that
+  // isn't in the loaded Crew, we render an honest banner rather than silently
+  // showing nothing — see `unknownSelection` below.
+  const selectedAgent = openId ? agents.find((a) => a.agent_id === openId) : undefined;
+  const unknownSelection = !!openId && !loading && initialized && !selectedAgent;
+
+  // Bring the selected row/card into view once the roster has rendered it.
+  // `block: "nearest"` avoids jumping when it's already visible; an unknown id
+  // leaves the ref null and the page simply stays put.
+  useEffect(() => {
+    if (openId && selectedRef.current) {
+      selectedRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [openId, data]);
 
   // Workload (open assigned Briefs) + currently-running counts per Operative.
   const workload = new Map<string, number>();
@@ -541,6 +595,18 @@ export function Agents() {
     <Section title="Crew">
       {error && <div className="banner err">{error}</div>}
       {banner && <div className={"banner " + banner.kind}>{banner.msg}</div>}
+      {/* A deep link (`?agent=<id>`) that doesn't match any current Operative —
+          a stale/shared link or a since-removed hire. Stay calm and honest, and
+          give a one-click way to clear the selection. */}
+      {unknownSelection && (
+        <div className="banner info banner-action">
+          <span>
+            No Operative matches <span className="mono">{openId?.slice(0, 16)}</span> in this Guild —
+            it may have been removed, or the link is stale.
+          </span>
+          <span className="banner-cta link" onClick={() => setOpen(null)}>Clear selection</span>
+        </div>
+      )}
       <div className={"banner " + (availCount ? "ok" : "info") + " banner-action"}>
         <span>
           {availCount
@@ -589,7 +655,10 @@ export function Agents() {
 
       {/* Founder — shown separately as the org root. */}
       {founder && (
-        <div className="card">
+        <div
+          className={"card" + (openId === founder.agent_id ? " selected" : "")}
+          ref={openId === founder.agent_id ? (selectedRef as React.RefObject<HTMLDivElement>) : undefined}
+        >
           <h3>Founder</h3>
           <div className="row wrap" style={{ gap: 18, alignItems: "flex-start" }}>
             <div>
@@ -614,9 +683,14 @@ export function Agents() {
             </div>
             <div>
               <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>Permissions</div>
-              <button className="btn ghost sm" onClick={() => toggleDetail(founder.agent_id ?? "")}>
-                {openId === founder.agent_id ? "Hide" : "View"}
-              </button>
+              <div className="row" style={{ gap: 6 }}>
+                <button className="btn ghost sm" onClick={() => toggleDetail(founder.agent_id ?? "")}>
+                  {openId === founder.agent_id ? "Hide" : "View"}
+                </button>
+                {openId === founder.agent_id && (
+                  <button className="btn ghost sm" title="Copy a deep link to this Operative" onClick={() => copyLink(founder.agent_id ?? "")}>Copy link</button>
+                )}
+              </div>
             </div>
           </div>
           {openId === founder.agent_id && (
@@ -627,7 +701,10 @@ export function Agents() {
 
       {/* Prime — the Founder's planning lead, shown distinctly. */}
       {prime ? (
-        <div className="card">
+        <div
+          className={"card" + (openId === prime.agent_id ? " selected" : "")}
+          ref={openId === prime.agent_id ? (selectedRef as React.RefObject<HTMLDivElement>) : undefined}
+        >
           <h3>Prime</h3>
           <div className="row wrap" style={{ gap: 18, alignItems: "flex-start" }}>
             <div>
@@ -655,9 +732,14 @@ export function Agents() {
             </div>
             <div>
               <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>Permissions</div>
-              <button className="btn ghost sm" onClick={() => toggleDetail(prime.agent_id ?? "")}>
-                {openId === prime.agent_id ? "Hide" : "View"}
-              </button>
+              <div className="row" style={{ gap: 6 }}>
+                <button className="btn ghost sm" onClick={() => toggleDetail(prime.agent_id ?? "")}>
+                  {openId === prime.agent_id ? "Hide" : "View"}
+                </button>
+                {openId === prime.agent_id && (
+                  <button className="btn ghost sm" title="Copy a deep link to this Operative" onClick={() => copyLink(prime.agent_id ?? "")}>Copy link</button>
+                )}
+              </div>
             </div>
           </div>
           {openId === prime.agent_id && (
@@ -771,7 +853,10 @@ export function Agents() {
                   const id = a.agent_id ?? "";
                   return (
                     <Fragment key={id || i}>
-                    <tr>
+                    <tr
+                      className={openId === id ? "selected" : undefined}
+                      ref={openId === id ? (selectedRef as React.RefObject<HTMLTableRowElement>) : undefined}
+                    >
                       <td>
                         <strong>{a.name ?? id.slice(0, 10) ?? "operative"}</strong>
                         <div className="mono" style={{ fontSize: 10 }}>{id.slice(0, 12)}</div>
@@ -788,9 +873,14 @@ export function Agents() {
                           : <span className="muted">0</span>}
                       </td>
                       <td>
-                        <button className="btn ghost sm" onClick={() => toggleDetail(id)} title="View this Operative's permissions — Keys, capability powers, standing approvals">
-                          {openId === id ? "Hide" : "View"}
-                        </button>
+                        <div className="row" style={{ gap: 6 }}>
+                          <button className="btn ghost sm" onClick={() => toggleDetail(id)} title="View this Operative's permissions — Keys, capability powers, standing approvals">
+                            {openId === id ? "Hide" : "View"}
+                          </button>
+                          {openId === id && (
+                            <button className="btn ghost sm" title="Copy a deep link to this Operative" onClick={() => copyLink(id)}>Copy link</button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                     {openId === id && (

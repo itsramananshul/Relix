@@ -122,6 +122,10 @@ label.field span { display: block; font-size: 12px; color: var(--text-dim); marg
 .table th { text-align: left; color: var(--text-faint); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
 .table td { padding: 9px 10px; border-bottom: 1px solid var(--border-soft); }
 .table tr:hover td { background: var(--bg-raised); }
+/* A deep-linked / selected roster row — aligns with the board-card + lattice-node
+   selected treatment (info-toned left rail), so a `?agent=<id>` open reads as
+   selected without a loud fill. */
+.table tbody tr.selected td { box-shadow: inset 2px 0 0 var(--info); background: var(--bg-raised); }
 .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; color: var(--text-dim); }
 
 .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; border: 1px solid var(--border); color: var(--text-dim); }
@@ -168,6 +172,8 @@ label.field span { display: block; font-size: 12px; color: var(--text-dim); marg
 .board-card .t { font-size: 13px; font-weight: 500; margin-bottom: 5px; word-break: break-word; }
 .board-card .m { font-size: 11px; color: var(--text-faint); display: flex; gap: 7px; flex-wrap: wrap; }
 .board-card.selected { border-color: var(--info, #2d6cdf); box-shadow: 0 0 0 1px var(--info, #2d6cdf) inset; }
+/* A deep-linked / selected Operative card (Founder / Prime on the Crew page). */
+.card.selected { border-color: var(--info); box-shadow: 0 0 0 1px var(--info) inset; }
 /* Drag/drop affordances. The card body grabs; the column being hovered as a
    drop target lifts; the card in flight dims. Interactive controls inside the
    card stay on the default pointer so they read as clickable, not draggable. */
