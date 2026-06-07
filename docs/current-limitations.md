@@ -212,7 +212,7 @@ Brief+kind on read. What it does **not** do:
   "locked-flag → writes redirect to a new key" nicety; that auto-redirect is not
   implemented.
 
-### The Prime / company flow is governed + rule-based, not an autonomous CEO
+### Prime is autonomous over approved work, not self-approving
 
 Relix models a company — Founder, Prime (planning lead), Crew, Mandates,
 Clearances — and the dashboard drives the whole loop (found the company →
@@ -223,7 +223,8 @@ the Founder, the Prime, and the crew breakdown (active / pending / by role).
 The **Prime Assistant** (`POST /v1/spine/prime/propose` → `…/approve` →
 `…/start`, the Chat page) turns a free-text request into a structured,
 governed plan that creates nothing until approved, then starts the ready work
-when you click Start. What it does **not** do:
+when you click Start or when the opt-in autonomous Prime driver is enabled and
+the approved work is already ready. What it does **not** do:
 
 - **The Prime is rule-based by default; a model can draft the plan opt-in,
   but the coordinator never calls a model itself.** The default plan is
@@ -246,15 +247,17 @@ when you click Start. What it does **not** do:
   integration-tested in CI (it needs a real provider; the validator + fallback
   that bound it are fully tested with fake output), and there is no
   conversational refinement — one message → one proposal.
-- **A human is in the loop at every gate.** Prime PROPOSES; the operator must
-  click **Approve & create** to create anything, greenlight each spawn
-  Clearance, and click **Start the work** to run it. `prime.start`
+- **A human is in the loop at every approval gate.** Prime PROPOSES; the operator
+  must click **Approve & create** to create anything and greenlight each spawn
+  Clearance. `prime.start`
   (company-model §12.5B) closes the loop — it turns the approved Mandate's
   ready Briefs into real Shifts through the same governed run path as a manual
   run (approved-only, ready-only, every skipped Brief reported with a reason) —
-  but it is still an operator-initiated gate, not an auto-pilot.
+  Manual Start stays sovereign; the opt-in autonomous Prime driver can call the
+  same start path for already-approved, ready proposal work while adding the
+  autonomous budget hard-stop.
 - **There is a bounded "guided driver" (v1) AND an opt-in bounded *autonomous*
-  Prime driver (v1) — NOT an autonomous CEO that reasons about strategy itself.**
+  Prime driver (v1) — NOT a self-approving strategist.**
   `prime.next_step` (READ-ONLY) classifies the ONE next governed step for a
   proposal or Mandate over live state — approval, strategy gate, team plan + live
   readiness (hires / Clearances), the Brief board, and the run ledger
@@ -267,7 +270,7 @@ when you click Start. What it does **not** do:
   requested action is no longer the current next step**, executes through the same
   governed handler + Keys as the manual route, and surfaces every governance
   refusal honestly.
-  - **The autonomous Prime driver (v1) closes the "Prime is not autonomous"
+  - **The autonomous Prime driver (v1) closes the old manual-only Prime
     caveat — opt-in, default OFF, bounded.** Behind an explicit switch
     (`RELIX_AUTONOMOUS_PRIME`, **off by default**, paced via
     `RELIX_AUTONOMOUS_PRIME_INTERVAL_SECS` default 30s, bounded per tick by

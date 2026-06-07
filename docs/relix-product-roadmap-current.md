@@ -118,7 +118,7 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   Operatives + mints **no** hires; or `orchestrate_assign_ready` — existing
   `mandate.orchestrate` in `assign_ready` mode), re-reading state and **refusing as stale
   (HTTP 409, no side effects)** when the requested action is no longer current, through the
-  same governed handler + Keys as the manual route. It is **not** an autonomous CEO: no
+  same governed handler + Keys as the manual route. It is **not** self-approving: no
   blind loop, never auto-approves a strategy/hire/spawn/budget gate, never runs a real
   adapter (Start stays the explicit button), one click = one step. Bridge:
   `GET /v1/spine/{prime/proposals,mandates}/:id/next-step` +
@@ -129,7 +129,7 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   pairs the step with board/run counts from the payload + a live pressure strip from the
   Action Center, is best-effort (a missing next step never blanks the Overview), and on a
   stale `409` shows an honest banner + reloads the fresh step. Still one safe explicit step,
-  **not** an autonomous CEO loop.
+  **not** a self-approving strategy loop.
 
 ### Briefs / Workroom (`relix-execution-and-issue-design.md` §1, §1.9)
 - **Two-pointer Claim** — `checkout_run` + `execution_run`, self-refresh, lease/release,
@@ -251,7 +251,8 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   budget / recovery / review / ready), and a restrained **Advance one step** button when
   `can_advance` (else the route to take by hand). Best-effort + honest empty/stale states; uses
   the existing `prime.next_step` / `prime.advance` routes — no new backend authority. Still one
-  explicit governed step, not an autonomous CEO loop.
+  explicit governed step; the separate opt-in autonomous Prime driver can now
+  run those same approved-work steps on a bounded timer.
 - **Operations snapshot** — a compact, read-only cockpit card fed by `company.operations`
   (the server-computed, tenant-scoped summary above): three glance groups — *work in flight*
   (running / ready / in review), *needs attention* (unassigned / blocked / stale / recovery),
@@ -499,7 +500,7 @@ ledger entry or design section.
    `task.retry` recovery is a separate, unchanged layer.
 3e. **[BE/FE] Guarded operator Shift retry (Stage-2, bounded)** — **SHIPPED** (`execution-and-issue
    §3.3b` Stage-2b *Retry now*). Turns the Stage-1 retryable verdict into a real **one-click**
-   operator recovery — **NOT** a blind auto-retry loop and **NOT** an autonomous CEO. Additive
+   operator recovery — **NOT** a blind auto-retry loop and **NOT** a company planner. Additive
    `brief_runs.retried_from_run_id` / `retry_attempt` lineage + a partial UNIQUE index enforcing
    at-most-one child per source (the duplicate guard). New capability `run.retry` + route
    `POST /v1/runs/:run_id/retry`: a pure tenant-scoped `retry_precheck` refuses unless the source is
@@ -522,7 +523,7 @@ ledger entry or design section.
    quota polling**.
 
 **P3 — depth / autonomy**
-9b. **[BE/FE] Prime guided driver v1** — **SHIPPED (bounded one-step guide, NOT an autonomous CEO).**
+9b. **[BE/FE] Prime guided driver v1** — **SHIPPED (bounded one-step guide, NOT self-approving).**
    Closes part of the long-standing "the Prime/company flow is governed but not a driver" gap honestly.
    `prime.next_step` (READ-ONLY) names the ONE next governed step for a proposal/Mandate from live
    state; `prime.advance` runs **one** safe, explicitly-requested step (`create_team_plan` /
@@ -558,7 +559,8 @@ ledger entry or design section.
    (`llm_used` / `fallback` / `unavailable`) + a safe reason, and the reply says so — it never fakes
    an AI success. The dashboard's "Use AI" checkbox now drives the Command button too. **Still one
    turn → one validated action; no autonomous planner/agent loop** (`current-limitations.md`; ledger
-   "Mandate orchestration" still not autonomous).
+   autonomous Prime driver is shipped for approved-work orchestration; raw
+   strategy/approval reasoning remains human-gated).
    **Companion chat *console* now FRONTEND SHIPPED (product polish, `dashboard-design §13`):** the Chat
    page is a usable operating console, not a stateless command box — over the SAME governed routes (no
    new mutation path). It **persists the chat log locally** (versioned `localStorage` key `relix.chat.v1`,

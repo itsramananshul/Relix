@@ -3,7 +3,9 @@
 //! gates) focused onto a SINGLE Prime work session, plus `§12.5/§12.5B` (the
 //! Prime planner + `prime.start`).
 //!
-//! This is a **bounded guide**, NOT an autonomous CEO. Two capabilities:
+//! This is the **bounded guide** surface. The opt-in autonomous Prime loop below
+//! reuses this classifier / advance path on a timer, so manual and autonomous
+//! routes share the same governed steps. Two capabilities:
 //!
 //!   - **`prime.next_step`** — READ-ONLY. Given a Prime proposal id OR a Mandate
 //!     id, classify the one next governed step over live state: the proposal /
@@ -22,6 +24,8 @@
 //!     deliberately routed to the existing explicit Prime **Start** button, not
 //!     auto-advanced. Every step goes through the same governed handler + Keys as
 //!     the manual route.
+//!     The autonomous loop below is the separate timer that may call
+//!     `prime.start` for already-approved, ready proposal work.
 
 use std::sync::Arc;
 
@@ -504,7 +508,8 @@ fn classify_mandate(
                 "Start the ready Briefs",
                 format!(
                     "{} Brief(s) are assigned, unblocked, and ready to run as Shifts. Use the \
-                     explicit Start control — the driver does not auto-run real adapters.",
+                     explicit Start control, or enable autonomous Prime to start approved ready \
+                     proposal work through the same prime.start path.",
                     counts.ready
                 ),
                 start_route,
