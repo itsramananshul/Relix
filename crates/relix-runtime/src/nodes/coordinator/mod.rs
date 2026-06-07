@@ -5018,6 +5018,52 @@ impl TaskStore {
             if changed != 1 {
                 return Ok(None); // a newer Claim re-acquired it between read + write
             }
+            // The wake that spawned this now-terminal run is left mid-flight when
+            // the dispatcher dies before finishing it — and (after the claim/run id
+            // alignment) its `execution_run_id` is the SAME id as the Claim pointer
+            // and the terminal run. A leftover `queued`/`running` wake for this
+            // Brief+id would coalesce the next timer wake and wedge re-dispatch, so
+            // finish it HERE, honestly mirroring the run's terminal status, so the
+            // adopted Brief can be dispatched again this same tick with no duplicate
+            // run/wake. It matches ONLY the wake tied to THIS terminal run (its id
+            // == the pointer) — an unrelated wake (different id, or a `deferred`
+            // wake with no id) is never touched, and it is a no-op for the
+            // manual/Prime path (which creates no wake under the run id).
+            let wake_status = match status.as_str() {
+                "done" => "completed",
+                "continued" => "continued",
+                "cancelled" => "cancelled",
+                _ => "failed",
+            };
+            let stale_wakes: Vec<String> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT wakeup_id FROM brief_wakeup_requests
+                         WHERE task_id = ?1
+                           AND status IN ('queued', 'running')
+                           AND TRIM(COALESCE(execution_run_id, '')) = ?2",
+                    )
+                    .map_err(CoordinatorError::Db)?;
+                stmt.query_map(params![task_id, pointer], |r| r.get::<_, String>(0))
+                    .map_err(CoordinatorError::Db)?
+                    .collect::<rusqlite::Result<_>>()
+                    .map_err(CoordinatorError::Db)?
+            };
+            for wid in &stale_wakes {
+                conn.execute(
+                    "UPDATE brief_wakeup_requests
+                     SET status = ?1, updated_at = ?2, finished_at = ?2,
+                         context = COALESCE(context, ?3)
+                     WHERE wakeup_id = ?4",
+                    params![wake_status, now, "wake closed by terminal-run reclaim", wid],
+                )
+                .map_err(CoordinatorError::Db)?;
+                let _ = conn.execute(
+                    "INSERT INTO task_events (task_id, ts, event_type, payload)
+                     VALUES (?1, ?2, 'brief.wakeup_finished', ?3)",
+                    params![task_id, now, format!("{wid}:{wake_status}")],
+                );
+            }
             let _ = promote_oldest_deferred_wakeup_in_conn(&conn, task_id, now)?;
             Some((pointer, status))
         };
@@ -6937,7 +6983,15 @@ impl TaskStore {
             } else {
                 (
                     "queued",
-                    Some(format!("shift_{}", uuid::Uuid::new_v4())),
+                    // The durable run id is minted HERE, once, and carried all the
+                    // way through: it becomes the Brief Claim's `execution_run_id`
+                    // at claim time AND the `brief_runs.run_id` the dispatcher
+                    // records — ONE id, not a `shift_?` claim pointer paired with a
+                    // separately-minted `run_?` ledger row. That alignment is what
+                    // lets a heartbeat-origin Claim left dangling on a TERMINAL run
+                    // be adopted by terminal-evidence reclaim (`reclaim_terminal_claim`)
+                    // exactly like a manual run (execution-and-issue-design §1.4/§7.1).
+                    Some(format!("run_{}", uuid::Uuid::new_v4())),
                     "brief.wakeup_queued",
                     format!("{src}:{why}"),
                 )
@@ -7080,10 +7134,15 @@ impl TaskStore {
                     continue;
                 }
             };
+            // The Claim's `execution_run_id` IS the durable run id: reuse the one
+            // minted when this wake was queued, else mint a `run_` id (NOT a
+            // `shift_` one) so the Claim pointer matches the `brief_runs.run_id`
+            // the dispatcher records — the alignment terminal-evidence adoption
+            // depends on (execution-and-issue-design §1.4/§7.1).
             let execution_run_id = wake
                 .execution_run_id
                 .clone()
-                .unwrap_or_else(|| format!("shift_{}", uuid::Uuid::new_v4()));
+                .unwrap_or_else(|| format!("run_{}", uuid::Uuid::new_v4()));
             let checkout_run_id = format!("claim_{}", new_task_id());
             let changed = tx
                 .execute(
@@ -7124,7 +7183,7 @@ impl TaskStore {
             .map_err(CoordinatorError::Db)?;
             let mut running = wake;
             running.status = "running".to_string();
-            running.execution_run_id = Some(execution_run_id);
+            running.execution_run_id = Some(execution_run_id.clone());
             running.started_at = Some(now);
             running.updated_at = now;
             let _ = tx.execute(
@@ -7136,6 +7195,7 @@ impl TaskStore {
             claimed.push(ClaimedWakeup {
                 wakeup: running,
                 card,
+                run_id: execution_run_id,
             });
         }
         tx.commit().map_err(CoordinatorError::Db)?;
@@ -12014,6 +12074,13 @@ pub struct BriefWakeupDecision {
 pub struct ClaimedWakeup {
     pub wakeup: BriefWakeupRow,
     pub card: brief::BriefCard,
+    /// The durable run id stamped on the Brief's Claim by this claim step
+    /// (its `execution_run_id`). The dispatcher MUST record `brief_runs`
+    /// under THIS id rather than minting a fresh one, so the Claim pointer
+    /// and the run-ledger row are the SAME id — the alignment that lets a
+    /// heartbeat-origin Claim left dangling on a terminal run be adopted by
+    /// terminal evidence (`reclaim_terminal_claim`), §1.4/§7.1.
+    pub run_id: String,
 }
 
 // ──────────────────────────── Capability registration ──────────────────────
@@ -17781,7 +17848,10 @@ fn promote_oldest_deferred_wakeup_in_conn(
     let Some(wakeup_id) = next else {
         return Ok(None);
     };
-    let execution_run_id = format!("shift_{}", uuid::Uuid::new_v4());
+    // A promoted wake mints a `run_` id (the durable run id), not a `shift_`
+    // one, so when it is claimed the Claim pointer matches the run-ledger row
+    // the dispatcher records — the alignment terminal-evidence adoption needs.
+    let execution_run_id = format!("run_{}", uuid::Uuid::new_v4());
     conn.execute(
         "UPDATE brief_wakeup_requests
          SET status = 'queued',

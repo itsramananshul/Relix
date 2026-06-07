@@ -88,7 +88,13 @@ pub fn claim_ready_batch(
         let Some(assignee) = card.assignee_agent_id.as_deref() else {
             continue;
         };
-        let execution_run_id = format!("shift_{}", uuid::Uuid::new_v4());
+        // The Claim pointer is a `run_` id (the durable run-ledger shape), not a
+        // `shift_` one, matching the live heartbeat path
+        // (`claim_queued_wakeups_with_caps`) where the Claim's `execution_run_id`
+        // IS the `brief_runs.run_id` — the alignment terminal-evidence adoption
+        // depends on. (This pure helper is test-only; the live loop claims via the
+        // wakeup queue, but it must not model the old `shift_?`-pointer split.)
+        let execution_run_id = format!("run_{}", uuid::Uuid::new_v4());
         if store.claim_brief_for_run(
             &card.task_id,
             assignee,
@@ -540,6 +546,13 @@ where
     for claimed_wake in claimed {
         let card = claimed_wake.card;
         let wakeup_id = claimed_wake.wakeup.wakeup_id;
+        // The durable run id the claim step stamped on this Brief's Claim
+        // (`execution_run_id`). The committed run below records `brief_runs` under
+        // THIS SAME id — never a freshly minted one — so a heartbeat-origin Claim
+        // left dangling on a TERMINAL run is adopted by terminal-evidence reclaim
+        // (`reclaim_terminal_claim`) exactly like a manual run, closing the old
+        // `shift_?`-pointer / `run_?`-ledger asymmetry (execution-and-issue §1.4/§7.1).
+        let run_id = claimed_wake.run_id;
         // PHASE 4 (Allowance hard-stop, relix-company-model §3.6/§5.2D):
         // before running the Brief, check the assigned Operative is
         // within budget. If over budget / hard-stopped, do NOT run it
@@ -650,7 +663,6 @@ where
         // review state, apply eligibility. The only difference is the
         // `heartbeat` trigger stamped on the run record.
         let rig_name = rig.name().to_string();
-        let run_id = format!("run_{}", uuid::Uuid::new_v4());
         let prompt = build_prompt(&card);
         match prepare_claimed_run(
             store,
@@ -4815,6 +4827,189 @@ mod tests {
             "agt_b",
             "Guild B's live Claim untouched"
         );
+    }
+
+    /// The Brief Claim's current `execution_run_id` pointer (None when unset).
+    fn claim_exec_run_id(s: &TaskStore, id: &str) -> Option<String> {
+        let conn = s.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT execution_run_id FROM tasks WHERE task_id = ?1",
+            rusqlite::params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn heartbeat_claim_pointer_is_a_run_ledger_id_not_a_shift_id() {
+        // The fix: the autonomous heartbeat claim path mints ONE durable run id at
+        // wakeup-queue time and carries it through, so the Claim's `execution_run_id`
+        // IS the `brief_runs.run_id` the dispatcher records — not a `shift_?` claim
+        // pointer paired with a separately-minted `run_?` ledger row. Without that
+        // single id, a heartbeat-origin Claim could never be adopted by terminal
+        // evidence (the pointer never matched a recorded run).
+        let s = store();
+        let id = ready_brief(&s, "aligned ids", "agt_a");
+        // Queue the timer wake exactly as the live heartbeat does.
+        let dec = s
+            .request_brief_wakeup(&id, "agt_a", "timer", "heartbeat", None)
+            .unwrap();
+        assert_eq!(dec.status, "queued");
+        let queued_run = dec.execution_run_id.clone().unwrap();
+        assert!(
+            queued_run.starts_with("run_"),
+            "a queued heartbeat wake mints a run-ledger id, not shift_: {queued_run}"
+        );
+        // Claim it through the SAME path `dispatch_batch_with_policy` uses.
+        let claimed = s.claim_queued_wakeups_with_caps(50, 300, |_| 20).unwrap();
+        assert_eq!(claimed.len(), 1, "the queued wake is claimed");
+        let claim_run = claimed[0].run_id.clone();
+        assert!(
+            claim_run.starts_with("run_"),
+            "the claim carries a run-ledger id: {claim_run}"
+        );
+        // The carried id, the Claim pointer on the Brief row, and the queued
+        // wake's id are ALL the same id — so the run the dispatcher records under
+        // it will match for terminal-evidence adoption.
+        assert_eq!(claim_run, queued_run, "one id from queue through claim");
+        assert_eq!(
+            claim_exec_run_id(&s, &id).as_deref(),
+            Some(claim_run.as_str()),
+            "the Brief Claim's execution_run_id == the run-ledger id"
+        );
+        // And it is a safe workspace-path segment (run_<uuid>).
+        assert!(run_id_is_safe(&claim_run), "claim run id is workspace-safe");
+    }
+
+    #[test]
+    fn heartbeat_origin_dangling_terminal_claim_is_adopted_and_redispatched() {
+        // The real heartbeat-origin case the caveat flagged: a Brief is claimed
+        // through the wakeup queue, its run reaches a TERMINAL state, but the owner
+        // dies before releasing the Claim (and before finishing the wake). The
+        // Claim is still LIVE, so `list_ready_briefs` excludes it and age-based
+        // recovery can't help (the run is no longer `running`). Before the id
+        // alignment the Claim pointed at `shift_?` while the ledger row was `run_?`,
+        // so terminal evidence never matched and the Brief waited for lease expiry.
+        // Now the Claim pointer IS the terminal run's id, so one heartbeat tick
+        // adopts it and re-dispatches the SAME tick — with no duplicate run/wake.
+        let (s, _tmp) = store_ws();
+        let reg = echo_registry();
+        let id = ready_brief(&s, "heartbeat origin", "agt_a");
+        // Drive the REAL heartbeat claim path (queue → claim).
+        let dec = s
+            .request_brief_wakeup(&id, "agt_a", "timer", "heartbeat", None)
+            .unwrap();
+        let claimed = s.claim_queued_wakeups_with_caps(50, 300, |_| 20).unwrap();
+        assert_eq!(claimed.len(), 1);
+        let run_id = claimed[0].run_id.clone();
+        assert_eq!(dec.execution_run_id.as_deref(), Some(run_id.as_str()));
+        // The dispatcher recorded a terminal run under THIS id, then the owner died
+        // before releasing the Claim / finishing the wake.
+        s.record_run_start(
+            &run_id,
+            &id,
+            "agt_a",
+            "echo",
+            "heartbeat",
+            &crate::nodes::coordinator::RunWorkspaceInfo::default(),
+        )
+        .unwrap();
+        s.record_run_finish(&run_id, "done", "prior heartbeat shift ended")
+            .unwrap();
+        assert!(
+            s.claim_holder(&id).unwrap().is_some(),
+            "the heartbeat-origin Claim is still live before the tick"
+        );
+
+        // One heartbeat tick adopts + re-dispatches.
+        let records = dispatch_batch(
+            &s,
+            50,
+            300,
+            None,
+            |_: &brief::BriefCard| reg.get("echo"),
+            |c: &brief::BriefCard| c.title.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 1, "adopted + re-dispatched this tick: {records:?}");
+        assert_eq!(records[0].brief_id, id);
+        assert!(matches!(records[0].outcome, RigOutcome::Done { .. }));
+        assert_eq!(
+            reclaim_chronicle_count(&s, &id),
+            1,
+            "exactly one reclaim note (terminal-evidence adoption)"
+        );
+        assert_eq!(s.board_status(&id).unwrap().as_deref(), Some("in_review"));
+        assert!(
+            s.claim_holder(&id).unwrap().is_none(),
+            "the Claim is released after the re-dispatched run"
+        );
+        // A fresh terminal run beyond the adopted one, none left running.
+        let runs = s.runs_for_brief(&id, 10).unwrap();
+        assert!(runs.len() >= 2, "the new run plus the prior terminal one: {runs:?}");
+        assert_eq!(
+            runs.iter().filter(|r| r.status == "running").count(),
+            0,
+            "no run left running after the tick"
+        );
+        // No duplicate live wake: the stale heartbeat wake was closed by the
+        // reclaim and the re-dispatch's wake finished — none left queued/running.
+        let live_wakes = s
+            .list_brief_wakeups(&id, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|w| matches!(w.status.as_str(), "queued" | "running"))
+            .count();
+        assert_eq!(live_wakes, 0, "no leftover queued/running wake after re-dispatch");
+    }
+
+    #[test]
+    fn reclaim_closes_only_the_wake_tied_to_the_terminal_run() {
+        // SAFETY: the stale-wake cleanup in `reclaim_terminal_claim` matches ONLY
+        // the wake whose id == the reclaimed (terminal) run pointer. An unrelated
+        // queued wake for a DIFFERENT Brief is never touched.
+        let s = store();
+        let a = ready_brief(&s, "terminal-stale", "agt_a");
+        let b = ready_brief(&s, "unrelated queued", "agt_b");
+        // a: a heartbeat-origin Claim dangling on a terminal run (its wake running).
+        let dec_a = s
+            .request_brief_wakeup(&a, "agt_a", "timer", "heartbeat", None)
+            .unwrap();
+        let claimed = s.claim_queued_wakeups_with_caps(50, 300, |_| 20).unwrap();
+        let run_a = claimed
+            .iter()
+            .find(|c| c.card.task_id == a)
+            .unwrap()
+            .run_id
+            .clone();
+        assert_eq!(dec_a.execution_run_id.as_deref(), Some(run_a.as_str()));
+        s.record_run_start(
+            &run_a,
+            &a,
+            "agt_a",
+            "echo",
+            "heartbeat",
+            &crate::nodes::coordinator::RunWorkspaceInfo::default(),
+        )
+        .unwrap();
+        s.record_run_finish(&run_a, "done", "ended").unwrap();
+        // b: an independent wake sitting queued the whole time.
+        let dec_b = s
+            .request_brief_wakeup(&b, "agt_b", "timer", "heartbeat", None)
+            .unwrap();
+        assert_eq!(dec_b.status, "queued");
+
+        let reclaimed = s.reclaim_terminal_claims_ready(50).unwrap();
+        assert_eq!(reclaimed, vec![a.clone()], "only a's terminal-stale Claim adopted");
+        // b's queued wake is untouched (different Brief, different run id).
+        let b_queued = s
+            .list_brief_wakeups(&b, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|w| w.status == "queued")
+            .count();
+        assert_eq!(b_queued, 1, "the unrelated queued wake survives the reclaim");
     }
 
     #[test]

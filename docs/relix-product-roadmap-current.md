@@ -260,11 +260,18 @@ ledger entry or design section.
    evidence without waiting for the age-based `recover_stale_runs` sweep / lease expiry
    (`execution §1.4`/`§7.1` LOCKED; ledger "Claim HTTP 409 + per-Operative start lock +
    duplicate-start guard" = DONE, "stale-run adoption" = DONE, "heartbeat stale-claim
-   admission" = DONE). *Remaining edge (deferred):* Relix releases+re-claims rather than
-   transferring the dead owner's checkout context in place (full Paperclip "adopt the prior
-   checkout run"); adoption fires on terminal evidence where the Claim's run pointer matches
-   a recorded terminal `brief_runs` row (the same evidence the manual/Prime path uses) — a
-   Claim whose pointer never matched a recorded run is still freed by lease expiry.
+   admission" = DONE). **Heartbeat-origin Claims are now adoptable too:** the autonomous
+   claim path mints ONE durable `run_` id at wakeup-queue time and carries it through, so a
+   heartbeat-claimed Brief's Claim pointer (`execution_run_id`) IS the `brief_runs.run_id`
+   the dispatcher records — closing the old `shift_?`-pointer / `run_?`-ledger asymmetry that
+   meant a heartbeat-origin Claim's pointer could never match a terminal run. A reclaim also
+   closes the now-id-aligned mid-flight wake, so the adopted Brief re-dispatches the same
+   tick with no duplicate run/wake. *Remaining edge (deferred):* Relix releases+re-claims
+   rather than transferring the dead owner's checkout context in place (full Paperclip "adopt
+   the prior checkout run"); and adoption still requires the Claim's pointer to match a
+   recorded terminal `brief_runs` row, so the only Claim freed by lease expiry instead is one
+   lost in the narrow window before its run row was ever written (a crash between the claim
+   and `record_run_start`).
 2. **[BE] Guild-level spend hard-stop** — **SHIPPED for autonomous dispatch** (roadmap §5
    slice 2): the heartbeat path now refuses a Brief when its Guild is over its monthly
    budget, mirroring the per-Operative hard-stop and additive on top of it
