@@ -5032,6 +5032,96 @@ impl TaskStore {
         Ok(Some(pointer))
     }
 
+    /// Autonomous-heartbeat **stale-claim admission** (execution-and-issue-design
+    /// §1.4 "stale-run adoption" / §7.1 LOCKED two-pointer Claim).
+    ///
+    /// [`Self::reclaim_terminal_claim`] is the shared, tested per-Brief adoption
+    /// primitive, and the manual/Prime start chokepoint ([`heartbeat::preflight_run`])
+    /// already calls it before claiming. The **autonomous heartbeat** could not
+    /// benefit from it, because a Brief whose Claim is still **live** (lease not
+    /// yet expired) is excluded from [`Self::list_ready_briefs`] — so the
+    /// dispatcher never saw the Brief to adopt it, and it stayed wedged behind the
+    /// dangling Claim until the lease aged out (the age-based recovery the docs
+    /// flagged as the remaining edge).
+    ///
+    /// This is the batch admission step the heartbeat runs **before** selecting
+    /// ready Briefs: it finds every would-be-ready Brief (assigned, active board,
+    /// unblocked) that is blocked **only** by a live Claim whose run pointer
+    /// (`execution_run_id`, else `checkout_run_id`) refers to a **terminal**
+    /// `brief_runs` row for that Brief, and reclaims each through the same
+    /// [`Self::reclaim_terminal_claim`] helper. Once reclaimed, the Brief becomes
+    /// `ready` again and the normal heartbeat queue/claim path picks it up this
+    /// same tick.
+    ///
+    /// The candidate query is only a **pre-filter** — all the safety lives in
+    /// [`Self::reclaim_terminal_claim`], which re-reads each Claim under its own
+    /// lock and releases **only** on terminal evidence matching the Claim's own
+    /// pointer + holder (never a still-`running` run, never a Claim with no
+    /// matching run, never a newer Claim that re-acquired the Brief between the
+    /// candidate read and the release). So a Claim that changed after the
+    /// candidate scan is left untouched, and the step is **idempotent**: a Brief
+    /// already reclaimed (Claim now null) or re-running (pointer now `running`) is
+    /// no longer a candidate, so a second pass records no further reclaim. It is
+    /// **tenant-safe by construction**: each reclaim touches only that one Brief's
+    /// own Claim, so a terminal-stale Claim in one Guild can never release a live
+    /// Claim in another.
+    ///
+    /// Returns the ids of the Briefs whose Claim was actually reclaimed.
+    pub fn reclaim_terminal_claims_ready(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<String>, CoordinatorError> {
+        let lim = limit.clamp(1, self.max_list) as i64;
+        let now = unix_secs();
+        // Gather candidates under one lock, then DROP it before calling
+        // `reclaim_terminal_claim` (which takes its own lock + may `append_event`).
+        let candidates: Vec<String> = {
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT t.task_id
+                     FROM tasks t
+                     WHERE t.assignee_agent_id IS NOT NULL
+                       AND t.board_status IN ('todo', 'in_progress')
+                       AND t.claim_agent_id IS NOT NULL
+                       AND t.claim_expires_at IS NOT NULL
+                       AND t.claim_expires_at >= ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM task_edges e
+                           JOIN tasks b ON b.task_id = e.related_task_id
+                           WHERE e.task_id = t.task_id AND e.edge_type = 'blocked_on'
+                             AND b.board_status != 'done'
+                       )
+                       AND EXISTS (
+                           SELECT 1 FROM brief_runs r
+                           WHERE r.brief_id = t.task_id
+                             AND r.status != 'running'
+                             AND r.run_id = COALESCE(
+                                   NULLIF(TRIM(t.execution_run_id), ''),
+                                   NULLIF(TRIM(t.checkout_run_id), '')
+                             )
+                       )
+                     ORDER BY t.updated_at ASC
+                     LIMIT ?2",
+                )
+                .map_err(CoordinatorError::Db)?;
+            stmt.query_map(params![now, lim], |r| r.get::<_, String>(0))
+                .map_err(CoordinatorError::Db)?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(CoordinatorError::Db)?
+        };
+        let mut reclaimed = Vec::new();
+        for task_id in candidates {
+            // `reclaim_terminal_claim` re-checks terminal evidence + the
+            // pointer/holder guard authoritatively, so a Claim that changed after
+            // the candidate read is safely a no-op (returns `None`).
+            if self.reclaim_terminal_claim(&task_id)?.is_some() {
+                reclaimed.push(task_id);
+            }
+        }
+        Ok(reclaimed)
+    }
+
     /// Open a run record for a Brief execution (status `running`). One
     /// durable row per Rig run — the stable run ledger the dashboard
     /// polls (`/v1/runs`) instead of parsing event strings. Called once

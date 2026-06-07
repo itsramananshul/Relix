@@ -511,6 +511,20 @@ where
     C: FnMut(&str) -> i64,
     B: Fn(&brief::BriefCard) -> BudgetAdmission,
 {
+    // Autonomous stale-claim adoption (execution-and-issue-design §1.4
+    // "stale-run adoption" / §7.1 LOCKED two-pointer Claim): BEFORE selecting
+    // ready Briefs, reclaim any would-be-ready Brief that is blocked ONLY by a
+    // LIVE Claim dangling on TERMINAL run evidence — the SAME adoption the
+    // manual/Prime start performs via `reclaim_terminal_claim`, sharing that one
+    // tested helper. Without this, a live-but-dead Claim is excluded from
+    // `list_ready_briefs`, so the heartbeat would wait for the age-based lease
+    // sweep before re-dispatching. Safe + idempotent + tenant-safe: each reclaim
+    // releases only on terminal evidence matching the Claim's own pointer (never a
+    // live run, never a Claim a newer run re-acquired, never another Guild's
+    // Claim), chronicles `brief.claim_reclaimed` once, and promotes the oldest
+    // deferred wake — so the normal queue/claim path below picks the Brief up this
+    // same tick without duplicating wakeups or runs.
+    let _ = store.reclaim_terminal_claims_ready(batch)?;
     let ready = store.list_ready_briefs(batch)?;
     for card in &ready {
         let Some(assignee) = card.assignee_agent_id.as_deref() else {
@@ -4547,6 +4561,259 @@ mod tests {
         assert!(
             matches!(retry, Preflight::Refused(r) if r.status == "already_running"),
             "a retry of a 409 conflict loses again — clients must not retry"
+        );
+    }
+
+    // ── Autonomous heartbeat: stale-claim adoption by terminal evidence ──
+    // (execution-and-issue-design §1.4 "stale-run adoption" / §7.1 LOCKED
+    // two-pointer Claim) — the heartbeat shares the SAME `reclaim_terminal_claim`
+    // helper as the manual/Prime start, so a dangling live Claim on a terminal
+    // run no longer waits for the age-based recovery sweep.
+
+    /// Seed a Brief whose LIVE Claim (held by `holder`) dangles on a `run_id`
+    /// that has already finished in the durable ledger with terminal `status`.
+    fn dangling_terminal_claim(
+        s: &TaskStore,
+        id: &str,
+        holder: &str,
+        run_id: &str,
+        status: &str,
+    ) {
+        assert!(s.claim_brief_for_run(id, holder, 300, Some(run_id)).unwrap());
+        s.record_run_start(
+            run_id,
+            id,
+            holder,
+            "echo",
+            "heartbeat",
+            &crate::nodes::coordinator::RunWorkspaceInfo::default(),
+        )
+        .unwrap();
+        s.record_run_finish(run_id, status, "prior shift ended").unwrap();
+    }
+
+    fn reclaim_chronicle_count(s: &TaskStore, id: &str) -> usize {
+        s.query_events(
+            id,
+            0,
+            50,
+            Some("brief.claim_reclaimed"),
+            crate::nodes::coordinator::EventOrder::Desc,
+        )
+        .unwrap()
+        .len()
+    }
+
+    #[test]
+    fn heartbeat_adopts_a_terminal_stale_claim_then_dispatches() {
+        // The remaining edge: a Brief's Claim is still LIVE (lease not yet aged
+        // out) but the run it points at already finished terminal — the owner
+        // crashed before releasing. Age-based recovery can't help (the run is no
+        // longer `running`), and `list_ready_briefs` excludes the live-claimed
+        // Brief — so before this slice the heartbeat had to wait for the lease to
+        // expire. Now the dispatch tick adopts the stale Claim and runs it.
+        let (s, _tmp) = store_ws();
+        let reg = echo_registry();
+        let id = ready_brief(&s, "stranded brief", "agt_a");
+        // The assignee's own prior Shift went terminal but left a live Claim.
+        dangling_terminal_claim(&s, &id, "agt_a", "run_prev", "done");
+        assert!(
+            s.claim_holder(&id).unwrap().is_some(),
+            "claim is live before the tick"
+        );
+
+        let records = dispatch_batch(
+            &s,
+            50,
+            300,
+            None,
+            |_: &brief::BriefCard| reg.get("echo"),
+            |c: &brief::BriefCard| c.title.clone(),
+        )
+        .unwrap();
+
+        // The Brief was dispatched this same tick.
+        assert_eq!(records.len(), 1, "the adopted Brief dispatched: {records:?}");
+        assert_eq!(records[0].brief_id, id);
+        assert!(matches!(records[0].outcome, RigOutcome::Done { .. }));
+        // Exactly one reclaim was chronicled (the adoption), and the board
+        // advanced to review with the Claim released after the run.
+        assert_eq!(reclaim_chronicle_count(&s, &id), 1, "one reclaim note");
+        assert_eq!(s.board_status(&id).unwrap().as_deref(), Some("in_review"));
+        assert!(
+            s.claim_holder(&id).unwrap().is_none(),
+            "claim released after the dispatched run"
+        );
+        // A fresh terminal run exists beyond the prior one (no duplicate live run).
+        let runs = s.runs_for_brief(&id, 10).unwrap();
+        assert!(runs.len() >= 2, "the new run plus the prior one: {runs:?}");
+        assert_eq!(
+            runs.iter().filter(|r| r.status == "running").count(),
+            0,
+            "no run left running after the tick"
+        );
+    }
+
+    #[test]
+    fn heartbeat_never_reclaims_a_live_running_claim() {
+        // SAFETY: a Claim backing a run that is STILL `running` must never be
+        // stolen — that is a live owner, not a stale one. The admission step
+        // leaves it alone and the heartbeat does not dispatch it.
+        let (s, _tmp) = store_ws();
+        let reg = echo_registry();
+        let id = ready_brief(&s, "live owner", "agt_a");
+        assert!(s
+            .claim_brief_for_run(&id, "agt_live", 300, Some("run_live"))
+            .unwrap());
+        s.record_run_start(
+            "run_live",
+            &id,
+            "agt_live",
+            "echo",
+            "heartbeat",
+            &crate::nodes::coordinator::RunWorkspaceInfo::default(),
+        )
+        .unwrap(); // still `running`
+
+        let reclaimed = s.reclaim_terminal_claims_ready(50).unwrap();
+        assert!(reclaimed.is_empty(), "a running run is never reclaimed");
+
+        let records = dispatch_batch(
+            &s,
+            50,
+            300,
+            None,
+            |_: &brief::BriefCard| reg.get("echo"),
+            |c: &brief::BriefCard| c.title.clone(),
+        )
+        .unwrap();
+        assert!(records.is_empty(), "a live-owned Brief is not dispatched");
+        assert_eq!(
+            s.claim_holder(&id).unwrap().unwrap().0,
+            "agt_live",
+            "the live owner's Claim is untouched"
+        );
+        assert_eq!(reclaim_chronicle_count(&s, &id), 0, "no reclaim note");
+    }
+
+    #[test]
+    fn heartbeat_does_not_reclaim_when_the_pointer_moved_to_a_newer_running_run() {
+        // SAFETY (pointer changed before release): an OLD run going terminal must
+        // not release a Claim that a NEWER, still-running run already re-acquired.
+        // The candidate scan keys on the Claim's CURRENT pointer (the newer run),
+        // which is `running` — so the terminal old run is not evidence and the
+        // admission step is a no-op. This is the admission-level mirror of the
+        // store guard `reclaim_terminal_claim_does_not_clobber_a_newer_running_claim`.
+        let s = store();
+        let id = ready_brief(&s, "re-claimed before reclaim", "agt_a");
+        // run_old finished terminal...
+        s.record_run_start(
+            "run_old",
+            &id,
+            "agt_a",
+            "echo",
+            "heartbeat",
+            &crate::nodes::coordinator::RunWorkspaceInfo::default(),
+        )
+        .unwrap();
+        s.record_run_finish("run_old", "interrupted", "gone").unwrap();
+        // ...but a newer run re-claimed the Brief and is running; the Claim now
+        // points at run_new, not the terminal run_old.
+        assert!(s
+            .claim_brief_for_run(&id, "agt_a", 300, Some("run_new"))
+            .unwrap());
+        s.record_run_start(
+            "run_new",
+            &id,
+            "agt_a",
+            "echo",
+            "heartbeat",
+            &crate::nodes::coordinator::RunWorkspaceInfo::default(),
+        )
+        .unwrap();
+
+        let reclaimed = s.reclaim_terminal_claims_ready(50).unwrap();
+        assert!(
+            reclaimed.is_empty(),
+            "the newer running Claim must not be clobbered by the old terminal run"
+        );
+        assert_eq!(
+            s.claim_holder(&id).unwrap().unwrap().0,
+            "agt_a",
+            "the newer running Claim survives"
+        );
+        assert_eq!(reclaim_chronicle_count(&s, &id), 0, "no reclaim note");
+    }
+
+    #[test]
+    fn heartbeat_terminal_claim_adoption_is_idempotent() {
+        // Running the admission twice records AT MOST one reclaim and promotes a
+        // pending deferred wake only once — no duplicate reclaim, wakeup, or run.
+        let (s, _tmp) = store_ws();
+        let id = ready_brief(&s, "adopt once", "agt_a");
+        dangling_terminal_claim(&s, &id, "agt_dead", "run_prev", "failed");
+        // A wake that arrived while the dead Claim was live is sitting deferred.
+        let deferred =
+            s.request_brief_wakeup(&id, "agt_a", "assignment", "assigned", None).unwrap();
+        assert_eq!(deferred.status, "deferred", "queued behind the live Claim");
+
+        let first = s.reclaim_terminal_claims_ready(50).unwrap();
+        assert_eq!(first, vec![id.clone()], "first pass reclaims it");
+        // The deferred wake is promoted to queued exactly once by the release.
+        let promoted: Vec<String> = s
+            .list_brief_wakeups(&id, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|w| w.status == "queued")
+            .map(|w| w.wakeup_id)
+            .collect();
+        assert_eq!(promoted.len(), 1, "exactly one queued wake after promotion");
+
+        let second = s.reclaim_terminal_claims_ready(50).unwrap();
+        assert!(second.is_empty(), "second pass finds nothing to reclaim");
+        assert_eq!(reclaim_chronicle_count(&s, &id), 1, "no duplicate reclaim note");
+        // Still exactly one queued wake — the no-op second pass added none.
+        let still_queued = s
+            .list_brief_wakeups(&id, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|w| w.status == "queued")
+            .count();
+        assert_eq!(still_queued, 1, "no duplicate wake from the idempotent re-run");
+    }
+
+    #[test]
+    fn heartbeat_terminal_claim_adoption_is_tenant_safe() {
+        // Each reclaim touches only its own Brief's Claim, so a terminal-stale
+        // Claim in one Guild never releases a live Claim in another. Guild A's
+        // dangling terminal Claim is adopted; Guild B's live running Claim is not.
+        let s = store();
+        let a = ready_brief(&s, "guild a stale", "agt_a");
+        s.set_task_tenant(&a, "guild_a").unwrap();
+        dangling_terminal_claim(&s, &a, "agt_a", "run_a", "done");
+
+        let b = ready_brief(&s, "guild b live", "agt_b");
+        s.set_task_tenant(&b, "guild_b").unwrap();
+        assert!(s
+            .claim_brief_for_run(&b, "agt_b", 300, Some("run_b"))
+            .unwrap());
+        s.record_run_start(
+            "run_b",
+            &b,
+            "agt_b",
+            "echo",
+            "heartbeat",
+            &crate::nodes::coordinator::RunWorkspaceInfo::default(),
+        )
+        .unwrap(); // still `running` in Guild B
+
+        let reclaimed = s.reclaim_terminal_claims_ready(50).unwrap();
+        assert_eq!(reclaimed, vec![a.clone()], "only Guild A's stale Claim adopted");
+        assert!(s.claim_holder(&a).unwrap().is_none(), "Guild A released");
+        assert_eq!(
+            s.claim_holder(&b).unwrap().unwrap().0,
+            "agt_b",
+            "Guild B's live Claim untouched"
         );
     }
 

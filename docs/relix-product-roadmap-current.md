@@ -119,15 +119,18 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   Operative already has a live, actually-running run on the same Brief — so a double-start
   can no longer open two run rows/workspaces while the lower-level `claim_brief_for_run`
   stays idempotent for wakeup/heartbeat/recovery (§1.4/§2.6). **Stale-run adoption by
-  terminal evidence** now also ships (§5 slice 10): a dangling **live** Claim whose run
-  pointer (`execution_run_id`/`checkout_run_id`) points at an already-**terminal**
-  `brief_runs` row is reclaimed at start time (`reclaim_terminal_claim`, called in
-  `preflight_run` before the claim), so a new start proceeds on terminal evidence instead
-  of waiting for the age-based `recover_stale_runs` sweep — safe by construction (never
+  terminal evidence** now ships on **both** the manual/Prime and the **autonomous
+  heartbeat** paths (§5 slice 10): a dangling **live** Claim whose run pointer
+  (`execution_run_id`/`checkout_run_id`) points at an already-**terminal** `brief_runs` row
+  is reclaimed via the shared `reclaim_terminal_claim` helper — called in `preflight_run`
+  before the manual/Prime claim, and as a batch admission step
+  (`reclaim_terminal_claims_ready`) at the **top of every heartbeat dispatch tick** — so a
+  start *or* an autonomous re-dispatch proceeds on terminal evidence instead of waiting for
+  the age-based `recover_stale_runs` sweep / lease expiry. Safe by construction (never
   releases a Claim backing a still-`running` run, a Claim with no matching run evidence, or
-  a newer Claim) and chronicled `brief.claim_reclaimed`. *Remaining edge:* Relix
-  releases+re-claims rather than transferring the dead owner's checkout context in place
-  (full Paperclip "adopt the prior checkout run").
+  a newer Claim), idempotent, tenant-safe, and chronicled `brief.claim_reclaimed`.
+  *Remaining edge:* Relix releases+re-claims rather than transferring the dead owner's
+  checkout context in place (full Paperclip "adopt the prior checkout run").
 - **Entry guards** — `in_progress` requires assignee + no unresolved Snags; `in_review`
   requires a real reviewer.
 - **Brief detail API** — `brief.detail` returns the full product object (fields,
@@ -247,17 +250,21 @@ ledger entry or design section.
    `200`; an in-process per-Operative start lock serializes concurrent starts; a new start
    by the same Operative on a Brief it is already running is refused `already_running`
    instead of opening a second run row/workspace; "never retry a 409" pinned in tests). The
-   last open piece, **stale-run *adoption by terminal evidence***, now also shipped (§5
-   slice 10): a dangling **live** Claim whose run pointer references an already-**terminal**
-   `brief_runs` row is reclaimed at start time (`reclaim_terminal_claim` in `preflight_run`),
-   safe by construction and chronicled `brief.claim_reclaimed`, so a new start proceeds on
-   terminal evidence without waiting for the age-based `recover_stale_runs` sweep
+   last open piece, **stale-run *adoption by terminal evidence***, now shipped on **both**
+   the manual/Prime and the autonomous-heartbeat paths (§5 slice 10): a dangling **live**
+   Claim whose run pointer references an already-**terminal** `brief_runs` row is reclaimed
+   via the shared `reclaim_terminal_claim` helper — at start time (`preflight_run`) and as a
+   batch admission step (`reclaim_terminal_claims_ready`) at the top of every heartbeat
+   dispatch tick — safe by construction, idempotent, tenant-safe, and chronicled
+   `brief.claim_reclaimed`, so a start *or* an autonomous re-dispatch proceeds on terminal
+   evidence without waiting for the age-based `recover_stale_runs` sweep / lease expiry
    (`execution §1.4`/`§7.1` LOCKED; ledger "Claim HTTP 409 + per-Operative start lock +
-   duplicate-start guard" = DONE, "stale-run adoption" = DONE). *Remaining edge (deferred):*
-   Relix releases+re-claims rather than transferring the dead owner's checkout context in
-   place (full Paperclip "adopt the prior checkout run"); the reclaim is wired into the
-   manual/Prime start chokepoint, while the autonomous heartbeat path still relies on the
-   age-based sweep (a live-claimed Brief is not `ready`, so the heartbeat never races it).
+   duplicate-start guard" = DONE, "stale-run adoption" = DONE, "heartbeat stale-claim
+   admission" = DONE). *Remaining edge (deferred):* Relix releases+re-claims rather than
+   transferring the dead owner's checkout context in place (full Paperclip "adopt the prior
+   checkout run"); adoption fires on terminal evidence where the Claim's run pointer matches
+   a recorded terminal `brief_runs` row (the same evidence the manual/Prime path uses) — a
+   Claim whose pointer never matched a recorded run is still freed by lease expiry.
 2. **[BE] Guild-level spend hard-stop** — **SHIPPED for autonomous dispatch** (roadmap §5
    slice 2): the heartbeat path now refuses a Brief when its Guild is over its monthly
    budget, mirroring the per-Operative hard-stop and additive on top of it
