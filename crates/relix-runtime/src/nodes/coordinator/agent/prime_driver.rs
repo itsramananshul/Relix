@@ -87,6 +87,9 @@ const PHASE_NEEDS_APPLY: &str = "needs_apply";
 /// The autonomous disposition actions (distinct from any mandate-advance key).
 const ACTION_REVIEW_ACCEPT: &str = "review_accept";
 const ACTION_APPLY_RUN: &str = "apply_run";
+/// The autonomous plan-package approval action (accept/materialize a
+/// Prime-authored plan package through the existing plan-confirm path).
+const ACTION_PLAN_PACKAGE_APPROVE: &str = "plan_package_approve";
 
 // ── PRIME STANDING AUTHORITY (v1) ──────────────────────────────────────────
 // The Board can grant the autonomous Prime loop bounded power to take specific
@@ -133,8 +136,20 @@ pub const CATEGORY_RUN_REVIEW_ACCEPT: &str = "prime.run.review_accept";
 /// never applied, and a conflicted/failed apply NEVER marks the Brief done. Apply
 /// is SEPARATE from review acceptance (the grant above).
 pub const CATEGORY_RUN_APPLY: &str = "prime.run.apply";
+/// Standing-authority category: autonomous ACCEPTANCE / materialization of an
+/// OPEN plan-package `confirm` that autonomous Prime ITSELF authored (author =
+/// [`AUTONOMOUS_PRIME_AUTHORITY`]), through the EXISTING governed plan-confirm
+/// path (`TaskStore::respond_plan_confirm`) and the exactly-once decomposition
+/// ledger — the SAME primitive a human approval uses, so the behaviour is
+/// identical. This is NOT blanket self-approval: it ONLY ever accepts a
+/// Prime-authored package (a human/other-actor package is never auto-approved),
+/// it never bypasses the ledger or creates children by hand, it is tenant-scoped
+/// to a single Brief, and a duplicate / already-materialized package consumes no
+/// second grant. With no grant the loop leaves the confirm OPEN exactly as
+/// before (the pending package keeps holding a `before_execute` start).
+pub const CATEGORY_PLAN_PACKAGE_APPROVE: &str = "prime.plan_package.approve";
 
-/// The six standing-authority categories, in display order.
+/// The seven standing-authority categories, in display order.
 pub const STANDING_AUTHORITY_CATEGORIES: &[&str] = &[
     CATEGORY_PROPOSAL_APPROVE,
     CATEGORY_HIRE_APPROVE,
@@ -142,6 +157,7 @@ pub const STANDING_AUTHORITY_CATEGORIES: &[&str] = &[
     CATEGORY_STRATEGY_APPROVE,
     CATEGORY_RUN_REVIEW_ACCEPT,
     CATEGORY_RUN_APPLY,
+    CATEGORY_PLAN_PACKAGE_APPROVE,
 ];
 
 /// Default safe Rig the autonomous hire-approve binds when
@@ -1075,6 +1091,162 @@ fn try_open_plan_package_for_mandate(
     }
 }
 
+// ── PRIME PLAN-PACKAGE APPROVAL — STANDING AUTHORITY v1 ─────────────────────
+// The next safe slice of autonomy: let the loop ACCEPT/materialize a plan
+// package it ITSELF opened, but ONLY when the Board has granted the explicit
+// `prime.plan_package.approve` standing authority for the Guild. It is NOT
+// blanket self-approval — it accepts a Prime-authored package only, through the
+// EXISTING governed plan-confirm path (`respond_plan_confirm`) and the
+// exactly-once decomposition ledger (no hand-rolled child creation, no ledger
+// bypass), and consumes one bounded grant call only on a real materialization.
+
+/// Try to ACCEPT an OPEN plan-package confirm that autonomous Prime itself
+/// authored on `mandate_id`'s lone Brief, returning `Some(record)` when the
+/// approval step HANDLED the candidate (materialized the package, or honestly
+/// reported a budget/refusal) — the caller returns that record verbatim — and
+/// `None` when there is nothing to approve OR no standing grant (the caller
+/// proceeds with its normal flow: the pending package keeps holding the start /
+/// is reported by the open path). Runs BEFORE opening a duplicate package and
+/// BEFORE a raw start, so a pending Prime-authored package is an actionable
+/// governance gate the moment the grant exists.
+///
+/// Strictly bounded:
+/// - **Prime-authored only** — the confirm's `author` must be
+///   [`AUTONOMOUS_PRIME_AUTHORITY`]; a human/other-actor package is never
+///   auto-approved (returns `None`).
+/// - **Single-Brief, tenant-scoped** — same conservative scope as the open path;
+///   a many-Brief Mandate or a cross-Guild Brief is invisible (returns `None`).
+/// - **Grant-gated** — with no live `prime.plan_package.approve` standing grant
+///   in `tenant` it takes NO side effect and consumes NO grant (returns `None`),
+///   leaving the confirm OPEN exactly as before.
+/// - **Existing path + ledger** — acceptance flows through
+///   [`TaskStore::respond_plan_confirm`] (identical to the human approval), so
+///   the exactly-once ledger materializes the children; children always open
+///   unassigned (an autonomous package sets no assignee hints), so an empty
+///   resolved-assignee slice is correct.
+/// - **Idempotent** — once accepted the confirm is `resolved`, so a re-tick finds
+///   no OPEN Prime confirm and neither duplicates children nor consumes a second
+///   grant. A store refusal (e.g. a stale plan) is reported honestly with no
+///   grant consumed.
+#[allow(clippy::too_many_arguments)]
+fn try_approve_prime_plan_package_for_mandate(
+    agent_store: &AgentStore,
+    task_store: &TaskStore,
+    tenant: &str,
+    mandate_id: &str,
+    now_ms: i64,
+    actions: &mut usize,
+    max: usize,
+    phase: &str,
+    mk: &dyn Fn(String, &'static str, &'static str, String, Option<String>) -> PrimeAutonomyRecord,
+) -> Option<PrimeAutonomyRecord> {
+    // Same conservative scope as the open path: act only on a single-Brief
+    // candidate Mandate, and never on a Brief outside this Guild.
+    let briefs = task_store.list_briefs_by_mandate(mandate_id, 500).ok()?;
+    if briefs.len() != 1 {
+        return None;
+    }
+    let brief_id = briefs[0].task_id.clone();
+    if !task_store
+        .task_in_tenant(&brief_id, tenant)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    // Find the OPEN plan-package confirm Prime itself authored: a `confirm` bound
+    // to a `plan` Dossier WITH a linked `suggest_tasks` proposal, authored by the
+    // synthetic autonomous-Prime authority. A human/other-actor package (any other
+    // author) is deliberately invisible here — this authority is Prime-authored
+    // packages only.
+    let ix = task_store.list_interactions(&brief_id).ok()?;
+    let confirm = ix.iter().find(|i| {
+        i.kind == "confirm"
+            && i.status == "open"
+            && i.bound_doc_kind.as_deref() == Some("plan")
+            && i.bound_interaction_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            && i.author == AUTONOMOUS_PRIME_AUTHORITY
+    })?;
+
+    // A Prime-authored package EXISTS. Whether we accept it depends solely on the
+    // standing grant: with none, leave the confirm OPEN (no side effect, no grant
+    // consumed) and let the caller's normal flow hold/report it.
+    let now_secs = now_secs_from_ms(now_ms);
+    if !standing_active(agent_store, tenant, CATEGORY_PLAN_PACKAGE_APPROVE, now_secs) {
+        return None;
+    }
+    if *actions >= max {
+        return Some(mk(
+            phase.to_string(),
+            ACTION_PLAN_PACKAGE_APPROVE,
+            "skipped",
+            "tick action budget reached".into(),
+            Some(mandate_id.to_string()),
+        ));
+    }
+
+    // Accept through the EXISTING governed plan-confirm path + exactly-once
+    // decomposition ledger — the same primitive the human approval uses. Children
+    // open unassigned (no assignee hints on an autonomous package), so an empty
+    // resolved-assignee slice is correct; the ledger no-ops over any extra slot.
+    let confirm_id = confirm.interaction_id.clone();
+    match task_store.respond_plan_confirm(
+        tenant,
+        AUTONOMOUS_PRIME_AUTHORITY,
+        &brief_id,
+        &confirm_id,
+        AUTONOMOUS_PRIME_AUTHORITY,
+        true,
+        &[],
+    ) {
+        Ok(result) => {
+            *actions += 1;
+            // Consume ONE bounded grant call ONLY on a real materialization
+            // (`approved`). An idempotent `already_approved` (the ledger had
+            // already materialized) takes no second grant.
+            if result.outcome == "approved" {
+                let _ =
+                    consume_standing(agent_store, tenant, CATEGORY_PLAN_PACKAGE_APPROVE, now_secs);
+            }
+            chronicle_autonomous(
+                task_store,
+                mandate_id,
+                "prime.autonomous_plan_package_approve",
+                &format!(
+                    "autonomous Prime approved its plan package on brief {brief_id} (confirm {confirm_id}, {}): materialized {} child Brief(s)",
+                    result.outcome,
+                    result.created.len()
+                ),
+            );
+            let mut rec = mk(
+                phase.to_string(),
+                ACTION_PLAN_PACKAGE_APPROVE,
+                "advanced",
+                format!(
+                    "approved Prime-authored plan package on brief {brief_id} ({}); materialized {} child Brief(s)",
+                    result.outcome,
+                    result.created.len()
+                ),
+                Some(mandate_id.to_string()),
+            );
+            rec.suggestion_id = Some(result.suggestion_id);
+            rec.confirm_id = Some(confirm_id);
+            rec.child_count = Some(result.created.len());
+            Some(rec)
+        }
+        // Store refusal (e.g. the plan went stale, or a race) — report honestly,
+        // take no credit, consume no grant; the confirm is left as the store left it.
+        Err(e) => Some(mk(
+            phase.to_string(),
+            ACTION_PLAN_PACKAGE_APPROVE,
+            "blocked",
+            format!("plan package approve refused: {e}"),
+            Some(mandate_id.to_string()),
+        )),
+    }
+}
+
 /// Compute the next governed step for a proposal or a mandate. Returns
 /// `Err(HandlerOutcome)` for an invalid arg / not-found target so a caller can
 /// return it verbatim.
@@ -1797,6 +1969,7 @@ pub fn handle_prime_standing_authority(
         "Autonomously approve a proposed Mandate strategy through the existing mandate.strategy.approve path (a rejected/missing strategy is never approved).",
         "Autonomously accept a completed Shift's review for a Brief in this Guild's own Mandate/proposal set, through the existing review path (only a done + pending_review run; this never applies).",
         "Autonomously apply an already-accepted run through the existing safe apply machinery (run_apply_eligibility, conflict/baseline checks, review-to-done); a conflicted/failed apply never marks the Brief done.",
+        "Autonomously accept/materialize an OPEN plan-package confirm that autonomous Prime itself authored, through the existing plan-confirm path + exactly-once decomposition ledger (Prime-authored packages only; a human/other-actor package is never auto-approved).",
     ];
     let categories: Vec<Value> = STANDING_AUTHORITY_CATEGORIES
         .iter()
@@ -3264,6 +3437,33 @@ fn process_candidate_inner(
     // Chronicle all go through the shared heartbeat machinery (no new run system,
     // stamped as an autonomous/heartbeat-trigger run, not dashboard `manual`).
     if step.phase == "ready_to_start" {
+        // (B-approve) Prime Plan-Package Approval — Standing Authority v1. BEFORE
+        // opening a new (duplicate) package and BEFORE any raw start, if this
+        // candidate has an OPEN plan-package confirm that autonomous Prime ITSELF
+        // authored AND the Board granted the `prime.plan_package.approve` standing
+        // authority for this Guild, ACCEPT/materialize the package through the
+        // EXISTING governed plan-confirm path + exactly-once decomposition ledger.
+        // With no grant this is a no-op (returns `None`) and the (B0) active-planner
+        // hold below keeps the pending package open exactly as before. Independent
+        // of the authoring switch: approval authority is separate from authoring.
+        // Prime-authored packages only — a human/other-actor package is never
+        // auto-approved. Runs in every trigger mode so a pending package is an
+        // actionable governance gate the moment the grant exists.
+        if let Some(mid) = mandate_id.clone()
+            && let Some(rec) = try_approve_prime_plan_package_for_mandate(
+                agent_store,
+                task_store,
+                tenant,
+                &mid,
+                now_ms,
+                actions,
+                max,
+                &phase,
+                &mk,
+            )
+        {
+            return rec;
+        }
         // (B0) Active planner (Prime Active Planner Trigger v2 — `before_execute`).
         // BEFORE starting/executing this candidate's ready work, if the master
         // plan-package opt-in is on AND the trigger is `before_execute` AND the
@@ -3847,6 +4047,29 @@ fn process_candidate_inner(
     // dedup-guarded (no second package, never over a human/locked/existing plan).
     // Because the plan-package primitive attaches to a Brief, the candidate's
     // resolved Mandate must carry one.
+    //
+    // (B5-approve) First, the standing-authority approval gate (Plan-Package
+    // Approval v1): a tail/idle candidate may already carry an OPEN plan-package
+    // confirm Prime itself authored on a PRIOR tick. If the Guild granted
+    // `prime.plan_package.approve`, ACCEPT/materialize it through the existing
+    // plan-confirm path BEFORE the (B5) open path would merely re-report it as
+    // pending. With no grant this is a no-op and (B5) reports the pending package
+    // exactly as before. Prime-authored packages only.
+    if let Some(mid) = mandate_id.clone()
+        && let Some(rec) = try_approve_prime_plan_package_for_mandate(
+            agent_store,
+            task_store,
+            tenant,
+            &mid,
+            now_ms,
+            actions,
+            max,
+            &phase,
+            &mk,
+        )
+    {
+        return rec;
+    }
     if plan_package_llm_enabled
         && let Some(mid) = mandate_id.clone()
         && let Some(rec) = try_open_plan_package_for_mandate(
@@ -9394,5 +9617,286 @@ in force.\n";
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // ── PRIME PLAN-PACKAGE APPROVAL — STANDING AUTHORITY v1 ─────────────────
+    // The next slice: with an explicit `prime.plan_package.approve` standing
+    // grant, the loop ACCEPTS/materializes a plan package it ITSELF authored,
+    // through the existing plan-confirm path + exactly-once decomposition ledger.
+    // No grant → the confirm stays open (the pending package keeps holding the
+    // start). Prime-authored packages only; tenant-scoped; idempotent.
+
+    /// Open a plan package on `brief` authored by `author`, with two unassigned
+    /// children. `AUTONOMOUS_PRIME_AUTHORITY` makes it a Prime-authored package
+    /// the approval gate may accept; any other author makes it a human/other-actor
+    /// package the gate must refuse.
+    fn open_package_as(
+        tasks: &Arc<TaskStore>,
+        brief: &str,
+        author: &str,
+    ) -> crate::nodes::coordinator::brief::PlanPackage {
+        use crate::nodes::coordinator::brief::ChildSpec;
+        let children = vec![
+            ChildSpec {
+                title: "Wire the form".into(),
+                priority: Some("high".into()),
+                after: None,
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
+            ChildSpec {
+                title: "Hook up auth".into(),
+                priority: None,
+                after: Some(0),
+                assignee_agent_id: None,
+                assignee_role: None,
+            },
+        ];
+        tasks
+            .open_plan_package(
+                brief,
+                author,
+                "Login plan",
+                "# Plan\n\nDecompose the login work.",
+                "Decompose the login page",
+                &children,
+                "Approve this plan and create the proposed task(s)?",
+            )
+            .unwrap()
+    }
+
+    // PPA1) No standing grant: a Prime-authored open package is NOT approved — the
+    //       confirm stays open, no children materialize, and the grant is untouched.
+    #[test]
+    fn plan_package_approve_without_standing_leaves_confirm_open() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (_m, brief) = idle_single_brief_mandate(&agents, &spine, &tasks, "default", "ppa1");
+        let pkg = open_package_as(&tasks, &brief, AUTONOMOUS_PRIME_AUTHORITY);
+
+        // No grant. A tick must not approve the package.
+        let recs = tick_pp(&agents, &spine, &tasks, &reg, 5, Some("default"), None);
+        assert!(
+            recs.iter().all(|r| r.action != "plan_package_approve"),
+            "no approval without a standing grant"
+        );
+        // Confirm still open, no children materialized.
+        assert_eq!(open_interactions(&tasks, &brief), (1, 1));
+        assert!(tasks.list_subbriefs(&brief).unwrap().is_empty());
+        let ix = tasks.list_interactions(&brief).unwrap();
+        assert!(
+            ix.iter()
+                .any(|i| i.interaction_id == pkg.confirm_id && i.status == "open"),
+            "the Prime confirm is left OPEN"
+        );
+    }
+
+    // PPA2) With the `prime.plan_package.approve` standing grant: the open
+    //       Prime-authored package is accepted through the EXISTING plan-confirm
+    //       path + ledger — children materialize, the confirm resolves, and the
+    //       bounded (max_calls=1) grant is consumed exactly once.
+    #[test]
+    fn plan_package_approve_with_standing_materializes_through_ledger() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief) = idle_single_brief_mandate(&agents, &spine, &tasks, "default", "ppa2");
+        let pkg = open_package_as(&tasks, &brief, AUTONOMOUS_PRIME_AUTHORITY);
+        let _grant = grant_standing(&agents, "default", CATEGORY_PLAN_PACKAGE_APPROVE, Some(1));
+
+        let recs = tick_pp(&agents, &spine, &tasks, &reg, 5, Some("default"), None);
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m && r.action == "plan_package_approve")
+            .expect("the pending Prime package is approved with the standing grant");
+        assert_eq!(rec.outcome, "advanced");
+        assert_eq!(rec.confirm_id.as_deref(), Some(pkg.confirm_id.as_str()));
+        assert_eq!(rec.child_count, Some(2));
+        // Children materialized through the ledger; the confirm is resolved.
+        assert_eq!(tasks.list_subbriefs(&brief).unwrap().len(), 2);
+        let ix = tasks.list_interactions(&brief).unwrap();
+        assert!(
+            ix.iter()
+                .any(|i| i.interaction_id == pkg.confirm_id && i.status == "resolved"),
+            "the Prime confirm is resolved on approval"
+        );
+        // The bounded grant (max_calls=1) is now exhausted — consumed exactly once.
+        assert!(
+            !standing_active(&agents, "default", CATEGORY_PLAN_PACKAGE_APPROVE, 0),
+            "a bounded grant is consumed once on approval"
+        );
+    }
+
+    // PPA3) Re-tick idempotency: after approval the confirm is resolved, so a
+    //       second tick neither materializes duplicate children nor consumes a
+    //       second grant call (max_calls=2 → still one left).
+    #[test]
+    fn plan_package_approve_is_idempotent_on_retick() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief) = idle_single_brief_mandate(&agents, &spine, &tasks, "default", "ppa3");
+        let _pkg = open_package_as(&tasks, &brief, AUTONOMOUS_PRIME_AUTHORITY);
+        let _grant = grant_standing(&agents, "default", CATEGORY_PLAN_PACKAGE_APPROVE, Some(2));
+
+        let recs1 = tick_pp(&agents, &spine, &tasks, &reg, 5, Some("default"), None);
+        assert!(
+            recs1
+                .iter()
+                .any(|r| r.target_id == m && r.action == "plan_package_approve"),
+            "first tick approves"
+        );
+        assert_eq!(tasks.list_subbriefs(&brief).unwrap().len(), 2);
+
+        // Re-tick: the confirm is already resolved → nothing to approve.
+        let recs2 = tick_pp(&agents, &spine, &tasks, &reg, 5, Some("default"), None);
+        assert!(
+            recs2.iter().all(|r| r.action != "plan_package_approve"),
+            "no second approval on the re-tick"
+        );
+        // No duplicate children.
+        assert_eq!(tasks.list_subbriefs(&brief).unwrap().len(), 2);
+        // The grant still has a call left — only ONE was consumed across two ticks.
+        assert!(
+            standing_active(&agents, "default", CATEGORY_PLAN_PACKAGE_APPROVE, 0),
+            "only one grant call is consumed across the two ticks"
+        );
+    }
+
+    // PPA4) Tenant isolation: a grant in Guild A cannot approve a Guild B package.
+    //       The package lives in `guild-b` (no grant there); the grant is in
+    //       `guild-a`. Driving `guild-b` must not approve it.
+    #[test]
+    fn plan_package_approve_is_tenant_isolated() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (_m, brief) = idle_single_brief_mandate(&agents, &spine, &tasks, "guild-b", "ppa4");
+        let pkg = open_package_as(&tasks, &brief, AUTONOMOUS_PRIME_AUTHORITY);
+        // Grant the approval authority in a DIFFERENT Guild.
+        let _grant = grant_standing(&agents, "guild-a", CATEGORY_PLAN_PACKAGE_APPROVE, Some(5));
+
+        // Drive guild-b (where the package lives) — it has no grant of its own.
+        let recs = tick_pp(&agents, &spine, &tasks, &reg, 5, Some("guild-b"), None);
+        assert!(
+            recs.iter().all(|r| r.action != "plan_package_approve"),
+            "a guild-a grant must not approve a guild-b package"
+        );
+        assert!(tasks.list_subbriefs(&brief).unwrap().is_empty());
+        let ix = tasks.list_interactions(&brief).unwrap();
+        assert!(
+            ix.iter()
+                .any(|i| i.interaction_id == pkg.confirm_id && i.status == "open"),
+            "the cross-Guild package stays open"
+        );
+    }
+
+    // PPA5) A human/other-actor package is NEVER auto-approved — even with the
+    //       grant. This authority is for Prime-authored packages only.
+    #[test]
+    fn plan_package_approve_refuses_human_authored_package() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (_m, brief) = idle_single_brief_mandate(&agents, &spine, &tasks, "default", "ppa5");
+        // A human (operator) opens the package — NOT the autonomous Prime authority.
+        let pkg = open_package_as(&tasks, &brief, "operator");
+        let _grant = grant_standing(&agents, "default", CATEGORY_PLAN_PACKAGE_APPROVE, Some(5));
+
+        let recs = tick_pp(&agents, &spine, &tasks, &reg, 5, Some("default"), None);
+        assert!(
+            recs.iter().all(|r| r.action != "plan_package_approve"),
+            "a human-authored package is never auto-approved"
+        );
+        assert!(tasks.list_subbriefs(&brief).unwrap().is_empty());
+        let ix = tasks.list_interactions(&brief).unwrap();
+        assert!(
+            ix.iter()
+                .any(|i| i.interaction_id == pkg.confirm_id && i.status == "open"),
+            "the human package stays open"
+        );
+    }
+
+    // PPA6) Before-execute pipeline integration: tick 1 OPENS the package (trigger
+    //       before_execute) and holds the start; tick 2 — with the standing grant —
+    //       APPROVES/materializes it through the ledger BEFORE any new open / raw
+    //       start; tick 3 proceeds without duplicating the package or re-approving.
+    #[test]
+    fn plan_package_before_execute_then_standing_approval_then_proceed() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = ready_bare_mandate(&agents, &spine, &tasks, "default");
+        let brief = lone_brief(&tasks, &m);
+        let decider = ScriptedDecider {
+            reply: Ok(pp_reply()),
+        };
+
+        // Tick 1 — before_execute opens the package and HOLDS the start (no grant).
+        let recs1 = tick_pp_trig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            5,
+            Some("default"),
+            Some(&decider),
+            PrimePlanPackageTrigger::BeforeExecute,
+        );
+        let open = recs1
+            .iter()
+            .find(|r| r.target_id == m && r.action == "plan_package")
+            .expect("tick 1 opens the package");
+        assert_eq!(open.outcome, "advanced");
+        let confirm = open.confirm_id.clone().unwrap();
+        assert_eq!(open_interactions(&tasks, &brief), (1, 1));
+        assert!(tasks.list_subbriefs(&brief).unwrap().is_empty());
+
+        // Grant the approval authority, then Tick 2 — the pending Prime package is
+        // accepted through the ledger before any new open / raw start.
+        let _grant = grant_standing(&agents, "default", CATEGORY_PLAN_PACKAGE_APPROVE, Some(1));
+        let recs2 = tick_pp_trig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            5,
+            Some("default"),
+            Some(&decider),
+            PrimePlanPackageTrigger::BeforeExecute,
+        );
+        let appr = recs2
+            .iter()
+            .find(|r| r.target_id == m && r.action == "plan_package_approve")
+            .expect("tick 2 approves the pending package with the grant");
+        assert_eq!(appr.outcome, "advanced");
+        assert_eq!(appr.confirm_id.as_deref(), Some(confirm.as_str()));
+        assert_eq!(tasks.list_subbriefs(&brief).unwrap().len(), 2);
+        // Confirm resolved, no open package left.
+        assert_eq!(open_interactions(&tasks, &brief), (0, 0));
+
+        // Tick 3 — the package is materialized; the candidate proceeds without
+        // opening a duplicate package or re-approving.
+        let recs3 = tick_pp_trig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            5,
+            Some("default"),
+            Some(&decider),
+            PrimePlanPackageTrigger::BeforeExecute,
+        );
+        assert!(
+            recs3.iter().all(|r| r.action != "plan_package_approve"),
+            "no second approval"
+        );
+        assert!(
+            recs3.iter().all(|r| r.action != "plan_package"),
+            "no duplicate package is opened after materialization"
+        );
+        // Still exactly the two children — no duplication.
+        assert_eq!(tasks.list_subbriefs(&brief).unwrap().len(), 2);
     }
 }

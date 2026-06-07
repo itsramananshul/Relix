@@ -293,12 +293,30 @@ Brief+kind on read. What it does **not** do:
       - Any **unknown** value safely falls back to `tail`. The effective trigger is
         surfaced on the tick record as `plan_package_trigger` (`tail` /
         `before_execute`).
+    - **Approving a Prime-authored package is now possible, but ONLY under an
+      explicit standing grant (Prime Plan-Package Approval — Standing Authority
+      v1).** Authoring a package never approves it; acceptance still requires a
+      separate, Board-granted `prime.plan_package.approve` standing authority for
+      the Guild (see the standing-authority section below). With that grant active,
+      the autonomous/manual Prime tick will — *before* opening a duplicate package
+      and *before* any raw start — ACCEPT/materialize an **OPEN plan-package confirm
+      that autonomous Prime itself authored** (author `__relix_autonomous_prime__`),
+      through the EXISTING `TaskStore::respond_plan_confirm` path and the
+      exactly-once decomposition ledger (the SAME primitive a human approval uses —
+      no hand-rolled child creation, no ledger bypass). It is **not** blanket
+      self-approval: it is single-Brief + tenant-scoped, accepts a **Prime-authored
+      package only** (a human/other-actor package is never auto-approved), consumes
+      one bounded grant call only on a real materialization, and is idempotent (an
+      already-accepted package neither duplicates children nor consumes a second
+      grant). With **no** grant the confirm stays OPEN exactly as before — in
+      `before_execute` the pending package keeps holding the start across ticks.
     - **Honest scope / remaining limits:** this is bounded plan-package *authoring*
-      under a configurable trigger, NOT freeform document editing and **NOT
-      autonomous approval** — Prime never accepts its own confirm (no
-      standing-authority category gates plan-package approval; self-approval is
-      deliberately **not implemented**). Even in `before_execute` the only thing
-      preempted is the raw start of a **lone eligible leaf** Brief; it does **not**
+      under a configurable trigger plus **grant-gated** approval of Prime-authored
+      packages — NOT freeform document editing and **NOT** blanket self-approval
+      (with no `prime.plan_package.approve` standing grant Prime never accepts its
+      own confirm, and it never approves another actor's package). Even in
+      `before_execute` the only thing preempted is the raw start of a **lone
+      eligible leaf** Brief; it does **not**
       interrupt higher-priority governance gates (proposal / strategy approval, team
       plan, hire / Clearance), decompose multi-Brief / orchestrated Mandates, or
       scan every leaf Brief. The live bridge→model→coordinator round trip is **not**
@@ -507,7 +525,7 @@ the approved work is already ready. What it does **not** do:
     when — the Board has granted a bounded **standing approval** in the Guild, the
     same loop may also take the specific *approval* action the grant covers. This
     is **not a loop-toggle bypass**: turning the loop on wakes the driver, but
-    each of the six approval categories acts **only** while a
+    each of the seven approval categories acts **only** while a
     `standing_approvals` row exists for the synthetic authority subject
     `__relix_autonomous_prime__` in that tenant. The categories are:
     `prime.proposal.approve` (autonomously approve a **proposed** Prime proposal
@@ -543,7 +561,17 @@ the approved work is already ready. What it does **not** do:
     apply records `blocked` and **never** marks the Brief done, and is not retried
     in the same tick). **Review and apply are SEPARATE grants and SEPARATE ticks**
     — a single tick accepts XOR applies one run (the first tick accepts; the next
-    applies), so neither can be combined into one broad superpower. Each autonomous approval **consumes** one
+    applies), so neither can be combined into one broad superpower. The seventh
+    category is `prime.plan_package.approve` (autonomously **accept/materialize an
+    OPEN plan-package confirm that autonomous Prime itself authored** — author
+    `__relix_autonomous_prime__` — through the existing
+    `TaskStore::respond_plan_confirm` path and the exactly-once decomposition
+    ledger, the SAME primitive a human approval uses; it is single-Brief +
+    tenant-scoped, runs **before** opening a duplicate package or any raw start, and
+    accepts a **Prime-authored package only** — a human/other-actor package is never
+    auto-approved. With no grant the confirm stays OPEN, so a pending `before_execute`
+    package keeps holding the start; once accepted the confirm is `resolved`, so a
+    re-tick neither duplicates children nor consumes a second grant). Each autonomous approval **consumes** one
     call of a bounded grant (`max_calls` / `max_cost_micros`); an unlimited grant
     is not decremented (existing standing-approval semantics). It is **tenant-safe**
     (a grant in Guild A never approves Guild B's proposal/hire/Clearance/strategy — the
@@ -553,7 +581,7 @@ the approved work is already ready. What it does **not** do:
     (`POST`/`DELETE /v1/agents/__relix_autonomous_prime__/standing-approvals`) —
     the same routes real Operatives use, so **no duplicate approval system was
     invented**. **The Settings page is now an operator control surface, not
-    read-only:** each of the six categories shows enabled/disabled with a
+    read-only:** each of the seven categories shows enabled/disabled with a
     **Grant** (when disabled) / **Revoke** (when enabled) button. Granting creates
     a bounded standing approval for the synthetic authority (default `expires_at =
     now + 24h`, `max_calls = 25`, no cost cap); revoking deletes every row for that

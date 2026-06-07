@@ -917,14 +917,16 @@ candidate the existing governed flow leaves **idle**, Prime may OPEN a plan pack
 single un-decomposed Brief and **leave the confirm OPEN for a human** — but **the model
 is NOT the permission system**, exactly as in §C/§D/§E/§F:
 
-- **Propose only — never approve, never assign, never create children.** Prime opens the
-  package through the EXISTING `open_plan_package` primitive (the interactions stamped
-  with the synthetic `__relix_autonomous_prime__` authority) and stops. It does **not**
-  accept its own `confirm` (no standing-authority category gates plan-package approval in
-  this v1 — distinct from §G's grant-gated review/apply), so children are materialized
-  only when a human accepts through the EXISTING `brief.plan_confirm_respond` path and the
-  EXISTING exactly-once decomposition ledger (§1.7). Children always open **unassigned**
-  (no model-chosen assignee).
+- **Propose only — the AUTHORING layer never approves, assigns, or creates children.**
+  Prime opens the package through the EXISTING `open_plan_package` primitive (the
+  interactions stamped with the synthetic `__relix_autonomous_prime__` authority) and stops.
+  The authoring layer does **not** accept its own `confirm`; children are materialized only
+  when an approval accepts through the EXISTING `brief.plan_confirm_respond` /
+  `respond_plan_confirm` path and the EXISTING exactly-once decomposition ledger (§1.7).
+  That approval is either a human, **or** — under the explicit, default-OFF
+  `prime.plan_package.approve` standing grant (F-quater below, distinct from §G's review/
+  apply) — the autonomous loop accepting its OWN Prime-authored package. Children always
+  open **unassigned** (no model-chosen assignee).
 - **The model authors content only.** It may write the plan title/body, the approval
   summary, and a bounded list of proposed child Briefs (title / priority / a backward
   `after` dependency) — nothing else. It can never choose a method, capability, or tool,
@@ -988,11 +990,57 @@ is on.
   effective trigger is surfaced on the tick record as `plan_package_trigger`
   (`tail` / `before_execute`).
 
-**Still NOT autonomous approval.** `before_execute` is the active *planner*, not an
-autonomous *approver*: Prime still never accepts its own `confirm`, still never assigns
-agents / picks tools / creates children, and a human still materializes the decomposition
-through `brief.plan_confirm_respond`. This is **not** freeform LLM control of the company —
-it is a bounded, governed proposal placed one step earlier in the tick.
+**Authoring still NEVER approves on its own.** `before_execute` is the active *planner*,
+not an autonomous *approver*: the authoring layers (F-bis / F-ter) still never accept their
+own `confirm`, never assign agents / pick tools / create children, and always leave the
+confirm OPEN. Acceptance is a **separate, grant-gated** authority — F-quater below — never
+implied by authoring. This is **not** freeform LLM control of the company — it is a bounded,
+governed proposal placed one step earlier in the tick.
+
+### F-quater. Prime Plan-Package Approval — Standing Authority v1 (opt-in, grant-gated)
+
+**The gap.** F-bis/F-ter let Prime *author* a plan package but always left the `confirm`
+OPEN for a human — so even a Prime-authored decomposition stalled until a person clicked
+Approve. That was the right default while no authority existed, but it left the loop unable
+to carry a package it had itself proposed all the way to materialized children, even when
+the Board wanted exactly that.
+
+**The contract.** Acceptance of a Prime-authored package is now possible, but **only**
+through an explicit, Board-granted standing authority — never as a side effect of authoring.
+This is the seventh standing-authority category (alongside §G's review/apply), with the same
+"operate *through* the grant, not around the gate" rule:
+
+- **`prime.plan_package.approve` — the grant.** When — and ONLY when — a live
+  `standing_approvals` row for `__relix_autonomous_prime__` in the Guild covers this
+  category, the autonomous/manual tick will ACCEPT/materialize an **OPEN plan-package
+  confirm that autonomous Prime itself authored** (confirm/suggestion `author` =
+  `__relix_autonomous_prime__`). With no grant the confirm stays OPEN exactly as in
+  F-bis/F-ter (a pending `before_execute` package keeps holding the start).
+- **Existing path + exactly-once ledger.** Acceptance flows through the EXISTING
+  `TaskStore::respond_plan_confirm` primitive — the SAME one the human
+  `brief.plan_confirm_respond` handler calls — so the linked proposal is materialized once
+  through the exactly-once decomposition ledger (§1.7). No hand-rolled child creation, no
+  ledger bypass. Children open **unassigned** (an autonomous package carries no assignee
+  hints), so the resolved-assignee set is empty.
+- **Prime-authored packages ONLY.** A `confirm` authored by a human or any other actor is
+  never auto-approved, even with the grant — the gate matches on the synthetic authority id.
+- **Ordering — an actionable governance gate.** The approval runs **before** opening a
+  duplicate package and **before** any raw start. A pending Prime-authored package is the
+  next relevant gate the moment the grant exists; without the grant the prior hold/report
+  behaviour is unchanged.
+- **Bounded + tenant-scoped + idempotent.** Single-Brief candidate Mandates only; a grant
+  in Guild A never approves Guild B's package. One bounded grant call is consumed **only**
+  on a real materialization (`max_calls` / `max_cost_micros`; an unlimited grant is not
+  decremented). Once accepted the confirm is `resolved`, so a re-tick neither duplicates
+  children nor consumes a second grant. A stale/refused accept is recorded honestly with no
+  grant consumed. The tick record carries the action `plan_package_approve` (outcome
+  `advanced` on success) with the `suggestion_id` / `confirm_id` / `child_count`.
+
+**Still NOT blanket self-approval.** This is explicit standing authority for **Prime-authored
+packages only**, through the existing confirm/decomposition-ledger path only — not a code
+path that lets Prime approve arbitrary work, another actor's package, or anything beyond the
+bound the Board set. With no `prime.plan_package.approve` grant every plan-package gate stays
+human, exactly as before.
 
 ### G. Prime Shift Disposition v1 — autonomous review-accept + apply (opt-in, grant-gated)
 
