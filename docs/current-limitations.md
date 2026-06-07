@@ -371,10 +371,42 @@ the approved work is already ready. What it does **not** do:
     acts only while its grant is live. With no standing grant, every approval gate
     stays human exactly as before — autonomy here only *adds* power when the Board
     has explicitly granted it, inside the bound it set.
+  - **Prime Strategy Drafting (v1) — Prime now DRAFTS a Mandate strategy, but
+    still does not APPROVE it.** Previously a Mandate with no strategy was a dead
+    stop until an operator hand-wrote and proposed a strategy doc. Now, when a
+    Mandate has **no strategy yet**, the guided/autonomous driver classifies it as
+    `needs_strategy_proposal` (`advance_action = "propose_strategy"`,
+    `can_advance = true`) and can compose a **deterministic** strategy doc from the
+    Mandate's own fields (title / description / status) + the Guild's active work
+    roles and propose it through the **existing** `mandate.strategy.propose` path
+    (`draft_mandate_strategy` → `handle_strategy_propose`). The manual
+    one-click `prime.advance {action:"propose_strategy"}` and the opt-in autonomous
+    Prime tick both run it through that same governed handler, stale-guarded exactly
+    like the other advance actions. **It is emphatically NOT strategy approval:** the
+    doc lands `proposed` (it surfaces in the Action Center / Approvals as an
+    `approval` item, and the next governed step becomes the human
+    `mandate.strategy.approve` gate); team planning and orchestration stay locked
+    until a human (or a future explicit standing-authority category) approves it.
+    It is **idempotent and non-destructive** — a strategy already `proposed`,
+    `approved`, or `rejected` is **never overwritten** (a re-advance refuses as
+    `stale_action`), so a human **rejection** is honoured: Prime does not turn
+    around and re-propose to fight the operator. It is **tenant-scoped** (a tick for
+    Guild A never drafts Guild B's strategy), **bounded** (consumes one autonomous
+    tick action when it proposes), and **chronicled only when it actually proposes**
+    — a distinct `prime.autonomous_strategy_proposed` event is appended to the
+    Mandate's parent Brief if one exists (a strategy is usually drafted *before*
+    orchestration, so there is often no Brief yet and the `PrimeAutonomyRecord` is
+    the only trace, by design — an idle/skipped tick spams nothing). The draft is
+    **deterministic v1 only** — there is **no model-backed strategy reasoning**; the
+    body is a structured objective / constraints / team-tracks / execution /
+    review-apply / risk-and-approval doc derived from the Mandate, sanitized for the
+    pipe-delimited wire and length-bounded. **No new provider/key system was added.**
   - What this still does **NOT** do: there is **no LLM/strategy reasoning** — the
-    autonomous driver only executes the deterministic next governed step; it
-    **does not author strategy, decide which person/identity to hire, or invent a
-    goal from raw intent**. **Raw goal creation still starts from a submitted
+    autonomous driver only executes the deterministic next governed step, and the
+    strategy it drafts (above) is a **deterministic** doc, never a model-reasoned
+    one; it **drafts a strategy proposal but does not approve it, does not decide
+    which person/identity to hire, and does not invent a goal from raw intent**.
+    **Raw goal creation still starts from a submitted
     goal/proposal** — Prime proposes a plan from a request; it never conjures a
     goal from nothing. The standing-authority layer may *approve* a proposal,
     *activate* a planning hire, or *greenlight* a planning Clearance — but only
@@ -602,10 +634,12 @@ shapes the *interpretation* (never crew/governance), and with **no standing
 grant** the loop **never** auto-approves a strategy / hire / spawn / budget /
 Clearance gate — so by default approvals + hire decisions + the Guild budget
 ceiling stay human, raw goal creation still starts from a submitted
-goal/proposal, and there is still no driver that **reasons about strategy
-itself** or takes a goal from raw intent to done autonomously. Autonomy operates
-strictly **inside** the Board's gates — after a human approval, or within an
-explicit standing grant.
+goal/proposal. Prime now **drafts** a deterministic Mandate strategy and proposes
+it (Prime Strategy Drafting v1, above) — but that is a *draft*, left `proposed`
+for a human to approve, not a driver that **reasons about strategy itself** or
+takes a goal from raw intent to done autonomously. Autonomy operates strictly
+**inside** the Board's gates — after a human approval, or within an explicit
+standing grant.
 
 ### Bridge persists every chat as a Task (fail-soft)
 

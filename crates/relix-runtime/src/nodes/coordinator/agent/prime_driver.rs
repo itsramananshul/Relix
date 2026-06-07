@@ -37,7 +37,7 @@ use crate::nodes::coordinator::TaskStore;
 use crate::nodes::coordinator::agent::handlers::{
     ReadinessView, autonomous_approve_spawn_clearance, brief_status_row, caller_is_operator,
     compute_readiness, handle_orchestrate, handle_prime_approve, handle_prime_start,
-    handle_team_plan, internal, invalid, policy_denied,
+    handle_strategy_propose, handle_team_plan, internal, invalid, policy_denied,
 };
 use crate::nodes::coordinator::agent::prime;
 use crate::nodes::coordinator::agent::store::{AgentStore, StandingApprovalMatch};
@@ -48,6 +48,12 @@ use crate::nodes::coordinator::spine::SpineStore;
 /// here — they stay human decisions.
 const ADVANCE_CREATE_TEAM_PLAN: &str = "create_team_plan";
 const ADVANCE_ORCHESTRATE: &str = "orchestrate_assign_ready";
+/// Prime Strategy Drafting v1 (company-model §12.5/§12.5A — the Prime planner).
+/// The driver may DRAFT a Mandate strategy when none exists and propose it
+/// through the existing `mandate.strategy.propose` path. This is **not** strategy
+/// approval — the doc lands `proposed` and still needs a human (or an explicit
+/// standing grant) to approve before team planning unlocks.
+const ADVANCE_PROPOSE_STRATEGY: &str = "propose_strategy";
 
 // ── PRIME STANDING AUTHORITY (v1) ──────────────────────────────────────────
 // The Board can grant the autonomous Prime loop bounded power to take specific
@@ -356,6 +362,91 @@ fn active_crew_roles(agent_store: &AgentStore, tenant: &str) -> Vec<&'static str
     roles
 }
 
+/// Max characters of a Mandate's free-text description folded into a drafted
+/// strategy — keeps the proposal bounded regardless of input size.
+const STRATEGY_DRAFT_DESC_CAP: usize = 600;
+/// Hard cap on the whole drafted strategy body.
+const STRATEGY_DRAFT_BODY_CAP: usize = 4000;
+
+/// Prime Strategy Drafting v1 (company-model §12.5/§12.5A — the Prime planner).
+/// Produce a concise, useful strategy doc DETERMINISTICALLY from the Mandate's own
+/// fields (title / description / status) plus the known company context (the
+/// Guild's active work roles). NO model, NO secret-shaped values — this is the safe
+/// deterministic draft Prime proposes when a Mandate has no strategy yet. The
+/// result is sanitized for the pipe-delimited `mandate.strategy.propose` wire (the
+/// `|` separator is replaced) and length-bounded. It is left `proposed` for human
+/// approval: drafting is NOT approval.
+pub(crate) fn draft_mandate_strategy(
+    mandate: &crate::nodes::coordinator::spine::store::Mandate,
+    active_roles: &[&str],
+) -> String {
+    let title = match mandate.title.trim() {
+        "" => "(untitled Mandate)",
+        t => t,
+    };
+    let status = match mandate.status.trim() {
+        "" => "planned",
+        s => s,
+    };
+    let desc = mandate.description.trim();
+    let objective = if desc.is_empty() {
+        format!("Deliver the Mandate \"{title}\".")
+    } else if desc.chars().count() > STRATEGY_DRAFT_DESC_CAP {
+        let clipped: String = desc.chars().take(STRATEGY_DRAFT_DESC_CAP).collect();
+        format!("{clipped}…")
+    } else {
+        desc.to_string()
+    };
+
+    let tracks = if active_roles.is_empty() {
+        "No active work crew yet — staff the team (team plan / hires) before execution can begin."
+            .to_string()
+    } else {
+        active_roles
+            .iter()
+            .map(|r| format!("- {r}: own the {r} work track for this Mandate."))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let body = format!(
+        "# Strategy — {title}\n\
+         \n\
+         Status at drafting: {status}. This is a Prime DRAFT proposal (deterministic v1), not an approved strategy.\n\
+         \n\
+         ## Objective\n{objective}\n\
+         \n\
+         ## Constraints\n\
+         - Stay within the approved Mandate scope; do not expand beyond \"{title}\".\n\
+         - Human approval gates remain in force (strategy, hires, spawn Clearances, budget).\n\
+         - Execution runs in scoped Shift workspaces; changes are reviewed before they are applied.\n\
+         \n\
+         ## Team & work tracks\n{tracks}\n\
+         \n\
+         ## Execution approach\n\
+         - Decompose the Mandate into Briefs and assign each to the relevant work track.\n\
+         - Run assigned Briefs as Shifts; keep sub-work and blockers explicit.\n\
+         - Sequence dependent work; let independent tracks proceed in parallel.\n\
+         \n\
+         ## Review & apply policy\n\
+         - Every Shift's output is inspected and reviewed before apply.\n\
+         - Apply is all-or-nothing per run; conflicts are resolved by re-run, not force.\n\
+         \n\
+         ## Risks & approvals\n\
+         - This strategy is a DRAFT and is NOT approved. A human (or an explicitly granted standing authority) must approve it before team planning and orchestration unlock.\n\
+         - Rejecting it stops the work here; Prime will not silently re-propose over a rejection.\n",
+    );
+
+    // Sanitize the pipe delimiter and bound the length. The wire is `mandate_id|doc`
+    // (splitn(2)), so a stray `|` in the body is harmless in practice, but we replace
+    // it defensively to keep the pipe contract unambiguous.
+    let mut body = body.replace('|', "/");
+    if body.chars().count() > STRATEGY_DRAFT_BODY_CAP {
+        body = body.chars().take(STRATEGY_DRAFT_BODY_CAP).collect();
+    }
+    body
+}
+
 /// Compute the next governed step for a proposal or a mandate. Returns
 /// `Err(HandlerOutcome)` for an invalid arg / not-found target so a caller can
 /// return it verbatim.
@@ -590,15 +681,16 @@ fn classify_mandate(
                 None,
             ),
             _ => base(
-                "needs_approval",
-                "Propose & approve a strategy",
-                "This Mandate has no approved strategy yet. Propose one, then approve it, \
-                 before planning a team."
+                "needs_strategy_proposal",
+                "Draft strategy",
+                "This Mandate has no strategy yet. Prime can DRAFT a strategy proposal from \
+                 the Mandate's goal and your company context — it is left proposed for your \
+                 approval and unlocks team planning only after you approve it."
                     .into(),
                 "POST /v1/spine/mandates/:id/strategy/propose",
                 "mandate.strategy.propose",
-                false,
-                None,
+                true,
+                Some(ADVANCE_PROPOSE_STRATEGY),
             ),
         });
     }
@@ -835,7 +927,10 @@ pub fn handle_prime_advance(
         Err(e) => return invalid(format!("prime.advance: bad args: {e}")),
     };
     let requested = args.action.trim().to_string();
-    if requested != ADVANCE_CREATE_TEAM_PLAN && requested != ADVANCE_ORCHESTRATE {
+    if requested != ADVANCE_CREATE_TEAM_PLAN
+        && requested != ADVANCE_ORCHESTRATE
+        && requested != ADVANCE_PROPOSE_STRATEGY
+    {
         return invalid(format!("prime.advance: unknown action `{requested}`"));
     }
 
@@ -870,6 +965,24 @@ pub fn handle_prime_advance(
     // only swaps the args; never elevate the caller.
     let mut sub = ctx.clone();
     let result = match requested.as_str() {
+        // Prime Strategy Drafting v1 — DRAFT a deterministic strategy doc from the
+        // Mandate's own fields + the Guild's active work roles and propose it
+        // through the EXISTING governed `mandate.strategy.propose` path. This is
+        // NOT approval: the doc lands `proposed` and the next step becomes the
+        // (human) strategy-approval gate.
+        ADVANCE_PROPOSE_STRATEGY => {
+            let mandate = match spine_store.get_mandate_for_tenant(&mandate_id, tenant) {
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    return invalid(format!("prime.advance: mandate not found: {mandate_id}"));
+                }
+                Err(e) => return internal(format!("prime.advance load mandate: {e}")),
+            };
+            let roles = active_crew_roles(agent_store, tenant);
+            let doc = draft_mandate_strategy(&mandate, &roles);
+            sub.args = format!("{mandate_id}|{doc}").into_bytes();
+            handle_strategy_propose(spine_store, &sub)
+        }
         ADVANCE_CREATE_TEAM_PLAN => {
             // Plan from the existing active crew (adopts active Operatives,
             // mints no hires). Roles are the distinct work roles already on the
@@ -1299,12 +1412,25 @@ fn process_candidate(
                 if v.get("advanced").and_then(Value::as_bool) == Some(true) {
                     *actions += 1;
                     if let Some(mid) = mandate_id.as_deref() {
-                        chronicle_autonomous(
-                            task_store,
-                            mid,
-                            "prime.autonomous_advance",
-                            &format!("autonomous Prime advanced `{action}` on mandate {mid}"),
-                        );
+                        // A drafted strategy gets its own distinct event; every
+                        // other safe advance shares `prime.autonomous_advance`.
+                        // (A strategy is drafted BEFORE orchestration, so usually
+                        // no Brief exists yet — `chronicle_autonomous` no-ops and
+                        // the PrimeAutonomyRecord is the only trace, by design.)
+                        let (event, detail) = if action == ADVANCE_PROPOSE_STRATEGY {
+                            (
+                                "prime.autonomous_strategy_proposed",
+                                format!(
+                                    "autonomous Prime drafted a strategy proposal for mandate {mid}"
+                                ),
+                            )
+                        } else {
+                            (
+                                "prime.autonomous_advance",
+                                format!("autonomous Prime advanced `{action}` on mandate {mid}"),
+                            )
+                        };
+                        chronicle_autonomous(task_store, mid, event, &detail);
                     }
                     mk(
                         phase,
@@ -2051,6 +2177,128 @@ mod tests {
         assert!(spine.latest_team_plan("default", &m).unwrap().is_none());
     }
 
+    // ── PRIME STRATEGY DRAFTING v1 (manual prime.advance propose_strategy) ──
+
+    /// A bare Mandate (no strategy yet).
+    fn bare_mandate(spine: &SpineStore) -> String {
+        spine
+            .create_mandate(
+                "default",
+                "Ship the login page",
+                "wire it to auth",
+                None,
+                None,
+            )
+            .unwrap()
+    }
+
+    // S1) A Mandate with NO strategy → next step is `needs_strategy_proposal` and a
+    //     manual `prime.advance propose_strategy` drafts + proposes a strategy that
+    //     lands `proposed` (NOT approved). Idempotent: a re-advance refuses as stale.
+    #[test]
+    fn no_strategy_advances_propose_strategy_to_proposed_not_approved() {
+        let (agents, spine, tasks) = stores();
+        let m = bare_mandate(&spine);
+
+        let v = next_step(&agents, &spine, &tasks, json!({ "mandate_id": m }));
+        assert_eq!(v["phase"], "needs_strategy_proposal");
+        assert_eq!(v["can_advance"], true);
+        assert_eq!(v["advance_action"], "propose_strategy");
+        assert!(v["strategy_status"].is_null());
+
+        let r = advance(
+            &agents,
+            &spine,
+            &tasks,
+            json!({ "mandate_id": m, "action": "propose_strategy" }),
+        );
+        assert_eq!(r["advanced"], true);
+        assert_eq!(r["action"], "propose_strategy");
+        // The strategy is now proposed but NOT approved (drafting is not approval).
+        assert_eq!(
+            spine.strategy_status("default", &m).unwrap().as_deref(),
+            Some("proposed")
+        );
+        assert!(!spine.strategy_approved("default", &m).unwrap());
+        // The next step has moved to the (human) strategy-approval gate.
+        let after = &r["next_step"];
+        assert_eq!(after["phase"], "needs_approval");
+        assert_eq!(after["action_api"], "mandate.strategy.approve");
+        assert_eq!(after["can_advance"], false);
+
+        // A second propose_strategy now refuses as stale — no overwrite.
+        let again = advance(
+            &agents,
+            &spine,
+            &tasks,
+            json!({ "mandate_id": m, "action": "propose_strategy" }),
+        );
+        assert_eq!(again["advanced"], false);
+        assert_eq!(again["refused"], "stale_action");
+        assert_eq!(
+            spine.strategy_status("default", &m).unwrap().as_deref(),
+            Some("proposed")
+        );
+    }
+
+    // S2) A rejected strategy is NOT overwritten by propose_strategy (Prime does
+    //     not fight a human rejection): the step is `blocked` and advance is stale.
+    #[test]
+    fn rejected_strategy_is_not_overwritten() {
+        let (agents, spine, tasks) = stores();
+        let m = bare_mandate(&spine);
+        spine
+            .propose_strategy("default", &m, "first draft")
+            .unwrap();
+        spine.reject_strategy("default", &m).unwrap();
+
+        let v = next_step(&agents, &spine, &tasks, json!({ "mandate_id": m }));
+        assert_eq!(v["phase"], "blocked");
+        assert_eq!(v["can_advance"], false);
+
+        let r = advance(
+            &agents,
+            &spine,
+            &tasks,
+            json!({ "mandate_id": m, "action": "propose_strategy" }),
+        );
+        assert_eq!(r["advanced"], false);
+        assert_eq!(r["refused"], "stale_action");
+        // Still rejected — never reset to proposed.
+        assert_eq!(
+            spine.strategy_status("default", &m).unwrap().as_deref(),
+            Some("rejected")
+        );
+    }
+
+    // S3) The deterministic draft is non-empty, useful, and pipe-safe.
+    #[test]
+    fn draft_mandate_strategy_is_useful_and_pipe_safe() {
+        let spine = SpineStore::in_memory().unwrap();
+        let m = spine
+            .create_mandate(
+                "default",
+                "Build | the thing",
+                "a | piped | description",
+                None,
+                None,
+            )
+            .unwrap();
+        let mandate = spine
+            .get_mandate_for_tenant(&m, "default")
+            .unwrap()
+            .unwrap();
+        let doc = draft_mandate_strategy(&mandate, &["engineer", "designer"]);
+        assert!(
+            !doc.contains('|'),
+            "pipe must be sanitized out of the draft"
+        );
+        assert!(doc.contains("DRAFT"), "draft must say it is not approved");
+        assert!(doc.contains("Objective"));
+        assert!(doc.contains("engineer"));
+        assert!(doc.chars().count() <= STRATEGY_DRAFT_BODY_CAP);
+    }
+
     // ── AUTONOMOUS PRIME DRIVER (the opt-in loop) ──────────────────────────
 
     use crate::nodes::coordinator::agent::handlers::{handle_prime_propose, handle_starter_crew};
@@ -2157,6 +2405,83 @@ mod tests {
         assert_eq!(rec.outcome, "advanced");
         // A Team Plan now exists, recorded through the governed route.
         assert!(spine.latest_team_plan("default", &m).unwrap().is_some());
+    }
+
+    // B-strat) A bare Mandate with NO strategy is DRAFTED by the loop through the
+    //    governed `propose_strategy` path: the strategy lands `proposed` (NOT
+    //    approved), one action is consumed, and a second tick is idempotent (the
+    //    proposed strategy is never overwritten — Prime then waits for a human).
+    #[test]
+    fn autonomous_tick_drafts_strategy_then_is_idempotent() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = bare_mandate(&spine);
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.phase, "needs_strategy_proposal");
+        assert_eq!(rec.action, "propose_strategy");
+        assert_eq!(rec.outcome, "advanced");
+        // Proposed, never approved — drafting is not approval.
+        assert_eq!(
+            spine.strategy_status("default", &m).unwrap().as_deref(),
+            Some("proposed")
+        );
+        assert!(!spine.strategy_approved("default", &m).unwrap());
+
+        // A second tick does NOT re-propose / overwrite — it now sees the human
+        // approval gate and records `blocked` (no action), strategy unchanged.
+        let recs2 = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec2 = recs2
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate re-considered");
+        assert_eq!(rec2.phase, "needs_approval");
+        assert_ne!(rec2.outcome, "advanced");
+        assert_eq!(
+            spine.strategy_status("default", &m).unwrap().as_deref(),
+            Some("proposed")
+        );
+    }
+
+    // B-strat2) A rejected strategy is never re-drafted by the loop (Prime does not
+    //    fight a human rejection).
+    #[test]
+    fn autonomous_tick_does_not_redraft_rejected_strategy() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = bare_mandate(&spine);
+        spine.propose_strategy("default", &m, "first").unwrap();
+        spine.reject_strategy("default", &m).unwrap();
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        if let Some(rec) = recs.iter().find(|r| r.target_id == m) {
+            assert_ne!(rec.outcome, "advanced");
+        }
+        assert_eq!(
+            spine.strategy_status("default", &m).unwrap().as_deref(),
+            Some("rejected")
+        );
+    }
+
+    // B-strat3) Tenant isolation — a tick scoped to another Guild never drafts this
+    //    Guild's strategy.
+    #[test]
+    fn autonomous_tick_strategy_is_tenant_isolated() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = bare_mandate(&spine); // tenant "default"
+
+        // A tick scoped to "other" touches nothing in "default".
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("other"));
+        assert!(recs.iter().all(|r| r.target_id != m));
+        assert!(spine.strategy_status("default", &m).unwrap().is_none());
     }
 
     // C) A ready team at `needs_orchestration` is advanced by the loop through the

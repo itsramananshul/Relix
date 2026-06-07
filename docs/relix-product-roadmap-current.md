@@ -526,15 +526,21 @@ ledger entry or design section.
 9b. **[BE/FE] Prime guided driver v1** — **SHIPPED (bounded one-step guide, NOT self-approving).**
    Closes part of the long-standing "the Prime/company flow is governed but not a driver" gap honestly.
    `prime.next_step` (READ-ONLY) names the ONE next governed step for a proposal/Mandate from live
-   state; `prime.advance` runs **one** safe, explicitly-requested step (`create_team_plan` /
-   `orchestrate_assign_ready`) through the existing gated handler, re-reading state and **refusing as
-   stale (409) with no side effects** on mismatch. It **never** auto-approves a strategy/hire/spawn/
-   budget gate, **never** runs a real adapter (Start stays the explicit button), and is **not** a blind
-   loop — one click advances one step. *Files:* `crates/relix-runtime/src/nodes/coordinator/agent/prime_driver.rs`
+   state; `prime.advance` runs **one** safe, explicitly-requested step (`propose_strategy` /
+   `create_team_plan` / `orchestrate_assign_ready`) through the existing gated handler, re-reading state
+   and **refusing as stale (409) with no side effects** on mismatch. It **never** auto-approves a
+   strategy/hire/spawn/budget gate, **never** runs a real adapter (Start stays the explicit button), and
+   is **not** a blind loop — one click advances one step. **Prime Strategy Drafting v1 — SHIPPED:** a
+   Mandate with no strategy yet is classified `needs_strategy_proposal` and the driver (manual click or
+   the opt-in autonomous tick) can **DRAFT** a deterministic strategy doc and propose it through the
+   existing `mandate.strategy.propose` path — *draft only*, left `proposed` for a human to approve, never
+   overwriting an existing proposed/approved/rejected strategy (so a rejection is honoured). *Files:*
+   `crates/relix-runtime/src/nodes/coordinator/agent/prime_driver.rs`
    (+ `controller_runtime.rs` registration, `handlers.rs` reuse), `crates/relix-web-bridge/src/{spine.rs,main.rs}`
    (4 routes + 409 mapping), `apps/dashboard/src/{api.ts,pages/Chat.tsx}`, the boot scripts +
    coverage manifest, rebuilt `dashboard-dist`. *Still deferred:* a true end-to-end autonomous driver
-   (propose → approve → staff → orchestrate → run on its own) — out of scope and intentionally not built.
+   (propose → **approve** → staff → orchestrate → run on its own) — out of scope and intentionally not
+   built; strategy **approval** (and model-reasoned strategy) remain human/deferred.
 9. **[BE/FE] Smarter companion** — **BACKEND SHIPPED (now AI-assisted action selection, opt-in +
    validated + fallback; still one-turn / one-action, NOT autonomous).**
    The `POST /v1/spine/companion` parser is a **company-aware action spine**
