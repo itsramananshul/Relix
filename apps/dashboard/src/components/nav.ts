@@ -14,6 +14,7 @@ export const PRIMARY: NavEntry[] = [
   { to: "/mandates", label: "Mandates", icon: "◎" },
   { to: "/briefs", label: "Briefs", icon: "▤" },
   { to: "/runs", label: "Active Runs", icon: "◐" },
+  { to: "/approvals", label: "Approvals", icon: "✔" },
   { to: "/chat", label: "Chat", icon: "✦" },
 ];
 

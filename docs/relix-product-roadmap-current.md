@@ -296,8 +296,18 @@ ledger entry or design section.
    *Honest gap:* no **dedicated** interaction-card SSE — a card raised without a run transition
    surfaces on the next run event / manual refresh, not instantly (the design's "one socket
    streams cards" remains future).
-8. **[FE] Approvals + Settings hubs** — full Approvals surface with spend-enforcement
-   controls and a real Settings hub (`dashboard-design §10`; Settings.tsx is a stub).
+8. **[FE] Approvals + Settings hubs** — **FRONTEND SHIPPED (partial)** (`dashboard-design §10`).
+   New `/approvals` page + nav/palette entry: pending **Clearances** from `/v1/spine/clearances`
+   (unified `coord.approval.pending` queue — spawn-hire/strategy/budget/high-risk, decided inline
+   via `/v1/spine/clearances/:id/decide`), plus direct **pending hires** + **budget alerts** from
+   `/v1/spine/company/actions` (hire approve/reject via `/v1/agents/:id/approve-hire|reject-hire`).
+   A pending-Clearance nav badge; decisions invalidate the actions/mandates/briefs surfaces.
+   Settings hub gains an **Admin · session recovery** section over `/v1/runs/runtime-state`
+   (per-agent lookup + gated reset) on top of the existing Health/Maintenance/Adapter/run-sandbox/
+   heartbeat sections. *Honest gaps:* the budget-alert decision still lives on its own route (no
+   inline decide route exists); strategy/budget/high-risk Clearances decide through the same generic
+   `decide` (no per-type typed payload editor yet); runtime-state is per-agent (the route requires an
+   `agent_id`), so there is no global session list.
 
 **P3 — depth / autonomy**
 9. **[BE/FE] Smarter companion** — `prime.propose` AI mode is opt-in and rule-validated;
@@ -454,15 +464,24 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    --check` clean.
 
 7. **Approvals hub** — `dashboard-design.md §10`.
-   *Files:* new `apps/dashboard/src/pages/Approvals.tsx`, `nav.ts`; reads
-   `coord.approval.pending`/`get`, decides via `coord.approval.decide`. *Adds:* typed
-   payload detail (hire/strategy/budget/high-risk), inline greenlight/reject. *Verify:*
-   rebuild dist; approve a starter-crew hire from the hub in a smoke mesh.
+   **✅ DONE (partial).** *Files changed:* new `apps/dashboard/src/pages/Approvals.tsx`,
+   `nav.ts` (+`/approvals` entry → auto-listed in the ⌘K palette), `App.tsx` (route),
+   `Layout.tsx` (title + pending-Clearance nav badge), `api.ts` (`clearances.list/decide`,
+   `companyActions.list`). Reads `/v1/spine/clearances` (the unified `coord.approval.pending`
+   queue) and the `hire`/`budget` items of `/v1/spine/company/actions`; decides Clearances via
+   `/v1/spine/clearances/:id/decide` and direct hires via `/v1/agents/:id/approve-hire|reject-hire`,
+   then invalidates actions/mandates/briefs. *Honest gaps:* no per-type typed-payload editor (one
+   generic approve/reject); budget alerts link to their own route (no inline decide route exists).
+   *Verify:* `npm run build` green; dist rebuilt + committed.
 
 8. **Settings hub** — `dashboard-design.md §10`.
-   *Files:* flesh out `apps/dashboard/src/pages/Settings.tsx`; surfaces existing config
-   (admin recovery pointers, maintenance, run-workspace context mode, theme). *Adds:* a real
-   settings home, not a stub. *Verify:* rebuild dist; manual.
+   **✅ DONE (partial).** *Files changed:* `apps/dashboard/src/pages/Settings.tsx` (+`api.ts`
+   `runtimeState.get/reset`). Added an **Admin · session recovery** section over
+   `/v1/runs/runtime-state` (per-agent lookup of the persisted adapter runtime rows + a typed-confirm
+   reset) on top of the already-real Health, Maintenance & storage, AI providers, run-execution
+   sandbox, autonomous-heartbeat, Bridge-info, and Adapter-readiness sections. *Honest gap:*
+   runtime-state is per-agent (the route requires an `agent_id`) — there is no global session list.
+   *Verify:* `npm run build` green; dist rebuilt + committed.
 
 9. **Allowance calendar-month windowing + reset bookkeeping** — `company-model.md §6/§6.6`.
    **✅ DONE.** *Files changed:* `crates/relix-runtime/src/nodes/coordinator/heartbeat.rs`

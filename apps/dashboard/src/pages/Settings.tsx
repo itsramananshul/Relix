@@ -1,4 +1,5 @@
-import { tryGet } from "../api";
+import { useState } from "react";
+import { runtimeState, tryGet, type RuntimeStateRow } from "../api";
 import { useAuth } from "../auth";
 import { asArray, Empty, useAsync } from "../components/common";
 import { MaintenancePanel } from "../components/MaintenancePanel";
@@ -235,6 +236,8 @@ export function Settings() {
         </p>
       </div>
 
+      <AdminRecoveryPanel />
+
       <div className="card" style={{ gridColumn: "1 / -1" }}>
         <div className="row" style={{ marginBottom: 8 }}>
           <h3 style={{ margin: 0 }}>Agent adapters (Rigs)</h3>
@@ -295,6 +298,138 @@ export function Settings() {
         )}
       </div>
       </div>
+    </div>
+  );
+}
+
+// Admin / session recovery (dashboard-design §10): the persisted adapter
+// runtime state for one Operative — the resumable session id, accumulated
+// usage/cost, and last run status the heartbeat/Rig layer keeps so a Shift can
+// resume. A wedged resumable session is cleared with Reset (the route forgets
+// the rows only; the durable run ledger is untouched). The route is per-agent
+// (`agent_id` is required), so this is an operator lookup, not a global list.
+function AdminRecoveryPanel() {
+  const [agentId, setAgentId] = useState("");
+  const [rows, setRows] = useState<RuntimeStateRow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [confirm, setConfirm] = useState("");
+
+  async function lookup() {
+    const id = agentId.trim();
+    if (!id) return;
+    setBusy(true);
+    setError(null);
+    setBanner(null);
+    setConfirm("");
+    const r = await runtimeState.get(id);
+    setBusy(false);
+    if (r.error) {
+      setError(r.error);
+      setRows(null);
+      return;
+    }
+    const data = r.data;
+    const list = Array.isArray(data)
+      ? data
+      : data && typeof data === "object" && Array.isArray((data as { rows?: RuntimeStateRow[] }).rows)
+        ? (data as { rows: RuntimeStateRow[] }).rows
+        : [];
+    setRows(list);
+  }
+
+  async function reset() {
+    const id = agentId.trim();
+    if (!id) return;
+    setBusy(true);
+    setBanner(null);
+    try {
+      const r = await runtimeState.reset(id);
+      setBanner({ kind: "ok", msg: `Forgot ${r.removed ?? 0} runtime-state row(s) for ${id}.` });
+      setConfirm("");
+      await lookup();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Reset failed" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const canReset = confirm.trim().toUpperCase() === "RESET";
+
+  return (
+    <div className="card" style={{ gridColumn: "1 / -1" }}>
+      <h3 style={{ margin: 0, marginBottom: 8 }}>Admin · session recovery</h3>
+      <p className="muted" style={{ marginTop: -2, marginBottom: 12, fontSize: 12 }}>
+        Inspect the persisted adapter runtime state for one Operative (resumable session id,
+        accumulated usage/cost, last status). Reset forgets those rows so a wedged resumable session
+        is cleared — it never touches the durable run ledger, transcripts, or artifacts. Tenant-scoped
+        via <span className="mono">/v1/runs/runtime-state</span>.
+      </p>
+
+      {banner && <div className={"banner " + banner.kind} style={{ fontSize: 12 }}>{banner.msg}</div>}
+
+      <div className="row wrap" style={{ gap: 10, alignItems: "flex-end" }}>
+        <label className="field" style={{ margin: 0, flex: "1 1 260px" }}>
+          <span>Operative (agent id)</span>
+          <input
+            className="input"
+            value={agentId}
+            placeholder="agent id"
+            onChange={(e) => setAgentId(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") void lookup(); }}
+          />
+        </label>
+        <button className="btn ghost" disabled={busy || !agentId.trim()} onClick={() => void lookup()}>
+          {busy ? "…" : "Look up"}
+        </button>
+      </div>
+
+      {error && (
+        <div className="banner err" style={{ fontSize: 12, marginTop: 10 }}>
+          Could not read runtime state — <span className="mono">GET /v1/runs/runtime-state</span>: {error}
+        </div>
+      )}
+
+      {rows != null && !error && (
+        rows.length === 0 ? (
+          <div className="empty" style={{ marginTop: 10 }}>No persisted runtime state for this Operative.</div>
+        ) : (
+          <>
+            <div className="table-scroll" style={{ marginTop: 12 }}>
+              <table className="table compact">
+                <thead>
+                  <tr><th>Brief</th><th>Session</th><th>Status</th><th>Tokens</th><th>Cost</th><th>Updated</th></tr>
+                </thead>
+                <tbody>
+                  {rows.map((row, i) => (
+                    <tr key={i}>
+                      <td className="mono" style={{ fontSize: 11 }}>{row.brief_key ?? "—"}</td>
+                      <td className="mono" style={{ fontSize: 11 }}>{(row.session_id ?? "—").slice(0, 16)}</td>
+                      <td><span className="badge" style={{ fontSize: 9 }}>{row.status ?? "—"}</span></td>
+                      <td className="muted" style={{ fontSize: 11 }}>{row.total_tokens ?? 0}</td>
+                      <td className="muted" style={{ fontSize: 11 }}>
+                        ${(((row.total_cost_micros ?? 0) as number) / 1_000_000).toFixed(2)}
+                      </td>
+                      <td className="muted" style={{ fontSize: 11 }}>
+                        {row.updated_at ? new Date((row.updated_at as number) * 1000).toLocaleString() : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="row wrap" style={{ marginTop: 10, gap: 8, alignItems: "center" }}>
+              <span className="muted" style={{ fontSize: 12 }}>
+                Type <strong>RESET</strong> to forget this Operative's runtime state:
+              </span>
+              <input className="input" style={{ width: 130 }} value={confirm} placeholder="RESET" onChange={(e) => setConfirm(e.target.value)} />
+              <button className="btn" disabled={busy || !canReset} onClick={() => void reset()}>Reset runtime state</button>
+            </div>
+          </>
+        )
+      )}
     </div>
   );
 }

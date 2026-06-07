@@ -10,6 +10,7 @@ const TITLES: Record<string, { title: string; sub: string }> = {
   "/mandates": { title: "Mandates", sub: "Turn a big goal into a Brief tree" },
   "/briefs": { title: "Briefs", sub: "The issue board — your unit of work" },
   "/runs": { title: "Active Runs", sub: "Execution & activity status" },
+  "/approvals": { title: "Approvals", sub: "Pending operator decisions" },
   "/chat": { title: "Chat", sub: "Talk to the company companion" },
   "/agents": { title: "Crew", sub: "Operatives in your Guild" },
   "/lattice": { title: "The Lattice", sub: "The company org chart" },
@@ -85,13 +86,16 @@ export function Layout({ children }: { children: ReactNode }) {
       // The board summary is an object keyed by status, e.g. {todo:2,total:5}.
       const board = await tryGet<Record<string, number>>("/v1/spine/board", {});
       const co = await tryGet<CompanyIdent>("/v1/spine/company", {});
+      // Pending Clearances → the Approvals nav badge (dashboard-design §10).
+      const clr = await tryGet<unknown[]>("/v1/spine/clearances?limit=50", []);
       if (!on) return;
       const needsAttention =
         (inbox.blocked?.length ?? 0) +
         (inbox.overdue?.length ?? 0) +
         (inbox.unassigned?.length ?? 0);
       const active = (board.todo ?? 0) + (board.in_progress ?? 0) + (board.in_review ?? 0);
-      setCounts({ "/briefs": needsAttention, "/runs": active });
+      const pendingApprovals = Array.isArray(clr) ? clr.length : 0;
+      setCounts({ "/briefs": needsAttention, "/runs": active, "/approvals": pendingApprovals });
       setCompany(co ?? null);
     })();
     return () => {

@@ -516,6 +516,109 @@ export function subscribePrimeStatus(
   };
 }
 
+// ── Approvals hub (Clearances + the governance action feed) ───────────────
+// The operator-decision surface (dashboard-design §10). Two REAL backends:
+//
+//  1. Pending Clearances — `GET /v1/spine/clearances` (the unified
+//     `coord.approval.pending` queue: spawn-hire Clearances, strategy gates,
+//     budget overrides, high-risk approvals — distinguished by `method`).
+//     Decided inline via `POST /v1/spine/clearances/:id/decide`, which forwards
+//     to `coord.approval.decide` under the bridge's verified identity (the
+//     runtime cap enforces the real authorisation — never fabricated here).
+//
+//  2. Direct pending hires + budget alerts — the `hire`/`budget` items in the
+//     `GET /v1/spine/company/actions` feed (a `route=direct` hire carries no
+//     Clearance, so it is activated via `POST /v1/agents/:id/approve-hire`).
+//
+// No other approval type has a decide route today, so the hub surfaces those as
+// honest "decide on <route>" pointers rather than a fake inline action.
+
+// One pending Clearance row (the bridge parses `coord.approval.pending`'s TSV).
+// `requested_at` arrives as a string column (unix seconds); coerce at render.
+export interface Clearance {
+  approval_id: string;
+  agent_id: string;
+  method: string;
+  reason: string;
+  requested_at: string;
+}
+
+export const clearances = {
+  // Pending Clearances (best-effort report so the hub shows an honest
+  // unavailable state with the route/reason instead of a blank panel).
+  list: (limit = 50) =>
+    tryGetReport<Clearance[]>(`/v1/spine/clearances?limit=${limit}`, []),
+  // Greenlight / refuse a Clearance. `decision` is `approve`|`reject`; the
+  // runtime refuses to re-decide an already-terminal approval, so side effects
+  // (e.g. activating a spawn hire) apply exactly once.
+  decide: (approvalId: string, decision: "approve" | "reject", note = "") =>
+    api.post<{ ok: boolean; approval_id: string; decision: string; approval_token?: string }>(
+      `/v1/spine/clearances/${encodeURIComponent(approvalId)}/decide`,
+      { decision, note },
+    ),
+};
+
+// One row of the server-computed `company.actions` feed (company-model §5.4 /
+// §8.2). Read-only; the Approvals hub consumes only the `hire`/`budget` items
+// (the `approval` items duplicate the Clearance list, which has the real
+// decide route + the true approval_id).
+export interface CompanyActionItem {
+  id?: string;
+  category?: string;
+  severity?: string;
+  title?: string;
+  reason?: string;
+  target_type?: string;
+  target_id?: string;
+  target_title?: string;
+  action_label?: string;
+  route?: string;
+  action_api?: string;
+  suggested_rig?: string;
+}
+export interface CompanyActionsFeed {
+  actions?: CompanyActionItem[];
+  counts?: { total?: number; by_category?: Record<string, number>; by_severity?: Record<string, number> };
+  truncated?: boolean;
+}
+
+export const companyActions = {
+  list: () => tryGetReport<CompanyActionsFeed | null>("/v1/spine/company/actions", null),
+};
+
+// ── Adapter runtime state (admin / session recovery) ──────────────────────
+// The persisted adapter runtime rows for ONE Operative (resumable session id,
+// accumulated usage/cost, last run status) — the recovery pointer the Settings
+// hub exposes (dashboard-design §10). Tenant-scoped, newest first. Reset forgets
+// the rows (optionally scoped to one Brief) so a wedged resumable session can be
+// cleared without touching the durable run ledger.
+export interface RuntimeStateRow {
+  agent_id?: string;
+  brief_key?: string;
+  session_id?: string;
+  status?: string;
+  total_cost_micros?: number;
+  total_tokens?: number;
+  updated_at?: number;
+  [k: string]: unknown;
+}
+
+export const runtimeState = {
+  // Per-agent lookup (the route requires an agent_id). Reports failure so the
+  // panel shows the bridge's own error, not a blank.
+  get: (agentId: string) =>
+    tryGetReport<RuntimeStateRow[] | { rows?: RuntimeStateRow[] } | null>(
+      `/v1/runs/runtime-state?agent_id=${encodeURIComponent(agentId)}`,
+      null,
+    ),
+  // Forget persisted runtime state for one agent (optionally one Brief).
+  reset: (agentId: string, briefKey?: string) =>
+    api.post<{ removed?: number }>("/v1/runs/runtime-state/reset", {
+      agent_id: agentId,
+      ...(briefKey ? { brief_key: briefKey } : {}),
+    }),
+};
+
 // Outcome of probing one health dimension. `status` is the HTTP code (null
 // when the request never reached the bridge — a network/DNS/TLS failure).
 export interface Probe {

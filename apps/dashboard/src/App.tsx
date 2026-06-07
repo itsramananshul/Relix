@@ -11,6 +11,7 @@ import { Company } from "./pages/Company";
 import { Costs } from "./pages/Costs";
 import { Assign } from "./pages/Assign";
 import { Runs } from "./pages/Runs";
+import { Approvals } from "./pages/Approvals";
 import { Chat } from "./pages/Chat";
 import { Scheduled } from "./pages/Scheduled";
 import { Settings } from "./pages/Settings";
@@ -39,6 +40,7 @@ export function App() {
         <Route path="/costs" element={<Costs />} />
         <Route path="/assign" element={<Assign />} />
         <Route path="/runs" element={<Runs />} />
+        <Route path="/approvals" element={<Approvals />} />
         <Route path="/chat" element={<Chat />} />
         <Route path="/scheduled" element={<Scheduled />} />
         <Route path="/settings" element={<Settings />} />
