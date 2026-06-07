@@ -428,20 +428,28 @@ a > .stat-card:hover { border-color: var(--text-faint); }
 
 /* ── The Lattice (org chart) — dashboard-design §9 ─────────────────────────
    A dense reports-to tree: an SVG edge layer + absolutely-positioned node
-   cards on a scrollable stage that zooms via a CSS transform. B&W; semantic
-   color only (the status dot + the live pill). Full drag-pan/pinch is deferred
-   — the overflow:auto wrapper is the pan, with explicit −/reset/+ controls. */
-.lattice-zoom { display: inline-flex; gap: 4px; align-items: center; }
+   cards on a transformed stage. B&W; semantic color only (the status dot +
+   the live pill). Full pan/zoom/pinch: the viewport translates+scales the
+   stage from drag-pan (pointer events), cursor-anchored wheel zoom, and
+   two-finger pinch, plus explicit −/+/Fit/Reset controls (roadmap §P2 4). */
+.lattice-controls { display: inline-flex; gap: 4px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
 .lattice-card { padding: 10px; }
-/* The pan viewport: scroll to move around a tree larger than the frame. */
+/* The pan/zoom viewport: a fixed frame the stage is dragged/zoomed within.
+   `touch-action:none` hands every touch gesture to our pinch/pan handlers (so
+   the page itself doesn't scroll/zoom); `overflow:hidden` clips the panned
+   stage; `grab`/`grabbing` cursors signal the drag affordance. */
 .lattice-stage-wrap {
-  overflow: auto; max-height: calc(100vh - 220px); min-height: 280px;
+  position: relative; overflow: hidden; touch-action: none; cursor: grab;
+  user-select: none; -webkit-user-select: none;
+  max-height: calc(100vh - 220px); min-height: 280px;
   border: 1px solid var(--border-soft); border-radius: 6px; background: var(--bg);
 }
-/* The unscaled coordinate space the layout places nodes/edges into; scaled
-   as a whole for zoom (top-left origin so scroll math stays predictable). */
-.lattice-stage { position: relative; transform-origin: 0 0; padding: 18px; }
-.lattice-edges { position: absolute; top: 18px; left: 18px; pointer-events: none; overflow: visible; }
+.lattice-stage-wrap.grabbing { cursor: grabbing; }
+/* The unscaled coordinate space the layout places nodes/edges into; the whole
+   stage is translated+scaled as one (top-left origin so the pan/zoom math is
+   a single affine transform). `will-change` keeps the transform smooth. */
+.lattice-stage { position: absolute; top: 0; left: 0; transform-origin: 0 0; will-change: transform; }
+.lattice-edges { position: absolute; top: 0; left: 0; pointer-events: none; overflow: visible; }
 .lattice-edge { stroke: var(--border); stroke-width: 1.5; }
 /* Node card — a flat bordered button (it IS the click target). No nesting. */
 .lattice-node {
@@ -458,6 +466,7 @@ a > .stat-card:hover { border-color: var(--text-faint); }
   margin-left: auto; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px;
   color: var(--ok); border: 1px solid rgba(63,185,80,0.4); border-radius: 999px; padding: 0 5px; flex: 0 0 auto;
 }
+.lattice-node .ln-title { font-size: 10px; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lattice-node .ln-meta { display: flex; align-items: center; gap: 5px; min-width: 0; flex-wrap: nowrap; overflow: hidden; }
 .lattice-node .ln-count { font-size: 10px; color: var(--text-faint); white-space: nowrap; }
 .lattice-node .dot, .lattice-legend .dot {
@@ -467,6 +476,12 @@ a > .stat-card:hover { border-color: var(--text-faint); }
 .lattice-node .dot.warn, .lattice-legend .dot.warn { background: var(--warn); }
 .lattice-legend { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; font-size: 11px; margin-top: 10px; }
 .lattice-legend > span { display: inline-flex; align-items: center; gap: 5px; }
+/* Direct-reports list inside the detail panel — click to walk the tree. */
+.ln-reports { display: flex; flex-direction: column; gap: 4px; }
+.ln-report {
+  display: inline-flex; align-items: center; gap: 6px; text-align: left;
+  background: none; border: none; cursor: pointer; padding: 2px 0; font-size: 12px;
+}
 
 /* Per-Operative governance panel (Keys + capability powers + standing approvals).
    Grouped, read-only; stacks cleanly inside cards and table-expansion rows. */

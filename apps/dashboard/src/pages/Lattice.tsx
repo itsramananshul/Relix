@@ -1,20 +1,21 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { tryGet } from "../api";
 import { Badge, Empty, Section, useAsync } from "../components/common";
 
 // The Lattice — the company's hierarchy view (lexicon: "The Lattice" = the org
 // chart; internal edges stay `reports_to`). dashboard-design §9: a dense,
-// inspectable reports-to tree (nodes + edges), each node showing role/status/
-// rig + counts, click → a per-Operative governance detail. B&W aesthetic (§12);
-// color is reserved for semantic status only.
+// inspectable reports-to tree (nodes + edges), each node showing role/title/
+// status/rig + counts, click → a per-Operative governance detail. B&W aesthetic
+// (§12); color is reserved for semantic status only.
 //
-// Pan/zoom note (design §9 asks for pan/zoom/pinch): full drag-pan/pinch is
-// DEFERRED — this ships a scrollable responsive stage (the overflow:auto wrapper
-// IS the pan) with explicit zoom controls (−/reset/+). That keeps the surface
-// CSP-clean and dependency-free (no SVG-pan lib) while staying inspectable on
-// desktop and phone; true drag-pan/pinch can layer on later without reshaping
-// the data. (Recorded in product-spine-implementation.md as a partial.)
+// Pan/zoom (design §9 asks for a "pan/zoom/pinch tree"): the stage is a true
+// transformed viewport — drag-pan (pointer events), cursor-anchored wheel zoom,
+// and two-finger pinch — plus explicit −/+/Fit/Reset controls. No dependency:
+// the whole tree is one CSS `transform: translate() scale()` over a fixed
+// coordinate space, driven by native PointerEvent/WheelEvent, so it stays
+// CSP-clean and dependency-free. (Roadmap §P2 slice 4 — the deferred
+// drag-pan/pinch/fit gap is now closed.)
 
 interface Op {
   agent_id?: string;
@@ -65,11 +66,13 @@ function fmtCents(c?: number | null): string {
   return "$" + (c / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+
 // Tree-layout geometry (px, in unscaled stage coordinates).
-const NODE_W = 190;
-const NODE_H = 86;
-const H_GAP = 26;
-const V_GAP = 60;
+const NODE_W = 200;
+const NODE_H = 92;
+const H_GAP = 28;
+const V_GAP = 62;
 
 interface Placed { op: Op; x: number; y: number }
 
@@ -121,14 +124,33 @@ function layout(ops: Op[], rootOrder: Op[]): { placed: Placed[]; w: number; h: n
   return { placed, w: maxX + NODE_W, h: maxY + NODE_H };
 }
 
-const ZOOM_MIN = 0.5;
-const ZOOM_MAX = 1.6;
-const ZOOM_STEP = 0.15;
+const ZOOM_MIN = 0.3;
+const ZOOM_MAX = 2.5;
+
+// The transformed view: scale `s`, translate (`tx`,`ty`) in viewport px. A stage
+// point (sx,sy) renders at screen (tx + s*sx, ty + s*sy); transform-origin 0 0.
+interface View { s: number; tx: number; ty: number }
 
 export function Lattice() {
   const [selId, setSelId] = useState<string | null>(null);
-  const [zoom, setZoom] = useState(1);
   const [detailCache, setDetailCache] = useState<Record<string, { keys: Keys | null; detail: AgentDetail | null }>>({});
+
+  // ── Pan/zoom view state + interaction refs ──────────────────────────────
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const [view, setView] = useState<View>({ s: 1, tx: 24, ty: 24 });
+  // A live mirror so the native (non-passive) wheel listener + pointer math read
+  // the current view without re-binding every frame.
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  const didFitRef = useRef(false);
+  // Active touch/mouse pointers (id → last client position) for pinch + pan.
+  const pointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
+  const dragRef = useRef<{ sx: number; sy: number; baseTx: number; baseTy: number; active: boolean; moved: boolean } | null>(null);
+  const pinchRef = useRef<{ dist: number } | null>(null);
+  // True the instant a pan crosses the move threshold — read by a node's click
+  // to swallow the click that would otherwise fire after a drag (drag ≠ select).
+  const pannedRef = useRef(false);
+  const [grabbing, setGrabbing] = useState(false);
 
   const { data, loading, error } = useAsync(async () => {
     const [company, ops, adapters, runs] = await Promise.all([
@@ -184,8 +206,136 @@ export function Lattice() {
     const o = ops.find((x) => x.agent_id === id);
     return o?.name ?? id.slice(0, 8);
   };
+  const childrenOfSel = useMemo(
+    () => (selId ? ops.filter((o) => o.reports_to === selId) : []),
+    [ops, selId],
+  );
   const directReports = (id?: string) =>
     id ? ops.filter((o) => o.reports_to === id).length : 0;
+  // Honest per-Operative Rig readiness: a bound adapter that probes available.
+  const rigReady = (rig?: string | null) =>
+    !!rig && byName.get(rig)?.probe?.status === "available";
+
+  const initialized = company.initialized ?? ops.length > 0;
+  const stageReady = !loading && initialized && ops.length > 0;
+
+  // ── View controls (Fit / Reset / zoom) ──────────────────────────────────
+  // Anchor a zoom around a viewport-relative point so that point stays put.
+  const zoomAround = useCallback((nextScale: number, cx: number, cy: number) => {
+    setView((v) => {
+      const s = clamp(nextScale, ZOOM_MIN, ZOOM_MAX);
+      const k = s / v.s;
+      return { s, tx: cx - k * (cx - v.tx), ty: cy - k * (cy - v.ty) };
+    });
+  }, []);
+  const zoomByCenter = useCallback((factor: number) => {
+    const el = viewportRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    zoomAround(viewRef.current.s * factor, r.width / 2, r.height / 2);
+  }, [zoomAround]);
+  // Fit: scale + center so the whole tree (with padding) sits in the viewport.
+  // Never enlarges past 1× (a tiny tree shouldn't balloon).
+  const fit = useCallback(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0 || w === 0 || h === 0) return;
+    const pad = 36;
+    const s = clamp(Math.min((r.width - pad * 2) / w, (r.height - pad * 2) / h, 1), ZOOM_MIN, ZOOM_MAX);
+    setView({ s, tx: (r.width - w * s) / 2, ty: (r.height - h * s) / 2 });
+  }, [w, h]);
+  const reset = useCallback(() => setView({ s: 1, tx: 24, ty: 24 }), []);
+
+  // Frame the tree once on first render (so it opens centered, not top-left).
+  // Guarded so it never re-fits — the chart must not jump while the operator
+  // hovers/clicks (requirement: no resize/jump on interaction).
+  useEffect(() => {
+    if (!stageReady || didFitRef.current) return;
+    const el = viewportRef.current;
+    if (!el) return;
+    if (el.getBoundingClientRect().width === 0) return;
+    didFitRef.current = true;
+    fit();
+  }, [stageReady, fit]);
+
+  // Cursor-anchored wheel zoom. Bound natively (not via React's passive onWheel)
+  // so `preventDefault` actually suppresses the page scroll.
+  useEffect(() => {
+    const el = viewportRef.current;
+    if (!el || !stageReady) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const r = el.getBoundingClientRect();
+      const cx = e.clientX - r.left;
+      const cy = e.clientY - r.top;
+      const factor = Math.exp(-e.deltaY * 0.0015);
+      zoomAround(viewRef.current.s * factor, cx, cy);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [stageReady, zoomAround]);
+
+  // ── Pointer interaction: drag-pan (1 pointer) + pinch-zoom (2 pointers) ──
+  const onPointerDown = (e: React.PointerEvent) => {
+    pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const n = pointersRef.current.size;
+    if (n === 1) {
+      dragRef.current = {
+        sx: e.clientX,
+        sy: e.clientY,
+        baseTx: viewRef.current.tx,
+        baseTy: viewRef.current.ty,
+        active: true,
+        moved: false,
+      };
+      pannedRef.current = false;
+    } else if (n === 2) {
+      // Second finger down → start a pinch; abandon the pan in progress.
+      dragRef.current = null;
+      const p = [...pointersRef.current.values()];
+      pinchRef.current = { dist: Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y) };
+    }
+  };
+  const onPointerMove = (e: React.PointerEvent) => {
+    if (!pointersRef.current.has(e.pointerId)) return;
+    pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const n = pointersRef.current.size;
+    if (n >= 2 && pinchRef.current) {
+      const el = viewportRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      const p = [...pointersRef.current.values()];
+      const dist = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+      const mx = (p[0].x + p[1].x) / 2 - r.left;
+      const my = (p[0].y + p[1].y) / 2 - r.top;
+      const factor = dist / (pinchRef.current.dist || dist);
+      zoomAround(viewRef.current.s * factor, mx, my);
+      pinchRef.current = { dist };
+      return;
+    }
+    const d = dragRef.current;
+    if (d && d.active) {
+      const dx = e.clientX - d.sx;
+      const dy = e.clientY - d.sy;
+      if (!d.moved && Math.hypot(dx, dy) > 4) {
+        d.moved = true;
+        pannedRef.current = true;
+        setGrabbing(true);
+        try { viewportRef.current?.setPointerCapture(e.pointerId); } catch { /* capture is best-effort */ }
+      }
+      if (d.moved) setView({ s: viewRef.current.s, tx: d.baseTx + dx, ty: d.baseTy + dy });
+    }
+  };
+  const endPointer = (e: React.PointerEvent) => {
+    pointersRef.current.delete(e.pointerId);
+    try { viewportRef.current?.releasePointerCapture(e.pointerId); } catch { /* never had capture */ }
+    if (pointersRef.current.size < 2) pinchRef.current = null;
+    if (pointersRef.current.size === 0) {
+      if (dragRef.current) dragRef.current.active = false;
+      setGrabbing(false);
+    }
+  };
 
   async function select(id: string) {
     setSelId(id);
@@ -198,8 +348,15 @@ export function Lattice() {
       setDetailCache((m) => ({ ...m, [id]: { keys, detail } }));
     }
   }
-
-  const initialized = company.initialized ?? ops.length > 0;
+  // A node's click: swallow the click that trails a drag (so panning never
+  // selects), otherwise open the detail.
+  const onNodeClick = (id: string) => {
+    if (pannedRef.current) {
+      pannedRef.current = false;
+      return;
+    }
+    select(id);
+  };
 
   if (!loading && !initialized) {
     return (
@@ -219,8 +376,7 @@ export function Lattice() {
   }
 
   const sel = selId ? posById.get(selId)?.op : undefined;
-  const selRig = sel?.rig ? byName.get(sel.rig) : undefined;
-  const selRunnable = !!sel?.rig && selRig?.probe?.status === "available";
+  const selRunnable = rigReady(sel?.rig);
   const selDetail = selId ? detailCache[selId] : undefined;
 
   // Role tone for the node chip (semantic color only).
@@ -242,10 +398,12 @@ export function Lattice() {
     <Section
       title="The Lattice"
       action={
-        <div className="lattice-zoom" role="group" aria-label="Zoom">
-          <button className="btn ghost sm" aria-label="Zoom out" onClick={() => setZoom((z) => Math.max(ZOOM_MIN, +(z - ZOOM_STEP).toFixed(2)))}>−</button>
-          <button className="btn ghost sm" aria-label="Reset zoom" onClick={() => setZoom(1)}>{Math.round(zoom * 100)}%</button>
-          <button className="btn ghost sm" aria-label="Zoom in" onClick={() => setZoom((z) => Math.min(ZOOM_MAX, +(z + ZOOM_STEP).toFixed(2)))}>+</button>
+        <div className="lattice-controls" role="group" aria-label="Org chart view controls">
+          <button className="btn ghost sm" aria-label="Zoom out" onClick={() => zoomByCenter(1 / 1.2)}>−</button>
+          <button className="btn ghost sm" aria-label="Current zoom" title="Current zoom" onClick={reset}>{Math.round(view.s * 100)}%</button>
+          <button className="btn ghost sm" aria-label="Zoom in" onClick={() => zoomByCenter(1.2)}>+</button>
+          <button className="btn ghost sm" onClick={fit}>Fit</button>
+          <button className="btn ghost sm" onClick={reset}>Reset</button>
         </div>
       }
     >
@@ -259,10 +417,18 @@ export function Lattice() {
             <div className="card"><Empty>No Operatives in the lattice yet.</Empty></div>
           ) : (
             <div className="card lattice-card">
-              <div className="lattice-stage-wrap">
+              <div
+                ref={viewportRef}
+                className={"lattice-stage-wrap" + (grabbing ? " grabbing" : "")}
+                onPointerDown={onPointerDown}
+                onPointerMove={onPointerMove}
+                onPointerUp={endPointer}
+                onPointerCancel={endPointer}
+                onPointerLeave={endPointer}
+              >
                 <div
                   className="lattice-stage"
-                  style={{ width: w, height: h, transform: `scale(${zoom})` }}
+                  style={{ width: w, height: h, transform: `translate(${view.tx}px, ${view.ty}px) scale(${view.s})` }}
                 >
                   <svg
                     className="lattice-edges"
@@ -295,13 +461,14 @@ export function Lattice() {
                     const id = p.op.agent_id ?? "";
                     const run = running.get(id) ?? 0;
                     const reports = directReports(id);
+                    const ready = rigReady(p.op.rig);
                     return (
                       <button
                         key={id}
                         type="button"
                         className={"lattice-node" + (selId === id ? " selected" : "")}
                         style={{ left: p.x, top: p.y, width: NODE_W, height: NODE_H }}
-                        onClick={() => select(id)}
+                        onClick={() => onNodeClick(id)}
                         title={`${p.op.name ?? id} — ${p.op.role ?? "operative"}`}
                       >
                         <div className="ln-head">
@@ -309,11 +476,18 @@ export function Lattice() {
                           <span className="ln-name">{p.op.name ?? id.slice(0, 10)}</span>
                           {run > 0 && <span className="ln-live" title={`${run} running`}>live</span>}
                         </div>
+                        {p.op.title && <div className="ln-title">{p.op.title}</div>}
                         <div className="ln-meta">
                           <span className={"badge " + roleTone(p.op.role)} style={{ fontSize: 9 }}>
                             {p.op.role ?? "operative"}
                           </span>
-                          <span className="badge" style={{ fontSize: 9 }}>{p.op.rig ?? "no rig"}</span>
+                          {p.op.rig ? (
+                            <span className={"badge " + (ready ? "" : "blocked")} style={{ fontSize: 9 }}>
+                              {ready ? p.op.rig : `${p.op.rig} · not ready`}
+                            </span>
+                          ) : (
+                            <span className="badge backlog" style={{ fontSize: 9 }}>no rig</span>
+                          )}
                           {reports > 0 && <span className="ln-count">{reports} report{reports === 1 ? "" : "s"}</span>}
                         </div>
                       </button>
@@ -325,7 +499,7 @@ export function Lattice() {
                 <span><span className="dot on" /> active</span>
                 <span><span className="dot warn" /> pending</span>
                 <span><span className="dot" /> suspended / disabled</span>
-                <span>scroll to pan · −/+ to zoom · click a node for detail</span>
+                <span>drag to pan · scroll or pinch to zoom · click a node for detail</span>
               </div>
             </div>
           )}
@@ -342,6 +516,7 @@ export function Lattice() {
               <div className="row wrap" style={{ gap: 6, marginBottom: 10 }}>
                 <span className={"badge " + roleTone(sel.role)}>{sel.role ?? "operative"}</span>
                 <Badge status={sel.status ?? "active"} />
+                {(running.get(selId) ?? 0) > 0 && <span className="badge in_progress">running</span>}
               </div>
               <div className="mono" style={{ fontSize: 11, marginBottom: 10 }}>{selId.slice(0, 20)}</div>
 
@@ -359,6 +534,27 @@ export function Lattice() {
               <div className="kv"><span className="muted">Reports to</span><span>{nameOf(sel.reports_to) ?? <span className="muted">— (apex)</span>}</span></div>
               <div className="kv"><span className="muted">Direct reports</span><span>{directReports(selId)}</span></div>
               <div className="kv"><span className="muted">Running now</span><span>{(running.get(selId) ?? 0) > 0 ? <span className="badge in_progress">{running.get(selId)}</span> : <span className="muted">0</span>}</span></div>
+
+              {/* Direct reports — click to walk the tree without losing the panel. */}
+              {childrenOfSel.length > 0 && (
+                <div className="op-group" style={{ marginTop: 12 }}>
+                  <div className="op-group-title">Direct reports ({childrenOfSel.length})</div>
+                  <div className="ln-reports">
+                    {childrenOfSel.map((c) => (
+                      <button
+                        key={c.agent_id}
+                        type="button"
+                        className="link ln-report"
+                        onClick={() => c.agent_id && select(c.agent_id)}
+                      >
+                        <span className={"dot " + statusDot(c.status)} />
+                        {c.name ?? c.agent_id?.slice(0, 10)}
+                        <span className="muted" style={{ fontSize: 10 }}>{c.role ?? "operative"}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Keys + allowance + capability — the §9 governance face, read-only. */}
               <div className="op-group" style={{ marginTop: 12 }}>

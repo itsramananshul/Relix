@@ -353,14 +353,23 @@ ledger entry or design section.
    that would render depth.
 
 **P2 — product-feel surfaces (mostly frontend on data that already exists)**
-4. **[FE] The Lattice (org chart)** — **FRONTEND SHIPPED (partial)** (`dashboard-design §9`).
+4. **[FE] The Lattice (org chart)** — **FRONTEND SHIPPED** (`dashboard-design §9`).
    `apps/dashboard/src/pages/Lattice.tsx` (nav `/lattice`) renders the live `reports_to`
    forest from `/v1/spine/operatives` (+ `/v1/spine/company` for apex order) as an SVG-edge +
-   node-card tree, role/status/rig chips + direct-report counts, a live pill driven by
+   node-card tree, role/title/status/rig chips + direct-report counts, a live pill driven by
    `/v1/runs`, and click → a per-Operative detail (Keys + allowance + risk ceiling via
-   `/v1/spine/keys/:id` + `/v1/agents/:id`). *Partial (honest):* full drag-pan/pinch is
-   **deferred** — the surface ships a scrollable stage (overflow:auto = pan) with explicit
-   −/reset/+ zoom controls instead, to stay CSP-clean and dependency-free.
+   `/v1/spine/keys/:id` + `/v1/agents/:id`, now with a clickable direct-reports list to walk
+   the tree). **Full pan/zoom/pinch + Fit/Reset now ship** (the previously-deferred gap is
+   closed): the stage is one CSS `transform: translate() scale()` viewport driven by native
+   PointerEvent (drag-pan + two-finger pinch) and a non-passive WheelEvent (cursor-anchored
+   zoom), with explicit −/+/Fit/Reset controls, an auto-fit-once on first render (no jump on
+   hover/click), and `touch-action:none` for mobile gesture handling — still CSP-clean and
+   dependency-free (no SVG-pan lib). Cycles + orphan `reports_to` pointers render safely
+   (visited-set DFS; an orphan/cycle node falls back to a root, an edge to a missing parent is
+   simply not drawn). *Honest remaining nuance:* view state (zoom/pan) is in-memory per mount
+   only — not persisted to storage, since the app has no local-preference pattern to reuse
+   (avoided overbuilding per the brief); `brief.detail`'s `delegation_depth` is still not
+   rendered here.
 5. **[FE] Full Costs surface** — **SHIPPED** (`dashboard-design §10`).
    `apps/dashboard/src/pages/Costs.tsx` (nav `/costs`): the Guild budget card now reads
    **canonical month-to-date Guild spend** from the dedicated `guild.spend` route
