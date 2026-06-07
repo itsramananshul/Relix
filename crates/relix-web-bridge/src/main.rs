@@ -734,6 +734,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/spine/briefs/:id/interactions",
             get(spine::list_interactions).post(spine::open_interaction),
         )
+        // Dedicated REALTIME interaction-card stream (dashboard-design §7/§11):
+        // tenant-scoped SSE that proxies `brief.interactions` on a bounded poll
+        // and pushes only when the card list changes (fingerprint-gated), so the
+        // workroom's ask/confirm/suggest/plan-package cards refresh even when no
+        // run event fires. The static `stream` segment sits beside the `:iid`
+        // param of the respond route below (axum/matchit gives the static path
+        // priority — same shape as `/v1/runs/events/stream` vs `/v1/runs/:id/…`).
+        .route(
+            "/v1/spine/briefs/:id/interactions/stream",
+            get(spine::interactions_stream),
+        )
         .route(
             "/v1/spine/briefs/:id/interactions/:iid/respond",
             post(spine::respond_interaction),

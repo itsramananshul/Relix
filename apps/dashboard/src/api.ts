@@ -341,8 +341,8 @@ export const briefSuggestions = {
 // linked proposal materializes exactly once through the resumable decomposition
 // ledger; rejecting closes the confirm and its still-open proposal.
 export const briefPlanConfirms = {
-  // Open a plan package. Returns the three artifact ids. (Exposed for
-  // completeness / companion use; the dashboard has no package editor yet.)
+  // Open a plan package. Returns the three artifact ids. (Used by the
+  // companion and by the workroom's minimal manual plan-package composer.)
   open: (
     briefId: string,
     body: {
@@ -602,6 +602,85 @@ export function subscribePrimeStatus(
     // NB: we intentionally do NOT listen for a custom `error` event — the
     // server's transient `event: error` frames just precede the next snapshot,
     // and EventSource's own connection `error` is handled by `onerror` below.
+    es.onerror = () => {
+      es?.close();
+      es = null;
+      if (closed) return;
+      attempts += 1;
+      onConn(attempts >= 3 ? "unavailable" : "reconnecting");
+      timer = setTimeout(connect, backoff);
+      backoff = Math.min(backoff * 2, 15000);
+    };
+  };
+
+  connect();
+  return () => {
+    closed = true;
+    if (timer) clearTimeout(timer);
+    es?.close();
+    es = null;
+  };
+}
+
+// ── Dedicated Brief interaction-card stream (SSE) ──────────────────────────
+// Subscribe to the bridge's dedicated `/v1/spine/briefs/:id/interactions/
+// stream` feed so the Brief workroom's ask/confirm/suggest/plan-package cards
+// refresh the moment the card list changes — a card raised, answered, or
+// superseded — even when NO run event fires (the run-event stream above misses
+// those). Tenant-scoped server-side (it proxies the same `brief.interactions`
+// read the list route serves); polling-backed (~2.5s) + fingerprint-gated, so
+// an unchanged list pushes nothing. Cookie auth rides the same-origin
+// EventSource. Complements `subscribeRunEvents` — it does not replace it.
+
+export type InteractionStreamConn = "connecting" | "live" | "reconnecting" | "unavailable";
+
+// Open the interaction stream for one Brief. `onInteractions` receives the full
+// card array on the initial snapshot + every change (same shape as
+// `briefInteractions.list`); `onConn` reports honest connection state; `onGone`
+// fires once when the server emits a terminal `not_found` (the Brief is unknown
+// / cross-Guild). Manages reconnect with capped backoff. Returns an unsubscribe.
+export function subscribeBriefInteractions(
+  briefId: string,
+  onInteractions: (interactions: BriefInteraction[]) => void,
+  onConn: (state: InteractionStreamConn) => void,
+  onGone?: () => void,
+): () => void {
+  let es: EventSource | null = null;
+  let closed = false;
+  let attempts = 0;
+  let backoff = 1000;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const connect = () => {
+    if (closed) return;
+    onConn(attempts === 0 ? "connecting" : "reconnecting");
+    es = new EventSource(
+      `/v1/spine/briefs/${encodeURIComponent(briefId)}/interactions/stream`,
+      { withCredentials: true },
+    );
+    es.onopen = () => {
+      attempts = 0;
+      backoff = 1000;
+      onConn("live");
+    };
+    es.addEventListener("interactions", (e: MessageEvent) => {
+      try {
+        const arr = JSON.parse(e.data);
+        if (Array.isArray(arr)) onInteractions(arr as BriefInteraction[]);
+      } catch {
+        /* malformed frame — ignore, the next snapshot corrects it */
+      }
+    });
+    // Terminal: the Brief is gone / cross-Guild. Stop cleanly — no reconnect.
+    es.addEventListener("not_found", () => {
+      closed = true;
+      es?.close();
+      es = null;
+      onConn("unavailable");
+      onGone?.();
+    });
+    // NB: the server's transient `event: error` frames just precede the next
+    // snapshot; EventSource's own connection `error` is handled by `onerror`.
     es.onerror = () => {
       es?.close();
       es = null;

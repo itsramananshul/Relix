@@ -5,12 +5,14 @@ import {
   tryGet,
   tryGetReport,
   subscribeRunEvents,
+  subscribeBriefInteractions,
   runControls,
   briefInteractions,
   briefSuggestions,
   briefPlanConfirms,
   type RunDiff,
   type BriefInteraction,
+  type InteractionStreamConn,
   type SuggestChild,
 } from "../api";
 import { useAuth } from "../auth";
@@ -218,6 +220,15 @@ export function BriefDetail({
   // draft for open `ask` cards that have no fixed choices.
   const [ixBusy, setIxBusy] = useState<string | null>(null);
   const [ixDraft, setIxDraft] = useState<Record<string, string>>({});
+  // Live interaction-card override (dashboard-design §11 surgical update): the
+  // dedicated interactions SSE stream below writes the latest card array here so
+  // ask/confirm/suggest/plan-package cards refresh even when no run event fires.
+  // `null` ⇒ fall back to the useAsync snapshot; cleared whenever a fresh load
+  // arrives (see the `data` effect) so a local answer's reload is never masked,
+  // then the stream re-establishes it on its next push. Plus the stream's honest
+  // connection state for the subtle "live" cue on the Requests header.
+  const [streamIx, setStreamIx] = useState<BriefInteraction[] | null>(null);
+  const [ixConn, setIxConn] = useState<InteractionStreamConn>("connecting");
   // Busy flag while a plan-approval confirm is being opened (§1.8).
   const [planBusy, setPlanBusy] = useState(false);
   // Plan-package composer state (§1.7/§1.8/§3.1). A minimal MANUAL composer —
@@ -291,6 +302,36 @@ export function BriefDetail({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Dedicated interaction-card stream (dashboard-design §7/§11): while THIS
+  // Brief is open, subscribe to its `…/interactions/stream` SSE so the
+  // ask/confirm/suggest/plan-package cards refresh the moment the card list
+  // changes — a card raised, answered, or superseded — even when no run event
+  // fires (the run-event stream above misses pure card changes). We update the
+  // card state DIRECTLY (no extra reload) per the §11 surgical-update rule; the
+  // run-event reload above still owns the rest of the workroom. Re-subscribes
+  // when the Brief changes.
+  useEffect(() => {
+    setStreamIx(null);
+    setIxConn("connecting");
+    const unsub = subscribeBriefInteractions(
+      briefId,
+      (arr) => setStreamIx(arr),
+      (state) => setIxConn(state),
+    );
+    return () => {
+      unsub();
+      setStreamIx(null);
+    };
+  }, [briefId]);
+
+  // Drop the live override whenever a fresh useAsync load lands (initial load or
+  // any reload — e.g. after answering a card), so the freshly-fetched cards show
+  // immediately instead of being masked by a now-stale stream frame. The stream
+  // re-establishes the override on its next push (identical content ⇒ no flicker).
+  useEffect(() => {
+    setStreamIx(null);
+  }, [data]);
+
   // Client invalidation bus (dashboard-design §11): refetch this Brief when a
   // CO-MOUNTED surface (the Issue board beside this panel) reports it changed —
   // e.g. an assign/move on the board card mirrors into the open detail without
@@ -324,7 +365,9 @@ export function BriefDetail({
 
   // Thread interactions (§1.9): the open ask/confirm cards needing an answer
   // sit above the Conversation; resolved/rejected ones stay listed but marked.
-  const interactions = data?.interactions ?? [];
+  // Prefer the live stream override when present (dashboard-design §11), else
+  // the useAsync snapshot.
+  const interactions = streamIx ?? data?.interactions ?? [];
   // suggest_tasks cards render with their own Accept/Reject controls; the
   // ask/confirm cards keep the Yes/No · choice · free-text controls.
   const openInteractions = interactions.filter(
@@ -1061,6 +1104,21 @@ export function BriefDetail({
               {openInteractions.length + openSuggestions.length} open ·{" "}
               {closedInteractions.length} answered
             </span>
+            {/* Subtle live cue (dashboard-design §11): a muted dot when the
+                dedicated interaction stream is connected — cards refresh on
+                change without a manual Refresh. Hidden unless live to stay calm. */}
+            {ixConn === "live" && (
+              <span
+                className="muted"
+                style={{ fontSize: 10, marginLeft: 8, display: "inline-flex", alignItems: "center", gap: 4 }}
+                title="Live — interaction cards refresh automatically when they change"
+              >
+                <span
+                  style={{ display: "inline-block", width: 6, height: 6, borderRadius: 3, background: "#1e7e34" }}
+                />
+                live
+              </span>
+            )}
           </div>
 
           {openInteractions.map((it) => (

@@ -1715,6 +1715,107 @@ pub async fn list_interactions(
     json_passthrough(call_peer(&state, "brief.interactions", id.as_bytes()).await?)
 }
 
+/// Bounded poll cadence for the interaction-card stream. Interaction cards
+/// (ask/confirm/suggest_tasks/plan-package) change on comments, answers, run
+/// dispositions, and proposals — there is no single dedicated event source for
+/// them — so the stream re-reads the SAME `brief.interactions` capability the
+/// list route serves on this low, bounded interval and emits ONLY when the
+/// payload's fingerprint changes. Honest "polling-backed SSE", never a fake
+/// push, and it never spins (one read per tick, de-duped by fingerprint).
+const INTERACTIONS_POLL: Duration = Duration::from_millis(2500);
+
+/// A compact 64-bit fingerprint of an interactions JSON body. PURE +
+/// deterministic for a given byte sequence (`DefaultHasher` is seeded with
+/// fixed keys), so an unchanged list hashes identically and pushes nothing.
+/// Hashing the raw bytes is sufficient: `brief.interactions` returns a stable
+/// oldest-first ordering, so an equal list serializes — and thus fingerprints —
+/// the same. Used by the stream as the cheap "did the card list change?" gate.
+pub fn interactions_fingerprint(body: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut h);
+    h.finish()
+}
+
+/// `GET /v1/spine/briefs/:id/interactions/stream` — the dedicated REALTIME
+/// interaction-card stream for one Brief workroom (dashboard-design §7/§11).
+/// Tenant-scoped exactly like the `…/interactions` list route by proxying the
+/// SAME `brief.interactions` capability (the resolved tenant is captured at
+/// open time and re-applied to every downstream coord call) — no cross-Guild
+/// leak. The stream:
+///
+/// - emits the current cards immediately as `event: interactions` (JSON = the
+///   same array the list route returns);
+/// - re-reads on a low, bounded interval and pushes again only when the
+///   payload's [`interactions_fingerprint`] changes, so a card raised/answered/
+///   superseded between run events still refreshes the workroom (and an
+///   unchanged list pushes nothing — keep-alive `ping` only, never a spin);
+/// - on a tenant-gated / unknown Brief emits a terminal `event: not_found` and
+///   stops cleanly (no existence leak); transient errors emit `event: error`
+///   and keep trying;
+/// - stops cleanly when the client disconnects (the stream future is dropped,
+///   releasing the stream-metrics guard).
+///
+/// No new persistent state or event table — it composes the existing read
+/// capability exactly like the polling list route, mirroring
+/// [`prime_status_stream`]'s forced-refresh fallback shape.
+pub async fn interactions_stream(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<
+    Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, Json<ApiError>),
+> {
+    let brief_id = id.trim().to_string();
+    if brief_id.is_empty() {
+        return Err(bad("brief id required"));
+    }
+    // Capture the resolved tenant NOW (inside the middleware scope); the stream
+    // body runs later, OUTSIDE that scope, and must re-apply it on each call.
+    let tenant_scope = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    let opened_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let stream_guard = state
+        .stream_metrics
+        .open(format!("interactions:{brief_id}"), opened_at);
+
+    let s = stream! {
+        let _live_guard = stream_guard;
+        let mut last_fp: Option<u64> = None;
+        loop {
+            let fetch = CURRENT_TENANT.scope(
+                tenant_scope.clone(),
+                call_peer(&state, "brief.interactions", brief_id.as_bytes()),
+            );
+            match fetch.await {
+                Ok(body) => {
+                    let text = String::from_utf8_lossy(&body).to_string();
+                    let fp = interactions_fingerprint(&text);
+                    // De-dupe: only push when the card list actually changed.
+                    if last_fp != Some(fp) {
+                        yield Ok(Event::default().event("interactions").data(text));
+                        last_fp = Some(fp);
+                    }
+                }
+                Err((status, err)) => {
+                    let payload = serde_json::json!({ "error": err.0.error }).to_string();
+                    if status == StatusCode::NOT_FOUND {
+                        // Tenant-gated / unknown Brief → terminal, no leak.
+                        yield Ok(Event::default().event("not_found").data(payload));
+                        break;
+                    }
+                    // Transient (mesh / gateway) — surface and keep trying.
+                    yield Ok(Event::default().event("error").data(payload));
+                }
+            }
+            tokio::time::sleep(INTERACTIONS_POLL).await;
+        }
+    };
+    Ok(Sse::new(s).keep_alive(KeepAlive::default().text("ping")))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RespondInteractionRequest {
     pub responder: String,
@@ -2660,6 +2761,29 @@ mod tests {
     }
 
     #[test]
+    fn interactions_fingerprint_is_stable_and_change_sensitive() {
+        // Same bytes ⇒ same fingerprint (so an unchanged card list pushes
+        // nothing), and it is deterministic across calls (fixed-key hasher).
+        let a = r#"[{"interaction_id":"ix_1","status":"open"}]"#;
+        assert_eq!(
+            interactions_fingerprint(a),
+            interactions_fingerprint(a),
+            "identical bodies must fingerprint identically"
+        );
+        // A status flip (open → resolved) changes the fingerprint, so the
+        // stream re-emits when a card is answered.
+        let b = r#"[{"interaction_id":"ix_1","status":"resolved"}]"#;
+        assert_ne!(
+            interactions_fingerprint(a),
+            interactions_fingerprint(b),
+            "a changed card list must fingerprint differently"
+        );
+        // An empty list and a non-empty list differ (a first card appearing
+        // triggers a push).
+        assert_ne!(interactions_fingerprint("[]"), interactions_fingerprint(a));
+    }
+
+    #[test]
     fn parse_event_lines_builds_array_and_skips_blanks() {
         // task.events is newline-delimited JSON objects; the composite
         // turns it into a real array and drops blank / unparseable lines.
@@ -2739,6 +2863,22 @@ mod tests {
             .route("/v1/spine/briefs/:id/move", post(move_brief))
             .route("/v1/spine/briefs/:id/pin", post(pin_brief))
             .route("/v1/spine/briefs/:id/comment", post(comment_brief))
+            // §1.9 thread interactions + the dedicated REALTIME card stream —
+            // matchit panics here if the static `…/interactions/stream` segment
+            // conflicts with the sibling `…/interactions/:iid` param of the
+            // respond route (it does not: the static path takes priority).
+            .route(
+                "/v1/spine/briefs/:id/interactions",
+                get(list_interactions).post(open_interaction),
+            )
+            .route(
+                "/v1/spine/briefs/:id/interactions/stream",
+                get(interactions_stream),
+            )
+            .route(
+                "/v1/spine/briefs/:id/interactions/:iid/respond",
+                post(respond_interaction),
+            )
             .route("/v1/spine/briefs/:id/due", post(set_due))
             .route("/v1/spine/briefs/:id/set", post(set_field))
             .route("/v1/spine/briefs/:id/snag", post(add_snag))

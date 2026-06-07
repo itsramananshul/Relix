@@ -320,12 +320,19 @@ ledger entry or design section.
    groups, denied/error callouts, usage/cost chip), live-tailed via the run-event SSE with a
    polling fallback + honest connection chip. Used on the Runs page and embedded in the Brief
    workroom.
-7. **[FE] Streaming Brief thread** — **FRONTEND SHIPPED (partial)** (`dashboard-design §7/§8`).
-   The Brief workroom embeds the live run transcript inline (`<RunTranscript>` Live-work block);
-   interaction cards refresh on the run-event SSE via the detail's existing `reload()`.
-   *Honest gap:* no **dedicated** interaction-card SSE — a card raised without a run transition
-   surfaces on the next run event / manual refresh, not instantly (the design's "one socket
-   streams cards" remains future).
+7. **[FE/BE] Streaming Brief thread** — **SHIPPED** (`dashboard-design §7/§8/§11`).
+   The Brief workroom embeds the live run transcript inline (`<RunTranscript>` Live-work block),
+   and a **dedicated interaction-card SSE** now refreshes the ask/confirm/suggest/plan-package
+   cards on its own: `GET /v1/spine/briefs/:id/interactions/stream` (bridge `interactions_stream`)
+   tenant-scopes exactly like the list route by proxying the same `brief.interactions` capability,
+   emits an initial snapshot, then pushes `event: interactions` only when the card list's
+   fingerprint changes (terminal `event: not_found` on an unknown/cross-Guild Brief; transient
+   `event: error` keeps trying). The detail subscribes via `subscribeBriefInteractions` and updates
+   the cards directly (§11 surgical update), with a subtle "live" cue on the Requests header; the
+   run-event SSE `reload()` still owns the rest of the workroom, so a card raised **without** a run
+   transition now surfaces within the poll window instead of only on the next run event / manual
+   refresh. *Honest caveat:* this is **polling-backed SSE** (~2.5s, fingerprint-gated) like the
+   Prime status stream — not a true backend event source / full websocket push.
 8. **[FE] Approvals + Settings hubs** — **FRONTEND SHIPPED (partial)** (`dashboard-design §10`).
    New `/approvals` page + nav/palette entry: pending **Clearances** from `/v1/spine/clearances`
    (unified `coord.approval.pending` queue — spawn-hire/strategy/budget/high-risk, decided inline
@@ -588,20 +595,24 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    the stream is unavailable. Color is semantic-only; no fabricated cards. *Verify:* `npm run
    build` green; dist rebuilt + committed (parity gate); `git diff --check` clean.
 
-6. **Streamed Brief thread + interaction cards** — `dashboard-design.md §7/§8`.
-   **✅ DONE (partial — honest).** *Files changed:* `apps/dashboard/src/components/BriefDetail.tsx`
-   (embeds `<RunTranscript>` as a **Live work** block in the Latest-Shift section so the agent's
-   run is visible inside the workroom, not only on the Runs page; a `txKey` re-fetches it after a
-   Shift mutation), rebuilt `dashboard-dist`. *Adds:* the active/latest run's transcript streams
-   inline in the Brief; interaction cards already **refresh on the run-event SSE** because
-   BriefDetail's existing subscription calls `reload()` (which refetches `interactions`) on any
-   execution transition for this Brief. Existing answer/accept/reject controls and the
-   invalidation-bus wiring are preserved unchanged. *Partial (honest gap):* there is **no
-   dedicated interaction-card SSE** — a card raised by an agent **without** an accompanying run
-   transition appears on the next run event or a manual Refresh, not instantly. The transcript
-   itself is keyed by Brief (not run) on the stream, so it refetches on any transition while the
-   Shift is `running`. *Verify:* `npm run build` green; dist rebuilt + committed; `git diff
-   --check` clean.
+6. **Streamed Brief thread + interaction cards** — `dashboard-design.md §7/§8/§11`.
+   **✅ DONE.** *Files changed:* `crates/relix-web-bridge/src/spine.rs` (new `interactions_stream`
+   handler + pure `interactions_fingerprint` helper + unit test), `crates/relix-web-bridge/src/main.rs`
+   (route `GET /v1/spine/briefs/:id/interactions/stream`; also added to the route-conflict test),
+   `apps/dashboard/src/api.ts` (`subscribeBriefInteractions`), `apps/dashboard/src/components/BriefDetail.tsx`
+   (embeds `<RunTranscript>` as a **Live work** block; subscribes to the interaction stream and
+   updates cards directly with a subtle "live" cue), rebuilt `dashboard-dist`. *Adds:* the
+   active/latest run's transcript streams inline in the Brief, AND a **dedicated interaction-card
+   SSE** refreshes the ask/confirm/suggest/plan-package cards on its own — it tenant-scopes exactly
+   like the list route by proxying `brief.interactions`, emits an initial snapshot, then pushes
+   `event: interactions` only when the list's fingerprint changes (terminal `not_found` on an
+   unknown/cross-Guild Brief). So a card raised **without** an accompanying run transition now
+   surfaces within the poll window instead of only on the next run event / manual Refresh. The
+   run-event SSE `reload()` still owns the rest of the workroom; existing answer/accept/reject
+   controls and the invalidation-bus wiring are preserved. *Honest caveat:* the card stream is
+   **polling-backed SSE** (~2.5s, fingerprint-gated) like the Prime status stream — not a true
+   backend event source / full websocket push. *Verify:* `cargo test -p relix-web-bridge
+   spine::tests` green; `npm run build` green; dist rebuilt + committed; `git diff --check` clean.
 
 7. **Approvals hub** — `dashboard-design.md §10`.
    **✅ DONE (partial).** *Files changed:* new `apps/dashboard/src/pages/Approvals.tsx`,
