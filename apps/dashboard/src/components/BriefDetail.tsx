@@ -68,6 +68,17 @@ interface LatestRun {
   total_runs?: number;
 }
 
+// Interaction terminal-status → badge tone. `expired` (§1.8) is rendered
+// distinctly from `rejected`: a plan-bound `confirm` that was superseded by a
+// newer `plan` Dossier revision (or a comment) before it could be approved —
+// the operator did NOT decline it, the plan moved on. Neutral tone, not the
+// red of a rejection.
+const IX_STATUS_TONE: Record<string, string> = {
+  resolved: "done",
+  rejected: "blocked",
+  expired: "todo",
+};
+
 // Run status → badge tone (mirrors the Runs page).
 const RUN_TONE: Record<string, string> = {
   running: "in_progress",
@@ -190,6 +201,8 @@ export function BriefDetail({
   // draft for open `ask` cards that have no fixed choices.
   const [ixBusy, setIxBusy] = useState<string | null>(null);
   const [ixDraft, setIxDraft] = useState<Record<string, string>>({});
+  // Busy flag while a plan-approval confirm is being opened (§1.8).
+  const [planBusy, setPlanBusy] = useState(false);
 
   // Load the Brief detail AND the fuller Chronicle timeline together. The
   // detail carries only a bounded `chronicle.recent`; the dedicated `/events`
@@ -281,6 +294,15 @@ export function BriefDetail({
     (i) => i.status === "open" && i.kind === "suggest_tasks",
   );
   const closedInteractions = interactions.filter((i) => i.status !== "open");
+  // Plan-approval control state (§1.8). The detail's `dossiers` list isn't
+  // ordered by revision, so it tells us only whether a `plan` Dossier EXISTS
+  // locally — enough to enable/label the control honestly; the bridge binds to
+  // the true latest revision (and refuses if none). An already-open plan-bound
+  // confirm is surfaced so we don't invite a duplicate pending approval.
+  const hasPlanDossier = (d.dossiers ?? []).some((x) => x.kind === "plan");
+  const openPlanConfirm = interactions.find(
+    (i) => i.status === "open" && i.kind === "confirm" && i.bound_doc_kind === "plan",
+  );
 
   async function submitComment() {
     const text = comment.trim();
@@ -299,6 +321,35 @@ export function BriefDetail({
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Comment failed" });
     } finally {
       setBusy(false);
+    }
+  }
+
+  // Request approval for the latest `plan` Dossier (§1.8): open a `confirm`
+  // bound to that exact revision. The bridge refuses when the Brief has no
+  // `plan` Dossier; we disable the control locally when we can see there's no
+  // plan, but still surface a server refusal honestly if the data is stale.
+  // Once opened, the bound confirm appears in Requests for a Yes/No answer.
+  async function requestPlanApproval() {
+    setPlanBusy(true);
+    setBanner(null);
+    try {
+      await briefInteractions.openPlanConfirm(briefId, {
+        author: status?.username || "operator",
+      });
+      setBanner({
+        kind: "ok",
+        msg: "Plan approval requested — answer the bound confirm in Requests below.",
+      });
+      reload();
+      // A new open confirm can add an Action Center item (§1.9) — refresh it.
+      invalidate(["briefs", "actions"], { briefId });
+    } catch (e) {
+      setBanner({
+        kind: "err",
+        msg: e instanceof Error ? e.message : "Could not request plan approval",
+      });
+    } finally {
+      setPlanBusy(false);
     }
   }
 
@@ -672,6 +723,40 @@ export function BriefDetail({
         </div>
       )}
 
+      {/* Plan approval (§1.8; dashboard-design §7 "Request confirmation — used
+          for plan approval"). A workroom-native control that opens a `confirm`
+          bound to the Brief's latest `plan` Dossier revision. Disabled when no
+          plan Dossier is visible locally (the bridge would refuse anyway) or
+          when one is already pending — answered as Yes/No in Requests below. */}
+      <div
+        className="row"
+        style={{ marginTop: 14, gap: 8, alignItems: "baseline", flexWrap: "wrap" }}
+      >
+        <strong style={{ fontSize: 12 }}>Plan approval</strong>
+        <span className="muted" style={{ fontSize: 11 }}>
+          {openPlanConfirm
+            ? "A plan approval is pending below — answer it in Requests."
+            : hasPlanDossier
+              ? "Bind an approval to the latest plan Dossier revision."
+              : "No plan Dossier yet — attach a plan before requesting approval."}
+        </span>
+        <div className="spacer" style={{ flex: 1 }} />
+        <button
+          className="btn sm"
+          disabled={planBusy || !hasPlanDossier || !!openPlanConfirm}
+          title={
+            openPlanConfirm
+              ? "A plan-bound confirm is already open — answer it in Requests"
+              : hasPlanDossier
+                ? "Open an approval-bound confirm against the latest plan Dossier"
+                : "No plan Dossier to approve — attach one first"
+          }
+          onClick={requestPlanApproval}
+        >
+          {planBusy ? "…" : "Request approval"}
+        </button>
+      </div>
+
       {/* Requests — answerable interaction cards (§1.9; dashboard-design §7).
           Open ask/confirm cards an Operative or the companion raised sit above
           the Conversation so they read as "needs an answer", not a buried
@@ -696,6 +781,15 @@ export function BriefDetail({
             >
               <div className="row" style={{ gap: 6, alignItems: "baseline", flexWrap: "wrap" }}>
                 <span className="badge in_progress" style={{ fontSize: 10 }}>{it.kind}</span>
+                {it.bound_doc_kind === "plan" && it.bound_doc_id ? (
+                  <span
+                    className="badge todo"
+                    style={{ fontSize: 9 }}
+                    title={`Bound to plan Dossier ${it.bound_doc_id} — approving after the plan changes is refused as stale`}
+                  >
+                    bound to plan
+                  </span>
+                ) : null}
                 <span className="mono" style={{ fontSize: 10 }}>{it.author}</span>
                 {it.created_at ? (
                   <span className="muted" style={{ fontSize: 10 }}>
@@ -908,12 +1002,26 @@ export function BriefDetail({
                   >
                     <div className="row" style={{ gap: 6, alignItems: "baseline", flexWrap: "wrap" }}>
                       <span
-                        className={"badge " + (it.status === "resolved" ? "done" : "blocked")}
+                        className={"badge " + (IX_STATUS_TONE[it.status] ?? "blocked")}
                         style={{ fontSize: 9 }}
+                        title={
+                          it.status === "expired"
+                            ? "Expired — superseded by a newer plan revision or a comment before it was approved; it never resolved as approved"
+                            : undefined
+                        }
                       >
                         {it.status}
                       </span>
                       <span className="muted" style={{ fontSize: 11 }}>{it.kind}</span>
+                      {it.bound_doc_kind === "plan" && it.bound_doc_id ? (
+                        <span
+                          className="badge todo"
+                          style={{ fontSize: 9 }}
+                          title={`Bound to plan Dossier ${it.bound_doc_id}`}
+                        >
+                          bound to plan
+                        </span>
+                      ) : null}
                       <span style={{ wordBreak: "break-word" }}>{it.prompt}</span>
                     </div>
                     {createdIds.length > 0 ? (

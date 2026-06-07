@@ -233,13 +233,21 @@ export interface BriefInteraction {
   prompt: string;
   choices: string[];
   author: string;
-  status: string; // open | resolved | rejected
+  status: string; // open | resolved | rejected | expired
   response?: string | null;
   created_at?: number;
   resolved_at?: number | null;
   resolved_by?: string | null;
   // Present only on `suggest_tasks` cards.
   proposal?: BriefProposal | null;
+  // Approval-bound plan confirm (§1.8): when this `confirm` was opened against
+  // a specific `plan` Dossier revision, the bound Dossier id (which IS the
+  // revision — Dossiers are immutable) and its kind (`plan`). Present only on a
+  // bound confirm; an accept after the plan changed (newer revision or a
+  // superseding comment) is refused server-side and the card flips to
+  // `expired`.
+  bound_doc_id?: string | null;
+  bound_doc_kind?: string | null;
 }
 
 export const briefInteractions = {
@@ -270,6 +278,20 @@ export const briefInteractions = {
       `/v1/spine/briefs/${encodeURIComponent(briefId)}/interactions/${encodeURIComponent(
         interactionId,
       )}/respond`,
+      body,
+    ),
+  // Open an approval-bound plan confirm (§1.8): a `confirm` card bound to the
+  // Brief's latest `plan` Dossier revision. The route refuses (4xx) when the
+  // Brief has no `plan` Dossier — the caller surfaces that honestly. `author`
+  // defaults to the bridge identity when omitted. The card lists/answers
+  // through the same interaction routes; an accept after the plan changed is
+  // refused as stale and the card flips to `expired`.
+  openPlanConfirm: (
+    briefId: string,
+    body: { author?: string; prompt?: string },
+  ) =>
+    api.post<{ interaction_id: string }>(
+      `/v1/spine/briefs/${encodeURIComponent(briefId)}/plan-confirm`,
       body,
     ),
 };

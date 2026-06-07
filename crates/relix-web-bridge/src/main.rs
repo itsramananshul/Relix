@@ -738,6 +738,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/spine/briefs/:id/interactions/:iid/respond",
             post(spine::respond_interaction),
         )
+        // §1.8 approval-bound plan confirm: open a `confirm` bound to the
+        // Brief's latest `plan` Dossier revision (answered via the respond
+        // route above; a stale accept after a newer plan / a comment expires).
+        .route(
+            "/v1/spine/briefs/:id/plan-confirm",
+            post(spine::open_plan_confirm),
+        )
         // §1.9 suggest_tasks: propose a child-Brief tree, accept (materialize
         // as Sub-briefs) or reject it.
         .route(

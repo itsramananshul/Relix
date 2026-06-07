@@ -1746,6 +1746,47 @@ pub async fn respond_interaction(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct OpenPlanConfirmRequest {
+    /// Who is requesting the approval. Optional — defaults to the local
+    /// bridge/dashboard identity (`operator`) when absent, mirroring the
+    /// comment composer's `status?.username || "operator"` convention.
+    #[serde(default)]
+    pub author: String,
+    /// Optional prompt text shown on the confirm card; the coordinator
+    /// supplies a sensible default line when this is empty.
+    #[serde(default)]
+    pub prompt: String,
+}
+
+/// `POST /v1/spine/briefs/:id/plan-confirm` — open an approval-bound plan
+/// confirm (relix-execution-and-issue-design §1.8): a `confirm` card bound to
+/// the Brief's current latest `plan` Dossier revision. The coordinator refuses
+/// clearly when no `plan` Dossier exists, so the bridge forwards and surfaces
+/// that refusal rather than guessing. Returns `{interaction_id}`; the card is
+/// then answered through the existing `…/interactions/:iid/respond` route, and
+/// an accept after the plan changed (or after a comment superseded it) is
+/// refused as stale server-side. Mirrors `comment_brief`'s author handling.
+pub async fn open_plan_confirm(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<OpenPlanConfirmRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let author = if req.author.trim().is_empty() {
+        "operator"
+    } else {
+        req.author.trim()
+    };
+    // author is a positional wire field, so it must not carry a literal `|`;
+    // prompt is the trailing field (splitn 3) and may.
+    if author.contains('|') {
+        return Err(bad("author must not contain `|`"));
+    }
+    let arg = format!("{id}|{author}|{}", req.prompt);
+    let body = call_peer(&state, "brief.plan_confirm_open", arg.as_bytes()).await?;
+    json_id("interaction_id", &body)
+}
+
+#[derive(Debug, Deserialize)]
 pub struct SuggestChild {
     pub title: String,
     #[serde(default)]

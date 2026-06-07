@@ -122,7 +122,10 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   dependencies, idempotent accept, children inheriting parent context. **Approval-bound
   plan confirms** (`brief.plan_confirm_open`, §1.8) bind a `confirm` to the latest `plan`
   Dossier revision; a stale accept (newer plan revision, or superseded by a comment)
-  expires the card and never resolves as approved.
+  expires the card and never resolves as approved. Now usable from the dashboard: a
+  `POST /v1/spine/briefs/:id/plan-confirm` bridge route + a workroom **Request approval**
+  control open the bound confirm, the `expired` status renders distinctly from `rejected`,
+  and a "bound to plan" cue shows on the card.
 - **Desk / Inbox reads** — `/v1/spine/inbox`, `/v1/spine/briefs/:id/thread`,
   `/v1/spine/unassigned`; board cards surface unresolved same-Guild blockers.
 - **Supervisory auto-wake** (`execution §1.6/§3.1`) — the central `set_board_status`
@@ -374,11 +377,14 @@ ledger entry or design section.
     Dossier was attached (or the operator **superseded it by commenting**), the accept is **refused
     as stale**, the card flips to `expired`, and it **never resolves as approved** against a
     superseded plan. Plain confirms are unaffected; duplicate answers stay typed/idempotent;
-    tenant-isolated (cross-Guild reads as not-found). *Still deferred:* tying that bound-plan
-    approval into the decomposition trigger (decomposition still keys on the `suggest_tasks`
-    interaction id, **not** the bound plan revision), `owner`-liveness takeover enforcement, and
-    full issue **document authoring / per-doc revision-locking / forking** (`execution §1.8`) plus
-    wiring this into the autonomous planner flow.
+    tenant-isolated (cross-Guild reads as not-found). **Dashboard control now shipped:** a
+    `POST /v1/spine/briefs/:id/plan-confirm` bridge route proxies the capability and the Brief
+    workroom carries a **Request approval** control (against the latest `plan` Dossier), renders
+    `expired` distinctly from `rejected`, and shows a "bound to plan" cue. *Still deferred:* tying
+    that bound-plan approval into the decomposition trigger (decomposition still keys on the
+    `suggest_tasks` interaction id, **not** the bound plan revision), `owner`-liveness takeover
+    enforcement, and full issue **document authoring / per-doc revision-locking / forking**
+    (`execution §1.8`) plus wiring this into the autonomous planner flow.
 
 ---
 
