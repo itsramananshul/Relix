@@ -3360,6 +3360,137 @@ impl TaskStore {
         Ok(changed == 1)
     }
 
+    /// Stale-run **adoption by terminal evidence** (execution-and-issue-design
+    /// §1.4 "stale-run adoption" / §7.1 LOCKED two-pointer Claim).
+    ///
+    /// A Brief's Claim can be left **live** (the lease has not yet expired)
+    /// even though the run it points to has already reached a **terminal**
+    /// state — e.g. the owning process died between recording the terminal run
+    /// row and releasing the Claim, or a long lease outlives a crashed owner.
+    /// Age-based [`Self::recover_stale_runs`] never fixes this: it only scans
+    /// `running` rows, and this run is already terminal. So the dangling Claim
+    /// would block a fresh start (`already_running` → HTTP 409) until the lease
+    /// simply ages out — even though terminal evidence proves the prior Shift
+    /// ended.
+    ///
+    /// This reclaims that Claim **immediately**, but ONLY on terminal evidence:
+    /// the Claim points (via `execution_run_id`, else `checkout_run_id`) to a
+    /// `brief_runs` row **for this Brief** whose status is terminal (any status
+    /// other than `running`).
+    ///
+    /// It is **safe by construction** and never steals a live owner:
+    ///   - if the pointed run is still `running`, it does nothing (never
+    ///     releases a Claim that backs a currently-running run);
+    ///   - if the Claim pointer matches no `brief_runs` row for this Brief, it
+    ///     does nothing (no terminal evidence → never release another actor's
+    ///     live Claim on a guess);
+    ///   - the release is a conditional `UPDATE` keyed on the Claim's OWN
+    ///     pointer + holder, so a NEWER Claim that already re-acquired the
+    ///     Brief is never clobbered (the same guard as
+    ///     [`Self::release_claim_for_run`]).
+    ///
+    /// Records a `brief.claim_reclaimed` Chronicle note only when a reclaim
+    /// actually happens (an abnormal dangling Claim, not normal completion),
+    /// and promotes the oldest deferred wakeup just like a normal release.
+    /// Returns the released run pointer when a reclaim happened, else `None`.
+    pub fn reclaim_terminal_claim(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<String>, CoordinatorError> {
+        let now = unix_secs();
+        // Read the Claim, find its run pointer, confirm terminal evidence, and
+        // (conditionally) release — all under one lock. `append_event` takes
+        // its own lock, so it runs AFTER we drop this one.
+        let reclaimed: Option<(String, String)> = {
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            let claim = conn
+                .query_row(
+                    "SELECT claim_agent_id, execution_run_id, checkout_run_id
+                     FROM tasks WHERE task_id = ?1",
+                    params![task_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<String>>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(CoordinatorError::Db)?;
+            let Some((holder, exec_run, checkout_run)) = claim else {
+                return Ok(None); // no such Brief
+            };
+            let Some(holder) = holder.filter(|s| !s.trim().is_empty()) else {
+                return Ok(None); // no Claim to reclaim
+            };
+            // The Claim's run pointer: prefer the live execution run, else the
+            // checkout run (the ownership pointer).
+            let pointer = exec_run
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    checkout_run
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
+                .map(ToOwned::to_owned);
+            let Some(pointer) = pointer else {
+                return Ok(None); // a Claim with no run pointer — no run evidence to adopt
+            };
+            // Terminal EVIDENCE: the pointed run must exist for THIS Brief.
+            // A `running` row → still live, do nothing. No row → no evidence,
+            // do nothing (never release another actor's live Claim on a guess).
+            let status: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM brief_runs WHERE run_id = ?1 AND brief_id = ?2",
+                    params![pointer, task_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(CoordinatorError::Db)?;
+            let Some(status) = status else {
+                return Ok(None); // pointer matches no run on this Brief — no evidence
+            };
+            if status == "running" {
+                return Ok(None); // a live run still backs this Claim — never release
+            }
+            // Terminal evidence confirmed. Release the Claim, conditional on the
+            // pointer + holder still matching (so a newer Claim is untouched).
+            let changed = conn
+                .execute(
+                    "UPDATE tasks
+                     SET claimed_by = NULL,
+                         claim_expires_at = NULL,
+                         checkout_run_id = NULL,
+                         execution_run_id = NULL,
+                         claim_agent_id = NULL,
+                         claim_locked_at = NULL,
+                         updated_at = ?1
+                     WHERE task_id = ?2 AND claim_agent_id = ?3
+                       AND (execution_run_id = ?4 OR checkout_run_id = ?4)",
+                    params![now, task_id, holder.trim(), pointer],
+                )
+                .map_err(CoordinatorError::Db)?;
+            if changed != 1 {
+                return Ok(None); // a newer Claim re-acquired it between read + write
+            }
+            let _ = promote_oldest_deferred_wakeup_in_conn(&conn, task_id, now)?;
+            Some((pointer, status))
+        };
+        let Some((pointer, status)) = reclaimed else {
+            return Ok(None);
+        };
+        let _ = self.append_event(
+            task_id,
+            "brief.claim_reclaimed",
+            &format!("claim released by terminal evidence: run {pointer} is {status}"),
+        );
+        Ok(Some(pointer))
+    }
+
     /// Open a run record for a Brief execution (status `running`). One
     /// durable row per Rig run — the stable run ledger the dashboard
     /// polls (`/v1/runs`) instead of parsing event strings. Called once
@@ -25398,6 +25529,95 @@ mod tests {
         // released it.
         let holder = s.claim_holder(&b).unwrap();
         assert!(holder.is_some(), "claim for the newer run must survive run_old recovery");
+    }
+
+    // ── Stale-run adoption by terminal evidence (execution §1.4/§7.1) ──
+
+    #[test]
+    fn reclaim_terminal_claim_releases_when_pointed_run_is_terminal() {
+        // A LIVE Claim points at a run that already finished terminal (the
+        // owning process died before releasing the Claim). Age-based recovery
+        // can't help — the run is no longer `running`. Terminal evidence lets
+        // the Claim be reclaimed immediately.
+        let s = store();
+        let b = brief(&s, "dangling terminal claim");
+        assert!(s.claim_brief_for_run(&b, "agt_a", 300, Some("run_x")).unwrap());
+        running_run(&s, "run_x", &b, "agt_a");
+        s.record_run_finish("run_x", "done", "ok").unwrap(); // terminal, Claim still live
+        assert!(s.claim_holder(&b).unwrap().is_some(), "claim live before reclaim");
+
+        let released = s.reclaim_terminal_claim(&b).unwrap();
+        assert_eq!(released.as_deref(), Some("run_x"));
+        assert!(
+            s.claim_holder(&b).unwrap().is_none(),
+            "claim released by terminal evidence"
+        );
+        // An honest Chronicle note was recorded (named consistently).
+        let chron = s
+            .query_events(&b, 0, 50, Some("brief.claim_reclaimed"), EventOrder::Desc)
+            .unwrap();
+        assert_eq!(chron.len(), 1, "one reclaim chronicle note");
+        // Idempotent: nothing left to reclaim, no second note.
+        assert!(s.reclaim_terminal_claim(&b).unwrap().is_none());
+        let chron = s
+            .query_events(&b, 0, 50, Some("brief.claim_reclaimed"), EventOrder::Desc)
+            .unwrap();
+        assert_eq!(chron.len(), 1, "no duplicate reclaim note");
+    }
+
+    #[test]
+    fn reclaim_terminal_claim_leaves_a_running_run_alone() {
+        // SAFETY: never release a Claim that still backs a `running` run.
+        let s = store();
+        let b = brief(&s, "live run claim");
+        assert!(s.claim_brief_for_run(&b, "agt_a", 300, Some("run_live")).unwrap());
+        running_run(&s, "run_live", &b, "agt_a"); // still running
+        assert!(
+            s.reclaim_terminal_claim(&b).unwrap().is_none(),
+            "a running run must not be reclaimed"
+        );
+        assert!(s.claim_holder(&b).unwrap().is_some(), "claim untouched");
+    }
+
+    #[test]
+    fn reclaim_terminal_claim_needs_evidence_matching_the_pointer() {
+        // SAFETY: a terminal run that is NOT the Claim's pointer is not
+        // evidence — never release another actor's live Claim on a guess.
+        let s = store();
+        let b = brief(&s, "mismatched evidence");
+        // The Claim points to run_x (which has no run row); a DIFFERENT run_y
+        // is the one that is terminal.
+        assert!(s.claim_brief_for_run(&b, "agt_a", 300, Some("run_x")).unwrap());
+        running_run(&s, "run_y", &b, "agt_a");
+        s.record_run_finish("run_y", "failed", "boom").unwrap();
+        assert!(
+            s.reclaim_terminal_claim(&b).unwrap().is_none(),
+            "no terminal evidence for the Claim's own pointer"
+        );
+        assert!(s.claim_holder(&b).unwrap().is_some(), "claim must survive");
+    }
+
+    #[test]
+    fn reclaim_terminal_claim_does_not_clobber_a_newer_running_claim() {
+        // SAFETY: an OLD run going terminal must not release a Claim that a
+        // NEWER, still-running run already re-acquired (the same invariant as
+        // age-based recovery's release-only-if-it-belongs guard).
+        let s = store();
+        let b = brief(&s, "re-claimed before reclaim");
+        running_run(&s, "run_old", &b, "agt_a");
+        s.record_run_finish("run_old", "interrupted", "gone").unwrap(); // old run terminal
+        // A newer run re-claims the Brief and is running; the Claim now points
+        // at run_new, not the terminal run_old.
+        assert!(s.claim_brief_for_run(&b, "agt_a", 300, Some("run_new")).unwrap());
+        running_run(&s, "run_new", &b, "agt_a");
+        assert!(
+            s.reclaim_terminal_claim(&b).unwrap().is_none(),
+            "the newer running Claim must not be clobbered by the old terminal run"
+        );
+        assert!(
+            s.claim_holder(&b).unwrap().is_some(),
+            "newer running Claim survives"
+        );
     }
 
     #[test]

@@ -2014,6 +2014,18 @@ pub fn preflight_run(
             workspace_bytes: None,
         }));
     }
+    // Stale-run adoption by terminal evidence (execution-and-issue-design §1.4
+    // "stale-run adoption" / §7.1 LOCKED two-pointer Claim): if a prior Shift
+    // left a LIVE Claim pointing at a run that has already reached a terminal
+    // state, reclaim it NOW so this start isn't stuck behind a dead owner until
+    // the lease ages out (`recover_stale_runs` can't help — it only sweeps
+    // `running` rows). Safe by construction: it only releases on terminal
+    // evidence matching the Claim's own pointer, never a Claim that backs a
+    // still-`running` run or a Claim a newer run has re-acquired (see
+    // `reclaim_terminal_claim`). The duplicate-start guard above already passed
+    // (no `running` run by THIS Operative), so a terminal Claim is the only
+    // thing the claim below could collide with — clear it before claiming.
+    let _ = store.reclaim_terminal_claim(&card.task_id)?;
     // Single-owner: claim the Brief so a duplicate concurrent run can't
     // start. A live claim by another run → refuse.
     let run_id = format!("run_{}", uuid::Uuid::new_v4());
@@ -4248,6 +4260,114 @@ mod tests {
         assert_eq!(s.claim_holder(&id).unwrap().unwrap().0, "other_agent");
         // No run row was opened for the refused start.
         assert!(s.runs_for_brief(&id, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn preflight_run_adopts_a_stale_claim_with_terminal_run_evidence() {
+        // execution-and-issue-design §1.4 "stale-run adoption" / §7.1 LOCKED
+        // two-pointer Claim: a prior Shift left a LIVE Claim (held by a now-dead
+        // worker) pointing at a run that already reached a terminal state. A new
+        // start must NOT be stuck on `already_running` until the lease ages out
+        // — terminal evidence proves the prior Shift ended, so the Claim is
+        // reclaimed and the start succeeds.
+        let (s, _tmp) = store_ws();
+        let reg = echo_registry();
+        let id = ready_brief(&s, "stale terminal claim", "agt_a");
+        // A previous owner holds a LIVE Claim pointing at run_prev...
+        assert!(s
+            .claim_brief_for_run(&id, "agt_prev", 300, Some("run_prev"))
+            .unwrap());
+        // ...but run_prev has already finished terminal (`done`).
+        s.record_run_start(
+            "run_prev",
+            &id,
+            "agt_prev",
+            "echo",
+            "manual",
+            &crate::nodes::coordinator::RunWorkspaceInfo::default(),
+        )
+        .unwrap();
+        s.record_run_finish("run_prev", "done", "ok").unwrap();
+
+        let ready = match preflight_run(&s, &reg, None, 300, &id, Some("echo"), "go".into()).unwrap()
+        {
+            Preflight::Ready(r) => *r,
+            Preflight::Refused(r) => {
+                panic!("terminal evidence should let the start proceed, got {r:?}")
+            }
+        };
+        // The new start owns the Brief now; exactly one fresh `running` row.
+        assert_eq!(s.claim_holder(&id).unwrap().unwrap().0, "agt_a");
+        let runs = s.runs_for_brief(&id, 10).unwrap();
+        assert_eq!(
+            runs.iter().filter(|r| r.status == "running").count(),
+            1,
+            "exactly one live run after adoption"
+        );
+        assert!(runs.iter().any(|r| r.run_id == ready.run_id));
+        // A reclaim Chronicle note records the adoption honestly.
+        assert_eq!(
+            s.query_events(
+                &id,
+                0,
+                50,
+                Some("brief.claim_reclaimed"),
+                crate::nodes::coordinator::EventOrder::Desc,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        let _ = execute_ready(&s, None, ready);
+    }
+
+    #[test]
+    fn preflight_run_refuses_when_other_workers_run_is_still_running() {
+        // The adoption path must NEVER steal a Claim that still backs a RUNNING
+        // run: a different worker holds a live Claim whose execution run is
+        // actually `running` → the new start is refused `already_running`
+        // (→ HTTP 409), exactly as before. NEVER retry a 409.
+        let (s, _tmp) = store_ws();
+        let reg = echo_registry();
+        let id = ready_brief(&s, "live other run", "agt_a");
+        assert!(s
+            .claim_brief_for_run(&id, "agt_prev", 300, Some("run_prev"))
+            .unwrap());
+        s.record_run_start(
+            "run_prev",
+            &id,
+            "agt_prev",
+            "echo",
+            "manual",
+            &crate::nodes::coordinator::RunWorkspaceInfo::default(),
+        )
+        .unwrap(); // still `running` — a live owner
+
+        let report =
+            match preflight_run(&s, &reg, None, 300, &id, Some("echo"), "x".into()).unwrap() {
+                Preflight::Refused(r) => r,
+                Preflight::Ready(_) => panic!("a still-running owner must block the start"),
+            };
+        assert_eq!(report.status, "already_running", "got: {report:?}");
+        assert!(report.run_id.is_none(), "a conflict opens no run row");
+        assert_eq!(
+            s.claim_holder(&id).unwrap().unwrap().0,
+            "agt_prev",
+            "the live owner's Claim is untouched"
+        );
+        // No SECOND run row was opened; only the owner's `running` row exists.
+        assert_eq!(
+            s.runs_for_brief(&id, 10).unwrap().len(),
+            1,
+            "no duplicate run row"
+        );
+        // NEVER retry a 409: a retry while the owner runs loses again.
+        let retry =
+            preflight_run(&s, &reg, None, 300, &id, Some("echo"), "y".into()).unwrap();
+        assert!(
+            matches!(retry, Preflight::Refused(r) if r.status == "already_running"),
+            "a retry of a 409 conflict loses again — clients must not retry"
+        );
     }
 
     #[test]

@@ -103,8 +103,16 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   duplicate-start guard** refuses a *new* start (`already_running` → `409`) when that
   Operative already has a live, actually-running run on the same Brief — so a double-start
   can no longer open two run rows/workspaces while the lower-level `claim_brief_for_run`
-  stays idempotent for wakeup/heartbeat/recovery (§1.4/§2.6). *Still partial:* stale-run
-  adoption by terminal evidence (see gaps / §5 slice 10).
+  stays idempotent for wakeup/heartbeat/recovery (§1.4/§2.6). **Stale-run adoption by
+  terminal evidence** now also ships (§5 slice 10): a dangling **live** Claim whose run
+  pointer (`execution_run_id`/`checkout_run_id`) points at an already-**terminal**
+  `brief_runs` row is reclaimed at start time (`reclaim_terminal_claim`, called in
+  `preflight_run` before the claim), so a new start proceeds on terminal evidence instead
+  of waiting for the age-based `recover_stale_runs` sweep — safe by construction (never
+  releases a Claim backing a still-`running` run, a Claim with no matching run evidence, or
+  a newer Claim) and chronicled `brief.claim_reclaimed`. *Remaining edge:* Relix
+  releases+re-claims rather than transferring the dead owner's checkout context in place
+  (full Paperclip "adopt the prior checkout run").
 - **Entry guards** — `in_progress` requires assignee + no unresolved Snags; `in_review`
   requires a real reviewer.
 - **Brief detail API** — `brief.detail` returns the full product object (fields,
@@ -185,16 +193,23 @@ Tagged **[BE]** backend, **[FE]** frontend, **[DOC]** docs-only. Each cites the 
 ledger entry or design section.
 
 **P1 — correctness & governance honesty**
-1. **[BE] Claim stale-run adoption by terminal evidence** — the `409` conflict surface, the
-   per-Operative start lock, and the **same-Operative duplicate-start guard** **shipped**
-   (roadmap §5 slice 1: `brief.run` maps a Claim conflict `already_running` → HTTP `409`,
-   never a retryable `200`; an in-process per-Operative start lock serializes concurrent
-   starts; a new start by the same Operative on a Brief it is already running is refused
-   `already_running` instead of opening a second run row/workspace; "never retry a 409"
-   pinned in tests). What remains of the two-pointer Claim is **stale-run *adoption by
-   terminal evidence*** — see §5 slice 10 (`execution §1.4`/`§7.1` LOCKED; ledger "Claim HTTP
-   409 + per-Operative start lock + duplicate-start guard" = DONE, "stale-run adoption" =
-   PARTIAL).
+1. **[BE] Claim two-pointer model — DONE.** The `409` conflict surface, the per-Operative
+   start lock, and the **same-Operative duplicate-start guard** shipped in slice 1
+   (`brief.run` maps a Claim conflict `already_running` → HTTP `409`, never a retryable
+   `200`; an in-process per-Operative start lock serializes concurrent starts; a new start
+   by the same Operative on a Brief it is already running is refused `already_running`
+   instead of opening a second run row/workspace; "never retry a 409" pinned in tests). The
+   last open piece, **stale-run *adoption by terminal evidence***, now also shipped (§5
+   slice 10): a dangling **live** Claim whose run pointer references an already-**terminal**
+   `brief_runs` row is reclaimed at start time (`reclaim_terminal_claim` in `preflight_run`),
+   safe by construction and chronicled `brief.claim_reclaimed`, so a new start proceeds on
+   terminal evidence without waiting for the age-based `recover_stale_runs` sweep
+   (`execution §1.4`/`§7.1` LOCKED; ledger "Claim HTTP 409 + per-Operative start lock +
+   duplicate-start guard" = DONE, "stale-run adoption" = DONE). *Remaining edge (deferred):*
+   Relix releases+re-claims rather than transferring the dead owner's checkout context in
+   place (full Paperclip "adopt the prior checkout run"); the reclaim is wired into the
+   manual/Prime start chokepoint, while the autonomous heartbeat path still relies on the
+   age-based sweep (a live-claimed Brief is not `ready`, so the heartbeat never races it).
 2. **[BE] Guild-level spend hard-stop** — **SHIPPED for autonomous dispatch** (roadmap §5
    slice 2): the heartbeat path now refuses a Brief when its Guild is over its monthly
    budget, mirroring the per-Operative hard-stop and additive on top of it
@@ -353,11 +368,33 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    calendar-month window with reset, replacing trailing-30d approximation; near-band
    configurable. *Test:* month-boundary reset test. *Verify:* `cargo test`; ledger updated.
 
-10. **Stale-run adoption by terminal evidence** — `execution-and-issue-design.md §1.4`.
-    *Files:* `recover_stale_runs` + claim store. *Adds:* a dead checkout reclaimed when
-    terminal evidence proves the prior Shift ended (beyond the current age-based
-    `interrupted` sweep). *Test:* adoption test with a stale checkout + terminal run row.
-    *Verify:* `cargo test`; ledger "Claim two-pointer" PARTIAL detail closed.
+10. **Stale-run adoption by terminal evidence** — `execution-and-issue-design.md §1.4/§7.1`.
+    **✅ DONE.** *Files changed:* `crates/relix-runtime/src/nodes/coordinator/mod.rs` (new
+    `TaskStore::reclaim_terminal_claim` + 4 store tests), `…/coordinator/heartbeat.rs`
+    (`preflight_run` calls it after the duplicate-start guard, before `claim_brief_for_run`
+    + 2 preflight tests). *Adds:* a dangling **live** Claim whose run pointer
+    (`execution_run_id`, else `checkout_run_id`) references an already-**terminal**
+    `brief_runs` row is reclaimed at start time — beyond the age-based `recover_stale_runs`
+    → `interrupted` sweep, which only touches `running` rows and so never frees a Claim whose
+    run is already terminal. *Safe by construction:* never releases a Claim that still backs
+    a `running` run, a Claim whose pointer matches no run row for this Brief (no terminal
+    evidence → never steal another actor's live Claim on a guess), or a **newer** Claim that
+    re-acquired the Brief (conditional `UPDATE` keyed on the Claim's own pointer + holder).
+    On a real reclaim it promotes the oldest deferred wakeup and records a
+    `brief.claim_reclaimed` Chronicle note (only on the abnormal dangling case — no noise on
+    normal completion). *Preserves slice 1:* a still-`running` matching run still refuses
+    `already_running` → 409 (reclaim is a no-op on it); a terminal matching run now lets a new
+    start proceed. *Tests:* store — releases on terminal pointer (+ chronicle + idempotent),
+    leaves a `running` run alone, needs evidence matching the Claim's own pointer, does not
+    clobber a newer running Claim; `preflight_run` — adopts a stale terminal Claim and a fresh
+    start succeeds (one live run row), refuses `already_running`/409 (never retry) when
+    another worker's run is still `running`. *Verified:* full `cargo test -p relix-runtime`
+    green (3950 lib tests, +6); `cargo check` clean; `cargo clippy` clean on the touched code
+    (2 pre-existing unrelated warnings in `maintenance.rs`); `git diff --check` clean.
+    *Remaining edge (deferred):* Relix releases+re-claims rather than transferring the dead
+    owner's checkout context in place (full Paperclip "adopt the prior checkout run"); the
+    reclaim is wired into the manual/Prime start chokepoint, while the autonomous heartbeat
+    path still relies on the age-based sweep for the same condition.
 
 > After completing a slice: re-open the cited section, update the implementation map /
 > divergence ledger in `product-spine-implementation.md`, and update this file's §2/§3 so
