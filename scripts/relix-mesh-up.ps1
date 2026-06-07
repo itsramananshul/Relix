@@ -1392,6 +1392,10 @@ name = "spine_brief_interaction_open"
 method = "brief.interaction_open"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_brief_plan_confirm_open"
+method = "brief.plan_confirm_open"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_brief_interactions"
 method = "brief.interactions"
 allow_groups = ["chat-users"]

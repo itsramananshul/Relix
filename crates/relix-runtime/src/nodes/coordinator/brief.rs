@@ -78,6 +78,21 @@ pub struct Interaction {
     /// child Briefs); `None` for `ask`/`confirm`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal: Option<Proposal>,
+    /// **Approval-bound plan confirm** (relix-execution-and-issue-design
+    /// §1.8): when this `confirm` card was opened against a specific Dossier
+    /// revision, the exact bound Dossier id (which IS the revision — Dossiers
+    /// are immutable, append-only rows). The accept path re-checks that the
+    /// latest Dossier of [`Self::bound_doc_kind`] is still this id; if the plan
+    /// changed since opening, the accept is refused as **stale** and the card
+    /// expires (it must never resolve as *approved* against a superseded plan).
+    /// `None` for a plain `ask`/`confirm`/`suggest_tasks` (those behave exactly
+    /// as before — no binding, no staleness check, no supersede-on-comment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_doc_id: Option<String>,
+    /// The Dossier kind this confirm is bound to (e.g. `plan`); `None` when
+    /// unbound. Paired with [`Self::bound_doc_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_doc_kind: Option<String>,
 }
 
 /// One proposed child Brief inside a `suggest_tasks` interaction (§1.9):

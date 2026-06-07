@@ -80,6 +80,8 @@ $RequiredCapabilities = @(
     'brief.comment', 'brief.unassigned', 'brief.unblocked', 'brief.run', 'brief.runs',
     # Brief thread interactions (answerable ask/confirm cards, §1.9)
     'brief.interaction_open', 'brief.interactions', 'brief.interaction_respond',
+    # Approval-bound plan confirm (bind a confirm to the latest plan Dossier, §1.8)
+    'brief.plan_confirm_open',
     # Brief suggest_tasks cards (propose + accept/reject a child-Brief tree, §1.9)
     'brief.suggest_open', 'brief.suggest_respond',
     'task.events', 'task.recent_events',

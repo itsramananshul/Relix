@@ -1951,6 +1951,47 @@ impl TaskStore {
             params![task_id, now, format!("{author}: {text}")],
         )
         .map_err(CoordinatorError::Db)?;
+        // §1.8/§1.9 supersede-on-comment: a fresh comment supersedes any OPEN
+        // plan-bound confirm on this Brief — the operator answered by commenting
+        // instead of clicking, so the pending plan approval expires (it must not
+        // later resolve as approved against a plan the conversation has moved
+        // past). Only plan-bound confirms (`kind = confirm` AND
+        // `bound_doc_kind = 'plan'`) are touched — plain ask/confirm/suggest
+        // cards are deliberately left untouched.
+        let superseded: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT interaction_id FROM brief_interactions
+                     WHERE task_id = ?1 AND status = 'open'
+                       AND kind = 'confirm' AND bound_doc_kind = 'plan'",
+                )
+                .map_err(CoordinatorError::Db)?;
+            stmt.query_map(params![task_id], |r| r.get::<_, String>(0))
+                .map_err(CoordinatorError::Db)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(CoordinatorError::Db)?
+        };
+        if !superseded.is_empty() {
+            conn.execute(
+                "UPDATE brief_interactions
+                 SET status = 'expired', resolved_at = ?1, resolved_by = ?2
+                 WHERE task_id = ?3 AND status = 'open'
+                   AND kind = 'confirm' AND bound_doc_kind = 'plan'",
+                params![now, author, task_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+            for iid in &superseded {
+                let _ = conn.execute(
+                    "INSERT INTO task_events (task_id, ts, event_type, payload)
+                     VALUES (?1, ?2, 'brief.interaction_expired', ?3)",
+                    params![
+                        task_id,
+                        now,
+                        format!("{author}: plan confirmation {iid} superseded by comment")
+                    ],
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2017,6 +2058,82 @@ impl TaskStore {
         Ok(interaction_id)
     }
 
+    /// §1.8 (approval-bound plan confirm): open a `confirm` card **bound to
+    /// the Brief's current latest `plan` Dossier revision**. This is the
+    /// governed plan-approval gate: the planner writes a `plan` Dossier, then
+    /// opens this confirm against that *exact* revision and waits.
+    ///
+    /// - The Brief must exist (tenant scoping is enforced by the caller against
+    ///   the owning Brief, as for [`Self::open_interaction`]).
+    /// - A latest `plan` Dossier must exist, else a clear typed refusal — you
+    ///   can't bind an approval to a plan that isn't written yet.
+    /// - The opened card records the bound Dossier id (the revision) and
+    ///   `bound_doc_kind = "plan"`; the bound id is mirrored into the Chronicle
+    ///   (`brief.plan_confirm_opened`) so the approval thread is auditable.
+    ///
+    /// On accept, [`Self::respond_interaction`] re-checks the latest `plan`
+    /// revision is still the bound one; if the plan changed (a newer `plan`
+    /// Dossier was attached, or the operator superseded it by commenting), the
+    /// accept is refused as **stale** and the card expires — it never resolves
+    /// as approved against a superseded plan.
+    pub fn open_plan_confirm(
+        &self,
+        task_id: &str,
+        author: &str,
+        prompt: &str,
+    ) -> Result<String, CoordinatorError> {
+        let author = author.trim();
+        if author.is_empty() {
+            return Err(CoordinatorError::Invalid(
+                "plan confirm author required".to_string(),
+            ));
+        }
+        // The prompt is optional — a plan confirm has a sensible default line.
+        let prompt = {
+            let p = prompt.trim();
+            if p.is_empty() {
+                "Approve the current plan?".to_string()
+            } else {
+                p.to_string()
+            }
+        };
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, task_id)? {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let bound_doc_id = match latest_dossier_id_conn(&conn, task_id, "plan")
+            .map_err(CoordinatorError::Db)?
+        {
+            Some(id) => id,
+            None => {
+                return Err(CoordinatorError::Invalid(
+                    "no `plan` Dossier to confirm; attach a plan Dossier first".to_string(),
+                ));
+            }
+        };
+        let interaction_id = new_interaction_id();
+        let now = unix_secs();
+        conn.execute(
+            "INSERT INTO brief_interactions
+                 (interaction_id, task_id, kind, prompt, choices, author,
+                  status, response, created_at, resolved_at, resolved_by,
+                  bound_doc_id, bound_doc_kind)
+             VALUES (?1, ?2, 'confirm', ?3, '[]', ?4, 'open', NULL, ?5, NULL, NULL, ?6, 'plan')",
+            params![interaction_id, task_id, prompt, author, now, bound_doc_id],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let _ = conn.execute(
+            "INSERT INTO task_events (task_id, ts, event_type, payload)
+             VALUES (?1, ?2, 'brief.plan_confirm_opened', ?3)",
+            params![
+                task_id,
+                now,
+                format!("{author}: plan approval bound to {bound_doc_id}")
+            ],
+        );
+        Ok(interaction_id)
+    }
+
     /// §1.9: list a Brief's thread interactions (oldest first), open
     /// and resolved alike, so the workroom can show open cards above
     /// the Conversation and mark resolved ones. Does not check Brief
@@ -2031,7 +2148,7 @@ impl TaskStore {
             .prepare(
                 "SELECT interaction_id, task_id, kind, prompt, choices, author,
                         status, response, created_at, resolved_at, resolved_by,
-                        proposal
+                        proposal, bound_doc_id, bound_doc_kind
                  FROM brief_interactions WHERE task_id = ?1
                  ORDER BY created_at ASC, rowid ASC",
             )
@@ -2057,6 +2174,8 @@ impl TaskStore {
                     resolved_at: r.get(9)?,
                     resolved_by: r.get(10)?,
                     proposal,
+                    bound_doc_id: r.get(12)?,
+                    bound_doc_kind: r.get(13)?,
                 })
             })
             .map_err(CoordinatorError::Db)?
@@ -2097,34 +2216,71 @@ impl TaskStore {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         // Resolve the card within this Brief; a card under another Brief
         // (or a missing id) reads as not-found here.
-        let current: Option<(String, String)> = conn
+        let current: Option<(String, String, Option<String>, Option<String>)> = conn
             .query_row(
-                "SELECT status, kind FROM brief_interactions
+                "SELECT status, kind, bound_doc_id, bound_doc_kind FROM brief_interactions
                  WHERE interaction_id = ?1 AND task_id = ?2",
                 params![interaction_id, task_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
             .map_err(CoordinatorError::Db)?;
-        match current {
+        let (cur_status, cur_kind, bound_doc_id, bound_doc_kind) = match current {
             None => return Err(CoordinatorError::NotFound(interaction_id.to_string())),
-            // `suggest_tasks` cards are answered through `respond_suggestion`
-            // (accept materializes child Briefs; reject closes) — the generic
-            // respond path must not resolve one without creating its children.
-            Some((_, kind)) if kind == "suggest_tasks" => {
-                return Err(CoordinatorError::Invalid(
-                    "suggest_tasks cards are answered via the suggestion accept/reject path"
-                        .to_string(),
-                ));
-            }
-            Some((s, _)) if s != "open" => {
-                return Err(CoordinatorError::Invalid(format!(
-                    "interaction already {s}"
-                )));
-            }
-            Some(_) => {}
+            Some(c) => c,
+        };
+        // `suggest_tasks` cards are answered through `respond_suggestion`
+        // (accept materializes child Briefs; reject closes) — the generic
+        // respond path must not resolve one without creating its children.
+        if cur_kind == "suggest_tasks" {
+            return Err(CoordinatorError::Invalid(
+                "suggest_tasks cards are answered via the suggestion accept/reject path"
+                    .to_string(),
+            ));
+        }
+        // Duplicate-answer behavior is typed/idempotent (incl. an already-
+        // `expired` stale plan confirm): a second response is a clear refusal,
+        // never a silent overwrite.
+        if cur_status != "open" {
+            return Err(CoordinatorError::Invalid(format!(
+                "interaction already {cur_status}"
+            )));
         }
         let now = unix_secs();
+        // §1.8 approval-bound plan confirm: an *accept* of a confirm bound to a
+        // `plan` Dossier must verify the latest `plan` revision is still the one
+        // it was opened against. If the plan changed since opening (a newer
+        // `plan` Dossier was attached), the accept is **stale** — it must not
+        // resolve as approved against a superseded plan. Expire the card
+        // durably and refuse typed. (A reject of a stale card is harmless and
+        // left to the normal path; this guards only the approval.)
+        if status == "resolved"
+            && cur_kind == "confirm"
+            && bound_doc_kind.as_deref() == Some("plan")
+        {
+            let latest =
+                latest_dossier_id_conn(&conn, task_id, "plan").map_err(CoordinatorError::Db)?;
+            if latest.as_deref() != bound_doc_id.as_deref() {
+                let _ = conn.execute(
+                    "UPDATE brief_interactions
+                     SET status = 'expired', resolved_at = ?1, resolved_by = ?2
+                     WHERE interaction_id = ?3 AND task_id = ?4 AND status = 'open'",
+                    params![now, responder, interaction_id, task_id],
+                );
+                let _ = conn.execute(
+                    "INSERT INTO task_events (task_id, ts, event_type, payload)
+                     VALUES (?1, ?2, 'brief.interaction_expired', ?3)",
+                    params![
+                        task_id,
+                        now,
+                        format!("{responder}: plan changed since this confirmation opened — stale")
+                    ],
+                );
+                return Err(CoordinatorError::Invalid(
+                    "plan confirmation is stale: the plan changed since it was opened".to_string(),
+                ));
+            }
+        }
         // Guard the write on `status = 'open'` too, so concurrent
         // responders can't both land (the lock already serializes us, but
         // this keeps the invariant explicit at the row level).
@@ -11171,6 +11327,18 @@ pub fn register(
             })),
         );
     }
+    // §1.8 (approval-bound plan confirm): open a confirm bound to the latest
+    // `plan` Dossier revision (answered via `brief.interaction_respond`).
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.plan_confirm_open",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_plan_confirm_open(&s, &ctx) }
+            })),
+        );
+    }
     {
         let s = store.clone();
         bridge.register(
@@ -12922,6 +13090,36 @@ fn handle_brief_interaction_open(store: &TaskStore, ctx: &InvocationCtx) -> Hand
     match store.open_interaction(task, parts[1].trim(), parts[2].trim(), parts[4], &choices) {
         Ok(id) => HandlerOutcome::Ok(id.into_bytes()),
         Err(e) => map_edge_err("brief.interaction_open", e),
+    }
+}
+
+/// `brief.plan_confirm_open` — open an approval-bound plan confirm (§1.8).
+/// Arg `task_id|author|prompt` (prompt is the optional trailing field, may
+/// contain pipes; defaults to a sensible line when omitted/empty). Binds the
+/// `confirm` card to the Brief's current latest `plan` Dossier revision and
+/// refuses clearly when no `plan` Dossier exists yet. Returns the new
+/// interaction_id. Answered through `brief.interaction_respond` like any
+/// confirm, but an accept after the plan changed (or after a comment
+/// superseded it) is refused as stale.
+fn handle_brief_plan_confirm_open(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.plan_confirm_open utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(3, '|').collect();
+    if parts.len() < 2 {
+        return invalid(
+            "brief.plan_confirm_open: expected `task_id|author|prompt`".to_string(),
+        );
+    }
+    let task = parts[0].trim();
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.plan_confirm_open") {
+        return out;
+    }
+    let prompt = parts.get(2).copied().unwrap_or("");
+    match store.open_plan_confirm(task, parts[1].trim(), prompt) {
+        Ok(id) => HandlerOutcome::Ok(id.into_bytes()),
+        Err(e) => map_edge_err("brief.plan_confirm_open", e),
     }
 }
 
@@ -15506,6 +15704,12 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             resolved_at    INTEGER,
             resolved_by    TEXT,
             proposal       TEXT,
+            -- Approval-bound plan confirm (execution-and-issue §1.8): when a
+            -- `confirm` card is opened against a specific Dossier revision, the
+            -- bound Dossier id (= the revision; Dossiers are immutable rows) and
+            -- its kind (e.g. `plan`). NULL for plain ask/confirm/suggest cards.
+            bound_doc_id   TEXT,
+            bound_doc_kind TEXT,
             FOREIGN KEY (task_id) REFERENCES tasks(task_id)
         );
         CREATE INDEX IF NOT EXISTS brief_interactions_by_task
@@ -15906,6 +16110,12 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         // specs) carried by a `suggest_tasks` interaction card. NULL for
         // `ask`/`confirm` cards and for legacy rows.
         "ALTER TABLE brief_interactions ADD COLUMN proposal TEXT",
+        // §1.8 approval-bound plan confirm: bind a `confirm` card to an exact
+        // Dossier revision (the bound Dossier id IS the revision — Dossiers are
+        // immutable, append-only rows) + the bound kind (e.g. `plan`). Additive
+        // + nullable — existing cards are simply unbound plain confirms.
+        "ALTER TABLE brief_interactions ADD COLUMN bound_doc_id TEXT",
+        "ALTER TABLE brief_interactions ADD COLUMN bound_doc_kind TEXT",
         // ISSUE-TREE COST ROLLUP + BILLING ATTRIBUTION (company-model §6.6):
         // an optional billing code on a Brief so its (and its descendant
         // Sub-briefs') run cost attributes to the requesting team. Additive +
@@ -15948,6 +16158,27 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
     // statements as the cursor so adding a new ALTER bumps it.
     crate::db::record_migration_applied(conn, alters.len() as i64).map_err(CoordinatorError::Db)?;
     Ok(())
+}
+
+/// The id of the **latest** Dossier of `kind` on a Brief, read against an
+/// already-held connection (so callers inside a locked section — e.g.
+/// [`TaskStore::respond_interaction`] — don't deadlock on the store's own
+/// `Mutex`). Latest = newest `created_at`, `rowid` tiebreak, matching
+/// [`TaskStore::latest_dossier`]. `None` when the Brief has no such Dossier.
+/// Because Dossiers are immutable append-only rows, this id IS the current
+/// revision of that kind.
+fn latest_dossier_id_conn(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+    kind: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT doc_id FROM task_documents WHERE task_id = ?1 AND kind = ?2
+         ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        params![task_id, kind],
+        |r| r.get(0),
+    )
+    .optional()
 }
 
 /// Split a comma-joined id list (the decomposition claim's `created_ids`
@@ -21394,6 +21625,222 @@ mod tests {
         // The card is still open for the owning Guild.
         let listed = s.list_interactions(&a).unwrap();
         assert_eq!(listed[0].status, "open");
+    }
+
+    // §1.8 (approval-bound plan confirm): opening a plan confirm refuses
+    // clearly when the Brief has no `plan` Dossier to bind to.
+    #[test]
+    fn plan_confirm_open_refuses_without_plan_dossier() {
+        let s = TaskStore::in_memory().unwrap();
+        let b = s
+            .create_brief("acme", "Needs a plan", "subj", None, None, None, None)
+            .unwrap();
+        // No `plan` Dossier yet — opening is a typed refusal, no card created.
+        let out = s.open_plan_confirm(&b, "operative-1", "");
+        assert!(matches!(out, Err(CoordinatorError::Invalid(_))));
+        assert!(s.list_interactions(&b).unwrap().is_empty());
+        // A Dossier of a *different* kind does not satisfy it either.
+        s.add_dossier(&b, "design", "The Design", "boxes").unwrap();
+        assert!(matches!(
+            s.open_plan_confirm(&b, "operative-1", ""),
+            Err(CoordinatorError::Invalid(_))
+        ));
+    }
+
+    // §1.8: opening a plan confirm binds the CURRENT latest `plan` Dossier
+    // revision (its id), records it in the interaction metadata, and
+    // Chronicles the bound doc id so the approval thread is auditable.
+    #[test]
+    fn plan_confirm_open_binds_latest_plan_revision() {
+        let s = TaskStore::in_memory().unwrap();
+        let b = s
+            .create_brief("acme", "Plan it", "subj", None, None, None, None)
+            .unwrap();
+        s.add_dossier(&b, "plan", "Plan v1", "first").unwrap();
+        let v2 = s.add_dossier(&b, "plan", "Plan v2", "second").unwrap();
+        let id = s.open_plan_confirm(&b, "operative-1", "").unwrap();
+        // The card is a confirm bound to the LATEST plan revision (v2), with
+        // the bound kind recorded in its metadata.
+        let listed = s.list_interactions(&b).unwrap();
+        let card = listed.iter().find(|i| i.interaction_id == id).unwrap();
+        assert_eq!(card.kind, "confirm");
+        assert_eq!(card.status, "open");
+        assert_eq!(card.bound_doc_id.as_deref(), Some(v2.as_str()));
+        assert_eq!(card.bound_doc_kind.as_deref(), Some("plan"));
+        // The bound doc id is mirrored into the Chronicle.
+        let opened = s
+            .query_events(&b, 0, 50, Some("brief.plan_confirm_opened"), EventOrder::Asc)
+            .unwrap();
+        assert_eq!(opened.len(), 1);
+        assert!(opened[0].payload.contains(&v2));
+    }
+
+    // §1.8: accepting the bound confirm SUCCEEDS while the latest plan is
+    // unchanged; a duplicate accept is then a typed idempotent refusal.
+    #[test]
+    fn plan_confirm_accept_succeeds_when_plan_unchanged() {
+        let s = TaskStore::in_memory().unwrap();
+        let b = s
+            .create_brief("acme", "Plan it", "subj", None, None, None, None)
+            .unwrap();
+        s.add_dossier(&b, "plan", "Plan v1", "first").unwrap();
+        let id = s.open_plan_confirm(&b, "operative-1", "Approve?").unwrap();
+        s.respond_interaction(&b, &id, "founder", "resolved", "yes — ship")
+            .unwrap();
+        let listed = s.list_interactions(&b).unwrap();
+        let card = listed.iter().find(|i| i.interaction_id == id).unwrap();
+        assert_eq!(card.status, "resolved");
+        assert_eq!(card.response.as_deref(), Some("yes — ship"));
+        // A real approval event was recorded.
+        assert_eq!(
+            s.query_events(&b, 0, 50, Some("brief.interaction_resolved"), EventOrder::Asc)
+                .unwrap()
+                .len(),
+            1
+        );
+        // Duplicate accept is a typed refusal, not a silent overwrite.
+        assert!(matches!(
+            s.respond_interaction(&b, &id, "founder", "resolved", "again"),
+            Err(CoordinatorError::Invalid(_))
+        ));
+    }
+
+    // §1.8: a newer `plan` Dossier attached AFTER the confirm opened makes
+    // the old confirm STALE — accept refuses, the card expires, and NO
+    // approved disposition is recorded against the superseded plan.
+    #[test]
+    fn plan_confirm_stale_after_new_plan_revision() {
+        let s = TaskStore::in_memory().unwrap();
+        let b = s
+            .create_brief("acme", "Plan it", "subj", None, None, None, None)
+            .unwrap();
+        s.add_dossier(&b, "plan", "Plan v1", "first").unwrap();
+        let id = s.open_plan_confirm(&b, "operative-1", "").unwrap();
+        // The plan changes out from under the open confirm.
+        s.add_dossier(&b, "plan", "Plan v2", "second").unwrap();
+        // Accepting is refused as stale.
+        assert!(matches!(
+            s.respond_interaction(&b, &id, "founder", "resolved", "yes"),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        // The card expired (not resolved); no approved success recorded.
+        let listed = s.list_interactions(&b).unwrap();
+        let card = listed.iter().find(|i| i.interaction_id == id).unwrap();
+        assert_eq!(card.status, "expired");
+        assert_eq!(card.response, None);
+        assert!(
+            s.query_events(&b, 0, 50, Some("brief.interaction_resolved"), EventOrder::Asc)
+                .unwrap()
+                .is_empty(),
+            "a stale plan must never resolve as approved"
+        );
+        assert_eq!(
+            s.query_events(&b, 0, 50, Some("brief.interaction_expired"), EventOrder::Asc)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    // §1.8/§1.9 supersede-on-comment: commenting while a plan-bound confirm
+    // is open supersedes/expires it (the operator answered by commenting); a
+    // later accept is then a typed refusal.
+    #[test]
+    fn plan_confirm_superseded_by_comment() {
+        let s = TaskStore::in_memory().unwrap();
+        let b = s
+            .create_brief("acme", "Plan it", "subj", None, None, None, None)
+            .unwrap();
+        s.add_dossier(&b, "plan", "Plan v1", "first").unwrap();
+        let id = s.open_plan_confirm(&b, "operative-1", "").unwrap();
+        // The operator just comments instead of clicking.
+        s.comment_on_brief(&b, "founder", "let's tweak step 2 first")
+            .unwrap();
+        let listed = s.list_interactions(&b).unwrap();
+        let card = listed.iter().find(|i| i.interaction_id == id).unwrap();
+        assert_eq!(card.status, "expired");
+        assert_eq!(
+            s.query_events(&b, 0, 50, Some("brief.interaction_expired"), EventOrder::Asc)
+                .unwrap()
+                .len(),
+            1
+        );
+        // A later accept is a typed (idempotent) refusal — the comment thread
+        // moved past it; it must not resolve as approved.
+        assert!(matches!(
+            s.respond_interaction(&b, &id, "founder", "resolved", "yes"),
+            Err(CoordinatorError::Invalid(_))
+        ));
+    }
+
+    // §1.8: a PLAIN confirm (not bound to a Dossier) is unaffected by plan
+    // updates and supersede-on-comment — the existing behavior is preserved.
+    #[test]
+    fn plain_confirm_unaffected_by_plan_update_and_comment() {
+        let s = TaskStore::in_memory().unwrap();
+        let b = s
+            .create_brief("acme", "Ship?", "subj", None, None, None, None)
+            .unwrap();
+        let id = s
+            .open_interaction(&b, "confirm", "operative-1", "Proceed?", &[])
+            .unwrap();
+        // Plain confirms carry no Dossier binding.
+        let card = s.list_interactions(&b).unwrap().remove(0);
+        assert_eq!(card.bound_doc_id, None);
+        assert_eq!(card.bound_doc_kind, None);
+        // A plan churn + a comment do NOT touch it.
+        s.add_dossier(&b, "plan", "Plan v1", "first").unwrap();
+        s.add_dossier(&b, "plan", "Plan v2", "second").unwrap();
+        s.comment_on_brief(&b, "founder", "fyi").unwrap();
+        assert_eq!(s.list_interactions(&b).unwrap()[0].status, "open");
+        // And it still accepts normally.
+        s.respond_interaction(&b, &id, "founder", "resolved", "yes")
+            .unwrap();
+        assert_eq!(s.list_interactions(&b).unwrap()[0].status, "resolved");
+    }
+
+    // §1.8 + GROUP 6 (tenant isolation): a plan confirm cannot be opened,
+    // bound, or accepted across Guilds — a cross-Guild Brief/card reads as
+    // not-found (no existence leak), same convention as plain interactions.
+    #[test]
+    fn plan_confirm_denied_across_tenant() {
+        let s = TaskStore::in_memory().unwrap();
+        let a = s
+            .create_brief("acme", "Acme", "subj", None, None, None, None)
+            .unwrap();
+        s.add_dossier(&a, "plan", "The Plan", "body").unwrap();
+        // Cross-tenant open is refused.
+        assert!(matches!(
+            handle_brief_plan_confirm_open(
+                &s,
+                &ctx_tenant(format!("{a}|op|").as_bytes(), "globex"),
+            ),
+            HandlerOutcome::Err(_)
+        ));
+        // Same-tenant open returns the bound card id.
+        let id = match handle_brief_plan_confirm_open(
+            &s,
+            &ctx_tenant(format!("{a}|op|").as_bytes(), "acme"),
+        ) {
+            HandlerOutcome::Ok(body) => String::from_utf8(body).unwrap(),
+            HandlerOutcome::Err(_) => panic!("plan_confirm_open errored"),
+        };
+        // Cross-tenant accept is refused (not-found on the owning Brief).
+        assert!(matches!(
+            handle_brief_interaction_respond(
+                &s,
+                &ctx_tenant(format!("{a}|{id}|hacker|resolved|yes").as_bytes(), "globex"),
+            ),
+            HandlerOutcome::Err(_)
+        ));
+        // Still open for the owning Guild.
+        let card = s
+            .list_interactions(&a)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.interaction_id == id)
+            .unwrap();
+        assert_eq!(card.status, "open");
     }
 
     // §1.9 (suggest_tasks): accepting a suggestion materializes the

@@ -119,7 +119,10 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   sub-briefs, parents, snags, dossiers, labels, due, claim, `latest_run`, chronicle).
 - **Thread interactions** — answerable `ask` / `confirm` / `suggest_tasks` cards
   (`brief_interactions` table), with governed assignee hints, backward-only `after`
-  dependencies, idempotent accept, children inheriting parent context.
+  dependencies, idempotent accept, children inheriting parent context. **Approval-bound
+  plan confirms** (`brief.plan_confirm_open`, §1.8) bind a `confirm` to the latest `plan`
+  Dossier revision; a stale accept (newer plan revision, or superseded by a comment)
+  expires the card and never resolves as approved.
 - **Desk / Inbox reads** — `/v1/spine/inbox`, `/v1/spine/briefs/:id/thread`,
   `/v1/spine/unassigned`; board cards surface unresolved same-Guild blockers.
 - **Supervisory auto-wake** (`execution §1.6/§3.1`) — the central `set_board_status`
@@ -362,11 +365,20 @@ ledger entry or design section.
     child create with its cursor record — the loser blocks then no-ops or resumes, never leaving an
     unlinked orphan child Brief (proven by a two-thread barrier race test). All prior governance
     (parent context inheritance, assign-Key-gated hints, tenant
-    isolation, delegation-depth) is unchanged. *Still deferred:* binding the accepted plan to an
-    approval-bound **Dossier/document revision** (`execution §1.7/§1.8` — today the accepted-plan
-    identity is the `suggest_tasks` interaction id, not a Dossier revision) and `owner`-liveness
-    takeover enforcement; approval-bound issue **Dossiers/documents** (`execution §1.8`) remain
-    unimplemented.
+    isolation, delegation-depth) is unchanged. **Approval-bound plan *confirm* is now BACKEND
+    SHIPPED (first slice, `execution §1.8`):** a new `brief.plan_confirm_open` capability opens a
+    `confirm` **bound to the Brief's latest `plan` Dossier revision** (the bound Dossier id IS the
+    revision — Dossiers are immutable, append-only rows; recorded on the card as
+    `bound_doc_id`/`bound_doc_kind` and chronicled). It **refuses when no `plan` Dossier exists**;
+    on **accept** it re-checks the latest `plan` revision is still the bound one — if a newer `plan`
+    Dossier was attached (or the operator **superseded it by commenting**), the accept is **refused
+    as stale**, the card flips to `expired`, and it **never resolves as approved** against a
+    superseded plan. Plain confirms are unaffected; duplicate answers stay typed/idempotent;
+    tenant-isolated (cross-Guild reads as not-found). *Still deferred:* tying that bound-plan
+    approval into the decomposition trigger (decomposition still keys on the `suggest_tasks`
+    interaction id, **not** the bound plan revision), `owner`-liveness takeover enforcement, and
+    full issue **document authoring / per-doc revision-locking / forking** (`execution §1.8`) plus
+    wiring this into the autonomous planner flow.
 
 ---
 
@@ -645,8 +657,12 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
     exactly-once plan decomposition (§1.7 — durable `brief_decomposition_claims` ledger:
     fingerprint + `created_ids` resume cursor + crash-safe resume / no-op duplicate / no-fork
     accept + orphan-free concurrent accept via a per-decomposition materialization lock; see §P3
-    slice 10). *Still deferred:* binding the accepted plan to an approval-bound
-    Dossier/document revision and approval-bound issue Dossiers/documents (§1.8).
+    slice 10). **Approval-bound plan *confirm* is now backend-shipped (first slice, §1.8):**
+    `brief.plan_confirm_open` binds a `confirm` to the latest `plan` Dossier revision; a stale accept
+    (after a newer plan revision or a superseding comment) expires the card and never resolves as
+    approved. *Still deferred:* tying that bound-plan approval into the decomposition trigger
+    (decomposition still keys on the interaction id) and full issue document authoring /
+    revision-locking / forking (§1.8).
 
 > After completing a slice: re-open the cited section, update the implementation map /
 > divergence ledger in `product-spine-implementation.md`, and update this file's §2/§3 so
