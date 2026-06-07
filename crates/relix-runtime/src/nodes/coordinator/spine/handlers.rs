@@ -54,6 +54,7 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<SpineStore>) {
     cap!("guild.counts", handle_guild_counts);
     cap!("guild.set", handle_guild_set);
     cap!("guild.set_allowance", handle_guild_set_allowance);
+    cap!("guild.set_billing_code", handle_guild_set_billing_code);
     cap!("mandate.propose_strategy", handle_mandate_propose_strategy);
     cap!("mandate.approve_strategy", handle_mandate_approve_strategy);
     cap!("mandate.reject_strategy", handle_mandate_reject_strategy);
@@ -196,6 +197,22 @@ fn handle_guild_set_allowance(store: &SpineStore, ctx: &InvocationCtx) -> Handle
         Ok(()) => HandlerOutcome::Ok(Vec::new()),
         Err(SpineStoreError::BadInput(m)) => invalid(format!("guild.set_allowance: {m}")),
         Err(e) => internal(format!("guild.set_allowance: {e}")),
+    }
+}
+
+/// `guild.set_billing_code` — set the Guild's OBJECT-LEVEL billing code
+/// (company-model §6.6). Arg `code` (empty clears it). Tenant from ctx.
+/// Mirrors `guild.set_allowance`.
+fn handle_guild_set_billing_code(store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("guild.set_billing_code utf8: {e}")),
+    };
+    let code = if raw.is_empty() { None } else { Some(raw) };
+    match store.set_guild_billing_code(ctx.tenant_id_or_default(), code) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(SpineStoreError::BadInput(m)) => invalid(format!("guild.set_billing_code: {m}")),
+        Err(e) => internal(format!("guild.set_billing_code: {e}")),
     }
 }
 

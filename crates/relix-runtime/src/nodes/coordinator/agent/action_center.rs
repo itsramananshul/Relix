@@ -972,6 +972,7 @@ mod tests {
             owner_agent_id: None,
             status: "planned".to_string(),
             parent_mandate_id: None,
+            billing_code: None,
             created_at: 1,
             updated_at: 2,
         };

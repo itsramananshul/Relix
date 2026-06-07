@@ -7948,6 +7948,11 @@ fn register_node_type_handlers(
         ) {
             Ok(spine_store) => {
                 let spine_store = std::sync::Arc::new(spine_store);
+                // OBJECT-LEVEL billing-code inheritance (company-model §6.6):
+                // inject the spine as the Brief ledger's resolver so run
+                // stamping can fall back Brief → ancestor Brief →
+                // Campaign/Mandate → Guild, all within the Brief's own Guild.
+                store.set_object_billing_resolver(spine_store.clone());
                 crate::nodes::coordinator::spine::handlers::register(bridge, spine_store.clone());
                 tracing::info!(
                     "coordinator startup: spine (mandate/campaign) capabilities registered"

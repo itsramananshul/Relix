@@ -226,8 +226,8 @@ ledger entry or design section.
    (operator-initiated, no Guild gate). *(The issue-tree cost rollup + billing-code
    attribution backend is now SHIPPED — see §P1 slice 3b; the spend window is the UTC
    calendar month with reset — slice 9 = DONE. The delegation-depth counter + guard backend
-   is now SHIPPED — see §P1 slice 3c. Remaining deferred: the frontend Costs
-   surface and object-level billing codes.)*
+   is now SHIPPED — see §P1 slice 3c. Object-level (Mandate/Campaign/Guild) billing codes
+   are now SHIPPED too — see §P1 slice 3b. Remaining deferred: the frontend Costs surface.)*
 3. **[BE] Allowance windowing** — **DONE** (§5 slice 9). The per-Operative and Guild
    hard-stops + the Action Center live-spend feed now bill against the **current UTC
    calendar month** via the single canonical `heartbeat::allowance_window(now_ms)`
@@ -239,10 +239,16 @@ ledger entry or design section.
    descendant totals, tree counts, per-billing-code breakdown), tenant-safe by construction
    and windowed on the canonical `allowance_window` (overridable since/until). Billing code is
    an additive `tasks.billing_code` (set via `brief.set`, on `BriefFields`) + a
-   `brief_runs.billing_code` **stamped at run start** (Brief's own, else inherited from the
-   nearest same-Guild ancestor Sub-brief) for manual + autonomous runs alike. *Still deferred:*
-   the **frontend** Costs surface (§P2 slice 5) and object-level (Mandate/Campaign/Guild) billing
-   codes.
+   `brief_runs.billing_code` **stamped at run start** for manual + autonomous runs alike.
+   **Object-level billing codes are now BACKEND SHIPPED:** additive `billing_code` on
+   Mandate, Campaign, and Guild (set via `mandate.update`/`campaign.update <id>|billing_code|<code>`
+   and the new `guild.set_billing_code`; surfaced on the Mandate/Campaign/Guild reads), with the
+   run-stamp inheritance now resolving **Brief own → nearest same-Guild ancestor Brief →
+   linked Campaign → linked Mandate → Guild**. The object fallback is injected into the Brief
+   ledger as a tenant-safe `ObjectBillingResolver` (the spine store): a Brief in one Guild can
+   never inherit another Guild's Campaign/Mandate/Guild code even with a bad/cross-Guild link,
+   and a later object-code change never rewrites a past run's stamp (point-in-time). *Still
+   deferred:* the **frontend** Costs surface (§P2 slice 5).
 3c. **[BE] Delegation-depth counter + guard** — **BACKEND SHIPPED** (`company-model §6.6`).
    The runaway-recursion safety backstop that complements 3b. A Brief's **delegation depth** =
    the longest same-Guild `spawned` parent chain up to a root (root `0`, Sub-brief `1`, …),
@@ -369,8 +375,9 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    touched code (2 pre-existing unrelated warnings only); `git diff --check` clean. *(The
    issue-tree cost rollup + billing-code attribution backend shipped in §P1 slice 3b; the
    calendar-month spend window with implicit reset shipped in slice 9 = DONE; the
-   delegation-depth counter + guard shipped in §P1 slice 3c. Remaining
-   deferred: the frontend Costs surface and object-level billing codes.)*
+   delegation-depth counter + guard shipped in §P1 slice 3c; object-level
+   (Mandate/Campaign/Guild) billing codes shipped in §P1 slice 3b. Remaining
+   deferred: the frontend Costs surface.)*
 
 3. **The Lattice org-chart view** — `dashboard-design.md §9`.
    *Files:* new `apps/dashboard/src/pages/Lattice.tsx` (or extend Agents.tsx), `nav.ts`;
@@ -430,8 +437,8 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    into the next January. *Verified:* targeted + full `cargo test -p relix-runtime` green;
    `cargo check`/`cargo clippy` clean on the touched code. *(The issue-tree cost rollup +
    billing-code attribution backend shipped in §P1 slice 3b, the delegation-depth counter +
-   guard in §P1 slice 3c; remaining deferred: the frontend Costs surface and object-level
-   billing codes.)*
+   guard in §P1 slice 3c, object-level (Mandate/Campaign/Guild) billing codes in §P1 slice 3b;
+   remaining deferred: the frontend Costs surface.)*
 
 10. **Stale-run adoption by terminal evidence** — `execution-and-issue-design.md §1.4/§7.1`.
     **✅ DONE.** *Files changed:* `crates/relix-runtime/src/nodes/coordinator/mod.rs` (new

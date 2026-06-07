@@ -45,6 +45,11 @@ pub struct Mandate {
     pub status: String,
     /// Parent mandate, for a mandate hierarchy. `None` at the top.
     pub parent_mandate_id: Option<String>,
+    /// OBJECT-LEVEL billing code (company-model §6.6) — cross-team cost
+    /// attribution at the Mandate level. `None` when unset. Inherited
+    /// by a linked Brief's run only when no Brief in the chain carries
+    /// its own code (see [`crate::nodes::coordinator::ObjectBillingResolver`]).
+    pub billing_code: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -65,6 +70,11 @@ pub struct Campaign {
     /// Optional shared workspace/environment the campaign's work
     /// runs in (a cwd, a worktree, or — later — a sandbox id).
     pub workspace: Option<String>,
+    /// OBJECT-LEVEL billing code (company-model §6.6) — cross-team cost
+    /// attribution at the Campaign level. `None` when unset. Takes
+    /// precedence over the linked Mandate's code in the run-stamp
+    /// fallback (see [`crate::nodes::coordinator::ObjectBillingResolver`]).
+    pub billing_code: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -79,6 +89,12 @@ pub struct Guild {
     /// The Guild's monthly **Allowance** (budget) in cents. `None`
     /// = no cap.
     pub monthly_allowance_cents: Option<i64>,
+    /// OBJECT-LEVEL billing code (company-model §6.6) — the Guild-wide
+    /// default cost-attribution code. `None` when unset. The lowest-
+    /// precedence fallback when a Brief, its ancestors, and its linked
+    /// Campaign/Mandate all carry no code
+    /// (see [`crate::nodes::coordinator::ObjectBillingResolver`]).
+    pub billing_code: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -380,7 +396,7 @@ impl SpineStore {
         let row = conn
             .query_row(
                 "SELECT tenant_id, display_name, monthly_allowance_cents,
-                        created_at, updated_at
+                        billing_code, created_at, updated_at
                  FROM guilds WHERE tenant_id = ?1",
                 params![normalize_tenant(tenant_id)],
                 |r| {
@@ -388,8 +404,9 @@ impl SpineStore {
                         tenant_id: r.get(0)?,
                         display_name: r.get(1)?,
                         monthly_allowance_cents: r.get(2)?,
-                        created_at: r.get(3)?,
-                        updated_at: r.get(4)?,
+                        billing_code: r.get(3)?,
+                        created_at: r.get(4)?,
+                        updated_at: r.get(5)?,
                     })
                 },
             )
@@ -420,6 +437,30 @@ impl SpineStore {
              ON CONFLICT(tenant_id)
                  DO UPDATE SET monthly_allowance_cents = ?2, updated_at = ?3",
             params![tenant, cents, now],
+        )?;
+        Ok(())
+    }
+
+    /// Set or clear a Guild's OBJECT-LEVEL **billing code**
+    /// (company-model §6.6). `None`/empty clears it. Creates the Guild
+    /// (named after the tenant) if it doesn't exist yet. Mirrors
+    /// [`set_guild_allowance`](Self::set_guild_allowance).
+    pub fn set_guild_billing_code(
+        &self,
+        tenant_id: &str,
+        code: Option<&str>,
+    ) -> Result<(), SpineStoreError> {
+        let tenant = normalize_tenant(tenant_id);
+        let code = code.and_then(non_empty);
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        conn.execute(
+            "INSERT INTO guilds
+                 (tenant_id, display_name, billing_code, created_at, updated_at)
+             VALUES (?1, ?1, ?2, ?3, ?3)
+             ON CONFLICT(tenant_id)
+                 DO UPDATE SET billing_code = ?2, updated_at = ?3",
+            params![tenant, code, now],
         )?;
         Ok(())
     }
@@ -840,7 +881,7 @@ impl SpineStore {
         let row = conn
             .query_row(
                 "SELECT mandate_id, tenant_id, title, description, owner_agent_id,
-                        status, parent_mandate_id, created_at, updated_at
+                        status, parent_mandate_id, billing_code, created_at, updated_at
                  FROM mandates WHERE mandate_id = ?1 AND tenant_id = ?2",
                 params![mandate_id, normalize_tenant(tenant)],
                 row_to_mandate,
@@ -861,14 +902,14 @@ impl SpineStore {
         let (sql, with_status) = match status_filter.and_then(non_empty) {
             Some(_) => (
                 "SELECT mandate_id, tenant_id, title, description, owner_agent_id,
-                        status, parent_mandate_id, created_at, updated_at
+                        status, parent_mandate_id, billing_code, created_at, updated_at
                  FROM mandates WHERE tenant_id = ?1 AND status = ?2
                  ORDER BY created_at DESC",
                 true,
             ),
             None => (
                 "SELECT mandate_id, tenant_id, title, description, owner_agent_id,
-                        status, parent_mandate_id, created_at, updated_at
+                        status, parent_mandate_id, billing_code, created_at, updated_at
                  FROM mandates WHERE tenant_id = ?1 ORDER BY created_at DESC",
                 false,
             ),
@@ -907,7 +948,7 @@ impl SpineStore {
         let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
         let mut stmt = conn.prepare(
             "SELECT mandate_id, tenant_id, title, description, owner_agent_id,
-                    status, parent_mandate_id, created_at, updated_at
+                    status, parent_mandate_id, billing_code, created_at, updated_at
              FROM mandates
              WHERE tenant_id = ?1 AND title LIKE ?2 ESCAPE '\\'
              ORDER BY created_at DESC LIMIT ?3",
@@ -930,7 +971,7 @@ impl SpineStore {
         let tenant = normalize_tenant(tenant);
         let mut stmt = conn.prepare(
             "SELECT mandate_id, tenant_id, title, description, owner_agent_id,
-                    status, parent_mandate_id, created_at, updated_at
+                    status, parent_mandate_id, billing_code, created_at, updated_at
              FROM mandates WHERE tenant_id = ?1 AND parent_mandate_id = ?2
              ORDER BY created_at DESC",
         )?;
@@ -987,7 +1028,7 @@ impl SpineStore {
 
     /// Update one writable mandate field. Writable: `status`,
     /// `title`, `description`, `owner_agent_id`,
-    /// `parent_mandate_id`. A `parent_mandate_id` change is validated
+    /// `parent_mandate_id`, `billing_code`. A `parent_mandate_id` change is validated
     /// (must exist in-tenant, no self-parent, no cycle).
     pub fn update_mandate_field(
         &self,
@@ -1062,6 +1103,15 @@ impl SpineStore {
                     )?
                 }
             }
+            // OBJECT-LEVEL billing code (company-model §6.6). Empty clears it.
+            "billing_code" => {
+                let t = value.trim();
+                let stored: Option<&str> = if t.is_empty() { None } else { Some(t) };
+                conn.execute(
+                    "UPDATE mandates SET billing_code=?1, updated_at=?2 WHERE mandate_id=?3",
+                    params![stored, now, mandate_id],
+                )?
+            }
             other => {
                 return Err(SpineStoreError::BadInput(format!(
                     "unknown mandate field '{other}'"
@@ -1132,7 +1182,7 @@ impl SpineStore {
         let row = conn
             .query_row(
                 "SELECT campaign_id, tenant_id, title, mandate_id, lead_agent_id,
-                        status, workspace, created_at, updated_at
+                        status, workspace, billing_code, created_at, updated_at
                  FROM campaigns WHERE campaign_id = ?1 AND tenant_id = ?2",
                 params![campaign_id, normalize_tenant(tenant)],
                 row_to_campaign,
@@ -1153,14 +1203,14 @@ impl SpineStore {
         let (sql, with_mandate) = match mandate_filter.and_then(non_empty) {
             Some(_) => (
                 "SELECT campaign_id, tenant_id, title, mandate_id, lead_agent_id,
-                        status, workspace, created_at, updated_at
+                        status, workspace, billing_code, created_at, updated_at
                  FROM campaigns WHERE tenant_id = ?1 AND mandate_id = ?2
                  ORDER BY created_at DESC",
                 true,
             ),
             None => (
                 "SELECT campaign_id, tenant_id, title, mandate_id, lead_agent_id,
-                        status, workspace, created_at, updated_at
+                        status, workspace, billing_code, created_at, updated_at
                  FROM campaigns WHERE tenant_id = ?1 ORDER BY created_at DESC",
                 false,
             ),
@@ -1199,7 +1249,7 @@ impl SpineStore {
         let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
         let mut stmt = conn.prepare(
             "SELECT campaign_id, tenant_id, title, mandate_id, lead_agent_id,
-                    status, workspace, created_at, updated_at
+                    status, workspace, billing_code, created_at, updated_at
              FROM campaigns
              WHERE tenant_id = ?1 AND title LIKE ?2 ESCAPE '\\'
              ORDER BY created_at DESC LIMIT ?3",
@@ -1211,7 +1261,7 @@ impl SpineStore {
     }
 
     /// Update one writable campaign field. Writable: `status`,
-    /// `title`, `mandate_id`, `lead_agent_id`, `workspace`.
+    /// `title`, `mandate_id`, `lead_agent_id`, `workspace`, `billing_code`.
     pub fn update_campaign_field(
         &self,
         campaign_id: &str,
@@ -1275,6 +1325,15 @@ impl SpineStore {
                 "UPDATE campaigns SET workspace=?1, updated_at=?2 WHERE campaign_id=?3",
                 params![non_empty(value), now, campaign_id],
             )?,
+            // OBJECT-LEVEL billing code (company-model §6.6). Empty clears it.
+            "billing_code" => {
+                let t = value.trim();
+                let stored: Option<&str> = if t.is_empty() { None } else { Some(t) };
+                conn.execute(
+                    "UPDATE campaigns SET billing_code=?1, updated_at=?2 WHERE campaign_id=?3",
+                    params![stored, now, campaign_id],
+                )?
+            }
             other => {
                 return Err(SpineStoreError::BadInput(format!(
                     "unknown campaign field '{other}'"
@@ -1288,14 +1347,54 @@ impl SpineStore {
     }
 }
 
+/// The SpineStore is the OBJECT-LEVEL billing-code source for run
+/// stamping (company-model §6.6). Given a Brief's Guild (`tenant`) and
+/// its Campaign/Mandate link ids, it resolves the effective object code
+/// with precedence **Campaign-own → Mandate-own → Guild-own**, all
+/// WITHIN `tenant`. Tenant-safe by construction: `get_campaign_for_tenant`
+/// / `get_mandate_for_tenant` only return an object that belongs to
+/// `tenant`, and the Guild fallback reads the Brief's OWN Guild — so a
+/// stray or cross-Guild link id resolves to nothing and can never leak
+/// another company's code.
+impl crate::nodes::coordinator::ObjectBillingResolver for SpineStore {
+    fn object_billing_code(
+        &self,
+        tenant: &str,
+        mandate_id: Option<&str>,
+        campaign_id: Option<&str>,
+    ) -> Option<String> {
+        // Campaign-own code first (the most specific object the Brief links).
+        if let Some(cid) = campaign_id.and_then(non_empty)
+            && let Ok(Some(c)) = self.get_campaign_for_tenant(cid, tenant)
+            && let Some(code) = c.billing_code.as_deref().and_then(non_empty)
+        {
+            return Some(code.to_string());
+        }
+        // Then the linked Mandate's code.
+        if let Some(mid) = mandate_id.and_then(non_empty)
+            && let Ok(Some(m)) = self.get_mandate_for_tenant(mid, tenant)
+            && let Some(code) = m.billing_code.as_deref().and_then(non_empty)
+        {
+            return Some(code.to_string());
+        }
+        // Finally the Guild-wide default code (the Brief's OWN Guild).
+        if let Ok(Some(g)) = self.get_guild(tenant)
+            && let Some(code) = g.billing_code.as_deref().and_then(non_empty)
+        {
+            return Some(code.to_string());
+        }
+        None
+    }
+}
+
 // ── schema + helpers ──────────────────────────────────────
 
 const SELECT_MANDATE: &str = "SELECT mandate_id, tenant_id, title, description, owner_agent_id,
-        status, parent_mandate_id, created_at, updated_at
+        status, parent_mandate_id, billing_code, created_at, updated_at
  FROM mandates WHERE mandate_id = ?1";
 
 const SELECT_CAMPAIGN: &str = "SELECT campaign_id, tenant_id, title, mandate_id, lead_agent_id,
-        status, workspace, created_at, updated_at
+        status, workspace, billing_code, created_at, updated_at
  FROM campaigns WHERE campaign_id = ?1";
 
 fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -1401,6 +1500,18 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         "ALTER TABLE guilds ADD COLUMN monthly_allowance_cents INTEGER",
         [],
     );
+    // Defensive additive OBJECT-LEVEL billing-code columns (company-model
+    // §6.6) — tolerate spine tables created before these columns existed.
+    // Each runs independently; the row readers SELECT the column, so on a
+    // pre-existing DB the ALTER must succeed (or already exist). NULL =
+    // unset (no object-level code → falls through to the next precedence).
+    for alter in [
+        "ALTER TABLE mandates ADD COLUMN billing_code TEXT",
+        "ALTER TABLE campaigns ADD COLUMN billing_code TEXT",
+        "ALTER TABLE guilds ADD COLUMN billing_code TEXT",
+    ] {
+        let _ = conn.execute(alter, []);
+    }
     // Defensive additive columns on orchestration runs — tolerate a table
     // created before stable source markers existed (company-model §4.6).
     // Each runs independently so a pre-existing column on one does not
@@ -1480,8 +1591,9 @@ fn row_to_mandate(r: &rusqlite::Row) -> rusqlite::Result<Mandate> {
         owner_agent_id: r.get(4)?,
         status: r.get(5)?,
         parent_mandate_id: r.get(6)?,
-        created_at: r.get(7)?,
-        updated_at: r.get(8)?,
+        billing_code: r.get(7)?,
+        created_at: r.get(8)?,
+        updated_at: r.get(9)?,
     })
 }
 
@@ -1494,8 +1606,9 @@ fn row_to_campaign(r: &rusqlite::Row) -> rusqlite::Result<Campaign> {
         lead_agent_id: r.get(4)?,
         status: r.get(5)?,
         workspace: r.get(6)?,
-        created_at: r.get(7)?,
-        updated_at: r.get(8)?,
+        billing_code: r.get(7)?,
+        created_at: r.get(8)?,
+        updated_at: r.get(9)?,
     })
 }
 
@@ -1610,9 +1723,63 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nodes::coordinator::ObjectBillingResolver;
 
     fn store() -> SpineStore {
         SpineStore::in_memory().unwrap()
+    }
+
+    #[test]
+    fn object_billing_code_set_reads_and_resolves_with_precedence() {
+        let s = store();
+        // Empty: no object carries a code.
+        assert_eq!(s.object_billing_code("acme", None, None), None);
+        // Guild-level default.
+        s.set_guild_billing_code("acme", Some("G")).unwrap();
+        assert_eq!(s.get_guild("acme").unwrap().unwrap().billing_code.as_deref(), Some("G"));
+        assert_eq!(s.object_billing_code("acme", None, None).as_deref(), Some("G"));
+        // Mandate code beats the Guild default.
+        let m = s.create_mandate("acme", "M", "", None, None).unwrap();
+        s.update_mandate_field(&m, "billing_code", "M-CODE").unwrap();
+        assert_eq!(s.get_mandate(&m).unwrap().unwrap().billing_code.as_deref(), Some("M-CODE"));
+        assert_eq!(
+            s.object_billing_code("acme", Some(&m), None).as_deref(),
+            Some("M-CODE")
+        );
+        // Campaign code beats the Mandate code.
+        let c = s.create_campaign("acme", "C", Some(&m), None, None).unwrap();
+        s.update_campaign_field(&c, "billing_code", "C-CODE").unwrap();
+        assert_eq!(s.get_campaign(&c).unwrap().unwrap().billing_code.as_deref(), Some("C-CODE"));
+        assert_eq!(
+            s.object_billing_code("acme", Some(&m), Some(&c)).as_deref(),
+            Some("C-CODE")
+        );
+        // Clearing a code (empty value) falls through to the next level.
+        s.update_campaign_field(&c, "billing_code", "").unwrap();
+        assert_eq!(
+            s.object_billing_code("acme", Some(&m), Some(&c)).as_deref(),
+            Some("M-CODE")
+        );
+    }
+
+    #[test]
+    fn object_billing_code_is_tenant_scoped() {
+        let s = store();
+        // Codes live in tenant `b`.
+        s.set_guild_billing_code("b", Some("B-G")).unwrap();
+        let mb = s.create_mandate("b", "MB", "", None, None).unwrap();
+        s.update_mandate_field(&mb, "billing_code", "B-M").unwrap();
+        let cb = s.create_campaign("b", "CB", Some(&mb), None, None).unwrap();
+        s.update_campaign_field(&cb, "billing_code", "B-C").unwrap();
+        // A caller in tenant `a` passing tenant `b`'s ids gets nothing — the
+        // ids resolve to None outside their Guild, and tenant `a` has no Guild
+        // code of its own.
+        assert_eq!(s.object_billing_code("a", Some(&mb), Some(&cb)), None);
+        // The same ids DO resolve under tenant `b`.
+        assert_eq!(
+            s.object_billing_code("b", Some(&mb), Some(&cb)).as_deref(),
+            Some("B-C")
+        );
     }
 
     #[test]

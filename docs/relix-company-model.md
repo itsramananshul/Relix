@@ -334,13 +334,21 @@ When a manager delegates, the subordinate's costs **roll up** to the requester. 
 >   recursive descent follows `spawned` edges only into same-Guild Briefs, so a
 >   stray cross-Guild edge (and its whole subtree) is excluded, and a cross-Guild
 >   caller reads not-found.
-> - **Billing code.** An additive `billing_code` on a Brief (set via
->   `brief.set <id>|billing_code|<code>`, surfaced on the Brief detail). When a
->   run **starts**, its effective code is **stamped** onto the run row — the
->   Brief's own code, else inherited from the nearest same-Guild ancestor
->   Sub-brief — so attribution is durable and point-in-time (a later code change
->   never rewrites a past run's bill). Manual and autonomous runs are attributed
->   identically (the stamp is in the shared `prepare_claimed_run` seam).
+> - **Billing code (Brief + object-level, BACKEND SHIPPED).** An additive
+>   `billing_code` on a Brief (set via `brief.set <id>|billing_code|<code>`,
+>   surfaced on the Brief detail) AND an additive `billing_code` on **Mandate,
+>   Campaign, and Guild** (set via `mandate.update`/`campaign.update
+>   <id>|billing_code|<code>` and `guild.set_billing_code <code>`, surfaced on
+>   their reads). When a run **starts**, its effective code is **stamped** onto
+>   the run row with the full precedence: the **Brief's own** code → the nearest
+>   same-Guild **ancestor Sub-brief**'s code → the linked **Campaign** code →
+>   the linked **Mandate** code → the **Guild**'s own code. The object-level
+>   steps resolve through a tenant-safe `ObjectBillingResolver` (the spine store)
+>   injected into the Brief ledger — so a Brief in one Guild can never inherit
+>   another Guild's Campaign/Mandate/Guild code, even with a bad/cross-Guild
+>   link. Attribution is durable and point-in-time (a later change to ANY object's
+>   code never rewrites a past run's bill). Manual and autonomous runs are
+>   attributed identically (the stamp is in the shared `prepare_claimed_run` seam).
 > - **Window.** The rollup bills against the **same canonical
 >   `heartbeat::allowance_window`** (current UTC calendar month) the dispatch
 >   gate uses; a caller/test may override with explicit bounded since/until.
@@ -356,9 +364,9 @@ When a manager delegates, the subordinate's costs **roll up** to the requester. 
 >   stays open). Depth is computed over same-Guild edges only, so a cross-Guild
 >   edge can never inflate/leak another Guild's depth; `brief.detail` now
 >   surfaces `delegation_depth` + `max_delegation_depth` for read visibility.
-> - **Still deferred (honest):** Mandate/Campaign/Guild-level billing **codes**
->   (those objects carry no billing-code field — only the Brief tree does) and
->   the **frontend** Costs surface remain unbuilt.
+> - **Still deferred (honest):** the **frontend** Costs surface remains unbuilt.
+>   (Object-level Mandate/Campaign/Guild billing **codes** are now shipped — see
+>   the Billing-code note above.)
 
 ---
 

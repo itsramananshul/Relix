@@ -472,6 +472,28 @@ fn default_recovery_scan() -> bool {
 /// chat traffic for a noticeable time.
 pub const MAX_ROWS_PER_RETENTION_PASS: i64 = 1000;
 
+/// OBJECT-LEVEL billing-code source for run stamping (company-model
+/// §6.6). The Brief ledger ([`TaskStore`]) knows a Brief's own code and
+/// its ancestor Sub-briefs' codes, but the linked **Campaign / Mandate /
+/// Guild** billing codes live in the separate spine store. Rather than
+/// thread the spine store through the whole run-dispatch path, the
+/// SpineStore is injected once at wiring as a `dyn ObjectBillingResolver`
+/// so [`TaskStore::effective_billing_code`] can fall back to the object
+/// codes. Implemented by the spine `SpineStore`; tenant-safe by
+/// construction (a link id outside the Brief's Guild resolves to nothing).
+pub trait ObjectBillingResolver: Send + Sync {
+    /// Resolve the effective OBJECT-level billing code for a Brief whose
+    /// Guild is `tenant` and which links the given Mandate/Campaign ids.
+    /// Precedence is Campaign-own → Mandate-own → Guild-own; `None` when
+    /// no linked object (within `tenant`) carries a code.
+    fn object_billing_code(
+        &self,
+        tenant: &str,
+        mandate_id: Option<&str>,
+        campaign_id: Option<&str>,
+    ) -> Option<String>;
+}
+
 /// SQLite-backed Task ledger. `rusqlite::Connection` is not `Sync`, so
 /// the connection lives inside an `Arc<Mutex<_>>`; the bridge serialises
 /// access. Volume is low (one row per task, one row per checkpoint) so
@@ -499,6 +521,14 @@ pub struct TaskStore {
     /// and measure capacity; this orders the start itself. Different Operatives
     /// get distinct locks, so unrelated work runs fully in parallel.
     start_locks: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
+    /// OBJECT-LEVEL billing-code resolver (company-model §6.6), injected
+    /// once at wiring (the spine store). Set via
+    /// [`set_object_billing_resolver`](Self::set_object_billing_resolver);
+    /// consulted by [`effective_billing_code`](Self::effective_billing_code)
+    /// to fall back from the Brief tree to its linked Campaign/Mandate/Guild
+    /// code. Empty in tests / before wiring → Brief-tree-only attribution
+    /// (unchanged legacy behavior).
+    object_billing: std::sync::OnceLock<Arc<dyn ObjectBillingResolver>>,
 }
 
 /// Resolve the scoped-run workspace base. `RELIX_RUN_WORKSPACE_ROOT`
@@ -539,6 +569,7 @@ impl TaskStore {
             workspace_config:
                 crate::nodes::coordinator::heartbeat::resolve_workspace_config(),
             start_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            object_billing: std::sync::OnceLock::new(),
         })
     }
 
@@ -557,7 +588,16 @@ impl TaskStore {
             workspace_config:
                 crate::nodes::coordinator::heartbeat::WorkspaceConfig::default(),
             start_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            object_billing: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Inject the OBJECT-LEVEL billing-code resolver (company-model §6.6) —
+    /// the spine store, wired once at coordinator boot. Idempotent: a
+    /// second call is ignored (the `OnceLock` keeps the first resolver).
+    /// Takes `&self` so it can be set through an `Arc<TaskStore>`.
+    pub fn set_object_billing_resolver(&self, resolver: Arc<dyn ObjectBillingResolver>) {
+        let _ = self.object_billing.set(resolver);
     }
 
     /// PHASE 3 (start lock): return the in-process **start lock** for one
@@ -3877,11 +3917,24 @@ impl TaskStore {
         }))
     }
 
-    /// Resolve a Brief's EFFECTIVE billing code (company-model §6.6): the
-    /// Brief's own `billing_code` if set, else inherited from the nearest
-    /// ancestor Sub-brief (walking `spawned` parent edges) WITHIN THE SAME
-    /// Guild — so cross-Guild inheritance can never happen. `None` when no
-    /// Brief in the chain carries a code. The walk is bounded and cycle-safe.
+    /// Resolve a Brief's EFFECTIVE billing code (company-model §6.6) with
+    /// the full precedence:
+    ///
+    /// 1. the Brief's **own** `billing_code`;
+    /// 2. else the nearest same-Guild **ancestor Sub-brief**'s code
+    ///    (walking `spawned` parent edges);
+    /// 3. else the Brief's linked **Campaign** code, then its linked
+    ///    **Mandate** code;
+    /// 4. else the **Guild**'s own default code.
+    ///
+    /// Steps 1–2 are resolved here from the Brief ledger; steps 3–4 are
+    /// resolved through the injected [`ObjectBillingResolver`] (the spine
+    /// store) and are SKIPPED when no resolver is wired (tests / pre-wiring),
+    /// preserving the original Brief-tree-only behavior. Everything is
+    /// confined to the Brief's OWN Guild — cross-Guild inheritance can never
+    /// happen (the ancestor walk is same-Guild, and the resolver only reads
+    /// objects in `tenant`). The walk is bounded and cycle-safe. `None`
+    /// when nothing in the chain or the linked objects carries a code.
     pub fn effective_billing_code(
         &self,
         brief_id: &str,
@@ -3890,6 +3943,8 @@ impl TaskStore {
         let Some(tenant) = self.task_tenant(brief_id)? else {
             return Ok(None);
         };
+        // 1 + 2: the Brief's own code, else the nearest same-Guild ancestor
+        // Sub-brief's code.
         let mut current = brief_id.to_string();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for _ in 0..64 {
@@ -3909,7 +3964,57 @@ impl TaskStore {
                 None => break,
             }
         }
+        // 3 + 4: fall back to the Brief's linked Campaign/Mandate code, then
+        // the Guild's own code — via the injected spine resolver, all within
+        // the Brief's OWN Guild. Skipped (legacy behavior) when no resolver
+        // is wired.
+        if let Some(resolver) = self.object_billing.get() {
+            let (mandate_id, campaign_id) = self.brief_object_links(brief_id)?;
+            if let Some(code) =
+                resolver.object_billing_code(&tenant, mandate_id.as_deref(), campaign_id.as_deref())
+            {
+                return Ok(Some(code));
+            }
+        }
         Ok(None)
+    }
+
+    /// The Brief's own linked Mandate + Campaign ids (trimmed; `None` when
+    /// unset/empty), used to resolve the object-level billing-code fallback.
+    /// Reads only the starting Brief's own links — a Sub-brief inherits an
+    /// ancestor's *Brief* code via the chain walk above; the object fallback
+    /// keys off this Brief's own spine links.
+    fn brief_object_links(
+        &self,
+        brief_id: &str,
+    ) -> Result<(Option<String>, Option<String>), CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT mandate_id, campaign_id FROM tasks WHERE task_id = ?1",
+                params![brief_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        let norm = |v: Option<String>| {
+            v.and_then(|s| {
+                let t = s.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            })
+        };
+        Ok(row
+            .map(|(m, c)| (norm(m), norm(c)))
+            .unwrap_or((None, None)))
     }
 
     /// Stamp a run row with the Brief's effective billing code at run START
@@ -26235,6 +26340,132 @@ mod tests {
             .unwrap();
         assert_eq!(roll.run_count, 1, "pre-run refusal not a real run");
         assert_eq!(roll.cost_micros, 50);
+    }
+
+    // ── Object-level billing-code inheritance (company-model §6.6) ──
+    //
+    // Precedence for a run's effective code: Brief own → nearest same-Guild
+    // ancestor Brief → linked Campaign → linked Mandate → Guild. Steps after
+    // the Brief tree resolve through the injected spine `ObjectBillingResolver`.
+
+    /// A TaskStore wired with an in-memory SpineStore as its object-level
+    /// billing-code resolver — returned alongside the spine so a test can
+    /// create/mutate Mandates/Campaigns/Guilds.
+    fn store_with_spine() -> (TaskStore, std::sync::Arc<crate::nodes::coordinator::spine::SpineStore>)
+    {
+        let s = store();
+        let spine =
+            std::sync::Arc::new(crate::nodes::coordinator::spine::SpineStore::in_memory().unwrap());
+        s.set_object_billing_resolver(spine.clone());
+        (s, spine)
+    }
+
+    /// Read a run row's stamped `billing_code` directly (get_run does not
+    /// surface it).
+    fn run_billing_code(s: &TaskStore, run_id: &str) -> Option<String> {
+        let c = s.conn.lock().unwrap();
+        c.query_row(
+            "SELECT billing_code FROM brief_runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn effective_billing_code_inherits_campaign_then_mandate_then_guild() {
+        let (s, spine) = store_with_spine();
+        let b = brief(&s, "no own/ancestor code");
+        // Nothing set anywhere → no code.
+        assert_eq!(s.effective_billing_code(&b).unwrap(), None);
+        // Only the Guild has a code → Brief inherits the Guild default.
+        spine.set_guild_billing_code("default", Some("GUILD")).unwrap();
+        assert_eq!(s.effective_billing_code(&b).unwrap().as_deref(), Some("GUILD"));
+        // Linked Mandate with a code beats the Guild.
+        let m = spine.create_mandate("default", "M", "", None, None).unwrap();
+        spine.update_mandate_field(&m, "billing_code", "MAND").unwrap();
+        s.set_brief_field(&b, "mandate", &m).unwrap();
+        assert_eq!(s.effective_billing_code(&b).unwrap().as_deref(), Some("MAND"));
+        // Linked Campaign with a code beats the Mandate.
+        let c = spine
+            .create_campaign("default", "C", Some(&m), None, None)
+            .unwrap();
+        spine.update_campaign_field(&c, "billing_code", "CAMP").unwrap();
+        s.set_brief_field(&b, "campaign", &c).unwrap();
+        assert_eq!(s.effective_billing_code(&b).unwrap().as_deref(), Some("CAMP"));
+    }
+
+    #[test]
+    fn effective_billing_code_precedence_brief_over_ancestor_over_object() {
+        let (s, spine) = store_with_spine();
+        spine.set_guild_billing_code("default", Some("GUILD")).unwrap();
+        let m = spine.create_mandate("default", "M", "", None, None).unwrap();
+        spine.update_mandate_field(&m, "billing_code", "MAND").unwrap();
+        let parent = brief(&s, "parent");
+        let child = brief(&s, "child");
+        s.link_subbrief(&parent, &child).unwrap();
+        s.set_brief_field(&child, "mandate", &m).unwrap();
+        // No Brief code anywhere → object fallback (Mandate beats Guild).
+        assert_eq!(s.effective_billing_code(&child).unwrap().as_deref(), Some("MAND"));
+        // An ancestor Brief code beats the linked object code.
+        s.set_brief_field(&parent, "billing_code", "ANCESTOR").unwrap();
+        assert_eq!(
+            s.effective_billing_code(&child).unwrap().as_deref(),
+            Some("ANCESTOR")
+        );
+        // The Brief's OWN code beats the ancestor.
+        s.set_brief_field(&child, "billing_code", "OWN").unwrap();
+        assert_eq!(s.effective_billing_code(&child).unwrap().as_deref(), Some("OWN"));
+    }
+
+    #[test]
+    fn object_code_change_after_run_start_does_not_rewrite_stamp() {
+        let (s, spine) = store_with_spine();
+        let m = spine.create_mandate("default", "M", "", None, None).unwrap();
+        spine.update_mandate_field(&m, "billing_code", "OLD").unwrap();
+        let b = brief(&s, "stamped from mandate");
+        s.set_brief_field(&b, "mandate", &m).unwrap();
+        // Run starts → stamp the effective (object) code point-in-time.
+        running_run(&s, "r1", &b, "agt");
+        s.stamp_run_billing_code("r1", &b).unwrap();
+        assert_eq!(run_billing_code(&s, "r1").as_deref(), Some("OLD"));
+        // Later object-code change must NOT rewrite the past run's bill.
+        spine.update_mandate_field(&m, "billing_code", "NEW").unwrap();
+        assert_eq!(
+            run_billing_code(&s, "r1").as_deref(),
+            Some("OLD"),
+            "a past run's stamp is durable point-in-time"
+        );
+        // A NEW run picks up the new effective code.
+        running_run(&s, "r2", &b, "agt");
+        s.stamp_run_billing_code("r2", &b).unwrap();
+        assert_eq!(run_billing_code(&s, "r2").as_deref(), Some("NEW"));
+    }
+
+    #[test]
+    fn object_code_does_not_leak_across_guilds() {
+        let (s, spine) = store_with_spine();
+        // Guild-b carries codes at every object level.
+        spine.set_guild_billing_code("guild-b", Some("B-GUILD")).unwrap();
+        let mb = spine.create_mandate("guild-b", "MB", "", None, None).unwrap();
+        spine.update_mandate_field(&mb, "billing_code", "B-MAND").unwrap();
+        let cb = spine
+            .create_campaign("guild-b", "CB", Some(&mb), None, None)
+            .unwrap();
+        spine.update_campaign_field(&cb, "billing_code", "B-CAMP").unwrap();
+        // A Brief in guild-a mis-linked to guild-b's Campaign + Mandate ids.
+        let b = brief(&s, "guild-a brief, cross-Guild links");
+        s.set_task_tenant(&b, "guild-a").unwrap();
+        s.set_brief_field(&b, "mandate", &mb).unwrap();
+        s.set_brief_field(&b, "campaign", &cb).unwrap();
+        // None of guild-b's codes resolve for a guild-a Brief, and guild-a has
+        // no Guild code of its own → no code at all (no cross-Guild leak).
+        assert_eq!(s.effective_billing_code(&b).unwrap(), None);
+        // Sanity: the SAME ids DO resolve for a genuine guild-b Brief.
+        let bb = brief(&s, "guild-b brief");
+        s.set_task_tenant(&bb, "guild-b").unwrap();
+        s.set_brief_field(&bb, "campaign", &cb).unwrap();
+        assert_eq!(s.effective_billing_code(&bb).unwrap().as_deref(), Some("B-CAMP"));
     }
 
     // ─────────────────────────────────────────────────────────────────────
