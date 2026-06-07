@@ -331,7 +331,7 @@ the approved work is already ready. What it does **not** do:
     when — the Board has granted a bounded **standing approval** in the Guild, the
     same loop may also take the specific *approval* action the grant covers. This
     is **not a loop-toggle bypass**: turning the loop on wakes the driver, but
-    each of the three approval categories acts **only** while a
+    each of the four approval categories acts **only** while a
     `standing_approvals` row exists for the synthetic authority subject
     `__relix_autonomous_prime__` in that tenant. The categories are:
     `prime.proposal.approve` (autonomously approve a **proposed** Prime proposal
@@ -347,10 +347,16 @@ the approved work is already ready. What it does **not** do:
     `prime.clearance.approve` (greenlight a **pending spawn Clearance tied to the
     Mandate's Team Plan**, reusing the store decide path's exact side effects —
     `decide_approval` + the hire-activation hop — and refusing any non-spawn /
-    tool / budget / high-risk approval). Each autonomous approval **consumes** one
+    tool / budget / high-risk approval), and `prime.strategy.approve` (approve a
+    **proposed** Mandate strategy through the existing `mandate.strategy.approve`
+    handler — the store only flips `proposed` → `approved` (`WHERE
+    status='proposed'`), so a **rejected or missing** strategy is never approved
+    and never re-proposed: a human **strategy rejection stays final**, and once a
+    strategy is approved the next step is no longer the approval gate so a re-tick
+    neither re-approves nor double-consumes). Each autonomous approval **consumes** one
     call of a bounded grant (`max_calls` / `max_cost_micros`); an unlimited grant
     is not decremented (existing standing-approval semantics). It is **tenant-safe**
-    (a grant in Guild A never approves Guild B's proposal/hire/Clearance — the
+    (a grant in Guild A never approves Guild B's proposal/hire/Clearance/strategy — the
     check is per the candidate's own Guild), **bounded** (still ≤
     `RELIX_AUTONOMOUS_PRIME_MAX` actions/tick), and **idempotent**. Grants are
     made/revoked through the EXISTING `agent.standing_approval.*` routes
@@ -371,8 +377,9 @@ the approved work is already ready. What it does **not** do:
     acts only while its grant is live. With no standing grant, every approval gate
     stays human exactly as before — autonomy here only *adds* power when the Board
     has explicitly granted it, inside the bound it set.
-  - **Prime Strategy Drafting (v1) — Prime now DRAFTS a Mandate strategy, but
-    still does not APPROVE it.** Previously a Mandate with no strategy was a dead
+  - **Prime Strategy Drafting (v1) — Prime DRAFTS a Mandate strategy; it does not
+    APPROVE it by default (only under an explicit `prime.strategy.approve` standing
+    grant, above).** Previously a Mandate with no strategy was a dead
     stop until an operator hand-wrote and proposed a strategy doc. Now, when a
     Mandate has **no strategy yet**, the guided/autonomous driver classifies it as
     `needs_strategy_proposal` (`advance_action = "propose_strategy"`,
@@ -386,7 +393,15 @@ the approved work is already ready. What it does **not** do:
     doc lands `proposed` (it surfaces in the Action Center / Approvals as an
     `approval` item, and the next governed step becomes the human
     `mandate.strategy.approve` gate); team planning and orchestration stay locked
-    until a human (or a future explicit standing-authority category) approves it.
+    until that gate is approved. **By default that approval is a human's.** It
+    becomes autonomous **only** when the autonomous Prime loop is effectively ON
+    (runtime toggle or env override) **and** the Board has granted the
+    `prime.strategy.approve` standing authority for the Guild (above) — then the
+    same loop approves the *proposed* strategy through the existing
+    `mandate.strategy.approve` handler, consuming one bounded grant call. **A
+    strategy rejection stays final** — the store only flips `proposed` →
+    `approved`, so a rejected (or missing) strategy is never auto-approved or
+    re-proposed; only a human proposing a fresh strategy reopens the gate.
     It is **idempotent and non-destructive** — a strategy already `proposed`,
     `approved`, or `rejected` is **never overwritten** (a re-advance refuses as
     `stale_action`), so a human **rejection** is honoured: Prime does not turn
@@ -404,15 +419,16 @@ the approved work is already ready. What it does **not** do:
   - What this still does **NOT** do: there is **no LLM/strategy reasoning** — the
     autonomous driver only executes the deterministic next governed step, and the
     strategy it drafts (above) is a **deterministic** doc, never a model-reasoned
-    one; it **drafts a strategy proposal but does not approve it, does not decide
-    which person/identity to hire, and does not invent a goal from raw intent**.
-    **Raw goal creation still starts from a submitted
+    one; it **drafts a strategy proposal and — by default — does not approve it,
+    does not decide which person/identity to hire, and does not invent a goal from
+    raw intent**. **Raw goal creation still starts from a submitted
     goal/proposal** — Prime proposes a plan from a request; it never conjures a
     goal from nothing. The standing-authority layer may *approve* a proposal,
-    *activate* a planning hire, or *greenlight* a planning Clearance — but only
-    **inside the bounded authority the Board explicitly granted** (the
-    `standing_approvals` row), only for items **attributable to Prime/company
-    planning** (a proposal in the proposed set; a hire/Clearance in the Mandate's
+    *approve* a proposed strategy, *activate* a planning hire, or *greenlight* a
+    planning Clearance — but only **inside the bounded authority the Board explicitly
+    granted** (the `standing_approvals` row), only for items **attributable to
+    Prime/company planning** (a proposal in the proposed set; a *proposed* strategy
+    on the Mandate; a hire/Clearance in the Mandate's
     Team Plan), and never for an arbitrary tool/budget/high-risk approval. With
     **no grant**, proposing/approving plans, greenlighting hires/Clearances, and
     the Guild-budget ceiling all remain the human/Board's, exactly as before. The
@@ -625,14 +641,17 @@ work forward on a timer — planning the team, orchestrating the Brief tree, and
 starting ready work through the same governed routes, bounded + idempotent +
 tenant-safe, with the autonomous budget hard-stop re-imposed on auto-start. On
 top of that, an **opt-in standing-authority layer** lets the SAME loop also
-approve a proposal, activate a planning hire, or greenlight a planning Clearance
+approve a proposal, approve a proposed strategy, activate a planning hire, or
+greenlight a planning Clearance
 — but **only inside a bounded standing approval the Board explicitly granted**
 to the synthetic `__relix_autonomous_prime__` authority for that Guild (never
 from env alone, never for an arbitrary tool/budget/high-risk approval, always
-tenant-scoped + consumed). The default Prime is still rules, the model only
+tenant-scoped + consumed, and never reviving a rejected strategy). The default
+Prime is still rules, the model only
 shapes the *interpretation* (never crew/governance), and with **no standing
-grant** the loop **never** auto-approves a strategy / hire / spawn / budget /
-Clearance gate — so by default approvals + hire decisions + the Guild budget
+grant** the loop **never** auto-approves a strategy / proposal / hire / spawn /
+budget / Clearance gate — so by default approvals + strategy + hire decisions +
+the Guild budget
 ceiling stay human, raw goal creation still starts from a submitted
 goal/proposal. Prime now **drafts** a deterministic Mandate strategy and proposes
 it (Prime Strategy Drafting v1, above) — but that is a *draft*, left `proposed`

@@ -37,7 +37,8 @@ use crate::nodes::coordinator::TaskStore;
 use crate::nodes::coordinator::agent::handlers::{
     ReadinessView, autonomous_approve_spawn_clearance, brief_status_row, caller_is_operator,
     compute_readiness, handle_orchestrate, handle_prime_approve, handle_prime_start,
-    handle_strategy_propose, handle_team_plan, internal, invalid, policy_denied,
+    handle_strategy_approve, handle_strategy_propose, handle_team_plan, internal, invalid,
+    policy_denied,
 };
 use crate::nodes::coordinator::agent::prime;
 use crate::nodes::coordinator::agent::store::{AgentStore, StandingApprovalMatch};
@@ -60,7 +61,7 @@ const ADVANCE_PROPOSE_STRATEGY: &str = "propose_strategy";
 // governed APPROVAL actions on its behalf — but ONLY through an explicit
 // `standing_approvals` row in the tenant, never from env alone. The grant is
 // recorded against a SYNTHETIC authority subject (not a real Operative) and one
-// of three narrow categories. This is "within powers you granted it", not a
+// of four narrow categories. This is "within powers you granted it", not a
 // hidden bypass: with no standing row the loop leaves every approval gate to the
 // human, exactly as before. (company-model standing-approval semantics.)
 
@@ -82,12 +83,18 @@ pub const CATEGORY_HIRE_APPROVE: &str = "prime.hire.approve";
 /// Standing-authority category: autonomous greenlight of a PENDING spawn
 /// Clearance tied to Prime / company planning.
 pub const CATEGORY_CLEARANCE_APPROVE: &str = "prime.clearance.approve";
+/// Standing-authority category: autonomous approval of a PROPOSED Mandate
+/// strategy (drives the existing `mandate.strategy.approve` path). Strategy
+/// REJECTION stays final — the store only flips `proposed` → `approved`, so a
+/// rejected / missing strategy is never approved and never re-proposed here.
+pub const CATEGORY_STRATEGY_APPROVE: &str = "prime.strategy.approve";
 
-/// The three standing-authority categories, in display order.
+/// The four standing-authority categories, in display order.
 pub const STANDING_AUTHORITY_CATEGORIES: &[&str] = &[
     CATEGORY_PROPOSAL_APPROVE,
     CATEGORY_HIRE_APPROVE,
     CATEGORY_CLEARANCE_APPROVE,
+    CATEGORY_STRATEGY_APPROVE,
 ];
 
 /// Default safe Rig the autonomous hire-approve binds when
@@ -1035,7 +1042,7 @@ pub fn configured_autonomous_hire_rig() -> String {
 }
 
 /// `prime.standing_authority` — READ-ONLY. The Prime standing-authority state
-/// for the caller's Guild: whether each of the three categories is currently
+/// for the caller's Guild: whether each of the four categories is currently
 /// active (a non-expired, non-exhausted `standing_approvals` row exists for the
 /// synthetic authority subject in this tenant), plus the synthetic authority id,
 /// the grantable categories, and the configured autonomous hire Rig. Mutates
@@ -1059,6 +1066,7 @@ pub fn handle_prime_standing_authority(
         "Autonomously approve/materialize a proposed Prime proposal through the existing prime.approve path.",
         "Autonomously activate a pending hire created by Prime/company planning, bound to the configured safe Rig.",
         "Autonomously greenlight a pending spawn Clearance tied to Prime/company planning.",
+        "Autonomously approve a proposed Mandate strategy through the existing mandate.strategy.approve path (a rejected/missing strategy is never approved).",
     ];
     let categories: Vec<Value> = STANDING_AUTHORITY_CATEGORIES
         .iter()
@@ -1204,10 +1212,15 @@ pub fn handle_prime_autonomy_set(spine_store: &SpineStore, ctx: &InvocationCtx) 
 // operator click uses, it advances ONLY the safe steps `prime.advance` already
 // allows (`create_team_plan` / `orchestrate_assign_ready`) plus starting ready
 // work for an already-approved proposal through the existing `prime.start`
-// path, and it NEVER auto-approves a strategy / hire / spawn / budget /
-// Clearance gate (those stay human). Bounded per tick, idempotent (each tick
-// re-classifies, so team plans / orchestration trees / started Shifts never
-// duplicate), and tenant-safe (each candidate is processed under its OWN Guild).
+// path. By DEFAULT it NEVER auto-approves a strategy / proposal / hire / spawn /
+// budget / Clearance gate (those stay human); the ONLY exception is the
+// **standing-authority layer** below — a gate is approved only while the Board
+// holds a live `standing_approvals` grant for the matching category in THAT
+// Guild (`prime.proposal.approve` / `prime.hire.approve` /
+// `prime.clearance.approve` / `prime.strategy.approve`), and budget approvals are
+// never delegated. Bounded per tick, idempotent (each tick re-classifies, so team
+// plans / orchestration trees / started Shifts never duplicate), and tenant-safe
+// (each candidate is processed under its OWN Guild).
 // ─────────────────────────────────────────────────────────────────────────
 
 /// What one autonomous Prime tick did with one candidate (for logs + tests).
@@ -1227,7 +1240,8 @@ pub struct PrimeAutonomyRecord {
     /// / `ready_to_start` / `needs_approval` / …).
     pub phase: String,
     /// The action attempted: `create_team_plan` / `orchestrate_assign_ready` /
-    /// `start` / `none`.
+    /// `propose_strategy` / `approve_strategy` / `approve` / `hire_approve` /
+    /// `clearance_approve` / `start` / `none`.
     pub action: &'static str,
     /// `advanced` / `started` / `skipped` / `blocked`.
     pub outcome: &'static str,
@@ -1713,6 +1727,88 @@ fn process_candidate(
             };
         }
         // Fall through (no actionable item) to the human-gate record below.
+    }
+
+    // (B3) needs_approval + PROPOSED strategy — STANDING-AUTHORITY strategy
+    // approval. A proposed Mandate strategy is normally a human gate (left
+    // `blocked`), but when the Board granted `prime.strategy.approve` for THIS
+    // Guild the loop may approve it on the Board's behalf through the EXISTING
+    // governed `mandate.strategy.approve` handler. That handler/store only flips
+    // `proposed` → `approved` (its UPDATE is `WHERE status='proposed'`), so a
+    // REJECTED or MISSING strategy is refused by the store and never re-proposed —
+    // a human rejection stays final. Tenant-scoped (the grant is checked per the
+    // candidate's own Guild), bounded (skips when the tick action budget is spent,
+    // consuming nothing), idempotent (once approved the next step is no longer
+    // `needs_approval`, so a re-tick neither re-approves nor double-consumes), and
+    // it consumes exactly ONE call of the bounded grant on success.
+    if step.phase == "needs_approval"
+        && step.action_api == "mandate.strategy.approve"
+        && step.strategy_status.as_deref() == Some("proposed")
+    {
+        let now_secs = now_secs_from_ms(now_ms);
+        if !standing_active(agent_store, tenant, CATEGORY_STRATEGY_APPROVE, now_secs) {
+            return mk(
+                phase,
+                "none",
+                "blocked",
+                "proposed strategy — no prime.strategy.approve standing authority for this Guild"
+                    .into(),
+                mandate_id,
+            );
+        }
+        if *actions >= max {
+            return mk(
+                phase,
+                "approve_strategy",
+                "skipped",
+                "tick action budget reached".into(),
+                mandate_id,
+            );
+        }
+        let Some(mid) = mandate_id.clone() else {
+            return mk(
+                phase,
+                "none",
+                "skipped",
+                "strategy approve: next step has no mandate".into(),
+                None,
+            );
+        };
+        // Route through the EXISTING governed strategy-approve handler (no new
+        // handler, no SpineStore bypass). Its arg is the bare mandate id.
+        let approve_ctx = autonomous_prime_ctx(tenant, mid.clone().into_bytes());
+        return match handle_strategy_approve(spine_store, &approve_ctx) {
+            HandlerOutcome::Ok(_) => {
+                *actions += 1;
+                let _ = consume_standing(agent_store, tenant, CATEGORY_STRATEGY_APPROVE, now_secs);
+                chronicle_autonomous(
+                    task_store,
+                    &mid,
+                    "prime.autonomous_strategy_approve",
+                    &format!(
+                        "autonomous Prime approved the proposed strategy for mandate {mid} via standing authority"
+                    ),
+                );
+                mk(
+                    phase,
+                    "approve_strategy",
+                    "advanced",
+                    format!(
+                        "approved the proposed strategy for mandate {mid} via prime.strategy.approve standing authority"
+                    ),
+                    Some(mid),
+                )
+            }
+            // Governance / store refusal (e.g. a strategy that is no longer
+            // proposed) — propagate honestly, take no credit, consume nothing.
+            HandlerOutcome::Err(e) => mk(
+                phase,
+                "approve_strategy",
+                "blocked",
+                format!("strategy approve refused: {}", e.cause),
+                Some(mid),
+            ),
+        };
     }
 
     // (C) Everything else needs a human gate, or is already running / done —
@@ -3145,6 +3241,234 @@ mod tests {
                 .unwrap(),
             "a skipped Clearance action does not consume the grant"
         );
+    }
+
+    // ── PRIME STRATEGY APPROVAL standing authority (v1) ────────────────────
+
+    /// A Mandate carrying a PROPOSED (not-yet-approved) strategy in `tenant` —
+    /// the `needs_approval` / `mandate.strategy.approve` shape the strategy-approve
+    /// standing authority acts on.
+    fn mandate_with_proposed_strategy(spine: &SpineStore, tenant: &str) -> String {
+        let m = spine
+            .create_mandate(tenant, "Ship v1", "real product", None, None)
+            .unwrap();
+        spine
+            .propose_strategy(tenant, &m, "a proposed strategy")
+            .unwrap();
+        m
+    }
+
+    // SA-a) Without `prime.strategy.approve` standing authority the loop DRAFTS a
+    //       strategy but never approves it: the draft lands `proposed`, and a
+    //       re-tick leaves it at the human approval gate (blocked, not approved).
+    #[test]
+    fn autonomous_tick_drafts_strategy_but_does_not_approve_without_grant() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = bare_mandate(&spine);
+
+        // Tick 1: draft a strategy proposal (proposed, NOT approved).
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.action, "propose_strategy");
+        assert_eq!(rec.outcome, "advanced");
+        assert_eq!(
+            spine.strategy_status("default", &m).unwrap().as_deref(),
+            Some("proposed")
+        );
+        assert!(!spine.strategy_approved("default", &m).unwrap());
+
+        // Tick 2: the next step is the human strategy-approval gate; with NO
+        // standing authority it is left blocked, never approved.
+        let recs2 = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec2 = recs2
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate re-considered");
+        assert_eq!(rec2.phase, "needs_approval");
+        assert_eq!(rec2.action, "none");
+        assert_eq!(rec2.outcome, "blocked");
+        assert!(!spine.strategy_approved("default", &m).unwrap());
+    }
+
+    // SA-b) With `prime.strategy.approve` standing authority the loop approves an
+    //       already-PROPOSED strategy through the existing
+    //       `mandate.strategy.approve` handler, consumes one bounded call, and the
+    //       next governed step is no longer the strategy-approval gate.
+    #[test]
+    fn autonomous_tick_with_standing_approves_proposed_strategy() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = mandate_with_proposed_strategy(&spine, "default");
+        grant_standing(&agents, "default", CATEGORY_STRATEGY_APPROVE, Some(1));
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.phase, "needs_approval");
+        assert_eq!(rec.action, "approve_strategy");
+        assert_eq!(rec.outcome, "advanced");
+        // Approved through the governed handler/store (proposed → approved).
+        assert!(spine.strategy_approved("default", &m).unwrap());
+        assert_eq!(
+            spine.strategy_status("default", &m).unwrap().as_deref(),
+            Some("approved")
+        );
+        // The bounded (max_calls=1) grant is now consumed.
+        assert!(
+            !agents
+                .has_active_standing(AUTONOMOUS_PRIME_AUTHORITY, CATEGORY_STRATEGY_APPROVE, 1)
+                .unwrap(),
+            "a bounded strategy-approve grant is consumed when the approval is taken"
+        );
+        // The next governed step has moved off the strategy-approval gate.
+        let after = next_step(&agents, &spine, &tasks, json!({ "mandate_id": m }));
+        assert_ne!(after["phase"], "needs_approval");
+        assert_ne!(after["action_api"], "mandate.strategy.approve");
+    }
+
+    // SA-c) Tenant isolation: a strategy-approve grant in Guild A never approves
+    //       Guild B's proposed strategy (a cross-Guild tick approves only the
+    //       granted Guild's strategy).
+    #[test]
+    fn standing_strategy_approve_is_tenant_isolated() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m_default = mandate_with_proposed_strategy(&spine, "default");
+        let m_other = mandate_with_proposed_strategy(&spine, "other");
+        // Grant ONLY in "default".
+        grant_standing(&agents, "default", CATEGORY_STRATEGY_APPROVE, None);
+
+        // Drive ALL Guilds.
+        let _ = tick(&agents, &spine, &tasks, &reg, 10, None);
+
+        assert!(
+            spine.strategy_approved("default", &m_default).unwrap(),
+            "the granted Guild's strategy is approved"
+        );
+        assert_eq!(
+            spine.strategy_status("other", &m_other).unwrap().as_deref(),
+            Some("proposed"),
+            "a grant in `default` must never approve `other`'s strategy"
+        );
+    }
+
+    // SA-d) A REJECTED strategy is never auto-approved or re-proposed, even WITH
+    //       the grant — the store only flips `proposed` → `approved`, so a human
+    //       rejection stays final and the grant is not consumed.
+    #[test]
+    fn standing_strategy_approve_never_approves_rejected() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = bare_mandate(&spine);
+        spine.propose_strategy("default", &m, "first").unwrap();
+        spine.reject_strategy("default", &m).unwrap();
+        // Even WITH the grant, a rejected strategy is final.
+        grant_standing(&agents, "default", CATEGORY_STRATEGY_APPROVE, Some(1));
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 5, Some("default"));
+        if let Some(rec) = recs.iter().find(|r| r.target_id == m) {
+            assert_ne!(rec.outcome, "advanced");
+            assert_ne!(rec.action, "approve_strategy");
+        }
+        assert_eq!(
+            spine.strategy_status("default", &m).unwrap().as_deref(),
+            Some("rejected"),
+            "a rejected strategy is never re-proposed or approved"
+        );
+        // The grant is untouched — no approval fired.
+        assert!(
+            agents
+                .has_active_standing(AUTONOMOUS_PRIME_AUTHORITY, CATEGORY_STRATEGY_APPROVE, 1)
+                .unwrap(),
+            "no approval ⇒ the strategy-approve grant is not consumed"
+        );
+    }
+
+    // SA-e) The per-tick action budget caps strategy approvals: with two proposed
+    //       strategies and max=1, exactly one is approved; the budget-blocked one
+    //       stays proposed and consumes NO grant call.
+    #[test]
+    fn standing_strategy_approve_respects_action_budget() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m1 = mandate_with_proposed_strategy(&spine, "default");
+        let m2 = mandate_with_proposed_strategy(&spine, "default");
+        // The grant has plenty of calls — the limiter under test is the per-tick
+        // action budget (max=1), not the grant.
+        grant_standing(&agents, "default", CATEGORY_STRATEGY_APPROVE, Some(5));
+
+        let _ = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+
+        let approved = [&m1, &m2]
+            .iter()
+            .filter(|m| spine.strategy_approved("default", m).unwrap())
+            .count();
+        assert_eq!(
+            approved, 1,
+            "the per-tick action budget caps approvals at max=1"
+        );
+        let still_proposed = [&m1, &m2]
+            .iter()
+            .filter(|m| spine.strategy_status("default", m).unwrap().as_deref() == Some("proposed"))
+            .count();
+        assert_eq!(
+            still_proposed, 1,
+            "the budget-blocked strategy stays proposed (never approved over budget)"
+        );
+
+        // Exactly one grant call was consumed — the budget-blocked candidate
+        // (the tick stops at the action bound before reaching it) consumed none.
+        let used = agents
+            .list_standing_for_tenant(AUTONOMOUS_PRIME_AUTHORITY, "default")
+            .unwrap()[0]
+            .calls_used;
+        assert_eq!(
+            used, 1,
+            "only the approval that actually fired consumed a grant call"
+        );
+    }
+
+    // SA-f) Documents the chosen tick granularity: a bare Mandate DRAFTS on one
+    //       tick and APPROVES on the NEXT. process_candidate takes at most one
+    //       governed action per candidate per tick, so drafting + approving never
+    //       collapse into a single tick even with max=2 and the grant present
+    //       (minimal-invasive: no per-candidate re-classification loop was added).
+    #[test]
+    fn autonomous_tick_drafts_then_approves_strategy_across_two_ticks() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = bare_mandate(&spine);
+        grant_standing(&agents, "default", CATEGORY_STRATEGY_APPROVE, None);
+
+        // Tick 1 (max=2): draft only — does NOT also approve the same tick.
+        let recs1 = tick(&agents, &spine, &tasks, &reg, 2, Some("default"));
+        let rec1 = recs1.iter().find(|r| r.target_id == m).unwrap();
+        assert_eq!(rec1.action, "propose_strategy");
+        assert_eq!(rec1.outcome, "advanced");
+        assert_eq!(
+            spine.strategy_status("default", &m).unwrap().as_deref(),
+            Some("proposed")
+        );
+        assert!(!spine.strategy_approved("default", &m).unwrap());
+
+        // Tick 2: now approves the proposed strategy via standing authority.
+        let recs2 = tick(&agents, &spine, &tasks, &reg, 2, Some("default"));
+        let rec2 = recs2.iter().find(|r| r.target_id == m).unwrap();
+        assert_eq!(rec2.action, "approve_strategy");
+        assert_eq!(rec2.outcome, "advanced");
+        assert!(spine.strategy_approved("default", &m).unwrap());
     }
 
     // P) The read-only `prime.standing_authority` surface reflects live grant

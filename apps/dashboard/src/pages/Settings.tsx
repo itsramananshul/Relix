@@ -543,6 +543,19 @@ const AUTONOMOUS_PRIME_AUTHORITY = "__relix_autonomous_prime__";
 const GRANT_TTL_SECS = 24 * 60 * 60;
 const GRANT_MAX_CALLS = 25;
 
+// Human-facing labels for the bounded standing-authority categories the backend
+// (`prime.standing_authority`) returns. The category wire name stays the source
+// of truth (and is shown verbatim); this only adds a readable headline per row.
+const CATEGORY_LABELS: Record<string, string> = {
+  "prime.proposal.approve": "Approve proposed plans",
+  "prime.hire.approve": "Approve pending hires",
+  "prime.clearance.approve": "Greenlight spawn Clearances",
+  "prime.strategy.approve": "Approve proposed strategies",
+};
+function categoryLabel(cat: string): string {
+  return CATEGORY_LABELS[cat] ?? cat;
+}
+
 interface StandingListRow {
   standing_id?: string;
   match_category?: string;
@@ -662,7 +675,10 @@ function PrimeStandingAuthorityPanel({
               const inFlight = busy === cat;
               return (
                 <tr key={cat}>
-                  <td className="mono" style={{ fontSize: 12 }}>{cat}</td>
+                  <td style={{ fontSize: 12 }}>
+                    <div>{categoryLabel(cat)}</div>
+                    <div className="mono muted" style={{ fontSize: 11 }}>{cat}</div>
+                  </td>
                   <td>
                     <span className={"badge " + (active ? "done" : "backlog")}>
                       {active ? "enabled" : "disabled"}

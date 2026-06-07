@@ -538,9 +538,15 @@ ledger entry or design section.
    `crates/relix-runtime/src/nodes/coordinator/agent/prime_driver.rs`
    (+ `controller_runtime.rs` registration, `handlers.rs` reuse), `crates/relix-web-bridge/src/{spine.rs,main.rs}`
    (4 routes + 409 mapping), `apps/dashboard/src/{api.ts,pages/Chat.tsx}`, the boot scripts +
-   coverage manifest, rebuilt `dashboard-dist`. *Still deferred:* a true end-to-end autonomous driver
-   (propose → **approve** → staff → orchestrate → run on its own) — out of scope and intentionally not
-   built; strategy **approval** (and model-reasoned strategy) remain human/deferred.
+   coverage manifest, rebuilt `dashboard-dist`. *Update:* strategy **approval** is no longer always
+   human — the bounded standing-authority layer adds a `prime.strategy.approve` category, so when the
+   autonomous Prime loop is effectively ON **and** the Board has granted that standing authority for the
+   Guild, the loop approves a *proposed* strategy through the existing `mandate.strategy.approve` handler
+   (a separate per-candidate action from drafting; tenant-scoped, bounded, consumes one grant call; a
+   **rejected/missing** strategy is never approved or re-proposed). With **no grant** strategy approval
+   stays human exactly as before. *Still deferred:* a true end-to-end no-grant autonomous driver
+   (propose → **approve** → staff → orchestrate → run on its own with nothing granted) — intentionally
+   not built; **model-reasoned** strategy remains deferred (the draft + approval are deterministic).
 9. **[BE/FE] Smarter companion** — **BACKEND SHIPPED (now AI-assisted action selection, opt-in +
    validated + fallback; still one-turn / one-action, NOT autonomous).**
    The `POST /v1/spine/companion` parser is a **company-aware action spine**
@@ -565,8 +571,9 @@ ledger entry or design section.
    (`llm_used` / `fallback` / `unavailable`) + a safe reason, and the reply says so — it never fakes
    an AI success. The dashboard's "Use AI" checkbox now drives the Command button too. **Still one
    turn → one validated action; no autonomous planner/agent loop** (`current-limitations.md`; ledger
-   autonomous Prime driver is shipped for approved-work orchestration; raw
-   strategy/approval reasoning remains human-gated).
+   autonomous Prime driver is shipped for approved-work orchestration, and bounded standing
+   grants — including `prime.strategy.approve` — can delegate specific approvals; **model-reasoned**
+   strategy/approval remains deferred, and with no grant approvals stay human).
    **Companion chat *console* now FRONTEND SHIPPED (product polish, `dashboard-design §13`):** the Chat
    page is a usable operating console, not a stateless command box — over the SAME governed routes (no
    new mutation path). It **persists the chat log locally** (versioned `localStorage` key `relix.chat.v1`,
