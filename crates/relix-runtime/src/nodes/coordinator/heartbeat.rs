@@ -3507,6 +3507,49 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_budget_admits_guild_gate_is_inert_without_metrics_or_spine() {
+        use crate::nodes::coordinator::agent::store::AgentStore;
+        use crate::nodes::coordinator::spine::SpineStore;
+        let s = store();
+        let agents = AgentStore::in_memory().unwrap();
+        let spine = SpineStore::in_memory().unwrap();
+
+        // An active Operative with NO per-Operative Allowance, in a Guild whose
+        // budget is set and WOULD be over — if spend could actually be read.
+        let eng = agents
+            .ensure_starter_operative("engineer", "Eng A", "Operative", "echo", "guild-a")
+            .unwrap()
+            .0;
+        let brief = ready_brief_in_tenant(&s, "work", &eng, "guild-a");
+        let card = s.brief_card(&brief).unwrap().unwrap();
+        spine.set_guild_allowance("guild-a", Some(20_000)).unwrap();
+
+        // (a) Metrics ledger unavailable → the Guild gate cannot read spend, so
+        // it stays INERT and never fabricates an over-budget refusal. This pins
+        // the no-fake-spend contract: a transient/absent metrics ledger must NOT
+        // become a phantom Guild hard-stop.
+        assert_eq!(
+            dispatch_budget_admits(&card, &s, &agents, Some(&spine), None, now_ms()),
+            BudgetAdmission::Allow,
+            "no metrics ledger → Guild gate inert, never a fabricated over-budget stop"
+        );
+
+        // (b) Spine store unavailable → the Guild budget can't be resolved → the
+        // gate is inert even with real over-budget spend in the ledger.
+        let in_window = allowance_window(now_ms()).start_ms;
+        let mstore = crate::metrics::MetricsStore::in_memory().unwrap();
+        mstore
+            .insert_batch(&[guild_spend_row(&eng, "guild-a", in_window, 250_000_000)])
+            .unwrap();
+        let mq = crate::metrics::MetricsQuery::new(mstore);
+        assert_eq!(
+            dispatch_budget_admits(&card, &s, &agents, None, Some(&mq), now_ms()),
+            BudgetAdmission::Allow,
+            "no spine store → Guild budget unresolved → gate inert (per-Operative gate still applies)"
+        );
+    }
+
+    #[test]
     fn over_guild_budget_brief_is_parked_and_chronicled_as_guild_stop() {
         use crate::rig::RigRegistry;
         let (s, _tmp) = store_ws();

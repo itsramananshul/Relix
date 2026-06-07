@@ -329,13 +329,15 @@ when you click Start. What it does **not** do:
     - **Live actual-spend signals** (money already *spent*): when the metrics
       ledger is wired, the handler reads the **authoritative month-to-date spend
       the dispatch gate itself enforces** — `MetricsQuery::cost_since` summing
-      `cost_micros` over the **trailing 30 days**, the exact source + window of
-      the `over_allowance` refusal (`heartbeat::allowance_admits`) — through a
+      `cost_micros` over the **current UTC calendar month** (the canonical
+      `heartbeat::allowance_window`), the exact source + window of the
+      `over_allowance` / `over_guild_budget` refusals
+      (`heartbeat::allowance_admits` / `guild_allowance_admits`) — through a
       read-only `SpendSource` seam, and emits: a per-Operative **spend over/near
       its Allowance** alert (over = at/over the cap = the gate's refusal
       threshold), and a **Guild spend over/near budget** alert. Each carries the
       real `spent / limit / percent` in its reason (e.g. *"spent $250.00 of the
-      $200.00 monthly Allowance (125%) in the last 30 days"*).
+      $200.00 monthly Allowance (125%) this month"*).
 
     Honest scope and the remaining gaps:
     - **No fabricated spend.** When metrics are disabled (`[metrics] enabled =
@@ -346,19 +348,37 @@ when you click Start. What it does **not** do:
       the actual-spend item (money spent) are separate objects with separate ids
       — they never collapse onto one another and never double-count the same
       money.
-    - **Window.** Spend is the **trailing 30 days** (matching the gate), compared
-      against the Guild's *monthly* budget / Operative *monthly* Allowance — an
-      approximate calendar month, stated literally in every reason line so no two
-      windows are silently mixed. The near band is 80% (the gate refuses at 100%).
+    - **Window.** Spend is the **current UTC calendar month** (the canonical
+      `heartbeat::allowance_window` — month start inclusive, reset at the next
+      month boundary), the SAME window the dispatch gate bills against, compared
+      against the Guild's *monthly* budget / Operative *monthly* Allowance and
+      stated literally in every reason line so no two windows are silently mixed.
+      The near band is 80% (the gate refuses at 100%).
     - **Tenant isolation.** Guild spend is the **sum of this tenant's own
       Operatives'** per-agent `cost_since`; the handler never issues a
       company-wide `cost_since(None, …)`, so no other Guild's spend can leak into
       this Guild's totals.
-    - **Still alert-only at the Guild level.** There is **no Guild-level spend
-      *gate*** — the dispatch gate enforces the per-Operative Allowance hard-stop;
-      Guild over-budget is surfaced for the operator, not auto-enforced. Real
-      per-Operative over-spend continues to surface *reactively* as the
-      `over_allowance` recovery card as well.
+    - **The Guild budget is now an autonomous hard-stop, not alert-only.** The
+      dispatch gate enforces TWO ceilings on the autonomous path
+      (`heartbeat::dispatch_budget_admits`): the per-Operative Allowance
+      hard-stop (`allowance_admits`, authoritative, takes precedence) and — when
+      the per-Operative gate allows — the **additive Guild-budget hard-stop**
+      (`guild_allowance_admits`). When this Guild's month-to-date spend
+      (the tenant-scoped sum of its own active Operatives' `cost_since`) reaches
+      its `Guild.monthly_allowance_cents` budget, the heartbeat **refuses** new
+      autonomous runs of that Guild's Briefs, parks the Brief in `blocked`,
+      chronicles `guild.budget_refused`, and records a durable refused run with
+      status `over_guild_budget` (distinct from the per-Operative `over_allowance`
+      so run history reads which ceiling refused). The budget alert above is the
+      operator-facing surface of this same gate (same figure + window), not a
+      separate not-enforced signal. **Manual operator runs stay sovereign** —
+      `preflight_run` / `brief.run` / `prime.start` take no budget gate, so the
+      Board can always run an over-budget Brief by hand. The gate is **inert
+      (allows) when the SpineStore or metrics ledger is unavailable** — it never
+      fabricates a Guild stop from missing spend. A Guild budget of `0`/unset
+      means "no cap" (deliberately distinct from the per-Operative `0` =
+      hard-stop). Real per-Operative over-spend also continues to surface
+      *reactively* as the `over_allowance` recovery card.
     - **The Approvals hub renders these budget alerts read-only.** The typed
       Approvals hub (`/approvals`) groups Clearances by type and shows a per-type
       payload summary, but the `budget`-category items are **informational only** —
