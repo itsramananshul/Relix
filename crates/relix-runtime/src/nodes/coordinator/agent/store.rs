@@ -1847,6 +1847,11 @@ impl AgentStore {
                         trimmed.len()
                     )));
                 }
+                if contains_agent_wire_delimiter(trimmed) {
+                    return Err(AgentStoreError::BadInput(
+                        "model_preference cannot contain pipe, tab, or newline characters".into(),
+                    ));
+                }
                 let stored: Option<&str> = if trimmed.is_empty() {
                     None
                 } else {
@@ -3650,6 +3655,10 @@ fn is_known_effort(s: &str) -> bool {
     matches!(s, "minimal" | "low" | "medium" | "high")
 }
 
+fn contains_agent_wire_delimiter(s: &str) -> bool {
+    s.contains(['|', '\n', '\r', '\t'])
+}
+
 fn new_agent_id(role: &str) -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 4];
@@ -3793,6 +3802,25 @@ mod tests {
             s.update_agent_field(&id, "model_preference", &long),
             Err(AgentStoreError::BadInput(_))
         ));
+    }
+
+    #[test]
+    fn model_preference_rejects_agent_wire_delimiters() {
+        let s = store();
+        let id = s
+            .create_agent("A", "engineer", "Eng", "rd", "core", "op", "subj-wire", "low", "default")
+            .unwrap();
+
+        for bad in ["claude|sonnet", "claude\nsonnet", "claude\rsonnet", "claude\tsonnet"] {
+            assert!(
+                matches!(
+                    s.update_agent_field(&id, "model_preference", bad),
+                    Err(AgentStoreError::BadInput(_))
+                ),
+                "bad model preference was accepted: {bad:?}"
+            );
+        }
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().model_preference, None);
     }
 
     #[test]
