@@ -9928,7 +9928,8 @@ fn register_node_type_handlers(
                             use crate::nodes::coordinator::agent::prime_driver::{
                                 MeshAiDecider, handle_prime_autonomy_tick_now_with_ai,
                                 parse_prime_llm_deliberation, parse_prime_llm_orchestration,
-                                parse_prime_llm_prioritization, parse_prime_llm_strategy_draft,
+                                parse_prime_llm_plan_package, parse_prime_llm_prioritization,
+                                parse_prime_llm_strategy_draft,
                             };
                             // Re-read all three Prime LLM switches (like the timer) so
                             // an operator can flip them without a restart: deliberation
@@ -9956,6 +9957,11 @@ fn register_node_type_handlers(
                                     .ok()
                                     .as_deref(),
                             );
+                            let plan_package_llm_enabled = parse_prime_llm_plan_package(
+                                std::env::var("RELIX_PRIME_LLM_PLAN_PACKAGE")
+                                    .ok()
+                                    .as_deref(),
+                            );
                             // Capture the runtime handle on the async thread; the
                             // blocking tick bridges the async mesh call through it.
                             let prime_handle = tokio::runtime::Handle::current();
@@ -9971,6 +9977,7 @@ fn register_node_type_handlers(
                                     || strategy_llm_enabled
                                     || prioritization_enabled
                                     || orchestration_llm_enabled
+                                    || plan_package_llm_enabled
                                 {
                                     prime_alert_cell
                                         .as_ref()
@@ -10003,6 +10010,7 @@ fn register_node_type_handlers(
                                     strategy_llm_enabled,
                                     prioritization_enabled,
                                     orchestration_llm_enabled,
+                                    plan_package_llm_enabled,
                                 )
                             })
                             .await;
@@ -11657,8 +11665,9 @@ fn register_node_type_handlers(
                         use crate::nodes::coordinator::agent::prime_driver::{
                             AutonomyDrive, MeshAiDecider, RUNTIME_KEY_AUTONOMOUS_PRIME,
                             autonomous_prime_tick, parse_prime_llm_deliberation,
-                            parse_prime_llm_orchestration, parse_prime_llm_prioritization,
-                            parse_prime_llm_strategy_draft, plan_autonomy_drive,
+                            parse_prime_llm_orchestration, parse_prime_llm_plan_package,
+                            parse_prime_llm_prioritization, parse_prime_llm_strategy_draft,
+                            plan_autonomy_drive,
                         };
                         // Re-read all three Prime LLM switches each tick: deliberation
                         // (action choice), strategy draft (proposed strategy body
@@ -11686,10 +11695,16 @@ fn register_node_type_handlers(
                                 .ok()
                                 .as_deref(),
                         );
+                        let prime_plan_package = parse_prime_llm_plan_package(
+                            std::env::var("RELIX_PRIME_LLM_PLAN_PACKAGE")
+                                .ok()
+                                .as_deref(),
+                        );
                         let prime_decider = if prime_llm
                             || prime_strategy_llm
                             || prime_prioritization
                             || prime_orchestration
+                            || prime_plan_package
                         {
                             prime_alert_cell.as_ref().and_then(|c| c.get()).map(|ctx| {
                                 MeshAiDecider::new(
@@ -11749,6 +11764,7 @@ fn register_node_type_handlers(
                                     prime_strategy_llm,
                                     prime_prioritization,
                                     prime_orchestration,
+                                    prime_plan_package,
                                 )?;
                                 records.append(&mut r);
                             }
@@ -11771,6 +11787,7 @@ fn register_node_type_handlers(
                                         prime_strategy_llm,
                                         prime_prioritization,
                                         prime_orchestration,
+                                        prime_plan_package,
                                     )?;
                                     records.append(&mut r);
                                 }

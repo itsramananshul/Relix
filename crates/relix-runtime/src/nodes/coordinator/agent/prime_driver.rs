@@ -49,6 +49,10 @@ use crate::nodes::coordinator::agent::prime_orchestration::{
     PrimeOrchestrationBlueprint, PrimeOrchestrationMode, PrimeOrchestrationRole,
     PrimeOrchestrationSnapshot, build_orchestration_prompt, parse_orchestration_blueprint,
 };
+use crate::nodes::coordinator::agent::prime_plan_package::{
+    PrimePlanPackageMode, PrimePlanPackageSnapshot, ValidatedPlanPackage,
+    build_plan_package_prompt, deterministic_plan_package, validate_plan_package,
+};
 use crate::nodes::coordinator::agent::prime_priority::{
     MAX_PRIORITY_CANDIDATES, PrimePriorityCandidate, PrimePriorityMode, build_priority_prompt,
     parse_priority_order,
@@ -723,6 +727,177 @@ fn author_orchestration_blueprint(
         Err(e) => (
             None,
             PrimeOrchestrationMode::Unavailable,
+            Some(format!("model unavailable: {e}")),
+        ),
+    }
+}
+
+// ── PRIME PLAN-PACKAGE AUTHORING v1 (opt-in) ────────────────────────────────
+// A bounded, additive planner step for the autonomous/manual Prime tick: for a
+// candidate the existing flow leaves idle, author a *proposed* decomposition plan
+// package (plan Dossier + suggest_tasks proposal + approval-bound confirm) on a
+// single un-decomposed Brief and leave the confirm OPEN for a human. Reuses the
+// EXISTING `open_plan_package` primitive — no duplicate Dossier/interaction logic.
+
+/// Outcome of checking whether an autonomous-tick candidate has a Brief that
+/// needs a *proposed* decomposition plan (Prime Plan-Package Authoring v1).
+enum PlanPackageEligibility {
+    /// The candidate's SOLE Brief is a non-terminal, childless leaf with no `plan`
+    /// Dossier, no `plan` lock, and no open `suggest_tasks` / plan `confirm` — Prime
+    /// may author a plan package on it. Carries `(brief_id, brief_title, brief_status)`.
+    Eligible {
+        brief_id: String,
+        brief_title: String,
+        brief_status: String,
+    },
+    /// A plan package (open `suggest_tasks` / plan `confirm`), an existing `plan`
+    /// Dossier, or a `plan` lock already covers the Brief — skip without authoring a
+    /// duplicate or clobbering a human/locked plan. Carries an honest reason.
+    Blocked(String),
+    /// The candidate has no single un-decomposed Brief to plan — fall through to the
+    /// existing human-gate tail (no plan package this tick).
+    NotApplicable,
+}
+
+/// Decide whether the candidate Mandate has exactly one un-decomposed Brief that
+/// warrants a proposed decomposition plan package. Conservative + tenant-scoped:
+/// it acts ONLY when the Mandate has a SINGLE Brief (an orchestrated Mandate has
+/// many Briefs and is left to the existing flow — this never floods the board), and
+/// that Brief is non-terminal (`done`/`cancelled` are never decomposed), childless
+/// (no Sub-briefs), has NO `plan` Dossier at all (so a human-, Prime-, or
+/// stale-authored plan is NEVER overwritten), is not `plan`-locked, and has no open
+/// plan package already awaiting approval. All reads are tenant-scoped: a Brief not
+/// in `tenant` is invisible. Any store error degrades to `NotApplicable` (safe — no
+/// authoring on an unreadable candidate).
+fn plan_package_eligibility(
+    task_store: &TaskStore,
+    tenant: &str,
+    mandate_id: &str,
+) -> PlanPackageEligibility {
+    let Ok(briefs) = task_store.list_briefs_by_mandate(mandate_id, 500) else {
+        return PlanPackageEligibility::NotApplicable;
+    };
+    // Only a single un-decomposed Brief is a plan-package candidate (a many-Brief
+    // Mandate is already planned/orchestrated — leave it to the existing flow).
+    if briefs.len() != 1 {
+        return PlanPackageEligibility::NotApplicable;
+    }
+    let card = &briefs[0];
+    let brief_id = card.task_id.clone();
+    // Tenant isolation: never read/write a Brief outside this Guild.
+    if !task_store
+        .task_in_tenant(&brief_id, tenant)
+        .unwrap_or(false)
+    {
+        return PlanPackageEligibility::NotApplicable;
+    }
+    // Terminal Briefs (done/cancelled) are never decomposed.
+    if matches!(card.board_status.as_str(), "done" | "cancelled") {
+        return PlanPackageEligibility::NotApplicable;
+    }
+    // Already decomposed (has Sub-briefs) — nothing to plan.
+    match task_store.list_subbriefs(&brief_id) {
+        Ok(kids) if !kids.is_empty() => return PlanPackageEligibility::NotApplicable,
+        Err(_) => return PlanPackageEligibility::NotApplicable,
+        Ok(_) => {}
+    }
+    // A `plan` Dossier already exists — never overwrite a human/Prime/stale plan.
+    match task_store.latest_dossier(&brief_id, "plan") {
+        Ok(Some(_)) => {
+            return PlanPackageEligibility::Blocked(
+                "a plan Dossier already exists on the Brief — not overwriting".to_string(),
+            );
+        }
+        Err(_) => return PlanPackageEligibility::NotApplicable,
+        Ok(None) => {}
+    }
+    // The `plan` Dossier is locked by someone — respect the lease, do not author.
+    match task_store.list_dossier_locks(&brief_id) {
+        Ok(locks) if locks.iter().any(|l| l.kind == "plan") => {
+            return PlanPackageEligibility::Blocked(
+                "the Brief's plan Dossier is locked — not authoring over a held lock".to_string(),
+            );
+        }
+        Err(_) => return PlanPackageEligibility::NotApplicable,
+        Ok(_) => {}
+    }
+    // An open plan package (suggest_tasks proposal or plan-bound confirm) already
+    // awaits approval — never open a duplicate.
+    match task_store.list_interactions(&brief_id) {
+        Ok(ix) => {
+            let open_suggestion = ix
+                .iter()
+                .any(|i| i.kind == "suggest_tasks" && i.status == "open");
+            let open_plan_confirm = ix.iter().any(|i| {
+                i.kind == "confirm"
+                    && i.status == "open"
+                    && i.bound_doc_kind.as_deref() == Some("plan")
+            });
+            if open_suggestion || open_plan_confirm {
+                return PlanPackageEligibility::Blocked(
+                    "an open plan package already awaits approval on the Brief".to_string(),
+                );
+            }
+        }
+        Err(_) => return PlanPackageEligibility::NotApplicable,
+    }
+    PlanPackageEligibility::Eligible {
+        brief_id,
+        brief_title: card.title.clone(),
+        brief_status: card.board_status.clone(),
+    }
+}
+
+/// Author the plan-package CONTENT (plan title/body, summary, child Briefs) for an
+/// eligible Brief. When model authoring is enabled (`plan_package_llm_enabled`) AND
+/// a live decider is wired, the model authors the content from the SAME bounded,
+/// secret-free snapshot; the reply is fully re-validated + sanitized by
+/// [`validate_plan_package`]. **This is NOT approval:** the caller opens the content
+/// through `open_plan_package` and leaves the confirm OPEN. On disabled / no decider
+/// / unavailable / rejected output the content degrades to the deterministic
+/// [`deterministic_plan_package`] with an honest [`PrimePlanPackageMode`]. The model
+/// authors content only — it never assigns agents (children open unassigned), picks
+/// tools/methods, or approves anything.
+fn author_plan_package_content(
+    ai: Option<&dyn PrimeAiDecider>,
+    brief_title: &str,
+    brief_status: &str,
+    mandate_title: &str,
+    plan_package_llm_enabled: bool,
+) -> (ValidatedPlanPackage, PrimePlanPackageMode, Option<String>) {
+    let deterministic = || deterministic_plan_package(brief_title);
+    if !plan_package_llm_enabled {
+        return (
+            deterministic(),
+            PrimePlanPackageMode::DeterministicOnly,
+            None,
+        );
+    }
+    let Some(decider) = ai else {
+        return (
+            deterministic(),
+            PrimePlanPackageMode::Unavailable,
+            Some("no AI decider wired for plan-package authoring".to_string()),
+        );
+    };
+    let snap = PrimePlanPackageSnapshot::new(brief_title, brief_status, mandate_title);
+    let prompt = build_plan_package_prompt(&snap);
+    match decider.deliberate(&prompt) {
+        Ok(raw) => match validate_plan_package(&raw, brief_title) {
+            Ok(vp) => (
+                vp,
+                PrimePlanPackageMode::LlmUsed,
+                Some("model-authored plan package".to_string()),
+            ),
+            Err(e) => (
+                deterministic(),
+                PrimePlanPackageMode::Fallback,
+                Some(format!("model plan-package output rejected: {e}")),
+            ),
+        },
+        Err(e) => (
+            deterministic(),
+            PrimePlanPackageMode::Unavailable,
             Some(format!("model unavailable: {e}")),
         ),
     }
@@ -1619,6 +1794,16 @@ fn prime_autonomy_record_json(r: &PrimeAutonomyRecord) -> Value {
         // deterministic one.
         "orchestration_ai_mode": r.orchestration_ai_mode,
         "orchestration_ai_reason": r.orchestration_ai_reason,
+        // Prime Plan-Package Authoring v1 provenance + the opened package's ids /
+        // child count: present only on a plan_package row; null elsewhere. The plan
+        // BODY is never put on a tick record (ids/counts/summary only) — the
+        // operator opens the Brief to read it.
+        "plan_package_ai_mode": r.plan_package_ai_mode,
+        "plan_package_ai_reason": r.plan_package_ai_reason,
+        "plan_doc_id": r.plan_doc_id,
+        "suggestion_id": r.suggestion_id,
+        "confirm_id": r.confirm_id,
+        "child_count": r.child_count,
     })
 }
 
@@ -1680,6 +1865,11 @@ pub fn handle_prime_autonomy_tick_now(
             .ok()
             .as_deref(),
     );
+    let plan_package_llm_enabled = parse_prime_llm_plan_package(
+        std::env::var("RELIX_PRIME_LLM_PLAN_PACKAGE")
+            .ok()
+            .as_deref(),
+    );
     handle_prime_autonomy_tick_now_with_ai(
         agent_store,
         spine_store,
@@ -1692,6 +1882,7 @@ pub fn handle_prime_autonomy_tick_now(
         strategy_llm_enabled,
         prioritization_enabled,
         orchestration_llm_enabled,
+        plan_package_llm_enabled,
     )
 }
 
@@ -1724,6 +1915,7 @@ pub fn handle_prime_autonomy_tick_now_with_ai(
     strategy_llm_enabled: bool,
     prioritization_enabled: bool,
     orchestration_llm_enabled: bool,
+    plan_package_llm_enabled: bool,
 ) -> HandlerOutcome {
     // Same Board-only gate as the runtime toggle: a worker subject can never
     // wake the autonomous Prime driver, even though this takes no new authority.
@@ -1766,6 +1958,7 @@ pub fn handle_prime_autonomy_tick_now_with_ai(
         strategy_llm_enabled,
         prioritization_enabled,
         orchestration_llm_enabled,
+        plan_package_llm_enabled,
     ) {
         Ok(r) => r,
         Err(e) => return internal(format!("prime.autonomy_tick_now: {e}")),
@@ -1853,6 +2046,24 @@ pub fn parse_prime_llm_strategy_draft(raw: Option<&str>) -> bool {
 /// invents a role, agent, Brief id, assignment, or gate, and any
 /// invalid/unavailable output falls back to the deterministic titles + dossiers.
 pub fn parse_prime_llm_orchestration(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Parse `RELIX_PRIME_LLM_PLAN_PACKAGE` (`1|true|yes|on`, case-insensitive) into
+/// the model-plan-package-authoring flag (Prime Plan-Package Authoring v1).
+/// Default OFF. Independent of the other Prime LLM switches: a Guild may let the
+/// model author a *proposed* Brief decomposition (plan Dossier + `suggest_tasks`
+/// proposal + approval-bound `confirm`) for an un-decomposed Brief while keeping
+/// deterministic action selection / strategy drafting / orchestration / priority.
+/// The model authors plan content only — it never assigns agents, picks
+/// tools/methods, mutates an existing Dossier, or approves anything; the confirm is
+/// always left OPEN for a human, and any invalid/unavailable output falls back to a
+/// deterministic safe decomposition. With the switch OFF the tick authors no plan
+/// package at all (byte-for-byte legacy behaviour).
+pub fn parse_prime_llm_plan_package(raw: Option<&str>) -> bool {
     matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
         Some("1" | "true" | "yes" | "on")
@@ -2157,6 +2368,29 @@ pub struct PrimeAutonomyRecord {
     /// (model reason on `llm_used`, or the honest fallback/unavailable reason).
     /// `None` when no orchestration text was authored.
     pub orchestration_ai_reason: Option<String>,
+    /// Prime Plan-Package Authoring v1 provenance — how the proposed plan-package
+    /// CONTENT (plan title/body, summary, child Briefs) was authored on a
+    /// `plan_package` action: `deterministic_only` / `llm_used` / `fallback` /
+    /// `unavailable`. `None` for every other action (no plan package was authored).
+    /// Distinct from the other `*_ai_mode` fields.
+    pub plan_package_ai_mode: Option<String>,
+    /// Secret-free reason the plan-package content was authored the way it was
+    /// (model reason on `llm_used`, or the honest fallback/unavailable reason).
+    /// `None` when no plan package was authored.
+    pub plan_package_ai_reason: Option<String>,
+    /// The immutable `plan` Dossier revision id opened by a `plan_package` action;
+    /// `None` for every other action. (Ids/counts only — the plan body never goes
+    /// into a tick record.)
+    pub plan_doc_id: Option<String>,
+    /// The `suggest_tasks` proposal id opened by a `plan_package` action; `None`
+    /// otherwise.
+    pub suggestion_id: Option<String>,
+    /// The approval-bound `confirm` id opened by a `plan_package` action (left OPEN
+    /// for the operator); `None` otherwise.
+    pub confirm_id: Option<String>,
+    /// How many child Briefs the proposed plan package would create on approval;
+    /// `None` for every other action.
+    pub child_count: Option<usize>,
 }
 
 /// Build the synthetic **autonomous Prime** invocation context for `tenant`.
@@ -2423,6 +2657,7 @@ fn process_candidate(
     llm_enabled: bool,
     strategy_llm_enabled: bool,
     orchestration_llm_enabled: bool,
+    plan_package_llm_enabled: bool,
 ) -> PrimeAutonomyRecord {
     let mut delib_mode = PrimeDeliberationMode::DeterministicOnly;
     let mut delib_reason: Option<String> = None;
@@ -2456,6 +2691,12 @@ fn process_candidate(
                         priority_rank: None,
                         orchestration_ai_mode: None,
                         orchestration_ai_reason: None,
+                        plan_package_ai_mode: None,
+                        plan_package_ai_reason: None,
+                        plan_doc_id: None,
+                        suggestion_id: None,
+                        confirm_id: None,
+                        child_count: None,
                     };
                 }
                 Deliberation::Proceed { mode, reason } => {
@@ -2483,6 +2724,7 @@ fn process_candidate(
         ai,
         strategy_llm_enabled,
         orchestration_llm_enabled,
+        plan_package_llm_enabled,
     );
     rec.ai_mode = Some(delib_mode.as_str().to_string());
     rec.ai_reason = delib_reason;
@@ -2514,6 +2756,7 @@ fn process_candidate_inner(
     ai: Option<&dyn PrimeAiDecider>,
     strategy_llm_enabled: bool,
     orchestration_llm_enabled: bool,
+    plan_package_llm_enabled: bool,
 ) -> PrimeAutonomyRecord {
     let mk = |phase: String,
               action: &'static str,
@@ -2544,6 +2787,12 @@ fn process_candidate_inner(
             // Set only on the orchestrate_assign_ready arm below (the text author).
             orchestration_ai_mode: None,
             orchestration_ai_reason: None,
+            plan_package_ai_mode: None,
+            plan_package_ai_reason: None,
+            plan_doc_id: None,
+            suggestion_id: None,
+            confirm_id: None,
+            child_count: None,
         }
     };
 
@@ -3339,6 +3588,117 @@ fn process_candidate_inner(
         };
     }
 
+    // (B5) Prime Plan-Package Authoring v1 — opt-in, default OFF
+    // (`RELIX_PRIME_LLM_PLAN_PACKAGE`). For a candidate the existing governed flow
+    // leaves IDLE (we reached here without a safe advance / start / governance /
+    // disposition action), Prime may author a *proposed* decomposition plan
+    // package — a `plan` Dossier + a `suggest_tasks` proposal + an approval-bound
+    // `confirm`, all through the EXISTING `open_plan_package` primitive — for a
+    // single un-decomposed Brief, and LEAVE the confirm OPEN for a human. It is
+    // purely additive: with the flag off the tick authors nothing (byte-for-byte
+    // legacy), and it NEVER competes with orchestrate/start (those returned
+    // earlier). It NEVER approves the confirm itself (no standing-authority
+    // category gates it — that is deliberately out of scope for v1). It is bounded
+    // by the action budget, tenant-scoped, idempotent / dedup-guarded (no second
+    // package, never over a human/locked/existing plan — see
+    // [`plan_package_eligibility`]), and the content is model-authored only when a
+    // live decider is wired, else a deterministic safe decomposition. Because the
+    // plan-package primitive attaches to a Brief, the candidate's resolved Mandate
+    // must carry one.
+    if plan_package_llm_enabled && let Some(mid) = mandate_id.clone() {
+        match plan_package_eligibility(task_store, tenant, &mid) {
+            PlanPackageEligibility::Eligible {
+                brief_id,
+                brief_title,
+                brief_status,
+            } => {
+                if *actions >= max {
+                    return mk(
+                        phase,
+                        "plan_package",
+                        "skipped",
+                        "tick action budget reached".into(),
+                        Some(mid),
+                    );
+                }
+                // The owning Mandate title is context for the model snapshot only
+                // (best-effort; absence does not block authoring).
+                let mandate_title = spine_store
+                    .get_mandate_for_tenant(&mid, tenant)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.title)
+                    .unwrap_or_default();
+                let (vp, pp_mode, pp_reason) = author_plan_package_content(
+                    ai,
+                    &brief_title,
+                    &brief_status,
+                    &mandate_title,
+                    plan_package_llm_enabled,
+                );
+                let child_count = vp.children.len();
+                return match task_store.open_plan_package(
+                    &brief_id,
+                    AUTONOMOUS_PRIME_AUTHORITY,
+                    &vp.plan_title,
+                    &vp.plan_body,
+                    &vp.summary,
+                    &vp.children,
+                    &vp.prompt,
+                ) {
+                    Ok(pkg) => {
+                        *actions += 1;
+                        // Chronicle ids/counts/mode only — never the plan body.
+                        chronicle_autonomous(
+                            task_store,
+                            &mid,
+                            "prime.autonomous_plan_package",
+                            &format!(
+                                "autonomous Prime opened a plan package on brief {brief_id}: plan {} + {child_count} child(ren), gated by confirm {} (content: {})",
+                                pkg.plan_doc_id,
+                                pkg.confirm_id,
+                                pp_mode.as_str()
+                            ),
+                        );
+                        let mut rec = mk(
+                            phase,
+                            "plan_package",
+                            "advanced",
+                            format!(
+                                "opened a plan package on brief {brief_id} ({child_count} proposed child(ren)); confirm {} left open for approval",
+                                pkg.confirm_id
+                            ),
+                            Some(mid),
+                        );
+                        rec.plan_package_ai_mode = Some(pp_mode.as_str().to_string());
+                        rec.plan_package_ai_reason = pp_reason;
+                        rec.plan_doc_id = Some(pkg.plan_doc_id);
+                        rec.suggestion_id = Some(pkg.suggestion_id);
+                        rec.confirm_id = Some(pkg.confirm_id);
+                        rec.child_count = Some(child_count);
+                        rec
+                    }
+                    // Store refusal (e.g. a race created a Brief edge / plan since
+                    // the eligibility read) — propagate honestly, take no credit.
+                    Err(e) => mk(
+                        phase,
+                        "plan_package",
+                        "blocked",
+                        format!("plan package open refused: {e}"),
+                        Some(mid),
+                    ),
+                };
+            }
+            // A plan package / plan Dossier / lock already covers the Brief — report
+            // honestly, author no duplicate.
+            PlanPackageEligibility::Blocked(reason) => {
+                return mk(phase, "plan_package", "skipped", reason, Some(mid));
+            }
+            // No single un-decomposed Brief — fall through to the human-gate tail.
+            PlanPackageEligibility::NotApplicable => {}
+        }
+    }
+
     // (C) Everything else needs a human gate, or is already running / done —
     // record it, act on nothing, write no event.
     let outcome = match step.phase {
@@ -3576,6 +3936,12 @@ fn exec_proposal_approve(
             priority_rank: None,
             orchestration_ai_mode: None,
             orchestration_ai_reason: None,
+            plan_package_ai_mode: None,
+            plan_package_ai_reason: None,
+            plan_doc_id: None,
+            suggestion_id: None,
+            confirm_id: None,
+            child_count: None,
         }
     };
 
@@ -3708,6 +4074,7 @@ fn execute_candidate(
     llm_enabled: bool,
     strategy_llm_enabled: bool,
     orchestration_llm_enabled: bool,
+    plan_package_llm_enabled: bool,
 ) -> PrimeAutonomyRecord {
     match cand {
         AutoCandidate::ProposalApprove(p) => exec_proposal_approve(
@@ -3742,6 +4109,7 @@ fn execute_candidate(
             llm_enabled,
             strategy_llm_enabled,
             orchestration_llm_enabled,
+            plan_package_llm_enabled,
         ),
         AutoCandidate::Mandate { tenant, mandate_id } => process_candidate(
             agent_store,
@@ -3761,6 +4129,7 @@ fn execute_candidate(
             llm_enabled,
             strategy_llm_enabled,
             orchestration_llm_enabled,
+            plan_package_llm_enabled,
         ),
     }
 }
@@ -3804,6 +4173,7 @@ pub fn autonomous_prime_tick(
     strategy_llm_enabled: bool,
     prioritization_enabled: bool,
     orchestration_llm_enabled: bool,
+    plan_package_llm_enabled: bool,
 ) -> Result<Vec<PrimeAutonomyRecord>, String> {
     if max == 0 {
         return Ok(Vec::new());
@@ -3978,6 +4348,12 @@ pub fn autonomous_prime_tick(
                 priority_rank: Some(rank0 + 1),
                 orchestration_ai_mode: None,
                 orchestration_ai_reason: None,
+                plan_package_ai_mode: None,
+                plan_package_ai_reason: None,
+                plan_doc_id: None,
+                suggestion_id: None,
+                confirm_id: None,
+                child_count: None,
             });
         }
         for (i, cand) in queue.iter().enumerate() {
@@ -4000,6 +4376,7 @@ pub fn autonomous_prime_tick(
                 llm_enabled,
                 strategy_llm_enabled,
                 orchestration_llm_enabled,
+                plan_package_llm_enabled,
             );
             rec.priority_ai_mode = Some(priority_mode_str.clone());
             rec.priority_ai_reason = priority_reason.clone();
@@ -4042,6 +4419,7 @@ pub fn autonomous_prime_tick(
                 llm_enabled,
                 strategy_llm_enabled,
                 orchestration_llm_enabled,
+                plan_package_llm_enabled,
             );
             rec.priority_ai_mode = Some(priority_mode_str.clone());
             rec.priority_ai_reason = priority_reason.clone();
@@ -4074,6 +4452,7 @@ pub fn autonomous_prime_tick(
             llm_enabled,
             strategy_llm_enabled,
             orchestration_llm_enabled,
+            plan_package_llm_enabled,
         );
         rec.priority_ai_mode = Some(priority_mode_str.clone());
         rec.priority_ai_reason = priority_reason.clone();
@@ -4502,7 +4881,7 @@ mod tests {
     ) -> Vec<PrimeAutonomyRecord> {
         autonomous_prime_tick(
             agents, spine, tasks, reg, None, 0, max, tenant, "echo", None, false, false, false,
-            false,
+            false, false,
         )
         .unwrap()
     }
@@ -4520,7 +4899,7 @@ mod tests {
     ) -> Vec<PrimeAutonomyRecord> {
         autonomous_prime_tick(
             agents, spine, tasks, reg, None, 0, max, tenant, hire_rig, None, false, false, false,
-            false,
+            false, false,
         )
         .unwrap()
     }
@@ -4562,6 +4941,7 @@ mod tests {
             "echo",
             Some(decider),
             true,
+            false,
             false,
             false,
             false,
@@ -4723,6 +5103,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         )
         .unwrap();
         let rec = recs
@@ -4802,6 +5183,7 @@ mod tests {
             Some(decider),
             false,
             true,
+            false,
             false,
             false,
         )
@@ -4921,6 +5303,7 @@ in force.\n";
             None,
             false,
             true,
+            false,
             false,
             false,
         )
@@ -5101,6 +5484,7 @@ in force.\n";
             false,
             false,
             true,
+            false,
         )
         .unwrap()
     }
@@ -5215,6 +5599,7 @@ in force.\n";
             false,
             false,
             true,
+            false,
         )
         .unwrap();
         let rec = recs.iter().find(|r| r.target_id == m).expect("considered");
@@ -5373,7 +5758,7 @@ in force.\n";
     ) -> Vec<PrimeAutonomyRecord> {
         autonomous_prime_tick(
             agents, spine, tasks, reg, None, 0, max, tenant, "echo", decider, false, false, true,
-            false,
+            false, false,
         )
         .unwrap()
     }
@@ -6206,6 +6591,7 @@ in force.\n";
             false,
             false,
             false,
+            false,
         )
         .unwrap();
         let rec = recs
@@ -6499,8 +6885,9 @@ in force.\n";
             &ctx,
             ai,
             llm_enabled,
-            // Strategy authoring + prioritization + orchestration authoring off for
-            // the deliberation-focused manual-tick tests.
+            // Strategy authoring + prioritization + orchestration + plan-package
+            // authoring off for the deliberation-focused manual-tick tests.
+            false,
             false,
             false,
             false,
@@ -8023,5 +8410,380 @@ in force.\n";
             Some("applied")
         );
         assert_eq!(tasks.board_status(&brief).unwrap().as_deref(), Some("done"));
+    }
+
+    // ── PRIME PLAN-PACKAGE AUTHORING v1 (opt-in, default OFF) ───────────────
+
+    /// A scripted-valid plan-package reply (2 children, one with a backward dep).
+    fn pp_reply() -> String {
+        serde_json::json!({
+            "plan_title": "Login plan",
+            "plan_body": "# Plan\n\nDecompose the login work into steps.",
+            "summary": "Decompose the login page",
+            "children": [
+                {"title": "Wire the form", "priority": "high"},
+                {"title": "Hook up auth", "after": 0}
+            ]
+        })
+        .to_string()
+    }
+
+    /// Build a candidate Mandate in `tenant` that the existing governed flow leaves
+    /// IDLE on the plan-package tail: strategy-approved + team-ready (so it is past
+    /// every advance/gate), with exactly ONE un-decomposed Brief that is BLOCKED
+    /// (so it is not `ready_to_start` and the tick reaches the (B5) plan-package
+    /// step). Returns `(mandate_id, brief_id)`.
+    fn idle_single_brief_mandate(
+        agents: &AgentStore,
+        spine: &SpineStore,
+        tasks: &Arc<TaskStore>,
+        tenant: &str,
+        seed: &str,
+    ) -> (String, String) {
+        let eng = agents
+            .request_hire(
+                "W", "engineer", "W", "eng", "eng", "prime", seed, "medium", tenant,
+            )
+            .unwrap();
+        agents
+            .approve_hire_with_rig(&eng, Some("echo"), tenant)
+            .unwrap();
+        let m = spine
+            .create_mandate(tenant, "Ship the login page", "wire it to auth", None, None)
+            .unwrap();
+        spine.propose_strategy(tenant, &m, "build a team").unwrap();
+        spine.approve_strategy(tenant, &m).unwrap();
+        spine
+            .record_team_plan(&TeamPlanRecord {
+                tenant_id: tenant,
+                mandate_id: &m,
+                actor_id: "operator",
+                description: "build it",
+                proposed_roles_json: "[\"engineer\"]",
+                pending_hires_json: "[]",
+                clearance_ids_json: "[]",
+                denials_json: "[]",
+                next_steps_json: "[]",
+                status: "ready",
+            })
+            .unwrap();
+        let brief = tasks
+            .create_brief(
+                tenant,
+                "Ship the login page",
+                "operator",
+                Some(&eng),
+                Some(&m),
+                None,
+                None,
+            )
+            .unwrap();
+        // A separate, un-linked blocker Brief makes the candidate Brief `blocked`
+        // (so the tick reaches the plan-package tail instead of `ready_to_start`).
+        // It carries no mandate_id, so the candidate Mandate still has exactly one
+        // Brief.
+        let blocker = tasks
+            .create_brief(tenant, "blocker", "operator", None, None, None, None)
+            .unwrap();
+        tasks.add_snag(&brief, &blocker).unwrap();
+        (m, brief)
+    }
+
+    /// Run one autonomous tick with the plan-package switch ON (and an optional live
+    /// decider), other LLM switches off, `echo` hire Rig, no budget gate.
+    fn tick_pp(
+        agents: &AgentStore,
+        spine: &SpineStore,
+        tasks: &Arc<TaskStore>,
+        reg: &crate::rig::RigRegistry,
+        max: usize,
+        tenant: Option<&str>,
+        ai: Option<&dyn crate::nodes::coordinator::agent::prime_deliberation::PrimeAiDecider>,
+    ) -> Vec<PrimeAutonomyRecord> {
+        autonomous_prime_tick(
+            agents, spine, tasks, reg, None, 0, max, tenant, "echo", ai, false, false, false,
+            false, true,
+        )
+        .unwrap()
+    }
+
+    fn open_interactions(tasks: &TaskStore, brief: &str) -> (usize, usize) {
+        let ix = tasks.list_interactions(brief).unwrap();
+        let suggestions = ix
+            .iter()
+            .filter(|i| i.kind == "suggest_tasks" && i.status == "open")
+            .count();
+        let confirms = ix
+            .iter()
+            .filter(|i| {
+                i.kind == "confirm"
+                    && i.status == "open"
+                    && i.bound_doc_kind.as_deref() == Some("plan")
+            })
+            .count();
+        (suggestions, confirms)
+    }
+
+    // PP1) An eligible idle candidate gets EXACTLY ONE model-authored plan package,
+    //      and the confirm is left OPEN (never self-approved).
+    #[test]
+    fn plan_package_opens_one_and_leaves_confirm_open() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief) = idle_single_brief_mandate(&agents, &spine, &tasks, "default", "pp1");
+
+        let decider = ScriptedDecider {
+            reply: Ok(pp_reply()),
+        };
+        let recs = tick_pp(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            1,
+            Some("default"),
+            Some(&decider),
+        );
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m && r.action == "plan_package")
+            .expect("the idle candidate gets a plan-package action");
+        assert_eq!(rec.outcome, "advanced");
+        assert_eq!(rec.plan_package_ai_mode.as_deref(), Some("llm_used"));
+        assert_eq!(rec.child_count, Some(2));
+        assert!(rec.plan_doc_id.is_some());
+        assert!(rec.suggestion_id.is_some());
+        assert!(rec.confirm_id.is_some());
+
+        // The package exists: a plan Dossier + an OPEN suggest_tasks + an OPEN
+        // plan-bound confirm. The confirm is NOT resolved — no self-approval.
+        assert!(tasks.latest_dossier(&brief, "plan").unwrap().is_some());
+        assert_eq!(open_interactions(&tasks, &brief), (1, 1));
+        // No children materialized yet (approval is still pending).
+        assert!(tasks.list_subbriefs(&brief).unwrap().is_empty());
+    }
+
+    // PP2) A second tick does NOT open a duplicate package — it reports the existing
+    //      open package and authors nothing new.
+    #[test]
+    fn plan_package_no_duplicate_on_second_tick() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief) = idle_single_brief_mandate(&agents, &spine, &tasks, "default", "pp2");
+        let decider = ScriptedDecider {
+            reply: Ok(pp_reply()),
+        };
+
+        let _ = tick_pp(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            1,
+            Some("default"),
+            Some(&decider),
+        );
+        assert_eq!(open_interactions(&tasks, &brief), (1, 1));
+
+        let recs2 = tick_pp(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            1,
+            Some("default"),
+            Some(&decider),
+        );
+        let rec2 = recs2
+            .iter()
+            .find(|r| r.target_id == m && r.action == "plan_package")
+            .expect("a plan-package record on the re-tick");
+        assert_eq!(rec2.outcome, "skipped");
+        // Dedup-guarded: a re-tick refuses to author a second package — either
+        // because the plan Dossier now exists or because the open package awaits
+        // approval (the eligibility check reports the first guard it hits).
+        assert!(rec2.reason.contains("already"), "got: {}", rec2.reason);
+        // Still exactly one open package — no duplicate.
+        assert_eq!(open_interactions(&tasks, &brief), (1, 1));
+    }
+
+    // PP3) Malformed model output falls back to a deterministic SAFE package (no
+    //      partial broken package); an absent decider is honestly `unavailable`.
+    #[test]
+    fn plan_package_malformed_or_unavailable_falls_back_safely() {
+        // Malformed JSON → deterministic fallback content, one valid package.
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief) = idle_single_brief_mandate(&agents, &spine, &tasks, "default", "pp3a");
+        let bad = ScriptedDecider {
+            reply: Ok("not json at all".to_string()),
+        };
+        let recs = tick_pp(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            1,
+            Some("default"),
+            Some(&bad),
+        );
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m && r.action == "plan_package")
+            .unwrap();
+        assert_eq!(rec.outcome, "advanced");
+        assert_eq!(rec.plan_package_ai_mode.as_deref(), Some("fallback"));
+        assert_eq!(rec.child_count, Some(3)); // the deterministic 3-step chain
+        assert_eq!(open_interactions(&tasks, &brief), (1, 1));
+
+        // No decider wired → unavailable, still a deterministic package.
+        let (agents2, spine2, tasks2) = stores();
+        let tasks2 = Arc::new(tasks2);
+        let (m2, brief2) = idle_single_brief_mandate(&agents2, &spine2, &tasks2, "default", "pp3b");
+        let recs2 = tick_pp(&agents2, &spine2, &tasks2, &reg, 1, Some("default"), None);
+        let rec2 = recs2
+            .iter()
+            .find(|r| r.target_id == m2 && r.action == "plan_package")
+            .unwrap();
+        assert_eq!(rec2.outcome, "advanced");
+        assert_eq!(rec2.plan_package_ai_mode.as_deref(), Some("unavailable"));
+        assert_eq!(open_interactions(&tasks2, &brief2), (1, 1));
+    }
+
+    // PP4) An existing `plan` Dossier (e.g. human-authored) is NEVER clobbered — the
+    //      tick reports blocked and authors no package.
+    #[test]
+    fn plan_package_does_not_clobber_existing_plan() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief) = idle_single_brief_mandate(&agents, &spine, &tasks, "default", "pp4");
+        // A human writes a plan Dossier first.
+        tasks
+            .add_dossier(&brief, "plan", "Human plan", "do it by hand")
+            .unwrap();
+
+        let decider = ScriptedDecider {
+            reply: Ok(pp_reply()),
+        };
+        let recs = tick_pp(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            1,
+            Some("default"),
+            Some(&decider),
+        );
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m && r.action == "plan_package")
+            .unwrap();
+        assert_eq!(rec.outcome, "skipped");
+        assert!(rec.reason.contains("already exists"), "got: {}", rec.reason);
+        // No package opened, and the human plan is intact (unchanged title).
+        assert_eq!(open_interactions(&tasks, &brief), (0, 0));
+        assert_eq!(
+            tasks.latest_dossier(&brief, "plan").unwrap().unwrap().title,
+            "Human plan"
+        );
+    }
+
+    // PP5) Tenant isolation — a tick scoped to another Guild never authors a package
+    //      on this Guild's Brief.
+    #[test]
+    fn plan_package_tenant_isolation() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (_m, brief) = idle_single_brief_mandate(&agents, &spine, &tasks, "guild-a", "pp5");
+        let decider = ScriptedDecider {
+            reply: Ok(pp_reply()),
+        };
+        // Drive a DIFFERENT Guild — guild-a's Brief must be untouched.
+        let _ = tick_pp(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            5,
+            Some("guild-b"),
+            Some(&decider),
+        );
+        assert_eq!(open_interactions(&tasks, &brief), (0, 0));
+        assert!(tasks.latest_dossier(&brief, "plan").unwrap().is_none());
+    }
+
+    // PP6) An approved plan package materializes its children through the EXISTING
+    //      exactly-once decomposition ledger (a second accept returns the SAME ids).
+    #[test]
+    fn plan_package_approval_materializes_exactly_once() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief) = idle_single_brief_mandate(&agents, &spine, &tasks, "default", "pp6");
+        let decider = ScriptedDecider {
+            reply: Ok(pp_reply()),
+        };
+        let recs = tick_pp(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            1,
+            Some("default"),
+            Some(&decider),
+        );
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m && r.action == "plan_package")
+            .unwrap();
+        let confirm = rec.confirm_id.clone().unwrap();
+        let n = rec.child_count.unwrap();
+
+        // Approve through the existing plan-confirm path (children carry no assignee
+        // hints, so resolved_assignees is all-None).
+        let assignees: Vec<Option<String>> = vec![None; n];
+        let first = tasks
+            .respond_plan_confirm(
+                "default", "operator", &brief, &confirm, "operator", true, &assignees,
+            )
+            .unwrap();
+        assert_eq!(first.outcome, "approved");
+        assert_eq!(first.created.len(), n);
+        assert_eq!(tasks.list_subbriefs(&brief).unwrap().len(), n);
+
+        // A duplicate accept is idempotent — the SAME ids, never doubled.
+        let again = tasks
+            .respond_plan_confirm(
+                "default", "operator", &brief, &confirm, "operator", true, &assignees,
+            )
+            .unwrap();
+        assert_eq!(again.outcome, "already_approved");
+        assert_eq!(again.created, first.created);
+        assert_eq!(tasks.list_subbriefs(&brief).unwrap().len(), n);
+    }
+
+    // PP7) With the switch OFF (the default) the tick authors NO plan package — the
+    //      idle candidate is recorded exactly as before.
+    #[test]
+    fn plan_package_off_by_default_authors_nothing() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief) = idle_single_brief_mandate(&agents, &spine, &tasks, "default", "pp7");
+
+        // The standard `tick` helper leaves every LLM switch (incl. plan-package) off.
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        assert!(
+            recs.iter()
+                .all(|r| !(r.target_id == m && r.action == "plan_package")),
+            "no plan-package action when the switch is off"
+        );
+        assert_eq!(open_interactions(&tasks, &brief), (0, 0));
+        assert!(tasks.latest_dossier(&brief, "plan").unwrap().is_none());
     }
 }

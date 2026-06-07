@@ -900,6 +900,64 @@ NOT the permission system**, exactly as in §C/§D/§E:
   document state, not an off-to-the-side raw insert — without granting any freeform
   agent document editing (an operator's Dossier is never agent-authored).
 
+### F-bis. Prime Plan-Package Authoring v1 — a model may PROPOSE a Brief decomposition (opt-in)
+
+**The gap.** The planner pattern's front door — the **plan package** (an immutable
+`plan` Dossier revision + a linked `suggest_tasks` proposal + an approval-bound
+`confirm`, opened atomically by `TaskStore::open_plan_package`, execution-and-issue
+§1.7/§1.8/§3.1) — existed only as a **manual** surface (the dashboard composer / the
+chat companion). The autonomous Prime loop had no way to *propose* a decomposition: it
+could plan, staff, orchestrate, prioritize, start, and dispose, but a Brief that simply
+needed breaking down sat idle. There was no autonomous LLM planner and no model-chosen
+`create_document` + `create_interaction`.
+
+**The contract.** Behind an explicit, default-OFF switch
+(`RELIX_PRIME_LLM_PLAN_PACKAGE`), when the autonomous/manual-tick loop reaches a
+candidate the existing governed flow leaves **idle**, Prime may OPEN a plan package on a
+single un-decomposed Brief and **leave the confirm OPEN for a human** — but **the model
+is NOT the permission system**, exactly as in §C/§D/§E/§F:
+
+- **Propose only — never approve, never assign, never create children.** Prime opens the
+  package through the EXISTING `open_plan_package` primitive (the interactions stamped
+  with the synthetic `__relix_autonomous_prime__` authority) and stops. It does **not**
+  accept its own `confirm` (no standing-authority category gates plan-package approval in
+  this v1 — distinct from §G's grant-gated review/apply), so children are materialized
+  only when a human accepts through the EXISTING `brief.plan_confirm_respond` path and the
+  EXISTING exactly-once decomposition ledger (§1.7). Children always open **unassigned**
+  (no model-chosen assignee).
+- **The model authors content only.** It may write the plan title/body, the approval
+  summary, and a bounded list of proposed child Briefs (title / priority / a backward
+  `after` dependency) — nothing else. It can never choose a method, capability, or tool,
+  assign an agent, mutate an existing Dossier, or approve anything.
+- **Strict server-side validation.** The reply is validated by
+  `prime_plan_package::validate_plan_package`: output is size-bounded, a code fence is
+  stripped, every string is secret-redacted + length-bounded, children are capped at
+  `MAX_AUTONOMOUS_CHILDREN` (8, tighter than the store's 20), invalid priorities are
+  dropped, and each `after` is remapped to a strictly-earlier kept sibling (forward / self
+  / unknown / dropped-target refs dropped) so the store's own `normalize_proposal` always
+  accepts the result. Empty body / no usable child → reject → deterministic fallback.
+- **Dedup-guarded + non-clobbering + tenant-scoped.** Prime acts ONLY when the Mandate
+  has a SINGLE non-terminal, childless Brief with **no** `plan` Dossier, **no** `plan`
+  lock, and **no** open plan package — so a human/Prime/stale plan or an existing open
+  package is never overwritten or duplicated (it reports `already exists` / `already
+  awaits approval` and authors nothing). All reads/writes are scoped to the candidate's
+  own Guild; another Guild's Brief is invisible.
+- **Deterministic fallback.** On disabled / no-decider / unavailable / malformed output
+  the content degrades to a safe deterministic plan→build→verify decomposition (carrying
+  the DRAFT/not-approved language), with an honest provenance mode.
+- **Honest provenance.** The tick record carries `plan_package_ai_mode`
+  (`deterministic_only` / `llm_used` / `fallback` / `unavailable`) +
+  `plan_package_ai_reason` plus the opened `plan_doc_id` / `suggestion_id` /
+  `confirm_id` / `child_count` (ids/counts only — the plan body is never put on a record
+  or Chronicle event), surfaced on `prime.autonomy_tick_now`.
+- **No keys in the coordinator + independent of §C/§D/§E/§F.** It reuses the SAME `ai.chat`
+  mesh path + decider as the other authoring layers — no provider key enters the
+  coordinator, web bridge, or dashboard; an unavailable peer falls back deterministically.
+  The switches are independent. **Honest scope:** this is a deliberate gap-filler placed at
+  the tick tail, so it fires only for a candidate the existing flow leaves idle (e.g. a
+  Mandate whose lone Brief is `blocked`); it does not pre-empt orchestrate/start, decompose
+  multi-Brief / orchestrated Mandates, or scan every leaf Brief.
+
 ### G. Prime Shift Disposition v1 — autonomous review-accept + apply (opt-in, grant-gated)
 
 **The gap.** The autonomous Prime loop could plan, staff, orchestrate, prioritize,
