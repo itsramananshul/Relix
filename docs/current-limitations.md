@@ -299,10 +299,22 @@ the approved work is already ready. What it does **not** do:
     already-claimed/running Brief is never double-started), **tenant-safe** (a tick
     spans all Guilds with each candidate processed under its **own** Guild, or one
     Guild when scoped), and **bounded** (≤ `max` actions/tick). It chronicles a
-    distinct `prime.autonomous_advance` / `prime.autonomous_start` event on the
-    Mandate's parent Brief for an actual action only (never per skipped gate). A
-    **bare Mandate** is planned/orchestrated but its per-Brief runs are left to the
-    heartbeat / `brief.run` (no new bare-Mandate start policy invented).
+    distinct `prime.autonomous_advance` / `prime.autonomous_start` /
+    `prime.autonomous_mandate_start` event on the Mandate's parent Brief for an
+    actual action only (never per skipped gate). A **bare Mandate** (one reached
+    `ready_to_start` with **no** owning Prime proposal) now has its ready
+    same-tenant Briefs **started by the loop itself** through the **same shared
+    guarded run pipeline** the heartbeat dispatcher and `prime.start` use
+    (`heartbeat::preflight_and_spawn_with_trigger` → `preflight_run_with_prefs_trigger`
+    → `prepare_claimed_run` → `execute_ready`): claims, the duplicate-run guard,
+    the live adapter probe, scoped workspace prep, the durable `brief_runs` ledger,
+    bridge-token minting, board advancement, and Chronicle. No second run system
+    is invented — the run is just stamped as an **autonomous/heartbeat** trigger
+    (not dashboard `manual`), the ready set is read tenant-scoped via
+    `TaskStore::list_ready_briefs_for_tenant` and filtered to the Mandate (no
+    cross-Guild Brief is selected), and the **same autonomous budget hard-stop**
+    (`heartbeat::dispatch_budget_admits` against each ready Brief) blocks the whole
+    start with zero runs if any ready Brief is over budget.
     **The loop is now controllable from the product at runtime — no restart, no
     env edit (Prime Runtime Autonomy Switch v1).** A **dormant watcher** is
     spawned whenever the coordinator's `SpineStore` exists, and each tick decides

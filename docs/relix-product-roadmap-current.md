@@ -556,9 +556,21 @@ ledger entry or design section.
    Guild, the loop approves a *proposed* strategy through the existing `mandate.strategy.approve` handler
    (a separate per-candidate action from drafting; tenant-scoped, bounded, consumes one grant call; a
    **rejected/missing** strategy is never approved or re-proposed). With **no grant** strategy approval
-   stays human exactly as before. *Still deferred:* a true end-to-end no-grant autonomous driver
-   (propose → **approve** → staff → orchestrate → run on its own with nothing granted) — intentionally
-   not built; **model-reasoned** strategy remains deferred (the draft + approval are deterministic).
+   stays human exactly as before. **Bare-Mandate autonomous start — SHIPPED:** a **bare Mandate** (one
+   reached `ready_to_start` with **no** owning Prime proposal) now has its ready same-tenant Briefs
+   **started by the loop itself** (action `start_mandate`) — not left to the heartbeat / manual `brief.run`
+   — through the **same shared guarded run pipeline** the heartbeat dispatcher and `prime.start` use
+   (`heartbeat::preflight_and_spawn_with_trigger` → `preflight_run_with_prefs_trigger` → `prepare_claimed_run`
+   → `execute_ready`): claims, duplicate-run guard, live adapter probe, scoped workspace prep, durable
+   `brief_runs` ledger, bridge-token minting, board advancement, Chronicle (`prime.autonomous_mandate_start`).
+   No second run system is invented — the run is stamped as an **autonomous/heartbeat** trigger (not dashboard
+   `manual`); the ready set is tenant-scoped (`list_ready_briefs_for_tenant`, filtered to the Mandate, no
+   cross-Guild leak); the **same autonomous budget hard-stop** (`dispatch_budget_admits` per ready Brief)
+   blocks the whole start with **zero** runs if any is over budget; an already-claimed/running Brief is never
+   double-started; and it counts exactly one tick action when ≥1 run starts. Starting is **not** an approval
+   gate, so this needs **no** standing grant. *Still deferred:* a true end-to-end no-grant autonomous driver
+   that also **approves** on its own (propose → **approve** → staff → orchestrate with nothing granted) —
+   intentionally not built; **model-reasoned** strategy remains deferred (the draft + approval are deterministic).
 9. **[BE/FE] Smarter companion** — **BACKEND SHIPPED (now AI-assisted action selection, opt-in +
    validated + fallback; still one-turn / one-action, NOT autonomous).**
    The `POST /v1/spine/companion` parser is a **company-aware action spine**

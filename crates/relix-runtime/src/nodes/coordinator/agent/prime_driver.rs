@@ -786,8 +786,9 @@ fn classify_mandate(
                 "Start the ready Briefs",
                 format!(
                     "{} Brief(s) are assigned, unblocked, and ready to run as Shifts. Use the \
-                     explicit Start control, or enable autonomous Prime to start approved ready \
-                     proposal work through the same prime.start path.",
+                     explicit Start control, or enable autonomous Prime to start ready work — \
+                     approved proposal work through prime.start, and bare-Mandate work through \
+                     the same shared guarded run pipeline (budget/adapters/claims enforced).",
                     counts.ready
                 ),
                 start_route,
@@ -1307,8 +1308,11 @@ pub fn handle_prime_autonomy_tick_now(
 // whatever it wants" — every action goes through the SAME governed handler the
 // operator click uses, it advances ONLY the safe steps `prime.advance` already
 // allows (`create_team_plan` / `orchestrate_assign_ready`) plus starting ready
-// work for an already-approved proposal through the existing `prime.start`
-// path. By DEFAULT it NEVER auto-approves a strategy / proposal / hire / spawn /
+// work — for an already-approved proposal through the existing `prime.start`
+// path, and for a BARE Mandate (no owning proposal) through the same shared
+// guarded run pipeline (claims, adapter probe, durable ledger, budget hard-stop),
+// stamped as an autonomous/heartbeat-trigger run. By DEFAULT it NEVER
+// auto-approves a strategy / proposal / hire / spawn /
 // budget / Clearance gate (those stay human); the ONLY exception is the
 // **standing-authority layer** below — a gate is approved only while the Board
 // holds a live `standing_approvals` grant for the matching category in THAT
@@ -1337,7 +1341,8 @@ pub struct PrimeAutonomyRecord {
     pub phase: String,
     /// The action attempted: `create_team_plan` / `orchestrate_assign_ready` /
     /// `propose_strategy` / `approve_strategy` / `approve` / `hire_approve` /
-    /// `clearance_approve` / `start` / `none`.
+    /// `clearance_approve` / `start` (approved proposal) / `start_mandate` (bare
+    /// Mandate ready work) / `none`.
     pub action: &'static str,
     /// `advanced` / `started` / `skipped` / `blocked`.
     pub outcome: &'static str,
@@ -1441,11 +1446,152 @@ fn start_budget_admitted(
     Ok(())
 }
 
+/// Autonomously start the currently-ready Briefs of a BARE Mandate — one that
+/// reached `ready_to_start` with NO owning Prime proposal — through the SAME
+/// guarded run pipeline the heartbeat dispatcher and `prime.start` use
+/// ([`heartbeat::preflight_and_spawn_with_trigger`] → `preflight_run_with_prefs_trigger`
+/// → `prepare_claimed_run` → `execute_ready`): the single-owner Claim, the
+/// duplicate-run guard, the live adapter probe, scoped workspace prep, the durable
+/// `brief_runs` ledger row, bridge-token minting, board advancement, and Chronicle
+/// events. NO second run system is invented — the only differences from a manual
+/// `brief.run` are (1) the run trigger is [`RunTrigger::Heartbeat`] (the autonomous
+/// boundary, not dashboard `manual`) and (2) the per-Brief autonomous budget
+/// hard-stop is applied FIRST.
+///
+/// Tenant-isolated: the ready set is read with
+/// [`TaskStore::list_ready_briefs_for_tenant`] for the candidate's OWN Guild and
+/// filtered to `mandate_id`, so no cross-Guild Brief is ever selected or started.
+/// Budget hard-stop: if ANY ready same-tenant Brief of the Mandate is over budget
+/// ([`heartbeat::dispatch_budget_admits`]), the WHOLE autonomous start is blocked
+/// and ZERO runs open (conservative, mirroring the proposal start gate). Returns
+/// `(outcome, reason, started_count)`.
+#[allow(clippy::too_many_arguments)]
+fn start_bare_mandate_ready(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &Arc<TaskStore>,
+    registry: &crate::rig::RigRegistry,
+    metrics: Option<&crate::metrics::MetricsQuery>,
+    now_ms: i64,
+    tenant: &str,
+    mandate_id: &str,
+) -> (&'static str, String, usize) {
+    use crate::nodes::coordinator::heartbeat::{
+        BudgetAdmission, DEFAULT_DISPATCH_LEASE_SECS, RunModelPrefs, RunTrigger,
+        dispatch_budget_admits, preflight_and_spawn_with_trigger,
+    };
+
+    // Tenant-scoped ready set, narrowed to THIS Mandate. `list_ready_briefs_for_tenant`
+    // already excludes unassigned / blocked / live-claimed Briefs, so a Brief another
+    // run currently owns is not even a candidate (never double-started).
+    let ready: Vec<_> = task_store
+        .list_ready_briefs_for_tenant(tenant, 500)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.mandate_id.as_deref() == Some(mandate_id))
+        .collect();
+    if ready.is_empty() {
+        return (
+            "skipped",
+            "no ready same-tenant Brief to start for this Mandate".into(),
+            0,
+        );
+    }
+
+    // Autonomous budget hard-stop: if ANY ready Brief is over budget, refuse the
+    // whole start and open ZERO runs (the same conservative gate the proposal start
+    // applies; the heartbeat still gates per Brief). Inert when metrics/spine carry
+    // no budget signal, mirroring the heartbeat dispatcher.
+    for card in &ready {
+        if let BudgetAdmission::Refuse { reason, .. } = dispatch_budget_admits(
+            card,
+            task_store,
+            agent_store,
+            Some(spine_store),
+            metrics,
+            now_ms,
+        ) {
+            return ("blocked", format!("budget hard-stop: {reason}"), 0);
+        }
+    }
+
+    // Start each ready Brief through the shared guarded pipeline, stamped as an
+    // autonomous (heartbeat-trigger) run. A pre-run refusal (adapter unavailable /
+    // Claim lost) is recorded honestly as a tenant-scoped refusal and not counted.
+    let bridge_tokens = crate::rig::bridge::BridgeTokenStore::global();
+    let mut started = 0usize;
+    for card in &ready {
+        let brief_id = &card.task_id;
+        let assignee = card.assignee_agent_id.clone().unwrap_or_default();
+        let agent = agent_store
+            .get_agent_for_tenant(&assignee, tenant)
+            .ok()
+            .flatten();
+        let prefs = agent
+            .as_ref()
+            .map(|a| RunModelPrefs::new(a.model_preference.clone(), a.reasoning_effort.clone()))
+            .unwrap_or_default();
+        let preferred = agent.as_ref().and_then(|a| a.rig.clone());
+        let charter = agent
+            .map(|a| a.instruction_bundle)
+            .filter(|c| !c.trim().is_empty());
+        let prompt = task_store.compose_brief_prompt_with_charter(brief_id, 10, charter.as_deref());
+        match preflight_and_spawn_with_trigger(
+            task_store,
+            registry,
+            Some(&bridge_tokens),
+            DEFAULT_DISPATCH_LEASE_SECS,
+            brief_id,
+            preferred.as_deref(),
+            prompt,
+            prefs,
+            RunTrigger::Heartbeat,
+        ) {
+            // A Shift started (run_id present).
+            Ok(report) if report.run_id.is_some() => {
+                let _ = task_store.append_event(
+                    brief_id,
+                    "prime.work_started",
+                    &format!(
+                        "autonomous Prime started work on `{}` (run {})",
+                        report.rig,
+                        report.run_id.as_deref().unwrap_or("")
+                    ),
+                );
+                started += 1;
+            }
+            // A pre-run refusal — durable tenant-scoped refusal, never a faked run.
+            Ok(report) => {
+                let _ = task_store.record_manual_refusal_for_tenant(
+                    brief_id,
+                    tenant,
+                    &assignee,
+                    &report.rig,
+                    &report.status,
+                    &report.summary,
+                );
+            }
+            Err(_) => {}
+        }
+    }
+
+    if started > 0 {
+        (
+            "started",
+            format!("started {started} ready Shift(s)"),
+            started,
+        )
+    } else {
+        ("skipped", "no ready Shift actually started".into(), 0)
+    }
+}
+
 /// Process ONE autonomous candidate: classify its next governed step and, when
-/// it is a safe auto-advanceable step (or a ready-to-start approved proposal),
-/// execute exactly that one step through the existing governed handler. Counts a
-/// real mutation against `actions` (so the tick stays bounded by `max`); a human
-/// gate / already-running / done step records and acts on nothing.
+/// it is a safe auto-advanceable step (a ready-to-start approved proposal, or a
+/// ready-to-start BARE Mandate), execute exactly that one step through the
+/// existing governed handler / shared run pipeline. Counts a real mutation
+/// against `actions` (so the tick stays bounded by `max`); a human gate /
+/// already-running / done step records and acts on nothing.
 #[allow(clippy::too_many_arguments)]
 fn process_candidate(
     agent_store: &AgentStore,
@@ -1575,19 +1721,57 @@ fn process_candidate(
         };
     }
 
-    // (B) ready_to_start — start ready work for an already-APPROVED Prime
-    // proposal through the existing governed `prime.start` path, gated by the
-    // autonomous budget hard-stop. A bare Mandate's runs are deliberately left
-    // to the heartbeat / `brief.run` (no new start policy invented).
+    // (B) ready_to_start — start ready work through the SAME guarded run
+    // pipeline, gated by the autonomous budget hard-stop. An already-APPROVED
+    // Prime proposal starts through the existing governed `prime.start` path
+    // (`pid` Some); a BARE Mandate (no owning proposal) starts its ready
+    // same-tenant Briefs itself through [`start_bare_mandate_ready`] — claims,
+    // duplicate-run guard, adapter probe, durable ledger, board advancement and
+    // Chronicle all go through the shared heartbeat machinery (no new run system,
+    // stamped as an autonomous/heartbeat-trigger run, not dashboard `manual`).
     if step.phase == "ready_to_start" {
         let Some(pid) = step.proposal_id.clone() else {
-            return mk(
-                phase,
-                "none",
-                "skipped",
-                "bare Mandate ready — runs left to heartbeat/brief.run".into(),
-                mandate_id,
+            let Some(mid) = mandate_id.clone() else {
+                return mk(
+                    phase,
+                    "none",
+                    "skipped",
+                    "ready bare Mandate has no mandate id".into(),
+                    None,
+                );
+            };
+            if *actions >= max {
+                return mk(
+                    phase,
+                    "start_mandate",
+                    "skipped",
+                    "tick action budget reached".into(),
+                    mandate_id,
+                );
+            }
+            let (outcome, reason, started) = start_bare_mandate_ready(
+                agent_store,
+                spine_store,
+                task_store,
+                registry,
+                metrics,
+                now_ms,
+                tenant,
+                &mid,
             );
+            // Count exactly ONE tick action only when at least one run actually
+            // started; a budget block / no-ready-run records honestly and acts on
+            // nothing. Chronicle the Mandate-level start on its root Brief.
+            if started > 0 {
+                *actions += 1;
+                chronicle_autonomous(
+                    task_store,
+                    &mid,
+                    "prime.autonomous_mandate_start",
+                    &format!("autonomous Prime started {started} ready Shift(s) for mandate {mid}"),
+                );
+            }
+            return mk(phase, "start_mandate", outcome, reason, mandate_id);
         };
         if *actions >= max {
             return mk(
@@ -2869,6 +3053,260 @@ mod tests {
             recs2.iter().all(|r| r.outcome != "started"),
             "a running proposal must not be double-started"
         );
+    }
+
+    // ── BARE-MANDATE AUTONOMOUS START (no owning Prime proposal) ───────────
+    // A normal Mandate that reaches `ready_to_start` with NO owning proposal is
+    // started by the autonomous loop ITSELF through the shared guarded run
+    // pipeline (claims, adapter probe, durable ledger, budget hard-stop),
+    // tenant-scoped and stamped as a heartbeat-trigger run.
+
+    fn real_now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    /// A cost-bearing metric row attributing `cost_micros` of spend to `agent` in
+    /// `tenant` at `ts_ms` — the additive Guild-budget gate sums these over the
+    /// Guild's active roster.
+    fn spend_row(
+        agent: &str,
+        tenant: &str,
+        ts_ms: i64,
+        cost_micros: u64,
+    ) -> crate::metrics::InvocationMetric {
+        crate::metrics::InvocationMetric {
+            agent_name: agent.to_string(),
+            tenant_id: tenant.to_string(),
+            peer_alias: "coord".to_string(),
+            method: "ai.chat".to_string(),
+            timestamp_ms: ts_ms,
+            latency_ms: 10,
+            success: true,
+            error_kind: None,
+            token_count: Some(100),
+            cost_micros: Some(cost_micros),
+            input_bytes: 0,
+            output_bytes: 0,
+            model: Some("mock".to_string()),
+            confidence_score: None,
+            routing_tier: None,
+            request_id: None,
+        }
+    }
+
+    /// Build a BARE Mandate (no owning Prime proposal) in `tenant` that is
+    /// strategy-approved, team-planned, and at `ready_to_start`: an active,
+    /// runnable engineer on the safe-local `echo` Rig, a Team Plan whose single
+    /// required role re-resolves to that Operative (planned AND ready — no missing
+    /// roles), and one assigned, unblocked, ready leaf Brief under the Mandate.
+    /// Returns the Mandate id. (Built directly rather than through the orchestrate
+    /// container tree, which leaves structural parent/track Briefs unassigned and
+    /// so never classifies as `ready_to_start`.)
+    fn ready_bare_mandate(
+        agents: &AgentStore,
+        spine: &SpineStore,
+        tasks: &Arc<TaskStore>,
+        tenant: &str,
+    ) -> String {
+        let eng = agents
+            .ensure_starter_operative("engineer", "Eng", "Operative", "echo", tenant)
+            .unwrap()
+            .0;
+        let m = spine
+            .create_mandate(tenant, "Ship the login page", "wire it to auth", None, None)
+            .unwrap();
+        spine.propose_strategy(tenant, &m, "build a team").unwrap();
+        spine.approve_strategy(tenant, &m).unwrap();
+        spine
+            .record_team_plan(&TeamPlanRecord {
+                tenant_id: tenant,
+                mandate_id: &m,
+                actor_id: "operator",
+                description: "build it",
+                proposed_roles_json: "[\"engineer\"]",
+                pending_hires_json: "[]",
+                clearance_ids_json: "[]",
+                denials_json: "[]",
+                next_steps_json: "[]",
+                status: "ready",
+            })
+            .unwrap();
+        tasks
+            .create_brief(
+                tenant,
+                "Wire login to auth",
+                "operator",
+                Some(&eng),
+                Some(&m),
+                None,
+                None,
+            )
+            .unwrap();
+        m
+    }
+
+    // H) A bare Mandate at ready_to_start is started by an autonomous tick — no
+    //    owning proposal, no RELIX_HEARTBEAT_ENABLED, no manual brief.run — and the
+    //    run is stamped as an autonomous heartbeat trigger, not dashboard manual.
+    #[tokio::test]
+    async fn autonomous_tick_starts_ready_bare_mandate() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = ready_bare_mandate(&agents, &spine, &tasks, "default");
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 5, Some("default"));
+        let rec = recs
+            .iter()
+            .find(|r| r.target_kind == "mandate" && r.target_id == m && r.outcome == "started")
+            .expect("a bare Mandate's ready work is started by the loop");
+        assert_eq!(rec.phase, "ready_to_start");
+        assert_eq!(rec.action, "start_mandate");
+
+        // At least one durable run row, stamped as an autonomous heartbeat trigger.
+        let runs = tasks.list_runs_for_tenant("default", 100).unwrap();
+        assert!(!runs.is_empty(), "at least one durable run row was opened");
+        assert!(
+            runs.iter()
+                .any(|r| r.trigger.as_deref() == Some("heartbeat")),
+            "the autonomous start stamps a heartbeat-trigger run, not manual"
+        );
+        assert!(
+            runs.iter().all(|r| r.trigger.as_deref() != Some("manual")),
+            "no manual-trigger run is created by the autonomous bare-Mandate start"
+        );
+    }
+
+    // I) Budget refusal blocks the WHOLE bare-Mandate autonomous start and opens
+    //    ZERO run rows (the same conservative gate the proposal start applies).
+    #[tokio::test]
+    async fn autonomous_bare_mandate_start_blocked_over_budget_opens_no_runs() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = ready_bare_mandate(&agents, &spine, &tasks, "default");
+
+        // Attribute the overspend to a ready Brief's assignee so the additive
+        // Guild-budget gate (which sums the Guild's active roster) trips.
+        let assignee = tasks
+            .list_ready_briefs_for_tenant("default", 500)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.mandate_id.as_deref() == Some(m.as_str()))
+            .and_then(|c| c.assignee_agent_id)
+            .expect("a ready Brief with an assignee");
+
+        // Guild budget $200; spend $250 → over budget.
+        spine.set_guild_allowance("default", Some(20_000)).unwrap();
+        let now = real_now_ms();
+        let in_window = crate::nodes::coordinator::heartbeat::allowance_window(now).start_ms;
+        let mstore = crate::metrics::MetricsStore::in_memory().unwrap();
+        mstore
+            .insert_batch(&[spend_row(&assignee, "default", in_window, 250_000_000)])
+            .unwrap();
+        let mq = crate::metrics::MetricsQuery::new(mstore);
+
+        let recs = autonomous_prime_tick(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            Some(&mq),
+            now,
+            5,
+            Some("default"),
+            "echo",
+        )
+        .unwrap();
+        let rec = recs
+            .iter()
+            .find(|r| r.target_id == m)
+            .expect("mandate considered");
+        assert_eq!(rec.phase, "ready_to_start");
+        assert_eq!(rec.action, "start_mandate");
+        assert_eq!(rec.outcome, "blocked");
+        assert!(
+            rec.reason.contains("budget"),
+            "reason names the budget stop"
+        );
+
+        // The hard-stop opened ZERO runs.
+        assert!(
+            tasks
+                .list_runs_for_tenant("default", 100)
+                .unwrap()
+                .is_empty(),
+            "an over-budget bare-Mandate start opens no run rows"
+        );
+    }
+
+    // J) Tenant isolation: a tick scoped to Guild "default" never selects or starts
+    //    a ready bare Mandate that belongs to Guild "other".
+    #[tokio::test]
+    async fn autonomous_tick_does_not_start_cross_tenant_ready_bare_mandate() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m_other = ready_bare_mandate(&agents, &spine, &tasks, "other");
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 5, Some("default"));
+        assert!(
+            recs.iter().all(|r| r.target_id != m_other),
+            "a `default` tick must not consider an `other` Mandate"
+        );
+        assert!(
+            tasks.list_runs_for_tenant("other", 100).unwrap().is_empty(),
+            "no cross-tenant Brief is started by a tenant-scoped tick"
+        );
+    }
+
+    // K) A live claim / already-running Brief is not double-started: a second
+    //    immediate tick leaves each already-started Brief with exactly one run row
+    //    and records an honest non-started outcome.
+    #[tokio::test]
+    async fn autonomous_bare_mandate_does_not_double_start_running_briefs() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = ready_bare_mandate(&agents, &spine, &tasks, "default");
+
+        let recs1 = tick(&agents, &spine, &tasks, &reg, 5, Some("default"));
+        assert!(
+            recs1
+                .iter()
+                .any(|r| r.target_id == m && r.outcome == "started"),
+            "first tick starts the ready bare-Mandate work"
+        );
+        let count_by_brief = |t: &Arc<TaskStore>| {
+            let mut map = std::collections::HashMap::new();
+            for r in t.list_runs_for_tenant("default", 500).unwrap() {
+                *map.entry(r.brief_id).or_insert(0usize) += 1;
+            }
+            map
+        };
+        let before = count_by_brief(&tasks);
+        assert!(!before.is_empty(), "the first tick opened run rows");
+
+        // A second immediate tick must not double-start an already-claimed/running
+        // Brief — each previously-started Brief keeps exactly one run row.
+        let recs2 = tick(&agents, &spine, &tasks, &reg, 5, Some("default"));
+        let after = count_by_brief(&tasks);
+        for (bid, n) in &before {
+            assert_eq!(
+                after.get(bid),
+                Some(n),
+                "Brief {bid} must not be double-started"
+            );
+        }
+        if let Some(rec2) = recs2.iter().find(|r| r.target_id == m) {
+            assert_ne!(
+                rec2.outcome, "started",
+                "a running bare Mandate is not re-started"
+            );
+        }
     }
 
     // ── MANUAL AUTONOMY TICK (operator `prime.autonomy_tick_now`) ──────────

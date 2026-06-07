@@ -2155,7 +2155,8 @@ pub fn preflight_and_spawn(
     prompt: String,
     prefs: RunModelPrefs,
 ) -> Result<RunReport, CoordinatorError> {
-    match preflight_run_with_prefs(
+    // Manual provenance — delegate to the trigger-parameterized variant.
+    preflight_and_spawn_with_trigger(
         store,
         registry,
         bridge_tokens,
@@ -2164,6 +2165,39 @@ pub fn preflight_and_spawn(
         preferred_rig,
         prompt,
         prefs,
+        RunTrigger::Manual,
+    )
+}
+
+/// Trigger-parameterized variant of [`preflight_and_spawn`]: same async commit +
+/// background-execute shape, but stamps the committed run with `trigger`. The
+/// autonomous Prime loop's bare-Mandate start passes [`RunTrigger::Heartbeat`] so
+/// its Shifts read as autonomous, while still going through the ONE shared
+/// [`preflight_run_with_prefs_trigger`] → [`prepare_claimed_run`] →
+/// [`execute_ready`] chokepoint (claims, duplicate-run guard, adapter probe,
+/// workspace prep, durable ledger, bridge token, board advancement, Chronicle).
+#[allow(clippy::too_many_arguments)]
+pub fn preflight_and_spawn_with_trigger(
+    store: &Arc<TaskStore>,
+    registry: &crate::rig::RigRegistry,
+    bridge_tokens: Option<&BridgeTokenStore>,
+    lease_secs: i64,
+    brief_id: &str,
+    preferred_rig: Option<&str>,
+    prompt: String,
+    prefs: RunModelPrefs,
+    trigger: RunTrigger,
+) -> Result<RunReport, CoordinatorError> {
+    match preflight_run_with_prefs_trigger(
+        store,
+        registry,
+        bridge_tokens,
+        lease_secs,
+        brief_id,
+        preferred_rig,
+        prompt,
+        prefs,
+        trigger,
     )? {
         Preflight::Refused(report) => Ok(report),
         Preflight::Ready(ready) => {
@@ -2672,6 +2706,42 @@ pub fn preflight_run_with_prefs(
     prompt: String,
     prefs: RunModelPrefs,
 ) -> Result<Preflight, CoordinatorError> {
+    // Manual provenance (dashboard `brief.run` / sovereign `prime.start`) —
+    // delegates to the trigger-parameterized core, stamping `RunTrigger::Manual`.
+    preflight_run_with_prefs_trigger(
+        store,
+        registry,
+        bridge_tokens,
+        lease_secs,
+        brief_id,
+        preferred_rig,
+        prompt,
+        prefs,
+        RunTrigger::Manual,
+    )
+}
+
+/// Trigger-parameterized core of [`preflight_run_with_prefs`]. The pre-flight is
+/// IDENTICAL (Rig resolution + availability probe, the per-Operative start lock,
+/// the duplicate-start / live-run guard, the single-owner two-pointer Claim,
+/// terminal-Claim reclaim, scoped workspace prep, the durable `brief_runs` ledger
+/// row, the scoped bridge-back token, and board advancement) — only the committed
+/// run's `trigger` differs. The AUTONOMOUS Prime loop's bare-Mandate start passes
+/// [`RunTrigger::Heartbeat`] so its runs read as autonomous/heartbeat-style rather
+/// than dashboard-`manual`, while going through this ONE chokepoint. Existing
+/// manual callers keep using [`preflight_run_with_prefs`] and are unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn preflight_run_with_prefs_trigger(
+    store: &TaskStore,
+    registry: &crate::rig::RigRegistry,
+    bridge_tokens: Option<&BridgeTokenStore>,
+    lease_secs: i64,
+    brief_id: &str,
+    preferred_rig: Option<&str>,
+    prompt: String,
+    prefs: RunModelPrefs,
+    trigger: RunTrigger,
+) -> Result<Preflight, CoordinatorError> {
     let Some(card) = store.brief_card(brief_id)? else {
         return Ok(Preflight::Refused(RunReport::refuse(
             brief_id,
@@ -2788,7 +2858,7 @@ pub fn preflight_run_with_prefs(
         rig,
         &run_id,
         prompt,
-        RunTrigger::Manual,
+        trigger,
         prefs,
     )? {
         Ok(ready) => Ok(Preflight::Ready(Box::new(ready))),
