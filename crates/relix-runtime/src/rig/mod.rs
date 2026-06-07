@@ -56,6 +56,24 @@ pub struct RigRunRequest {
     /// over the Rig's configured `working_dir`. Validated (must exist +
     /// be a directory) before spawn.
     pub working_dir: Option<std::path::PathBuf>,
+    /// Optional per-run model override carried from the assigned
+    /// Operative's stored `model_preference` (relix-agent-adapters.md
+    /// §3.2/§3.3). Empty/absent → the adapter runs on its own default
+    /// model. A supported subscription CLI Rig maps this to its `--model`
+    /// flag (Claude + Codex); echo / raw / unsupported Rigs ignore it, so
+    /// the field is fully backward-compatible.
+    pub model_preference: Option<String>,
+    /// Optional reasoning/effort tier carried from the Operative's stored
+    /// `reasoning_effort` (`minimal`/`low`/`medium`/`high`). Only the
+    /// Codex Rig maps this (`-c model_reasoning_effort=<effort>`, adapters
+    /// §3.3); other Rigs ignore it.
+    pub reasoning_effort: Option<String>,
+}
+
+/// Trim a stored preference and collapse empty/whitespace-only to `None`
+/// so an absent or blank preference never reaches an adapter as a flag.
+fn normalize_pref(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 impl RigRunRequest {
@@ -74,6 +92,8 @@ impl RigRunRequest {
             context: String::new(),
             bridge_token: String::new(),
             working_dir: None,
+            model_preference: None,
+            reasoning_effort: None,
         }
     }
 
@@ -98,6 +118,21 @@ impl RigRunRequest {
     /// Pin the working directory for this run (builder style).
     pub fn with_working_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.working_dir = Some(dir.into());
+        self
+    }
+
+    /// Carry the Operative's stored model preference (builder style).
+    /// Empty / whitespace-only normalizes to `None` so a blank preference
+    /// is indistinguishable from an absent one.
+    pub fn with_model_preference(mut self, model: Option<String>) -> Self {
+        self.model_preference = normalize_pref(model);
+        self
+    }
+
+    /// Carry the Operative's stored reasoning-effort tier (builder style).
+    /// Empty / whitespace-only normalizes to `None`.
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = normalize_pref(effort);
         self
     }
 }
@@ -1290,6 +1325,78 @@ pub fn codex_events(stdout: &str, bridge_token: &str) -> Vec<RigEvent> {
     out
 }
 
+/// Build the per-run model/effort flag args a CLI adapter accepts, keyed
+/// on its [`RigOutputFormat`] — the safe discriminator between the Claude
+/// and Codex subscription adapters (relix-agent-adapters.md §3.2/§3.3).
+/// Returns an empty vec for `Raw` (echo / Gemini / generic process) or
+/// when no usable preference is set, so non-CLI adapters are untouched.
+///
+/// - Claude (`ClaudeStreamJson`): `--model <model>` when a model pref is
+///   set. Claude Code exposes no headless reasoning-effort flag, so effort
+///   is intentionally NOT mapped here.
+/// - Codex (`CodexJsonl`): `--model <model>` plus, for effort,
+///   `-c model_reasoning_effort=<effort>` (matching the doc).
+///
+/// The caller passes each element as a DISCRETE argv entry (never a joined
+/// shell string), so a Brief's content cannot inject. As a second layer, a
+/// value that is empty or contains any whitespace/control character is
+/// skipped — a malformed preference can never become a stray flag.
+pub fn model_flag_args(
+    format: RigOutputFormat,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Vec<String> {
+    let clean = |v: Option<&str>| -> Option<String> {
+        let v = v?.trim();
+        if v.is_empty() || v.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return None;
+        }
+        Some(v.to_string())
+    };
+    let mut out = Vec::new();
+    match format {
+        RigOutputFormat::ClaudeStreamJson => {
+            if let Some(m) = clean(model) {
+                out.push("--model".to_string());
+                out.push(m);
+            }
+        }
+        RigOutputFormat::CodexJsonl => {
+            if let Some(m) = clean(model) {
+                out.push("--model".to_string());
+                out.push(m);
+            }
+            if let Some(e) = clean(effort) {
+                out.push("-c".to_string());
+                out.push(format!("model_reasoning_effort={e}"));
+            }
+        }
+        RigOutputFormat::Raw => {}
+    }
+    out
+}
+
+/// Splice `extra` argv elements into `base` so a trailing stdin marker
+/// (`-`) stays LAST: Codex's `exec … -` reads the prompt from stdin via
+/// that positional `-`, so injected flags MUST precede it. When `base`
+/// has no trailing `-` (e.g. Claude), the extras are appended. A no-op
+/// when `extra` is empty.
+fn argv_with_model_flags(base: &[String], extra: Vec<String>) -> Vec<String> {
+    if extra.is_empty() {
+        return base.to_vec();
+    }
+    let mut out: Vec<String> = base.to_vec();
+    if out.last().map(|s| s == "-").unwrap_or(false) {
+        let pos = out.len() - 1;
+        for (i, e) in extra.into_iter().enumerate() {
+            out.insert(pos + i, e);
+        }
+    } else {
+        out.extend(extra);
+    }
+    out
+}
+
 pub struct ProcessRig {
     name: String,
     program: String,
@@ -1574,7 +1681,20 @@ impl ProcessRig {
                 RunUsage::default(),
             );
         };
-        let mut command = command_for(&spawn, &self.args);
+        // Splice in any per-run model/effort flags the assigned Operative's
+        // stored preference asks for, keyed on this adapter's output format
+        // (Claude/Codex map them; raw/echo ignore). Discrete argv only — a
+        // trailing stdin `-` (Codex) stays last so the prompt still reads
+        // from stdin.
+        let effective_args = argv_with_model_flags(
+            &self.args,
+            model_flag_args(
+                self.output_format,
+                req.model_preference.as_deref(),
+                req.reasoning_effort.as_deref(),
+            ),
+        );
+        let mut command = command_for(&spawn, &effective_args);
         command
             // The agent learns its own scope from the environment;
             // the bridge token (when present) is how it calls Relix
@@ -2686,6 +2806,134 @@ mod tests {
     fn timeout_clamped_to_at_least_one_second() {
         let rig = ProcessRig::new("p", "echo", vec![]).with_timeout(std::time::Duration::ZERO);
         assert!(rig.timeout() >= std::time::Duration::from_secs(1));
+    }
+
+    // ── Per-run model preference → adapter flags ──────────────
+
+    #[test]
+    fn run_request_normalizes_model_and_effort_prefs() {
+        // Set values are carried; empty / whitespace-only normalize to None
+        // so a blank stored preference is indistinguishable from absent.
+        let req = RigRunRequest::new("b", "a", "g", "p")
+            .with_model_preference(Some("  gpt-5-codex  ".to_string()))
+            .with_reasoning_effort(Some("high".to_string()));
+        assert_eq!(req.model_preference.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
+
+        let blank = RigRunRequest::new("b", "a", "g", "p")
+            .with_model_preference(Some("   ".to_string()))
+            .with_reasoning_effort(Some(String::new()));
+        assert_eq!(blank.model_preference, None);
+        assert_eq!(blank.reasoning_effort, None);
+
+        // A fresh request carries neither (backward-compatible default).
+        let bare = RigRunRequest::new("b", "a", "g", "p");
+        assert_eq!(bare.model_preference, None);
+        assert_eq!(bare.reasoning_effort, None);
+    }
+
+    #[test]
+    fn model_flag_args_maps_per_format() {
+        // Claude: only `--model` (no headless effort flag).
+        assert_eq!(
+            model_flag_args(RigOutputFormat::ClaudeStreamJson, Some("claude-sonnet-4"), Some("high")),
+            vec!["--model".to_string(), "claude-sonnet-4".to_string()]
+        );
+        // Codex: `--model` AND `-c model_reasoning_effort=<effort>`.
+        assert_eq!(
+            model_flag_args(RigOutputFormat::CodexJsonl, Some("gpt-5-codex"), Some("medium")),
+            vec![
+                "--model".to_string(),
+                "gpt-5-codex".to_string(),
+                "-c".to_string(),
+                "model_reasoning_effort=medium".to_string(),
+            ]
+        );
+        // Codex effort alone (no model) still maps the effort.
+        assert_eq!(
+            model_flag_args(RigOutputFormat::CodexJsonl, None, Some("low")),
+            vec!["-c".to_string(), "model_reasoning_effort=low".to_string()]
+        );
+        // Raw / echo / generic: never mapped.
+        assert!(model_flag_args(RigOutputFormat::Raw, Some("x"), Some("high")).is_empty());
+        // Absent prefs → no flags on any format.
+        assert!(model_flag_args(RigOutputFormat::ClaudeStreamJson, None, None).is_empty());
+        assert!(model_flag_args(RigOutputFormat::CodexJsonl, None, None).is_empty());
+    }
+
+    #[test]
+    fn model_flag_args_skips_malformed_values() {
+        // Whitespace / control chars inside a value → skipped, never a stray
+        // flag or argument (defense in depth atop the store's write-time guard).
+        assert!(model_flag_args(RigOutputFormat::ClaudeStreamJson, Some("a b"), None).is_empty());
+        assert!(model_flag_args(RigOutputFormat::CodexJsonl, Some("m\tx"), None).is_empty());
+        assert!(model_flag_args(RigOutputFormat::CodexJsonl, None, Some("hi gh")).is_empty());
+        assert!(model_flag_args(RigOutputFormat::ClaudeStreamJson, Some("   "), None).is_empty());
+    }
+
+    #[test]
+    fn claude_argv_appends_model_flag_safely() {
+        // The EXACT argv `ProcessRig::execute` builds for the Claude rig with a
+        // model preference: `--model <m>` appended (no trailing stdin marker).
+        let base = claude_rig().args().to_vec();
+        let argv = argv_with_model_flags(
+            &base,
+            model_flag_args(RigOutputFormat::ClaudeStreamJson, Some("claude-sonnet-4"), None),
+        );
+        assert!(argv.windows(2).any(|w| w[0] == "--model" && w[1] == "claude-sonnet-4"));
+        // The original flags are preserved.
+        assert!(argv.iter().any(|a| a == "--print"));
+        assert!(argv.iter().any(|a| a == "stream-json"));
+    }
+
+    #[test]
+    fn codex_argv_inserts_flags_before_trailing_stdin_marker() {
+        // Codex's `exec … -` reads the prompt from stdin via the positional
+        // `-`, which MUST stay last; the model/effort flags are spliced in
+        // just before it.
+        let base = codex_rig().args().to_vec();
+        assert_eq!(base.last().map(String::as_str), Some("-"), "codex base ends with stdin marker");
+        let argv = argv_with_model_flags(
+            &base,
+            model_flag_args(RigOutputFormat::CodexJsonl, Some("gpt-5-codex"), Some("high")),
+        );
+        assert_eq!(argv.last().map(String::as_str), Some("-"), "stdin marker stays last");
+        assert!(argv.windows(2).any(|w| w[0] == "--model" && w[1] == "gpt-5-codex"));
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=high"));
+        // `exec` / `--json` / sandbox flags survive.
+        assert!(argv.iter().any(|a| a == "exec"));
+        assert!(argv.iter().any(|a| a == "--json"));
+    }
+
+    #[test]
+    fn argv_with_model_flags_is_noop_without_prefs() {
+        // No prefs → argv is byte-for-byte the rig's configured args (the
+        // echo / default path is completely untouched).
+        let base = codex_rig().args().to_vec();
+        assert_eq!(argv_with_model_flags(&base, Vec::new()), base);
+        let claude = claude_rig().args().to_vec();
+        assert_eq!(argv_with_model_flags(&claude, Vec::new()), claude);
+    }
+
+    #[test]
+    fn process_rig_run_request_with_prefs_does_not_break_echo_path() {
+        // A Raw-format process rig run with model prefs present must behave
+        // exactly as without them — prefs are simply ignored.
+        let (prog, args) = echo_cmd("hello-with-prefs");
+        let rig = ProcessRig::new("test-echo", prog, args);
+        let req = RigRunRequest::new("b", "a", "g", "ignored")
+            .with_model_preference(Some("gpt-5-codex".to_string()))
+            .with_reasoning_effort(Some("high".to_string()));
+        match rig.run(&req) {
+            RigOutcome::Done { summary } => {
+                assert!(summary.contains("hello-with-prefs"), "got: {summary:?}");
+                // The preference text must NOT leak into raw output as a flag.
+                assert!(!summary.contains("--model"), "raw path must not add flags: {summary:?}");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
     }
 
     #[test]

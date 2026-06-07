@@ -1076,23 +1076,39 @@ pub fn handle_prime_start(
     let mut started: Vec<serde_json::Value> = Vec::new();
     let mut started_ids: Vec<String> = Vec::new();
     for brief_id in &to_start {
-        // Resolve the assignee's preferred Rig + charter (exactly as brief.run).
-        let (preferred, charter, assignee) = match task_store.brief_card(brief_id) {
+        // Resolve the assignee's preferred Rig + charter + model hints
+        // (exactly as brief.run).
+        let (preferred, charter, assignee, prefs) = match task_store.brief_card(brief_id) {
             Ok(Some(card)) => {
                 let assignee = card.assignee_agent_id.clone().unwrap_or_default();
                 let agent = card
                     .assignee_agent_id
                     .as_deref()
                     .and_then(|a| agent_store.get_agent(a).ok().flatten());
+                let prefs = agent
+                    .as_ref()
+                    .map(|a| {
+                        crate::nodes::coordinator::heartbeat::RunModelPrefs::new(
+                            a.model_preference.clone(),
+                            a.reasoning_effort.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
                 (
                     agent.as_ref().and_then(|a| a.rig.clone()),
                     agent
                         .map(|a| a.instruction_bundle)
                         .filter(|c| !c.trim().is_empty()),
                     assignee,
+                    prefs,
                 )
             }
-            _ => (None, None, String::new()),
+            _ => (
+                None,
+                None,
+                String::new(),
+                crate::nodes::coordinator::heartbeat::RunModelPrefs::default(),
+            ),
         };
         let prompt = task_store.compose_brief_prompt_with_charter(brief_id, 10, charter.as_deref());
         match crate::nodes::coordinator::heartbeat::preflight_and_spawn(
@@ -1103,6 +1119,7 @@ pub fn handle_prime_start(
             brief_id,
             preferred.as_deref(),
             prompt,
+            prefs,
         ) {
             // A Shift started (run_id present).
             Ok(report) if report.run_id.is_some() => {

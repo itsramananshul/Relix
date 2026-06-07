@@ -83,9 +83,11 @@ interface AgentDetail {
   wake_on_timer?: boolean;
   wake_on_demand?: boolean;
   // Adapter preferences (relix-agent-adapters.md §3.2/§3.3/§7;
-  // relix-dashboard-design.md §9 "model lane"). STORED PREFERENCE ONLY —
-  // adapter execution does not consume them yet; surfaced as a future
-  // adapter hint, editable via the configure-gated PATCH /v1/agents/:id.
+  // relix-dashboard-design.md §9 "model lane"). CONSUMED by the supported
+  // subscription CLI Rigs: a run carries these into the Rig request and the
+  // Claude / Codex adapters map them to `--model` (+ Codex
+  // `-c model_reasoning_effort`); echo / Gemini / generic Rigs ignore them.
+  // Editable via the configure-gated PATCH /v1/agents/:id.
   model_preference?: string | null;
   reasoning_effort?: string | null;
 }
@@ -275,8 +277,8 @@ export function Agents() {
   const [saving, setSaving] = useState(false);
   // Configuration-tab model-preference editor state. `modelEditing` opens the
   // inline editor; `modelDraft`/`effortDraft` are its working copies; `savingModel`
-  // blocks the controls mid-write. STORED PREFERENCE ONLY — adapter execution does
-  // not consume these yet. Reset on Operative/tab change (effect below).
+  // blocks the controls mid-write. CONSUMED by the supported CLI Rigs at run
+  // time (Claude / Codex `--model`, Codex effort). Reset on Operative/tab change.
   const [modelEditing, setModelEditing] = useState(false);
   const [modelDraft, setModelDraft] = useState("");
   const [effortDraft, setEffortDraft] = useState("");
@@ -450,11 +452,12 @@ export function Agents() {
   // Write the adapter model preference (model name + reasoning/effort tier)
   // through the SAME configure-gated update path as the charter
   // (`PATCH /v1/agents/:id { model_preference, reasoning_effort }`). An empty
-  // value CLEARS that field (the backend allows it). STORED PREFERENCE ONLY —
-  // adapter execution does not consume these yet; this records a future adapter
-  // hint. On success we force-refetch this Operative's detail so the new values
-  // (and `updated_at`) render immediately. Any configure-power denial / backend
-  // refusal (e.g. an out-of-set effort) is shown verbatim — never bypassed.
+  // value CLEARS that field (the backend allows it). CONSUMED at run time by the
+  // supported subscription CLI Rigs (Claude / Codex map it to `--model`, Codex
+  // also `-c model_reasoning_effort`); other Rigs ignore it. On success we
+  // force-refetch this Operative's detail so the new values (and `updated_at`)
+  // render immediately. Any configure-power denial / backend refusal (e.g. an
+  // out-of-set effort) is shown verbatim — never bypassed.
   async function saveModelPrefs(agentId: string, model: string, effort: string) {
     setSavingModel(true);
     setBanner(null);
@@ -467,7 +470,7 @@ export function Agents() {
       setModelEditing(false);
       setBanner({
         kind: "ok",
-        msg: "Model preference saved — stored as an adapter hint (execution does not consume it yet).",
+        msg: "Model preference saved — supported CLI Rigs (Claude / Codex) will run on it; other Rigs ignore it.",
       });
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Save failed" });
@@ -1246,12 +1249,14 @@ export function Agents() {
                 </div>
               </div>
               <div className="op-group">
-                <div className="op-group-title">Model preference (adapter hint)</div>
+                <div className="op-group-title">Model preference</div>
                 <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
                   Optional per-Operative model + reasoning/effort preference (dashboard-design §9
-                  "model lane"; adapters §3.2/§3.3/§7). <strong>Stored preference only</strong> — the
-                  Rig run contract carries no per-run model override, so an adapter does not consume
-                  these yet; they record a future adapter hint. Edits flow through the configure-gated{" "}
+                  "model lane"; adapters §3.2/§3.3/§7). <strong>Consumed at run time</strong> by the
+                  supported subscription CLI Rigs — Claude and Codex map it to{" "}
+                  <span className="mono">--model</span> (Codex also{" "}
+                  <span className="mono">-c model_reasoning_effort</span>); echo / Gemini / generic
+                  Rigs ignore it. Edits flow through the configure-gated{" "}
                   <span className="mono">PATCH /v1/agents/:id</span>; an empty value clears the field.
                 </div>
                 {modelEditing ? (

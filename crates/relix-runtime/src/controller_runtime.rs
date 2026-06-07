@@ -9492,7 +9492,7 @@ fn register_node_type_handlers(
                             // can be attributed to the Operative (when one is
                             // set).
                             let tenant = ctx.tenant_id_or_default().to_string();
-                            let (preferred, charter, assignee) = match st.brief_card(&brief_id) {
+                            let (preferred, charter, assignee, prefs) = match st.brief_card(&brief_id) {
                                 Ok(Some(card)) => {
                                     let assignee =
                                         card.assignee_agent_id.clone().unwrap_or_default();
@@ -9500,15 +9500,33 @@ fn register_node_type_handlers(
                                         .assignee_agent_id
                                         .as_deref()
                                         .and_then(|a| ags.get_agent(a).ok().flatten());
+                                    // The Operative's stored model/effort hints —
+                                    // a supported CLI Rig maps them to its
+                                    // `--model` / `-c model_reasoning_effort` flags.
+                                    let prefs = agent
+                                        .as_ref()
+                                        .map(|a| {
+                                            crate::nodes::coordinator::heartbeat::RunModelPrefs::new(
+                                                a.model_preference.clone(),
+                                                a.reasoning_effort.clone(),
+                                            )
+                                        })
+                                        .unwrap_or_default();
                                     (
                                         agent.as_ref().and_then(|a| a.rig.clone()),
                                         agent
                                             .map(|a| a.instruction_bundle)
                                             .filter(|c| !c.trim().is_empty()),
                                         assignee,
+                                        prefs,
                                     )
                                 }
-                                _ => (None, None, String::new()),
+                                _ => (
+                                    None,
+                                    None,
+                                    String::new(),
+                                    crate::nodes::coordinator::heartbeat::RunModelPrefs::default(),
+                                ),
                             };
                             let prompt = st
                                 .compose_brief_prompt_with_charter(&brief_id, 10, charter.as_deref());
@@ -9543,6 +9561,7 @@ fn register_node_type_handlers(
                                     &brief_id,
                                     chosen_rig,
                                     prompt,
+                                    prefs,
                                 ) {
                                     Err(e) => return internal(format!("brief.run: {e}")),
                                     Ok(report) => {
@@ -11035,6 +11054,24 @@ fn register_node_type_handlers(
                                     10,
                                     charter.as_deref(),
                                 )
+                            },
+                            // Carry the assigned Operative's stored model/effort
+                            // preference into the autonomous run so a supported
+                            // CLI Rig runs on it (relix-agent-adapters.md
+                            // §3.2/§3.3). The caller owns the agent lookup (as
+                            // with `resolve_rig`), keeping dispatch decoupled.
+                            |card| {
+                                let agent = card
+                                    .assignee_agent_id
+                                    .as_deref()
+                                    .and_then(|a| ags.get_agent(a).ok().flatten());
+                                match agent {
+                                    Some(a) => crate::nodes::coordinator::heartbeat::RunModelPrefs::new(
+                                        a.model_preference,
+                                        a.reasoning_effort,
+                                    ),
+                                    None => crate::nodes::coordinator::heartbeat::RunModelPrefs::default(),
+                                }
                             },
                         )
                     })

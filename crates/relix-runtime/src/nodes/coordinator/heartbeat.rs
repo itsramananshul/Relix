@@ -491,6 +491,9 @@ where
         |_| BudgetAdmission::Allow,
         resolve_rig,
         build_prompt,
+        // No per-run model hints for the simple wrapper — the backward-
+        // compatible default (the assignee's Rig runs on its own default model).
+        |_| RunModelPrefs::default(),
     )
 }
 
@@ -499,7 +502,7 @@ where
 /// this variant lets production wiring enforce per-agent runtime
 /// Keys before queueing timer wakes and before claiming queued runs.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_batch_with_policy<R, P, A, C, B>(
+pub fn dispatch_batch_with_policy<R, P, A, C, B, M>(
     store: &TaskStore,
     batch: usize,
     lease_secs: i64,
@@ -509,6 +512,7 @@ pub fn dispatch_batch_with_policy<R, P, A, C, B>(
     admit_budget: B,
     resolve_rig: R,
     build_prompt: P,
+    resolve_model_prefs: M,
 ) -> Result<Vec<DispatchRecord>, CoordinatorError>
 where
     R: Fn(&brief::BriefCard) -> Option<Arc<dyn Rig>>,
@@ -516,6 +520,7 @@ where
     A: Fn(&brief::BriefCard) -> bool,
     C: FnMut(&str) -> i64,
     B: Fn(&brief::BriefCard) -> BudgetAdmission,
+    M: Fn(&brief::BriefCard) -> RunModelPrefs,
 {
     // Autonomous stale-claim adoption (execution-and-issue-design §1.4
     // "stale-run adoption" / §7.1 LOCKED two-pointer Claim): BEFORE selecting
@@ -664,6 +669,10 @@ where
         // `heartbeat` trigger stamped on the run record.
         let rig_name = rig.name().to_string();
         let prompt = build_prompt(&card);
+        // The assigned Operative's stored model/effort hints for this run —
+        // the caller owns the agent lookup (mirrors `resolve_rig`), so this
+        // stays decoupled from the agent store.
+        let prefs = resolve_model_prefs(&card);
         match prepare_claimed_run(
             store,
             bridge_tokens,
@@ -674,6 +683,7 @@ where
             &run_id,
             prompt,
             RunTrigger::Heartbeat,
+            prefs,
         )? {
             // Workspace prep refused → no run row opened, board untouched.
             Err(refusal) => {
@@ -2020,8 +2030,9 @@ pub fn preflight_and_spawn(
     brief_id: &str,
     preferred_rig: Option<&str>,
     prompt: String,
+    prefs: RunModelPrefs,
 ) -> Result<RunReport, CoordinatorError> {
-    match preflight_run(
+    match preflight_run_with_prefs(
         store,
         registry,
         bridge_tokens,
@@ -2029,6 +2040,7 @@ pub fn preflight_and_spawn(
         brief_id,
         preferred_rig,
         prompt,
+        prefs,
     )? {
         Preflight::Refused(report) => Ok(report),
         Preflight::Ready(ready) => {
@@ -2185,12 +2197,32 @@ pub fn open_retry_child(
     }
 }
 
-/// Pre-flight one Brief run: resolve the Operative's Rig, refuse clearly
-/// when it is unavailable (never spawns), and — only once the run is
-/// committed (adapter available + Claim won) — open the durable run
-/// record, advance the board, and mint the scoped bridge-back token.
-/// Returns a [`ReadyRun`] the caller can execute synchronously
-/// ([`run_brief_now`]) or hand to a background thread (async dispatch).
+/// The assigned Operative's stored per-run model hints, threaded from the
+/// agent profile into the run request (relix-agent-adapters.md §3.2/§3.3).
+/// Both fields are optional; an absent / blank preference means "use the
+/// adapter's own default model," and a Rig that doesn't support the hint
+/// (echo / raw / Gemini) simply ignores it. Default = neither set, which is
+/// the backward-compatible behavior every existing caller gets for free.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunModelPrefs {
+    /// `agent_profiles.model_preference` (e.g. `claude-sonnet-4`,
+    /// `gpt-5-codex`) → the adapter's `--model` flag.
+    pub model: Option<String>,
+    /// `agent_profiles.reasoning_effort` (`minimal`/`low`/`medium`/`high`)
+    /// → Codex's `-c model_reasoning_effort=<effort>`.
+    pub effort: Option<String>,
+}
+
+impl RunModelPrefs {
+    pub fn new(model: Option<String>, effort: Option<String>) -> Self {
+        Self { model, effort }
+    }
+}
+
+/// Pre-flight one Brief run with NO per-run model hints — the backward-
+/// compatible entry. Thin wrapper over [`preflight_run_with_prefs`]; the
+/// production manual path ([`preflight_and_spawn`]) calls the with-prefs
+/// variant so a configured Operative's model preference reaches its Rig.
 #[allow(clippy::too_many_arguments)]
 pub fn preflight_run(
     store: &TaskStore,
@@ -2200,6 +2232,36 @@ pub fn preflight_run(
     brief_id: &str,
     preferred_rig: Option<&str>,
     prompt: String,
+) -> Result<Preflight, CoordinatorError> {
+    preflight_run_with_prefs(
+        store,
+        registry,
+        bridge_tokens,
+        lease_secs,
+        brief_id,
+        preferred_rig,
+        prompt,
+        RunModelPrefs::default(),
+    )
+}
+
+/// Pre-flight one Brief run: resolve the Operative's Rig, refuse clearly
+/// when it is unavailable (never spawns), and — only once the run is
+/// committed (adapter available + Claim won) — open the durable run
+/// record, advance the board, and mint the scoped bridge-back token.
+/// `prefs` carries the assigned Operative's stored model/effort hints into
+/// the run request. Returns a [`ReadyRun`] the caller can execute
+/// synchronously or hand to a background thread (async dispatch).
+#[allow(clippy::too_many_arguments)]
+pub fn preflight_run_with_prefs(
+    store: &TaskStore,
+    registry: &crate::rig::RigRegistry,
+    bridge_tokens: Option<&BridgeTokenStore>,
+    lease_secs: i64,
+    brief_id: &str,
+    preferred_rig: Option<&str>,
+    prompt: String,
+    prefs: RunModelPrefs,
 ) -> Result<Preflight, CoordinatorError> {
     let Some(card) = store.brief_card(brief_id)? else {
         return Ok(Preflight::Refused(RunReport::refuse(
@@ -2321,6 +2383,7 @@ pub fn preflight_run(
         &run_id,
         prompt,
         RunTrigger::Manual,
+        prefs,
     )? {
         Ok(ready) => Ok(Preflight::Ready(Box::new(ready))),
         Err(report) => {
@@ -2354,6 +2417,7 @@ pub fn prepare_claimed_run(
     run_id: &str,
     prompt: String,
     trigger: RunTrigger,
+    prefs: RunModelPrefs,
 ) -> Result<Result<ReadyRun, RunReport>, CoordinatorError> {
     let rig_name = rig.name().to_string();
     // Scoped per-run workspace — the Rig executes HERE, not in the
@@ -2467,7 +2531,13 @@ pub fn prepare_claimed_run(
     let mut req = RigRunRequest::new(&card.task_id, assignee, String::new(), prompt)
         .with_run_id(run_id)
         .with_bridge_token(&token)
-        .with_context(brief_context(card));
+        .with_context(brief_context(card))
+        // Carry the assigned Operative's stored model/effort preference into
+        // the run; a supported CLI Rig maps it to its `--model` /
+        // `-c model_reasoning_effort` flags, others ignore it (relix-agent-
+        // adapters.md §3.2/§3.3). Empty/absent normalizes away in the builder.
+        .with_model_preference(prefs.model.clone())
+        .with_reasoning_effort(prefs.effort.clone());
     // Pin the child's working directory to the scoped workspace.
     if let Some(ws) = &workspace {
         req = req.with_working_dir(std::path::PathBuf::from(ws));
@@ -2932,6 +3002,7 @@ mod tests {
             |_| BudgetAdmission::Allow,
             |_: &brief::BriefCard| reg.get("echo"),
             |c: &brief::BriefCard| c.title.clone(),
+            |_: &brief::BriefCard| RunModelPrefs::default(),
         )
         .unwrap();
         assert!(records.is_empty());
@@ -2958,6 +3029,7 @@ mod tests {
             |_| BudgetAdmission::Allow,
             |_: &brief::BriefCard| reg.get("echo"),
             |c: &brief::BriefCard| c.title.clone(),
+            |_: &brief::BriefCard| RunModelPrefs::default(),
         )
         .unwrap();
         assert_eq!(records.len(), 1);
@@ -2971,6 +3043,82 @@ mod tests {
         let queued_rows = s.list_brief_wakeups(&queued_id, 10).unwrap();
         assert_eq!(queued_rows.len(), 1);
         assert_eq!(queued_rows[0].status, "queued");
+    }
+
+    // ── Per-Operative model preference reaches the Rig request ──
+
+    /// A Rig that records the model/effort hints on the request it is asked
+    /// to run, so a test can prove the stored preference flows through the
+    /// dispatch chokepoint into the [`RigRunRequest`].
+    struct CaptureRig {
+        seen: std::sync::Arc<std::sync::Mutex<Option<(Option<String>, Option<String>)>>>,
+    }
+    impl Rig for CaptureRig {
+        fn name(&self) -> &str {
+            "capture"
+        }
+        fn run(&self, req: &RigRunRequest) -> RigOutcome {
+            *self.seen.lock().unwrap() =
+                Some((req.model_preference.clone(), req.reasoning_effort.clone()));
+            RigOutcome::Done {
+                summary: "captured".to_string(),
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_passes_operative_model_prefs_into_run_request() {
+        let (s, _tmp) = store_ws();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let rig: Arc<dyn Rig> = Arc::new(CaptureRig { seen: seen.clone() });
+        ready_brief(&s, "cap", "agt_cap");
+        let records = dispatch_batch_with_policy(
+            &s,
+            50,
+            300,
+            None,
+            |_| true,
+            |_| 20,
+            |_| BudgetAdmission::Allow,
+            |_: &brief::BriefCard| Some(rig.clone()),
+            |c: &brief::BriefCard| c.title.clone(),
+            // Stand in for the controller's agent-profile lookup.
+            |_: &brief::BriefCard| {
+                RunModelPrefs::new(Some("gpt-5-codex".to_string()), Some("high".to_string()))
+            },
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        let got = seen.lock().unwrap().clone().expect("the rig ran");
+        assert_eq!(got.0.as_deref(), Some("gpt-5-codex"), "model pref reached the request");
+        assert_eq!(got.1.as_deref(), Some("high"), "effort reached the request");
+    }
+
+    #[test]
+    fn dispatch_omits_model_prefs_when_operative_has_none() {
+        // No stored preference → the request carries neither hint (the Rig
+        // runs on its own default model). Proves the absent path stays clean.
+        let (s, _tmp) = store_ws();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let rig: Arc<dyn Rig> = Arc::new(CaptureRig { seen: seen.clone() });
+        ready_brief(&s, "cap2", "agt_cap2");
+        let records = dispatch_batch_with_policy(
+            &s,
+            50,
+            300,
+            None,
+            |_| true,
+            |_| 20,
+            |_| BudgetAdmission::Allow,
+            |_: &brief::BriefCard| Some(rig.clone()),
+            |c: &brief::BriefCard| c.title.clone(),
+            |_: &brief::BriefCard| RunModelPrefs::default(),
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        let got = seen.lock().unwrap().clone().expect("the rig ran");
+        assert_eq!(got.0, None, "no model pref when the Operative has none");
+        assert_eq!(got.1, None, "no effort when the Operative has none");
     }
 
     // ── Allowance / budget hard-stop (company-model §3.6/§5.2D) ──
@@ -3035,6 +3183,7 @@ mod tests {
             },
             |_: &brief::BriefCard| reg.get("echo"),
             |c: &brief::BriefCard| c.title.clone(),
+            |_: &brief::BriefCard| RunModelPrefs::default(),
         )
         .unwrap();
 
@@ -3383,6 +3532,7 @@ mod tests {
             },
             |_: &brief::BriefCard| reg.get("echo"),
             |c: &brief::BriefCard| c.title.clone(),
+            |_: &brief::BriefCard| RunModelPrefs::default(),
         )
         .unwrap();
 

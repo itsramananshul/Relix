@@ -253,6 +253,20 @@ when you click Start. What it does **not** do:
   coding-agent CLI on the Settings page and switching an Operative's Rig to it.
   The starter Operatives are plain workers (no spawn/assign Keys) and are
   created directly only as the Board's sovereign first-run action.
+- **A per-Operative model preference is now CONSUMED by the supported CLI
+  adapters — with two stated gaps.** An Operative's stored `model_preference`
+  / `reasoning_effort` flows from its profile into the Rig run on every start
+  path (manual `brief.run`, Prime's Start-to-Shift, the autonomous heartbeat)
+  and onto the subscription CLIs' argv: the Claude Rig gets `--model <model>`,
+  the Codex Rig gets `--model <model>` + `-c model_reasoning_effort=<effort>`
+  (adapters §3.2/§3.3). It is argv-only (no shell), and echo / Gemini /
+  generic Rigs ignore it. **Remaining:** (1) **Claude effort is not mapped** —
+  Claude Code exposes no documented headless reasoning-effort flag, so only the
+  model is applied for the Claude Rig; (2) the **guarded operator retry**
+  (`run.retry`) still runs with no model preference (it reuses the
+  backward-compatible preflight wrapper) — a small scoped follow-up. An invalid
+  model name is the CLI's own run-time error (Relix passes it as a discrete
+  argv value, never a shell token).
 - **The autonomous heartbeat only executes**, it does not plan. It runs
   already-assigned Briefs on a timer — it never authors strategy, staffs a
   team, or orchestrates a Mandate.
