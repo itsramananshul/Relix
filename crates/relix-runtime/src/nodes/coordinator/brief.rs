@@ -254,6 +254,50 @@ pub fn normalize_proposal(summary: &str, children: &[ChildSpec]) -> Result<Propo
     Ok(Proposal { summary, children: norm })
 }
 
+/// A canonical, hashable fingerprint of a `suggest_tasks` proposal's
+/// **materialization-affecting** content (relix-execution-and-issue-design
+/// §1.7 — "a hash of the requested children, normalized so cosmetic
+/// differences don't matter"). Two proposals that would create the *same*
+/// children — same titles, priorities, `after` order, and assignee hints —
+/// produce the same fingerprint regardless of JSON key order, whitespace, or
+/// the human-facing `summary` (which never affects what gets created).
+///
+/// Used by the durable decomposition claim to detect a **plan fork**: a
+/// second accept of the same card whose proposal hashes differently is
+/// refused (you can't fork the plan under one accepted identity), while the
+/// same fingerprint resumes / no-ops.
+///
+/// Input is expected to be an already-[`normalize_proposal`]d `Proposal`
+/// (the form stored on the card), so the encoding below is the canonical
+/// one — but the function is total over any `Proposal`.
+///
+/// Encoding: a unit/record-separated stream of the per-child
+/// materialization fields in order, then BLAKE3-hashed (the repo's local
+/// hash convention — `hex(blake3(bytes))`, as in `db.rs`). The child *count*
+/// is included so a truncated/extended plan can never collide with a prefix.
+pub fn proposal_fingerprint(proposal: &Proposal) -> String {
+    // Field separator \u{1f} (unit sep) and record separator \u{1e} are
+    // control chars that cannot appear in a normalized title (titles are
+    // trimmed plain text), so the encoding is unambiguous.
+    let mut buf = String::new();
+    buf.push_str(&proposal.children.len().to_string());
+    for c in &proposal.children {
+        buf.push('\u{1e}');
+        buf.push_str(&c.title);
+        buf.push('\u{1f}');
+        buf.push_str(c.priority.as_deref().unwrap_or(""));
+        buf.push('\u{1f}');
+        if let Some(a) = c.after {
+            buf.push_str(&a.to_string());
+        }
+        buf.push('\u{1f}');
+        buf.push_str(c.assignee_agent_id.as_deref().unwrap_or(""));
+        buf.push('\u{1f}');
+        buf.push_str(c.assignee_role.as_deref().unwrap_or(""));
+    }
+    hex::encode(blake3::hash(buf.as_bytes()).as_bytes())
+}
+
 /// The product-spine fields of a Brief (the columns layered onto
 /// the Task ledger): who it's assigned to, where it sits on the
 /// board, its priority, and what it links *up* to.
@@ -806,6 +850,53 @@ mod tests {
         assert_eq!(p.children.len(), 2);
         assert_eq!(p.children[1].title, "C");
         assert_eq!(p.children[1].after, Some(0));
+    }
+
+    #[test]
+    fn fingerprint_ignores_cosmetic_summary_but_tracks_children() {
+        // Same children, different summary → SAME fingerprint (summary is
+        // cosmetic and never affects what gets materialized).
+        let a = normalize_proposal("Plan A", &[child("First"), child("Second")]).unwrap();
+        let b = normalize_proposal("totally different wording", &[child("First"), child("Second")])
+            .unwrap();
+        assert_eq!(proposal_fingerprint(&a), proposal_fingerprint(&b));
+        // A different child set → DIFFERENT fingerprint.
+        let c = normalize_proposal("Plan A", &[child("First"), child("Third")]).unwrap();
+        assert_ne!(proposal_fingerprint(&a), proposal_fingerprint(&c));
+        // A truncated plan must not collide with a prefix of the longer one.
+        let d = normalize_proposal("Plan A", &[child("First")]).unwrap();
+        assert_ne!(proposal_fingerprint(&a), proposal_fingerprint(&d));
+    }
+
+    #[test]
+    fn fingerprint_tracks_priority_after_and_hints() {
+        let base = normalize_proposal("p", &[child("A"), child("B")]).unwrap();
+        // Priority change forks the fingerprint.
+        let prio = normalize_proposal(
+            "p",
+            &[
+                child("A"),
+                ChildSpec { title: "B".into(), priority: Some("high".into()), after: None, assignee_agent_id: None, assignee_role: None },
+            ],
+        )
+        .unwrap();
+        assert_ne!(proposal_fingerprint(&base), proposal_fingerprint(&prio));
+        // An `after` edge forks the fingerprint.
+        let after = normalize_proposal(
+            "p",
+            &[child_after("A", None), child_after("B", Some(0))],
+        )
+        .unwrap();
+        assert_ne!(proposal_fingerprint(&base), proposal_fingerprint(&after));
+        // An assignee hint forks the fingerprint.
+        let hinted = normalize_proposal(
+            "p",
+            &[child("A"), child_hint("B", Some("agt_eng_1"), None)],
+        )
+        .unwrap();
+        assert_ne!(proposal_fingerprint(&base), proposal_fingerprint(&hinted));
+        // Deterministic: hashing the same proposal twice is stable.
+        assert_eq!(proposal_fingerprint(&base), proposal_fingerprint(&base));
     }
 
     #[test]

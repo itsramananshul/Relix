@@ -334,8 +334,9 @@ ledger entry or design section.
 9. **[BE/FE] Smarter companion** — `prime.propose` AI mode is opt-in and rule-validated;
    replacing the deterministic planner with an LLM driving the governed spine APIs is
    future (`current-limitations.md`; ledger "Mandate orchestration" still not autonomous).
-10. **[BE] Exactly-once decomposition + auto-wake promotion** — **auto-wake promotion is
-    now BACKEND SHIPPED** (`execution §1.6/§3.1`; see §5 slice 12). When a Brief reaches a
+10. **[BE] Exactly-once decomposition + auto-wake promotion** — **both parts are now BACKEND
+    SHIPPED** (exactly-once decomposition partial; see below). **Auto-wake promotion**
+    (`execution §1.6/§3.1`; see §5 slice 12). When a Brief reaches a
     terminal column at the central `set_board_status` seam, Relix sequences follow-up work
     event-driven (no busy-poll): a `done` Brief promotes a `blockers-resolved` wakeup to each
     same-Guild dependent that is now fully unblocked, and a `done`/`cancelled` child promotes a
@@ -343,9 +344,24 @@ ledger entry or design section.
     terminal — through the existing persistent wakeup queue (coalesce/defer/skip, no duplicate
     runs), tenant-safe, and honest about a missing assignee. The **cost-tree rollup +
     billing-code attribution** part of this line is also **backend SHIPPED** (see §P1 slice 3b);
-    only the frontend Costs surface (§P2 slice 5) consumes it. *Still deferred:* **exactly-once
-    plan decomposition** (`execution §1.7` — the crash-safe decomposition claim) and
-    approval-bound issue **Dossiers/documents** (`execution §1.8`) are not yet implemented.
+    only the frontend Costs surface (§P2 slice 5) consumes it. **Exactly-once plan
+    decomposition** (`execution §1.7`) is now **BACKEND SHIPPED (partial)** too: the
+    `suggest_tasks` accept path is backed by a durable **decomposition claim/ledger**
+    (`brief_decomposition_claims`, keyed by `(task_id, interaction_id)`) so accepting a child-Brief
+    plan is **resumable and never double-creates children**. The claim row — not the card flip — is
+    the linearization point and carries a **proposal fingerprint** (BLAKE3 over the normalized
+    plan's materialization-affecting fields, so cosmetic/summary changes don't matter), a
+    **`created_ids` resume cursor** (each child id persisted via compare-and-swap *before* the next
+    child is created), `plan_len`, `owner`, and `status` (`in_progress`→`complete`). Net effect: a
+    duplicate accept **no-ops** (returns the same ordered ids), a crashed accept **resumes from the
+    cursor** (creating only the missing children, then idempotently re-links + wires `after`→Snag
+    edges), and a re-accept whose proposal hashes differently is **refused** (an accepted plan
+    cannot fork). All prior governance (parent context inheritance, assign-Key-gated hints, tenant
+    isolation, delegation-depth) is unchanged. *Still deferred:* binding the accepted plan to an
+    approval-bound **Dossier/document revision** (`execution §1.7/§1.8` — today the accepted-plan
+    identity is the `suggest_tasks` interaction id, not a Dossier revision) and `owner`-liveness
+    takeover enforcement; approval-bound issue **Dossiers/documents** (`execution §1.8`) remain
+    unimplemented.
 
 ---
 
@@ -620,8 +636,11 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
     does not wake/leak; a repeated done transition does not duplicate. *Verified:* targeted
     `auto_wake_*` (7) green; full `cargo test -p relix-runtime --lib` green (3977 lib tests, +7);
     `cargo check -p relix-runtime` clean; `cargo clippy` clean on the touched code (2 pre-existing
-    unrelated warnings in `maintenance.rs`); `git diff --check` clean. *Still deferred:*
-    exactly-once plan decomposition (§1.7) and approval-bound Dossiers/documents (§1.8).
+    unrelated warnings in `maintenance.rs`); `git diff --check` clean. *Now also shipped (partial):*
+    exactly-once plan decomposition (§1.7 — durable `brief_decomposition_claims` ledger:
+    fingerprint + `created_ids` resume cursor + crash-safe resume / no-op duplicate / no-fork
+    accept; see §P3 slice 10). *Still deferred:* binding the accepted plan to an approval-bound
+    Dossier/document revision and approval-bound issue Dossiers/documents (§1.8).
 
 > After completing a slice: re-open the cited section, update the implementation map /
 > divergence ledger in `product-spine-implementation.md`, and update this file's §2/§3 so

@@ -2252,6 +2252,67 @@ impl TaskStore {
         accept: bool,
         resolved_assignees: &[Option<String>],
     ) -> Result<Vec<String>, CoordinatorError> {
+        // Production entry point — no test fail-injection. The crash-safe
+        // materialization lives in the shared impl so the resume path is
+        // exercised through a controlled fail point rather than a weakened API.
+        self.respond_suggestion_impl(
+            tenant,
+            owner_subject_id,
+            task_id,
+            interaction_id,
+            responder,
+            accept,
+            resolved_assignees,
+            None,
+        )
+    }
+
+    /// Test-only variant of [`Self::respond_suggestion`] that simulates a
+    /// crash **after** `fail_after` child Briefs have been created and their
+    /// ids durably recorded on the decomposition claim's cursor on THIS call,
+    /// erroring before the card finalizes. Lets a test prove the resume path
+    /// creates only the missing children — without weakening the product API
+    /// (the public method has no fail hook).
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn respond_suggestion_failing_after(
+        &self,
+        tenant: &str,
+        owner_subject_id: &str,
+        task_id: &str,
+        interaction_id: &str,
+        responder: &str,
+        resolved_assignees: &[Option<String>],
+        fail_after: usize,
+    ) -> Result<Vec<String>, CoordinatorError> {
+        self.respond_suggestion_impl(
+            tenant,
+            owner_subject_id,
+            task_id,
+            interaction_id,
+            responder,
+            true,
+            resolved_assignees,
+            Some(fail_after),
+        )
+    }
+
+    /// Shared crash-safe implementation of accept/reject for a `suggest_tasks`
+    /// card (relix-execution-and-issue-design §1.7 — exactly-once plan
+    /// decomposition). `fail_after` is `None` in production; tests pass
+    /// `Some(n)` to bail after creating `n` children on this call.
+    #[allow(clippy::too_many_arguments)]
+    fn respond_suggestion_impl(
+        &self,
+        tenant: &str,
+        owner_subject_id: &str,
+        task_id: &str,
+        interaction_id: &str,
+        responder: &str,
+        accept: bool,
+        resolved_assignees: &[Option<String>],
+        fail_after: Option<usize>,
+    ) -> Result<Vec<String>, CoordinatorError> {
         let responder = responder.trim();
         if responder.is_empty() {
             return Err(CoordinatorError::Invalid(
@@ -2277,10 +2338,16 @@ impl TaskStore {
                  depth {depth})"
             )));
         }
-        // ── 1. Claim the card under one lock: verify kind/status, then flip
-        //       open → terminal with a row-level guard. This is the only
-        //       point that can win, so accept is idempotent. ──
-        let proposal_json: Option<String> = {
+        // ── 1. Read the card (kind / current status / proposal) under a
+        //       short lock. Unlike the old flow, the card is NOT flipped to a
+        //       terminal state on entry: for accept it stays `open` while the
+        //       decomposition materializes (so a crashed accept can re-read
+        //       the proposal + the wire handler can re-resolve hints on
+        //       resume) and is flipped to `resolved` only when the whole plan
+        //       has been created. The durable decomposition claim (§1.7,
+        //       below) — not the card status — is the crash-safe
+        //       linearization point. ──
+        let (card_status, proposal_json) = {
             let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
             let row: Option<(String, String, Option<String>)> = conn
                 .query_row(
@@ -2300,19 +2367,43 @@ impl TaskStore {
                     "not a suggest_tasks card".to_string(),
                 ));
             }
-            if status != "open" {
+            (status, proposal)
+        };
+
+        // ── REJECT: flip open → rejected (idempotent guard). A card whose
+        //    decomposition claim already exists cannot be rejected — the plan
+        //    was accepted, so declining it now would orphan the created
+        //    children under a "rejected" card. ──
+        if !accept {
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            let claim_exists = conn
+                .query_row(
+                    "SELECT 1 FROM brief_decomposition_claims
+                     WHERE task_id = ?1 AND interaction_id = ?2 LIMIT 1",
+                    params![task_id, interaction_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(CoordinatorError::Db)?
+                .is_some();
+            if claim_exists {
+                return Err(CoordinatorError::Invalid(
+                    "suggestion already accepted (decomposition under way) — cannot reject"
+                        .to_string(),
+                ));
+            }
+            if card_status != "open" {
                 return Err(CoordinatorError::Invalid(format!(
-                    "suggestion already {status}"
+                    "suggestion already {card_status}"
                 )));
             }
             let now = unix_secs();
-            let terminal = if accept { "resolved" } else { "rejected" };
             let changed = conn
                 .execute(
                     "UPDATE brief_interactions
-                     SET status = ?1, resolved_at = ?2, resolved_by = ?3
-                     WHERE interaction_id = ?4 AND task_id = ?5 AND status = 'open'",
-                    params![terminal, now, responder, interaction_id, task_id],
+                     SET status = 'rejected', resolved_at = ?1, resolved_by = ?2
+                     WHERE interaction_id = ?3 AND task_id = ?4 AND status = 'open'",
+                    params![now, responder, interaction_id, task_id],
                 )
                 .map_err(CoordinatorError::Db)?;
             if changed == 0 {
@@ -2320,41 +2411,124 @@ impl TaskStore {
                     "suggestion already answered".to_string(),
                 ));
             }
-            if !accept {
-                let _ = conn.execute(
-                    "INSERT INTO task_events (task_id, ts, event_type, payload)
-                     VALUES (?1, ?2, 'brief.suggestion_rejected', ?3)",
-                    params![task_id, now, format!("{responder}: declined")],
-                );
-                return Ok(Vec::new());
-            }
-            proposal
-        }; // lock dropped here — `create_brief` re-locks internally.
+            let _ = conn.execute(
+                "INSERT INTO task_events (task_id, ts, event_type, payload)
+                 VALUES (?1, ?2, 'brief.suggestion_rejected', ?3)",
+                params![task_id, now, format!("{responder}: declined")],
+            );
+            return Ok(Vec::new());
+        }
 
-        // ── 2. Accept: materialize the proposal into real child Briefs. The
-        //       card is already claimed (`resolved`), so even a partial
-        //       failure cannot be retried into duplicate Briefs. ──
+        // ── ACCEPT: materialize the proposal into real child Briefs exactly
+        //    once, resumably (§1.7). ──
         let proposal: brief::Proposal = proposal_json
             .as_deref()
             .and_then(|p| serde_json::from_str(p).ok())
             .ok_or_else(|| CoordinatorError::Invalid("suggestion proposal missing".to_string()))?;
-        // Read the parent's spine context once, so each child inherits the
-        // SAFE links (Mandate/Campaign/reviewer) and stays company-
-        // consistent. Assignee is deliberately NOT inherited (it runs
-        // governance gating). A vanished parent (it can't, the card lives on
-        // it) degrades to no inheritance rather than aborting.
+        let fingerprint = brief::proposal_fingerprint(&proposal);
+        let plan_len = proposal.children.len();
+
+        // ── 2. Establish / validate the durable decomposition claim — the
+        //    crash-safe linearization point. The first accept inserts the
+        //    claim (atomic on the PK); a later accept finds it and:
+        //      • a DIFFERENT fingerprint → refuse (the plan cannot fork under
+        //        the same accepted identity, §1.7);
+        //      • SAME fingerprint + status `complete` → no-op, return the
+        //        recorded ordered ids (a duplicate accept never re-creates);
+        //      • SAME fingerprint + status `in_progress` → resume from the
+        //        recorded cursor.
+        let (mut created, prior_status): (Vec<String>, String) = {
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            let now = unix_secs();
+            // Claim it fresh. INSERT OR IGNORE so a racing second accept does
+            // not error on the PK — it falls through to the read below.
+            conn.execute(
+                "INSERT OR IGNORE INTO brief_decomposition_claims
+                 (task_id, interaction_id, tenant_id, fingerprint, plan_len,
+                  created_ids, owner, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, 'in_progress', ?7, ?7)",
+                params![
+                    task_id,
+                    interaction_id,
+                    norm_tenant(tenant),
+                    fingerprint,
+                    plan_len as i64,
+                    responder,
+                    now
+                ],
+            )
+            .map_err(CoordinatorError::Db)?;
+            let (fp, ids, status): (String, String, String) = conn
+                .query_row(
+                    "SELECT fingerprint, created_ids, status FROM brief_decomposition_claims
+                     WHERE task_id = ?1 AND interaction_id = ?2",
+                    params![task_id, interaction_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(CoordinatorError::Db)?;
+            if fp != fingerprint {
+                return Err(CoordinatorError::Invalid(
+                    "this suggestion was already accepted with a different set of tasks; \
+                     the accepted plan cannot fork — open a new suggestion to propose a \
+                     changed plan"
+                        .to_string(),
+                ));
+            }
+            let created = split_csv_ids(&ids);
+            (created, status)
+        };
+
+        // A completed claim: pure duplicate accept → no-op. Return the full
+        // ordered ids exactly once (no new children, no duplicate events).
+        if prior_status == "complete" {
+            return Ok(created);
+        }
+
+        // Read the parent's spine context once so each child inherits the SAFE
+        // links (Mandate/Campaign/reviewer). Assignee is deliberately NOT
+        // inherited (it runs governance gating). A vanished parent degrades to
+        // no inheritance rather than aborting.
         let (inh_mandate, inh_campaign, inh_reviewer) = match self.brief_fields(task_id)? {
             Some(f) => (f.mandate_id, f.campaign_id, f.reviewer_agent_id),
             None => (None, None, None),
         };
-        let mut created: Vec<String> = Vec::new();
-        let mut assigned = 0usize;
-        for (idx, c) in proposal.children.iter().enumerate() {
-            // Apply the pre-validated assignee for this child (the wire
-            // handler resolved + assign-Key gated each hint BEFORE this
-            // claiming accept, so a bad hint already refused the whole
-            // accept). A `None`/absent slot opens the child unassigned —
-            // the default; the parent's assignee is never inherited.
+
+        // A genuine resume (existing partial progress) is chronicled once so
+        // the timeline is honest about the crash/resume.
+        let start_cursor = created.len();
+        if start_cursor > 0 && start_cursor < plan_len {
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            let _ = conn.execute(
+                "INSERT INTO task_events (task_id, ts, event_type, payload)
+                 VALUES (?1, ?2, 'brief.suggestion_resumed', ?3)",
+                params![
+                    task_id,
+                    unix_secs(),
+                    format!("{responder}: resuming decomposition from {start_cursor}/{plan_len}")
+                ],
+            );
+        }
+
+        // ── 3. Materialize children from the cursor forward. Each child is
+        //    created, then its id is recorded on the claim's cursor with a
+        //    compare-and-swap BEFORE moving on — so a crash resumes from the
+        //    last recorded id and never re-creates one. The CAS also serializes
+        //    racing accepts onto one cursor (the loser of a slot adopts the
+        //    winner's progress; its just-created orphan Brief is the
+        //    documented, rare cost of a true concurrent double-accept — the
+        //    sequential crash-retry path never produces one). ──
+        let mut made_this_call = 0usize;
+        loop {
+            let idx = created.len();
+            if idx >= plan_len {
+                break;
+            }
+            let prev_joined = created.join(",");
+            let c = &proposal.children[idx];
+            // Pre-validated assignee for this child (resolved + assign-Key
+            // gated by the wire handler BEFORE this call). `None` opens it
+            // unassigned — the default; the parent's assignee is never
+            // inherited.
             let assignee = resolved_assignees.get(idx).and_then(|o| o.as_deref());
             let child = self.create_brief(
                 tenant,
@@ -2365,23 +2539,66 @@ impl TaskStore {
                 inh_campaign.as_deref(),
                 c.priority.as_deref(),
             )?;
-            if assignee.is_some() {
-                assigned += 1;
-            }
-            self.link_subbrief(task_id, &child)?;
-            // Inherit the parent's reviewer best-effort: a fresh child has
-            // none, and carrying the parent's keeps the review chain intact.
-            // Fail-soft — a reviewer hiccup must not abort an otherwise-valid
-            // materialization (the child Brief already exists and is usable).
-            if let Some(rv) = inh_reviewer.as_deref() {
-                let _ = self.set_brief_field(&child, "reviewer", rv);
+            let new_joined = if prev_joined.is_empty() {
+                child.clone()
+            } else {
+                format!("{prev_joined},{child}")
+            };
+            let advanced = {
+                let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+                conn.execute(
+                    "UPDATE brief_decomposition_claims
+                     SET created_ids = ?1, updated_at = ?2
+                     WHERE task_id = ?3 AND interaction_id = ?4
+                       AND created_ids = ?5 AND status = 'in_progress'",
+                    params![new_joined, unix_secs(), task_id, interaction_id, prev_joined],
+                )
+                .map_err(CoordinatorError::Db)?
+            };
+            if advanced == 0 {
+                // Another worker advanced the cursor between our create and our
+                // record. Adopt the durable list (our `child` becomes an
+                // unlinked orphan — the rare concurrency cost) and continue.
+                let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+                let ids: String = conn
+                    .query_row(
+                        "SELECT created_ids FROM brief_decomposition_claims
+                         WHERE task_id = ?1 AND interaction_id = ?2",
+                        params![task_id, interaction_id],
+                        |r| r.get(0),
+                    )
+                    .map_err(CoordinatorError::Db)?;
+                created = split_csv_ids(&ids);
+                continue;
             }
             created.push(child);
+            made_this_call += 1;
+            // Test-only crash injection: bail after `n` children created +
+            // recorded this call, BEFORE linking / finalizing. The claim's
+            // cursor is durable, so a follow-up call resumes from here.
+            if fail_after == Some(made_this_call) {
+                return Err(CoordinatorError::Invalid(format!(
+                    "test: simulated crash after creating {made_this_call} child(ren)"
+                )));
+            }
         }
-        // Materialize the intra-proposal dependency edges (§1.6): a child
-        // with `after = Some(j)` (j strictly earlier, validated + remapped at
-        // open time) is `blocked_on` its earlier sibling — both already
-        // exist. `add_snag` re-checks existence/self/cycle and is idempotent.
+
+        // ── 4. Heal + link. Linking is done AFTER the cursor record (so the
+        //    cursor is the single source of truth — a crash between record and
+        //    link can't lose a child) and is idempotent, so re-linking on
+        //    resume is safe and fills any gap left by a prior crash. The
+        //    reviewer is inherited best-effort per child. ──
+        for child in &created {
+            self.link_subbrief(task_id, child)?;
+            if let Some(rv) = inh_reviewer.as_deref() {
+                let _ = self.set_brief_field(child, "reviewer", rv);
+            }
+        }
+        // Materialize the intra-proposal dependency edges (§1.6): a child with
+        // `after = Some(j)` (j strictly earlier, validated + remapped at open
+        // time) is `blocked_on` its earlier sibling — both already exist.
+        // `add_snag` re-checks existence/self/cycle and is idempotent, so this
+        // is safe to (re-)run after a resume.
         let mut dep_edges = 0usize;
         for (i, c) in proposal.children.iter().enumerate() {
             if let Some(j) = c.after {
@@ -2390,11 +2607,35 @@ impl TaskStore {
             }
         }
 
-        // ── 3. Record the created ids on the card + Chronicle. ──
+        // ── 5. Finalize, exactly once: mark the claim complete, flip the card
+        //    to `resolved`, record the full ordered child ids on the card, and
+        //    Chronicle the materialization (the single materialized event;
+        //    a resume adds one `brief.suggestion_resumed` before it). ──
         {
             let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
             let now = unix_secs();
             let joined = created.join(",");
+            // Count assigned children across the WHOLE plan (the hints are
+            // re-resolved identically each call), so the event is honest even
+            // on a resume.
+            let assigned = (0..plan_len)
+                .filter(|idx| resolved_assignees.get(*idx).and_then(|o| o.as_deref()).is_some())
+                .count();
+            conn.execute(
+                "UPDATE brief_decomposition_claims
+                 SET status = 'complete', created_ids = ?1, updated_at = ?2
+                 WHERE task_id = ?3 AND interaction_id = ?4",
+                params![joined, now, task_id, interaction_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+            // Flip the card (idempotent guard on `status='open'`) + record the
+            // full ordered ids as the response.
+            let _ = conn.execute(
+                "UPDATE brief_interactions
+                 SET status = 'resolved', resolved_at = ?1, resolved_by = ?2, response = ?3
+                 WHERE interaction_id = ?4 AND task_id = ?5 AND status = 'open'",
+                params![now, responder, joined, interaction_id, task_id],
+            );
             // Name the inherited context + dependency edges so the Chronicle
             // reads as an honest ledger of what materialization did.
             let mut inherited: Vec<&str> = Vec::new();
@@ -2412,11 +2653,6 @@ impl TaskStore {
             } else {
                 inherited.join("+")
             };
-            let _ = conn.execute(
-                "UPDATE brief_interactions SET response = ?1
-                 WHERE interaction_id = ?2 AND task_id = ?3",
-                params![joined, interaction_id, task_id],
-            );
             let needs_assignment = created.len().saturating_sub(assigned);
             let _ = conn.execute(
                 "INSERT INTO task_events (task_id, ts, event_type, payload)
@@ -15220,6 +15456,42 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         );
         CREATE INDEX IF NOT EXISTS brief_interactions_by_task
             ON brief_interactions(task_id, created_at);
+        -- Exactly-once plan decomposition — the durable decomposition claim
+        -- / ledger (relix-execution-and-issue-design §1.7). One row per
+        -- accepted `suggest_tasks` plan, keyed by `(task_id,
+        -- interaction_id)` = (source Brief, accepted-plan identity). For
+        -- this slice the accepted-plan identity is the `suggest_tasks`
+        -- interaction id (no full Dossier revision yet). The row makes an
+        -- accept **crash-safe and non-duplicating**:
+        --   `fingerprint`  — BLAKE3 of the normalized proposal's
+        --     materialization-affecting fields (titles/priorities/`after`/
+        --     assignee hints); a second accept with a DIFFERENT fingerprint
+        --     under the same identity is refused (the plan cannot fork).
+        --   `plan_len`     — how many children the accepted plan has.
+        --   `created_ids`  — the ordered, comma-joined child Brief ids
+        --     created **so far**; its length IS the resume cursor. Advanced
+        --     one id at a time (persist-before-proceed) so a crashed accept
+        --     resumes from exactly where it stopped, never re-creating a
+        --     child. Bounded (≤ MAX_SUGGESTED_CHILDREN ids) — no raw prompt
+        --     text is ever stored here.
+        --   `owner`        — who accepted (audit; future run-liveness
+        --     takeover gating — not enforced in this slice).
+        --   `status`       — `in_progress` until the cursor reaches
+        --     `plan_len` and the card finalizes, then `complete`.
+        CREATE TABLE IF NOT EXISTS brief_decomposition_claims (
+            task_id        TEXT NOT NULL,
+            interaction_id TEXT NOT NULL,
+            tenant_id      TEXT NOT NULL,
+            fingerprint    TEXT NOT NULL,
+            plan_len       INTEGER NOT NULL,
+            created_ids    TEXT NOT NULL DEFAULT '',
+            owner          TEXT NOT NULL,
+            status         TEXT NOT NULL DEFAULT 'in_progress',
+            created_at     INTEGER NOT NULL,
+            updated_at     INTEGER NOT NULL,
+            PRIMARY KEY (task_id, interaction_id),
+            FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+        );
         -- PHASE 1 (Brief identity, relix-execution-and-issue-design
         -- §1.2): the per-company (per-Guild) counter the human Brief
         -- identifier (e.g. REL-42) is allocated from. One row per
@@ -15622,6 +15894,18 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
     // statements as the cursor so adding a new ALTER bumps it.
     crate::db::record_migration_applied(conn, alters.len() as i64).map_err(CoordinatorError::Db)?;
     Ok(())
+}
+
+/// Split a comma-joined id list (the decomposition claim's `created_ids`
+/// cursor) into an ordered `Vec`. An empty string yields an empty vec (no
+/// stray `""` element). Ids never contain commas (they are coordinator-minted
+/// task ids), so a plain split is unambiguous.
+fn split_csv_ids(ids: &str) -> Vec<String> {
+    if ids.is_empty() {
+        Vec::new()
+    } else {
+        ids.split(',').map(str::to_string).collect()
+    }
 }
 
 /// Map a row of the BriefCard column set into a `brief::BriefCard`.
@@ -21401,9 +21685,12 @@ mod tests {
         assert_eq!(listed[0].status, "rejected");
     }
 
-    // A second accept is a typed refusal and does NOT double-create Briefs.
+    // §1.7: a second accept of an already-materialized plan is an idempotent
+    // no-op (returns the same ids, never double-creates); a re-reject after
+    // acceptance is refused (the plan was accepted — declining it now would
+    // orphan the created children).
     #[test]
-    fn brief_suggestion_duplicate_accept_is_refused_no_duplicates() {
+    fn brief_suggestion_duplicate_accept_noops_reject_refused() {
         let s = TaskStore::in_memory().unwrap();
         let parent = s
             .create_brief("acme", "Parent", "subj", None, None, None, None)
@@ -21423,10 +21710,12 @@ mod tests {
             .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
             .unwrap();
         assert_eq!(first.len(), 2);
-        // Re-accept → typed Invalid, no new children.
-        let again = s.respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[]);
-        assert!(matches!(again, Err(CoordinatorError::Invalid(_))));
-        // Re-reject after resolution is also refused.
+        // Re-accept → no-op resume, same ids, no new children.
+        let again = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
+            .unwrap();
+        assert_eq!(again, first, "duplicate accept returns the same ids");
+        // Re-reject after acceptance is refused (claim exists).
         let rej = s.respond_suggestion("acme", "subj", &parent, &id, "founder", false, &[]);
         assert!(matches!(rej, Err(CoordinatorError::Invalid(_))));
         assert_eq!(s.list_subbriefs(&parent).unwrap().len(), 2, "no duplicates");
@@ -21620,6 +21909,295 @@ mod tests {
         );
         let listed = s.list_interactions(&parent).unwrap();
         assert_eq!(listed[0].status, "open", "card stays open after refusal");
+    }
+
+    // ── Exactly-once plan decomposition (§1.7): the durable decomposition
+    //    claim makes an accepted plan resumable and non-duplicating. ──
+
+    // Helper: read the decomposition claim row (fingerprint, created_ids,
+    // status) for a card, or None when no claim exists yet.
+    fn decomp_claim(s: &TaskStore, task: &str, iid: &str) -> Option<(String, String, String)> {
+        let conn = s.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT fingerprint, created_ids, status FROM brief_decomposition_claims
+             WHERE task_id = ?1 AND interaction_id = ?2",
+            rusqlite::params![task, iid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok()
+    }
+
+    // Helper: count `brief.suggestion_materialized` Chronicle events on a Brief.
+    fn materialized_count(s: &TaskStore, parent: &str) -> usize {
+        s.query_events(
+            parent,
+            0,
+            200,
+            Some("brief.suggestion_materialized"),
+            EventOrder::Asc,
+        )
+        .unwrap()
+        .len()
+    }
+
+    fn open_plan(s: &TaskStore, parent: &str, titles: &[&str]) -> String {
+        let children: Vec<brief::ChildSpec> = titles
+            .iter()
+            .map(|t| brief::ChildSpec {
+                title: (*t).into(),
+                priority: None,
+                after: None,
+                assignee_agent_id: None,
+                assignee_role: None,
+            })
+            .collect();
+        s.open_suggestion(parent, "operative-1", "Break it down", &children)
+            .unwrap()
+    }
+
+    // A fresh full accept creates all children, links them, records an
+    // in-order cursor on a `complete` claim, and Chronicles once.
+    #[test]
+    fn decomposition_full_accept_records_complete_claim() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let id = open_plan(&s, &parent, &["A", "B", "C"]);
+        let created = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
+            .unwrap();
+        assert_eq!(created.len(), 3);
+        assert_eq!(s.list_subbriefs(&parent).unwrap().len(), 3);
+        let (_, ids, status) = decomp_claim(&s, &parent, &id).expect("claim exists");
+        assert_eq!(status, "complete");
+        assert_eq!(ids, created.join(","), "cursor holds the ordered ids");
+        assert_eq!(materialized_count(&s, &parent), 1);
+    }
+
+    // A duplicate accept of an already-complete plan is a no-op: it returns
+    // the same ordered ids and creates no new children or events.
+    #[test]
+    fn decomposition_duplicate_accept_is_noop() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let id = open_plan(&s, &parent, &["A", "B"]);
+        let first = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
+            .unwrap();
+        let second = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
+            .unwrap();
+        assert_eq!(first, second, "duplicate accept returns the same ids");
+        assert_eq!(
+            s.list_subbriefs(&parent).unwrap().len(),
+            2,
+            "no duplicate children"
+        );
+        assert_eq!(
+            materialized_count(&s, &parent),
+            1,
+            "no duplicate materialized event"
+        );
+    }
+
+    // A crash mid-materialization (the test fail-after hook) leaves a durable
+    // partial cursor; a follow-up accept RESUMES — creating only the missing
+    // children, reusing the already-created ones, and finalizing once.
+    #[test]
+    fn decomposition_resumes_from_partial_cursor() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let id = open_plan(&s, &parent, &["A", "B", "C"]);
+        // Crash after creating exactly one child.
+        let err = s
+            .respond_suggestion_failing_after("acme", "subj", &parent, &id, "founder", &[], 1)
+            .unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)));
+        // One child id is durably recorded; the claim is still in_progress.
+        let (_, ids_after_crash, status) = decomp_claim(&s, &parent, &id).expect("claim exists");
+        let partial = split_csv_ids(&ids_after_crash);
+        assert_eq!(partial.len(), 1, "exactly one child recorded before crash");
+        assert_eq!(status, "in_progress");
+        // The crashed call linked nothing yet (link happens post-loop).
+        assert!(s.list_subbriefs(&parent).unwrap().is_empty());
+        let child_a = partial[0].clone();
+
+        // Resume: only the two missing children are created; the first is reused.
+        let created = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
+            .unwrap();
+        assert_eq!(created.len(), 3, "the full ordered list, exactly once");
+        assert_eq!(created[0], child_a, "the pre-crash child is reused, not re-created");
+        let subs = s.list_subbriefs(&parent).unwrap();
+        assert_eq!(subs.len(), 3, "all three linked, none duplicated");
+        for c in &created {
+            assert!(subs.contains(c));
+        }
+        // Exactly one resume event + one final materialized event.
+        assert_eq!(materialized_count(&s, &parent), 1);
+        assert_eq!(
+            s.query_events(&parent, 0, 200, Some("brief.suggestion_resumed"), EventOrder::Asc)
+                .unwrap()
+                .len(),
+            1
+        );
+        let (_, ids, fstatus) = decomp_claim(&s, &parent, &id).unwrap();
+        assert_eq!(fstatus, "complete");
+        assert_eq!(ids, created.join(","));
+    }
+
+    // `after` dependencies are wired correctly even when materialization is
+    // resumed across a crash (edges are wired post-loop on the finishing call).
+    #[test]
+    fn decomposition_after_edges_survive_resume() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        // A, B(after A), C(after B).
+        let children = vec![
+            brief::ChildSpec { title: "A".into(), priority: None, after: None, assignee_agent_id: None, assignee_role: None },
+            brief::ChildSpec { title: "B".into(), priority: None, after: Some(0), assignee_agent_id: None, assignee_role: None },
+            brief::ChildSpec { title: "C".into(), priority: None, after: Some(1), assignee_agent_id: None, assignee_role: None },
+        ];
+        let id = s
+            .open_suggestion(&parent, "op", "ordered plan", &children)
+            .unwrap();
+        // Crash after the first child (no edges wired yet).
+        let _ = s
+            .respond_suggestion_failing_after("acme", "subj", &parent, &id, "founder", &[], 1)
+            .unwrap_err();
+        let created = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
+            .unwrap();
+        assert_eq!(created.len(), 3);
+        // B blocked_on A; C blocked_on B.
+        assert_eq!(s.list_snags(&created[1]).unwrap(), vec![created[0].clone()]);
+        assert_eq!(s.list_snags(&created[2]).unwrap(), vec![created[1].clone()]);
+    }
+
+    // A second accept of the same card with a CHANGED proposal (different
+    // fingerprint) is refused — the accepted plan cannot fork — and creates
+    // no further children.
+    #[test]
+    fn decomposition_changed_fingerprint_refuses_fork() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let id = open_plan(&s, &parent, &["A", "B", "C"]);
+        // Start the decomposition (crash after one), so a claim with the
+        // original fingerprint exists.
+        let _ = s
+            .respond_suggestion_failing_after("acme", "subj", &parent, &id, "founder", &[], 1)
+            .unwrap_err();
+        let (fp_before, ids_before, _) = decomp_claim(&s, &parent, &id).unwrap();
+        // Mutate the card's stored proposal to a DIFFERENT plan (same card id).
+        let forked = serde_json::to_string(&brief::Proposal {
+            summary: "Break it down".into(),
+            children: vec![brief::ChildSpec {
+                title: "Totally different".into(),
+                priority: None,
+                after: None,
+                assignee_agent_id: None,
+                assignee_role: None,
+            }],
+        })
+        .unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE brief_interactions SET proposal = ?1 WHERE interaction_id = ?2",
+                rusqlite::params![forked, id],
+            )
+            .unwrap();
+        }
+        // The fork is refused with a typed Invalid error.
+        let err = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
+            .unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)), "fork must refuse");
+        // The claim is untouched: same fingerprint + same cursor, no new children.
+        let (fp_after, ids_after, status) = decomp_claim(&s, &parent, &id).unwrap();
+        assert_eq!(fp_after, fp_before, "fingerprint unchanged");
+        assert_eq!(ids_after, ids_before, "cursor unchanged — no fork created");
+        assert_eq!(status, "in_progress");
+        assert_eq!(split_csv_ids(&ids_after).len(), 1, "only the original partial child");
+    }
+
+    // Governance: an invalid assignee hint refuses the WHOLE accept in the
+    // wire handler BEFORE respond_suggestion runs — so no decomposition claim
+    // and no child is ever created (no partial materialization).
+    #[test]
+    fn decomposition_invalid_hint_creates_no_claim() {
+        let s = TaskStore::in_memory().unwrap();
+        let astore = agent::AgentStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Parent", "subj", None, None, None, None)
+            .unwrap();
+        let open_arg = serde_json::json!({
+            "task_id": parent,
+            "author": "op",
+            "summary": "Plan",
+            "children": [
+                { "title": "A" },
+                { "title": "B", "assignee_role": "ghost" },
+            ],
+        });
+        let open_bytes = serde_json::to_vec(&open_arg).unwrap();
+        let id = match handle_brief_suggest_open(&s, &ctx_op_tenant(&open_bytes, "acme")) {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("open: {} {}", e.kind, e.cause),
+        };
+        let out = handle_brief_suggest_respond(
+            &s,
+            Some(&astore),
+            &ctx_op_tenant(format!("{parent}|{id}|founder|accept").as_bytes(), "acme"),
+        );
+        assert!(matches!(out, HandlerOutcome::Err(_)), "bad hint refuses");
+        assert!(s.list_subbriefs(&parent).unwrap().is_empty(), "no children");
+        assert!(
+            decomp_claim(&s, &parent, &id).is_none(),
+            "no decomposition claim created on a pre-creation refusal"
+        );
+    }
+
+    // Cross-tenant: an accept from the wrong Guild is refused at the handler
+    // boundary and creates neither a decomposition claim nor any child.
+    #[test]
+    fn decomposition_cross_tenant_accept_creates_nothing() {
+        let s = TaskStore::in_memory().unwrap();
+        let a = s
+            .create_brief("acme", "Acme", "subj", None, None, None, None)
+            .unwrap();
+        let open_arg = serde_json::json!({
+            "task_id": a, "author": "op", "summary": "Plan",
+            "children": [{ "title": "A" }, { "title": "B" }],
+        });
+        let open_bytes = serde_json::to_vec(&open_arg).unwrap();
+        let id = match handle_brief_suggest_open(&s, &ctx_tenant(&open_bytes, "acme")) {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(_) => panic!("open errored"),
+        };
+        // A globex caller's accept is refused (not-found, no existence leak).
+        assert!(matches!(
+            handle_brief_suggest_respond(
+                &s,
+                None,
+                &ctx_tenant(format!("{a}|{id}|hacker|accept").as_bytes(), "globex"),
+            ),
+            HandlerOutcome::Err(_)
+        ));
+        assert!(s.list_subbriefs(&a).unwrap().is_empty(), "no children leaked");
+        assert!(
+            decomp_claim(&s, &a, &id).is_none(),
+            "no claim created by a cross-tenant accept"
+        );
     }
 
     #[test]
