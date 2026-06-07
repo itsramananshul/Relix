@@ -243,12 +243,11 @@ Brief+kind on read. What it does **not** do:
   governed path described below — not freeform editing. So Prime may author its own
   bounded, generated plan Dossiers and plan packages under governance, but it still
   does not freely edit arbitrary documents.
-  - **Prime Plan-Package Authoring (v1) — Prime can autonomously OPEN a *proposed*
+  - **Prime Plan-Package Authoring — Prime can autonomously OPEN a *proposed*
     Brief decomposition; it never approves it (opt-in, default OFF).** Behind
     `RELIX_PRIME_LLM_PLAN_PACKAGE` (`1|true|yes|on`, off by default) the
-    autonomous / manual-tick Prime loop may, for a candidate Mandate the existing
-    governed flow leaves **idle**, open a governed **plan package** on a single
-    un-decomposed Brief through the EXISTING `TaskStore::open_plan_package`
+    autonomous / manual-tick Prime loop may open a governed **plan package** on a
+    single un-decomposed Brief through the EXISTING `TaskStore::open_plan_package`
     primitive — an immutable `plan` Dossier revision + a linked `suggest_tasks`
     proposal + an approval-bound `confirm`, the interactions stamped with the
     synthetic `__relix_autonomous_prime__` authority — and **leave the confirm
@@ -275,17 +274,37 @@ Brief+kind on read. What it does **not** do:
     childless Brief with **no** `plan` Dossier, **no** `plan` lock, and **no** open
     plan package, so a human/Prime/stale plan or an existing open package is never
     overwritten or duplicated (it reports `already exists` / `already awaits
-    approval` and authors nothing). **Honest scope / remaining limits:** this is
-    bounded plan-package *authoring*, NOT freeform document editing or
-    self-approval — Prime never accepts its own confirm (no standing-authority
-    category gates plan-package approval in this v1). Because it is deliberately a
-    **gap-filler placed at the tick tail**, it fires only for a candidate the
-    existing flow leaves idle (e.g. a Mandate whose lone Brief is `blocked`); it
-    does **not** pre-empt orchestrate/start, decompose multi-Brief / orchestrated
-    Mandates, or scan every leaf Brief. The live bridge→model→coordinator round
-    trip is **not** integration-tested in CI (the validator + deterministic
-    fallback + the eligibility/dedup/tenant/exactly-once paths are fully
-    unit/loop tested with scripted output).
+    approval` and authors nothing).
+    - **WHEN it fires is configurable (Prime Active Planner Trigger v2):**
+      `RELIX_PRIME_PLAN_PACKAGE_TRIGGER` selects the trigger mode, *layered on top
+      of* the master `RELIX_PRIME_LLM_PLAN_PACKAGE` opt-in (with the master switch
+      OFF nothing is authored in any mode):
+      - `tail` / `gap_fill` / blank (the **default**) — the v1 behaviour: author a
+        plan package only at the **idle tick tail**, for a candidate the existing
+        flow leaves idle (e.g. a Mandate whose lone Brief is `blocked`). Never
+        pre-empts a start.
+      - `before_execute` / `plan_before_execute` — the v2 **active planner**:
+        *before* starting a lone eligible un-decomposed leaf Brief that would
+        otherwise be started, open the proposed plan package **first** and **hold**
+        the raw start, leaving the confirm OPEN for a human. The idle-tail
+        gap-fill still runs as the catch-all. While a package is pending approval
+        the start stays held; an already-planned / locked Brief (not a pending
+        package) is left to start normally rather than stalling.
+      - Any **unknown** value safely falls back to `tail`. The effective trigger is
+        surfaced on the tick record as `plan_package_trigger` (`tail` /
+        `before_execute`).
+    - **Honest scope / remaining limits:** this is bounded plan-package *authoring*
+      under a configurable trigger, NOT freeform document editing and **NOT
+      autonomous approval** — Prime never accepts its own confirm (no
+      standing-authority category gates plan-package approval; self-approval is
+      deliberately **not implemented**). Even in `before_execute` the only thing
+      preempted is the raw start of a **lone eligible leaf** Brief; it does **not**
+      interrupt higher-priority governance gates (proposal / strategy approval, team
+      plan, hire / Clearance), decompose multi-Brief / orchestrated Mandates, or
+      scan every leaf Brief. The live bridge→model→coordinator round trip is **not**
+      integration-tested in CI (the validator + deterministic fallback + the
+      trigger / eligibility / dedup / tenant / exactly-once paths are fully
+      unit/loop tested with scripted output).
 - **Explicit document locking (v1) — SHIPPED, owner-or-nobody, refuse-not-redirect.**
   A logical Dossier (a Brief + `kind`, e.g. `plan`) can now be **locked** so
   concurrent authors don't race: `brief.dossier_lock` /

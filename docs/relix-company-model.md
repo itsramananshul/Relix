@@ -953,10 +953,46 @@ is NOT the permission system**, exactly as in §C/§D/§E/§F:
 - **No keys in the coordinator + independent of §C/§D/§E/§F.** It reuses the SAME `ai.chat`
   mesh path + decider as the other authoring layers — no provider key enters the
   coordinator, web bridge, or dashboard; an unavailable peer falls back deterministically.
-  The switches are independent. **Honest scope:** this is a deliberate gap-filler placed at
-  the tick tail, so it fires only for a candidate the existing flow leaves idle (e.g. a
-  Mandate whose lone Brief is `blocked`); it does not pre-empt orchestrate/start, decompose
-  multi-Brief / orchestrated Mandates, or scan every leaf Brief.
+  The switches are independent. **Honest scope:** by default (the `tail` trigger) this is a
+  deliberate gap-filler placed at the tick tail, so it fires only for a candidate the
+  existing flow leaves idle (e.g. a Mandate whose lone Brief is `blocked`); the
+  **`before_execute` trigger (F-ter, below)** makes it also pre-empt a raw start. It never
+  decomposes multi-Brief / orchestrated Mandates or scans every leaf Brief.
+
+### F-ter. Prime Active Planner Trigger v2 — plan BEFORE executing (opt-in)
+
+**The gap.** F-bis only fired at the **idle tail**: a Brief that was ready to *start* would
+just start raw and undecomposed; Prime never got the chance to propose a decomposition
+*first*. That kept the planner conservative — Prime could fill gaps but could not actively
+say "before we run this, here's how I'd break it down."
+
+**The contract.** A second, *layered* switch `RELIX_PRIME_PLAN_PACKAGE_TRIGGER` selects WHEN
+F-bis fires — it changes only the **timing**, never the contract above (still propose-only,
+still server-validated, still confirm-left-open, still no self-approval / assignment / child
+creation). It is **inert unless** the master `RELIX_PRIME_LLM_PLAN_PACKAGE` switch (F-bis)
+is on.
+
+- **`tail` / `gap_fill` / blank — the default.** F-bis's v1 behaviour exactly: author a plan
+  package only at the idle tail; never pre-empt a start.
+- **`before_execute` / `plan_before_execute` — the active planner.** Before starting a lone
+  **eligible** un-decomposed leaf Brief that would otherwise be started, Prime opens the
+  proposed plan package **first** and **holds** the raw start, leaving the confirm OPEN for a
+  human. The idle-tail gap-fill still runs as the catch-all. It pre-empts **only** a lone
+  eligible leaf start: it never interrupts a higher-priority governance gate (proposal /
+  strategy approval, team plan, hire / Clearance — those are different phases), and it never
+  touches a multi-Brief / orchestrated Mandate. While a package is **pending approval** the
+  start stays held across ticks (no duplicate package, no budget churn); an already-planned
+  or plan-locked Brief — not a pending package — is left to start normally rather than
+  stalling.
+- **Unknown values fall back to `tail`** (a typo never silently turns on preemption). The
+  effective trigger is surfaced on the tick record as `plan_package_trigger`
+  (`tail` / `before_execute`).
+
+**Still NOT autonomous approval.** `before_execute` is the active *planner*, not an
+autonomous *approver*: Prime still never accepts its own `confirm`, still never assigns
+agents / picks tools / creates children, and a human still materializes the decomposition
+through `brief.plan_confirm_respond`. This is **not** freeform LLM control of the company —
+it is a bounded, governed proposal placed one step earlier in the tick.
 
 ### G. Prime Shift Disposition v1 — autonomous review-accept + apply (opt-in, grant-gated)
 

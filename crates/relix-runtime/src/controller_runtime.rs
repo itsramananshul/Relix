@@ -9929,7 +9929,7 @@ fn register_node_type_handlers(
                                 MeshAiDecider, handle_prime_autonomy_tick_now_with_ai,
                                 parse_prime_llm_deliberation, parse_prime_llm_orchestration,
                                 parse_prime_llm_plan_package, parse_prime_llm_prioritization,
-                                parse_prime_llm_strategy_draft,
+                                parse_prime_llm_strategy_draft, parse_prime_plan_package_trigger,
                             };
                             // Re-read all three Prime LLM switches (like the timer) so
                             // an operator can flip them without a restart: deliberation
@@ -9959,6 +9959,15 @@ fn register_node_type_handlers(
                             );
                             let plan_package_llm_enabled = parse_prime_llm_plan_package(
                                 std::env::var("RELIX_PRIME_LLM_PLAN_PACKAGE")
+                                    .ok()
+                                    .as_deref(),
+                            );
+                            // WHEN plan-package authoring fires (tail gap-fill vs
+                            // active before-execute preemption); re-read each tick so
+                            // an operator can flip it without a restart. Inert unless
+                            // the master `RELIX_PRIME_LLM_PLAN_PACKAGE` switch is on.
+                            let plan_package_trigger = parse_prime_plan_package_trigger(
+                                std::env::var("RELIX_PRIME_PLAN_PACKAGE_TRIGGER")
                                     .ok()
                                     .as_deref(),
                             );
@@ -10011,6 +10020,7 @@ fn register_node_type_handlers(
                                     prioritization_enabled,
                                     orchestration_llm_enabled,
                                     plan_package_llm_enabled,
+                                    plan_package_trigger,
                                 )
                             })
                             .await;
@@ -11667,7 +11677,7 @@ fn register_node_type_handlers(
                             autonomous_prime_tick, parse_prime_llm_deliberation,
                             parse_prime_llm_orchestration, parse_prime_llm_plan_package,
                             parse_prime_llm_prioritization, parse_prime_llm_strategy_draft,
-                            plan_autonomy_drive,
+                            parse_prime_plan_package_trigger, plan_autonomy_drive,
                         };
                         // Re-read all three Prime LLM switches each tick: deliberation
                         // (action choice), strategy draft (proposed strategy body
@@ -11697,6 +11707,13 @@ fn register_node_type_handlers(
                         );
                         let prime_plan_package = parse_prime_llm_plan_package(
                             std::env::var("RELIX_PRIME_LLM_PLAN_PACKAGE")
+                                .ok()
+                                .as_deref(),
+                        );
+                        // WHEN plan-package authoring fires (tail vs before_execute);
+                        // inert unless the master plan-package switch is on.
+                        let prime_plan_package_trigger = parse_prime_plan_package_trigger(
+                            std::env::var("RELIX_PRIME_PLAN_PACKAGE_TRIGGER")
                                 .ok()
                                 .as_deref(),
                         );
@@ -11765,6 +11782,7 @@ fn register_node_type_handlers(
                                     prime_prioritization,
                                     prime_orchestration,
                                     prime_plan_package,
+                                    prime_plan_package_trigger,
                                 )?;
                                 records.append(&mut r);
                             }
@@ -11788,6 +11806,7 @@ fn register_node_type_handlers(
                                         prime_prioritization,
                                         prime_orchestration,
                                         prime_plan_package,
+                                        prime_plan_package_trigger,
                                     )?;
                                     records.append(&mut r);
                                 }

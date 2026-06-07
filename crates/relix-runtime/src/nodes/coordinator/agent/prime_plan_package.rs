@@ -83,6 +83,53 @@ impl PrimePlanPackageMode {
     }
 }
 
+/// WHEN, during a tick, Prime authors a plan package — layered ON TOP of the master
+/// `RELIX_PRIME_LLM_PLAN_PACKAGE` opt-in (`RELIX_PRIME_PLAN_PACKAGE_TRIGGER`). The
+/// master switch decides IF any plan-package authoring happens at all; this trigger
+/// decides whether authoring is limited to the idle tail (v1) or also preempts a
+/// raw Brief start (v2). With the master switch OFF, the trigger is inert (no
+/// authoring in any mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimePlanPackageTrigger {
+    /// v1 behaviour: author a plan package ONLY at the idle tail — for a candidate
+    /// the governed flow otherwise leaves idle (no safe advance / start / governance
+    /// / disposition action). NEVER preempts a Brief start. This is the default and
+    /// the safe fallback for a blank or unrecognised configured value (`tail` /
+    /// `gap_fill`).
+    Tail,
+    /// v2 active planner: BEFORE starting/executing a lone eligible un-decomposed
+    /// Brief, open a *proposed* decomposition plan package FIRST and HOLD the raw
+    /// start, leaving the confirm OPEN for a human. The idle-tail gap-fill still runs
+    /// as the catch-all for candidates that never reach a start. Still no
+    /// self-approval, no agent/tool assignment, no child creation — only the WHEN
+    /// changes (`before_execute` / `plan_before_execute`).
+    BeforeExecute,
+}
+
+impl PrimePlanPackageTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrimePlanPackageTrigger::Tail => "tail",
+            PrimePlanPackageTrigger::BeforeExecute => "before_execute",
+        }
+    }
+
+    /// Parse a configured trigger value (case-insensitive, trimmed). `before_execute`
+    /// / `plan_before_execute` → [`BeforeExecute`](Self::BeforeExecute); `tail` /
+    /// `gap_fill` / blank → [`Tail`](Self::Tail). Any UNKNOWN value SAFELY falls back
+    /// to `Tail` (the conservative v1 behaviour) — an operator typo never silently
+    /// turns on preemptive authoring. PURE + unit-tested.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("before_execute" | "plan_before_execute") => {
+                PrimePlanPackageTrigger::BeforeExecute
+            }
+            // tail / gap_fill / "" / unknown → conservative v1 tail behaviour.
+            _ => PrimePlanPackageTrigger::Tail,
+        }
+    }
+}
+
 /// A validated, sanitized plan package ready to hand to
 /// `TaskStore::open_plan_package`. The children are already normalized enough that
 /// the store's own [`brief::normalize_proposal`] accepts them (defence in depth:
@@ -563,5 +610,56 @@ mod tests {
         assert_eq!(PrimePlanPackageMode::LlmUsed.as_str(), "llm_used");
         assert_eq!(PrimePlanPackageMode::Fallback.as_str(), "fallback");
         assert_eq!(PrimePlanPackageMode::Unavailable.as_str(), "unavailable");
+    }
+
+    #[test]
+    fn trigger_parses_tail_gap_fill_and_blank_as_tail() {
+        for raw in [None, Some(""), Some("   "), Some("tail"), Some("gap_fill")] {
+            assert_eq!(
+                PrimePlanPackageTrigger::parse(raw),
+                PrimePlanPackageTrigger::Tail,
+                "raw {raw:?}"
+            );
+        }
+        // Case / whitespace insensitive.
+        assert_eq!(
+            PrimePlanPackageTrigger::parse(Some("  TAIL ")),
+            PrimePlanPackageTrigger::Tail
+        );
+    }
+
+    #[test]
+    fn trigger_parses_before_execute_variants() {
+        for raw in [
+            Some("before_execute"),
+            Some("plan_before_execute"),
+            Some("  Before_Execute "),
+        ] {
+            assert_eq!(
+                PrimePlanPackageTrigger::parse(raw),
+                PrimePlanPackageTrigger::BeforeExecute,
+                "raw {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_unknown_value_falls_back_to_tail() {
+        for raw in [Some("aggressive"), Some("on"), Some("yes"), Some("1")] {
+            assert_eq!(
+                PrimePlanPackageTrigger::parse(raw),
+                PrimePlanPackageTrigger::Tail,
+                "unknown {raw:?} must fall back to tail"
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_strings_are_stable() {
+        assert_eq!(PrimePlanPackageTrigger::Tail.as_str(), "tail");
+        assert_eq!(
+            PrimePlanPackageTrigger::BeforeExecute.as_str(),
+            "before_execute"
+        );
     }
 }
