@@ -1257,6 +1257,57 @@ pub fn handle_prime_autonomy_tick_now(
     metrics: Option<&crate::metrics::MetricsQuery>,
     ctx: &InvocationCtx,
 ) -> HandlerOutcome {
+    // Deterministic shape: honour the `RELIX_PRIME_LLM_DELIBERATION` switch for the
+    // honest mode but carry NO live decider. The live deliberation path is wired by
+    // the controller-runtime registration through
+    // [`handle_prime_autonomy_tick_now_with_ai`], which builds the SAME
+    // `MeshAiDecider` the background timer uses (and runs the tick from a blocking
+    // thread, because that decider does a `Handle::block_on`). Callers that already
+    // hold a mesh decider must use that helper, not this entry point.
+    let llm_enabled = parse_prime_llm_deliberation(
+        std::env::var("RELIX_PRIME_LLM_DELIBERATION")
+            .ok()
+            .as_deref(),
+    );
+    handle_prime_autonomy_tick_now_with_ai(
+        agent_store,
+        spine_store,
+        task_store,
+        registry,
+        metrics,
+        ctx,
+        None,
+        llm_enabled,
+    )
+}
+
+/// Backing helper for [`handle_prime_autonomy_tick_now`] that accepts an explicit
+/// optional live AI decider + the deliberation switch, so the controller-runtime
+/// registration can wire the SAME [`MeshAiDecider`] the background timer uses —
+/// closing the v1 caveat where the manual tick always reported `unavailable`. With
+/// `ai = Some(decider)` and `llm_enabled = true` each candidate may exercise the
+/// live `ai.chat` deliberation; with `ai = None` the tick is deterministic and each
+/// record honestly reads `unavailable` (when `llm_enabled`) or `deterministic_only`
+/// (when not). The role gate + tenant scoping are byte-for-byte the timer's: a
+/// worker caller is `POLICY_DENIED` with ZERO side effects, and the tick is scoped
+/// to the caller's OWN Guild (`Some(tenant)`), never all Guilds.
+///
+/// SAFETY: a [`MeshAiDecider`]'s `deliberate` bridges to the async mesh via
+/// `Handle::block_on`, which PANICS on an async-runtime worker thread. When `ai`
+/// may be a mesh decider, the caller MUST run this from a blocking thread
+/// (`spawn_blocking`). The pure-decider tests pass a synchronous scripted decider
+/// and so can call it directly.
+#[allow(clippy::too_many_arguments)]
+pub fn handle_prime_autonomy_tick_now_with_ai(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &Arc<TaskStore>,
+    registry: &crate::rig::RigRegistry,
+    metrics: Option<&crate::metrics::MetricsQuery>,
+    ctx: &InvocationCtx,
+    ai: Option<&dyn PrimeAiDecider>,
+    llm_enabled: bool,
+) -> HandlerOutcome {
     // Same Board-only gate as the runtime toggle: a worker subject can never
     // wake the autonomous Prime driver, even though this takes no new authority.
     if !caller_is_operator(ctx) {
@@ -1278,18 +1329,11 @@ pub fn handle_prime_autonomy_tick_now(
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     // Tenant-scoped (`Some(tenant)`): this wakes ONLY the caller's Guild, never
-    // all Guilds — even if the env override is on for the background timer.
-    // The manual wake-up does not carry a coordinator mesh client, so it never
-    // performs the live `ai.chat` deliberation call: it passes no decider. With
-    // `RELIX_PRIME_LLM_DELIBERATION` on, each candidate's record honestly reads
-    // `unavailable` (the deterministic action still runs); with it off, the
-    // records read `deterministic_only`. The background timer is the live
-    // deliberation path.
-    let llm_enabled = parse_prime_llm_deliberation(
-        std::env::var("RELIX_PRIME_LLM_DELIBERATION")
-            .ok()
-            .as_deref(),
-    );
+    // all Guilds — even if the env override is on for the background timer. When a
+    // live decider is wired (mesh AI peer reachable) and `RELIX_PRIME_LLM_DELIBERATION`
+    // is on, each candidate may use the live deliberation layer; otherwise the
+    // deterministic action runs and the record honestly reads `unavailable` /
+    // `deterministic_only`.
     let records = match autonomous_prime_tick(
         agent_store,
         spine_store,
@@ -1300,7 +1344,7 @@ pub fn handle_prime_autonomy_tick_now(
         max,
         Some(tenant),
         &hire_rig,
-        None,
+        ai,
         llm_enabled,
     ) {
         Ok(r) => r,
@@ -4157,6 +4201,197 @@ mod tests {
             team_planned, max,
             "the per-tick budget left the excess Mandate untouched"
         );
+    }
+
+    // ── MANUAL AUTONOMY TICK — LIVE DELIBERATION (operator) ────────────────
+    // The manual tick (`prime.autonomy_tick_now`) closes the Prime Deliberation
+    // v1 caveat: when the controller-runtime wires a live decider it exercises
+    // the SAME deliberation layer as the timer. These tests drive
+    // `handle_prime_autonomy_tick_now_with_ai` with a synchronous scripted
+    // decider (no mesh / `Handle::block_on`), so the role gate + provenance are
+    // covered without the async bridge.
+
+    /// Run `handle_prime_autonomy_tick_now_with_ai` for `tenant` as `role` with an
+    /// explicit optional decider + the deliberation switch. Returns the raw
+    /// outcome so the deny-path test can assert POLICY_DENIED.
+    fn tick_now_ai_raw(
+        agents: &AgentStore,
+        spine: &SpineStore,
+        tasks: &Arc<TaskStore>,
+        reg: &crate::rig::RigRegistry,
+        role: &str,
+        tenant: &str,
+        ai: Option<&dyn crate::nodes::coordinator::agent::prime_deliberation::PrimeAiDecider>,
+        llm_enabled: bool,
+    ) -> HandlerOutcome {
+        let mut ctx = fake_ctx_with_role(b"", role, b"caller");
+        ctx.tenant_id = Some(tenant.to_string());
+        handle_prime_autonomy_tick_now_with_ai(
+            agents,
+            spine,
+            tasks,
+            reg,
+            None,
+            &ctx,
+            ai,
+            llm_enabled,
+        )
+    }
+
+    /// Like [`tick_now_ai_raw`] but as an operator, unwrapping the Ok JSON.
+    fn tick_now_ai(
+        agents: &AgentStore,
+        spine: &SpineStore,
+        tasks: &Arc<TaskStore>,
+        reg: &crate::rig::RigRegistry,
+        tenant: &str,
+        ai: Option<&dyn crate::nodes::coordinator::agent::prime_deliberation::PrimeAiDecider>,
+        llm_enabled: bool,
+    ) -> Value {
+        match tick_now_ai_raw(
+            agents,
+            spine,
+            tasks,
+            reg,
+            "operator",
+            tenant,
+            ai,
+            llm_enabled,
+        ) {
+            HandlerOutcome::Ok(b) => serde_json::from_slice(&b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("tick_now_ai errored: {}", e.cause),
+        }
+    }
+
+    // TA-1) Manual tick with a live decider scripted to HOLD (`{action:"none"}`)
+    //       and llm_enabled=true: the record reads `ai_mode=llm_used`, the outcome
+    //       is `skipped`, and there are ZERO side effects (no Team Plan recorded).
+    #[test]
+    fn tick_now_with_decider_hold_is_llm_used_zero_side_effects() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        runnable_operative(&agents, "engineer", "subj-e");
+
+        let decider = ScriptedDecider {
+            reply: Ok(r#"{"action":"none","reason":"hold for human review"}"#.to_string()),
+        };
+        let v = tick_now_ai(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            "default",
+            Some(&decider),
+            true,
+        );
+        let rec = v["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["target_id"] == json!(m))
+            .expect("mandate considered");
+        assert_eq!(rec["phase"], "needs_team_plan");
+        assert_eq!(rec["action"], "none");
+        assert_eq!(rec["outcome"], "skipped");
+        assert_eq!(rec["ai_mode"], "llm_used");
+        // ZERO side effects — the HOLD recorded no Team Plan.
+        assert!(spine.latest_team_plan("default", &m).unwrap().is_none());
+    }
+
+    // TA-2) Manual tick with a live decider scripted to CONFIRM the computed action
+    //       executes the governed action and the record reads `ai_mode=llm_used`.
+    #[test]
+    fn tick_now_with_decider_confirm_executes_llm_used() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        runnable_operative(&agents, "engineer", "subj-e");
+
+        let decider = ScriptedDecider {
+            reply: Ok(r#"{"action":"create_team_plan","reason":"crew is ready"}"#.to_string()),
+        };
+        let v = tick_now_ai(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            "default",
+            Some(&decider),
+            true,
+        );
+        let rec = v["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["target_id"] == json!(m))
+            .expect("mandate considered");
+        assert_eq!(rec["action"], "create_team_plan");
+        assert_eq!(rec["outcome"], "advanced");
+        assert_eq!(rec["ai_mode"], "llm_used");
+        assert!(v["advanced"].as_u64().unwrap() >= 1);
+        // The governed action really ran.
+        assert!(spine.latest_team_plan("default", &m).unwrap().is_some());
+    }
+
+    // TA-3) Manual tick with NO decider but llm_enabled=true honestly reports
+    //       `ai_mode=unavailable` and still executes the deterministic action — the
+    //       missing-mesh / unreachable-peer fallback the caveat now narrows to.
+    #[test]
+    fn tick_now_no_decider_llm_enabled_is_unavailable_runs_deterministically() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        runnable_operative(&agents, "engineer", "subj-e");
+
+        let v = tick_now_ai(&agents, &spine, &tasks, &reg, "default", None, true);
+        let rec = v["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["target_id"] == json!(m))
+            .expect("mandate considered");
+        assert_eq!(rec["action"], "create_team_plan");
+        assert_eq!(rec["outcome"], "advanced");
+        assert_eq!(rec["ai_mode"], "unavailable");
+        // The deterministic action was NOT blocked by the absent decider.
+        assert!(spine.latest_team_plan("default", &m).unwrap().is_some());
+    }
+
+    // TA-4) The role gate is unchanged on the live-decider helper: a worker subject
+    //       is POLICY_DENIED with zero side effects even with a decider wired.
+    #[test]
+    fn tick_now_with_decider_worker_denied_no_side_effect() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        runnable_operative(&agents, "engineer", "subj-e");
+
+        let decider = ScriptedDecider {
+            reply: Ok(r#"{"action":"create_team_plan","reason":"go"}"#.to_string()),
+        };
+        let out = tick_now_ai_raw(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            "worker",
+            "default",
+            Some(&decider),
+            true,
+        );
+        match out {
+            HandlerOutcome::Err(e) => {
+                assert_eq!(e.kind, relix_core::types::error_kinds::POLICY_DENIED);
+            }
+            HandlerOutcome::Ok(_) => panic!("a worker subject must be denied tick-now"),
+        }
+        // The denied call mutated nothing — no Team Plan recorded.
+        assert!(spine.latest_team_plan("default", &m).unwrap().is_none());
     }
 
     // ── PRIME STANDING AUTHORITY (v1) ──────────────────────────────────────

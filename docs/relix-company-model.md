@@ -727,6 +727,14 @@ system.** The security invariant is absolute and unchanged:
   `{session_id,prompt,history}` shape as the bridge — no provider key enters the
   coordinator, the web bridge config, or the dashboard; a missing mesh / AI peer
   reads `unavailable` and falls back deterministically.
+- **The manual tick uses the same live path.** The operator **Run Prime now**
+  wake-up (`prime.autonomy_tick_now`) builds the SAME `MeshAiDecider` from the
+  coordinator's populated outbound mesh client as the background timer, so it
+  exercises live deliberation whenever the mesh AI peer is reachable (the
+  controller runs the tick from a blocking thread so the decider's
+  `Handle::block_on` never runs on an async worker). Live deliberation depends on
+  a **populated coordinator mesh client and a reachable AI peer**; without them
+  the manual tick honestly reads `unavailable` and falls back deterministically.
 
 **It is not freeform Prime.** This is *constrained deliberation over the existing
 action menu* — confirm-or-hold one computed action with a short reason. It does

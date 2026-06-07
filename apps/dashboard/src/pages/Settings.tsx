@@ -554,7 +554,9 @@ function AutonomousPrimeSwitchPanel({
             <span className="muted" style={{ fontSize: 12 }}>
               Wakes <strong>exactly one</strong> bounded tick for this Guild (up to{" "}
               {autonomy.autonomous_prime_max ?? 1} action). It does <strong>not</strong> require the
-              loop to be on and does <strong>not</strong> bypass standing approvals or budgets.
+              loop to be on and does <strong>not</strong> bypass standing approvals or budgets.{" "}
+              <strong>Run Prime now</strong> uses the same deliberation layer when the coordinator mesh
+              AI peer is available; otherwise it falls back deterministically.
             </span>
           </div>
 

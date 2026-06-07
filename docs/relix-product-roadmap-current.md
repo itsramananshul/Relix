@@ -578,9 +578,15 @@ ledger entry or design section.
    falls back deterministically with an honest `ai_mode` (`deterministic_only`/`llm_used`/`fallback`/`unavailable`,
    surfaced on `prime.autonomy_tick_now`). The live decider performs only the existing `ai.chat` mesh call to the
    AI peer (`RELIX_PRIME_AI_PEER`/`RELIX_PRIME_LLM_SESSION`) — **no provider key in the coordinator / web bridge /
-   dashboard**. *Files:* `crates/relix-runtime/src/nodes/coordinator/agent/prime_deliberation.rs` (new pure
-   module + 16 tests), `…/agent/prime_driver.rs` (wrapper + `MeshAiDecider` + 8 loop tests), `…/agent/mod.rs`,
-   `controller_runtime.rs` (live wiring), `apps/dashboard/src/pages/Settings.tsx` + rebuilt `dashboard-dist`.
+   dashboard**. Both the background timer **and** the manual **Run Prime now** tick (`prime.autonomy_tick_now`)
+   build the SAME `MeshAiDecider` from the coordinator's populated outbound mesh client, so the manual tick
+   exercises live deliberation when the mesh AI peer is reachable (the controller runs the tick from a blocking
+   thread so the decider's `Handle::block_on` never runs on an async worker); when the mesh cell is unpopulated or
+   the peer is unreachable it honestly falls back to `unavailable` + deterministic. *Files:*
+   `crates/relix-runtime/src/nodes/coordinator/agent/prime_deliberation.rs` (new pure
+   module + 16 tests), `…/agent/prime_driver.rs` (wrapper + `MeshAiDecider` + manual-tick helper + loop tests),
+   `…/agent/mod.rs`, `controller_runtime.rs` (live wiring for the timer + the manual tick),
+   `apps/dashboard/src/pages/Settings.tsx` + rebuilt `dashboard-dist`.
    *Still deferred:* a true end-to-end no-grant autonomous driver that also **approves** on its own (propose →
    **approve** → staff → orchestrate with nothing granted) — intentionally not built; **freeform tool-calling /
    model-reasoned strategy authoring** remains deferred (deliberation only confirms-or-holds a computed action;

@@ -476,10 +476,16 @@ the approved work is already ready. What it does **not** do:
     author strategy, invent goals, pick identities to hire, or call tools. The
     live bridge→model→coordinator round trip is **not** integration-tested in CI (it
     needs a real provider; the validator + the deterministic fallback that bound it are
-    fully unit/loop tested with scripted output), and the **manual** tick
-    (`prime.autonomy_tick_now`) carries no mesh client, so with deliberation ON it
-    honestly reports `unavailable` and runs deterministically — the background timer is
-    the live deliberation path.
+    fully unit/loop tested with scripted output). The **manual** tick
+    (`prime.autonomy_tick_now`, the **Run Prime now** button) now wires the SAME live
+    `MeshAiDecider` as the background timer: with deliberation ON it exercises live
+    deliberation whenever the coordinator's outbound mesh client (the populated alert
+    mesh cell) and the AI peer are reachable, and the controller runs the tick from a
+    blocking thread so the decider's `Handle::block_on` never executes on an async
+    worker. The remaining honest caveat is narrower: live AI deliberation depends on a
+    **populated coordinator mesh client and a reachable AI peer** — when the mesh cell
+    is unpopulated or the peer is unreachable the manual tick honestly reports
+    `unavailable` and runs deterministically.
   - What this still does **NOT** do: there is **no freeform model reasoning or
     tool-calling** — the deliberation above is constrained to confirm-or-hold the ONE
     computed governed action (it cannot author strategy, invent a goal, or call a

@@ -9896,6 +9896,21 @@ fn register_node_type_handlers(
             let st = store.clone();
             let ags = agent_store.clone();
             let mq = metrics.map(|m| m.query.clone());
+            // Prime Deliberation v1 — manual-tick live path. The manual tick now
+            // reuses the SAME mesh AI decider the background timer builds, so
+            // `Run Prime now` exercises the live deliberation layer instead of
+            // always reporting `unavailable`. No provider key enters the
+            // coordinator: the decider performs the existing governed `ai.chat`
+            // mesh call through the coordinator's EXISTING outbound mesh client
+            // (the populated alert mesh cell). When the cell is unpopulated or the
+            // switch is off the tick falls back deterministically, exactly as
+            // before. Because `MeshAiDecider::deliberate` does a `Handle::block_on`,
+            // the tick is run from a `spawn_blocking` thread (never the async
+            // worker) — calling `block_on` on a runtime thread would panic.
+            let prime_alert_cell = metrics.map(|m| m.alert_mesh_cell.clone());
+            let prime_ai_peer = crate::nodes::coordinator::agent::prime_driver::prime_ai_peer();
+            let prime_llm_session =
+                crate::nodes::coordinator::agent::prime_driver::prime_llm_session();
             bridge.register(
                 "prime.autonomy_tick_now",
                 std::sync::Arc::new(crate::dispatch::FnHandler(
@@ -9905,10 +9920,74 @@ fn register_node_type_handlers(
                         let ags = ags.clone();
                         let spine = spine.clone();
                         let mq = mq.clone();
+                        let prime_alert_cell = prime_alert_cell.clone();
+                        let prime_ai_peer = prime_ai_peer.clone();
+                        let prime_llm_session = prime_llm_session.clone();
                         async move {
-                            crate::nodes::coordinator::agent::prime_driver::handle_prime_autonomy_tick_now(
-                                &ags, &spine, &st, &reg, mq.as_ref(), &ctx,
-                            )
+                            use crate::nodes::coordinator::agent::prime_deliberation::PrimeAiDecider;
+                            use crate::nodes::coordinator::agent::prime_driver::{
+                                MeshAiDecider, handle_prime_autonomy_tick_now_with_ai,
+                                parse_prime_llm_deliberation,
+                            };
+                            // Re-read the deliberation switch (like the timer) so an
+                            // operator can flip it without a restart.
+                            let llm_enabled = parse_prime_llm_deliberation(
+                                std::env::var("RELIX_PRIME_LLM_DELIBERATION")
+                                    .ok()
+                                    .as_deref(),
+                            );
+                            // Capture the runtime handle on the async thread; the
+                            // blocking tick bridges the async mesh call through it.
+                            let prime_handle = tokio::runtime::Handle::current();
+                            let tenant = ctx.tenant_id_or_default().to_string();
+                            let outcome = tokio::task::spawn_blocking(move || {
+                                // Build the live decider only when the switch is on
+                                // AND the coordinator mesh cell is populated (a
+                                // reachable outbound client). Otherwise pass None →
+                                // honest `unavailable`/`deterministic_only` fallback.
+                                let prime_decider = if llm_enabled {
+                                    prime_alert_cell
+                                        .as_ref()
+                                        .and_then(|c| c.get())
+                                        .map(|mc| {
+                                            MeshAiDecider::new(
+                                                prime_handle.clone(),
+                                                mc.mesh.clone(),
+                                                mc.identity.clone(),
+                                                prime_ai_peer.clone(),
+                                                prime_llm_session.clone(),
+                                                30,
+                                                Some(tenant.clone()),
+                                            )
+                                        })
+                                } else {
+                                    None
+                                };
+                                let prime_ai: Option<&dyn PrimeAiDecider> =
+                                    prime_decider.as_ref().map(|d| d as &dyn PrimeAiDecider);
+                                handle_prime_autonomy_tick_now_with_ai(
+                                    &ags,
+                                    &spine,
+                                    &st,
+                                    &reg,
+                                    mq.as_ref(),
+                                    &ctx,
+                                    prime_ai,
+                                    llm_enabled,
+                                )
+                            })
+                            .await;
+                            match outcome {
+                                Ok(o) => o,
+                                Err(e) => crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                        cause: format!("prime.autonomy_tick_now join error: {e}"),
+                                        retry_hint: 1,
+                                        retry_after: None,
+                                    },
+                                ),
+                            }
                         }
                     },
                 )),
