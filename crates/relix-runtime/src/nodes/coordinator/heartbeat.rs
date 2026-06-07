@@ -2533,6 +2533,18 @@ pub fn prepare_claimed_run(
             )
         })
         .unwrap_or_default();
+    // Look up a SAFE, same-scope resumable adapter session so a subscription
+    // CLI Operative continues its prior thread instead of starting cold. The
+    // lookup is keyed on EXACTLY (tenant, Operative, Rig, Brief) — the same
+    // 4-tuple `record_run_runtime_state` writes — so a session stored under a
+    // different tenant, Operative, Rig, or unrelated Brief can never match.
+    // Only a supported CLI Rig (Codex) actually maps the id to a resume argv;
+    // every other Rig ignores the field (relix-agent-adapters.md §3.3).
+    // Best-effort — any lookup miss/error simply runs fresh.
+    let resume_session = store
+        .resume_session_for(&card.task_id, assignee, &rig_name)
+        .ok()
+        .flatten();
     let mut req = RigRunRequest::new(&card.task_id, assignee, String::new(), prompt)
         .with_run_id(run_id)
         .with_bridge_token(&token)
@@ -2542,7 +2554,10 @@ pub fn prepare_claimed_run(
         // `-c model_reasoning_effort` flags, others ignore it (relix-agent-
         // adapters.md §3.2/§3.3). Empty/absent normalizes away in the builder.
         .with_model_preference(prefs.model.clone())
-        .with_reasoning_effort(prefs.effort.clone());
+        .with_reasoning_effort(prefs.effort.clone())
+        // Continue the same-scope adapter session when one is stored (Codex
+        // only maps it; others ignore). Absent/blank normalizes away.
+        .with_resume_session_id(resume_session);
     // Pin the child's working directory to the scoped workspace.
     if let Some(ws) = &workspace {
         req = req.with_working_dir(std::path::PathBuf::from(ws));
@@ -3124,6 +3139,110 @@ mod tests {
         let got = seen.lock().unwrap().clone().expect("the rig ran");
         assert_eq!(got.0, None, "no model pref when the Operative has none");
         assert_eq!(got.1, None, "no effort when the Operative has none");
+    }
+
+    // ── Same-scope adapter session resume reaches the Rig request ──
+
+    /// A Rig that records the resume session id on the request it is asked to
+    /// run, so a test can prove a stored compatible session reaches the
+    /// dispatch chokepoint's [`RigRunRequest`] (and an incompatible one does
+    /// not).
+    struct ResumeCaptureRig {
+        seen: std::sync::Arc<std::sync::Mutex<Option<Option<String>>>>,
+    }
+    impl Rig for ResumeCaptureRig {
+        fn name(&self) -> &str {
+            "capture"
+        }
+        fn run(&self, req: &RigRunRequest) -> RigOutcome {
+            *self.seen.lock().unwrap() = Some(req.resume_session_id.clone());
+            RigOutcome::Done {
+                summary: "captured".to_string(),
+            }
+        }
+    }
+
+    /// Seed a prior FINISHED run's runtime state for an exact
+    /// (default-tenant, agent, rig, brief) pairing → a resumable session id.
+    /// The run is finished so it is not a `live` run that would block a new
+    /// start.
+    fn seed_session(s: &TaskStore, run_id: &str, brief: &str, agent: &str, rig: &str, session: &str) {
+        s.record_run_start(
+            run_id,
+            brief,
+            agent,
+            rig,
+            "manual",
+            &crate::nodes::coordinator::RunWorkspaceInfo::default(),
+        )
+        .unwrap();
+        let u = crate::rig::RunUsage {
+            session_id: Some(session.to_string()),
+            provider: Some("openai".to_string()),
+            ..Default::default()
+        };
+        s.record_run_runtime_state(run_id, &u, "done", None, None).unwrap();
+        s.record_run_finish(run_id, "done", "seeded").unwrap();
+    }
+
+    #[test]
+    fn dispatch_resumes_a_stored_compatible_session() {
+        let (s, _tmp) = store_ws();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let rig: Arc<dyn Rig> = Arc::new(ResumeCaptureRig { seen: seen.clone() });
+        let b = ready_brief(&s, "resume me", "agt_r");
+        // A prior run on the SAME (tenant, agent, rig, brief) left a session.
+        seed_session(&s, "seed_run", &b, "agt_r", "capture", "sess-keep");
+
+        let records = dispatch_batch_with_policy(
+            &s,
+            50,
+            300,
+            None,
+            |_| true,
+            |_| 20,
+            |_| BudgetAdmission::Allow,
+            |_: &brief::BriefCard| Some(rig.clone()),
+            |c: &brief::BriefCard| c.title.clone(),
+            |_: &brief::BriefCard| RunModelPrefs::default(),
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        let got = seen.lock().unwrap().clone().expect("the rig ran");
+        assert_eq!(
+            got.as_deref(),
+            Some("sess-keep"),
+            "the compatible same-scope session resumed into the request"
+        );
+    }
+
+    #[test]
+    fn dispatch_ignores_incompatible_stored_sessions() {
+        let (s, _tmp) = store_ws();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let rig: Arc<dyn Rig> = Arc::new(ResumeCaptureRig { seen: seen.clone() });
+        let b = ready_brief(&s, "target", "agt_r");
+        // Sessions stored under a DIFFERENT Operative or a DIFFERENT Rig — the
+        // run for (agt_r, capture, b) must NOT pick either up.
+        seed_session(&s, "seed_other_agent", &b, "agt_other", "capture", "sess-agent");
+        seed_session(&s, "seed_other_rig", &b, "agt_r", "claude", "sess-rig");
+
+        let records = dispatch_batch_with_policy(
+            &s,
+            50,
+            300,
+            None,
+            |_| true,
+            |_| 20,
+            |_| BudgetAdmission::Allow,
+            |_: &brief::BriefCard| Some(rig.clone()),
+            |c: &brief::BriefCard| c.title.clone(),
+            |_: &brief::BriefCard| RunModelPrefs::default(),
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        let got = seen.lock().unwrap().clone().expect("the rig ran");
+        assert_eq!(got, None, "no incompatible session crosses agent or rig scope");
     }
 
     // ── Allowance / budget hard-stop (company-model §3.6/§5.2D) ──

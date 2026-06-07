@@ -6003,6 +6003,42 @@ impl TaskStore {
         Ok(row)
     }
 
+    /// The resumable adapter session id for the EXACT
+    /// `(tenant, Operative, Rig, Brief)` pairing — the only safe scope to
+    /// continue an agent from (relix-agent-adapters.md §3.3). The tenant is
+    /// resolved from the Brief itself using the SAME
+    /// `COALESCE(tenant_id, 'default')` expression
+    /// [`Self::record_run_runtime_state`] writes with, so a session stored
+    /// under a DIFFERENT tenant, Operative, Rig, or Brief can never match, and
+    /// an unknown Brief resolves to no tenant → no match. Returns the stored
+    /// `session_id` (None when there is no row, the row has no session, or the
+    /// Brief is unknown). Best-effort: the caller treats any miss as "run
+    /// fresh", so this never forces a resume.
+    pub fn resume_session_for(
+        &self,
+        brief_key: &str,
+        agent_id: &str,
+        rig: &str,
+    ) -> Result<Option<String>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let sid: Option<String> = conn
+            .query_row(
+                "SELECT s.session_id
+                 FROM agent_runtime_state s
+                 WHERE s.brief_key = ?1 AND s.agent_id = ?2 AND s.rig = ?3
+                   AND s.tenant_id = (
+                       SELECT COALESCE(t.tenant_id, 'default')
+                       FROM tasks t WHERE t.task_id = ?1
+                   )",
+                params![brief_key, agent_id, rig],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?
+            .flatten();
+        Ok(sid)
+    }
+
     /// Reset (delete) ALL runtime-state rows for one agent within a tenant —
     /// e.g. to force a fresh adapter session. Returns the row count removed.
     pub fn reset_runtime_state(
@@ -31197,6 +31233,59 @@ mod tests {
         assert_eq!(
             s.list_runtime_state_for_tenant("default", 100_000).unwrap().len(),
             5
+        );
+    }
+
+    #[test]
+    fn resume_session_for_isolates_tenant_agent_rig_brief() {
+        let s = store();
+        let b = brief(&s, "resume brief");
+        // Seed a finished run's runtime state for an EXACT pairing.
+        let seed = |run_id: &str, brief_id: &str, agent: &str, rig: &str, session: &str| {
+            s.record_run_start(run_id, brief_id, agent, rig, "manual", &RunWorkspaceInfo::default())
+                .unwrap();
+            let u = crate::rig::RunUsage {
+                session_id: Some(session.into()),
+                provider: Some("openai".into()),
+                ..Default::default()
+            };
+            s.record_run_runtime_state(run_id, &u, "done", None, None).unwrap();
+        };
+        seed("r_match", &b, "agt_a", "codex", "sess-keep");
+
+        // Exact (tenant, Operative, Rig, Brief) → the stored session.
+        assert_eq!(
+            s.resume_session_for(&b, "agt_a", "codex").unwrap().as_deref(),
+            Some("sess-keep")
+        );
+        // A different Operative, Rig, or Brief never matches.
+        assert_eq!(s.resume_session_for(&b, "agt_other", "codex").unwrap(), None);
+        assert_eq!(s.resume_session_for(&b, "agt_a", "claude").unwrap(), None);
+        assert_eq!(s.resume_session_for("brief_missing", "agt_a", "codex").unwrap(), None);
+
+        // A row whose session_id is NULL yields None (nothing to resume).
+        let b_nosess = brief(&s, "no session brief");
+        s.record_run_start("r_nosess", &b_nosess, "agt_a", "codex", "manual", &RunWorkspaceInfo::default())
+            .unwrap();
+        s.record_run_runtime_state("r_nosess", &crate::rig::RunUsage::default(), "done", None, None)
+            .unwrap();
+        assert_eq!(s.resume_session_for(&b_nosess, "agt_a", "codex").unwrap(), None);
+
+        // Cross-tenant isolation: a session under a FOREIGN Guild is only
+        // reachable when looking up that Guild's own Brief (the tenant is
+        // resolved from the Brief), and never bleeds into the default Guild's
+        // lookup.
+        let bf = brief(&s, "foreign resume brief");
+        s.set_task_tenant(&bf, "guild-b").unwrap();
+        seed("r_foreign", &bf, "agt_a", "codex", "sess-foreign");
+        assert_eq!(
+            s.resume_session_for(&bf, "agt_a", "codex").unwrap().as_deref(),
+            Some("sess-foreign")
+        );
+        // The default-tenant Brief still only sees its own session.
+        assert_eq!(
+            s.resume_session_for(&b, "agt_a", "codex").unwrap().as_deref(),
+            Some("sess-keep")
         );
     }
 

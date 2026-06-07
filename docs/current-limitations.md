@@ -57,11 +57,35 @@ does **not** do:
 - **The session id is a masked summary, never shown in full.** The
   list/table truncate it; it is a recovery pointer, not a credential
   to copy.
-- **Session resume is stored-not-replayed.** The persisted
-  `session_id` / `runtime_state` is recorded so a Rig *could* resume,
-  but the SOL VM is synchronous and there is no durable replay (see
-  "No durable replay / no flow snapshots" below) — reset is "forget
-  the wedged pointer", not "resume from a snapshot".
+- **Subscription-CLI session resume is now replayed for the Codex Rig,
+  same-scope only — Claude stays stored-not-replayed.** When a run starts,
+  Relix looks up the stored `session_id` for the EXACT
+  `(tenant, Operative, Rig, Brief)` pairing and, **for the Codex Rig**,
+  threads it into the next spawn as `codex exec resume <session> …` (discrete
+  argv, the trailing stdin `-` marker preserved) so a Codex Operative
+  continues its prior thread instead of starting cold. This applies on every
+  start path (manual `brief.run`, Prime Start-to-Shift, the autonomous
+  heartbeat, and the guarded operator retry — a retry of the same line of work
+  continues the same thread). The lookup is keyed on that 4-tuple, so a session
+  stored under a different tenant / Operative / Rig / unrelated Brief can never
+  cross in; an unknown or invalid id is skipped and the run starts fresh. What
+  it still does **not** do:
+  - **Claude resume is intentionally NOT mapped.** Claude Code's
+    `--print --resume <session>` resolves the session from the run's working
+    directory, and Relix runs every Shift in a FRESH per-run scoped workspace,
+    so a resumed Claude session would not reliably resolve. Until a stable
+    per-line-of-work workspace exists for Claude, only the model is applied for
+    the Claude Rig (no resume). Codex threads live in `$CODEX_HOME` independent
+    of the cwd, which is why Codex resume is safe.
+  - **It is adapter-thread continuation, not SOL durable replay.** The SOL VM
+    is still synchronous and there is no durable flow replay (see "No durable
+    replay / no flow snapshots" below). Resume hands the *agent* its prior
+    conversation thread; it does not snapshot/replay Relix's own flow. Reset is
+    still "forget the wedged pointer", not "resume from a snapshot".
+  - **The session id is never logged or surfaced beyond the existing
+    masked runtime-state recovery table.** It is treated as adapter state, not
+    user input, and is validated (no whitespace/control, no leading `-`) before
+    it can become a discrete argv element.
 - **The per-SESSION reset still has no diagnosis of its own.** Reset
   deletes the `agent_runtime_state` row; it does **not** classify the
   session and does not replay it (see "Session resume is

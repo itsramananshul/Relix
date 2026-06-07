@@ -68,6 +68,15 @@ pub struct RigRunRequest {
     /// Codex Rig maps this (`-c model_reasoning_effort=<effort>`, adapters
     /// §3.3); other Rigs ignore it.
     pub reasoning_effort: Option<String>,
+    /// Optional resumable adapter session id, looked up from the SAME
+    /// (tenant, Operative, Rig, Brief) runtime state currently stored
+    /// (relix-agent-adapters.md §3.3). Empty/absent → the adapter starts a
+    /// fresh session. Only the Codex Rig maps this (`codex exec resume
+    /// <session> …`); the Claude Rig deliberately does NOT (its
+    /// working-dir-keyed session store does not survive Relix's per-run
+    /// scoped workspace — see `argv_with_resume`); echo / raw / Gemini /
+    /// generic Rigs ignore it, so the field is fully backward-compatible.
+    pub resume_session_id: Option<String>,
 }
 
 /// Trim a stored preference and collapse empty/whitespace-only to `None`
@@ -94,6 +103,7 @@ impl RigRunRequest {
             working_dir: None,
             model_preference: None,
             reasoning_effort: None,
+            resume_session_id: None,
         }
     }
 
@@ -133,6 +143,17 @@ impl RigRunRequest {
     /// Empty / whitespace-only normalizes to `None`.
     pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
         self.reasoning_effort = normalize_pref(effort);
+        self
+    }
+
+    /// Carry a resumable adapter session id (builder style). Empty /
+    /// whitespace-only normalizes to `None`; the stricter argv-injection
+    /// validation (no whitespace/control, no leading `-`) is applied at
+    /// argv-construction time in [`argv_with_resume`], mirroring how
+    /// `model_preference` is normalized here but flag-cleaned in
+    /// [`model_flag_args`].
+    pub fn with_resume_session_id(mut self, session_id: Option<String>) -> Self {
+        self.resume_session_id = normalize_pref(session_id);
         self
     }
 }
@@ -1397,6 +1418,73 @@ fn argv_with_model_flags(base: &[String], extra: Vec<String>) -> Vec<String> {
     out
 }
 
+/// Validate a stored adapter session id before it can become a discrete argv
+/// element. The id is **adapter state, not user input**, but it is still
+/// validated defensively: trims, then rejects an empty value, any
+/// whitespace/control character, or a leading `-` (which a CLI could parse as
+/// a flag). Returns the safe owned value, or `None` (→ run fresh) — a
+/// malformed id can never become a stray flag or a spawn of malformed argv.
+fn clean_session_id(session_id: Option<&str>) -> Option<String> {
+    let v = session_id?.trim();
+    if v.is_empty()
+        || v.starts_with('-')
+        || v.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    Some(v.to_string())
+}
+
+/// Build the argv that **continues a prior adapter session**, keyed on the
+/// adapter's [`RigOutputFormat`] — the same safe discriminator
+/// [`model_flag_args`] uses (relix-agent-adapters.md §3.3).
+///
+/// - **Codex (`CodexJsonl`)** — maps resume: `codex exec resume <session> …`.
+///   The `resume <id>` subcommand is spliced in right after the leading
+///   `exec`, leaving every other flag AND the trailing stdin `-` marker in
+///   place (so the prompt still reads from stdin). Defensive: it only
+///   transforms a recognizably-Codex argv that begins with `exec`.
+/// - **Claude (`ClaudeStreamJson`)** — deliberately **NOT** mapped. Claude
+///   Code's `--print --resume <session>` resolves the session from the run's
+///   working directory, and Relix runs every Shift in a FRESH per-run scoped
+///   workspace, so a resumed session would not reliably resolve. Until a
+///   stable per-line-of-work workspace exists for Claude, resume stays Codex-
+///   only (documented in `docs/current-limitations.md`).
+/// - **Raw / echo / Gemini / generic** — ignore resume entirely.
+///
+/// Returns `base` unchanged whenever resume does not apply (unsupported
+/// format, no/blank/invalid session id, or a Codex argv missing its `exec`
+/// subcommand). The session id is passed as a DISCRETE argv element (never a
+/// joined shell string), and a value that fails [`clean_session_id`] is
+/// skipped rather than spawned.
+pub fn argv_with_resume(
+    base: &[String],
+    format: RigOutputFormat,
+    session_id: Option<&str>,
+) -> Vec<String> {
+    let Some(sid) = clean_session_id(session_id) else {
+        return base.to_vec();
+    };
+    match format {
+        RigOutputFormat::CodexJsonl => {
+            // Only transform a recognizably-Codex `exec …` argv; anything else
+            // is left untouched (never inject `resume` into an unknown shape).
+            if base.first().map(String::as_str) != Some("exec") {
+                return base.to_vec();
+            }
+            let mut out: Vec<String> = Vec::with_capacity(base.len() + 2);
+            out.push(base[0].clone()); // `exec`
+            out.push("resume".to_string());
+            out.push(sid);
+            out.extend(base[1..].iter().cloned());
+            out
+        }
+        // Claude resume is intentionally unmapped (see the doc comment above);
+        // raw / echo / Gemini / generic ignore resume.
+        RigOutputFormat::ClaudeStreamJson | RigOutputFormat::Raw => base.to_vec(),
+    }
+}
+
 pub struct ProcessRig {
     name: String,
     program: String,
@@ -1681,13 +1769,19 @@ impl ProcessRig {
                 RunUsage::default(),
             );
         };
-        // Splice in any per-run model/effort flags the assigned Operative's
-        // stored preference asks for, keyed on this adapter's output format
-        // (Claude/Codex map them; raw/echo ignore). Discrete argv only — a
-        // trailing stdin `-` (Codex) stays last so the prompt still reads
-        // from stdin.
+        // First, continue a prior adapter session when one is carried and the
+        // adapter supports it (Codex only: `exec resume <session> …`; Claude
+        // intentionally unmapped; raw/echo ignore). This inserts `resume <id>`
+        // after Codex's leading `exec`, leaving the trailing stdin `-` last.
+        // Then splice in any per-run model/effort flags the assigned
+        // Operative's stored preference asks for, keyed on this adapter's
+        // output format. Discrete argv only — a trailing stdin `-` (Codex)
+        // stays last so the prompt still reads from stdin, and resume + model
+        // flags compose without disturbing each other.
+        let resumed_args =
+            argv_with_resume(&self.args, self.output_format, req.resume_session_id.as_deref());
         let effective_args = argv_with_model_flags(
-            &self.args,
+            &resumed_args,
             model_flag_args(
                 self.output_format,
                 req.model_preference.as_deref(),
@@ -2905,6 +2999,101 @@ mod tests {
         // `exec` / `--json` / sandbox flags survive.
         assert!(argv.iter().any(|a| a == "exec"));
         assert!(argv.iter().any(|a| a == "--json"));
+    }
+
+    // ── Resume a prior adapter session → adapter argv ────────────
+
+    #[test]
+    fn run_request_normalizes_resume_session() {
+        // A set id is carried; empty / whitespace-only normalizes to None.
+        let req = RigRunRequest::new("b", "a", "g", "p")
+            .with_resume_session_id(Some("  thread-abc123  ".to_string()));
+        assert_eq!(req.resume_session_id.as_deref(), Some("thread-abc123"));
+        let blank =
+            RigRunRequest::new("b", "a", "g", "p").with_resume_session_id(Some("   ".to_string()));
+        assert_eq!(blank.resume_session_id, None);
+        // A fresh request carries no resume id (backward-compatible default).
+        assert_eq!(RigRunRequest::new("b", "a", "g", "p").resume_session_id, None);
+    }
+
+    #[test]
+    fn resume_argv_maps_codex_after_exec_keeping_stdin_marker() {
+        // Codex maps resume: `codex exec resume <session> …`, with the
+        // `resume <id>` spliced in right after `exec` and the trailing stdin
+        // `-` marker left LAST so the prompt still reads from stdin.
+        let base = codex_rig().args().to_vec();
+        let argv = argv_with_resume(&base, RigOutputFormat::CodexJsonl, Some("thread-xyz"));
+        assert_eq!(argv[0], "exec");
+        assert_eq!(argv[1], "resume");
+        assert_eq!(argv[2], "thread-xyz");
+        assert_eq!(argv.last().map(String::as_str), Some("-"), "stdin marker stays last");
+        // The original flags survive intact.
+        assert!(argv.iter().any(|a| a == "--json"));
+        assert!(argv.iter().any(|a| a == "workspace-write"));
+        assert!(argv.iter().any(|a| a == "--skip-git-repo-check"));
+    }
+
+    #[test]
+    fn resume_argv_unmapped_for_claude_and_raw() {
+        // Claude resume is intentionally NOT mapped (its session store is keyed
+        // by the run's working dir, which Relix re-scopes per run) — argv is
+        // unchanged. Raw / echo / generic ignore resume too.
+        let claude = claude_rig().args().to_vec();
+        assert_eq!(
+            argv_with_resume(&claude, RigOutputFormat::ClaudeStreamJson, Some("sess-1")),
+            claude,
+            "claude argv is untouched (resume unmapped)"
+        );
+        let raw = vec!["run".to_string(), "-".to_string()];
+        assert_eq!(
+            argv_with_resume(&raw, RigOutputFormat::Raw, Some("sess-1")),
+            raw,
+            "raw argv is untouched"
+        );
+    }
+
+    #[test]
+    fn resume_argv_skips_absent_or_malformed_session() {
+        let base = codex_rig().args().to_vec();
+        // Absent / blank → no transformation.
+        assert_eq!(argv_with_resume(&base, RigOutputFormat::CodexJsonl, None), base);
+        assert_eq!(argv_with_resume(&base, RigOutputFormat::CodexJsonl, Some("   ")), base);
+        // Whitespace / control chars inside the id → skipped (never a split or
+        // injected argv element).
+        assert_eq!(argv_with_resume(&base, RigOutputFormat::CodexJsonl, Some("a b")), base);
+        assert_eq!(argv_with_resume(&base, RigOutputFormat::CodexJsonl, Some("x\ty")), base);
+        // A leading `-` (flag-injection shape) is rejected even though the id
+        // is adapter state, not user input.
+        assert_eq!(argv_with_resume(&base, RigOutputFormat::CodexJsonl, Some("--dangerous")), base);
+        // A non-Codex `exec …` argv shape is never transformed defensively.
+        let weird = vec!["notexec".to_string(), "-".to_string()];
+        assert_eq!(argv_with_resume(&weird, RigOutputFormat::CodexJsonl, Some("ok-id")), weird);
+    }
+
+    #[test]
+    fn resume_and_model_flags_compose_for_codex() {
+        // The EXACT argv `ProcessRig::execute` builds when BOTH a resume
+        // session and a model/effort preference are present: resume goes after
+        // `exec`, model/effort flags go before the trailing stdin `-`, and the
+        // `-` stays last. The two transforms compose without disturbing each
+        // other.
+        let base = codex_rig().args().to_vec();
+        let resumed = argv_with_resume(&base, RigOutputFormat::CodexJsonl, Some("thread-xyz"));
+        let argv = argv_with_model_flags(
+            &resumed,
+            model_flag_args(RigOutputFormat::CodexJsonl, Some("gpt-5-codex"), Some("high")),
+        );
+        assert_eq!(&argv[0..3], &["exec", "resume", "thread-xyz"], "resume after exec");
+        assert_eq!(argv.last().map(String::as_str), Some("-"), "stdin marker stays last");
+        assert!(argv.windows(2).any(|w| w[0] == "--model" && w[1] == "gpt-5-codex"));
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=high"));
+        // The model flags land BEFORE the stdin marker, after the resume tokens.
+        let model_at = argv.iter().position(|a| a == "--model").unwrap();
+        let dash_at = argv.iter().rposition(|a| a == "-").unwrap();
+        assert!(model_at < dash_at, "model flag precedes the stdin marker");
+        assert!(model_at > 2, "model flag comes after the resume tokens");
     }
 
     #[test]
