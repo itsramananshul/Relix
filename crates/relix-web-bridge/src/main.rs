@@ -105,6 +105,8 @@ mod belief;
 mod blocklist;
 mod bridge_back;
 #[cfg(test)]
+mod brief_doc_lock_mini_mesh_test;
+#[cfg(test)]
 mod brief_interaction_mini_mesh_test;
 mod browser_captures;
 mod browser_sessions;
@@ -852,6 +854,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/spine/briefs/:id/interactions/:iid/respond",
             post(spine::respond_interaction),
         )
+        // §1.9: cancel an answerable card (close without answering).
+        .route(
+            "/v1/spine/briefs/:id/interactions/:iid/cancel",
+            post(spine::cancel_interaction),
+        )
         // §1.8 approval-bound plan confirm: open a `confirm` bound to the
         // Brief's latest `plan` Dossier revision (answered via the respond
         // route above; a stale accept after a newer plan / a comment expires).
@@ -892,6 +899,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/v1/spine/briefs/:id/dossiers/latest",
             get(spine::dossier_latest),
+        )
+        // §1.8 document locking: lock / unlock a logical Dossier (a Brief's
+        // document `kind`) and list the active locks. Static `dossiers/*`
+        // segments — no param conflict with the other `:id/...` routes.
+        .route(
+            "/v1/spine/briefs/:id/dossiers/lock",
+            post(spine::lock_dossier),
+        )
+        .route(
+            "/v1/spine/briefs/:id/dossiers/unlock",
+            post(spine::unlock_dossier),
+        )
+        .route(
+            "/v1/spine/briefs/:id/dossiers/locks",
+            get(spine::list_dossier_locks),
         )
         .route("/v1/spine/briefs/:id/due", post(spine::set_due))
         .route("/v1/spine/briefs/:id/set", post(spine::set_field))

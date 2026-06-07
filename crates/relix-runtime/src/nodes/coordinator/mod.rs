@@ -1928,6 +1928,25 @@ impl TaskStore {
         if !task_row_exists(&conn, task_id)? {
             return Err(CoordinatorError::NotFound(task_id.to_string()));
         }
+        // §1.8 document locking: a locked logical Dossier (this Brief + kind)
+        // rejects a revision from anyone but the lock owner — a locked document
+        // is never silently overwritten. Checked BEFORE the stale/lineage
+        // decision so a locked-by-other write is refused regardless of base.
+        let lock_owner: Option<String> = conn
+            .query_row(
+                "SELECT locked_by FROM task_document_locks WHERE task_id = ?1 AND kind = ?2",
+                params![task_id, kind],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        if let Some(owner) = lock_owner.filter(|o| o != author) {
+            return Ok(brief::DossierAuthorOutcome::Locked(brief::DossierLocked {
+                locked: true,
+                kind: kind.to_string(),
+                locked_by: owner,
+            }));
+        }
         // The current latest revision of this kind (the lock target). The whole
         // store shares one connection mutex, so this read + the insert below are
         // effectively atomic — no other writer can interleave a revision.
@@ -2061,6 +2080,219 @@ impl TaskStore {
                 forked_from_doc_id: forked_from,
             },
         ))
+    }
+
+    /// §1.8 document locking: **lock** a logical Dossier (this Brief + `kind`)
+    /// so concurrent authors don't race. While the lock is held, only
+    /// `subject` may author a revision of that kind (every other write is
+    /// refused — see [`Self::author_dossier`]). Semantics:
+    ///
+    /// - no existing lock → the lock is created and returned;
+    /// - an existing lock held by **the same** subject → idempotent: the reason
+    ///   is updated and the (refreshed) lock returned;
+    /// - an existing lock held by a **different** subject → a no-write
+    ///   [`brief::DossierLockConflict`] (the bridge maps it to `409`).
+    ///
+    /// `kind` must be a safe token (as for authoring); `subject` is required;
+    /// `reason` is optional and length-bounded. Tenant isolation is enforced at
+    /// the handler boundary (the owning Brief). A successful lock Chronicles
+    /// `brief.dossier_locked`.
+    pub fn lock_dossier(
+        &self,
+        task_id: &str,
+        kind: &str,
+        subject: &str,
+        reason: Option<&str>,
+    ) -> Result<brief::DossierLockOutcome, CoordinatorError> {
+        let kind = kind.trim();
+        let subject = subject.trim();
+        if !is_safe_dossier_kind(kind) {
+            return Err(CoordinatorError::Invalid(format!(
+                "dossier kind must be a short token of [a-zA-Z0-9_-], ≤{MAX_DOSSIER_KIND_LEN} chars"
+            )));
+        }
+        if subject.is_empty() {
+            return Err(CoordinatorError::Invalid(
+                "lock subject required".to_string(),
+            ));
+        }
+        if subject.chars().count() > MAX_DOSSIER_AUTHOR_LEN {
+            return Err(CoordinatorError::Invalid(format!(
+                "lock subject too long (max {MAX_DOSSIER_AUTHOR_LEN} chars)"
+            )));
+        }
+        let reason = reason.map(str::trim).filter(|s| !s.is_empty());
+        if reason.is_some_and(|r| r.chars().count() > MAX_DOSSIER_LOCK_REASON_LEN) {
+            return Err(CoordinatorError::Invalid(format!(
+                "lock reason too long (max {MAX_DOSSIER_LOCK_REASON_LEN} chars)"
+            )));
+        }
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, task_id)? {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT locked_by FROM task_document_locks WHERE task_id = ?1 AND kind = ?2",
+                params![task_id, kind],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        if let Some(owner) = existing.as_ref().filter(|o| o.as_str() != subject) {
+            return Ok(brief::DossierLockOutcome::Conflict(
+                brief::DossierLockConflict {
+                    conflict: true,
+                    kind: kind.to_string(),
+                    locked_by: owner.clone(),
+                },
+            ));
+        }
+        let now = unix_secs();
+        // Upsert: a fresh lock, or a same-owner re-lock that refreshes the
+        // reason + timestamp (idempotent).
+        conn.execute(
+            "INSERT INTO task_document_locks (task_id, kind, locked_by, locked_at, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(task_id, kind) DO UPDATE SET
+                 locked_by = excluded.locked_by,
+                 locked_at = excluded.locked_at,
+                 reason    = excluded.reason",
+            params![task_id, kind, subject, now, reason],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let payload = match reason {
+            Some(r) => format!("{kind}: locked by {subject} — {r}"),
+            None => format!("{kind}: locked by {subject}"),
+        };
+        let _ = conn.execute(
+            "INSERT INTO task_events (task_id, ts, event_type, payload)
+             VALUES (?1, ?2, 'brief.dossier_locked', ?3)",
+            params![task_id, now, payload],
+        );
+        Ok(brief::DossierLockOutcome::Locked(brief::DossierLock {
+            task_id: task_id.to_string(),
+            kind: kind.to_string(),
+            locked_by: subject.to_string(),
+            locked_at: now,
+            reason: reason.map(str::to_string),
+        }))
+    }
+
+    /// §1.8 document locking: **unlock** a logical Dossier (this Brief +
+    /// `kind`). **Owner-or-nobody** — only the subject that holds the lock may
+    /// release it (the conservative v1 contract; there is no operator
+    /// force-unlock). Semantics:
+    ///
+    /// - lock held by `subject` → released, returned as
+    ///   [`brief::DossierUnlocked`];
+    /// - no lock present → idempotent no-op success (already unlocked);
+    /// - lock held by a **different** subject → a no-change
+    ///   [`brief::DossierLockConflict`] (the bridge maps it to `409`).
+    ///
+    /// A real release Chronicles `brief.dossier_unlocked`.
+    pub fn unlock_dossier(
+        &self,
+        task_id: &str,
+        kind: &str,
+        subject: &str,
+    ) -> Result<brief::DossierUnlockOutcome, CoordinatorError> {
+        let kind = kind.trim();
+        let subject = subject.trim();
+        if !is_safe_dossier_kind(kind) {
+            return Err(CoordinatorError::Invalid(format!(
+                "dossier kind must be a short token of [a-zA-Z0-9_-], ≤{MAX_DOSSIER_KIND_LEN} chars"
+            )));
+        }
+        if subject.is_empty() {
+            return Err(CoordinatorError::Invalid(
+                "unlock subject required".to_string(),
+            ));
+        }
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, task_id)? {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT locked_by FROM task_document_locks WHERE task_id = ?1 AND kind = ?2",
+                params![task_id, kind],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        match existing {
+            // Idempotent: unlocking a kind that isn't locked is a no-op success.
+            None => Ok(brief::DossierUnlockOutcome::Unlocked(
+                brief::DossierUnlocked {
+                    unlocked: true,
+                    kind: kind.to_string(),
+                    previously_locked_by: None,
+                },
+            )),
+            Some(owner) if owner != subject => Ok(brief::DossierUnlockOutcome::Conflict(
+                brief::DossierLockConflict {
+                    conflict: true,
+                    kind: kind.to_string(),
+                    locked_by: owner,
+                },
+            )),
+            Some(owner) => {
+                let now = unix_secs();
+                conn.execute(
+                    "DELETE FROM task_document_locks WHERE task_id = ?1 AND kind = ?2",
+                    params![task_id, kind],
+                )
+                .map_err(CoordinatorError::Db)?;
+                let _ = conn.execute(
+                    "INSERT INTO task_events (task_id, ts, event_type, payload)
+                     VALUES (?1, ?2, 'brief.dossier_unlocked', ?3)",
+                    params![task_id, now, format!("{kind}: unlocked by {subject}")],
+                );
+                Ok(brief::DossierUnlockOutcome::Unlocked(
+                    brief::DossierUnlocked {
+                        unlocked: true,
+                        kind: kind.to_string(),
+                        previously_locked_by: Some(owner),
+                    },
+                ))
+            }
+        }
+    }
+
+    /// §1.8 document locking: the active locks on a Brief's Dossiers (one per
+    /// locked `kind`), oldest first. Empty when nothing is locked. Tenant
+    /// isolation is enforced at the handler boundary (the owning Brief).
+    pub fn list_dossier_locks(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<brief::DossierLock>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, task_id)? {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT kind, locked_by, locked_at, reason FROM task_document_locks
+                 WHERE task_id = ?1 ORDER BY locked_at ASC, kind ASC",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![task_id], |r| {
+                Ok(brief::DossierLock {
+                    task_id: task_id.to_string(),
+                    kind: r.get(0)?,
+                    locked_by: r.get(1)?,
+                    locked_at: r.get(2)?,
+                    reason: r.get(3)?,
+                })
+            })
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(CoordinatorError::Db)?);
+        }
+        Ok(out)
     }
 
     /// PHASE 5 (Brief): the most recent Dossier of `kind` on a Brief
@@ -2272,6 +2504,26 @@ impl TaskStore {
         prompt: &str,
         choices: &[String],
     ) -> Result<String, CoordinatorError> {
+        self.open_interaction_idem(task_id, kind, author, prompt, choices, None)
+    }
+
+    /// §1.9 idempotency-aware variant of [`Self::open_interaction`]: when
+    /// `idempotency_key` is supplied, a repeated create with the same
+    /// `(task_id, author, idempotency_key)` returns the **existing** card's id
+    /// instead of opening a duplicate (the durable backstop is the partial
+    /// UNIQUE index `brief_interactions_idem`; the check-then-insert below runs
+    /// under the shared connection mutex, so it is atomic). An empty/whitespace
+    /// key is treated as absent (keyless, the legacy behaviour). Bounds the key
+    /// to a safe, short token.
+    pub fn open_interaction_idem(
+        &self,
+        task_id: &str,
+        kind: &str,
+        author: &str,
+        prompt: &str,
+        choices: &[String],
+        idempotency_key: Option<&str>,
+    ) -> Result<String, CoordinatorError> {
         let kind = kind.trim();
         if kind != "ask" && kind != "confirm" {
             return Err(CoordinatorError::Invalid(
@@ -2290,6 +2542,12 @@ impl TaskStore {
                 "interaction prompt required".to_string(),
             ));
         }
+        let idem = idempotency_key.map(str::trim).filter(|s| !s.is_empty());
+        if idem.is_some_and(|k| k.chars().count() > MAX_INTERACTION_IDEM_KEY_LEN) {
+            return Err(CoordinatorError::Invalid(format!(
+                "idempotency_key too long (max {MAX_INTERACTION_IDEM_KEY_LEN} chars)"
+            )));
+        }
         // Normalize choices: trim, drop empties, dedupe (first wins).
         let mut seen = std::collections::BTreeSet::new();
         let norm: Vec<String> = choices
@@ -2303,13 +2561,31 @@ impl TaskStore {
         if !task_row_exists(&conn, task_id)? {
             return Err(CoordinatorError::NotFound(task_id.to_string()));
         }
+        // Idempotent create: return the existing card for a repeated
+        // (task_id, author, idempotency_key). The lock serializes the
+        // check + insert, so two racing creates can't both land.
+        if let Some(k) = idem {
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT interaction_id FROM brief_interactions
+                     WHERE task_id = ?1 AND author = ?2 AND idempotency_key = ?3",
+                    params![task_id, author, k],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(CoordinatorError::Db)?;
+            if let Some(id) = existing {
+                return Ok(id);
+            }
+        }
         let interaction_id = new_interaction_id();
         let now = unix_secs();
         conn.execute(
             "INSERT INTO brief_interactions
                  (interaction_id, task_id, kind, prompt, choices, author,
-                  status, response, created_at, resolved_at, resolved_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', NULL, ?7, NULL, NULL)",
+                  status, response, created_at, resolved_at, resolved_by,
+                  idempotency_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', NULL, ?7, NULL, NULL, ?8)",
             params![
                 interaction_id,
                 task_id,
@@ -2317,7 +2593,8 @@ impl TaskStore {
                 prompt,
                 choices_json,
                 author,
-                now
+                now,
+                idem
             ],
         )
         .map_err(CoordinatorError::Db)?;
@@ -3007,6 +3284,91 @@ impl TaskStore {
              VALUES (?1, ?2, ?3, ?4)",
             params![task_id, now, event_type, format!("{responder}: {response}")],
         );
+        // §1.9 continuation policy ("wake the assignee when answered"): the
+        // operator has answered the card, so nudge the Brief's assignee to
+        // continue. Drop the connection lock FIRST — `offer_supervisory_wake`
+        // re-acquires it (deadlock otherwise). Best-effort: a Brief with no
+        // assignee records an honest `brief.wakeup_skipped` note instead.
+        drop(conn);
+        let _ = self.offer_supervisory_wake(task_id, &format!("interaction_{status}"));
+        Ok(())
+    }
+
+    /// §1.9 (thread interactions): **cancel** an answerable card — the operator
+    /// closes it without answering (e.g. they decided to just comment instead,
+    /// or the question is moot). Semantics:
+    ///
+    /// - an `open` card → `cancelled` (Chronicled `brief.interaction_cancelled`,
+    ///   then the assignee is woken to continue, per the §1.9 continuation
+    ///   policy);
+    /// - an already-`cancelled` card → **idempotent** success (no second event);
+    /// - any other terminal card (`resolved` / `rejected` / `expired`) → a typed
+    ///   refusal (a decided card is never silently reopened/clobbered).
+    ///
+    /// Works for any kind (`ask` / `confirm` / `suggest_tasks`) — cancelling a
+    /// `suggest_tasks` card simply closes the proposal without materializing
+    /// children. The card must belong to `task_id` (else not-found, like the
+    /// other interaction paths).
+    pub fn cancel_interaction(
+        &self,
+        task_id: &str,
+        interaction_id: &str,
+        subject: &str,
+    ) -> Result<(), CoordinatorError> {
+        let subject = subject.trim();
+        if subject.is_empty() {
+            return Err(CoordinatorError::Invalid(
+                "cancel subject required".to_string(),
+            ));
+        }
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let cur_status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM brief_interactions
+                 WHERE interaction_id = ?1 AND task_id = ?2",
+                params![interaction_id, task_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        let cur_status = match cur_status {
+            None => return Err(CoordinatorError::NotFound(interaction_id.to_string())),
+            Some(s) => s,
+        };
+        // Idempotent: re-cancelling a cancelled card is a no-op success.
+        if cur_status == "cancelled" {
+            return Ok(());
+        }
+        // A decided card (resolved/rejected/expired) is terminal — never reopen.
+        if cur_status != "open" {
+            return Err(CoordinatorError::Invalid(format!(
+                "interaction already {cur_status}"
+            )));
+        }
+        let now = unix_secs();
+        let changed = conn
+            .execute(
+                "UPDATE brief_interactions
+                 SET status = 'cancelled', resolved_at = ?1, resolved_by = ?2
+                 WHERE interaction_id = ?3 AND task_id = ?4 AND status = 'open'",
+                params![now, subject, interaction_id, task_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+        if changed == 0 {
+            // Lost a race to another terminal transition.
+            return Err(CoordinatorError::Invalid(
+                "interaction already answered".to_string(),
+            ));
+        }
+        let _ = conn.execute(
+            "INSERT INTO task_events (task_id, ts, event_type, payload)
+             VALUES (?1, ?2, 'brief.interaction_cancelled', ?3)",
+            params![task_id, now, format!("{subject}: cancelled")],
+        );
+        // Continuation policy: wake the assignee to continue (drop the lock
+        // first — see `respond_interaction`).
+        drop(conn);
+        let _ = self.offer_supervisory_wake(task_id, "interaction_cancelled");
         Ok(())
     }
 
@@ -12899,6 +13261,31 @@ pub fn register(
             })),
         );
     }
+    // §1.9: cancel an answerable card (close without answering); idempotent on
+    // an already-cancelled card, refuses a decided one.
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.interaction_cancel",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_interaction_cancel(&s, &ctx) }
+            })),
+        );
+    }
+    // §1.9: idempotency-aware ask/confirm create (JSON arg). A repeated create
+    // with the same (task_id, author, idempotency_key) returns the existing
+    // card instead of a duplicate.
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.interaction_create",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_interaction_create(&s, &ctx) }
+            })),
+        );
+    }
     // §1.9 (suggest_tasks): propose a bounded child-Brief tree on a Brief,
     // then accept (materialize as Sub-briefs) or reject it.
     {
@@ -13000,6 +13387,40 @@ pub fn register(
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_brief_dossier_author(&s, &ctx) }
+            })),
+        );
+    }
+    // §1.8 document locking: lock / unlock a logical Dossier (a Brief's `kind`)
+    // and list the active locks. A locked kind rejects a revision from anyone
+    // but the lock owner (see `brief.dossier_author`). Lock/unlock conflicts are
+    // an `Ok` body the bridge maps onto a 409.
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.dossier_lock",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_dossier_lock(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.dossier_unlock",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_dossier_unlock(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.dossier_locks",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_dossier_locks(&s, &ctx) }
             })),
         );
     }
@@ -14754,6 +15175,72 @@ fn handle_brief_interaction_respond(store: &TaskStore, ctx: &InvocationCtx) -> H
     }
 }
 
+/// `brief.interaction_cancel` — close an answerable card without answering
+/// (§1.9). Arg `task_id|interaction_id|subject`. Idempotent on an already-
+/// cancelled card; a typed refusal on a decided one.
+fn handle_brief_interaction_cancel(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.interaction_cancel utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(3, '|').collect();
+    if parts.len() < 3 {
+        return invalid(
+            "brief.interaction_cancel: expected `task_id|interaction_id|subject`".to_string(),
+        );
+    }
+    let task = parts[0].trim();
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.interaction_cancel") {
+        return out;
+    }
+    match store.cancel_interaction(task, parts[1].trim(), parts[2].trim()) {
+        Ok(()) => HandlerOutcome::Ok(Vec::new()),
+        Err(e) => map_edge_err("brief.interaction_cancel", e),
+    }
+}
+
+/// The JSON arg shape for `brief.interaction_create` (§1.9 idempotency-aware
+/// ask/confirm create). A structured key is awkward in the pipe wire, so this
+/// capability takes JSON (like `brief.suggest_open`). `task_id` is the owning
+/// Brief; `kind` is `ask`/`confirm`; `author` raises it; `prompt` is the
+/// question; `choices` are optional; `idempotency_key` (optional) de-duplicates
+/// a repeated create on `(task_id, author, idempotency_key)`.
+#[derive(serde::Deserialize)]
+struct InteractionCreateArg {
+    task_id: String,
+    kind: String,
+    author: String,
+    prompt: String,
+    #[serde(default)]
+    choices: Vec<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+/// `brief.interaction_create` — open an ask/confirm card, idempotency-aware.
+/// Returns the (existing or new) `interaction_id`.
+fn handle_brief_interaction_create(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let arg: InteractionCreateArg = match serde_json::from_slice(&ctx.args) {
+        Ok(a) => a,
+        Err(e) => return invalid(format!("brief.interaction_create arg: {e}")),
+    };
+    let task = arg.task_id.trim();
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.interaction_create") {
+        return out;
+    }
+    match store.open_interaction_idem(
+        task,
+        arg.kind.trim(),
+        arg.author.trim(),
+        &arg.prompt,
+        &arg.choices,
+        arg.idempotency_key.as_deref(),
+    ) {
+        Ok(id) => HandlerOutcome::Ok(id.into_bytes()),
+        Err(e) => map_edge_err("brief.interaction_create", e),
+    }
+}
+
 /// The JSON arg shape for `brief.suggest_open` — a structured proposal
 /// is awkward as a pipe-delimited string, so this capability takes JSON
 /// (like `prime.propose`). `task_id` is the owning Brief; `author` is
@@ -15206,6 +15693,79 @@ fn handle_brief_dossier_author(store: &TaskStore, ctx: &InvocationCtx) -> Handle
             Err(e) => internal(format!("brief.dossier_author encode: {e}")),
         },
         Err(e) => map_edge_err("brief.dossier_author", e),
+    }
+}
+
+/// `brief.dossier_lock` — lock a logical Dossier (§1.8). Arg
+/// `task_id|kind|subject|reason` (reason is the optional trailing field, may
+/// contain pipes / be omitted). On success returns the lock JSON; a conflict
+/// (locked by another subject) returns an `Ok` JSON `{conflict:true, …}`
+/// (nothing changed) the bridge maps onto a `409`. Tenant-scoped on the Brief.
+fn handle_brief_dossier_lock(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.dossier_lock utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(4, '|').collect();
+    if parts.len() < 3 {
+        return invalid("brief.dossier_lock: expected `task_id|kind|subject|reason`".to_string());
+    }
+    let task = parts[0].trim();
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.dossier_lock") {
+        return out;
+    }
+    let reason = parts.get(3).map(|r| r.trim()).filter(|r| !r.is_empty());
+    match store.lock_dossier(task, parts[1].trim(), parts[2].trim(), reason) {
+        Ok(outcome) => match serde_json::to_vec(&outcome) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.dossier_lock encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.dossier_lock", e),
+    }
+}
+
+/// `brief.dossier_unlock` — unlock a logical Dossier (§1.8). Arg
+/// `task_id|kind|subject`. Owner-or-nobody: a different subject is refused as a
+/// conflict (`Ok` JSON `{conflict:true, …}` → `409`); no lock is an idempotent
+/// success. Tenant-scoped on the Brief.
+fn handle_brief_dossier_unlock(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("brief.dossier_unlock utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(3, '|').collect();
+    if parts.len() < 3 {
+        return invalid("brief.dossier_unlock: expected `task_id|kind|subject`".to_string());
+    }
+    let task = parts[0].trim();
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.dossier_unlock") {
+        return out;
+    }
+    match store.unlock_dossier(task, parts[1].trim(), parts[2].trim()) {
+        Ok(outcome) => match serde_json::to_vec(&outcome) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.dossier_unlock encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.dossier_unlock", e),
+    }
+}
+
+/// `brief.dossier_locks` — list the active Dossier locks on a Brief (§1.8), a
+/// JSON array (one per locked kind, oldest first). Arg `task_id`. Tenant-scoped.
+fn handle_brief_dossier_locks(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task = match single_id(ctx, "brief.dossier_locks") {
+        Ok(t) => t,
+        Err(o) => return o,
+    };
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.dossier_locks") {
+        return out;
+    }
+    match store.list_dossier_locks(task) {
+        Ok(rows) => match serde_json::to_vec(&rows) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.dossier_locks encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.dossier_locks", e),
     }
 }
 
@@ -17512,6 +18072,22 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         );
         CREATE INDEX IF NOT EXISTS task_documents_by_task
             ON task_documents(task_id, created_at);
+        -- §1.8 Dossier (document) locking. A logical Dossier — a Brief's
+        -- document `kind` (e.g. `plan`, `design`) — can be LOCKED so concurrent
+        -- authors don't race. The lock is per `(task_id, kind)`. While a row
+        -- exists, `author_dossier` refuses a revision from anyone but
+        -- `locked_by` (no silent overwrite); only the owner may unlock
+        -- (owner-or-nobody, the conservative v1 contract). Tenant scoping is via
+        -- the owning Brief, like Dossiers.
+        CREATE TABLE IF NOT EXISTS task_document_locks (
+            task_id   TEXT NOT NULL,
+            kind      TEXT NOT NULL,
+            locked_by TEXT NOT NULL,
+            locked_at INTEGER NOT NULL,
+            reason    TEXT,
+            PRIMARY KEY (task_id, kind),
+            FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+        );
         -- Thread interactions — answerable cards on a Brief
         -- (relix-execution-and-issue-design §1.9; relix-dashboard-design
         -- §7). `kind` is `ask` | `confirm`; `status` is `open` and then a
@@ -17550,6 +18126,11 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             -- ledger. NULL for plain ask/confirm/suggest cards and for a
             -- standalone (unlinked) plan confirm.
             bound_interaction_id TEXT,
+            -- §1.9 idempotent create: an optional caller-supplied key. A repeated
+            -- create with the same `(task_id, author, idempotency_key)` returns
+            -- the existing card instead of a duplicate. NULL for keyless cards
+            -- (the default — every legacy card and any create that omits a key).
+            idempotency_key TEXT,
             FOREIGN KEY (task_id) REFERENCES tasks(task_id)
         );
         CREATE INDEX IF NOT EXISTS brief_interactions_by_task
@@ -18041,6 +18622,11 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         "ALTER TABLE task_documents ADD COLUMN author TEXT",
         "ALTER TABLE task_documents ADD COLUMN revision_of_doc_id TEXT",
         "ALTER TABLE task_documents ADD COLUMN forked_from_doc_id TEXT",
+        // §1.9 idempotent interaction create: an optional caller key so a
+        // repeated create with the same `(task_id, author, idempotency_key)`
+        // returns the existing card. Additive + nullable — legacy cards carry
+        // NULL and are unaffected.
+        "ALTER TABLE brief_interactions ADD COLUMN idempotency_key TEXT",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the
@@ -18071,6 +18657,17 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
     // cheap. Runs after the ALTER so the column exists; idempotent.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS tasks_tenant ON tasks(tenant_id)",
+        [],
+    )
+    .map_err(CoordinatorError::Db)?;
+    // §1.9 idempotent interaction create: at most ONE card per
+    // `(task_id, author, idempotency_key)`. Partial so the many keyless (NULL)
+    // cards are exempt. Runs AFTER the ALTER so `idempotency_key` exists on
+    // upgraded DBs; idempotent.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS brief_interactions_idem
+            ON brief_interactions(task_id, author, idempotency_key)
+            WHERE idempotency_key IS NOT NULL",
         [],
     )
     .map_err(CoordinatorError::Db)?;
@@ -18339,6 +18936,12 @@ const MAX_DOSSIER_BODY_BYTES: usize = 65_536;
 const MAX_DOSSIER_TITLE_LEN: usize = 200;
 const MAX_DOSSIER_KIND_LEN: usize = 40;
 const MAX_DOSSIER_AUTHOR_LEN: usize = 120;
+/// Bound on a §1.8 document-lock `reason` (a short operator note, never
+/// content). Kept small so a lock row can't bloat the ledger.
+const MAX_DOSSIER_LOCK_REASON_LEN: usize = 280;
+/// Bound on a §1.9 interaction `idempotency_key` (a short caller-supplied
+/// dedup token, never content).
+const MAX_INTERACTION_IDEM_KEY_LEN: usize = 200;
 
 /// A Dossier `kind` must be a short, safe token — `[a-zA-Z0-9_-]`, non-empty,
 /// `≤ MAX_DOSSIER_KIND_LEN`. This keeps `kind` usable as a stable key (e.g.
@@ -22289,6 +22892,7 @@ mod tests {
                 a.doc_id
             }
             DossierAuthorOutcome::Stale(_) => panic!("first author must not be stale"),
+            DossierAuthorOutcome::Locked(_) => panic!("first author must not be locked"),
         };
 
         // 2) Revise with the matching expected latest → revision 2 linking v1.
@@ -22312,6 +22916,7 @@ mod tests {
                 a.doc_id
             }
             DossierAuthorOutcome::Stale(_) => panic!("matching expected must not be stale"),
+            DossierAuthorOutcome::Locked(_) => panic!("matching expected must not be locked"),
         };
         // latest is now v2.
         assert_eq!(s.latest_dossier(&id, "plan").unwrap().unwrap().doc_id, v2);
@@ -22338,6 +22943,7 @@ mod tests {
                 assert_eq!(st.current_latest_doc_id.as_deref(), Some(v2.as_str()));
             }
             DossierAuthorOutcome::Authored(_) => panic!("stale revise must not write"),
+            DossierAuthorOutcome::Locked(_) => panic!("stale revise must not be locked"),
         }
         assert_eq!(
             s.list_dossiers(&id).unwrap().len(),
@@ -22369,6 +22975,7 @@ mod tests {
                 assert_eq!(a.revision_number, 3);
             }
             DossierAuthorOutcome::Stale(_) => panic!("fork must not be stale"),
+            DossierAuthorOutcome::Locked(_) => panic!("fork must not be locked"),
         }
 
         // Chronicle events: one create, one revise, one fork; the stale attempt
@@ -24265,6 +24872,344 @@ mod tests {
         // The card is still open for the owning Guild.
         let listed = s.list_interactions(&a).unwrap();
         assert_eq!(listed[0].status, "open");
+    }
+
+    // ── §1.8 Dossier (document) locking ──────────────────────────────────
+
+    // A locked logical Dossier rejects a revision from anyone but the lock
+    // owner (no silent overwrite); the owner can still author; unlock reopens.
+    #[test]
+    fn dossier_lock_blocks_other_author_then_unlock_allows() {
+        let s = TaskStore::in_memory().unwrap();
+        let b = s
+            .create_brief("acme", "Plan it", "subj", None, None, None, None)
+            .unwrap();
+        // Seed a first `plan` revision so the kind exists.
+        let first = s
+            .author_dossier(
+                &b,
+                "plan",
+                "Plan v1",
+                "the body",
+                "alice",
+                brief::DossierAuthorMode::Revise,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(first, brief::DossierAuthorOutcome::Authored(_)));
+        // alice locks the `plan` document.
+        let locked = s
+            .lock_dossier(&b, "plan", "alice", Some("drafting"))
+            .unwrap();
+        match locked {
+            brief::DossierLockOutcome::Locked(l) => {
+                assert_eq!(l.locked_by, "alice");
+                assert_eq!(l.reason.as_deref(), Some("drafting"));
+            }
+            other => panic!("expected lock, got {other:?}"),
+        }
+        // It shows up in the lock list.
+        let locks = s.list_dossier_locks(&b).unwrap();
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].kind, "plan");
+        assert_eq!(locks[0].locked_by, "alice");
+        // bob's write is refused (locked), nothing written.
+        let bob = s
+            .author_dossier(
+                &b,
+                "plan",
+                "Plan v2 (bob)",
+                "sneaky",
+                "bob",
+                brief::DossierAuthorMode::Revise,
+                None,
+                None,
+            )
+            .unwrap();
+        match bob {
+            brief::DossierAuthorOutcome::Locked(l) => assert_eq!(l.locked_by, "alice"),
+            other => panic!("expected locked refusal, got {other:?}"),
+        }
+        // Still one revision (bob's write did not land).
+        let rev_count = s.list_dossiers(&b).unwrap().len();
+        assert_eq!(rev_count, 1);
+        // The owner (alice) can still author while holding the lock.
+        let alice2 = s
+            .author_dossier(
+                &b,
+                "plan",
+                "Plan v2",
+                "real update",
+                "alice",
+                brief::DossierAuthorMode::Revise,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(alice2, brief::DossierAuthorOutcome::Authored(_)));
+        // alice unlocks; now bob can author.
+        let unlocked = s.unlock_dossier(&b, "plan", "alice").unwrap();
+        match unlocked {
+            brief::DossierUnlockOutcome::Unlocked(u) => {
+                assert!(u.unlocked);
+                assert_eq!(u.previously_locked_by.as_deref(), Some("alice"));
+            }
+            other => panic!("expected unlock, got {other:?}"),
+        }
+        assert!(s.list_dossier_locks(&b).unwrap().is_empty());
+        let bob2 = s
+            .author_dossier(
+                &b,
+                "plan",
+                "Plan v3 (bob)",
+                "now allowed",
+                "bob",
+                brief::DossierAuthorMode::Revise,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(bob2, brief::DossierAuthorOutcome::Authored(_)));
+    }
+
+    // Lock/unlock are owner-or-nobody: a different subject conflicts; the
+    // same owner re-lock is idempotent; unlock of an absent lock is a no-op.
+    #[test]
+    fn dossier_lock_conflict_and_idempotency() {
+        let s = TaskStore::in_memory().unwrap();
+        let b = s
+            .create_brief("acme", "Doc", "subj", None, None, None, None)
+            .unwrap();
+        // alice locks; a same-owner re-lock refreshes the reason (idempotent).
+        s.lock_dossier(&b, "design", "alice", None).unwrap();
+        let relock = s
+            .lock_dossier(&b, "design", "alice", Some("now with reason"))
+            .unwrap();
+        match relock {
+            brief::DossierLockOutcome::Locked(l) => {
+                assert_eq!(l.reason.as_deref(), Some("now with reason"))
+            }
+            other => panic!("expected idempotent re-lock, got {other:?}"),
+        }
+        assert_eq!(s.list_dossier_locks(&b).unwrap().len(), 1);
+        // bob cannot lock or unlock alice's lock.
+        assert!(matches!(
+            s.lock_dossier(&b, "design", "bob", None).unwrap(),
+            brief::DossierLockOutcome::Conflict(_)
+        ));
+        assert!(matches!(
+            s.unlock_dossier(&b, "design", "bob").unwrap(),
+            brief::DossierUnlockOutcome::Conflict(_)
+        ));
+        // The lock is unchanged after the refused attempts.
+        assert_eq!(s.list_dossier_locks(&b).unwrap()[0].locked_by, "alice");
+        // alice unlocks; a second unlock is an idempotent no-op (no prior owner).
+        assert!(matches!(
+            s.unlock_dossier(&b, "design", "alice").unwrap(),
+            brief::DossierUnlockOutcome::Unlocked(_)
+        ));
+        match s.unlock_dossier(&b, "design", "alice").unwrap() {
+            brief::DossierUnlockOutcome::Unlocked(u) => {
+                assert_eq!(u.previously_locked_by, None)
+            }
+            other => panic!("expected idempotent unlock, got {other:?}"),
+        }
+    }
+
+    // Lock validates the kind token and bounds the reason; unlock validates too.
+    #[test]
+    fn dossier_lock_validates_inputs() {
+        let s = TaskStore::in_memory().unwrap();
+        let b = s
+            .create_brief("acme", "Doc", "subj", None, None, None, None)
+            .unwrap();
+        // Bad kind (space/pipe-hostile) is refused.
+        assert!(matches!(
+            s.lock_dossier(&b, "not a kind", "alice", None),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        // Empty subject is refused.
+        assert!(matches!(
+            s.lock_dossier(&b, "plan", "  ", None),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        // Over-long reason is refused (no write).
+        let long = "x".repeat(MAX_DOSSIER_LOCK_REASON_LEN + 1);
+        assert!(matches!(
+            s.lock_dossier(&b, "plan", "alice", Some(&long)),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        assert!(s.list_dossier_locks(&b).unwrap().is_empty());
+    }
+
+    // Lock / unlock / list are tenant-scoped on the owning Brief: a cross-Guild
+    // caller gets the same not-found shape as a missing Brief (no existence
+    // leak), and cannot lock another Guild's Dossier.
+    #[test]
+    fn dossier_lock_denied_across_tenant() {
+        let s = TaskStore::in_memory().unwrap();
+        let a = s
+            .create_brief("acme", "Acme", "subj", None, None, None, None)
+            .unwrap();
+        // Cross-tenant lock / unlock / list all refuse at the handler boundary.
+        assert!(matches!(
+            handle_brief_dossier_lock(
+                &s,
+                &ctx_tenant(format!("{a}|plan|hacker|mine").as_bytes(), "globex"),
+            ),
+            HandlerOutcome::Err(_)
+        ));
+        assert!(matches!(
+            handle_brief_dossier_unlock(
+                &s,
+                &ctx_tenant(format!("{a}|plan|hacker").as_bytes(), "globex"),
+            ),
+            HandlerOutcome::Err(_)
+        ));
+        assert!(matches!(
+            handle_brief_dossier_locks(&s, &ctx_tenant(a.as_bytes(), "globex")),
+            HandlerOutcome::Err(_)
+        ));
+        // Same-tenant lock works and is visible only to the owning Guild.
+        assert!(matches!(
+            handle_brief_dossier_lock(
+                &s,
+                &ctx_tenant(format!("{a}|plan|alice|").as_bytes(), "acme"),
+            ),
+            HandlerOutcome::Ok(_)
+        ));
+        assert_eq!(s.list_dossier_locks(&a).unwrap().len(), 1);
+    }
+
+    // ── §1.9 interaction cancel + idempotent create + continuation wake ───
+
+    // Cancel closes an open card; re-cancel is idempotent; a cancelled card
+    // can't then be answered; a decided card can't be cancelled.
+    #[test]
+    fn interaction_cancel_lifecycle() {
+        let s = TaskStore::in_memory().unwrap();
+        let b = s
+            .create_brief("acme", "Q", "subj", None, None, None, None)
+            .unwrap();
+        let id = s
+            .open_interaction(&b, "ask", "op", "Which region?", &[])
+            .unwrap();
+        // Cancel the open card.
+        s.cancel_interaction(&b, &id, "founder").unwrap();
+        assert_eq!(s.list_interactions(&b).unwrap()[0].status, "cancelled");
+        let ev = s
+            .query_events(
+                &b,
+                0,
+                50,
+                Some("brief.interaction_cancelled"),
+                EventOrder::Asc,
+            )
+            .unwrap();
+        assert_eq!(ev.len(), 1);
+        // Re-cancel is idempotent (success, no second event).
+        s.cancel_interaction(&b, &id, "founder").unwrap();
+        let ev = s
+            .query_events(
+                &b,
+                0,
+                50,
+                Some("brief.interaction_cancelled"),
+                EventOrder::Asc,
+            )
+            .unwrap();
+        assert_eq!(ev.len(), 1, "idempotent re-cancel must not duplicate event");
+        // A cancelled card can't be answered.
+        assert!(matches!(
+            s.respond_interaction(&b, &id, "founder", "resolved", "us-east"),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        // A decided (resolved) card can't be cancelled.
+        let id2 = s.open_interaction(&b, "confirm", "op", "Go?", &[]).unwrap();
+        s.respond_interaction(&b, &id2, "founder", "resolved", "yes")
+            .unwrap();
+        assert!(matches!(
+            s.cancel_interaction(&b, &id2, "founder"),
+            Err(CoordinatorError::Invalid(_))
+        ));
+    }
+
+    // Idempotent create: the same (task_id, author, idempotency_key) returns the
+    // existing card; a different key (or none) opens a new one.
+    #[test]
+    fn interaction_create_is_idempotent() {
+        let s = TaskStore::in_memory().unwrap();
+        let b = s
+            .create_brief("acme", "Q", "subj", None, None, None, None)
+            .unwrap();
+        let id1 = s
+            .open_interaction_idem(&b, "ask", "op", "Region?", &[], Some("k1"))
+            .unwrap();
+        let id1b = s
+            .open_interaction_idem(&b, "ask", "op", "Region? (retry)", &[], Some("k1"))
+            .unwrap();
+        assert_eq!(id1, id1b, "same key must return the existing card");
+        // Only ONE card exists despite two creates.
+        assert_eq!(s.list_interactions(&b).unwrap().len(), 1);
+        // A different key opens a new card.
+        let id2 = s
+            .open_interaction_idem(&b, "ask", "op", "Region?", &[], Some("k2"))
+            .unwrap();
+        assert_ne!(id1, id2);
+        // A different author with the same key is a different card.
+        let id3 = s
+            .open_interaction_idem(&b, "ask", "op2", "Region?", &[], Some("k1"))
+            .unwrap();
+        assert_ne!(id1, id3);
+        // Keyless creates are never de-duplicated.
+        let k1 = s.open_interaction(&b, "ask", "op", "X?", &[]).unwrap();
+        let k2 = s.open_interaction(&b, "ask", "op", "X?", &[]).unwrap();
+        assert_ne!(k1, k2);
+    }
+
+    // §1.9 continuation policy: answering OR cancelling a card nudges the
+    // Brief's assignee to continue. With no assignee the hook records an honest
+    // `brief.wakeup_skipped` note (proving it fired without inventing a wake).
+    #[test]
+    fn interaction_respond_and_cancel_offer_continuation_wake() {
+        let s = TaskStore::in_memory().unwrap();
+        let b = s
+            .create_brief("acme", "Q", "subj", None, None, None, None)
+            .unwrap();
+        let id = s.open_interaction(&b, "confirm", "op", "Go?", &[]).unwrap();
+        s.respond_interaction(&b, &id, "founder", "resolved", "yes")
+            .unwrap();
+        let id2 = s.open_interaction(&b, "ask", "op", "Which?", &[]).unwrap();
+        s.cancel_interaction(&b, &id2, "founder").unwrap();
+        // The Brief has no assignee, so each continuation records a skipped note.
+        let skipped = s
+            .query_events(&b, 0, 50, Some("brief.wakeup_skipped"), EventOrder::Asc)
+            .unwrap();
+        assert_eq!(
+            skipped.len(),
+            2,
+            "respond + cancel should each offer a continuation wake"
+        );
+    }
+
+    // Cancel is tenant-scoped on the owning Brief (no existence leak).
+    #[test]
+    fn interaction_cancel_denied_across_tenant() {
+        let s = TaskStore::in_memory().unwrap();
+        let a = s
+            .create_brief("acme", "Acme", "subj", None, None, None, None)
+            .unwrap();
+        let id = s.open_interaction(&a, "ask", "op", "Q?", &[]).unwrap();
+        assert!(matches!(
+            handle_brief_interaction_cancel(
+                &s,
+                &ctx_tenant(format!("{a}|{id}|hacker").as_bytes(), "globex"),
+            ),
+            HandlerOutcome::Err(_)
+        ));
+        // Still open for the owning Guild.
+        assert_eq!(s.list_interactions(&a).unwrap()[0].status, "open");
     }
 
     // §1.8 (approval-bound plan confirm): opening a plan confirm refuses

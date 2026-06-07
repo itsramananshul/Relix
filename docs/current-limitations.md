@@ -207,16 +207,66 @@ Brief+kind on read. What it does **not** do:
 - **No collaborative editing.** There is no live cursor, presence, or operational
   transform — two operators editing the same kind race on the optimistic lock
   (the loser gets a 409 and reloads or forks). Single-operator-at-a-time by
-  design.
+  design. **Explicit document locking now exists** (below) on top of the
+  optimistic lock, so a deliberate "I'm editing this, hold off" lease is
+  available — but it is still single-writer, not true co-editing.
 - **No external document store.** Dossiers are rows in the coordinator's
   `task_documents` ledger (append-only); there is no Google-Docs/Notion-style
   external store, no per-doc binary blobs, and the body is byte-capped (64 KiB).
 - **No autonomous authoring.** No agent/LLM authors or revises a document on its
   own — every author/revise/fork is an operator action through the governed
   capability. The separate plan-package **composer** is likewise a manual surface.
-- **Locking is the revision lock + explicit fork**, not Paperclip's
-  "locked-flag → writes redirect to a new key" nicety; that auto-redirect is not
-  implemented.
+- **Explicit document locking (v1) — SHIPPED, owner-or-nobody, refuse-not-redirect.**
+  A logical Dossier (a Brief + `kind`, e.g. `plan`) can now be **locked** so
+  concurrent authors don't race: `brief.dossier_lock` /
+  `POST /v1/spine/briefs/:id/dossiers/lock` records a per-`(Brief, kind)` lock
+  (`locked_by` / `locked_at` / optional bounded `reason`); while held,
+  `brief.dossier_author` **refuses** a revision from anyone but the lock owner
+  (an `Ok` body `{locked:true, kind, locked_by}` the bridge maps onto **HTTP
+  409** — nothing written, never a silent overwrite). The owner keeps authoring
+  normally; `brief.dossier_unlock` /
+  `POST /v1/spine/briefs/:id/dossiers/unlock` releases it (**owner-or-nobody** —
+  only the owner may unlock; a different subject is a 409; an absent lock is an
+  idempotent no-op). Active locks are listable
+  (`brief.dossier_locks` / `GET …/dossiers/locks`). Create/update/lock/unlock all
+  Chronicle bounded events (`brief.dossier_locked` / `…_unlocked`), tenant-scoped
+  on the owning Brief (a cross-Guild caller gets the same not-found shape as a
+  missing Brief — no existence leak). What it still does **not** do: Paperclip's
+  **"locked-flag → writes auto-redirect to a new key"** nicety is **not**
+  implemented — a locked-document write from a non-owner is **refused** (the
+  caller reloads, waits for unlock, or explicitly `fork`s), not silently
+  redirected. There is also **no operator force-unlock** in this v1 (only the
+  owner releases its lock), and there is no lock lease/expiry (a lock is held
+  until explicitly released).
+
+### Thread interactions: cancel + idempotent create + continuation wake (v1)
+
+Brief thread interactions (answerable ask/confirm/suggest_tasks cards,
+`relix-execution-and-issue-design` §1.9) gained three v1 additions on top of the
+existing open/respond/expire lifecycle:
+
+- **Cancel — SHIPPED.** An operator can close an open card without answering it:
+  `brief.interaction_cancel` / `POST /v1/spine/briefs/:id/interactions/:iid/cancel`
+  flips an `open` card to `cancelled` (Chronicles `brief.interaction_cancelled`).
+  It is **idempotent** on an already-cancelled card and **refuses** a decided one
+  (`resolved` / `rejected` / `expired`) — a decided card is never reopened.
+- **Idempotent create — SHIPPED.** `brief.interaction_create` (JSON;
+  `POST …/interactions` with an `idempotency_key`) de-duplicates on
+  `(brief, author, idempotency_key)` — a repeated create returns the **existing**
+  card instead of a duplicate (durable partial-UNIQUE backstop +
+  check-then-insert under the store lock). A keyless create (the legacy pipe
+  `brief.interaction_open` path) is unchanged and never de-duplicated.
+- **Continuation wake — SHIPPED (best-effort).** Answering OR cancelling a card
+  now nudges the Brief's assignee to continue, via the existing supervisory-wake
+  primitive (the §1.9 "wake the assignee when answered" policy). A Brief with no
+  assignee records an honest `brief.wakeup_skipped` note instead of inventing a
+  wake. What it does **not** do: **supersede-on-comment** (a pending plain
+  confirm auto-expiring when you just comment) is **NOT** implemented for plain
+  ask/confirm cards — only the **approval-bound plan confirm** expires, and only
+  when the bound `plan` revision changes under it (the existing
+  `brief.interaction_expired` path). There is no per-interaction `expires_at`
+  TTL/clock-driven expiry, and `suggest_tasks` materialization (accept → child
+  Briefs) is the pre-existing exactly-once decomposition path, unchanged here.
 
 ### Prime is autonomous over approved work, not self-approving
 

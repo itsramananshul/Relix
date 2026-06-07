@@ -2189,10 +2189,18 @@ pub struct OpenInteractionRequest {
     #[serde(default)]
     pub choices: Vec<String>,
     pub author: String,
+    /// Optional §1.9 idempotency key: a repeated create with the same
+    /// `(brief, author, idempotency_key)` returns the existing card instead of
+    /// a duplicate. When present, the request is routed through the JSON
+    /// `brief.interaction_create` capability; when absent the legacy pipe
+    /// `brief.interaction_open` path is used unchanged.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 /// `POST /v1/spine/briefs/:id/interactions` — raise an answerable card
-/// (ask/confirm) on a Brief's thread (§1.9). Returns the interaction_id.
+/// (ask/confirm) on a Brief's thread (§1.9). Returns the interaction_id. When
+/// an `idempotency_key` is supplied the create is de-duplicated server-side.
 pub async fn open_interaction(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2203,6 +2211,25 @@ pub async fn open_interaction(
     }
     if req.prompt.trim().is_empty() || req.author.trim().is_empty() {
         return Err(bad("prompt and author required"));
+    }
+    let idem = req
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // Idempotency-aware path: a JSON arg (the key is awkward in the pipe wire).
+    if let Some(key) = idem {
+        let arg = serde_json::json!({
+            "task_id": id,
+            "kind": req.kind.trim(),
+            "author": req.author.trim(),
+            "prompt": req.prompt,
+            "choices": req.choices,
+            "idempotency_key": key,
+        });
+        let arg_bytes = serde_json::to_vec(&arg).map_err(|e| bad(&format!("encode: {e}")))?;
+        let body = call_peer(&state, "brief.interaction_create", &arg_bytes).await?;
+        return json_id("interaction_id", &body);
     }
     // kind/author/choices are positional wire fields, so they must not
     // carry a literal `|`; prompt is the trailing field and may.
@@ -2368,6 +2395,32 @@ pub async fn respond_interaction(
         req.response
     );
     call_peer(&state, "brief.interaction_respond", arg.as_bytes()).await?;
+    ok_json()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelInteractionRequest {
+    /// Who is cancelling the card.
+    pub subject: String,
+}
+
+/// `POST /v1/spine/briefs/:id/interactions/:iid/cancel` — close an answerable
+/// card without answering (§1.9). Idempotent on an already-cancelled card; a
+/// decided card (resolved/rejected/expired) is a typed `400`.
+pub async fn cancel_interaction(
+    State(state): State<AppState>,
+    Path((id, iid)): Path<(String, String)>,
+    Json(req): Json<CancelInteractionRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let subject = req.subject.trim();
+    if subject.is_empty() {
+        return Err(bad("subject required"));
+    }
+    if subject.contains('|') {
+        return Err(bad("subject must not contain `|`"));
+    }
+    let arg = format!("{id}|{iid}|{subject}");
+    call_peer(&state, "brief.interaction_cancel", arg.as_bytes()).await?;
     ok_json()
 }
 
@@ -2691,6 +2744,85 @@ pub async fn dossier_latest(
     json_passthrough(body)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LockDossierRequest {
+    /// The document `kind` to lock (e.g. `plan`, `design`).
+    pub kind: String,
+    /// Who holds the lock (the only subject allowed to author / unlock).
+    pub subject: String,
+    /// Optional short human reason the document is locked.
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// `POST /v1/spine/briefs/:id/dossiers/lock` — lock a logical Dossier (§1.8
+/// document locking): while held, only `subject` may author a revision of that
+/// `kind`. A conflict (already locked by another subject) is surfaced as an
+/// honest **`409`** carrying `{conflict:true, kind, locked_by}`. A re-lock by
+/// the same subject is idempotent (and refreshes the reason).
+pub async fn lock_dossier(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<LockDossierRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let kind = req.kind.trim();
+    let subject = req.subject.trim();
+    if kind.is_empty() {
+        return Err(bad("kind required"));
+    }
+    if subject.is_empty() {
+        return Err(bad("subject required"));
+    }
+    // kind + subject are positional wire fields, so no literal `|`; reason is
+    // the trailing field and may contain pipes.
+    if kind.contains('|') || subject.contains('|') {
+        return Err(bad("kind and subject must not contain `|`"));
+    }
+    let arg = format!("{id}|{kind}|{subject}|{}", req.reason);
+    let body = call_peer(&state, "brief.dossier_lock", arg.as_bytes()).await?;
+    dossier_lock_response(body)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UnlockDossierRequest {
+    pub kind: String,
+    /// Must be the lock owner (owner-or-nobody; no operator force-unlock in v1).
+    pub subject: String,
+}
+
+/// `POST /v1/spine/briefs/:id/dossiers/unlock` — unlock a logical Dossier
+/// (§1.8). Owner-or-nobody: a different subject is refused as a **`409`**
+/// (`{conflict:true, …}`); an absent lock is an idempotent `200`.
+pub async fn unlock_dossier(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UnlockDossierRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let kind = req.kind.trim();
+    let subject = req.subject.trim();
+    if kind.is_empty() {
+        return Err(bad("kind required"));
+    }
+    if subject.is_empty() {
+        return Err(bad("subject required"));
+    }
+    if kind.contains('|') || subject.contains('|') {
+        return Err(bad("kind and subject must not contain `|`"));
+    }
+    let arg = format!("{id}|{kind}|{subject}");
+    let body = call_peer(&state, "brief.dossier_unlock", arg.as_bytes()).await?;
+    dossier_lock_response(body)
+}
+
+/// `GET /v1/spine/briefs/:id/dossiers/locks` — the active Dossier locks on a
+/// Brief (§1.8), a JSON array (one per locked kind, oldest first).
+pub async fn list_dossier_locks(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "brief.dossier_locks", id.as_bytes()).await?)
+}
+
 /// The `brief.dossier_author` body carries a `stale: true` discriminant when
 /// the optimistic lock failed (a newer revision landed first). Map that one
 /// case onto **409 Conflict** (carrying the structured body so the editor can
@@ -2698,11 +2830,33 @@ pub async fn dossier_latest(
 /// `200`. Mirrors `run_report_response`'s "inspect the Ok body, map the one
 /// conflict case" pattern.
 fn dossier_author_response(body: Vec<u8>) -> Result<Response, (StatusCode, Json<ApiError>)> {
-    let is_stale = serde_json::from_slice::<serde_json::Value>(&body)
+    let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let flagged = |key: &str| {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(key).and_then(serde_json::Value::as_bool))
+            == Some(true)
+    };
+    // A stale-lock refusal (`stale:true`) OR a locked-document refusal
+    // (`locked:true`, §1.8 document locking) is a conflict — nothing written.
+    if flagged("stale") || flagged("locked") {
+        json_with_status(StatusCode::CONFLICT, body)
+    } else {
+        json_passthrough(body)
+    }
+}
+
+/// A `brief.dossier_lock` / `brief.dossier_unlock` body carries
+/// `conflict: true` when the lock is held by a *different* subject (§1.8). Map
+/// that one case onto **409 Conflict** (carrying the structured body); a
+/// successful lock/unlock passes through as `200`. Mirrors
+/// [`dossier_author_response`].
+fn dossier_lock_response(body: Vec<u8>) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let is_conflict = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
-        .and_then(|v| v.get("stale").and_then(serde_json::Value::as_bool))
+        .and_then(|v| v.get("conflict").and_then(serde_json::Value::as_bool))
         == Some(true);
-    if is_stale {
+    if is_conflict {
         json_with_status(StatusCode::CONFLICT, body)
     } else {
         json_passthrough(body)

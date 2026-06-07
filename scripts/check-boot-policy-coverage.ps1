@@ -81,6 +81,8 @@ $RequiredCapabilities = @(
     'brief.comment', 'brief.unassigned', 'brief.unblocked', 'brief.run', 'brief.runs',
     # Brief thread interactions (answerable ask/confirm cards, §1.9)
     'brief.interaction_open', 'brief.interactions', 'brief.interaction_respond',
+    # Interaction cancel + idempotency-aware create (§1.9)
+    'brief.interaction_cancel', 'brief.interaction_create',
     # Approval-bound plan confirm (bind a confirm to the latest plan Dossier, §1.8)
     'brief.plan_confirm_open',
     # Brief suggest_tasks cards (propose + accept/reject a child-Brief tree, §1.9)
@@ -94,6 +96,8 @@ $RequiredCapabilities = @(
     'brief.dossier_add', 'brief.set_snags', 'brief.clearance_request', 'bridge_back.authorize',
     # Dossier authoring / revision-lock / fork (issue documents, §1.8)
     'brief.dossier_author', 'brief.dossier_latest',
+    # Dossier (document) locking: lock / unlock / list active locks (§1.8)
+    'brief.dossier_lock', 'brief.dossier_unlock', 'brief.dossier_locks',
     # Agent roster: CRUD + hiring + clearances + standing approvals
     'agent.list', 'agent.get', 'agent.create', 'agent.update', 'agent.delete',
     'agent.approve_hire', 'agent.reject_hire', 'agent.operatives', 'agent.keys', 'agent.assign_check',

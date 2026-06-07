@@ -126,14 +126,97 @@ pub struct DossierStale {
     pub current_latest_doc_id: Option<String>,
 }
 
-/// The outcome of [`super::TaskStore::author_dossier`]: either a written
-/// revision or a no-write stale-lock refusal. Both are `Ok` (the capability
-/// succeeded in *deciding*); only `Authored` mutates.
+/// A **locked-document write refusal** from `brief.dossier_author` (§1.8
+/// document locking): the logical Dossier (this Brief + `kind`) is held under
+/// an explicit lock by a *different* subject, so the write is refused with
+/// **nothing written** — a locked document is never silently overwritten. The
+/// `locked` discriminant is what the bridge inspects to map this onto an honest
+/// HTTP `409`. The lock owner can still author normally (it owns the lock);
+/// another author must wait for an `unlock` (the owner releases it).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DossierLocked {
+    /// Always `true` — the wire discriminant the bridge keys its 409 on.
+    pub locked: bool,
+    pub kind: String,
+    /// The subject that currently holds the lock on this kind.
+    pub locked_by: String,
+}
+
+/// The outcome of [`super::TaskStore::author_dossier`]: a written revision, a
+/// no-write stale-lock refusal, or a no-write locked-document refusal. All are
+/// `Ok` (the capability succeeded in *deciding*); only `Authored` mutates.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DossierAuthorOutcome {
     Authored(DossierAuthored),
     Stale(DossierStale),
+    Locked(DossierLocked),
+}
+
+/// A **lock** held on a logical Dossier (a Brief's document `kind`, e.g.
+/// `plan`) — §1.8 document locking. While a lock exists, only `locked_by` may
+/// author a new revision of that `kind`; any other author's write is refused
+/// (no silent overwrite). The lock is per `(Brief, kind)` and tenant-scoped via
+/// the owning Brief, exactly like Dossiers. **Owner-or-nobody:** only the owner
+/// may `unlock` (a conservative, auditable contract — there is no operator
+/// force-unlock in this v1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DossierLock {
+    pub task_id: String,
+    pub kind: String,
+    pub locked_by: String,
+    pub locked_at: i64,
+    /// Optional human reason the document was locked (bounded); omitted when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// A **lock/unlock conflict refusal** (§1.8): the caller tried to lock or
+/// unlock a Dossier `kind` that is currently locked by a *different* subject.
+/// Nothing is changed. The `conflict` discriminant is what the bridge inspects
+/// to map this onto an honest HTTP `409`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DossierLockConflict {
+    /// Always `true` — the wire discriminant the bridge keys its 409 on.
+    pub conflict: bool,
+    pub kind: String,
+    /// The subject that currently holds the lock.
+    pub locked_by: String,
+}
+
+/// The outcome of [`super::TaskStore::lock_dossier`]: the active lock now held
+/// by the caller, or a conflict refusal when another subject holds it. Both are
+/// `Ok` (the capability decided); only `Locked` mutates. A re-lock by the same
+/// owner is idempotent and updates the reason.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DossierLockOutcome {
+    Locked(DossierLock),
+    Conflict(DossierLockConflict),
+}
+
+/// The result of a successful [`super::TaskStore::unlock_dossier`] (§1.8): the
+/// lock on `kind` is released (or was already absent — unlock is idempotent).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DossierUnlocked {
+    /// Always `true` — the document `kind` is now unlocked.
+    pub unlocked: bool,
+    pub kind: String,
+    /// The subject that held the lock that was just released; `None` when the
+    /// kind was not locked (an idempotent no-op unlock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previously_locked_by: Option<String>,
+}
+
+/// The outcome of [`super::TaskStore::unlock_dossier`]: the released lock, or a
+/// conflict refusal when a *different* subject holds it (only the owner may
+/// unlock in this v1). Both are `Ok`; only `Unlocked` mutates.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DossierUnlockOutcome {
+    Unlocked(DossierUnlocked),
+    Conflict(DossierLockConflict),
 }
 
 /// A **thread interaction** — an answerable card the agent (or
@@ -161,7 +244,10 @@ pub struct Interaction {
     pub choices: Vec<String>,
     /// Who raised the card (the Operative, the companion, or a human).
     pub author: String,
-    /// `open` | `resolved` | `rejected`.
+    /// `open` | `resolved` | `rejected` | `cancelled` | `expired`. A card is
+    /// `cancelled` when an operator closes it without answering
+    /// (`brief.interaction_cancel`); `expired` when a bound plan confirm went
+    /// stale (the plan changed under it).
     pub status: String,
     /// The operator's answer (the chosen option, free text, or yes/no
     /// note); `None` while still `open`. For an accepted `suggest_tasks`

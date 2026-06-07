@@ -1410,6 +1410,14 @@ name = "spine_brief_interaction_respond"
 method = "brief.interaction_respond"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_brief_interaction_cancel"
+method = "brief.interaction_cancel"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_interaction_create"
+method = "brief.interaction_create"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_brief_suggest_open"
 method = "brief.suggest_open"
 allow_groups = ["chat-users"]
@@ -1448,6 +1456,18 @@ allow_groups = ["chat-users"]
 [[rules]]
 name = "spine_brief_dossier_latest"
 method = "brief.dossier_latest"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_dossier_lock"
+method = "brief.dossier_lock"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_dossier_unlock"
+method = "brief.dossier_unlock"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_dossier_locks"
+method = "brief.dossier_locks"
 allow_groups = ["chat-users"]
 [[rules]]
 name = "spine_brief_set_snags"
