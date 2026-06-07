@@ -259,14 +259,17 @@ when you click Start. What it does **not** do:
   path (manual `brief.run`, Prime's Start-to-Shift, the autonomous heartbeat)
   and onto the subscription CLIs' argv: the Claude Rig gets `--model <model>`,
   the Codex Rig gets `--model <model>` + `-c model_reasoning_effort=<effort>`
-  (adapters §3.2/§3.3). It is argv-only (no shell), and echo / Gemini /
-  generic Rigs ignore it. **Remaining:** (1) **Claude effort is not mapped** —
-  Claude Code exposes no documented headless reasoning-effort flag, so only the
-  model is applied for the Claude Rig; (2) the **guarded operator retry**
-  (`run.retry`) still runs with no model preference (it reuses the
-  backward-compatible preflight wrapper) — a small scoped follow-up. An invalid
-  model name is the CLI's own run-time error (Relix passes it as a discrete
-  argv value, never a shell token).
+  (adapters §3.2/§3.3). The **guarded operator retry** (`run.retry`) now
+  **inherits** these prefs too: the bridge resolves the retry child's assignee
+  with a tenant-scoped Operative lookup and threads `model_preference` /
+  `reasoning_effort` through `open_retry_child` → `preflight_run_with_prefs`, so
+  a retry child runs on the SAME model the original Shift would (no silent
+  downgrade to the adapter default; an Operative with no preference stays clean).
+  It is argv-only (no shell), and echo / Gemini / generic Rigs ignore it.
+  **Remaining:** **Claude effort is not mapped** — Claude Code exposes no
+  documented headless reasoning-effort flag, so only the model is applied for the
+  Claude Rig. An invalid model name is the CLI's own run-time error (Relix passes
+  it as a discrete argv value, never a shell token).
 - **The autonomous heartbeat only executes**, it does not plan. It runs
   already-assigned Briefs on a timer — it never authors strategy, staffs a
   team, or orchestrates a Mandate.

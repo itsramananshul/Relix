@@ -9664,20 +9664,38 @@ fn register_node_type_handlers(
                                 Ok(None) => return not_found(),
                                 Err(e) => return internal(format!("run.retry: {e}")),
                             };
-                            let (preferred, charter) = match st.brief_card(&brief_id) {
+                            let (preferred, charter, prefs) = match st.brief_card(&brief_id) {
                                 Ok(Some(card)) => {
+                                    // Tenant-scoped Operative lookup (the caller has a
+                                    // tenant) so the retry child inherits the SAME
+                                    // Rig + charter + model/effort prefs the original
+                                    // Shift would have used — no cross-Guild read.
                                     let agent = card
                                         .assignee_agent_id
                                         .as_deref()
-                                        .and_then(|a| ags.get_agent(a).ok().flatten());
+                                        .and_then(|a| ags.get_agent_for_tenant(a, &tenant).ok().flatten());
+                                    let prefs = agent
+                                        .as_ref()
+                                        .map(|a| {
+                                            crate::nodes::coordinator::heartbeat::RunModelPrefs::new(
+                                                a.model_preference.clone(),
+                                                a.reasoning_effort.clone(),
+                                            )
+                                        })
+                                        .unwrap_or_default();
                                     (
                                         agent.as_ref().and_then(|a| a.rig.clone()),
                                         agent
                                             .map(|a| a.instruction_bundle)
                                             .filter(|c| !c.trim().is_empty()),
+                                        prefs,
                                     )
                                 }
-                                _ => (None, None),
+                                _ => (
+                                    None,
+                                    None,
+                                    crate::nodes::coordinator::heartbeat::RunModelPrefs::default(),
+                                ),
                             };
                             let prompt = st.compose_brief_prompt_with_charter(
                                 &brief_id,
@@ -9694,6 +9712,7 @@ fn register_node_type_handlers(
                                 &tenant,
                                 prompt,
                                 preferred.as_deref(),
+                                prefs,
                             ) {
                                 Err(e) => internal(format!("run.retry: {e}")),
                                 Ok(outcome) => {

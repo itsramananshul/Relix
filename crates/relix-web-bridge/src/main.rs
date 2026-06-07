@@ -186,6 +186,8 @@ mod slack;
 mod sol_validate;
 #[cfg(test)]
 mod run_apply_mini_mesh_test;
+#[cfg(test)]
+mod runs_stream_mini_mesh_test;
 mod spine;
 mod sse;
 #[cfg(test)]
@@ -724,6 +726,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/runs/runtime-state/reset", post(spine::runtime_state_reset))
         // Run/Brief execution event stream (TG5) — tenant-scoped SSE.
         .route("/v1/runs/events/stream", get(tasks::runs_events_stream))
+        // Active Runs snapshot stream (dashboard-design §10/§11): tenant-scoped
+        // SSE that proxies `brief.runs` on a bounded poll and pushes only when
+        // the recent-run ledger changes (fingerprint-gated), so the Active Runs
+        // table refreshes as a run moves `running` → `done`/`failed` without a
+        // manual reload. The static `stream` segment sits before `:run_id`
+        // (axum/matchit gives the static path priority).
+        .route("/v1/runs/stream", get(spine::runs_stream))
         .route("/v1/runs/:run_id", get(spine::run_get))
         .route("/v1/runs/:run_id/events", get(spine::run_events))
         .route("/v1/runs/:run_id/cancel", post(spine::run_cancel))
@@ -749,6 +758,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/company/starter-crew", post(spine::company_starter_crew))
         // Action Center: the operator's next-actions feed (company-model §8.2).
         .route("/v1/spine/company/actions", get(spine::company_actions))
+        // Action Center snapshot stream (company-model §5.4/§8.2): tenant-scoped
+        // SSE that proxies `company.actions` on a bounded poll and pushes only
+        // when the feed changes (fingerprint-gated), so the Command Center
+        // refreshes as approvals/hires/blockers/needs-review appear. The static
+        // `stream` segment sits beside the sibling `actions` route (no conflict).
+        .route(
+            "/v1/spine/company/actions/stream",
+            get(spine::company_actions_stream),
+        )
         .route("/v1/spine/operatives", get(spine::operatives))
         // Run-workspace context config (mode / project root / caps).
         .route("/v1/spine/run-config", get(spine::run_config))

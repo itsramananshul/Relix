@@ -1480,6 +1480,112 @@ pub async fn runs_recent(
     json_passthrough(call_peer(&state, "brief.runs", b"").await?)
 }
 
+/// Default + max recent-run rows the runs stream snapshots per tick. The
+/// underlying `brief.runs` capability already caps at 100; the stream clamps
+/// the operator-supplied `limit` into the same band so a snapshot is always
+/// bounded.
+const RUNS_STREAM_DEFAULT_LIMIT: usize = 50;
+const RUNS_STREAM_MAX_LIMIT: usize = 100;
+
+/// Re-read interval for the runs / actions snapshot streams. Same low, bounded
+/// cadence as [`CLEARANCES_POLL`] / [`INTERACTIONS_POLL`] — one read per tick,
+/// de-duped by fingerprint, so the loop never spins.
+const RUNS_POLL: Duration = Duration::from_millis(2500);
+
+/// Truncate a recent-runs JSON array to the most-recent `limit` rows and
+/// re-serialize it. `brief.runs` returns a newest-first array, so the first
+/// `limit` entries are the `limit` most recent runs — exactly what
+/// `GET /v1/runs?limit=N` would return. A body that does not parse as a JSON
+/// array (a transient transport blip, an empty body) passes through unchanged
+/// (lossy UTF-8) so the stream stays robust and never fabricates rows.
+fn truncate_runs_snapshot(body: &[u8], limit: usize) -> String {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(serde_json::Value::Array(mut rows)) => {
+            rows.truncate(limit);
+            serde_json::to_string(&serde_json::Value::Array(rows))
+                .unwrap_or_else(|_| "[]".to_string())
+        }
+        _ => String::from_utf8_lossy(body).to_string(),
+    }
+}
+
+/// `GET /v1/runs/stream?limit=N` — the dedicated snapshot stream for the Active
+/// Runs feed (dashboard-design §10/§11). Streams the SAME recent-run ledger
+/// rows `GET /v1/runs?limit=N` returns by proxying the SAME `brief.runs`
+/// capability (the resolved tenant is captured at open time and re-applied to
+/// every downstream coord call, exactly like the `/v1/runs` list route) — no
+/// new privilege, no cross-Guild leak beyond what the list already does. The
+/// stream:
+///
+/// - emits the current runs immediately as `event: runs` (JSON = the same array
+///   `/v1/runs` returns, truncated to the most-recent `limit` rows);
+/// - re-reads on a low, bounded interval and pushes again only when the
+///   truncated snapshot's fingerprint changes, so a run moving
+///   `running` → `done`/`failed` refreshes the table (and an unchanged ledger
+///   pushes nothing — the keep-alive `ping` only, never a spin);
+/// - is safe with no runs (an empty array still fingerprints + de-dupes);
+/// - emits `event: error` for transient mesh/gateway failures and KEEPS
+///   retrying (the ledger read is idempotent, so a hiccup must not end the feed);
+/// - stops cleanly when the client disconnects (the stream future is dropped,
+///   releasing the stream-metrics guard).
+///
+/// This is honest polling-backed SSE — NOT a true event bus / websocket. It adds
+/// no persistent state or event table; it composes the existing read capability
+/// exactly like the polling list route, mirroring [`clearances_stream`].
+pub async fn runs_stream(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> Result<
+    Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, Json<ApiError>),
+> {
+    // Capture the resolved tenant NOW (inside the middleware scope); the stream
+    // body runs later, OUTSIDE that scope, and must re-apply it on each call.
+    let tenant_scope = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    let opened_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let stream_guard = state.stream_metrics.open("runs".to_string(), opened_at);
+    let limit = q
+        .limit
+        .unwrap_or(RUNS_STREAM_DEFAULT_LIMIT)
+        .clamp(1, RUNS_STREAM_MAX_LIMIT);
+
+    let s = stream! {
+        let _live_guard = stream_guard;
+        let mut last_fp: Option<u64> = None;
+        loop {
+            // Same source of truth as the `/v1/runs` list route, re-scoped to
+            // the captured tenant on every tick.
+            let fetch = CURRENT_TENANT.scope(
+                tenant_scope.clone(),
+                call_peer(&state, "brief.runs", b""),
+            );
+            match fetch.await {
+                Ok(body) => {
+                    let text = truncate_runs_snapshot(&body, limit);
+                    let fp = interactions_fingerprint(&text);
+                    // De-dupe: only push when the run ledger actually changed.
+                    if last_fp != Some(fp) {
+                        yield Ok(Event::default().event("runs").data(text));
+                        last_fp = Some(fp);
+                    }
+                }
+                Err((_status, err)) => {
+                    // The ledger read is idempotent, so even a NOT_FOUND here is
+                    // transient (a mesh/gateway blip), never a per-resource
+                    // existence signal — surface it and keep trying.
+                    let payload = serde_json::json!({ "error": err.0.error }).to_string();
+                    yield Ok(Event::default().event("error").data(payload));
+                }
+            }
+            tokio::time::sleep(RUNS_POLL).await;
+        }
+    };
+    Ok(Sse::new(s).keep_alive(KeepAlive::default().text("ping")))
+}
+
 /// `GET /v1/spine/briefs/:id/runs` — the run (Shift) history for one
 /// Brief, newest first.
 pub async fn brief_runs(
@@ -1738,6 +1844,81 @@ pub async fn company_actions(
     State(state): State<AppState>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
     json_passthrough(call_peer(&state, "company.actions", b"").await?)
+}
+
+/// `GET /v1/spine/company/actions/stream` — the dedicated snapshot stream for
+/// the Action Center feed (company-model §5.4/§8.2, dashboard-design §10/§11).
+/// Streams EXACTLY the snapshot `GET /v1/spine/company/actions` returns by
+/// proxying the SAME `company.actions` capability (the resolved tenant is
+/// captured at open time and re-applied to every downstream coord call) — no new
+/// privilege, no cross-Guild leak, and no new data semantics. The feed has its
+/// own internal cap + honest `truncated` flag, so the stream takes NO `limit`
+/// (truncating client-side would falsify that flag); it mirrors the endpoint
+/// verbatim. The stream:
+///
+/// - emits the current feed immediately as `event: actions` (JSON = the same
+///   object the list route returns);
+/// - re-reads on a low, bounded interval and pushes again only when the feed's
+///   fingerprint changes, so a new approval/hire/blocker/needs-review refreshes
+///   the Command Center (and an unchanged feed pushes nothing — the keep-alive
+///   `ping` only, never a spin);
+/// - emits `event: error` for transient mesh/gateway failures and KEEPS
+///   retrying (the feed read is idempotent, so a hiccup must not end the feed);
+/// - stops cleanly when the client disconnects (the stream future is dropped,
+///   releasing the stream-metrics guard).
+///
+/// This is honest polling-backed SSE — NOT a true event bus / websocket. It adds
+/// no persistent state or event table; it composes the existing read capability
+/// exactly like the polling list route, mirroring [`clearances_stream`].
+pub async fn company_actions_stream(
+    State(state): State<AppState>,
+) -> Result<
+    Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, Json<ApiError>),
+> {
+    // Capture the resolved tenant NOW (inside the middleware scope); the stream
+    // body runs later, OUTSIDE that scope, and must re-apply it on each call.
+    let tenant_scope = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    let opened_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let stream_guard = state
+        .stream_metrics
+        .open("company_actions".to_string(), opened_at);
+
+    let s = stream! {
+        let _live_guard = stream_guard;
+        let mut last_fp: Option<u64> = None;
+        loop {
+            // Same source of truth as the `…/company/actions` list route,
+            // re-scoped to the captured tenant on every tick.
+            let fetch = CURRENT_TENANT.scope(
+                tenant_scope.clone(),
+                call_peer(&state, "company.actions", b""),
+            );
+            match fetch.await {
+                Ok(body) => {
+                    let text = String::from_utf8_lossy(&body).to_string();
+                    let fp = interactions_fingerprint(&text);
+                    // De-dupe: only push when the action feed actually changed.
+                    if last_fp != Some(fp) {
+                        yield Ok(Event::default().event("actions").data(text));
+                        last_fp = Some(fp);
+                    }
+                }
+                Err((_status, err)) => {
+                    // The feed read is idempotent, so even a NOT_FOUND here is
+                    // transient (a mesh/gateway blip), never a per-resource
+                    // existence signal — surface it and keep trying.
+                    let payload = serde_json::json!({ "error": err.0.error }).to_string();
+                    yield Ok(Event::default().event("error").data(payload));
+                }
+            }
+            tokio::time::sleep(RUNS_POLL).await;
+        }
+    };
+    Ok(Sse::new(s).keep_alive(KeepAlive::default().text("ping")))
 }
 
 /// `GET /v1/spine/run-config` — the run-workspace context config (mode /
@@ -3355,6 +3536,38 @@ mod tests {
             fp(raw_b),
             "the count summary line must not affect the fingerprint"
         );
+    }
+
+    #[test]
+    fn truncate_runs_snapshot_keeps_the_most_recent_rows() {
+        // `brief.runs` returns newest-first, so truncating to `limit` keeps the
+        // `limit` most-recent rows — exactly what `GET /v1/runs?limit=N` returns.
+        let body = br#"[{"run_id":"r3"},{"run_id":"r2"},{"run_id":"r1"}]"#;
+        let got = truncate_runs_snapshot(body, 2);
+        let arr: serde_json::Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(arr.as_array().unwrap().len(), 2, "truncated to the limit");
+        assert_eq!(arr[0]["run_id"], "r3", "newest row kept");
+        assert_eq!(arr[1]["run_id"], "r2");
+    }
+
+    #[test]
+    fn truncate_runs_snapshot_is_safe_with_no_runs_and_non_arrays() {
+        // An empty ledger stays an empty array (the stream is safe with no runs).
+        assert_eq!(truncate_runs_snapshot(b"[]", 50), "[]");
+        // A limit larger than the row count returns every row, unchanged.
+        let body = br#"[{"run_id":"r1"}]"#;
+        let got = truncate_runs_snapshot(body, 50);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&got)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        // A non-array body (a transient transport blip) passes through verbatim
+        // — never fabricated into rows.
+        assert_eq!(truncate_runs_snapshot(b"not json", 10), "not json");
     }
 
     #[test]

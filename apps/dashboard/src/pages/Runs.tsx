@@ -1,18 +1,18 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { api, tryGet, subscribeRunEvents, type RunEvent, type RunEventConn } from "../api";
+import { api, tryGet, subscribeRuns, type RunEvent, type RunsStreamConn } from "../api";
 import { Empty, Section, useAsync } from "../components/common";
 import { RunTranscript } from "../components/RunTranscript";
 import { invalidate } from "../invalidate";
 
-// Live run-event connection → a small honest status chip.
-const LIVE_LABEL: Record<RunEventConn, string> = {
+// Live runs-stream connection → a small honest status chip.
+const LIVE_LABEL: Record<RunsStreamConn, string> = {
   connecting: "connecting…",
   live: "live",
   reconnecting: "reconnecting…",
   unavailable: "live updates off",
 };
-const LIVE_TONE: Record<RunEventConn, string> = {
+const LIVE_TONE: Record<RunsStreamConn, string> = {
   connecting: "todo",
   live: "done",
   reconnecting: "in_progress",
@@ -274,8 +274,12 @@ export function Runs() {
   const [diff, setDiff] = useState<RunDiff | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
-  // Live run-event stream connection state (live / reconnecting / off).
-  const [liveConn, setLiveConn] = useState<RunEventConn>("connecting");
+  // Live runs-stream connection state (live / reconnecting / off).
+  const [liveConn, setLiveConn] = useState<RunsStreamConn>("connecting");
+  // The latest run snapshot pushed by `/v1/runs/stream`. When the stream is
+  // connected this is the table's source of truth (it pushes the full ledger on
+  // every change); otherwise the page falls back to the mount-load + Refresh.
+  const [liveRuns, setLiveRuns] = useState<RunRecord[] | null>(null);
 
   const { data, loading, error, reload } = useAsync(async () => {
     const [runs, adapters, storage] = await Promise.all([
@@ -394,27 +398,19 @@ export function Runs() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deepRun]);
 
-  // Live updates: subscribe ONCE to the execution event stream. On any
-  // transition (start / finish / refuse / recover / move / review / apply),
-  // debounce-refresh the runs list so the table stays current without a manual
-  // click. The expanded run's transcript self-tails inside <RunTranscript>.
-  // Refs keep the subscription stable across re-renders (no reconnect churn).
-  const reloadRef = useRef(reload);
-  reloadRef.current = reload;
+  // Live updates: subscribe ONCE to the runs snapshot stream. It pushes the full
+  // recent-run ledger on the initial snapshot + every change (start / finish /
+  // refuse / recover / review / apply / retry), fingerprint-gated server-side so
+  // an unchanged ledger pushes nothing. We render the pushed snapshot directly
+  // while the stream is `live` (no re-fetch); when it isn't, the page falls back
+  // to the mount-load + manual Refresh. The expanded run's transcript self-tails
+  // inside <RunTranscript>.
   useEffect(() => {
-    let pending: ReturnType<typeof setTimeout> | null = null;
-    const unsub = subscribeRunEvents(
-      () => {
-        if (pending) clearTimeout(pending);
-        pending = setTimeout(() => reloadRef.current(), 500);
-      },
+    const unsub = subscribeRuns(
+      (arr) => setLiveRuns(arr as RunRecord[]),
       (state) => setLiveConn(state),
     );
-    return () => {
-      if (pending) clearTimeout(pending);
-      unsub();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => unsub();
   }, []);
 
   async function copyRunLink(runId: string) {
@@ -508,7 +504,10 @@ export function Runs() {
     }
   }
 
-  const allRuns = data?.runs ?? [];
+  // While the snapshot stream is connected, the pushed ledger is the source of
+  // truth (fresher than the mount-load); otherwise fall back to the fetched data
+  // so the table still works with the stream absent (manual Refresh re-fetches).
+  const allRuns = liveConn === "live" && liveRuns ? liveRuns : (data?.runs ?? []);
   // Surface retry lineage: map each source run id → its retry child (from the
   // child rows in the list), so a retried source hides its Retry button and
   // links to the child instead.
@@ -546,7 +545,7 @@ export function Runs() {
             <span
               className={"badge " + LIVE_TONE[liveConn]}
               style={{ fontSize: 10 }}
-              title="live run-event stream (auto-refreshes this page)"
+              title="live runs stream (auto-refreshes this table)"
             >
               ● {LIVE_LABEL[liveConn]}
             </span>

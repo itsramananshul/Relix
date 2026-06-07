@@ -619,6 +619,73 @@ export function subscribeRunEvents(
   };
 }
 
+// ── Dedicated Active Runs snapshot stream (SSE) ────────────────────────────
+// Subscribe to the bridge's `/v1/runs/stream` feed so the Active Runs table
+// refreshes the moment the recent-run ledger changes — a run started, finished,
+// refused, reviewed, applied, or retried — instead of re-fetching on each
+// run-event. Tenant-scoped server-side (it proxies the SAME `brief.runs` read
+// the `/v1/runs` list route serves); polling-backed (~2.5s) + fingerprint-gated,
+// so an unchanged ledger pushes nothing. Honest polling-backed SSE — NOT a true
+// event bus/websocket. Cookie auth rides the same-origin EventSource. The page
+// falls back to its mount-load + manual Refresh whenever this never reaches
+// `live` (see Runs.tsx).
+
+export type RunsStreamConn = "connecting" | "live" | "reconnecting" | "unavailable";
+
+// Open the runs snapshot stream. `onRuns` receives the full recent-run array on
+// the initial snapshot + every change (same shape as `GET /v1/runs`, truncated
+// to `limit`); `onConn` reports honest connection state. Manages reconnect with
+// capped backoff. Returns an unsubscribe fn.
+export function subscribeRuns(
+  onRuns: (runs: unknown[]) => void,
+  onConn: (state: RunsStreamConn) => void,
+  limit = 100,
+): () => void {
+  let es: EventSource | null = null;
+  let closed = false;
+  let attempts = 0;
+  let backoff = 1000;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const connect = () => {
+    if (closed) return;
+    onConn(attempts === 0 ? "connecting" : "reconnecting");
+    es = new EventSource(`/v1/runs/stream?limit=${limit}`, { withCredentials: true });
+    es.onopen = () => {
+      attempts = 0;
+      backoff = 1000;
+      onConn("live");
+    };
+    es.addEventListener("runs", (e: MessageEvent) => {
+      try {
+        const arr = JSON.parse(e.data);
+        if (Array.isArray(arr)) onRuns(arr as unknown[]);
+      } catch {
+        /* malformed frame — ignore, the next snapshot corrects it */
+      }
+    });
+    // NB: the server's transient `event: error` frames just precede the next
+    // snapshot; EventSource's own connection `error` is handled by `onerror`.
+    es.onerror = () => {
+      es?.close();
+      es = null;
+      if (closed) return;
+      attempts += 1;
+      onConn(attempts >= 3 ? "unavailable" : "reconnecting");
+      timer = setTimeout(connect, backoff);
+      backoff = Math.min(backoff * 2, 15000);
+    };
+  };
+
+  connect();
+  return () => {
+    closed = true;
+    if (timer) clearTimeout(timer);
+    es?.close();
+    es = null;
+  };
+}
+
 // ── Prime guided driver v1 (next governed step + one-step advance) ──────────
 // The READ-ONLY next step for a Prime work session, plus the bounded one-step
 // advance. The advance runs AT MOST ONE safe governed step through the existing
@@ -989,6 +1056,70 @@ export interface CompanyActionsFeed {
 export const companyActions = {
   list: () => tryGetReport<CompanyActionsFeed | null>("/v1/spine/company/actions", null),
 };
+
+// ── Dedicated Action Center snapshot stream (SSE) ──────────────────────────
+// Subscribe to the bridge's `/v1/spine/company/actions/stream` feed so the
+// Command Center action feed refreshes the moment it changes — an approval,
+// hire, blocker, needs-review, or recovery card appears or clears — instead of
+// only on the run-event trigger / 20s poll. Tenant-scoped server-side (it
+// proxies the SAME `company.actions` read the list route serves); polling-backed
+// (~2.5s) + fingerprint-gated, so an unchanged feed pushes nothing. Honest
+// polling-backed SSE — NOT a true event bus/websocket. Cookie auth rides the
+// same-origin EventSource. The page keeps its bounded poll + invalidation-bus
+// fallback so the feed still converges when this never reaches `live`.
+
+export type CompanyActionsConn = "connecting" | "live" | "reconnecting" | "unavailable";
+
+// Open the actions snapshot stream. `onActions` receives the full feed on the
+// initial snapshot + every change (same shape as `GET /v1/spine/company/actions`);
+// `onConn` reports honest connection state. Manages reconnect with capped
+// backoff. Returns an unsubscribe fn.
+export function subscribeCompanyActions(
+  onActions: (feed: CompanyActionsFeed) => void,
+  onConn: (state: CompanyActionsConn) => void,
+): () => void {
+  let es: EventSource | null = null;
+  let closed = false;
+  let attempts = 0;
+  let backoff = 1000;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const connect = () => {
+    if (closed) return;
+    onConn(attempts === 0 ? "connecting" : "reconnecting");
+    es = new EventSource("/v1/spine/company/actions/stream", { withCredentials: true });
+    es.onopen = () => {
+      attempts = 0;
+      backoff = 1000;
+      onConn("live");
+    };
+    es.addEventListener("actions", (e: MessageEvent) => {
+      try {
+        const feed = JSON.parse(e.data);
+        if (feed && typeof feed === "object") onActions(feed as CompanyActionsFeed);
+      } catch {
+        /* malformed frame — ignore, the next snapshot corrects it */
+      }
+    });
+    es.onerror = () => {
+      es?.close();
+      es = null;
+      if (closed) return;
+      attempts += 1;
+      onConn(attempts >= 3 ? "unavailable" : "reconnecting");
+      timer = setTimeout(connect, backoff);
+      backoff = Math.min(backoff * 2, 15000);
+    };
+  };
+
+  connect();
+  return () => {
+    closed = true;
+    if (timer) clearTimeout(timer);
+    es?.close();
+    es = null;
+  };
+}
 
 // ── Adapter runtime state (admin / session recovery) ──────────────────────
 // The persisted adapter runtime rows for ONE Operative (resumable session id,

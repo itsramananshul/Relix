@@ -2121,6 +2121,7 @@ pub fn open_retry_child(
     tenant: &str,
     prompt: String,
     preferred_rig: Option<&str>,
+    prefs: RunModelPrefs,
 ) -> Result<RetryOpen, CoordinatorError> {
     use crate::nodes::coordinator::RetryPrecheck;
     let (brief_id, next_attempt) = match store.retry_precheck(run_id, tenant)? {
@@ -2153,8 +2154,11 @@ pub fn open_retry_child(
     // Eligible: commit the child through the SHARED preflight path (adapter
     // resolution + Claim + workspace prep + ledger row + governance). A Claim
     // conflict / adapter-unavailable / workspace refusal returns a structured
-    // RunReport WITHOUT opening a child row.
-    match preflight_run(
+    // RunReport WITHOUT opening a child row. The retry child inherits the
+    // assigned Operative's stored model/effort prefs so it runs on the same
+    // model the original Shift would (execution-and-issue §3.3b / adapters
+    // §3.2/§3.3) — never a silent downgrade to the adapter default.
+    match preflight_run_with_prefs(
         store,
         registry,
         bridge_tokens,
@@ -2162,6 +2166,7 @@ pub fn open_retry_child(
         &brief_id,
         preferred_rig,
         prompt,
+        prefs,
     )? {
         Preflight::Refused(report) => Ok(RetryOpen::Refused(report)),
         Preflight::Ready(ready) => {
@@ -6092,6 +6097,7 @@ mod tests {
             "default",
             "retry prompt".into(),
             Some("echo"),
+            RunModelPrefs::default(),
         )
         .unwrap()
         {
@@ -6141,7 +6147,7 @@ mod tests {
         let src = "run_src2";
         failed_source(&s, &brief, "agt_a", src, true);
 
-        let child1 = match open_retry_child(&s, &reg, None, 300, src, "default", "p".into(), Some("echo"))
+        let child1 = match open_retry_child(&s, &reg, None, 300, src, "default", "p".into(), Some("echo"), RunModelPrefs::default())
             .unwrap()
         {
             RetryOpen::Ready { child_run_id, ready, .. } => {
@@ -6153,7 +6159,7 @@ mod tests {
 
         // Second retry of the SAME source: the duplicate guard returns the
         // existing child id and opens NO new run.
-        match open_retry_child(&s, &reg, None, 300, src, "default", "p".into(), Some("echo")).unwrap() {
+        match open_retry_child(&s, &reg, None, 300, src, "default", "p".into(), Some("echo"), RunModelPrefs::default()).unwrap() {
             RetryOpen::AlreadyRetried { child_run_id } => assert_eq!(child_run_id, child1),
             _ => panic!("a duplicate retry must return the existing child"),
         }
@@ -6174,7 +6180,7 @@ mod tests {
             RetryPrecheck::Refused { status, .. } => assert_eq!(status, "not_retryable"),
             _ => panic!("a permanent failure must refuse retry"),
         }
-        match open_retry_child(&s, &reg, None, 300, src, "default", "p".into(), Some("echo")).unwrap() {
+        match open_retry_child(&s, &reg, None, 300, src, "default", "p".into(), Some("echo"), RunModelPrefs::default()).unwrap() {
             RetryOpen::Refused(report) => assert_eq!(report.status, "not_retryable"),
             _ => panic!("open_retry_child must surface the refusal"),
         }
@@ -6210,10 +6216,83 @@ mod tests {
         ));
         // Cross Guild: reads as not-found — no existence leak, no dispatch.
         assert_eq!(s.retry_precheck(src, "guild-b").unwrap(), RetryPrecheck::NotFound);
-        match open_retry_child(&s, &reg, None, 300, src, "guild-b", "p".into(), Some("echo")).unwrap() {
+        match open_retry_child(&s, &reg, None, 300, src, "guild-b", "p".into(), Some("echo"), RunModelPrefs::default()).unwrap() {
             RetryOpen::NotFound => {}
             _ => panic!("a cross-tenant retry must read as not-found"),
         }
         assert!(s.existing_retry_child(src).unwrap().is_none());
+    }
+
+    #[test]
+    fn retry_child_inherits_operative_model_prefs() {
+        // A guarded operator retry must run the child Shift on the SAME model
+        // the assigned Operative is configured for — not a silent downgrade to
+        // the adapter default (execution-and-issue §3.3b / adapters §3.2/§3.3).
+        use crate::rig::RigRegistry;
+        let (s, _tmp) = store_ws();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut reg = RigRegistry::with_builtins();
+        reg.register(Arc::new(CaptureRig { seen: seen.clone() }));
+        let brief = ready_brief(&s, "ship it", "agt_a");
+        let src = "run_pref_src";
+        failed_source(&s, &brief, "agt_a", src, true);
+
+        match open_retry_child(
+            &s,
+            &reg,
+            None,
+            300,
+            src,
+            "default",
+            "retry prompt".into(),
+            Some("capture"),
+            RunModelPrefs::new(Some("claude-sonnet-4".to_string()), Some("high".to_string())),
+        )
+        .unwrap()
+        {
+            RetryOpen::Ready { ready, .. } => {
+                let _ = execute_ready(&s, None, *ready);
+            }
+            _ => panic!("a retryable failed Shift must open a retry child"),
+        }
+        let got = seen.lock().unwrap().clone().expect("the retry child ran the Rig");
+        assert_eq!(got.0.as_deref(), Some("claude-sonnet-4"), "retry child inherits the model pref");
+        assert_eq!(got.1.as_deref(), Some("high"), "retry child inherits the reasoning effort");
+    }
+
+    #[test]
+    fn retry_child_stays_clean_when_operative_has_no_prefs() {
+        // No stored preference → the retry child's request carries neither hint
+        // (the Rig runs on its own default). Proves the absent path stays clean.
+        use crate::rig::RigRegistry;
+        let (s, _tmp) = store_ws();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut reg = RigRegistry::with_builtins();
+        reg.register(Arc::new(CaptureRig { seen: seen.clone() }));
+        let brief = ready_brief(&s, "ship it", "agt_a");
+        let src = "run_pref_src2";
+        failed_source(&s, &brief, "agt_a", src, true);
+
+        match open_retry_child(
+            &s,
+            &reg,
+            None,
+            300,
+            src,
+            "default",
+            "retry prompt".into(),
+            Some("capture"),
+            RunModelPrefs::default(),
+        )
+        .unwrap()
+        {
+            RetryOpen::Ready { ready, .. } => {
+                let _ = execute_ready(&s, None, *ready);
+            }
+            _ => panic!("a retryable failed Shift must open a retry child"),
+        }
+        let got = seen.lock().unwrap().clone().expect("the retry child ran the Rig");
+        assert_eq!(got.0, None, "no model pref when the Operative has none");
+        assert_eq!(got.1, None, "no effort when the Operative has none");
     }
 }

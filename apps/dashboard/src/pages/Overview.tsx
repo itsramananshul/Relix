@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { ApiError, api, primeDriver, subscribeRunEvents, tryGet, tryGetReport, type PrimeNextStep } from "../api";
+import { ApiError, api, primeDriver, subscribeCompanyActions, tryGet, tryGetReport, type PrimeNextStep } from "../api";
 import { Badge, extractList, useAsync } from "../components/common";
 import { HealthPanel } from "../components/HealthPanel";
 import { invalidate, useInvalidate } from "../invalidate";
@@ -231,17 +231,18 @@ export function Overview() {
     if (a) setLiveActions(a);
   }, []);
   useEffect(() => {
-    let debounce: ReturnType<typeof setTimeout> | null = null;
-    // Coalesce run-event bursts into one refresh ~1.2s later.
-    const ping = () => {
-      if (debounce) clearTimeout(debounce);
-      debounce = setTimeout(refreshActions, 1200);
-    };
-    // onConn is required by the API but the badge isn't surfaced here; ignore it.
-    const unsub = subscribeRunEvents(ping, () => {});
+    // Prefer the dedicated Action Center snapshot stream: it pushes the full
+    // feed on every change (fingerprint-gated server-side), so the Command
+    // Center updates without re-fetching. Success-only set → a transient blip
+    // can't blank it. The bounded poll stays as the convergence fallback for
+    // when the stream never connects, so we never lose the existing behavior.
+    // onConn is required by the API but no badge is surfaced here; ignore it.
+    const unsub = subscribeCompanyActions(
+      (feed) => { if (feed) setLiveActions(feed); },
+      () => {},
+    );
     const poll = setInterval(refreshActions, 20000); // convergence fallback (bounded)
     return () => {
-      if (debounce) clearTimeout(debounce);
       clearInterval(poll);
       unsub();
     };
