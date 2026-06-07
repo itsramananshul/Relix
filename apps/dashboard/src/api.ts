@@ -838,13 +838,23 @@ export function subscribeBriefInteractions(
 // honest "decide on <route>" pointers rather than a fake inline action.
 
 // One pending Clearance row (the bridge parses `coord.approval.pending`'s TSV).
-// `requested_at` arrives as a string column (unix seconds); coerce at render.
+// `requested_at`/`expires_at` arrive as string columns (unix seconds); coerce at
+// render. The typed fields (`subject_id`, `capability_category`, `expires_at`,
+// `task_id`) are surfaced verbatim from the runtime approval row — an empty
+// string means the runtime did not record that field for this Clearance (treat
+// as absent). Nothing is fabricated; there is no free-form resource/scope/
+// payload editor field because the runtime does not store one.
 export interface Clearance {
   approval_id: string;
   agent_id: string;
   method: string;
   reason: string;
   requested_at: string;
+  // Typed payload fields (optional / possibly empty — see above).
+  subject_id?: string;
+  capability_category?: string;
+  expires_at?: string;
+  task_id?: string;
 }
 
 export const clearances = {

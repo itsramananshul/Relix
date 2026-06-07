@@ -3940,13 +3940,26 @@ pub fn handle_approval_pending(store: &AgentStore, ctx: &InvocationCtx) -> Handl
         Ok(rows) => {
             let mut out = String::new();
             for r in &rows {
+                // TSV columns, APPEND-ONLY for back-compat: the historical
+                // 5-column prefix (approval_id, agent_id, method, reason,
+                // requested_at) is unchanged, then the typed fields the Desk's
+                // Approvals hub renders without a second per-row fetch:
+                // subject_id (who/what is affected), capability_category
+                // (stable type bucket), expires_at (governance window), and
+                // task_id (the parked Brief, when present — its target route).
+                // Every string column is tab/pipe-sanitised so the positional
+                // layout cannot shift.
                 out.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                     r.approval_id,
                     r.agent_id,
                     r.method,
                     sanitize(&r.reason),
                     r.requested_at,
+                    sanitize(&r.subject_id),
+                    sanitize(&r.capability_category),
+                    r.expires_at,
+                    sanitize(r.task_id.as_deref().unwrap_or("")),
                 ));
             }
             out.push_str(&format!("count={}\n", rows.len()));
@@ -10798,6 +10811,47 @@ mod tests {
         .unwrap();
         let body = ok_body(handle_approval_pending(&s, &fake_ctx(b"")));
         assert!(body.contains("count=2"));
+    }
+
+    #[test]
+    fn approval_pending_emits_typed_columns() {
+        // The pending TSV preserves the typed fields the Approvals hub needs
+        // (subject_id, capability_category, expires_at, task_id) APPENDED after
+        // the historical 5-column prefix, so the bridge can render a typed
+        // payload summary without a second per-row fetch. A spawn-hire Clearance
+        // carries its linked subject + a task id.
+        use crate::nodes::coordinator::agent::store::SPAWN_CLEARANCE_METHOD;
+        let s = store();
+        s.create_approval(
+            "agt-hire",                 // agent_id
+            "subj-hire",                // subject_id
+            SPAWN_CLEARANCE_METHOD,     // method
+            "spawn",                    // capability_category
+            "",                         // args_redacted_hash
+            "activate the pending hire", // reason
+            &[],                        // approver_groups
+            Some("REL-7"),              // task_id
+            9999999999,                 // expires_at
+            &[],                        // authorized_approvers
+            "default",
+        )
+        .unwrap();
+        let body = ok_body(handle_approval_pending(&s, &fake_ctx(b"")));
+        // The approval_id (col 0) is store-generated; the row is the only
+        // non-`count=` line.
+        let row = body
+            .lines()
+            .find(|l| !l.is_empty() && !l.starts_with("count="))
+            .expect("pending row present");
+        let cols: Vec<&str> = row.split('\t').collect();
+        assert_eq!(cols.len(), 9, "9 typed columns: {row:?}");
+        assert!(!cols[0].is_empty(), "approval_id present");
+        assert_eq!(cols[1], "agt-hire", "agent_id (the requesting actor)");
+        assert_eq!(cols[2], SPAWN_CLEARANCE_METHOD, "method");
+        assert_eq!(cols[5], "subj-hire", "subject_id (who/what is affected)");
+        assert_eq!(cols[6], "spawn", "capability_category bucket");
+        assert_eq!(cols[7], "9999999999", "expires_at window");
+        assert_eq!(cols[8], "REL-7", "task_id (the parked Brief target route)");
     }
 
     fn test_signer() -> crate::approval::ApprovalSigner {

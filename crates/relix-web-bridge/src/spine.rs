@@ -323,10 +323,13 @@ pub async fn assign_check(
 
 /// `GET /v1/spine/clearances?limit=` — the pending Clearances
 /// (approvals awaiting a Founder greenlight) as a JSON array. Sourced
-/// from `coord.approval.pending`, whose TSV lines are parsed into
-/// objects so the Desk can render them. Read-only: approve/reject is
-/// not proxied here (`coord.approval.decide` needs an authorised
-/// approver identity the bridge does not yet forward — documented).
+/// from `coord.approval.pending`, whose TSV lines are parsed into TYPED
+/// objects (approval_id, agent_id, method, reason, requested_at, plus
+/// subject_id / capability_category / expires_at / task_id) so the Desk
+/// can render a per-type payload summary. Read-only; the decision goes
+/// through the dedicated `POST /v1/spine/clearances/:id/decide` route
+/// (forwarded to `coord.approval.decide` under the bridge's verified
+/// identity — the runtime cap still enforces the real authorisation).
 pub async fn clearances(
     State(state): State<AppState>,
     Query(q): Query<ListQuery>,
@@ -1186,9 +1189,22 @@ fn parse_json(body: &[u8]) -> serde_json::Value {
     serde_json::from_slice(body).unwrap_or(serde_json::Value::Null)
 }
 
-/// Parse `coord.approval.pending`'s TSV rows
-/// (`approval_id\tagent_id\tmethod\treason\trequested_at`) into a JSON
-/// array of objects. The trailing `count=N` line is dropped.
+/// Parse `coord.approval.pending`'s TSV rows into a JSON array of objects so the
+/// Approvals hub can render a TYPED payload summary per Clearance without a
+/// second per-row fetch. The trailing `count=N` line is dropped.
+///
+/// Columns (APPEND-ONLY — the runtime emits the historical 5-column prefix then
+/// the typed fields):
+///
+/// `approval_id \t agent_id \t method \t reason \t requested_at \t subject_id \t
+///  capability_category \t expires_at \t task_id`
+///
+/// The parse is back-compatible: a legacy 5-column row simply leaves the typed
+/// fields empty (never a parse failure), and the typed fields are emitted as
+/// (possibly empty) strings so the dashboard treats an empty value as absent.
+/// These fields are surfaced verbatim from the runtime approval row — nothing is
+/// fabricated; fields the runtime does not record (e.g. a free-form resource /
+/// scope / payload editor) are simply not present.
 fn parse_clearance_lines(body: &[u8]) -> serde_json::Value {
     let text = String::from_utf8_lossy(body);
     let rows: Vec<serde_json::Value> = text
@@ -1196,12 +1212,26 @@ fn parse_clearance_lines(body: &[u8]) -> serde_json::Value {
         .filter(|l| !l.trim().is_empty() && !l.starts_with("count="))
         .map(|l| {
             let mut cols = l.split('\t');
+            let approval_id = cols.next().unwrap_or("").to_string();
+            let agent_id = cols.next().unwrap_or("").to_string();
+            let method = cols.next().unwrap_or("").to_string();
+            let reason = cols.next().unwrap_or("").to_string();
+            let requested_at = cols.next().unwrap_or("").to_string();
+            // Typed fields (empty for a legacy 5-column row).
+            let subject_id = cols.next().unwrap_or("").to_string();
+            let capability_category = cols.next().unwrap_or("").to_string();
+            let expires_at = cols.next().unwrap_or("").to_string();
+            let task_id = cols.next().unwrap_or("").to_string();
             serde_json::json!({
-                "approval_id": cols.next().unwrap_or("").to_string(),
-                "agent_id": cols.next().unwrap_or("").to_string(),
-                "method": cols.next().unwrap_or("").to_string(),
-                "reason": cols.next().unwrap_or("").to_string(),
-                "requested_at": cols.next().unwrap_or("").to_string(),
+                "approval_id": approval_id,
+                "agent_id": agent_id,
+                "method": method,
+                "reason": reason,
+                "requested_at": requested_at,
+                "subject_id": subject_id,
+                "capability_category": capability_category,
+                "expires_at": expires_at,
+                "task_id": task_id,
             })
         })
         .collect();
@@ -3001,6 +3031,8 @@ mod tests {
 
     #[test]
     fn parse_clearance_lines_parses_tsv_and_drops_count() {
+        // Legacy 5-column rows still parse (back-compat): the typed fields are
+        // present but empty, so the dashboard treats them as absent.
         let body = b"ap_1\tagt_x\tbrief.clearance_request\tneeds prod deploy\t1700\nap_2\tagt_y\tpayments\tspend $50\t1800\ncount=2\n";
         let got = parse_clearance_lines(body);
         let arr = got.as_array().unwrap();
@@ -3009,8 +3041,31 @@ mod tests {
         assert_eq!(arr[0]["agent_id"], "agt_x");
         assert_eq!(arr[0]["reason"], "needs prod deploy");
         assert_eq!(arr[1]["method"], "payments");
+        assert_eq!(arr[0]["subject_id"], "", "legacy row → empty typed field");
+        assert_eq!(arr[0]["task_id"], "");
         // An empty body is an empty array, never null.
         assert_eq!(parse_clearance_lines(b""), serde_json::json!([]));
+    }
+
+    #[test]
+    fn parse_clearance_lines_preserves_typed_columns() {
+        // A 9-column row carries the typed payload the Approvals hub renders:
+        // subject_id (who/what is affected), capability_category (the type
+        // bucket), expires_at (the governance window), and task_id (the parked
+        // Brief → its target route). The bridge surfaces them verbatim.
+        let body = b"ap_9\tagt_lead\tagent.activate_hire\tactivate the pending hire\t1700\tsubj_hire\tspawn\t9999\tREL-7\ncount=1\n";
+        let arr = parse_clearance_lines(body);
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        let c = &arr[0];
+        assert_eq!(c["approval_id"], "ap_9");
+        assert_eq!(c["agent_id"], "agt_lead");
+        assert_eq!(c["method"], "agent.activate_hire");
+        assert_eq!(c["requested_at"], "1700");
+        assert_eq!(c["subject_id"], "subj_hire");
+        assert_eq!(c["capability_category"], "spawn");
+        assert_eq!(c["expires_at"], "9999");
+        assert_eq!(c["task_id"], "REL-7");
     }
 
     #[test]

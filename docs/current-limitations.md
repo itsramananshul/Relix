@@ -328,6 +328,17 @@ when you click Start. What it does **not** do:
       Guild over-budget is surfaced for the operator, not auto-enforced. Real
       per-Operative over-spend continues to surface *reactively* as the
       `over_allowance` recovery card as well.
+    - **The Approvals hub renders these budget alerts read-only.** The typed
+      Approvals hub (`/approvals`) groups Clearances by type and shows a per-type
+      payload summary, but the `budget`-category items are **informational only** —
+      there is **no inline budget-decision route**, so the hub labels each by kind
+      (spend alert vs committed-Allowance plan vs hard-stop) and links out to
+      **Costs / Operatives** rather than offering a fake "decide". The Clearance
+      payload summary is derived from the fields the runtime actually records
+      (`subject_id` / `capability_category` / `expires_at` / `task_id` + method +
+      reason); there is **no free-form resource/scope/payload editor** because the
+      runtime stores none, and **no new approval authority is created** — the
+      runtime cap remains the sole authoriser and nothing is auto-approved.
   - **The `failed_or_refused` recovery card now carries a true
     retryable-vs-not verdict** — drawn from the durable per-run diagnosis layer
     (`failure_class` / `retryable` / `retry_budget_remaining` on `brief_runs`;

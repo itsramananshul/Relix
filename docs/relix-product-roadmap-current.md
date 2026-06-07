@@ -374,11 +374,20 @@ ledger entry or design section.
    masked session, status, tokens, cost, updated), a client-side filter (Operative/Rig/Brief/status/
    session fragment), and a per-row guarded reset (brief-scoped reset for a row with a `brief_key`;
    typed `RESET` confirm for the dangerous agent-level reset). On top of the existing
-   Health/Maintenance/Adapter/run-sandbox/heartbeat sections. *Honest gaps:* the budget-alert
-   decision still lives on its own route (no inline decide route exists); strategy/budget/high-risk
-   Clearances decide through the same generic `decide` (no per-type typed payload editor yet); the
-   stored session id is surfaced only as a **masked/truncated** summary, and session **resume is
-   still stored-not-replayed**. The **per-SESSION reset** still has no diagnosis of its own (it
+   Health/Maintenance/Adapter/run-sandbox/heartbeat sections. The Approvals hub is now **typed**:
+   the bridge preserves the runtime approval row's typed fields (`subject_id` / `capability_category`
+   / `expires_at` / `task_id`) through `/v1/spine/clearances`, and the page groups Clearances by type
+   (**Hire/Spawn · Strategy · Budget/Allowance · High-risk/Other**) with a per-type payload summary
+   (requesting actor, affected subject, capability category, age/expiry, parked-Brief target route),
+   a filter/search bar, and a per-group decision-impact line. High-risk/strategy/budget decisions
+   require a short operator note (typed confirmation); hire approvals stay fast. *Honest gaps:* the
+   budget-alert decision still routes out to Costs/Operatives (**no inline budget-decision route
+   exists** — labelled by kind: spend alert vs committed-Allowance plan vs hard-stop, never a fake
+   "decide"); the typed summary is limited to the fields the runtime records (no free-form
+   resource/scope/payload editor, because the runtime stores none); Rig binding at approval is only
+   available for **direct** hires (the spawn-Clearance decide cannot set a Rig — the card says so and
+   routes to the Operative page); the stored session id is surfaced only as a **masked/truncated**
+   summary, and session **resume is still stored-not-replayed**. The **per-SESSION reset** still has no diagnosis of its own (it
    forgets the row) — but the separate, now-shipped **run-level** Brief/Shift diagnosis layer (§P1
    slice 3d) does classify retryable-vs-not on the durable `brief_runs` ledger.
 3d. **[BE/FE] Brief/Shift recovery diagnosis (v1)** — **SHIPPED** (`execution-and-issue §3.3b`,
@@ -701,15 +710,23 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    spine::tests` green; `npm run build` green; dist rebuilt + committed; `git diff --check` clean.
 
 7. **Approvals hub** — `dashboard-design.md §10`.
-   **✅ DONE (partial).** *Files changed:* new `apps/dashboard/src/pages/Approvals.tsx`,
-   `nav.ts` (+`/approvals` entry → auto-listed in the ⌘K palette), `App.tsx` (route),
-   `Layout.tsx` (title + pending-Clearance nav badge), `api.ts` (`clearances.list/decide`,
-   `companyActions.list`). Reads `/v1/spine/clearances` (the unified `coord.approval.pending`
-   queue) and the `hire`/`budget` items of `/v1/spine/company/actions`; decides Clearances via
-   `/v1/spine/clearances/:id/decide` and direct hires via `/v1/agents/:id/approve-hire|reject-hire`,
-   then invalidates actions/mandates/briefs. *Honest gaps:* no per-type typed-payload editor (one
-   generic approve/reject); budget alerts link to their own route (no inline decide route exists).
-   *Verify:* `npm run build` green; dist rebuilt + committed.
+   **✅ DONE (typed).** *Files changed:* `apps/dashboard/src/pages/Approvals.tsx` (typed hub),
+   `api.ts` (`Clearance` typed fields), `crates/relix-web-bridge/src/spine.rs`
+   (`parse_clearance_lines` preserves the typed columns + bridge tests),
+   `crates/relix-runtime/src/nodes/coordinator/agent/handlers.rs` (`handle_approval_pending` appends
+   the typed TSV columns + a runtime test). Earlier slices added `nav.ts`/`App.tsx`/`Layout.tsx`.
+   Reads `/v1/spine/clearances` (the unified `coord.approval.pending` queue, now carrying
+   `subject_id` / `capability_category` / `expires_at` / `task_id`) and the `hire`/`budget` items of
+   `/v1/spine/company/actions`; **groups Clearances by type** (Hire/Spawn · Strategy ·
+   Budget/Allowance · High-risk/Other) with a per-type payload summary, filter/search, and a decision-
+   impact line; decides via `/v1/spine/clearances/:id/decide` (sensitive types require a note) and
+   direct hires via `/v1/agents/:id/approve-hire|reject-hire`, then invalidates
+   actions/mandates/briefs. *Honest gaps:* budget alerts route out to Costs/Operatives (no inline
+   budget-decision route exists, so they are never labelled "decide"); the typed summary is limited to
+   the runtime's recorded fields (no free-form resource/scope/payload editor); the spawn-Clearance
+   decide cannot bind a Rig (only the direct-hire approve can). No new approval authority is created
+   and nothing is auto-approved. *Verify:* `cargo test -p relix-web-bridge --bins spine::tests`
+   + `relix-runtime` approval_pending tests green; `npm run build` green; dist rebuilt + committed.
 
 8. **Settings hub** — `dashboard-design.md §10`.
    **✅ DONE (partial).** *Files changed:* `apps/dashboard/src/pages/Settings.tsx` (+`api.ts`
