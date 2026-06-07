@@ -134,6 +134,12 @@ pub struct AgentDetail {
     pub max_concurrent_runs: i64,
     pub wake_on_timer: bool,
     pub wake_on_demand: bool,
+    /// Adapter preference (relix-agent-adapters.md §3.2/§3.3/§7,
+    /// relix-dashboard-design.md §9 "model lane"). STORED PREFERENCE
+    /// ONLY — adapter execution does not consume it yet.
+    pub model_preference: Option<String>,
+    /// Adapter preference: reasoning/effort tier. STORED PREFERENCE ONLY.
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -201,6 +207,13 @@ pub struct UpdateAgentRequest {
     pub secret_allowlist: Option<String>,
     #[serde(default)]
     pub instruction_bundle: Option<String>,
+    // Adapter preferences (relix-agent-adapters.md §3.2/§3.3/§7). Empty
+    // string clears. STORED PREFERENCE ONLY — adapter execution does not
+    // consume them yet.
+    #[serde(default)]
+    pub model_preference: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -415,6 +428,14 @@ pub async fn update_agent(
     }
     if let Some(v) = req.instruction_bundle {
         commits.push(("instruction_bundle".into(), v));
+    }
+    // Adapter preferences (relix-agent-adapters.md §3.2/§3.3/§7). The runtime
+    // validates the effort enum + length-caps the model name; empty clears.
+    if let Some(v) = req.model_preference {
+        commits.push(("model_preference".into(), v));
+    }
+    if let Some(v) = req.reasoning_effort {
+        commits.push(("reasoning_effort".into(), v));
     }
 
     if commits.is_empty() {
@@ -949,6 +970,8 @@ pub fn parse_agent_detail(body: &str) -> Option<AgentDetail> {
         max_concurrent_runs: 20,
         wake_on_timer: true,
         wake_on_demand: true,
+        model_preference: None,
+        reasoning_effort: None,
     };
     for kv in trimmed.split('|') {
         let (k, v) = kv.split_once('=')?;
@@ -977,6 +1000,8 @@ pub fn parse_agent_detail(body: &str) -> Option<AgentDetail> {
             "max_concurrent_runs" => out.max_concurrent_runs = v.trim().parse().ok()?,
             "wake_on_timer" => out.wake_on_timer = parse_bool_wire(v)?,
             "wake_on_demand" => out.wake_on_demand = parse_bool_wire(v)?,
+            "model_preference" => out.model_preference = opt_string(v),
+            "reasoning_effort" => out.reasoning_effort = opt_string(v),
             _ => {}
         }
     }
@@ -1418,7 +1443,7 @@ mod tests {
 
     #[test]
     fn parse_agent_detail_round_trips_every_field() {
-        let body = "agent_id=id1|name=Alice|role=research|title=Junior|department=rd|team=ops|created_by=alice|status=active|subject_id=subj-1|risk_ceiling=medium|approval_timeout_secs=86400|created_at=100|updated_at=200|surface_allowlist=telegram,openwebui|allow_categories=browser,fetch|deny_categories=payments|allow_sensitivity_tags=|deny_sensitivity_tags=credentials:read|approval_required_categories=payments,production_deploy|rig=codex|monthly_allowance_cents=25000|max_concurrent_runs=3|wake_on_timer=false|wake_on_demand=true\n";
+        let body = "agent_id=id1|name=Alice|role=research|title=Junior|department=rd|team=ops|created_by=alice|status=active|subject_id=subj-1|risk_ceiling=medium|approval_timeout_secs=86400|created_at=100|updated_at=200|surface_allowlist=telegram,openwebui|allow_categories=browser,fetch|deny_categories=payments|allow_sensitivity_tags=|deny_sensitivity_tags=credentials:read|approval_required_categories=payments,production_deploy|rig=codex|monthly_allowance_cents=25000|max_concurrent_runs=3|wake_on_timer=false|wake_on_demand=true|model_preference=gpt-5-codex|reasoning_effort=high\n";
         let d = parse_agent_detail(body).unwrap();
         assert_eq!(d.agent_id, "id1");
         assert_eq!(d.allow_categories, vec!["browser", "fetch"]);
@@ -1429,6 +1454,31 @@ mod tests {
         assert_eq!(d.max_concurrent_runs, 3);
         assert!(!d.wake_on_timer);
         assert!(d.wake_on_demand);
+        assert_eq!(d.model_preference.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(d.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn parse_agent_detail_model_prefs_absent_default_none() {
+        // A legacy detail body (no model preference fields) leaves both None.
+        let body = "agent_id=id1|name=Alice|role=research|title=Junior|department=rd|team=ops|created_by=alice|status=active|subject_id=subj-1|risk_ceiling=medium|approval_timeout_secs=86400|created_at=100|updated_at=200|rig=echo|max_concurrent_runs=20|wake_on_timer=true|wake_on_demand=true\n";
+        let d = parse_agent_detail(body).unwrap();
+        assert_eq!(d.model_preference, None);
+        assert_eq!(d.reasoning_effort, None);
+    }
+
+    #[test]
+    fn update_request_parses_model_prefs_and_empty_clears() {
+        let req: UpdateAgentRequest =
+            serde_json::from_str(r#"{"model_preference":"claude-sonnet-4","reasoning_effort":""}"#)
+                .unwrap();
+        assert_eq!(req.model_preference.as_deref(), Some("claude-sonnet-4"));
+        // An explicit empty string is preserved (it CLEARS the field downstream),
+        // distinct from an absent field (None — left untouched).
+        assert_eq!(req.reasoning_effort.as_deref(), Some(""));
+        let absent: UpdateAgentRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.model_preference, None);
+        assert_eq!(absent.reasoning_effort, None);
     }
 
     #[test]

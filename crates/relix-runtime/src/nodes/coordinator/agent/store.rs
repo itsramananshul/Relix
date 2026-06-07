@@ -165,6 +165,22 @@ pub struct AgentProfile {
     /// in the profile read and composed into the agent's prompt.
     #[serde(default)]
     pub instruction_bundle: String,
+    /// Adapter preference (`relix-agent-adapters.md` §3.2/§3.3/§7,
+    /// `relix-dashboard-design.md` §9 "model lane"): the model this
+    /// Operative would prefer its Rig run on (e.g. `claude-sonnet-4`,
+    /// `gpt-5-codex`). Free text, nullable; empty clears. **STORED
+    /// PREFERENCE ONLY** — the [`crate::rig::RigRunRequest`] contract
+    /// carries no per-run model override, so adapter execution does not
+    /// consume this yet. Surfaced + editable as a future adapter hint.
+    #[serde(default)]
+    pub model_preference: Option<String>,
+    /// Adapter preference: the reasoning/effort tier
+    /// (`minimal`/`low`/`medium`/`high`; Codex's `model_reasoning_effort`
+    /// knob, adapters §3.3). Constrained to that set at write time;
+    /// nullable, empty clears. **STORED PREFERENCE ONLY** — see
+    /// [`Self::model_preference`].
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1002,7 +1018,8 @@ impl AgentStore {
                         can_spawn_agents, spawn_route, can_assign_work, assign_scope,
                         assign_allowed_agents, can_manage_work, can_configure_agents,
                         configure_scope, secret_allowlist, instruction_bundle,
-                        manage_scope, manage_allowed_agents, configure_allowed_agents
+                        manage_scope, manage_allowed_agents, configure_allowed_agents,
+                        model_preference, reasoning_effort
                  FROM agent_profiles WHERE subject_id = ?1 AND tenant_id = ?2",
                 params![subject_id, tenant],
                 row_to_agent,
@@ -1057,7 +1074,8 @@ impl AgentStore {
                         can_spawn_agents, spawn_route, can_assign_work, assign_scope,
                         assign_allowed_agents, can_manage_work, can_configure_agents,
                         configure_scope, secret_allowlist, instruction_bundle,
-                        manage_scope, manage_allowed_agents, configure_allowed_agents
+                        manage_scope, manage_allowed_agents, configure_allowed_agents,
+                        model_preference, reasoning_effort
                  FROM agent_profiles WHERE subject_id = ?1",
                 params![subject_id],
                 row_to_agent,
@@ -1813,6 +1831,51 @@ impl AgentStore {
                     "UPDATE agent_profiles SET instruction_bundle=?1, updated_at=?2
                      WHERE agent_id=?3",
                     params![value, now, agent_id],
+                )?
+            }
+            "model_preference" | "model" => {
+                // Adapter preference (relix-agent-adapters.md §3.2/§3.3/§7).
+                // Free-text model name; empty clears. Length-capped so a
+                // runaway value can't bloat the row. STORED PREFERENCE ONLY —
+                // adapter execution does not consume it (no per-run model
+                // override on the Rig run contract).
+                const MAX_MODEL: usize = 128;
+                let trimmed = value.trim();
+                if trimmed.len() > MAX_MODEL {
+                    return Err(AgentStoreError::BadInput(format!(
+                        "model_preference too long ({} chars; max {MAX_MODEL})",
+                        trimmed.len()
+                    )));
+                }
+                let stored: Option<&str> = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
+                conn.execute(
+                    "UPDATE agent_profiles SET model_preference=?1, updated_at=?2
+                     WHERE agent_id=?3",
+                    params![stored, now, agent_id],
+                )?
+            }
+            "reasoning_effort" | "effort" => {
+                // Adapter preference: reasoning/effort tier. Empty clears;
+                // otherwise constrained to the safe set. STORED PREFERENCE
+                // ONLY — see `model_preference`.
+                let trimmed = value.trim();
+                let stored: Option<&str> = if trimmed.is_empty() {
+                    None
+                } else if is_known_effort(trimmed) {
+                    Some(trimmed)
+                } else {
+                    return Err(AgentStoreError::BadInput(format!(
+                        "reasoning_effort '{trimmed}' not in minimal/low/medium/high"
+                    )));
+                };
+                conn.execute(
+                    "UPDATE agent_profiles SET reasoning_effort=?1, updated_at=?2
+                     WHERE agent_id=?3",
+                    params![stored, now, agent_id],
                 )?
             }
             other => {
@@ -2908,7 +2971,8 @@ const SELECT_AGENT: &str = "SELECT agent_id, name, role, title, department, team
         can_spawn_agents, spawn_route, can_assign_work, assign_scope,
         assign_allowed_agents, can_manage_work, can_configure_agents,
         configure_scope, secret_allowlist, instruction_bundle,
-        manage_scope, manage_allowed_agents, configure_allowed_agents
+        manage_scope, manage_allowed_agents, configure_allowed_agents,
+        model_preference, reasoning_effort
  FROM agent_profiles WHERE agent_id = ?1";
 
 /// GROUP 6 (tenant isolation): the agent-id read, additionally scoped
@@ -2925,7 +2989,8 @@ const SELECT_AGENT_FOR_TENANT: &str = "SELECT agent_id, name, role, title, depar
         can_spawn_agents, spawn_route, can_assign_work, assign_scope,
         assign_allowed_agents, can_manage_work, can_configure_agents,
         configure_scope, secret_allowlist, instruction_bundle,
-        manage_scope, manage_allowed_agents, configure_allowed_agents
+        manage_scope, manage_allowed_agents, configure_allowed_agents,
+        model_preference, reasoning_effort
  FROM agent_profiles WHERE agent_id = ?1 AND tenant_id = ?2";
 
 /// Full-profile column list scoped to a tenant, with an **open**
@@ -2944,7 +3009,8 @@ const SELECT_AGENTS_BY_TENANT: &str = "SELECT agent_id, name, role, title, depar
         can_spawn_agents, spawn_route, can_assign_work, assign_scope,
         assign_allowed_agents, can_manage_work, can_configure_agents,
         configure_scope, secret_allowlist, instruction_bundle,
-        manage_scope, manage_allowed_agents, configure_allowed_agents
+        manage_scope, manage_allowed_agents, configure_allowed_agents,
+        model_preference, reasoning_effort
  FROM agent_profiles WHERE tenant_id = ?1";
 
 const SELECT_APPROVAL: &str =
@@ -2996,7 +3062,9 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              instruction_bundle TEXT NOT NULL DEFAULT '',
              manage_scope TEXT NOT NULL DEFAULT 'specific',
              manage_allowed_agents TEXT NOT NULL DEFAULT '[]',
-             configure_allowed_agents TEXT NOT NULL DEFAULT '[]'
+             configure_allowed_agents TEXT NOT NULL DEFAULT '[]',
+             model_preference TEXT,
+             reasoning_effort TEXT
          );
          CREATE UNIQUE INDEX IF NOT EXISTS agent_profiles_subject
              ON agent_profiles(subject_id);
@@ -3214,6 +3282,13 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         "configure_allowed_agents",
         "TEXT NOT NULL DEFAULT '[]'",
     )?;
+    // Adapter preferences (relix-agent-adapters.md §3.2/§3.3/§7;
+    // relix-dashboard-design.md §9). Nullable, no default so existing
+    // rows read NULL (no preference). STORED PREFERENCE ONLY — adapter
+    // execution does not consume these yet (the Rig run contract carries
+    // no per-run model override).
+    ensure_column(conn, "agent_profiles", "model_preference", "TEXT")?;
+    ensure_column(conn, "agent_profiles", "reasoning_effort", "TEXT")?;
     // GROUP 6: tenant isolation. Add `tenant_id` to the per-caller
     // agent/approval tables. Idempotent (ensure_column probes
     // PRAGMA); existing rows default to the reserved 'default'
@@ -3507,6 +3582,11 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
         manage_scope: r.get::<_, String>(37)?,
         manage_allowed_agents: parse_json_list(&r.get::<_, String>(38)?),
         configure_allowed_agents: parse_json_list(&r.get::<_, String>(39)?),
+        // Adapter preferences appended last (indices 40+) so existing
+        // positional indices above stay stable for rows written before
+        // these columns. Nullable → None on a legacy/unset row.
+        model_preference: r.get::<_, Option<String>>(40)?,
+        reasoning_effort: r.get::<_, Option<String>>(41)?,
     })
 }
 
@@ -3560,6 +3640,14 @@ fn normalise_string_list(value: &str) -> Result<String, String> {
 
 fn is_known_risk(s: &str) -> bool {
     matches!(s, "safe" | "low" | "medium" | "high" | "critical")
+}
+
+/// The safe set for the adapter `reasoning_effort` preference
+/// (relix-agent-adapters.md §3.3 — Codex's `model_reasoning_effort`
+/// knob). Constrained at write time so a stored value is always one an
+/// adapter could later map; STORED PREFERENCE ONLY today.
+fn is_known_effort(s: &str) -> bool {
+    matches!(s, "minimal" | "low" | "medium" | "high")
 }
 
 fn new_agent_id(role: &str) -> String {
@@ -3642,6 +3730,69 @@ mod tests {
         let f = s.get_agent(&id).unwrap().unwrap();
         assert_eq!(f.name, "Founder");
         assert_eq!(f.rig.as_deref(), Some("echo"));
+    }
+
+    // ── Adapter model preferences (stored preference only) ────
+
+    #[test]
+    fn model_preference_defaults_none_then_set_read_and_clear() {
+        let s = store();
+        let id = s
+            .create_agent("A", "engineer", "Eng", "rd", "core", "op", "subj-mp", "low", "default")
+            .unwrap();
+        // Fresh row: no preferences stored.
+        let p = s.get_agent(&id).unwrap().unwrap();
+        assert_eq!(p.model_preference, None);
+        assert_eq!(p.reasoning_effort, None);
+
+        // Set both (also covers the read path round-trip).
+        s.update_agent_field(&id, "model_preference", "claude-sonnet-4")
+            .unwrap();
+        s.update_agent_field(&id, "reasoning_effort", "high").unwrap();
+        let p = s.get_agent(&id).unwrap().unwrap();
+        assert_eq!(p.model_preference.as_deref(), Some("claude-sonnet-4"));
+        assert_eq!(p.reasoning_effort.as_deref(), Some("high"));
+
+        // Empty string CLEARS each field back to NULL/None.
+        s.update_agent_field(&id, "model_preference", "  ").unwrap();
+        s.update_agent_field(&id, "reasoning_effort", "").unwrap();
+        let p = s.get_agent(&id).unwrap().unwrap();
+        assert_eq!(p.model_preference, None);
+        assert_eq!(p.reasoning_effort, None);
+    }
+
+    #[test]
+    fn reasoning_effort_rejects_unknown_tier() {
+        let s = store();
+        let id = s
+            .create_agent("A", "engineer", "Eng", "rd", "core", "op", "subj-re", "low", "default")
+            .unwrap();
+        let err = s
+            .update_agent_field(&id, "reasoning_effort", "turbo")
+            .unwrap_err();
+        assert!(matches!(err, AgentStoreError::BadInput(_)));
+        // The bad write left the field untouched (still None).
+        assert_eq!(s.get_agent(&id).unwrap().unwrap().reasoning_effort, None);
+    }
+
+    #[test]
+    fn model_preference_aliases_and_length_cap() {
+        let s = store();
+        let id = s
+            .create_agent("A", "engineer", "Eng", "rd", "core", "op", "subj-al", "low", "default")
+            .unwrap();
+        // `model` / `effort` are accepted aliases for the canonical names.
+        s.update_agent_field(&id, "model", "gpt-5-codex").unwrap();
+        s.update_agent_field(&id, "effort", "minimal").unwrap();
+        let p = s.get_agent(&id).unwrap().unwrap();
+        assert_eq!(p.model_preference.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(p.reasoning_effort.as_deref(), Some("minimal"));
+        // An over-long model name is rejected.
+        let long = "m".repeat(200);
+        assert!(matches!(
+            s.update_agent_field(&id, "model_preference", &long),
+            Err(AgentStoreError::BadInput(_))
+        ));
     }
 
     #[test]

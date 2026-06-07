@@ -389,8 +389,9 @@ ledger entry or design section.
    concurrency / approval timeout, explicitly labelled *committed* not spent, with live spend
    routed to the Costs page — never fabricated), and **Configuration** (adapter + autonomy/
    heartbeat flags + org placement + identity + timestamps from `/v1/agents/:id`; the charter is
-   linked to the Instructions tab as viewable/editable, Skills to the Skills tab as read-only, and the
-   copy notes per-Operative model config is still not exposed by the read API). The tab is URL-driven (`&tab=<tab>`, default Overview, unknown value falls back
+   linked to the Instructions tab as viewable/editable, Skills to the Skills tab as read-only, and a
+   per-Operative **model preference** (model name + reasoning/effort) is now viewable + editable here as a
+   **stored adapter hint** — execution does not consume it yet). The tab is URL-driven (`&tab=<tab>`, default Overview, unknown value falls back
    safely) and Copy-link captures it; all tabs but Skills reuse the page's existing fetches (the shared
    detail cache + `/v1/runs` + the board columns), and the Skills tab adds one bounded, tab-gated fetch
    to the **existing** `/v1/skills` route — **no new backend route and no extra fetch loop**. *Remaining gap:* by design this stays the inline workbench on the Crew page (NOT a
@@ -398,8 +399,11 @@ ledger entry or design section.
    instruction-bundle is now **viewable and editable** on the Instructions tab (read via `agent.keys`,
    written via the configure-gated `PATCH /v1/agents/:id { instruction_bundle }` — this writes the
    instruction bundle only, NOT a config-history UI), the **Skills** tab is now built (read-only over the
-   existing `/v1/skills` — no per-Operative skill-assignment / create-update-deprecate editor), but the
-   per-Operative **model lane** is still not built (the read API exposes no model config). **Full pan/zoom/pinch + Fit/Reset now ship** (the previously-deferred gap is
+   existing `/v1/skills` — no per-Operative skill-assignment / create-update-deprecate editor), and the
+   per-Operative **model lane** is now built as a **stored adapter preference** (model name + reasoning/effort,
+   editable via the configure-gated `PATCH /v1/agents/:id`) — but **adapter execution does not consume it yet**
+   (the `RigRunRequest` contract has no per-run model override), so it is labelled a future adapter hint, not
+   guaranteed runtime behavior. **Full pan/zoom/pinch + Fit/Reset now ship** (the previously-deferred gap is
    closed): the stage is one CSS `transform: translate() scale()` viewport driven by native
    PointerEvent (drag-pan + two-finger pinch) and a non-passive WheelEvent (cursor-anchored
    zoom), with explicit −/+/Fit/Reset controls, an auto-fit-once on first render (no jump on

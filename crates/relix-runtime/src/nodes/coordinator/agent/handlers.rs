@@ -3724,7 +3724,7 @@ pub fn handle_get(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
     match store.get_agent_for_tenant(id, ctx.tenant_id_or_default()) {
         Ok(Some(p)) => {
             let body = format!(
-                "agent_id={}|name={}|role={}|title={}|department={}|team={}|created_by={}|status={}|subject_id={}|risk_ceiling={}|approval_timeout_secs={}|created_at={}|updated_at={}|surface_allowlist={}|allow_categories={}|deny_categories={}|allow_sensitivity_tags={}|deny_sensitivity_tags={}|approval_required_categories={}|rig={}|monthly_allowance_cents={}|max_concurrent_runs={}|wake_on_timer={}|wake_on_demand={}\n",
+                "agent_id={}|name={}|role={}|title={}|department={}|team={}|created_by={}|status={}|subject_id={}|risk_ceiling={}|approval_timeout_secs={}|created_at={}|updated_at={}|surface_allowlist={}|allow_categories={}|deny_categories={}|allow_sensitivity_tags={}|deny_sensitivity_tags={}|approval_required_categories={}|rig={}|monthly_allowance_cents={}|max_concurrent_runs={}|wake_on_timer={}|wake_on_demand={}|model_preference={}|reasoning_effort={}\n",
                 p.agent_id,
                 sanitize(&p.name),
                 sanitize(&p.role),
@@ -3751,6 +3751,8 @@ pub fn handle_get(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
                 p.max_concurrent_runs,
                 p.wake_on_timer,
                 p.wake_on_demand,
+                p.model_preference.as_deref().unwrap_or(""),
+                p.reasoning_effort.as_deref().unwrap_or(""),
             );
             HandlerOutcome::Ok(body.into_bytes())
         }
@@ -10681,6 +10683,32 @@ mod tests {
                 "instruction_bundle",
                 "# I am admin now"
             )),
+            error_kinds::POLICY_DENIED
+        );
+    }
+
+    #[test]
+    fn model_preference_mutation_is_configure_gated() {
+        // Adapter model preferences (relix-agent-adapters.md §3.2/§3.3/§7)
+        // ride the same configure-gate as every other profile edit: an
+        // authorized configurer may set another Operative's preference; an
+        // actor may NOT set its own.
+        let (s, actor, report, _o) = configure_fixture("branch");
+        assert!(matches!(
+            update_as(&s, &report, "model_preference", "claude-sonnet-4"),
+            HandlerOutcome::Ok(_)
+        ));
+        assert_eq!(
+            s.get_agent(&report)
+                .unwrap()
+                .unwrap()
+                .model_preference
+                .as_deref(),
+            Some("claude-sonnet-4")
+        );
+        // Self-config is denied (the gate is not bypassed for adapter prefs).
+        assert_eq!(
+            err_kind(update_as(&s, &actor, "model_preference", "gpt-5-codex")),
             error_kinds::POLICY_DENIED
         );
     }

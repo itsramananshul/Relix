@@ -82,6 +82,12 @@ interface AgentDetail {
   max_concurrent_runs?: number;
   wake_on_timer?: boolean;
   wake_on_demand?: boolean;
+  // Adapter preferences (relix-agent-adapters.md §3.2/§3.3/§7;
+  // relix-dashboard-design.md §9 "model lane"). STORED PREFERENCE ONLY —
+  // adapter execution does not consume them yet; surfaced as a future
+  // adapter hint, editable via the configure-gated PATCH /v1/agents/:id.
+  model_preference?: string | null;
+  reasoning_effort?: string | null;
 }
 
 // One standing approval (`/v1/agents/:id/standing-approvals`) — a pre-granted
@@ -267,6 +273,14 @@ export function Agents() {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
+  // Configuration-tab model-preference editor state. `modelEditing` opens the
+  // inline editor; `modelDraft`/`effortDraft` are its working copies; `savingModel`
+  // blocks the controls mid-write. STORED PREFERENCE ONLY — adapter execution does
+  // not consume these yet. Reset on Operative/tab change (effect below).
+  const [modelEditing, setModelEditing] = useState(false);
+  const [modelDraft, setModelDraft] = useState("");
+  const [effortDraft, setEffortDraft] = useState("");
+  const [savingModel, setSavingModel] = useState(false);
   // Skills-tab state (read-only procedural memory for the open Operative).
   // `skillInput` is the live filter box; `skillQuery` is the committed search
   // term (only submitted on Enter / Search, never per-keystroke). `skillData`
@@ -433,6 +447,35 @@ export function Agents() {
     }
   }
 
+  // Write the adapter model preference (model name + reasoning/effort tier)
+  // through the SAME configure-gated update path as the charter
+  // (`PATCH /v1/agents/:id { model_preference, reasoning_effort }`). An empty
+  // value CLEARS that field (the backend allows it). STORED PREFERENCE ONLY —
+  // adapter execution does not consume these yet; this records a future adapter
+  // hint. On success we force-refetch this Operative's detail so the new values
+  // (and `updated_at`) render immediately. Any configure-power denial / backend
+  // refusal (e.g. an out-of-set effort) is shown verbatim — never bypassed.
+  async function saveModelPrefs(agentId: string, model: string, effort: string) {
+    setSavingModel(true);
+    setBanner(null);
+    try {
+      await api.patch(`/v1/agents/${encodeURIComponent(agentId)}`, {
+        model_preference: model.trim(),
+        reasoning_effort: effort.trim(),
+      });
+      await loadDetail(agentId, true);
+      setModelEditing(false);
+      setBanner({
+        kind: "ok",
+        msg: "Model preference saved — stored as an adapter hint (execution does not consume it yet).",
+      });
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Save failed" });
+    } finally {
+      setSavingModel(false);
+    }
+  }
+
   // Toggle the governance panel through the URL: clicking View/Hide writes (or
   // clears) `?agent=<id>`. The load + scroll happen in the effects below, so an
   // open from the URL (deep link / refresh / back-forward) behaves identically
@@ -452,6 +495,7 @@ export function Agents() {
   // tab changes, so a half-typed draft never bleeds across surfaces.
   useEffect(() => {
     setEditing(false);
+    setModelEditing(false);
   }, [openId, activeTab]);
 
   // Skills are scoped to the selected Operative. Clear the previous Operative's
@@ -1202,7 +1246,84 @@ export function Agents() {
                 </div>
               </div>
               <div className="op-group">
-                <div className="op-group-title">Charter &amp; model</div>
+                <div className="op-group-title">Model preference (adapter hint)</div>
+                <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
+                  Optional per-Operative model + reasoning/effort preference (dashboard-design §9
+                  "model lane"; adapters §3.2/§3.3/§7). <strong>Stored preference only</strong> — the
+                  Rig run contract carries no per-run model override, so an adapter does not consume
+                  these yet; they record a future adapter hint. Edits flow through the configure-gated{" "}
+                  <span className="mono">PATCH /v1/agents/:id</span>; an empty value clears the field.
+                </div>
+                {modelEditing ? (
+                  <>
+                    <div className="row" style={{ gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
+                      <label className="field" style={{ margin: 0, flex: "1 1 220px", minWidth: 160 }}>
+                        <span style={{ fontSize: 11 }}>Model</span>
+                        <input
+                          className="input"
+                          style={{ fontSize: 12, padding: "4px 8px" }}
+                          value={modelDraft}
+                          spellCheck={false}
+                          disabled={savingModel}
+                          placeholder="e.g. claude-sonnet-4 · gpt-5-codex (empty = adapter default)"
+                          onChange={(e) => setModelDraft(e.target.value)}
+                        />
+                      </label>
+                      <label className="field" style={{ margin: 0 }}>
+                        <span style={{ fontSize: 11 }}>Reasoning / effort</span>
+                        <select
+                          className="select"
+                          style={{ fontSize: 12, padding: "4px 6px" }}
+                          value={effortDraft}
+                          disabled={savingModel}
+                          onChange={(e) => setEffortDraft(e.target.value)}
+                        >
+                          <option value="">(adapter default)</option>
+                          <option value="minimal">minimal</option>
+                          <option value="low">low</option>
+                          <option value="medium">medium</option>
+                          <option value="high">high</option>
+                        </select>
+                      </label>
+                    </div>
+                    <div className="row" style={{ gap: 10, marginTop: 8, alignItems: "center", flexWrap: "wrap" }}>
+                      <button
+                        className="btn sm"
+                        disabled={
+                          savingModel ||
+                          (modelDraft.trim() === (detail?.model_preference ?? "") &&
+                            effortDraft.trim() === (detail?.reasoning_effort ?? ""))
+                        }
+                        title="Write the model preference through the configure-gated update path"
+                        onClick={() => saveModelPrefs(id, modelDraft, effortDraft)}
+                      >
+                        {savingModel ? "Saving…" : "Save preference"}
+                      </button>
+                      <button className="btn ghost sm" disabled={savingModel} onClick={() => setModelEditing(false)}>Cancel</button>
+                    </div>
+                  </>
+                ) : (
+                  <div className="row" style={{ gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                    <div className="kv-grid" style={{ fontSize: 12, flex: "1 1 220px" }}>
+                      <div className="kv"><span className="muted">Model</span><span className="mono">{detail?.model_preference || "—"}</span></div>
+                      <div className="kv"><span className="muted">Reasoning / effort</span><span>{detail?.reasoning_effort || "—"}</span></div>
+                    </div>
+                    <button
+                      className="btn ghost sm"
+                      onClick={() => {
+                        setModelDraft(detail?.model_preference ?? "");
+                        setEffortDraft(detail?.reasoning_effort ?? "");
+                        setBanner(null);
+                        setModelEditing(true);
+                      }}
+                    >
+                      {detail?.model_preference || detail?.reasoning_effort ? "Edit" : "Set preference"}
+                    </button>
+                  </div>
+                )}
+              </div>
+              <div className="op-group">
+                <div className="op-group-title">Charter</div>
                 <p className="muted" style={{ fontSize: 12, margin: 0 }}>
                   The instruction bundle (job description / charter) is viewable and{" "}
                   <strong>editable</strong> on the{" "}
@@ -1210,8 +1331,7 @@ export function Agents() {
                   the <span className="mono">agent.keys</span> read carries it and edits flow through the
                   configure-gated <span className="mono">PATCH /v1/agents/:id</span>. Skills (procedural
                   memory) are surfaced read-only on the{" "}
-                  <span className="link" onClick={() => setTab("skills")}>Skills</span> tab; per-Operative
-                  model config is not exposed by the read API yet.
+                  <span className="link" onClick={() => setTab("skills")}>Skills</span> tab.
                 </p>
               </div>
             </div>
