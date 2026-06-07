@@ -87,6 +87,11 @@ interface TickRecord {
   priority_ai_mode?: string | null;
   priority_ai_reason?: string | null;
   priority_rank?: number | null;
+  // How the orchestration Brief TEXT (titles / dossiers / checklists) was authored
+  // on an orchestrate_assign_ready row. ∈ deterministic_only / llm_used / fallback
+  // / unavailable; null on every other action.
+  orchestration_ai_mode?: string | null;
+  orchestration_ai_reason?: string | null;
 }
 interface TickResult {
   tenant?: string;
@@ -350,7 +355,7 @@ export function Settings() {
           <span className="mono">RELIX_AUTONOMOUS_PRIME_INTERVAL_SECS</span> and bounded by{" "}
           <span className="mono">RELIX_AUTONOMOUS_PRIME_MAX</span>. Autonomous runs still honor adapter
           readiness, per-Operative wake/concurrency caps, and budget hard-stops.{" "}
-          Prime has <strong>three independent, opt-in LLM switches</strong>, all off by default and all
+          Prime has <strong>four independent, opt-in LLM switches</strong>, all off by default and all
           falling back deterministically — <em>none ever approves a gate</em>.{" "}
           <strong>Prime Deliberation</strong> (<span className="mono">RELIX_PRIME_LLM_DELIBERATION</span>):
           when on, a model may only <em>confirm or hold</em> the one already-computed legal next step for a
@@ -367,10 +372,20 @@ export function Settings() {
           deterministic classifier has ALREADY computed as legal — or hold the whole queue this tick. It
           cannot invent a candidate, add an action, widen any candidate's action, or bypass standing-
           authority / budget / Claim / adapter / tenant gates; only already-attemptable candidates are
-          offered. Any switch falls back deterministically if the model is unavailable or its output is
-          invalid. Each tick record shows the provenance — action choice (<span className="mono">act:</span>),
-          on a strategy draft the body author (<span className="mono">strat:</span>), and the queue order with
-          this candidate's rank (<span className="mono">ord:</span>) — each ∈{" "}
+          offered.{" "}
+          <strong>Prime Orchestration authoring</strong> (
+          <span className="mono">RELIX_PRIME_LLM_ORCHESTRATION</span>): when on, a model may <em>author the
+          text</em> — titles, dossiers, checklists — of the orchestration Briefs (parent / role tracks /
+          subject executions) for the skeleton the deterministic readiness logic has ALREADY computed. It
+          cannot invent a role, agent, Brief id, source marker, dependency, assignee, approval, budget change,
+          or tool; the roles, agents, assignments, and gates are unchanged, an existing/hand-edited Brief
+          title is never clobbered, and direct one-click{" "}
+          <span className="mono">mandate.orchestrate</span> stays deterministic. Any switch falls back
+          deterministically if the model is unavailable or its output is invalid. Each tick record shows the
+          provenance — action choice (<span className="mono">act:</span>), on a strategy draft the body author
+          (<span className="mono">strat:</span>), the queue order with this candidate's rank (
+          <span className="mono">ord:</span>), and on an orchestrate row the Brief-text author (
+          <span className="mono">orch:</span>) — each ∈{" "}
           <span className="mono">deterministic_only</span> / <span className="mono">llm_used</span> /{" "}
           <span className="mono">fallback</span> / <span className="mono">unavailable</span>. All reuse the
           existing governed <span className="mono">ai.chat</span> mesh path; no provider key enters the
@@ -646,6 +661,14 @@ function AutonomousPrimeSwitchPanel({
                           ord:{r.priority_ai_mode ?? "deterministic_only"}
                           {typeof r.priority_rank === "number" ? `#${r.priority_rank}` : ""}
                         </span>
+                        {r.orchestration_ai_mode ? (
+                          <>
+                            <br />
+                            <span title={r.orchestration_ai_reason ?? undefined}>
+                              orch:{r.orchestration_ai_mode}
+                            </span>
+                          </>
+                        ) : null}
                       </td>
                       <td className="muted">{r.reason ?? ""}</td>
                     </tr>

@@ -9927,8 +9927,8 @@ fn register_node_type_handlers(
                             use crate::nodes::coordinator::agent::prime_deliberation::PrimeAiDecider;
                             use crate::nodes::coordinator::agent::prime_driver::{
                                 MeshAiDecider, handle_prime_autonomy_tick_now_with_ai,
-                                parse_prime_llm_deliberation, parse_prime_llm_prioritization,
-                                parse_prime_llm_strategy_draft,
+                                parse_prime_llm_deliberation, parse_prime_llm_orchestration,
+                                parse_prime_llm_prioritization, parse_prime_llm_strategy_draft,
                             };
                             // Re-read all three Prime LLM switches (like the timer) so
                             // an operator can flip them without a restart: deliberation
@@ -9951,6 +9951,11 @@ fn register_node_type_handlers(
                                     .ok()
                                     .as_deref(),
                             );
+                            let orchestration_llm_enabled = parse_prime_llm_orchestration(
+                                std::env::var("RELIX_PRIME_LLM_ORCHESTRATION")
+                                    .ok()
+                                    .as_deref(),
+                            );
                             // Capture the runtime handle on the async thread; the
                             // blocking tick bridges the async mesh call through it.
                             let prime_handle = tokio::runtime::Handle::current();
@@ -9965,6 +9970,7 @@ fn register_node_type_handlers(
                                 let prime_decider = if llm_enabled
                                     || strategy_llm_enabled
                                     || prioritization_enabled
+                                    || orchestration_llm_enabled
                                 {
                                     prime_alert_cell
                                         .as_ref()
@@ -9996,6 +10002,7 @@ fn register_node_type_handlers(
                                     llm_enabled,
                                     strategy_llm_enabled,
                                     prioritization_enabled,
+                                    orchestration_llm_enabled,
                                 )
                             })
                             .await;
@@ -11650,8 +11657,8 @@ fn register_node_type_handlers(
                         use crate::nodes::coordinator::agent::prime_driver::{
                             AutonomyDrive, MeshAiDecider, RUNTIME_KEY_AUTONOMOUS_PRIME,
                             autonomous_prime_tick, parse_prime_llm_deliberation,
-                            parse_prime_llm_prioritization, parse_prime_llm_strategy_draft,
-                            plan_autonomy_drive,
+                            parse_prime_llm_orchestration, parse_prime_llm_prioritization,
+                            parse_prime_llm_strategy_draft, plan_autonomy_drive,
                         };
                         // Re-read all three Prime LLM switches each tick: deliberation
                         // (action choice), strategy draft (proposed strategy body
@@ -11674,22 +11681,30 @@ fn register_node_type_handlers(
                                 .ok()
                                 .as_deref(),
                         );
-                        let prime_decider =
-                            if prime_llm || prime_strategy_llm || prime_prioritization {
-                                prime_alert_cell.as_ref().and_then(|c| c.get()).map(|ctx| {
-                                    MeshAiDecider::new(
-                                        prime_handle.clone(),
-                                        ctx.mesh.clone(),
-                                        ctx.identity.clone(),
-                                        prime_ai_peer.clone(),
-                                        prime_llm_session.clone(),
-                                        30,
-                                        None,
-                                    )
-                                })
-                            } else {
-                                None
-                            };
+                        let prime_orchestration = parse_prime_llm_orchestration(
+                            std::env::var("RELIX_PRIME_LLM_ORCHESTRATION")
+                                .ok()
+                                .as_deref(),
+                        );
+                        let prime_decider = if prime_llm
+                            || prime_strategy_llm
+                            || prime_prioritization
+                            || prime_orchestration
+                        {
+                            prime_alert_cell.as_ref().and_then(|c| c.get()).map(|ctx| {
+                                MeshAiDecider::new(
+                                    prime_handle.clone(),
+                                    ctx.mesh.clone(),
+                                    ctx.identity.clone(),
+                                    prime_ai_peer.clone(),
+                                    prime_llm_session.clone(),
+                                    30,
+                                    None,
+                                )
+                            })
+                        } else {
+                            None
+                        };
                         let prime_ai: Option<&dyn PrimeAiDecider> =
                             prime_decider.as_ref().map(|d| d as &dyn PrimeAiDecider);
                         let now_ms = std::time::SystemTime::now()
@@ -11733,6 +11748,7 @@ fn register_node_type_handlers(
                                     prime_llm,
                                     prime_strategy_llm,
                                     prime_prioritization,
+                                    prime_orchestration,
                                 )?;
                                 records.append(&mut r);
                             }
@@ -11754,6 +11770,7 @@ fn register_node_type_handlers(
                                         prime_llm,
                                         prime_strategy_llm,
                                         prime_prioritization,
+                                        prime_orchestration,
                                     )?;
                                     records.append(&mut r);
                                 }

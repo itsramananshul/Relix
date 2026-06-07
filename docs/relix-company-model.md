@@ -831,6 +831,55 @@ action budget — but **the model is NOT the permission system**, exactly as in 
   Guild may enable any combination. With this switch off (or <2 attemptable candidates)
   the discovery order is byte-for-byte the legacy behaviour.
 
+### F. Prime Orchestration Authoring v1 — a model may AUTHOR the Brief text (opt-in)
+
+**The gap.** `mandate.orchestrate` (§4.6) materialises an idempotent three-tier Brief
+tree (parent → role tracks → per-agent subject executions, with placeholder tracks for
+staffing gaps), but the work-object *text* was mechanical: a fixed role→title map and a
+single generated parent dossier. The tree was correct and stable but the titles /
+dossiers read as boilerplate, with no per-track checklist.
+
+**The contract.** Behind an explicit, default-OFF switch
+(`RELIX_PRIME_LLM_ORCHESTRATION`), when the autonomous/manual-tick loop advances
+`orchestrate_assign_ready` and a live mesh decider is available, a model may **author the
+text** — titles, dossiers, checklists — of the orchestration skeleton, but **the model is
+NOT the permission system**, exactly as in §C/§D/§E:
+
+- **Author text only — never the skeleton.** The deterministic readiness logic computes
+  the entire skeleton (which roles get tracks, which active agents get subject Briefs,
+  which gaps get placeholders) exactly as before. The model is offered ONLY the stable
+  role keys (the active roles) + subject keys (their staffed agent ids) + the parent, and
+  may author a title / dossier / checklist for each. It can never invent a role, agent,
+  Brief id, source marker, dependency, assignee, approval, budget change, or tool; the
+  roles, agents, assignments, reviewer stamping, `max_briefs` cap, placeholder behaviour,
+  and source-marker idempotency are byte-for-byte the deterministic path.
+- **Strict server-side validation.** The reply is validated by
+  `prime_orchestration::parse_orchestration_blueprint` against the offered keys only: an
+  unknown top-level / role / subject key, more entries than offered, an array where an
+  object is expected, a non-string / over-long title / dossier / checklist item, too many
+  checklist items, malformed/array/scalar/over-long JSON or prose all degrade to the
+  deterministic titles + dossiers. Pipe is sanitized to `/`; control chars are stripped.
+  The VALIDATED blueprint (never raw model output) is the only thing passed into the
+  orchestration handler.
+- **Applied to new items only; hand-edits preserved.** A blueprint title/dossier is
+  applied ONLY to a NEWLY-created Brief (the handler reuses existing Briefs by source
+  marker and sets a title only on creation), so a rerun never duplicates a Brief and a
+  hand-edited (or previously model-authored) title is never clobbered. Placeholder/gap
+  tracks keep their deterministic `… track blocked:` text so the placeholder→active title
+  promotion still works.
+- **Honest provenance.** Each orchestrate tick record carries `orchestration_ai_mode`
+  (`deterministic_only` / `llm_used` / `fallback` / `unavailable`) +
+  `orchestration_ai_reason`, distinct from the action-choice `ai_mode`, strategy-body
+  `strategy_ai_mode`, and queue-order `priority_ai_mode`, surfaced on
+  `prime.autonomy_tick_now` and the Settings tick table (`orch:`).
+- **No keys in the coordinator + independent of §C/§D/§E.** It reuses the SAME `ai.chat`
+  mesh path + decider as §C/§D/§E — no provider key enters the coordinator, web bridge, or
+  dashboard; an unavailable peer falls back deterministically. The four switches are
+  independent: a Guild may enable any combination. With this switch off the orchestration
+  text is byte-for-byte the deterministic v1, and the **direct one-click**
+  `mandate.orchestrate` / `prime.advance {action:"orchestrate_assign_ready"}` route stays
+  deterministic (it never builds a blueprint).
+
 ---
 
 ## 12.6 First-run company bootstrap + starter crew (the empty-company on-ramp)

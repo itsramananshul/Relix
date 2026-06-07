@@ -2905,12 +2905,41 @@ fn orchestration_signature(
 /// one assigned (assign-Key gated via `enforce_assign_key`). A changed
 /// active agent yields a new subject Brief while the role track is reused.
 /// Every run is persisted via `record_orchestration_run`.
-#[allow(clippy::too_many_lines)]
 pub fn handle_orchestrate(
     task_store: &TaskStore,
     agent_store: &AgentStore,
     spine_store: &SpineStore,
     ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    // The public `mandate.orchestrate` capability is deterministic by default —
+    // it never carries a model-authored blueprint. Only the autonomous/manual
+    // Prime tick path passes a validated blueprint (see
+    // `handle_orchestrate_with_blueprint`).
+    handle_orchestrate_with_blueprint(task_store, agent_store, spine_store, ctx, None)
+}
+
+/// Backing implementation of `mandate.orchestrate` that accepts an OPTIONAL,
+/// already-validated [`PrimeOrchestrationBlueprint`] authored by the Prime
+/// orchestration-authoring layer. **The blueprint is text-only:** it may change
+/// the TITLE / DOSSIER / CHECKLIST text of a NEWLY-CREATED parent / active
+/// role-track / subject-execution Brief, and nothing else. Every gate
+/// (approved strategy, ready team, assign-Key, reviewer stamping, max_briefs cap,
+/// placeholder behaviour, source-marker idempotency) is identical with or without
+/// it; the roles, agents, assignments, dependencies, Brief ids, and source
+/// markers are all still computed deterministically here. An existing Brief's
+/// title is never clobbered (reuse is by source marker; titles are set only on
+/// creation), and placeholder-track text stays deterministic so the
+/// placeholder→active title promotion is preserved. With `blueprint = None` the
+/// behaviour is byte-for-byte the deterministic v1.
+#[allow(clippy::too_many_lines)]
+pub fn handle_orchestrate_with_blueprint(
+    task_store: &TaskStore,
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    ctx: &InvocationCtx,
+    blueprint: Option<
+        &crate::nodes::coordinator::agent::prime_orchestration::PrimeOrchestrationBlueprint,
+    >,
 ) -> HandlerOutcome {
     let raw = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
@@ -3092,7 +3121,14 @@ pub fn handle_orchestrate(
         "plan_only: not created"
     };
     let owner_subject = ctx.caller.subject_id.to_string();
-    let parent_title = format!("Execute Mandate: {}", mandate.title);
+    // Parent title: a model-authored blueprint title (when provided) else the
+    // deterministic title. Only applied on CREATION (ensure_marked sets the title
+    // for new Briefs only), so a rerun never clobbers an existing/edited title.
+    let det_parent_title = format!("Execute Mandate: {}", mandate.title);
+    let parent_title = blueprint
+        .and_then(|b| b.parent_title())
+        .map(str::to_string)
+        .unwrap_or_else(|| det_parent_title.clone());
 
     // ── Stable source markers (company-model §4.6) ───────────────
     // Idempotency keys are derived from the Mandate id + role key, NOT
@@ -3232,14 +3268,19 @@ pub fn handle_orchestrate(
     if let Some((ref parent_id, was_existing, _, _)) = parent
         && !was_existing
     {
-        // Newly created parent: drop a durable orchestration Dossier.
+        // Newly created parent: drop a durable orchestration Dossier. A
+        // model-authored parent dossier (when provided) replaces the deterministic
+        // body; otherwise the deterministic body is used.
         let mut roles: Vec<&str> = active_plan.iter().map(|(r, _)| r.as_str()).collect();
         roles.extend(gap_plan.iter().map(|(r, _)| r.as_str()));
-        let body = format!(
+        let det_body = format!(
             "Orchestration of Mandate '{}' ({mandate_id}). Roles: {}",
             mandate.title,
             roles.join(", ")
         );
+        let body = blueprint
+            .and_then(|b| b.parent_dossier_body())
+            .unwrap_or(det_body);
         let _ = task_store.add_dossier(parent_id, "orchestration", "Orchestration plan", &body);
     }
 
@@ -3249,8 +3290,16 @@ pub fn handle_orchestrate(
     // the one that gets the assignment.
     for (role, agent_id) in &active_plan {
         let rm = role_marker(role);
+        let role_key = role.trim().to_ascii_lowercase();
         markers_used.push(rm.clone());
-        let active_title = role_track_title(role, &mandate.title);
+        // Active role-track title: a model-authored blueprint title (when provided
+        // for this role key) else the deterministic title. The promotion logic
+        // below targets this same `active_title`.
+        let active_title = blueprint
+            .and_then(|b| b.role(&role_key))
+            .and_then(|i| i.title.as_deref())
+            .map(str::to_string)
+            .unwrap_or_else(|| role_track_title(role, &mandate.title));
         let role_track = ensure_marked(
             &rm,
             &active_title,
@@ -3261,6 +3310,16 @@ pub fn handle_orchestrate(
         let Some((role_id, was_existing, _assignee, current_title)) = role_track else {
             continue;
         };
+        // On first creation, drop a model-authored work-track Dossier when the
+        // blueprint provided one (deterministic v1 created no role-track Dossier,
+        // so this only adds text when a blueprint authored it; never on rerun).
+        if !was_existing
+            && let Some(body) = blueprint
+                .and_then(|b| b.role(&role_key))
+                .and_then(super::prime_orchestration::PrimeOrchestrationItem::dossier_body)
+        {
+            let _ = task_store.add_dossier(&role_id, "orchestration", "Work track plan", &body);
+        }
         // Title lifecycle: when a role that was a placeholder becomes
         // active, promote its auto-generated `… track blocked:` title to
         // the normal active title — but ONLY if it is still the
@@ -3286,18 +3345,35 @@ pub fn handle_orchestrate(
         // is reused.
         let subject_marker = format!("{rm}:subject:{agent_id}");
         markers_used.push(subject_marker.clone());
+        // Subject-execution title: a model-authored blueprint title (when provided
+        // for this agent/subject key) else the deterministic title. Applied on
+        // creation only.
+        let subject_title = blueprint
+            .and_then(|b| b.subject(agent_id))
+            .and_then(|i| i.title.as_deref())
+            .map(str::to_string)
+            .unwrap_or_else(|| subject_exec_title(role, agent_id));
         let subject = ensure_marked(
             &subject_marker,
-            &subject_exec_title(role, agent_id),
+            &subject_title,
             &mut subject_briefs_created,
             &mut subject_briefs_existing,
             &mut skipped,
         );
-        let Some((subject_id, _sw, subject_assignee, _st)) = subject else {
+        let Some((subject_id, subject_was_existing, subject_assignee, _st)) = subject else {
             continue;
         };
         // Link the subject Brief under its role track.
         let _ = task_store.link_subbrief(&role_id, &subject_id);
+        // On first creation, drop a model-authored execution Dossier when the
+        // blueprint provided one (deterministic v1 created no subject Dossier).
+        if !subject_was_existing
+            && let Some(body) = blueprint
+                .and_then(|b| b.subject(agent_id))
+                .and_then(super::prime_orchestration::PrimeOrchestrationItem::dossier_body)
+        {
+            let _ = task_store.add_dossier(&subject_id, "execution", "Execution plan", &body);
+        }
 
         // Assignment lands on the subject Brief (assign_ready only); the
         // role track above stays unassigned. Always assign-Key gated.

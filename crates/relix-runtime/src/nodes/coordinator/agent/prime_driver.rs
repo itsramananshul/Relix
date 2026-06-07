@@ -36,14 +36,18 @@ use crate::dispatch::{HandlerOutcome, InvocationCtx};
 use crate::nodes::coordinator::TaskStore;
 use crate::nodes::coordinator::agent::handlers::{
     ReadinessView, autonomous_approve_spawn_clearance, brief_status_row, caller_is_operator,
-    compute_readiness, handle_orchestrate, handle_prime_approve, handle_prime_start,
-    handle_strategy_approve, handle_strategy_propose, handle_team_plan, internal, invalid,
-    policy_denied,
+    compute_readiness, handle_orchestrate, handle_orchestrate_with_blueprint, handle_prime_approve,
+    handle_prime_start, handle_strategy_approve, handle_strategy_propose, handle_team_plan,
+    internal, invalid, policy_denied,
 };
 use crate::nodes::coordinator::agent::prime;
 use crate::nodes::coordinator::agent::prime_deliberation::{
     ACTION_NONE, PrimeAiDecider, PrimeDeliberationInput, PrimeDeliberationMode,
     build_prime_deliberation_prompt, parse_prime_decision,
+};
+use crate::nodes::coordinator::agent::prime_orchestration::{
+    PrimeOrchestrationBlueprint, PrimeOrchestrationMode, PrimeOrchestrationRole,
+    PrimeOrchestrationSnapshot, build_orchestration_prompt, parse_orchestration_blueprint,
 };
 use crate::nodes::coordinator::agent::prime_priority::{
     MAX_PRIORITY_CANDIDATES, PrimePriorityCandidate, PrimePriorityMode, build_priority_prompt,
@@ -528,6 +532,167 @@ fn draft_strategy_doc(
             mode: PrimeStrategyDraftMode::Unavailable,
             reason: Some(format!("model unavailable: {e}")),
         },
+    }
+}
+
+/// The `max_briefs` cap the autonomous/manual Prime tick orchestrates under — the
+/// SAME default the deterministic `mandate.orchestrate` uses when the operator
+/// passes no cap (the tick dispatches `{mandate_id}|assign_ready`). Used only to
+/// bound the authoring snapshot fed to the model; the handler re-derives + clamps
+/// the real cap itself.
+const AUTONOMOUS_ORCH_MAX_BRIEFS: usize = 16;
+
+/// Build the bounded, secret-free orchestration-authoring snapshot for a Mandate
+/// — the SAME active/gap role computation `handle_orchestrate` performs, so the
+/// offered role / subject keys match exactly what the handler will materialise.
+/// Returns `None` (→ deterministic fallback) when the Mandate or its readiness is
+/// unavailable. NO secret, credential, token, or repo content is included; only
+/// the Mandate's own title/status, a bounded approved-strategy excerpt, the active
+/// role keys + their staffed agent ids, and the gap roles + reasons (context only).
+fn build_orchestration_snapshot(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    tenant: &str,
+    mandate_id: &str,
+) -> Option<PrimeOrchestrationSnapshot> {
+    let mandate = spine_store
+        .get_mandate_for_tenant(mandate_id, tenant)
+        .ok()??;
+    let view = compute_readiness(agent_store, spine_store, tenant, mandate_id).ok()?;
+
+    // Active role tracks — deduped by lowercased role key, first staffed agent
+    // wins (mirrors the handler's `active` BTreeMap).
+    let mut active: std::collections::BTreeMap<String, PrimeOrchestrationRole> =
+        std::collections::BTreeMap::new();
+    for (role, agent_id) in &view.active_agents {
+        let key = role.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        active
+            .entry(key.clone())
+            .or_insert_with(|| PrimeOrchestrationRole {
+                role_key: key.clone(),
+                agent_id: agent_id.clone(),
+            });
+    }
+    let active_keys: std::collections::BTreeSet<String> = active.keys().cloned().collect();
+
+    // Gap roles (context only) — missing / pending / blocked; an active role is
+    // never a gap. First writer wins (most specific reason first), mirroring the
+    // handler's `gap` BTreeMap ordering.
+    let mut gap: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    {
+        let mut note_gap = |role: &str, reason: &str| {
+            let key = role.trim().to_ascii_lowercase();
+            if key.is_empty() || active_keys.contains(&key) {
+                return;
+            }
+            gap.entry(key).or_insert_with(|| reason.to_string());
+        };
+        for c in &view.pending_clearances {
+            if let Some(role) = c.get("role").and_then(|v| v.as_str()) {
+                note_gap(role, "pending clearance");
+            }
+        }
+        for h in &view.pending_hires {
+            if let Some(r) = h.get("role").and_then(|v| v.as_str()) {
+                note_gap(r, "pending hire");
+            }
+        }
+        for r in &view.missing_roles {
+            note_gap(r, "crew not ready");
+        }
+        for b in &view.blocked_roles {
+            if let Some(r) = b.get("role").and_then(|v| v.as_str()) {
+                let reason = b
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("blocked");
+                note_gap(r, reason);
+            }
+        }
+    }
+
+    // Only feed the model an APPROVED strategy excerpt (the orchestrate gate
+    // requires an approved strategy; a non-approved doc is never authored from).
+    let strategy = match spine_store.strategy_approved(tenant, mandate_id) {
+        Ok(true) => spine_store.strategy_doc(tenant, mandate_id).ok().flatten(),
+        _ => None,
+    };
+
+    Some(PrimeOrchestrationSnapshot::new(
+        &mandate.title,
+        &mandate.status,
+        strategy.as_deref(),
+        active.into_values().collect(),
+        gap.into_iter().collect(),
+        AUTONOMOUS_ORCH_MAX_BRIEFS,
+    ))
+}
+
+/// Prime Orchestration Authoring v1 (company-model §4.6 / §12.5A). Author an
+/// orchestration TEXT blueprint for the Mandate's already-computed skeleton when
+/// model authoring is enabled (`orchestration_llm_enabled`) AND a live decider is
+/// wired; the reply is fully re-validated + key-constrained + sanitized by
+/// [`parse_orchestration_blueprint`]. **The model authors text only:** the
+/// returned blueprint can change only the title / dossier / checklist of
+/// newly-created parent / role-track / subject Briefs — never a role, agent, id,
+/// assignment, dependency, or gate (all fixed by `handle_orchestrate`). If
+/// authoring is off, no decider is wired, the snapshot is unavailable, the model
+/// is unreachable, or its output is rejected, this returns `None` with an honest
+/// [`PrimeOrchestrationMode`] and the caller falls back to the deterministic text.
+fn author_orchestration_blueprint(
+    ai: Option<&dyn PrimeAiDecider>,
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    tenant: &str,
+    mandate_id: &str,
+    orchestration_llm_enabled: bool,
+) -> (
+    Option<PrimeOrchestrationBlueprint>,
+    PrimeOrchestrationMode,
+    Option<String>,
+) {
+    if !orchestration_llm_enabled {
+        return (None, PrimeOrchestrationMode::DeterministicOnly, None);
+    }
+    let Some(decider) = ai else {
+        return (
+            None,
+            PrimeOrchestrationMode::Unavailable,
+            Some("no AI decider wired for orchestration authoring".to_string()),
+        );
+    };
+    let Some(snap) = build_orchestration_snapshot(agent_store, spine_store, tenant, mandate_id)
+    else {
+        return (
+            None,
+            PrimeOrchestrationMode::Fallback,
+            Some("orchestration snapshot unavailable".to_string()),
+        );
+    };
+    let role_keys = snap.offered_role_keys();
+    let subject_keys = snap.offered_subject_keys();
+    let prompt = build_orchestration_prompt(&snap);
+    match decider.deliberate(&prompt) {
+        Ok(raw) => match parse_orchestration_blueprint(&raw, &role_keys, &subject_keys) {
+            Ok(bp) => (
+                Some(bp),
+                PrimeOrchestrationMode::LlmUsed,
+                Some("model-authored orchestration blueprint".to_string()),
+            ),
+            Err(e) => (
+                None,
+                PrimeOrchestrationMode::Fallback,
+                Some(format!("model orchestration output rejected: {e}")),
+            ),
+        },
+        Err(e) => (
+            None,
+            PrimeOrchestrationMode::Unavailable,
+            Some(format!("model unavailable: {e}")),
+        ),
     }
 }
 
@@ -1308,6 +1473,12 @@ fn prime_autonomy_record_json(r: &PrimeAutonomyRecord) -> Value {
         "priority_ai_mode": r.priority_ai_mode.as_deref().unwrap_or("deterministic_only"),
         "priority_ai_reason": r.priority_ai_reason,
         "priority_rank": r.priority_rank,
+        // Prime Orchestration Authoring v1 provenance: present only on an
+        // orchestrate_assign_ready row (the Brief-text author); null elsewhere so
+        // the operator can tell a model-authored orchestration tree from a
+        // deterministic one.
+        "orchestration_ai_mode": r.orchestration_ai_mode,
+        "orchestration_ai_reason": r.orchestration_ai_reason,
     })
 }
 
@@ -1364,6 +1535,11 @@ pub fn handle_prime_autonomy_tick_now(
             .ok()
             .as_deref(),
     );
+    let orchestration_llm_enabled = parse_prime_llm_orchestration(
+        std::env::var("RELIX_PRIME_LLM_ORCHESTRATION")
+            .ok()
+            .as_deref(),
+    );
     handle_prime_autonomy_tick_now_with_ai(
         agent_store,
         spine_store,
@@ -1375,6 +1551,7 @@ pub fn handle_prime_autonomy_tick_now(
         llm_enabled,
         strategy_llm_enabled,
         prioritization_enabled,
+        orchestration_llm_enabled,
     )
 }
 
@@ -1406,6 +1583,7 @@ pub fn handle_prime_autonomy_tick_now_with_ai(
     llm_enabled: bool,
     strategy_llm_enabled: bool,
     prioritization_enabled: bool,
+    orchestration_llm_enabled: bool,
 ) -> HandlerOutcome {
     // Same Board-only gate as the runtime toggle: a worker subject can never
     // wake the autonomous Prime driver, even though this takes no new authority.
@@ -1447,6 +1625,7 @@ pub fn handle_prime_autonomy_tick_now_with_ai(
         llm_enabled,
         strategy_llm_enabled,
         prioritization_enabled,
+        orchestration_llm_enabled,
     ) {
         Ok(r) => r,
         Err(e) => return internal(format!("prime.autonomy_tick_now: {e}")),
@@ -1519,6 +1698,21 @@ pub fn parse_prime_llm_deliberation(raw: Option<&str>) -> bool {
 /// vice versa). Either way the strategy is only ever PROPOSED, never approved by
 /// the model.
 pub fn parse_prime_llm_strategy_draft(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Parse `RELIX_PRIME_LLM_ORCHESTRATION` (`1|true|yes|on`, case-insensitive) into
+/// the model-orchestration-authoring flag (Prime Orchestration Authoring v1).
+/// Default OFF. Independent of the other Prime LLM switches: a Guild may let the
+/// model author the orchestration Brief *text* (titles / dossiers / checklists)
+/// for the already-computed skeleton while keeping deterministic action selection
+/// / strategy drafting / prioritization. The model authors text only — it never
+/// invents a role, agent, Brief id, assignment, or gate, and any
+/// invalid/unavailable output falls back to the deterministic titles + dossiers.
+pub fn parse_prime_llm_orchestration(raw: Option<&str>) -> bool {
     matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
         Some("1" | "true" | "yes" | "on")
@@ -1808,6 +2002,17 @@ pub struct PrimeAutonomyRecord {
     /// picked the order (`priority_ai_mode == llm_used`); `None` in deterministic
     /// modes or for a candidate that was not part of the offered actionable menu.
     pub priority_rank: Option<usize>,
+    /// Prime Orchestration Authoring v1 provenance — how the orchestration Brief
+    /// TEXT (titles / dossiers / checklists) was authored on an
+    /// `orchestrate_assign_ready` action: `deterministic_only` / `llm_used` /
+    /// `fallback` / `unavailable`. `None` for every other action (no orchestration
+    /// text was authored). Distinct from `ai_mode` (action choice),
+    /// `strategy_ai_mode` (strategy body), and `priority_ai_mode` (queue order).
+    pub orchestration_ai_mode: Option<String>,
+    /// Secret-free reason the orchestration text was authored the way it was
+    /// (model reason on `llm_used`, or the honest fallback/unavailable reason).
+    /// `None` when no orchestration text was authored.
+    pub orchestration_ai_reason: Option<String>,
 }
 
 /// Build the synthetic **autonomous Prime** invocation context for `tenant`.
@@ -2073,6 +2278,7 @@ fn process_candidate(
     ai: Option<&dyn PrimeAiDecider>,
     llm_enabled: bool,
     strategy_llm_enabled: bool,
+    orchestration_llm_enabled: bool,
 ) -> PrimeAutonomyRecord {
     let mut delib_mode = PrimeDeliberationMode::DeterministicOnly;
     let mut delib_reason: Option<String> = None;
@@ -2104,6 +2310,8 @@ fn process_candidate(
                         priority_ai_mode: None,
                         priority_ai_reason: None,
                         priority_rank: None,
+                        orchestration_ai_mode: None,
+                        orchestration_ai_reason: None,
                     };
                 }
                 Deliberation::Proceed { mode, reason } => {
@@ -2130,6 +2338,7 @@ fn process_candidate(
         hire_rig,
         ai,
         strategy_llm_enabled,
+        orchestration_llm_enabled,
     );
     rec.ai_mode = Some(delib_mode.as_str().to_string());
     rec.ai_reason = delib_reason;
@@ -2160,6 +2369,7 @@ fn process_candidate_inner(
     hire_rig: &str,
     ai: Option<&dyn PrimeAiDecider>,
     strategy_llm_enabled: bool,
+    orchestration_llm_enabled: bool,
 ) -> PrimeAutonomyRecord {
     let mk = |phase: String,
               action: &'static str,
@@ -2187,6 +2397,9 @@ fn process_candidate_inner(
             priority_ai_mode: None,
             priority_ai_reason: None,
             priority_rank: None,
+            // Set only on the orchestrate_assign_ready arm below (the text author).
+            orchestration_ai_mode: None,
+            orchestration_ai_reason: None,
         }
     };
 
@@ -2304,6 +2517,78 @@ fn process_candidate_inner(
                     action,
                     "blocked",
                     format!("strategy propose refused: {}", e.cause),
+                    Some(mid),
+                ),
+            };
+        }
+
+        // (A2) Prime Orchestration Authoring v1 — when the safe advance is
+        // `orchestrate_assign_ready`, author the Brief TEXT (titles / dossiers /
+        // checklists) for the already-computed skeleton (model-authored when the
+        // orchestration flag is on AND a live decider is wired, else deterministic)
+        // and materialise the tree through the EXISTING governed
+        // `handle_orchestrate_with_blueprint` in `assign_ready` mode. The blueprint
+        // is TEXT-ONLY and fully re-validated/key-constrained server-side: it
+        // cannot invent a role, agent, Brief id, assignment, dependency, or gate —
+        // every orchestration gate (approved strategy, ready team, assign-Key,
+        // reviewer stamping, max_briefs cap, placeholder behaviour, source-marker
+        // idempotency) is identical to the deterministic path. Bad / unavailable
+        // output falls back to deterministic text. The provenance is stamped on the
+        // record so the operator sees whether the model authored the tree text.
+        if action == ADVANCE_ORCHESTRATE {
+            let Some(mid) = mandate_id.clone() else {
+                return mk(
+                    phase,
+                    action,
+                    "skipped",
+                    "orchestrate: next step has no mandate".into(),
+                    None,
+                );
+            };
+            let (blueprint, orch_mode, orch_reason) = author_orchestration_blueprint(
+                ai,
+                agent_store,
+                spine_store,
+                tenant,
+                &mid,
+                orchestration_llm_enabled,
+            );
+            let orch_ctx = autonomous_prime_ctx(tenant, format!("{mid}|assign_ready").into_bytes());
+            return match handle_orchestrate_with_blueprint(
+                task_store,
+                agent_store,
+                spine_store,
+                &orch_ctx,
+                blueprint.as_ref(),
+            ) {
+                HandlerOutcome::Ok(_) => {
+                    *actions += 1;
+                    chronicle_autonomous(
+                        task_store,
+                        &mid,
+                        "prime.autonomous_advance",
+                        &format!(
+                            "autonomous Prime advanced `{action}` on mandate {mid} (text: {})",
+                            orch_mode.as_str()
+                        ),
+                    );
+                    let mut rec = mk(
+                        phase,
+                        action,
+                        "advanced",
+                        format!("ran governed `{action}` ({} text)", orch_mode.as_str()),
+                        Some(mid),
+                    );
+                    rec.orchestration_ai_mode = Some(orch_mode.as_str().to_string());
+                    rec.orchestration_ai_reason = orch_reason;
+                    rec
+                }
+                // Governance / store refusal — propagate honestly, take no credit.
+                HandlerOutcome::Err(e) => mk(
+                    phase,
+                    action,
+                    "blocked",
+                    format!("orchestrate refused: {}", e.cause),
                     Some(mid),
                 ),
             };
@@ -2970,6 +3255,8 @@ fn exec_proposal_approve(
             priority_ai_mode: None,
             priority_ai_reason: None,
             priority_rank: None,
+            orchestration_ai_mode: None,
+            orchestration_ai_reason: None,
         }
     };
 
@@ -3101,6 +3388,7 @@ fn execute_candidate(
     ai: Option<&dyn PrimeAiDecider>,
     llm_enabled: bool,
     strategy_llm_enabled: bool,
+    orchestration_llm_enabled: bool,
 ) -> PrimeAutonomyRecord {
     match cand {
         AutoCandidate::ProposalApprove(p) => exec_proposal_approve(
@@ -3134,6 +3422,7 @@ fn execute_candidate(
             ai,
             llm_enabled,
             strategy_llm_enabled,
+            orchestration_llm_enabled,
         ),
         AutoCandidate::Mandate { tenant, mandate_id } => process_candidate(
             agent_store,
@@ -3152,6 +3441,7 @@ fn execute_candidate(
             ai,
             llm_enabled,
             strategy_llm_enabled,
+            orchestration_llm_enabled,
         ),
     }
 }
@@ -3194,6 +3484,7 @@ pub fn autonomous_prime_tick(
     llm_enabled: bool,
     strategy_llm_enabled: bool,
     prioritization_enabled: bool,
+    orchestration_llm_enabled: bool,
 ) -> Result<Vec<PrimeAutonomyRecord>, String> {
     if max == 0 {
         return Ok(Vec::new());
@@ -3366,6 +3657,8 @@ pub fn autonomous_prime_tick(
                 priority_ai_mode: Some(priority_mode_str.clone()),
                 priority_ai_reason: priority_reason.clone(),
                 priority_rank: Some(rank0 + 1),
+                orchestration_ai_mode: None,
+                orchestration_ai_reason: None,
             });
         }
         for (i, cand) in queue.iter().enumerate() {
@@ -3387,6 +3680,7 @@ pub fn autonomous_prime_tick(
                 ai,
                 llm_enabled,
                 strategy_llm_enabled,
+                orchestration_llm_enabled,
             );
             rec.priority_ai_mode = Some(priority_mode_str.clone());
             rec.priority_ai_reason = priority_reason.clone();
@@ -3428,6 +3722,7 @@ pub fn autonomous_prime_tick(
                 ai,
                 llm_enabled,
                 strategy_llm_enabled,
+                orchestration_llm_enabled,
             );
             rec.priority_ai_mode = Some(priority_mode_str.clone());
             rec.priority_ai_reason = priority_reason.clone();
@@ -3459,6 +3754,7 @@ pub fn autonomous_prime_tick(
             ai,
             llm_enabled,
             strategy_llm_enabled,
+            orchestration_llm_enabled,
         );
         rec.priority_ai_mode = Some(priority_mode_str.clone());
         rec.priority_ai_reason = priority_reason.clone();
@@ -3887,6 +4183,7 @@ mod tests {
     ) -> Vec<PrimeAutonomyRecord> {
         autonomous_prime_tick(
             agents, spine, tasks, reg, None, 0, max, tenant, "echo", None, false, false, false,
+            false,
         )
         .unwrap()
     }
@@ -3904,6 +4201,7 @@ mod tests {
     ) -> Vec<PrimeAutonomyRecord> {
         autonomous_prime_tick(
             agents, spine, tasks, reg, None, 0, max, tenant, hire_rig, None, false, false, false,
+            false,
         )
         .unwrap()
     }
@@ -3945,6 +4243,7 @@ mod tests {
             "echo",
             Some(decider),
             true,
+            false,
             false,
             false,
         )
@@ -4104,6 +4403,7 @@ mod tests {
             true,
             false,
             false,
+            false,
         )
         .unwrap();
         let rec = recs
@@ -4183,6 +4483,7 @@ mod tests {
             Some(decider),
             false,
             true,
+            false,
             false,
         )
         .unwrap()
@@ -4302,6 +4603,7 @@ in force.\n";
             false,
             true,
             false,
+            false,
         )
         .unwrap();
         let rec = recs.iter().find(|r| r.target_id == m).unwrap();
@@ -4405,6 +4707,333 @@ in force.\n";
         assert!(!parse_prime_llm_strategy_draft(None));
     }
 
+    // ── PRIME ORCHESTRATION AUTHORING v1 (scripted orchestration decider) ───
+    // These exercise the ORCHESTRATION-TEXT layer (titles / dossiers / checklists)
+    // — separate from action deliberation, strategy authoring, and prioritization
+    // (all OFF here). The action choice + the whole skeleton (roles, agents,
+    // assignments, ids, markers) stay deterministic; only the work-object TEXT of
+    // newly-created Briefs is model-authored (or falls back).
+
+    /// A ready-to-orchestrate Mandate: approved strategy + a recorded Team Plan
+    /// whose single engineer hire is an already-active Operative — so the next
+    /// governed step is `orchestrate_assign_ready`. Returns `(mandate_id,
+    /// engineer_agent_id)` so a blueprint can key the subject by agent id.
+    fn ready_to_orchestrate(
+        spine: &SpineStore,
+        agents: &AgentStore,
+        tenant: &str,
+    ) -> (String, String) {
+        let m = spine
+            .create_mandate(tenant, "Ship v1", "real product", None, None)
+            .unwrap();
+        spine.propose_strategy(tenant, &m, "build a team").unwrap();
+        spine.approve_strategy(tenant, &m).unwrap();
+        // Subject id is unique per tenant (agent_profiles.subject_id is globally
+        // unique), so cross-tenant setups don't collide.
+        let subject = format!("subj-w-{tenant}");
+        let agent_id = agents
+            .create_agent(
+                "W", "engineer", "W", "eng", "eng", "prime", &subject, "medium", tenant,
+            )
+            .unwrap();
+        let hires = format!("[{{\"role\":\"engineer\",\"agent_id\":\"{agent_id}\"}}]");
+        spine
+            .record_team_plan(&TeamPlanRecord {
+                tenant_id: tenant,
+                mandate_id: &m,
+                actor_id: "operator",
+                description: "build it",
+                proposed_roles_json: "[]",
+                pending_hires_json: &hires,
+                clearance_ids_json: "[]",
+                denials_json: "[]",
+                next_steps_json: "[]",
+                status: "staffing",
+            })
+            .unwrap();
+        (m, agent_id)
+    }
+
+    /// Run an autonomous Prime tick with ORCHESTRATION AUTHORING ON (deliberation +
+    /// strategy + prioritization OFF) and a scripted decider — so the orchestration
+    /// Brief TEXT is model-authored (or, with invalid output, deterministic) while
+    /// the action choice + skeleton stay deterministic.
+    fn tick_orch_ai(
+        agents: &AgentStore,
+        spine: &SpineStore,
+        tasks: &Arc<TaskStore>,
+        reg: &crate::rig::RigRegistry,
+        max: usize,
+        tenant: Option<&str>,
+        decider: &dyn crate::nodes::coordinator::agent::prime_deliberation::PrimeAiDecider,
+    ) -> Vec<PrimeAutonomyRecord> {
+        autonomous_prime_tick(
+            agents,
+            spine,
+            tasks,
+            reg,
+            None,
+            0,
+            max,
+            tenant,
+            "echo",
+            Some(decider),
+            false,
+            false,
+            false,
+            true,
+        )
+        .unwrap()
+    }
+
+    // ORC-1) Orchestration flag ON + a scripted GOOD blueprint → the SAME skeleton
+    //        is created/assigned (parent + role track + subject) but the
+    //        newly-created Briefs carry the MODEL's title/dossier and the record
+    //        reads orchestration_ai_mode llm_used. Action choice stays deterministic.
+    #[test]
+    fn orchestration_llm_authors_brief_text() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, agent_id) = ready_to_orchestrate(&spine, &agents, "default");
+
+        let reply = format!(
+            r#"{{"parent":{{"title":"Parent (LLM)","dossier":"Top plan."}},
+                "roles":{{"engineer":{{"title":"Eng track (LLM)","dossier":"Build it.","checklist":["wire api","tests"]}}}},
+                "subjects":{{"{agent_id}":{{"title":"Eng exec (LLM)","dossier":"Do the work."}}}}}}"#
+        );
+        let decider = ScriptedDecider { reply: Ok(reply) };
+        let recs = tick_orch_ai(&agents, &spine, &tasks, &reg, 1, Some("default"), &decider);
+        let rec = recs.iter().find(|r| r.target_id == m).expect("considered");
+        assert_eq!(rec.phase, "needs_orchestration");
+        assert_eq!(rec.action, "orchestrate_assign_ready");
+        assert_eq!(rec.outcome, "advanced");
+        // Action-choice provenance stays deterministic; orchestration text is llm.
+        assert_eq!(rec.ai_mode.as_deref(), Some("deterministic_only"));
+        assert_eq!(rec.orchestration_ai_mode.as_deref(), Some("llm_used"));
+
+        // The SAME deterministic skeleton: parent + role track + subject = 3 Briefs.
+        let cards = tasks.list_briefs_by_mandate(&m, 50).unwrap();
+        assert_eq!(cards.len(), 3, "parent + role track + subject execution");
+
+        // The newly-created Briefs carry the MODEL's titles (keyed by marker).
+        let parent = tasks
+            .get_brief_by_source_marker(&format!("mandate:{m}:parent"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.title, "Parent (LLM)");
+        let role = tasks
+            .get_brief_by_source_marker(&format!("mandate:{m}:role:engineer"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(role.title, "Eng track (LLM)");
+        let subject = tasks
+            .get_brief_by_source_marker(&format!("mandate:{m}:role:engineer:subject:{agent_id}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(subject.title, "Eng exec (LLM)");
+        // The subject Brief is the one assigned (the skeleton/assignment is unchanged).
+        assert_eq!(
+            subject.assignee_agent_id.as_deref(),
+            Some(agent_id.as_str())
+        );
+    }
+
+    // ORC-2) Orchestration flag ON + a scripted BAD (malformed) blueprint → the
+    //        deterministic titles are used and the record reads
+    //        orchestration_ai_mode fallback. The skeleton is still created.
+    #[test]
+    fn orchestration_llm_bad_output_falls_back_deterministically() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, _agent_id) = ready_to_orchestrate(&spine, &agents, "default");
+
+        let decider = ScriptedDecider {
+            reply: Ok("Sure! Here is the plan you asked for.".to_string()),
+        };
+        let recs = tick_orch_ai(&agents, &spine, &tasks, &reg, 1, Some("default"), &decider);
+        let rec = recs.iter().find(|r| r.target_id == m).expect("considered");
+        assert_eq!(rec.action, "orchestrate_assign_ready");
+        assert_eq!(rec.outcome, "advanced");
+        assert_eq!(rec.orchestration_ai_mode.as_deref(), Some("fallback"));
+        // The deterministic titles were used.
+        let parent = tasks
+            .get_brief_by_source_marker(&format!("mandate:{m}:parent"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.title, "Execute Mandate: Ship v1");
+        let role = tasks
+            .get_brief_by_source_marker(&format!("mandate:{m}:role:engineer"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(role.title, "Engineering track: Ship v1");
+        assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), 3);
+    }
+
+    // ORC-3) Orchestration flag ON but NO decider wired → record reads
+    //        orchestration_ai_mode unavailable and the deterministic tree is built.
+    #[test]
+    fn orchestration_llm_no_decider_is_unavailable() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, _agent_id) = ready_to_orchestrate(&spine, &agents, "default");
+
+        // Orchestration ON but ai = None.
+        let recs = autonomous_prime_tick(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            None,
+            0,
+            1,
+            Some("default"),
+            "echo",
+            None,
+            false,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        let rec = recs.iter().find(|r| r.target_id == m).expect("considered");
+        assert_eq!(rec.action, "orchestrate_assign_ready");
+        assert_eq!(rec.outcome, "advanced");
+        assert_eq!(rec.orchestration_ai_mode.as_deref(), Some("unavailable"));
+        // Deterministic title + a created tree.
+        let parent = tasks
+            .get_brief_by_source_marker(&format!("mandate:{m}:parent"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.title, "Execute Mandate: Ship v1");
+        assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), 3);
+    }
+
+    // ORC-4) Orchestration flag OFF → the deterministic titles are used and the
+    //        orchestrate row honestly reads orchestration_ai_mode
+    //        `deterministic_only` (the text author is the deterministic helper).
+    #[test]
+    fn orchestration_llm_off_is_deterministic_only() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, _agent_id) = ready_to_orchestrate(&spine, &agents, "default");
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec = recs.iter().find(|r| r.target_id == m).expect("considered");
+        assert_eq!(rec.action, "orchestrate_assign_ready");
+        assert_eq!(rec.outcome, "advanced");
+        assert_eq!(
+            rec.orchestration_ai_mode.as_deref(),
+            Some("deterministic_only")
+        );
+        let parent = tasks
+            .get_brief_by_source_marker(&format!("mandate:{m}:parent"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.title, "Execute Mandate: Ship v1");
+    }
+
+    // ORC-5) Rerun idempotency: a second orchestration tick with a DIFFERENT
+    //        blueprint creates NO duplicate Briefs and never clobbers a
+    //        hand-edited title (reuse is by source marker; titles are set on
+    //        creation only).
+    #[test]
+    fn orchestration_llm_rerun_is_idempotent_and_preserves_hand_edits() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, agent_id) = ready_to_orchestrate(&spine, &agents, "default");
+
+        let reply1 = format!(
+            r#"{{"roles":{{"engineer":{{"title":"Eng track (LLM)"}}}},"subjects":{{"{agent_id}":{{"title":"Eng exec (LLM)"}}}}}}"#
+        );
+        let decider1 = ScriptedDecider { reply: Ok(reply1) };
+        let _ = tick_orch_ai(&agents, &spine, &tasks, &reg, 1, Some("default"), &decider1);
+        let after_first = tasks.list_briefs_by_mandate(&m, 50).unwrap().len();
+        assert_eq!(after_first, 3);
+
+        // A human renames the role-track Brief.
+        let role_id = tasks
+            .get_brief_by_source_marker(&format!("mandate:{m}:role:engineer"))
+            .unwrap()
+            .unwrap()
+            .task_id;
+        tasks
+            .set_brief_field(&role_id, "title", "Human-edited track")
+            .unwrap();
+
+        // Re-run with a DIFFERENT blueprint title.
+        let reply2 = format!(
+            r#"{{"roles":{{"engineer":{{"title":"Eng track (LLM v2)"}}}},"subjects":{{"{agent_id}":{{"title":"Eng exec (LLM v2)"}}}}}}"#
+        );
+        let decider2 = ScriptedDecider { reply: Ok(reply2) };
+        let _ = tick_orch_ai(&agents, &spine, &tasks, &reg, 1, Some("default"), &decider2);
+
+        // No duplicate Briefs.
+        assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), 3);
+        // The hand-edited title is preserved (never clobbered by the rerun blueprint).
+        let role = tasks
+            .get_brief_by_source_marker(&format!("mandate:{m}:role:engineer"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(role.title, "Human-edited track");
+    }
+
+    // ORC-6) Cross-tenant safety: an orchestration tick scoped to one Guild only
+    //        materialises that Guild's tree; another Guild's ready Mandate is
+    //        untouched.
+    #[test]
+    fn orchestration_llm_is_tenant_scoped() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m_default, agent_default) = ready_to_orchestrate(&spine, &agents, "default");
+        let (m_other, _agent_other) = ready_to_orchestrate(&spine, &agents, "other");
+
+        let reply = format!(
+            r#"{{"roles":{{"engineer":{{"title":"Eng (LLM)"}}}},"subjects":{{"{agent_default}":{{"title":"Exec (LLM)"}}}}}}"#
+        );
+        let decider = ScriptedDecider { reply: Ok(reply) };
+        let recs = tick_orch_ai(&agents, &spine, &tasks, &reg, 5, Some("default"), &decider);
+
+        // The default Guild's tree was built…
+        assert!(recs.iter().any(|r| r.target_id == m_default));
+        assert_eq!(
+            tasks.list_briefs_by_mandate(&m_default, 50).unwrap().len(),
+            3
+        );
+        // …the other Guild's Mandate was never considered or materialised.
+        assert!(recs.iter().all(|r| r.target_id != m_other));
+        assert!(
+            tasks
+                .list_briefs_by_mandate(&m_other, 50)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // ORC-7) The orchestration-authoring env flag parser honours the truthy set,
+    //        defaults OFF.
+    #[test]
+    fn prime_llm_orchestration_flag_parsing() {
+        for on in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert!(
+                parse_prime_llm_orchestration(Some(on)),
+                "`{on}` should enable"
+            );
+        }
+        for off in ["0", "false", "no", "off", "", "maybe"] {
+            assert!(
+                !parse_prime_llm_orchestration(Some(off)),
+                "`{off}` should not"
+            );
+        }
+        assert!(!parse_prime_llm_orchestration(None));
+    }
+
     // ── PRIME EXECUTIVE PRIORITIZATION v1 (scripted prioritization decider) ──
     // These exercise the QUEUE-ORDER layer (separate from action deliberation and
     // strategy authoring): both of those are OFF, so each candidate's action is
@@ -4425,6 +5054,7 @@ in force.\n";
     ) -> Vec<PrimeAutonomyRecord> {
         autonomous_prime_tick(
             agents, spine, tasks, reg, None, 0, max, tenant, "echo", decider, false, false, true,
+            false,
         )
         .unwrap()
     }
@@ -5256,6 +5886,7 @@ in force.\n";
             false,
             false,
             false,
+            false,
         )
         .unwrap();
         let rec = recs
@@ -5549,8 +6180,9 @@ in force.\n";
             &ctx,
             ai,
             llm_enabled,
-            // Strategy authoring + prioritization off for the deliberation-focused
-            // manual-tick tests.
+            // Strategy authoring + prioritization + orchestration authoring off for
+            // the deliberation-focused manual-tick tests.
+            false,
             false,
             false,
         )

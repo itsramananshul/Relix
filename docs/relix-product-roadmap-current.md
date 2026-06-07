@@ -623,11 +623,37 @@ ledger entry or design section.
    pure module + tests), `…/agent/prime_driver.rs` (tick refactor + record provenance + loop wiring + tests),
    `…/agent/mod.rs`, `controller_runtime.rs` (both tick wiring sites), `apps/dashboard/src/pages/Settings.tsx` +
    rebuilt `dashboard-dist`.
+   **Prime Orchestration Authoring v1 — SHIPPED (opt-in, default OFF):** behind `RELIX_PRIME_LLM_ORCHESTRATION`,
+   when the autonomous/manual-tick loop executes `orchestrate_assign_ready` and a live mesh decider is available,
+   a model authors the *text* — titles / dossiers / checklists — of the Brief skeleton the deterministic
+   readiness logic has ALREADY computed (parent / role tracks / subject executions) from a bounded, secret-free
+   snapshot (Mandate title/status, a bounded approved-strategy excerpt, the active role keys + staffed agent ids,
+   gap roles + reasons, `max_briefs`). The reply is a VALIDATED blueprint keyed strictly by the offered
+   role/subject keys (`prime_orchestration::parse_orchestration_blueprint` — rejects unknown top-level/role/subject
+   keys, arrays where objects are expected, over-long/non-string title/dossier/checklist items, too many checklist
+   items, malformed/over-long JSON or prose; sanitizes pipe→`/` + control chars) and passed (never raw model
+   output) into `handle_orchestrate_with_blueprint`. **The model is NOT the permission system** — it authors text
+   only and can never invent a role, agent, Brief id, source marker, dependency, assignee, approval, budget
+   change, or tool; the roles/agents/assignments/reviewer stamping/`max_briefs` cap/placeholder behaviour/
+   source-marker idempotency are byte-for-byte the deterministic path, a newly-created Brief gets the model text
+   while an existing/hand-edited title is **never** clobbered (reuse is by source marker; titles set on creation
+   only), and placeholder-track text stays deterministic. Invalid/unavailable/disabled output falls back to the
+   deterministic titles + dossiers with honest provenance (`orchestration_ai_mode`/`orchestration_ai_reason`,
+   distinct from `ai_mode`/`strategy_ai_mode`/`priority_ai_mode`). Closes the "the orchestrated Brief tree's text
+   is mechanical/rule-based only" gap. It reuses the existing `MeshAiDecider`/AI peer/session — **no provider key
+   in the coordinator / web bridge / dashboard** — and the **direct one-click** `mandate.orchestrate` /
+   `prime.advance {action:"orchestrate_assign_ready"}` route stays deterministic by design. *Files:*
+   `…/agent/prime_orchestration.rs` (new pure module + tests), `…/agent/handlers.rs`
+   (`handle_orchestrate_with_blueprint` text integration), `…/agent/prime_driver.rs`
+   (`author_orchestration_blueprint` + record provenance + loop wiring + tests), `…/agent/mod.rs`,
+   `controller_runtime.rs` (both tick wiring sites), `apps/dashboard/src/pages/Settings.tsx` + rebuilt
+   `dashboard-dist`.
    *Still deferred:* a true end-to-end no-grant autonomous driver that also **approves** on its own (propose →
    **approve** → staff → orchestrate with nothing granted) — intentionally not built; **freeform tool-calling**
    remains deferred (deliberation only confirms-or-holds a computed action; prioritization only reorders the
-   already-computed legal candidate queue; the model may now author a *proposed* strategy's body but never
-   approves it, invents a goal, or calls a tool).
+   already-computed legal candidate queue; orchestration authoring only writes the *text* of the already-computed
+   Brief skeleton; the model may now author a *proposed* strategy's body but never approves it, invents a goal, or
+   calls a tool).
 9. **[BE/FE] Smarter companion** — **BACKEND SHIPPED (now AI-assisted action selection, opt-in +
    validated + fallback; still one-turn / one-action, NOT autonomous).**
    The `POST /v1/spine/companion` parser is a **company-aware action spine**

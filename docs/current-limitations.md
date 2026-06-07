@@ -559,11 +559,47 @@ the approved work is already ready. What it does **not** do:
     byte-for-byte the legacy behaviour. The live bridge→model→coordinator round trip
     is **not** integration-tested in CI (the parser + deterministic fallback that
     bound it are fully unit/loop tested with scripted output).
+  - **Prime Orchestration Authoring (v1) — the orchestration Brief *text* is no
+    longer mechanical-only; an opt-in model may AUTHOR the titles / dossiers /
+    checklists of the already-computed Brief skeleton (default OFF).** Behind
+    `RELIX_PRIME_LLM_ORCHESTRATION` (`1|true|yes|on`, off by default) the autonomous /
+    manual Prime tick still materialises the EXACT SAME idempotent Brief tree
+    (`mandate.orchestrate` in `assign_ready` mode — parent → role tracks → subject
+    executions, with placeholder tracks for staffing gaps), but the human-facing TEXT
+    of NEWLY-created parent / role-track / subject Briefs may be model-authored from a
+    bounded, secret-free snapshot (Mandate title/status, a bounded approved-strategy
+    excerpt, the active role keys + their staffed agent ids, gap roles + reasons,
+    `max_briefs`). **The model is NOT the permission system.** Its blueprint is keyed
+    STRICTLY by the offered role / subject keys and re-validated server-side
+    (`prime_orchestration::parse_orchestration_blueprint`): an unknown role/subject
+    key, an unknown top-level key, an array where an object is expected, an
+    over-long title/dossier/checklist item, too many checklist items, malformed JSON
+    or prose all degrade to the deterministic titles + dossiers with an honest mode.
+    The model can **only** change Brief text — it can never invent a role, agent,
+    Brief id, source marker, dependency, assignee, approval, budget change, or tool;
+    the roles, agents, assignments, reviewer stamping, gates, `max_briefs` cap,
+    placeholder behaviour, and source-marker idempotency are byte-for-byte identical
+    to the deterministic path, an existing/hand-edited Brief title is **never**
+    clobbered on rerun (reuse is by source marker; titles are set on creation only),
+    and placeholder-track text stays deterministic. Every orchestrate tick record
+    carries the provenance (`orchestration_ai_mode` ∈
+    {`deterministic_only`,`llm_used`,`fallback`,`unavailable`} +
+    `orchestration_ai_reason`), surfaced on `prime.autonomy_tick_now` and the Settings
+    tick table (`orch:`). The live decider reuses the SAME `MeshAiDecider` / AI peer /
+    session the other Prime LLM layers use — **no provider key enters the coordinator,
+    web bridge, or dashboard**; a missing mesh / AI peer produces `unavailable` and
+    falls back deterministically. **Honest scope:** this authors the *text* of an
+    already-allowed skeleton only; the direct one-click `mandate.orchestrate` /
+    `prime.advance {action:"orchestrate_assign_ready"}` route stays **deterministic**
+    by design (it never builds a blueprint). The live bridge→model→coordinator round
+    trip is **not** integration-tested in CI (the parser + deterministic fallback that
+    bound it are fully unit/loop tested with scripted output).
   - What this still does **NOT** do: there is **no freeform model reasoning or
     tool-calling** — the deliberation above is constrained to confirm-or-hold the ONE
-    computed governed action, and the prioritization above only reorders (or holds)
-    the already-computed legal candidate queue (neither can invent a goal or call a
-    tool). A model **may**
+    computed governed action, the prioritization above only reorders (or holds)
+    the already-computed legal candidate queue, and the orchestration authoring above
+    only writes the *text* of the already-computed Brief skeleton (none can invent a
+    goal, role, agent, assignment, or call a tool). A model **may**
     now author the *text* of a PROPOSED strategy (Prime Strategy Authoring, above)
     when its switch is on, but only the **body** of a `proposed` doc — it does not
     approve the strategy, choose the action, pick which person/identity to hire, or
