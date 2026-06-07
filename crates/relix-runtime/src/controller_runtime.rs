@@ -3377,6 +3377,31 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // CANONICAL GUILD MONTH-TO-DATE SPEND (company-model §6.6 / §3.6;
+    // dashboard-design §10): one numeric route the Costs page reads for the
+    // Guild's actual month-to-date spend, computed from the SAME metrics ledger +
+    // canonical calendar-month window the autonomous Guild hard-stop enforces
+    // (`heartbeat::guild_spend_micros` over `heartbeat::allowance_window`).
+    // Tenant-scoped; mutates nothing. `metrics == None` → honest null spend.
+    if let Some(spine) = spine_store.clone() {
+        let s = agent_store.clone();
+        let mq = metrics_query.clone();
+        bridge.register(
+            "guild.spend",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let spine = spine.clone();
+                let mq = mq.clone();
+                async move {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    handlers::handle_guild_spend(&s, &spine, mq.as_ref(), now_ms, &ctx)
+                }
+            })),
+        );
+    }
     if let Some(spine) = spine_store.clone() {
         bridge.register(
             "mandate.orchestration.latest",

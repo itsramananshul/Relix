@@ -2,10 +2,12 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import {
   briefCost,
+  guildSpend,
   tryGet,
   tryGetReport,
   type BriefCostRollup,
   type GetReport,
+  type GuildSpend,
 } from "../api";
 import { Empty, Section, useAsync } from "../components/common";
 
@@ -15,6 +17,13 @@ import { Empty, Section, useAsync } from "../components/common";
 // observability metrics), never fabricated. Where a figure isn't exposed by a
 // route yet, the section says so honestly (route + reason) instead of showing a
 // fake zero. B&W aesthetic; color is reserved for semantic status (§12).
+//
+// The Guild budget card reads canonical **month-to-date** spend from the
+// dedicated `guild.spend` route (`GET /v1/spine/guild/spend`) — the EXACT ledger
+// figure + UTC-calendar-month window the autonomous Guild hard-stop enforces, so
+// the card can never disagree with the gate. The per-agent "observed spend" table
+// below remains separate operational telemetry from the observability metrics
+// window (24h/7d/30d), explicitly distinguished from the governance month.
 
 interface Guild {
   tenant_id?: string;
@@ -76,6 +85,12 @@ function fmtDate(secs?: number): string {
   const d = new Date(secs * 1000);
   return Number.isNaN(d.getTime()) ? "—" : d.toLocaleDateString();
 }
+// Unix MS → a local date (the guild.spend window/reset fields are unix-ms).
+function fmtDateMs(ms?: number | null): string {
+  if (ms == null) return "—";
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleDateString();
+}
 // A YYYY-MM-DD date input → unix SECONDS at 00:00 UTC (matches the ledger's
 // inclusive window math). Empty → undefined (server defaults to the month).
 function dateToSecs(v: string): number | undefined {
@@ -127,6 +142,11 @@ export function Costs() {
     };
   }, []);
 
+  // Canonical month-to-date Guild spend (the gate's own ledger figure + UTC
+  // calendar-month window). Reported so an unavailable route shows an honest
+  // state — NEVER an approximation in its place.
+  const spend = useAsync<GetReport<GuildSpend | null>>(async () => guildSpend.get(), []);
+
   // Observability metrics (per-agent observed spend over the selected window).
   // Reported so an unavailable/disabled metrics layer shows an honest state.
   const metrics = useAsync<GetReport<unknown>>(
@@ -164,55 +184,98 @@ export function Costs() {
   const cap = guild.monthly_allowance_cents ?? null;
   const committedPct = cap && committed != null && cap > 0 ? Math.round((committed / cap) * 100) : null;
 
+  // ── Canonical Guild month-to-date spend (guild.spend) ──────────────────────
+  const gs = spend.data?.data ?? null;
+  const spendErr = spend.data?.error ?? null;
+  // Prefer the budget the canonical route reports; fall back to guild/detail's
+  // cap so the budget figure still renders if only one route answers.
+  const canonBudget = gs?.budget_cents ?? cap;
+  const spentCents = gs?.spent_cents ?? null;
+  const remainingCents = gs?.remaining_cents ?? null;
+  const overBudget = gs?.over_budget ?? null;
+  const spentPct =
+    canonBudget && spentCents != null && canonBudget > 0
+      ? Math.round((spentCents / canonBudget) * 100)
+      : null;
+
   return (
     <Section title="Costs">
       {base.error && <div className="banner err">{base.error}</div>}
 
-      {/* ── Guild budget ─────────────────────────────────────────── */}
+      {/* ── Guild budget — canonical month-to-date spend (guild.spend) ─── */}
       <div className="card">
         <div className="row" style={{ marginBottom: 10 }}>
           <h3 style={{ margin: 0 }}>Guild budget</h3>
-          {guild.display_name && <span className="muted" style={{ fontSize: 12, marginLeft: 8 }}>· {guild.display_name}</span>}
+          {(gs?.display_name || guild.display_name) && (
+            <span className="muted" style={{ fontSize: 12, marginLeft: 8 }}>· {gs?.display_name || guild.display_name}</span>
+          )}
           <div className="spacer" style={{ flex: 1 }} />
-          {guild.billing_code && <span className="badge" style={{ fontSize: 9 }}>billing: {guild.billing_code}</span>}
+          {overBudget === true && <span className="badge blocked" style={{ fontSize: 9 }}>over budget</span>}
+          {guild.billing_code && <span className="badge" style={{ fontSize: 9, marginLeft: 6 }}>billing: {guild.billing_code}</span>}
         </div>
-        {base.loading ? (
+        {base.loading || spend.loading ? (
           <div className="loading">Loading budget…</div>
         ) : (
           <>
+            {/* Primary trio: budget vs ACTUAL month-to-date spend (canonical). */}
             <div className="grid cols-3">
               <div>
-                <div className="stat">{cap != null ? fmtCents(cap) : "—"}</div>
+                <div className="stat">{canonBudget != null ? fmtCents(canonBudget) : "—"}</div>
                 <div className="stat-label">Monthly Guild budget</div>
               </div>
               <div>
-                <div className="stat">{fmtCents(committed)}</div>
-                <div className="stat-label">Committed Allowance (sum of caps)</div>
+                <div className="stat">
+                  {spentCents != null ? fmtCents(spentCents) : <span className="muted">—</span>}
+                </div>
+                <div className="stat-label">Spent this month{spentPct != null ? ` · ${spentPct}%` : ""}</div>
               </div>
               <div>
-                <div className="stat">{committedPct != null ? `${committedPct}%` : "—"}</div>
-                <div className="stat-label">Committed vs budget</div>
+                <div className="stat" style={remainingCents != null && remainingCents < 0 ? { color: "var(--err)" } : undefined}>
+                  {remainingCents != null ? fmtCents(remainingCents) : <span className="muted">—</span>}
+                </div>
+                <div className="stat-label">Remaining</div>
               </div>
             </div>
-            {cap != null && committed != null && cap > 0 ? (
+
+            {/* Spent-vs-budget progress (real spend; over-cap is a red bar). */}
+            {canonBudget != null && spentCents != null && canonBudget > 0 ? (
               <div className="progress-bar" style={{ marginTop: 12 }}>
                 <div
                   className="progress-fill"
                   style={{
-                    width: `${Math.min(100, committedPct ?? 0)}%`,
-                    background: (committedPct ?? 0) > 100 ? "var(--err)" : (committedPct ?? 0) >= 90 ? "var(--warn)" : "var(--ok)",
+                    width: `${Math.min(100, spentPct ?? 0)}%`,
+                    background: overBudget ? "var(--err)" : (spentPct ?? 0) >= 90 ? "var(--warn)" : "var(--ok)",
                   }}
                 />
               </div>
-            ) : (
+            ) : null}
+
+            {/* Honest unavailable / no-budget / no-ledger states. */}
+            {spendErr ? (
               <div className="muted" style={{ fontSize: 12, marginTop: 10 }}>
-                {cap == null
-                  ? "No Guild monthly budget configured — set one to track committed Allowance against a ceiling."
-                  : "Committed Allowance is $0 — no per-Operative caps are set yet."}
+                Canonical Guild spend unavailable — {spendErr} (GET /v1/spine/guild/spend).
               </div>
-            )}
+            ) : spentCents == null ? (
+              <div className="muted" style={{ fontSize: 12, marginTop: 10 }}>
+                Month-to-date spend can't be computed — the metrics ledger is unavailable.
+              </div>
+            ) : canonBudget == null ? (
+              <div className="muted" style={{ fontSize: 12, marginTop: 10 }}>
+                No Guild monthly budget configured — set one to gate autonomous spend against a ceiling.
+                {" "}({fmtCents(spentCents)} spent this month.)
+              </div>
+            ) : null}
+
+            {/* Reset bookkeeping + the committed-Allowance planning figure
+                (capacity reserved — DISTINCT from money already spent). */}
             <div className="muted" style={{ fontSize: 11, marginTop: 8 }}>
-              Committed Allowance is the sum of per-Operative monthly caps (governance), not month-to-date spend.
+              {gs?.resets_at_ms != null && `Resets ${fmtDateMs(gs.resets_at_ms)} (UTC calendar month). `}
+              Spend is canonical month-to-date from the run ledger — the same figure + window the autonomous Guild hard-stop enforces.
+            </div>
+            <div className="row" style={{ marginTop: 8, alignItems: "baseline", gap: 6 }}>
+              <span className="muted" style={{ fontSize: 11 }}>Committed Allowance (sum of per-Operative caps, capacity reserved):</span>
+              <strong style={{ fontSize: 12 }}>{fmtCents(committed)}</strong>
+              {committedPct != null && <span className="muted" style={{ fontSize: 11 }}>· {committedPct}% of budget</span>}
             </div>
           </>
         )}

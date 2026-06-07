@@ -609,6 +609,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/companion", post(companion::handle))
         .route("/v1/spine/guild", get(spine::guild_counts))
         .route("/v1/spine/guild/detail", get(spine::guild_detail))
+        .route("/v1/spine/guild/spend", get(spine::guild_spend))
         .route(
             "/v1/spine/allowance/committed",
             get(spine::allowance_committed),

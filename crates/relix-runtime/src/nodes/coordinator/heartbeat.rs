@@ -312,6 +312,37 @@ pub fn guild_allowance_admits(
     }
 }
 
+/// THE canonical **Guild month-to-date spend** in micro-USD: the SUM of
+/// `tenant`'s active Operatives' recorded run cost (`MetricsQuery::cost_since`)
+/// since `since_ms` (the canonical [`allowance_window`] start). This is the EXACT
+/// figure + window the autonomous Guild-budget hard-stop
+/// ([`dispatch_budget_admits`]) enforces and the Action Center's
+/// `company_spend_item` reports — extracted into one helper so the dispatch gate
+/// and any operator surface (the dashboard Costs page's `guild.spend` route) can
+/// never disagree by summing two different ways.
+///
+/// **Tenant-safe by construction:** sums ONLY `tenant`'s own active roster
+/// (`list_active_for_tenant`), never a cross-tenant `cost_since(None, …)`, so
+/// another Guild's spend can never enter this total. A per-agent ledger read
+/// error contributes `0` (mirrors the gate — a transient metrics hiccup never
+/// fabricates spend, and `saturating_add` can never overflow).
+pub fn guild_spend_micros(
+    agent_store: &crate::nodes::coordinator::agent::store::AgentStore,
+    metrics: &crate::metrics::MetricsQuery,
+    tenant: &str,
+    since_ms: i64,
+) -> u64 {
+    let mut guild_spend: u64 = 0;
+    if let Ok(actives) = agent_store.list_active_for_tenant(tenant) {
+        for a in &actives {
+            if let Ok(used) = metrics.cost_since(Some(&a.agent_id), since_ms) {
+                guild_spend = guild_spend.saturating_add(used);
+            }
+        }
+    }
+    guild_spend
+}
+
 /// Compose the autonomous-dispatch budget gate for one Brief: the per-Operative
 /// Allowance hard-stop ([`allowance_admits`], authoritative and unchanged)
 /// followed by the **additive** Guild-budget hard-stop ([`guild_allowance_admits`],
@@ -388,14 +419,9 @@ pub fn dispatch_budget_admits(
     let Some(budget) = budget else {
         return BudgetAdmission::Allow;
     };
-    let mut guild_spend: u64 = 0;
-    if let Ok(actives) = agent_store.list_active_for_tenant(&tenant) {
-        for a in &actives {
-            if let Ok(used) = metrics.cost_since(Some(&a.agent_id), since_ms) {
-                guild_spend = guild_spend.saturating_add(used);
-            }
-        }
-    }
+    // Canonical Guild month-to-date spend — the exact figure the `guild.spend`
+    // operator route reports (one shared helper, one window).
+    let guild_spend = guild_spend_micros(agent_store, metrics, &tenant, since_ms);
     match guild_allowance_admits(Some(budget), guild_spend) {
         BudgetAdmission::Allow => BudgetAdmission::Allow,
         BudgetAdmission::Refuse {

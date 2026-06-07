@@ -161,6 +161,14 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   through the gate's own `MetricsSpendSource` (commit `579fa8c5`, ledger-reconciled in
   `177c93ef`); the window is the canonical UTC calendar month (`allowance_window`), the
   exact source + window the dispatch gate enforces.
+- **Canonical Guild spend route** — `guild.spend` (`GET /v1/spine/guild/spend`) exposes the
+  Guild's current-UTC-month spend as a numeric object (`spent_micros`/`spent_cents`,
+  `budget_cents`/`remaining_cents`/`over_budget`, `window_start_ms`/`resets_at_ms`/`now_ms`,
+  `source`/`computed_from`). It is the SAME ledger figure + window the autonomous Guild
+  hard-stop enforces, via the single shared `heartbeat::guild_spend_micros` helper (the gate
+  was refactored to call it) — so the dashboard Costs card and the gate can never disagree.
+  Tenant-safe (sums only the caller's own Guild's active Operatives); no metrics ledger →
+  honest null spend (`company-model §6/§6.6`).
 - **Allowance calendar-month windowing** — the per-Operative Allowance and Guild-budget
   hard-stops bill against the **current UTC calendar month** via a single canonical
   `heartbeat::allowance_window(now_ms)` (inclusive month start → reset edge), replacing the
@@ -273,17 +281,22 @@ ledger entry or design section.
    `/v1/spine/keys/:id` + `/v1/agents/:id`). *Partial (honest):* full drag-pan/pinch is
    **deferred** — the surface ships a scrollable stage (overflow:auto = pan) with explicit
    −/reset/+ zoom controls instead, to stay CSP-clean and dependency-free.
-5. **[FE] Full Costs surface** — **FRONTEND SHIPPED (partial)** (`dashboard-design §10`).
-   `apps/dashboard/src/pages/Costs.tsx` (nav `/costs`): Guild budget (cap from
-   `/v1/spine/guild/detail` vs committed Allowance from `/v1/spine/allowance/committed`),
+5. **[FE] Full Costs surface** — **SHIPPED** (`dashboard-design §10`).
+   `apps/dashboard/src/pages/Costs.tsx` (nav `/costs`): the Guild budget card now reads
+   **canonical month-to-date Guild spend** from the dedicated `guild.spend` route
+   (`GET /v1/spine/guild/spend`) — the EXACT ledger figure + UTC-calendar-month window the
+   autonomous Guild hard-stop enforces (via the shared `heartbeat::guild_spend_micros` over
+   `heartbeat::allowance_window`), so the card can never disagree with the gate. The card shows
+   budget vs **actual spent** vs remaining (over-cap = red bar + "over budget" chip), the reset
+   date, and the committed Allowance kept as a clearly-DISTINCT *capacity-reserved* figure. Also:
    per-Operative allowance (Keys) + observed spend (`/v1/metrics/agents`, windowed), the
    Brief-tree rollup (`brief.cost_rollup` → `GET /v1/spine/briefs/:id/cost`) with own/descendant
    split + per-billing-code breakdown, and budget/over-cap incidents (the `budget`-category
-   Action Center items, which carry the authoritative live $ figures). *Partial (honest):* the
-   canonical month-to-date **Guild** spend is not exposed as a number by any route (only as
-   text in the Action Center `reason`), so per-agent observed spend is shown from the
-   observability **metrics window** (24h/7d/30d), explicitly distinguished from the governance
-   calendar-month; metrics↔Operative join is best-effort by agent name/id.
+   Action Center items). *Honest remaining nuance:* the per-agent "observed spend" table is
+   still **operational telemetry** from the observability **metrics window** (24h/7d/30d),
+   explicitly labelled distinct from the governance calendar-month, and its metrics↔Operative
+   join stays best-effort by agent name/id — but the **Guild** month-to-date figure is now
+   canonical, not an approximation.
 6. **[FE] Run transcript renderer** — **FRONTEND SHIPPED** (`dashboard-design §8`).
    `apps/dashboard/src/components/RunTranscript.tsx`: block-grouped "nice"/"raw" view over the
    real `/v1/runs/:id/events` stream (lifecycle rail, assistant/result cards, collapsible tool
@@ -421,18 +434,41 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    build` green; dist rebuilt + committed (dist-parity gate); `git diff --check` clean.
 
 4. **Costs surface** — `dashboard-design.md §10`.
-   **✅ DONE (partial).** *Files changed:* new `apps/dashboard/src/pages/Costs.tsx`,
-   `apps/dashboard/src/api.ts` (typed `briefCost.rollup` client for `GET
-   /v1/spine/briefs/:id/cost`), `App.tsx` (route `/costs`), `nav.ts` (ORG entry) + `Layout.tsx`
-   (title), rebuilt `dashboard-dist`. *Adds:* Guild budget (cap from `/v1/spine/guild/detail`
-   vs committed Allowance), per-Operative allowance (Keys) + observed spend
+   **✅ DONE.** *Files changed:* new `apps/dashboard/src/pages/Costs.tsx`,
+   `apps/dashboard/src/api.ts` (typed `briefCost.rollup` + `guildSpend.get` clients), `App.tsx`
+   (route `/costs`), `nav.ts` (ORG entry) + `Layout.tsx` (title), rebuilt `dashboard-dist`.
+   *Adds:* Guild budget vs **canonical month-to-date spend** (`guild.spend` →
+   `GET /v1/spine/guild/spend`), per-Operative allowance (Keys) + observed spend
    (`/v1/metrics/agents`, 24h/7d/30d window), the Brief-tree rollup (own/descendant + per-
-   billing-code breakdown), and budget/over-cap incident cards (the `budget`-category Action
-   Center items). All real data; honest unavailable states (route + reason) where a figure
-   isn't exposed — no fabricated zeroes. *Partial:* canonical month-to-date **Guild** spend has
-   no numeric route, so observed spend uses the metrics window, labelled distinct from the
-   governance calendar-month. *Verify:* `npm run build` green; dist rebuilt + committed; `git
-   diff --check` clean.
+   billing-code breakdown), and budget/over-cap incident cards. All real data; honest
+   unavailable states (route + reason). *Caveat closed (slice 11):* the canonical Guild MTD
+   spend now has a numeric route — the Guild budget card reads it, not the metrics
+   approximation. *Verify:* `npm run build` green; dist rebuilt + committed; `git diff --check`
+   clean.
+
+11. **Canonical Guild month-to-date spend route + Costs wiring** — `company-model.md §6/§6.6`,
+    `dashboard-design.md §10`.
+    **✅ DONE.** *Files changed:* `crates/relix-runtime/src/nodes/coordinator/heartbeat.rs`
+    (extracted the shared `guild_spend_micros` helper — the single source of truth for
+    "Guild month-to-date spend" — and refactored `dispatch_budget_admits` to call it),
+    `…/coordinator/agent/handlers.rs` (new `handle_guild_spend` + 4 tests),
+    `crates/relix-runtime/src/controller_runtime.rs` (register `guild.spend`, wired to the same
+    `MetricsQuery` the Action Center uses), `crates/relix-web-bridge/src/spine.rs` +
+    `…/main.rs` (route `GET /v1/spine/guild/spend`), `scripts/relix-mesh-up.{ps1,sh}` +
+    `scripts/check-boot-policy-coverage.ps1` (`guild.spend` allow rule + manifest),
+    `apps/dashboard/src/api.ts` (`guildSpend` client + `GuildSpend` type),
+    `apps/dashboard/src/pages/Costs.tsx` (Guild budget card reads canonical spend), rebuilt
+    `dashboard-dist`. *Adds:* one numeric route returning the Guild's actual current-UTC-month
+    spend — the EXACT ledger figure + window the autonomous Guild hard-stop enforces (so the
+    card can never disagree with the gate), with `spent_micros`/`spent_cents`,
+    `budget_cents`/`remaining_cents`/`over_budget` (honest-null when no budget),
+    `window_start_ms`/`resets_at_ms`/`now_ms`, and `source`/`computed_from`. Tenant-safe: sums
+    ONLY the caller's own Guild's active Operatives (never `cost_since(None, …)`); no metrics
+    ledger → null spend (never a faked 0). *Pinned:* current-month-only (stale row excluded),
+    over-budget + negative remaining, no-budget honest-null, no-metrics null, tenant isolation.
+    *Verified:* `cargo test -p relix-runtime --lib` green (3970, +4); `cargo test -p
+    relix-web-bridge` green; `cargo clippy` clean on the touched code; `npm run build` green;
+    dist rebuilt + committed (parity gate); boot-policy coverage PASS; `git diff --check` clean.
 
 5. **Run transcript renderer (nice/raw)** — `dashboard-design.md §8`.
    **✅ DONE.** *Files changed:* new `apps/dashboard/src/components/RunTranscript.tsx`

@@ -1304,6 +1304,10 @@ name = "spine_guild_get"
 method = "guild.get"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_guild_spend"
+method = "guild.spend"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_brief_board_summary"
 method = "brief.board_summary"
 allow_groups = ["chat-users"]

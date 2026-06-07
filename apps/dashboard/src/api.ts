@@ -338,6 +338,42 @@ export interface BriefCostRollup {
   by_billing_code: BillingCodeCost[];
 }
 
+// ── Canonical Guild month-to-date spend (guild.spend) ─────────────────────
+// THE numeric Guild spend the Costs page reads (company-model §6.6;
+// dashboard-design §10). NOT a dashboard-only approximation: it is the EXACT
+// ledger figure + UTC-calendar-month window the autonomous Guild hard-stop
+// enforces (`heartbeat::guild_spend_micros` over `heartbeat::allowance_window`),
+// so the card can never disagree with the gate. Hits `GET /v1/spine/guild/spend`.
+//
+// `spent_*` are null when no metrics ledger is wired (spend can't be computed
+// honestly — never a fabricated 0). The `budget_cents`/`remaining_cents`/
+// `over_budget` triplet is null when no positive Guild budget is configured.
+export interface GuildSpend {
+  tenant_id: string;
+  guild_id: string;
+  display_name: string | null;
+  // Exact integer micro-USD (1,000,000 micros = $1) + a rounded cents view.
+  spent_micros: number | null;
+  spent_cents: number | null;
+  // Configured Guild budget + remaining (cents); null when no budget is set.
+  budget_cents: number | null;
+  remaining_cents: number | null;
+  over_budget: boolean | null;
+  // Canonical Allowance window (UTC calendar month) + reset bookkeeping (unix-ms).
+  window_start_ms: number;
+  resets_at_ms: number;
+  now_ms: number;
+  source: string;
+  computed_from: string;
+}
+
+export const guildSpend = {
+  // Canonical month-to-date Guild spend. Reports the failure (via
+  // `tryGetReport`) so the Costs card shows an honest unavailable state with the
+  // route/reason instead of falling back to a fabricated/approximated figure.
+  get: () => tryGetReport<GuildSpend | null>("/v1/spine/guild/spend", null),
+};
+
 export const briefCost = {
   // The Brief-tree rollup. `since`/`until` are unix SECONDS — omit both for the
   // canonical current-calendar-month window the dispatch gate uses. Reports the

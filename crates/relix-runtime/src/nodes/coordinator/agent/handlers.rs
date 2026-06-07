@@ -1634,6 +1634,105 @@ impl action_center::SpendSource for MetricsSpendSource {
     }
 }
 
+/// `guild.spend` — THE canonical **Guild month-to-date spend** for the caller's
+/// own Guild over the current UTC calendar month (relix-company-model §6.6 /
+/// §3.6; relix-dashboard-design §10 "Costs: spend by company"). One numeric JSON
+/// object the dashboard Costs page reads instead of approximating Guild spend
+/// from the observability metrics window.
+///
+/// The figure is NOT a dashboard-only calculation: it is the EXACT spend +
+/// window the autonomous Guild-budget hard-stop enforces, via the single shared
+/// helper [`crate::nodes::coordinator::heartbeat::guild_spend_micros`] over the
+/// canonical [`crate::nodes::coordinator::heartbeat::allowance_window`] — so the
+/// number on the Costs card can never disagree with the gate.
+///
+/// **Tenant-safe by construction:** spend sums ONLY the caller's OWN Guild's
+/// active Operatives (the helper uses `list_active_for_tenant(tenant)`), never a
+/// cross-tenant `cost_since(None, …)`, and the Guild profile is read for the same
+/// tenant — no cross-Guild figure can leak.
+///
+/// Fields: `tenant_id`/`guild_id` (the Guild identity), `display_name`,
+/// `spent_micros` (exact integer micro-USD) + `spent_cents` (rounded), the
+/// `budget_cents` / `remaining_cents` / `over_budget` triplet (all `null` when no
+/// positive Guild budget is configured — honest, never a fabricated `0`),
+/// `window_start_ms`, `resets_at_ms`, `now_ms`, and a `source` / `computed_from`
+/// pair that makes the canonical ledger + month window explicit. When no metrics
+/// ledger is wired (`metrics == None`), `spent_*` are `null` (spend can't be
+/// computed honestly) while the budget + window fields still resolve.
+///
+/// `now_ms` is wall-clock unix-ms, passed by the caller so the window stays
+/// deterministic in tests.
+pub fn handle_guild_spend(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    metrics: Option<&crate::metrics::MetricsQuery>,
+    now_ms: i64,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    use crate::nodes::coordinator::heartbeat;
+    let tenant = ctx.tenant_id_or_default();
+    let win = heartbeat::allowance_window(now_ms);
+
+    // The Guild profile (budget + display name). A read error is honest-null, not
+    // a hard failure — the canonical spent figure can still be returned.
+    let guild = spine_store.get_guild(tenant).ok().flatten();
+    let display_name = guild.as_ref().map(|g| g.display_name.clone());
+    // Only a POSITIVE budget is a configured cap (mirrors the gate + Action
+    // Center; `None`/`0`/negative = no Guild budget set).
+    let budget_cents: Option<i64> = guild
+        .as_ref()
+        .and_then(|g| g.monthly_allowance_cents)
+        .filter(|b| *b > 0);
+
+    // Canonical month-to-date spend = the SAME figure + window the autonomous
+    // Guild hard-stop enforces. No metrics ledger wired → null (never a faked 0).
+    let spent_micros: Option<u64> =
+        metrics.map(|m| heartbeat::guild_spend_micros(agent_store, m, tenant, win.start_ms));
+    // Rounded half-up to the nearest cent; the exact value stays in spent_micros.
+    let spent_cents: Option<i64> = spent_micros
+        .map(|m| ((m + action_center::MICROS_PER_CENT / 2) / action_center::MICROS_PER_CENT) as i64);
+
+    // remaining = budget − spent (cents); honest even when negative (= over).
+    let remaining_cents: Option<i64> = match (budget_cents, spent_cents) {
+        (Some(b), Some(s)) => Some(b - s),
+        _ => None,
+    };
+    // over_budget compares EXACT micros vs the budget micros (the gate's `>=`).
+    let over_budget: Option<bool> = match (budget_cents, spent_micros) {
+        (Some(b), Some(m)) => {
+            let budget_micros = (b as u64).saturating_mul(action_center::MICROS_PER_CENT);
+            Some(m >= budget_micros)
+        }
+        _ => None,
+    };
+
+    let source = if spent_micros.is_some() {
+        "ledger:brief_runs/cost_since; window:utc_calendar_month(allowance_window); gate:guild_hard_stop"
+    } else {
+        "metrics_ledger_unavailable; window:utc_calendar_month(allowance_window)"
+    };
+
+    let body = serde_json::json!({
+        "tenant_id": tenant,
+        "guild_id": tenant,
+        "display_name": display_name,
+        "spent_micros": spent_micros,
+        "spent_cents": spent_cents,
+        "budget_cents": budget_cents,
+        "remaining_cents": remaining_cents,
+        "over_budget": over_budget,
+        "window_start_ms": win.start_ms,
+        "resets_at_ms": win.resets_at_ms,
+        "now_ms": win.cutoff_ms,
+        "source": source,
+        "computed_from": "sum of this Guild's active Operatives' month-to-date run-ledger cost over the canonical UTC-calendar-month Allowance window (the autonomous Guild hard-stop's own figure)",
+    });
+    match serde_json::to_vec(&body) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => internal(format!("guild.spend encode: {e}")),
+    }
+}
+
 /// `agent.request_hire` — the **gated** creation path (company-model
 /// §4.4 / §5.5): mints the Operative `pending` (inert — the gate
 /// denies non-active) so a Lead/Founder must approve it before it can
@@ -7787,6 +7886,189 @@ mod tests {
                 .any(|x| x["id"] == serde_json::json!(format!("budget:spend:{acme}"))),
             "acme's spend never leaks into globex's feed: {g}"
         );
+    }
+
+    // ── Canonical Guild month-to-date spend (`guild.spend`): the numeric route
+    //    the Costs page reads. Driven end-to-end through the SAME production seam
+    //    the dispatch gate uses (a real `MetricsStore` → `MetricsQuery` →
+    //    `heartbeat::guild_spend_micros`), so the route can never disagree with
+    //    the gate. ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn guild_spend_current_month_only_over_budget_and_window_fields() {
+        let (agents, spine, _task) = prime_stores();
+        // $200 Guild budget (20_000c). Two active Operatives in this Guild.
+        spine.set_guild_allowance("default", Some(20_000)).unwrap();
+        let a = agents
+            .create_agent(
+                "A", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"gs-a"), "medium", "default",
+            )
+            .unwrap();
+        let b = agents
+            .create_agent(
+                "B", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"gs-b"), "medium", "default",
+            )
+            .unwrap();
+
+        let store = crate::metrics::MetricsStore::in_memory().unwrap();
+        let now = now_unix_ms();
+        let win = crate::nodes::coordinator::heartbeat::allowance_window(now);
+        let recent = win.start_ms; // this month — counted.
+        let stale = win.start_ms - 1; // last month — MUST be excluded.
+        store
+            .insert_batch(&[
+                // $150 + $100 = $250 this month, split across two rows + agents.
+                spend_row(&a, "default", recent, 150_000_000),
+                spend_row(&b, "default", recent, 100_000_000),
+                // A huge LAST-MONTH row — excluded by the calendar-month window.
+                spend_row(&a, "default", stale, 9_000_000_000),
+            ])
+            .unwrap();
+        let q = crate::metrics::MetricsQuery::new(store);
+
+        let v = json_of(ok_body(handle_guild_spend(
+            &agents,
+            &spine,
+            Some(&q),
+            now,
+            &fake_ctx(b""),
+        )));
+        // Current-month spend only ($250) — the stale row is excluded; this is
+        // what proves the route bills the canonical month, not all-time.
+        assert_eq!(v["spent_micros"], serde_json::json!(250_000_000u64), "{v}");
+        assert_eq!(v["spent_cents"], serde_json::json!(25_000), "{v}");
+        assert_eq!(v["budget_cents"], serde_json::json!(20_000), "{v}");
+        // remaining = 20_000 − 25_000 = −5_000 (honest, even when over).
+        assert_eq!(v["remaining_cents"], serde_json::json!(-5_000), "{v}");
+        assert_eq!(v["over_budget"], serde_json::json!(true), "{v}");
+        // Reset / window bookkeeping fields present + canonical.
+        assert_eq!(v["window_start_ms"], serde_json::json!(win.start_ms), "{v}");
+        assert_eq!(v["resets_at_ms"], serde_json::json!(win.resets_at_ms), "{v}");
+        assert_eq!(v["now_ms"], serde_json::json!(now), "{v}");
+        // Guild identity + canonical source note.
+        assert_eq!(v["tenant_id"], serde_json::json!("default"), "{v}");
+        assert_eq!(v["guild_id"], serde_json::json!("default"), "{v}");
+        assert!(
+            v["source"].as_str().unwrap().contains("allowance_window"),
+            "source names the canonical window: {v}"
+        );
+    }
+
+    #[test]
+    fn guild_spend_no_budget_is_honest_null() {
+        let (agents, spine, _task) = prime_stores();
+        // No `set_guild_allowance` → no Guild budget configured at all.
+        let a = agents
+            .create_agent(
+                "A", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"gs-nob"), "medium", "default",
+            )
+            .unwrap();
+        let store = crate::metrics::MetricsStore::in_memory().unwrap();
+        let now = now_unix_ms();
+        let recent = crate::nodes::coordinator::heartbeat::allowance_window(now).start_ms;
+        store
+            .insert_batch(&[spend_row(&a, "default", recent, 30_000_000)])
+            .unwrap();
+        let q = crate::metrics::MetricsQuery::new(store);
+
+        let v = json_of(ok_body(handle_guild_spend(
+            &agents,
+            &spine,
+            Some(&q),
+            now,
+            &fake_ctx(b""),
+        )));
+        // Canonical spend is still returned ($30)…
+        assert_eq!(v["spent_micros"], serde_json::json!(30_000_000u64), "{v}");
+        assert_eq!(v["spent_cents"], serde_json::json!(3_000), "{v}");
+        // …but the budget-derived fields are HONESTLY null, never a faked 0.
+        assert!(v["budget_cents"].is_null(), "{v}");
+        assert!(v["remaining_cents"].is_null(), "{v}");
+        assert!(v["over_budget"].is_null(), "{v}");
+    }
+
+    #[test]
+    fn guild_spend_no_metrics_is_null_spend_budget_still_resolves() {
+        let (agents, spine, _task) = prime_stores();
+        spine.set_guild_allowance("default", Some(20_000)).unwrap();
+        let now = now_unix_ms();
+        // metrics == None → spend can't be computed honestly.
+        let v = json_of(ok_body(handle_guild_spend(
+            &agents,
+            &spine,
+            None,
+            now,
+            &fake_ctx(b""),
+        )));
+        assert!(v["spent_micros"].is_null(), "no ledger → null spend: {v}");
+        assert!(v["spent_cents"].is_null(), "{v}");
+        // Budget + window still resolve (they don't need the ledger).
+        assert_eq!(v["budget_cents"], serde_json::json!(20_000), "{v}");
+        assert!(v["remaining_cents"].is_null(), "no spend → no remaining: {v}");
+        assert!(
+            v["source"]
+                .as_str()
+                .unwrap()
+                .contains("metrics_ledger_unavailable"),
+            "source flags the unavailable ledger: {v}"
+        );
+    }
+
+    #[test]
+    fn guild_spend_is_tenant_isolated() {
+        let (agents, spine, _task) = prime_stores();
+        spine.set_guild_allowance("acme", Some(100_000)).unwrap();
+        spine.set_guild_allowance("globex", Some(100_000)).unwrap();
+        let acme = agents
+            .create_agent(
+                "AcmeEng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"gs-acme"), "medium", "acme",
+            )
+            .unwrap();
+        let globex = agents
+            .create_agent(
+                "GlobexEng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"gs-globex"), "medium", "globex",
+            )
+            .unwrap();
+
+        let store = crate::metrics::MetricsStore::in_memory().unwrap();
+        let now = now_unix_ms();
+        let in_window =
+            crate::nodes::coordinator::heartbeat::allowance_window(now).start_ms;
+        // Different amounts in the SHARED ledger so a leak would be obvious.
+        store
+            .insert_batch(&[
+                spend_row(&acme, "acme", in_window, 250_000_000),
+                spend_row(&globex, "globex", in_window, 999_000_000),
+            ])
+            .unwrap();
+        let q = crate::metrics::MetricsQuery::new(store);
+
+        // acme's route sums ONLY acme's Operative.
+        let va = json_of(ok_body(handle_guild_spend(
+            &agents,
+            &spine,
+            Some(&q),
+            now,
+            &fake_ctx_tenant(b"", "acme"),
+        )));
+        assert_eq!(va["spent_micros"], serde_json::json!(250_000_000u64), "{va}");
+        assert_eq!(va["tenant_id"], serde_json::json!("acme"), "{va}");
+
+        // globex's route sums ONLY globex's Operative — no acme leak.
+        let vg = json_of(ok_body(handle_guild_spend(
+            &agents,
+            &spine,
+            Some(&q),
+            now,
+            &fake_ctx_tenant(b"", "globex"),
+        )));
+        assert_eq!(vg["spent_micros"], serde_json::json!(999_000_000u64), "{vg}");
+        assert_eq!(vg["tenant_id"], serde_json::json!("globex"), "{vg}");
     }
 
     #[test]

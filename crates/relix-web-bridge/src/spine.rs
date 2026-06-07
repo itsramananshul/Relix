@@ -113,6 +113,18 @@ pub async fn allowance_committed(
     json_passthrough(call_peer(&state, "agent.allowance_committed", b"").await?)
 }
 
+/// `GET /v1/spine/guild/spend` — the canonical Guild **month-to-date spend** for
+/// the active Guild over the current UTC calendar month (relix-company-model
+/// §6.6; relix-dashboard-design §10). The SAME ledger figure + window the
+/// autonomous Guild hard-stop enforces — `spent_micros`/`spent_cents` plus the
+/// `budget_cents`/`remaining_cents`/`over_budget` triplet and the
+/// `window_start_ms`/`resets_at_ms` reset bookkeeping. Tenant-scoped.
+pub async fn guild_spend(
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "guild.spend", b"").await?)
+}
+
 pub async fn board_summary(
     State(state): State<AppState>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {

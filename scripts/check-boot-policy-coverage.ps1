@@ -65,8 +65,9 @@ $MinMethods = 80
 # BOTH boot scripts or the route 403s on the live mesh. Grouped by product
 # surface. See the header note on how to keep this in sync.
 $RequiredCapabilities = @(
-    # Guild overview reads (/v1/spine/guild, /v1/spine/guild/detail)
-    'guild.counts', 'guild.get',
+    # Guild overview reads (/v1/spine/guild, /v1/spine/guild/detail) + canonical
+    # Guild month-to-date spend (/v1/spine/guild/spend, the Costs page)
+    'guild.counts', 'guild.get', 'guild.spend',
     # Company / Founder bootstrap (company.* routes)
     'company.status', 'company.actions', 'company.starter_crew', 'company.bootstrap_founder',
     # Prime hiring path + status (incl. the status-stream dependencies)
