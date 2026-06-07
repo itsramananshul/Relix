@@ -454,6 +454,15 @@ pub struct BriefDetail {
     /// The Brief's most recent Shift (run) summary, or `None` when it has
     /// never run. Full history on `…/runs`; full run on `/v1/runs/:id`.
     pub latest_run: Option<LatestRun>,
+    /// Company-model §6.6 — this Brief's current **delegation depth**: the
+    /// longest same-Guild `spawned` parent chain up to a root (a root is `0`,
+    /// its Sub-brief `1`, …). Read-only visibility so a UI can show how deep a
+    /// delegation cascade sits without inventing the value.
+    pub delegation_depth: usize,
+    /// Company-model §6.6 — the max delegation depth a new Sub-brief link may
+    /// reach (the runaway backstop). A new Sub-brief under this Brief is
+    /// refused once `delegation_depth + 1` would exceed this.
+    pub max_delegation_depth: usize,
 }
 
 /// The board columns a Brief can sit in.

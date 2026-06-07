@@ -225,8 +225,9 @@ ledger entry or design section.
    over only the Brief's own Guild). Manual `brief.run` / `prime.start` stay sovereign
    (operator-initiated, no Guild gate). *(The issue-tree cost rollup + billing-code
    attribution backend is now SHIPPED — see §P1 slice 3b; the spend window is the UTC
-   calendar month with reset — slice 9 = DONE. Remaining deferred: the frontend Costs
-   surface, object-level billing codes, and the delegation-depth counter.)*
+   calendar month with reset — slice 9 = DONE. The delegation-depth counter + guard backend
+   is now SHIPPED — see §P1 slice 3c. Remaining deferred: the frontend Costs
+   surface and object-level billing codes.)*
 3. **[BE] Allowance windowing** — **DONE** (§5 slice 9). The per-Operative and Guild
    hard-stops + the Action Center live-spend feed now bill against the **current UTC
    calendar month** via the single canonical `heartbeat::allowance_window(now_ms)`
@@ -240,8 +241,22 @@ ledger entry or design section.
    an additive `tasks.billing_code` (set via `brief.set`, on `BriefFields`) + a
    `brief_runs.billing_code` **stamped at run start** (Brief's own, else inherited from the
    nearest same-Guild ancestor Sub-brief) for manual + autonomous runs alike. *Still deferred:*
-   the **frontend** Costs surface (§P2 slice 5), object-level (Mandate/Campaign/Guild) billing
-   codes, and the delegation-depth counter.
+   the **frontend** Costs surface (§P2 slice 5) and object-level (Mandate/Campaign/Guild) billing
+   codes.
+3c. **[BE] Delegation-depth counter + guard** — **BACKEND SHIPPED** (`company-model §6.6`).
+   The runaway-recursion safety backstop that complements 3b. A Brief's **delegation depth** =
+   the longest same-Guild `spawned` parent chain up to a root (root `0`, Sub-brief `1`, …),
+   via `brief_delegation_depth`. The central cap `MAX_SUBBRIEF_DELEGATION_DEPTH = 1024` is the
+   doc-LOCKED "≥1024 runaway backstop, not a product limit" (`execution` Part 7 item 2).
+   `link_subbrief` — the single choke point for direct `brief.subbrief`, the `suggest_tasks`
+   accept materialization, AND Mandate orchestration — refuses a link whose child would exceed
+   the cap (no edge created); the `suggest_tasks` accept pre-checks up front so an over-cap
+   accept refuses with **no partial child creation** and the card stays open. Tenant-safe:
+   depth is computed over same-Guild edges only, so a cross-Guild edge can't inflate/leak
+   another Guild's depth. `brief.detail` now surfaces `delegation_depth` + `max_delegation_depth`.
+   *Honest gap:* orchestration links via `let _ = link_subbrief(...)`, but its tree is only 2
+   deep, so the cap never fires there. *Still deferred:* the frontend Costs/Lattice surfaces
+   that would render depth.
 
 **P2 — product-feel surfaces (mostly frontend on data that already exists)**
 4. **[FE] The Lattice (org chart)** — pan/zoom org-tree view is **not started**
@@ -353,8 +368,9 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    relix-runtime` green (3944 lib tests, +6); `cargo check` clean; `cargo clippy` clean on the
    touched code (2 pre-existing unrelated warnings only); `git diff --check` clean. *(The
    issue-tree cost rollup + billing-code attribution backend shipped in §P1 slice 3b; the
-   calendar-month spend window with implicit reset shipped in slice 9 = DONE. Remaining
-   deferred: the frontend Costs surface, object-level billing codes, delegation-depth.)*
+   calendar-month spend window with implicit reset shipped in slice 9 = DONE; the
+   delegation-depth counter + guard shipped in §P1 slice 3c. Remaining
+   deferred: the frontend Costs surface and object-level billing codes.)*
 
 3. **The Lattice org-chart view** — `dashboard-design.md §9`.
    *Files:* new `apps/dashboard/src/pages/Lattice.tsx` (or extend Agents.tsx), `nav.ts`;
@@ -413,8 +429,9 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    before the boundary belongs to the previous month; Feb 2024 is 29 days; December rolls
    into the next January. *Verified:* targeted + full `cargo test -p relix-runtime` green;
    `cargo check`/`cargo clippy` clean on the touched code. *(The issue-tree cost rollup +
-   billing-code attribution backend shipped in §P1 slice 3b; remaining deferred: the
-   frontend Costs surface, object-level billing codes, the delegation-depth counter.)*
+   billing-code attribution backend shipped in §P1 slice 3b, the delegation-depth counter +
+   guard in §P1 slice 3c; remaining deferred: the frontend Costs surface and object-level
+   billing codes.)*
 
 10. **Stale-run adoption by terminal evidence** — `execution-and-issue-design.md §1.4/§7.1`.
     **✅ DONE.** *Files changed:* `crates/relix-runtime/src/nodes/coordinator/mod.rs` (new

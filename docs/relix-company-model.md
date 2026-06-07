@@ -344,10 +344,21 @@ When a manager delegates, the subordinate's costs **roll up** to the requester. 
 > - **Window.** The rollup bills against the **same canonical
 >   `heartbeat::allowance_window`** (current UTC calendar month) the dispatch
 >   gate uses; a caller/test may override with explicit bounded since/until.
+> - **Delegation-depth counter + guard (BACKEND SHIPPED).** The
+>   runaway-recursion backstop that complements the rollup. A Brief's
+>   **delegation depth** is the longest same-Guild `spawned` parent chain up to
+>   a root (root `0`, its Sub-brief `1`, …); `link_subbrief` — the single choke
+>   point for direct `brief.subbrief`, the `suggest_tasks` accept
+>   materialization, AND Mandate orchestration — refuses a link whose child
+>   would exceed the central cap `MAX_SUBBRIEF_DELEGATION_DEPTH = 1024` (the
+>   doc-LOCKED "≥1024 runaway backstop, not a product limit"). The
+>   `suggest_tasks` accept pre-checks up front (no partial child creation; card
+>   stays open). Depth is computed over same-Guild edges only, so a cross-Guild
+>   edge can never inflate/leak another Guild's depth; `brief.detail` now
+>   surfaces `delegation_depth` + `max_delegation_depth` for read visibility.
 > - **Still deferred (honest):** Mandate/Campaign/Guild-level billing **codes**
->   (those objects carry no billing-code field — only the Brief tree does), the
->   delegation-**depth** counter, and the **frontend** Costs surface remain
->   unbuilt.
+>   (those objects carry no billing-code field — only the Brief tree does) and
+>   the **frontend** Costs surface remain unbuilt.
 
 ---
 

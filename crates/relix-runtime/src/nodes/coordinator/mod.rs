@@ -166,6 +166,21 @@ pub use event_summary::{summarize_event, summarize_event_parts};
 /// an existing operator reason.
 pub const ANTI_THRASH_THRESHOLD: i64 = 3;
 
+/// Company-model §6.6 — the maximum Sub-brief **delegation depth** for a
+/// Brief tree: the deepest a `spawned`-edge chain may run, counted in hops
+/// from a root Brief (a root with no same-Guild parent Sub-brief is depth `0`,
+/// its Sub-brief is depth `1`, a grandchild `2`, …). This is a
+/// runaway-recursion **safety backstop**, NOT a product limit — the real spend
+/// controls are Budget + approval gates
+/// (relix-execution-and-issue-design.md Part 7 item 2, **LOCKED**: "raise to
+/// match-or-exceed Paperclip's high bound (≥1024) … treat it as a runaway
+/// safety backstop, not a product limit"). Linking a Sub-brief whose child
+/// would land past this depth is refused on the single link choke point
+/// ([`TaskStore::link_subbrief`]), which backs direct `brief.subbrief`, the
+/// `suggest_tasks` accept materialization, and Mandate orchestration. Named in
+/// exactly one place so the value + semantics never fork.
+pub const MAX_SUBBRIEF_DELEGATION_DEPTH: usize = 1024;
+
 /// Lightweight classification of why a flow failed. Written to
 /// `tasks.last_failure_class` by the bridge so operators (and any
 /// future auto-retry policy) can decide whether the failure is worth
@@ -767,8 +782,47 @@ impl TaskStore {
     /// PHASE 1 (Brief): link `child` as a **Sub-brief** of
     /// `parent` (a `task_edges` 'spawned' edge). Both must exist;
     /// no self-link; idempotent. The planner-decomposition emitter.
+    ///
+    /// **Delegation-depth guard (company-model §6.6).** This is the single
+    /// choke point every Sub-brief link flows through (direct `brief.subbrief`,
+    /// the `suggest_tasks` accept materialization, and Mandate orchestration),
+    /// so the depth backstop lives here. The new child would land at
+    /// `depth(parent) + 1`; if that would exceed
+    /// [`MAX_SUBBRIEF_DELEGATION_DEPTH`] the link is refused. Depth is measured
+    /// over **same-Guild** `spawned` edges only (see
+    /// [`Self::brief_delegation_depth`]), so a cross-Guild edge can never
+    /// change the verdict. The check is skipped when the edge already exists,
+    /// so an idempotent re-link of an already-valid Sub-brief never spuriously
+    /// fails even if `parent` was later re-parented deeper.
     pub fn link_subbrief(&self, parent: &str, child: &str) -> Result<(), CoordinatorError> {
+        if !self.spawned_edge_exists(parent, child)?
+            && let Some(parent_depth) = self.brief_delegation_depth(parent)?
+            && parent_depth + 1 > MAX_SUBBRIEF_DELEGATION_DEPTH
+        {
+            return Err(CoordinatorError::Invalid(format!(
+                "Sub-brief would exceed the max delegation depth of \
+                 {MAX_SUBBRIEF_DELEGATION_DEPTH} (parent `{parent}` is already at \
+                 delegation depth {parent_depth})"
+            )));
+        }
         self.add_brief_edge(parent, child, "spawned", "Sub-brief")
+    }
+
+    /// True when a `parent --spawned--> child` Sub-brief edge already exists.
+    /// Used by [`Self::link_subbrief`] to keep an idempotent re-link from
+    /// re-running the delegation-depth guard.
+    fn spawned_edge_exists(&self, parent: &str, child: &str) -> Result<bool, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        match conn.query_row(
+            "SELECT 1 FROM task_edges
+             WHERE task_id = ?1 AND edge_type = 'spawned' AND related_task_id = ?2 LIMIT 1",
+            params![parent, child],
+            |_| Ok(()),
+        ) {
+            Ok(()) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(CoordinatorError::Db(e)),
+        }
     }
 
     /// PHASE 1 (Brief): the Sub-briefs of `parent`, as task_ids.
@@ -1236,6 +1290,88 @@ impl TaskStore {
         self.list_reverse_edges_for_tenant(task, "spawned", tenant)
     }
 
+    /// Company-model §6.6 — this Brief's **delegation depth**: the length of
+    /// the LONGEST `spawned` parent chain from this Brief up to a root, counted
+    /// in hops (a root with no same-Guild parent Sub-brief is depth `0`, its
+    /// Sub-brief `1`, …). `None` when the Brief doesn't exist. This is the
+    /// counter the depth guard ([`Self::link_subbrief`]) reads and the value
+    /// surfaced read-only on `brief.detail`.
+    ///
+    /// **Tenant-safe by construction:** the upward walk follows `spawned`
+    /// parent edges ONLY into Briefs in the SAME Guild (a cross-Guild parent is
+    /// dropped at the JOIN), so a malicious cross-tenant edge can neither raise
+    /// nor lower a Guild's depth, and the walk never reveals a foreign Brief's
+    /// existence. The walk is cycle-safe (the `spawned` graph is acyclic —
+    /// [`Self::add_brief_edge`] rejects cycles — and re-visits are pruned) and
+    /// bounded by a hard expansion cap as a corrupt-graph backstop.
+    pub fn brief_delegation_depth(
+        &self,
+        brief: &str,
+    ) -> Result<Option<usize>, CoordinatorError> {
+        let Some(tenant) = self.task_tenant(brief)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.delegation_depth_in_tenant(brief, &tenant)?))
+    }
+
+    /// Longest same-Guild `spawned` parent-chain length from `brief` (root =
+    /// `0`). `brief` is assumed to live in `tenant` (its resolved Guild). One
+    /// lock; an in-memory longest-path over the upward DAG with per-node
+    /// re-visit pruning (so a diamond isn't re-expanded) and a hard global
+    /// expansion cap (so a corrupt graph can never spin forever).
+    fn delegation_depth_in_tenant(
+        &self,
+        brief: &str,
+        tenant: &str,
+    ) -> Result<usize, CoordinatorError> {
+        let tenant = norm_tenant(tenant).to_string();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        // Parents of a node: the `task_id` side of a `spawned` edge whose
+        // `related_task_id` is the node, filtered to PARENTS in the same Guild
+        // — a cross-Guild parent edge is excluded, so it cannot change depth.
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.task_id FROM task_edges e
+                 JOIN tasks t ON t.task_id = e.task_id
+                 WHERE e.related_task_id = ?1 AND e.edge_type = 'spawned'
+                   AND e.task_id IS NOT NULL
+                   AND COALESCE(t.tenant_id, 'default') = ?2",
+            )
+            .map_err(CoordinatorError::Db)?;
+        const MAX_EXPANSIONS: usize = 100_000;
+        let mut best: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut stack: Vec<(String, usize)> = vec![(brief.to_string(), 0)];
+        let mut max_depth = 0usize;
+        let mut expansions = 0usize;
+        while let Some((node, depth)) = stack.pop() {
+            expansions += 1;
+            if expansions > MAX_EXPANSIONS {
+                break;
+            }
+            // Prune: only (re-)expand a node if we reached it by a path at
+            // least as long as any seen before — longest-path memoization.
+            if let Some(&prev) = best.get(&node)
+                && prev >= depth
+            {
+                continue;
+            }
+            best.insert(node.clone(), depth);
+            if depth > max_depth {
+                max_depth = depth;
+            }
+            let parents: Vec<String> = stmt
+                .query_map(params![node, tenant], |r| r.get::<_, String>(0))
+                .map_err(CoordinatorError::Db)?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(CoordinatorError::Db)?;
+            for p in parents {
+                stack.push((p, depth + 1));
+            }
+        }
+        Ok(max_depth)
+    }
+
     /// PHASE 1 (Brief): the full detail view of a Brief in one read —
     /// spine fields + both directions of the relation graph +
     /// Dossiers + blocked flag. `None` when the Brief doesn't exist.
@@ -1388,6 +1524,10 @@ impl TaskStore {
             wakeup_count: self.brief_wakeup_count(task)?,
             chronicle,
             latest_run,
+            // Company-model §6.6 read visibility: the Brief is known to live in
+            // `tenant` (its own Guild), so the same-Guild depth walk is exact.
+            delegation_depth: self.delegation_depth_in_tenant(task, tenant)?,
+            max_delegation_depth: MAX_SUBBRIEF_DELEGATION_DEPTH,
         }))
     }
 
@@ -1931,6 +2071,25 @@ impl TaskStore {
             return Err(CoordinatorError::Invalid(
                 "suggestion responder required".to_string(),
             ));
+        }
+        // ── 0. Delegation-depth pre-check (company-model §6.6). On accept,
+        //       every materialized child links under `task_id`, so they would
+        //       all land at `depth(task_id) + 1`. Refuse the WHOLE accept up
+        //       front — BEFORE claiming the card or creating any child Brief —
+        //       when that would exceed MAX_SUBBRIEF_DELEGATION_DEPTH, so there
+        //       is NO partial child creation and the card stays open /
+        //       answerable (the existing refusal style). The per-link guard in
+        //       `link_subbrief` is the real backstop; this just makes the
+        //       suggest path fail cleanly instead of part-way through the loop.
+        if accept
+            && let Some(depth) = self.brief_delegation_depth(task_id)?
+            && depth + 1 > MAX_SUBBRIEF_DELEGATION_DEPTH
+        {
+            return Err(CoordinatorError::Invalid(format!(
+                "accepting these Sub-briefs would exceed the max delegation depth \
+                 of {MAX_SUBBRIEF_DELEGATION_DEPTH} (parent is already at delegation \
+                 depth {depth})"
+            )));
         }
         // ── 1. Claim the card under one lock: verify kind/status, then flip
         //       open → terminal with a row-level guard. This is the only
@@ -26076,6 +26235,158 @@ mod tests {
             .unwrap();
         assert_eq!(roll.run_count, 1, "pre-run refusal not a real run");
         assert_eq!(roll.cost_micros, 50);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Delegation-depth counter + guard (company-model §6.6).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Insert a raw `parent --spawned--> child` edge, bypassing the
+    /// `link_subbrief` depth guard — used ONLY to set up a deep chain cheaply
+    /// for boundary tests (mirrors `seed_run`'s direct-insert style).
+    fn raw_spawn_edge(s: &TaskStore, parent: &str, child: &str) {
+        let c = s.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO task_edges (task_id, edge_type, related_task_id, created_at)
+             VALUES (?1, 'spawned', ?2, 0)",
+            params![parent, child],
+        )
+        .unwrap();
+    }
+
+    /// Depth is the longest same-Guild `spawned` parent chain: root = 0, its
+    /// Sub-brief = 1, a grandchild = 2 — and it is surfaced read-only on the
+    /// Brief detail alongside the configured max.
+    #[test]
+    fn delegation_depth_counts_same_guild_hops() {
+        let s = store();
+        let root = brief(&s, "root");
+        let child = brief(&s, "child");
+        let grandchild = brief(&s, "grandchild");
+        s.link_subbrief(&root, &child).unwrap();
+        s.link_subbrief(&child, &grandchild).unwrap();
+        assert_eq!(s.brief_delegation_depth(&root).unwrap(), Some(0));
+        assert_eq!(s.brief_delegation_depth(&child).unwrap(), Some(1));
+        assert_eq!(s.brief_delegation_depth(&grandchild).unwrap(), Some(2));
+        // Unknown Brief → None (no existence assumed).
+        assert_eq!(s.brief_delegation_depth("nope").unwrap(), None);
+        // Read visibility on brief.detail.
+        let d = s.brief_detail(&grandchild).unwrap().unwrap();
+        assert_eq!(d.delegation_depth, 2);
+        assert_eq!(d.max_delegation_depth, MAX_SUBBRIEF_DELEGATION_DEPTH);
+    }
+
+    /// The link guard refuses a Sub-brief whose child would exceed the max
+    /// delegation depth, creating NO edge; the boundary (a child landing at
+    /// exactly the max) is allowed.
+    #[test]
+    fn link_subbrief_refuses_past_max_delegation_depth() {
+        let s = store();
+        // Build a same-Guild `spawned` chain to the max depth cheaply.
+        let mut chain = vec![brief(&s, "n0")];
+        for i in 1..=MAX_SUBBRIEF_DELEGATION_DEPTH {
+            let n = brief(&s, &format!("n{i}"));
+            raw_spawn_edge(&s, &chain[i - 1], &n);
+            chain.push(n);
+        }
+        let deepest = chain.last().unwrap().clone();
+        assert_eq!(
+            s.brief_delegation_depth(&deepest).unwrap(),
+            Some(MAX_SUBBRIEF_DELEGATION_DEPTH),
+            "deepest node sits at exactly the max depth"
+        );
+        // A child under the node at depth MAX-1 lands at MAX → allowed.
+        let ok_child = brief(&s, "ok");
+        s.link_subbrief(&chain[MAX_SUBBRIEF_DELEGATION_DEPTH - 1], &ok_child)
+            .unwrap();
+        // A child under the deepest (depth MAX) node would land at MAX+1 →
+        // refused, and no edge is created.
+        let deep_child = brief(&s, "too deep");
+        let err = s.link_subbrief(&deepest, &deep_child).unwrap_err();
+        assert!(
+            matches!(err, CoordinatorError::Invalid(_)),
+            "over-max Sub-brief link is refused, got {err:?}"
+        );
+        assert!(
+            s.list_subbriefs(&deepest).unwrap().is_empty(),
+            "a refused link creates no edge"
+        );
+        // Re-linking an ALREADY-existing edge at the boundary stays idempotent
+        // (the guard is skipped for an existing edge).
+        s.link_subbrief(&chain[MAX_SUBBRIEF_DELEGATION_DEPTH - 1], &ok_child)
+            .unwrap();
+    }
+
+    /// The `suggest_tasks` accept path refuses up front when the materialized
+    /// children would exceed the max depth — with NO partial child creation and
+    /// the card left open/answerable (the existing refusal style).
+    #[test]
+    fn suggestion_accept_refuses_past_max_delegation_depth() {
+        let s = store();
+        // A parent in `acme` sitting at exactly the max delegation depth.
+        let mut chain = vec![
+            s.create_brief("acme", "s0", "subj", None, None, None, None)
+                .unwrap(),
+        ];
+        for i in 1..=MAX_SUBBRIEF_DELEGATION_DEPTH {
+            let n = s
+                .create_brief("acme", &format!("s{i}"), "subj", None, None, None, None)
+                .unwrap();
+            raw_spawn_edge(&s, &chain[i - 1], &n);
+            chain.push(n);
+        }
+        let parent = chain.last().unwrap().clone();
+        let children = vec![brief::ChildSpec {
+            title: "would be too deep".into(),
+            priority: None,
+            after: None,
+            assignee_agent_id: None,
+            assignee_role: None,
+        }];
+        let id = s
+            .open_suggestion(&parent, "operative-1", "decompose", &children)
+            .unwrap();
+        let err = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
+            .unwrap_err();
+        assert!(
+            matches!(err, CoordinatorError::Invalid(_)),
+            "over-max accept refused, got {err:?}"
+        );
+        // No child Brief was materialized, and no Sub-brief edge added.
+        assert!(
+            s.list_subbriefs(&parent).unwrap().is_empty(),
+            "refused accept creates no Sub-brief"
+        );
+        // The card stays open so the operator can re-answer (e.g. reject).
+        let listed = s.list_interactions(&parent).unwrap();
+        assert_eq!(listed[0].status, "open", "card left answerable on refusal");
+    }
+
+    /// A cross-Guild `spawned` parent edge can neither inflate nor reveal
+    /// another Guild's delegation depth: depth is computed over same-Guild
+    /// edges only, in each Brief's OWN Guild.
+    #[test]
+    fn delegation_depth_ignores_cross_guild_parent_edge() {
+        let s = store();
+        let parent = brief(&s, "parent guild-a");
+        s.set_task_tenant(&parent, "guild-a").unwrap();
+        let foreign_child = brief(&s, "child guild-b");
+        s.set_task_tenant(&foreign_child, "guild-b").unwrap();
+        // Mis-link the guild-b child under the guild-a parent.
+        s.link_subbrief(&parent, &foreign_child).unwrap();
+        // The guild-b child's depth is computed in ITS Guild; the cross-Guild
+        // parent edge is filtered out, so it stays a root (0). A malicious
+        // cross-tenant edge cannot inflate another Guild's depth.
+        assert_eq!(s.brief_delegation_depth(&foreign_child).unwrap(), Some(0));
+        // The guild-a parent is likewise unaffected (still a root).
+        assert_eq!(s.brief_delegation_depth(&parent).unwrap(), Some(0));
+        // A SAME-Guild child of the foreign child IS counted — proving the
+        // filter is by-Guild, not "ignore every parent".
+        let local_grandchild = brief(&s, "grandchild guild-b");
+        s.set_task_tenant(&local_grandchild, "guild-b").unwrap();
+        s.link_subbrief(&foreign_child, &local_grandchild).unwrap();
+        assert_eq!(s.brief_delegation_depth(&local_grandchild).unwrap(), Some(1));
     }
 
     #[test]
