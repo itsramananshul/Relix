@@ -369,7 +369,7 @@ ledger entry or design section.
    (an unknown id renders an honest "no Operative matches …" banner, not a crash). **The
    per-Operative detail is now a full tabbed WORKBENCH (`dashboard-design §9`), not a row
    expansion** (Crew/Operative detail slice): selecting an Operative (any Open button, a Lattice
-   deep link, or `/agents?agent=<id>`) opens a prominent employee-record panel with five tabs —
+   deep link, or `/agents?agent=<id>`) opens a prominent employee-record panel with seven tabs —
    **Overview** (role/status/adapter/readiness, reports-to + clickable direct-reports, pressure
    summary, open assigned Briefs from the board fetch, recent Shifts), **Instructions** (the
    Operative's charter / instruction bundle from the full-profile `agent.keys` read — now **viewable
@@ -377,23 +377,29 @@ ledger entry or design section.
    HTML — with a char/line summary and an honest empty state when none is stored; **Edit** opens a
    bounded textarea and **Save** writes through the configure-gated `PATCH /v1/agents/:id
    { instruction_bundle }`, where an empty draft **clears** the charter and Cancel restores the last
-   loaded value), **Permissions** (the intact
+   loaded value), **Skills** (the Operative's **procedural memory** — reusable recipes relevant to it,
+   surfaced **read-only** from the existing `memory.skill_*` catalogue via
+   `GET /v1/skills?agent=<id>&q=<query>&limit=20`: each entry shows name + status/version/confidence/
+   usage + a bounded description preview + source/tags/id, with an Enter/Search-only filter, and honest
+   unavailable / empty states; **no create/update/deprecate or per-Operative skill-assignment UI** —
+   read-only by design, tab-gated so it only fetches while open), **Permissions** (the intact
    Keys + capability-powers + standing-approvals governance face — nothing removed), **Runs**
    (this Operative's Shifts from the existing `/v1/runs` payload — status/trigger/rig/duration/
    started + deep links to `/runs?run=<id>`), **Budget** (committed Allowance / risk ceiling /
    concurrency / approval timeout, explicitly labelled *committed* not spent, with live spend
    routed to the Costs page — never fabricated), and **Configuration** (adapter + autonomy/
    heartbeat flags + org placement + identity + timestamps from `/v1/agents/:id`; the charter is
-   linked to the Instructions tab as viewable/editable, and the copy notes model config + Skills are
-   still not exposed by the read API). The tab is URL-driven (`&tab=<tab>`, default Overview, unknown value falls back
-   safely) and Copy-link captures it; all five tabs reuse the page's existing fetches (the shared
-   detail cache + `/v1/runs` + the board columns) — **no new backend route and no extra fetch
-   loop**. *Remaining gap:* by design this stays the inline workbench on the Crew page (NOT a
+   linked to the Instructions tab as viewable/editable, Skills to the Skills tab as read-only, and the
+   copy notes per-Operative model config is still not exposed by the read API). The tab is URL-driven (`&tab=<tab>`, default Overview, unknown value falls back
+   safely) and Copy-link captures it; all tabs but Skills reuse the page's existing fetches (the shared
+   detail cache + `/v1/runs` + the board columns), and the Skills tab adds one bounded, tab-gated fetch
+   to the **existing** `/v1/skills` route — **no new backend route and no extra fetch loop**. *Remaining gap:* by design this stays the inline workbench on the Crew page (NOT a
    separate `/agents/:id` router route — the query-param deep link is canonical); the charter /
    instruction-bundle is now **viewable and editable** on the Instructions tab (read via `agent.keys`,
    written via the configure-gated `PATCH /v1/agents/:id { instruction_bundle }` — this writes the
-   instruction bundle only, NOT a config-history UI), but the per-Operative **model lane** and the
-   **Skills** tab are still not built (the read API exposes neither model config nor Skills). **Full pan/zoom/pinch + Fit/Reset now ship** (the previously-deferred gap is
+   instruction bundle only, NOT a config-history UI), the **Skills** tab is now built (read-only over the
+   existing `/v1/skills` — no per-Operative skill-assignment / create-update-deprecate editor), but the
+   per-Operative **model lane** is still not built (the read API exposes no model config). **Full pan/zoom/pinch + Fit/Reset now ship** (the previously-deferred gap is
    closed): the stage is one CSS `transform: translate() scale()` viewport driven by native
    PointerEvent (drag-pan + two-finger pinch) and a non-passive WheelEvent (cursor-anchored
    zoom), with explicit −/+/Fit/Reset controls, an auto-fit-once on first render (no jump on

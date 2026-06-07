@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { api, tryGet } from "../api";
+import { api, skills as skillsApi, tryGet, type SkillSearchResult, type SkillSummary } from "../api";
 import { asArray, Badge, Empty, extractList, Section, useAsync } from "../components/common";
 import { invalidate } from "../invalidate";
 
@@ -182,11 +182,12 @@ const WORK_COLUMNS = ["todo", "in_progress", "in_review"];
 
 // The Operative-detail workbench tabs (dashboard-design §9). Overview is the
 // default; an unknown `?tab=` value falls back to it (param safety).
-const TABS = ["overview", "instructions", "permissions", "runs", "budget", "configuration"] as const;
+const TABS = ["overview", "instructions", "skills", "permissions", "runs", "budget", "configuration"] as const;
 type Tab = (typeof TABS)[number];
 const TAB_LABEL: Record<Tab, string> = {
   overview: "Overview",
   instructions: "Instructions",
+  skills: "Skills",
   permissions: "Permissions",
   runs: "Runs",
   budget: "Budget",
@@ -223,6 +224,27 @@ function fmtDateTime(secs?: number): string {
   return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
 }
 
+// Defensive field pickers for a skill summary (every field optional — the
+// search summary may carry a subset, and a fuller/thinner shape must still
+// render). Names, body preview, source, and a normalized timestamp.
+function skillName(s: SkillSummary): string {
+  return String(s.name || s.title || s.id || "skill");
+}
+function skillPreview(s: SkillSummary): string {
+  const v = s.description ?? s.summary ?? s.body;
+  return typeof v === "string" ? v : "";
+}
+function skillSource(s: SkillSummary): string | null {
+  const v = s.source_agent ?? s.agent ?? s.source;
+  return v ? String(v) : null;
+}
+// Normalize whichever timestamp is present (seconds or `_ms`) to epoch-seconds.
+function skillWhen(s: SkillSummary): number | undefined {
+  const ms = s.updated_at_ms ?? s.created_at_ms;
+  if (typeof ms === "number") return Math.floor(ms / 1000);
+  return s.updated_at ?? s.created_at;
+}
+
 export function Agents() {
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -245,6 +267,18 @@ export function Agents() {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
+  // Skills-tab state (read-only procedural memory for the open Operative).
+  // `skillInput` is the live filter box; `skillQuery` is the committed search
+  // term (only submitted on Enter / Search, never per-keystroke). `skillData`
+  // is the last parsed result for the open Operative (carries the honest
+  // `available:false` shell when the capability is disabled). Skills load ONLY
+  // while the Skills tab is open (the effect below), so closed tabs cost no
+  // fetch; switching Operative or tab refetches.
+  const [skillInput, setSkillInput] = useState("");
+  const [skillQuery, setSkillQuery] = useState("");
+  const [skillData, setSkillData] = useState<SkillSearchResult | null>(null);
+  const [skillLoading, setSkillLoading] = useState(false);
+  const [skillError, setSkillError] = useState<string | null>(null);
   // The active workbench tab is URL-driven too (`?tab=runs`) so a deep link can
   // land on a specific tab and back/forward restore it. An unknown value falls
   // back to Overview without rewriting the URL (param safety).
@@ -326,6 +360,40 @@ export function Agents() {
     inflightRef.current.delete(agentId);
   }
 
+  // Load the open Operative's relevant Skills (read-only) through the existing
+  // `/v1/skills?agent=<id>&q=<query>&limit=20` route. `skillsApi.search` never
+  // throws — a bridge/route failure degrades to an empty available result; the
+  // backend's explicit `{available:false}` shell is surfaced honestly. Any
+  // thrown error (defensive) is shown as a calm message, not a blank panel.
+  async function loadSkills(agentId: string, q: string) {
+    if (!agentId) return;
+    setSkillLoading(true);
+    setSkillError(null);
+    try {
+      const res = await skillsApi.search({ agent: agentId, q, limit: 20 });
+      setSkillData(res);
+    } catch (e) {
+      setSkillError(e instanceof Error ? e.message : "Failed to load skills");
+      setSkillData(null);
+    } finally {
+      setSkillLoading(false);
+    }
+  }
+
+  // Commit the current filter box as the search term and refetch. Bound to the
+  // Search button + Enter — never per-keystroke, so the endpoint isn't spammed.
+  function submitSkillSearch() {
+    setSkillQuery(skillInput);
+    if (openId) loadSkills(openId, skillInput);
+  }
+
+  // Clear the filter and reload the unfiltered relevant skills.
+  function clearSkillSearch() {
+    setSkillInput("");
+    setSkillQuery("");
+    if (openId) loadSkills(openId, "");
+  }
+
   // Open the charter editor pre-filled with the last loaded value.
   function beginEdit(current: string) {
     setDraft(current);
@@ -384,6 +452,18 @@ export function Agents() {
   // tab changes, so a half-typed draft never bleeds across surfaces.
   useEffect(() => {
     setEditing(false);
+  }, [openId, activeTab]);
+
+  // Load Skills only while the Skills tab is open — and refetch with a cleared
+  // filter whenever the open Operative changes (or the tab is first opened), so
+  // a closed tab costs nothing and switching Operatives never shows the prior
+  // one's skills/filter.
+  useEffect(() => {
+    if (activeTab !== "skills" || !openId) return;
+    setSkillInput("");
+    setSkillQuery("");
+    loadSkills(openId, "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openId, activeTab]);
 
   // Copy a shareable deep link to this Operative's workbench. The canonical
@@ -773,6 +853,9 @@ export function Agents() {
             >
               {TAB_LABEL[t]}
               {t === "runs" && agentRuns.length > 0 && <span className="op-tab-n">{agentRuns.length}</span>}
+              {t === "skills" && skillData?.available && skillData.items.length > 0 && (
+                <span className="op-tab-n">{skillData.items.length}</span>
+              )}
             </button>
           ))}
         </div>
@@ -924,6 +1007,99 @@ export function Agents() {
                 )}
               </div>
             </div>
+          ) : activeTab === "skills" ? (
+            // Skills — the Operative's procedural memory (dashboard-design §9).
+            // READ-ONLY: reusable procedures (recipes) relevant to this
+            // Operative, from the shared `memory.skill_*` catalogue via
+            // `GET /v1/skills?agent=<id>`. No create/update/deprecate UI here —
+            // this surfaces skills attached/relevant to the Operative. Robust to
+            // a disabled deployment (`available:false`), an empty catalogue, and
+            // a varied list shape (parsed defensively in `skillsApi.search`).
+            <div className="op-detail">
+              <div className="op-group">
+                <div className="op-group-title">Skills — procedural memory</div>
+                <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
+                  Reusable procedures (recipes) relevant to this Operative, from the shared skill
+                  catalogue (<span className="mono">/v1/skills</span>). Read-only here — skills are
+                  authored and curated elsewhere.
+                </div>
+                <div className="row" style={{ gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
+                  <input
+                    className="input"
+                    style={{ fontSize: 12, padding: "4px 8px", flex: "1 1 220px", minWidth: 160 }}
+                    placeholder="Filter skills by name / description…"
+                    value={skillInput}
+                    disabled={skillLoading}
+                    spellCheck={false}
+                    onChange={(e) => setSkillInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") submitSkillSearch();
+                    }}
+                  />
+                  <button className="btn sm" disabled={skillLoading} onClick={submitSkillSearch}>
+                    {skillLoading ? "Searching…" : "Search"}
+                  </button>
+                  {skillQuery && (
+                    <button className="btn ghost sm" disabled={skillLoading} onClick={clearSkillSearch}>
+                      Clear
+                    </button>
+                  )}
+                </div>
+                {skillLoading ? (
+                  <div className="loading" style={{ fontSize: 12 }}>Loading skills…</div>
+                ) : skillError ? (
+                  <div className="muted" style={{ fontSize: 12 }}>Could not load skills — {skillError}</div>
+                ) : skillData && !skillData.available ? (
+                  // Honest unavailable state — the skill runtime/capability is
+                  // off on this deployment; show the backend's reason calmly.
+                  <div className="muted" style={{ fontSize: 12 }}>
+                    Skills are unavailable on this deployment{skillData.reason ? ` — ${skillData.reason}` : ""}.
+                  </div>
+                ) : !skillData || skillData.items.length === 0 ? (
+                  <div className="muted" style={{ fontSize: 12 }}>
+                    {skillQuery
+                      ? `No skills match “${skillQuery}” for this Operative.`
+                      : "No skills attached to this Operative yet."}
+                  </div>
+                ) : (
+                  <div className="op-skills">
+                    {skillData.items.map((s, i) => {
+                      const preview = skillPreview(s);
+                      const source = skillSource(s);
+                      const when = skillWhen(s);
+                      return (
+                        <div key={s.id || i} className="op-skill">
+                          <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "baseline" }}>
+                            <strong style={{ fontSize: 13 }}>{skillName(s)}</strong>
+                            {s.status && (
+                              <span className={"badge " + (s.status === "active" ? "done" : "backlog")} style={{ fontSize: 9 }}>{s.status}</span>
+                            )}
+                            {typeof s.version === "number" && <span className="muted" style={{ fontSize: 10 }}>v{s.version}</span>}
+                            {typeof s.confidence === "number" && <span className="muted" style={{ fontSize: 10 }}>conf {Math.round(s.confidence * 100)}%</span>}
+                            {typeof s.usage_count === "number" && <span className="muted" style={{ fontSize: 10 }}>used {s.usage_count}×</span>}
+                          </div>
+                          {preview && <div className="op-skill-body">{preview}</div>}
+                          {(source || when != null || s.id || (s.tags && s.tags.length > 0)) && (
+                            <div className="muted" style={{ fontSize: 10, marginTop: 4, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                              {source && <span>source {source}</span>}
+                              {when != null && <span>updated {fmtWhen(when)}</span>}
+                              {s.id && <span className="mono">{String(s.id).slice(0, 12)}</span>}
+                              {s.tags && s.tags.length > 0 && (
+                                <span className="pill-row" style={{ display: "inline-flex", gap: 4 }}>
+                                  {s.tags.slice(0, 6).map((t) => (
+                                    <span key={t} className="badge backlog" style={{ fontSize: 9 }}>{t}</span>
+                                  ))}
+                                </span>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
           ) : activeTab === "runs" ? (
             <div className="op-detail">
               <div className="op-group">
@@ -1021,8 +1197,10 @@ export function Agents() {
                   <strong>editable</strong> on the{" "}
                   <span className="link" onClick={() => setTab("instructions")}>Instructions</span> tab —
                   the <span className="mono">agent.keys</span> read carries it and edits flow through the
-                  configure-gated <span className="mono">PATCH /v1/agents/:id</span>. Per-Operative model
-                  config and Skills are not exposed by the read API yet.
+                  configure-gated <span className="mono">PATCH /v1/agents/:id</span>. Skills (procedural
+                  memory) are surfaced read-only on the{" "}
+                  <span className="link" onClick={() => setTab("skills")}>Skills</span> tab; per-Operative
+                  model config is not exposed by the read API yet.
                 </p>
               </div>
             </div>

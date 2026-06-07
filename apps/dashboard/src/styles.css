@@ -592,6 +592,18 @@ a > .stat-card:hover { border-color: var(--text-faint); }
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px;
   line-height: 1.5; white-space: pre-wrap; word-break: break-word; tab-size: 2;
 }
+/* Operative Skills tab — read-only procedural-memory entries (dashboard-design
+   §9). Dense bordered rows; the body preview is bounded to a few lines. */
+.op-skills { display: flex; flex-direction: column; gap: 8px; }
+.op-skill {
+  border: 1px solid var(--border-soft); border-radius: 6px;
+  padding: 8px 10px; background: var(--bg);
+}
+.op-skill-body {
+  margin-top: 4px; font-size: 12px; line-height: 1.45; color: var(--text-dim);
+  white-space: pre-wrap; word-break: break-word;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
 
 /* Run transcript renderer (dashboard-design §8) — block-grouped "nice" view +
    compact "raw" dump, B&W with semantic-only color. Reused on the Runs page

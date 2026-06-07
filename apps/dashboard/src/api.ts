@@ -1037,6 +1037,97 @@ export const runtimeState = {
     }),
 };
 
+// ── Operative Skills — procedural memory (read-only) ──────────────────────
+// The `memory.skill_*` catalogue, surfaced read-only on the Operative
+// workbench (relix-dashboard-design §9 — the agent detail includes Skills).
+// The bridge proxies `GET /v1/skills` → `memory.skill_search` on the AI node;
+// when the `[skills]` capability is DISABLED the bridge replies with the calm
+// shell `{ available:false, reason }` (HTTP 200) instead of a 502, so the panel
+// renders an honest unavailable state. Every field is optional — the search
+// SUMMARY carries id/name/description/source_agent/confidence/usage_count/
+// version/tags/status (no timestamps), but the helper stays defensive so a
+// thinner OR fuller row still renders.
+export interface SkillSummary {
+  id?: string;
+  name?: string;
+  title?: string;
+  description?: string;
+  summary?: string;
+  body?: string;
+  source_agent?: string;
+  agent?: string;
+  source?: string;
+  confidence?: number;
+  usage_count?: number;
+  version?: number;
+  status?: string;
+  tags?: string[];
+  // Timestamps are not on the search summary today, but accepted defensively
+  // (seconds or `_ms`) so a future/fuller shape renders without a change here.
+  updated_at?: number;
+  updated_at_ms?: number;
+  created_at?: number;
+  created_at_ms?: number;
+  [k: string]: unknown;
+}
+
+// The parsed skills-search outcome: either the bridge's `{available:false}`
+// shell, or a list pulled defensively from `results`/`items`/`skills`/`rows`/
+// a raw array.
+export interface SkillSearchResult {
+  available: boolean;
+  reason: string | null;
+  items: SkillSummary[];
+}
+
+// Normalize whatever the skills route returned into a `SkillSearchResult`.
+// Recognizes the unavailable shell, the documented `{results}` list, the other
+// common list keys, and a bare array; anything else degrades to empty.
+function parseSkillResult(raw: unknown): SkillSearchResult {
+  if (Array.isArray(raw)) {
+    return { available: true, reason: null, items: raw as SkillSummary[] };
+  }
+  if (raw && typeof raw === "object") {
+    const o = raw as Record<string, unknown>;
+    if (o.available === false) {
+      return {
+        available: false,
+        reason: typeof o.reason === "string" ? o.reason : null,
+        items: [],
+      };
+    }
+    for (const k of ["results", "items", "skills", "rows", "list"]) {
+      if (Array.isArray(o[k])) {
+        return { available: true, reason: null, items: o[k] as SkillSummary[] };
+      }
+    }
+  }
+  return { available: true, reason: null, items: [] };
+}
+
+export const skills = {
+  // Search the catalogue for skills relevant to one Operative. `agent` scopes
+  // to the Operative's id; a trimmed `q` adds a substring match. Never throws —
+  // a bridge/route failure degrades to an empty (available) result so the tab
+  // shows a calm empty state, while the backend's explicit `{available:false}`
+  // is surfaced verbatim.
+  search: async (opts: {
+    agent?: string;
+    q?: string;
+    limit?: number;
+  }): Promise<SkillSearchResult> => {
+    const qs = new URLSearchParams();
+    const q = opts.q?.trim();
+    if (q) qs.set("q", q);
+    if (opts.agent) qs.set("agent", opts.agent);
+    qs.set("limit", String(opts.limit ?? 20));
+    const raw = await tryGet<unknown>(`/v1/skills?${qs.toString()}`, null);
+    return parseSkillResult(raw);
+  },
+  // Aggregate catalogue counts (optional context — degrades to null).
+  stats: () => tryGet<unknown>("/v1/skills/stats", null),
+};
+
 // Outcome of probing one health dimension. `status` is the HTTP code (null
 // when the request never reached the bridge — a network/DNS/TLS failure).
 export interface Probe {
