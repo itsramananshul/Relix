@@ -3135,12 +3135,29 @@ pub fn register_agent_capabilities(
     // that stands up the single Founder; `agent.operatives` is the
     // tenant-scoped Crew roster (excludes the infra operator-console).
     {
+        // `company.status` carries a read-only, tenant-scoped operations summary
+        // (work in flight / blocked / review / approvals / mandates) when the
+        // spine + task stores are available — which they always are in the live
+        // bridge. It degrades to the agent-only first-run read if the spine is
+        // absent. The summary derives ONLY from existing tenant-scoped reads and
+        // mutates nothing (company-model §5.4 / §8.2; dashboard-design §5).
         let s = agent_store.clone();
+        let ts = task_store.clone();
+        let spine = spine_store.clone();
         bridge.register(
             "company.status",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
-                async move { handlers::handle_company_status(&s, &ctx) }
+                let ts = ts.clone();
+                let spine = spine.clone();
+                async move {
+                    match spine {
+                        Some(spine) => {
+                            handlers::handle_company_status_with_ops(&s, &spine, &ts, &ctx)
+                        }
+                        None => handlers::handle_company_status(&s, &ctx),
+                    }
+                }
             })),
         );
     }

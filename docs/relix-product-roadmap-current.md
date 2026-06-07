@@ -80,6 +80,21 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   empty-company → working-crew loop as the Founder's sovereign first-run action.
 - **Crew status & org shape** — `company.status` returns Prime + crew counts, by-status,
   by-role, reports-to tree.
+- **Company operations summary** (company-model §5.4/§8.2; dashboard-design §5) —
+  `company.status` (`GET /v1/spine/company`) now also carries a read-only, tenant-scoped
+  `operations` object so the Overview reads as ONE coherent company snapshot instead of
+  stitching the agent/identity dimension to separately-composed Brief/run/Mandate counts.
+  It derives ONLY from existing tenant-scoped store reads (the same helpers the Action
+  Center uses, so the snapshot and the feed can never disagree and never fabricate a figure):
+  `briefs` (total + `by_board` buckets + `in_review` / `ready_to_start` / `unassigned` /
+  `blocked` / `stale`), `runs` (a bounded recent `window` classified into `running` /
+  `failed_or_refused` / `pending_review`), `approvals` (`pending_clearances` /
+  `pending_hires`), and `mandates` (total + `by_status` + `strategy_proposed`). Backward-
+  compatible (the base initialized/founder/prime/crew fields are unchanged; the summary is
+  additive), best-effort (a transient sub-read degrades that bucket to `0`, never failing the
+  core read), and read-only (no new authority/route/policy). The Overview surfaces it as a
+  flat **Operations snapshot** card in the cockpit, alongside the intact Action Center +
+  Company operating status card.
 - **Governed hiring** — pending hires are inert until greenlit; `agent.approve_hire`
   binds a Rig atomically at approval so a greenlit Operative is immediately runnable.
   `agent.create` is operator-only; agent-originated hires require the **spawn Key**;
@@ -235,6 +250,12 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   `can_advance` (else the route to take by hand). Best-effort + honest empty/stale states; uses
   the existing `prime.next_step` / `prime.advance` routes — no new backend authority. Still one
   explicit governed step, not an autonomous CEO loop.
+- **Operations snapshot** — a compact, read-only cockpit card fed by `company.operations`
+  (the server-computed, tenant-scoped summary above): three glance groups — *work in flight*
+  (running / ready / in review), *needs attention* (unassigned / blocked / stale / recovery),
+  and *governance* (pending approvals / hires / strategy / mandates) — each stat a deep link to
+  where it's worked. Honest unavailable state when the summary is absent (the agent-only
+  fallback read); no nested cards; the Action Center + Company operating status card stay intact.
 - **Brief workroom** — Conversation thread + Chronicle ledger + answerable Requests panel;
   Shift lifecycle operated inline.
 - **Shell** — mobile off-canvas drawer + ⌘K command palette (navigation-only); client-side

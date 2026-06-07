@@ -13,12 +13,32 @@ interface Inbox { blocked?: Card[]; overdue?: Card[]; unassigned?: Card[]; revie
 interface Roster { active?: number; total?: number }
 interface EventRow { task_id?: string; event_type?: string; ts?: number; payload?: string }
 interface Founder { name?: string; rig?: string | null }
+// The read-only operations summary embedded in `company.status` (company-model
+// §5.4/§8.2; dashboard-design §5). Tenant-scoped, derived only from existing
+// stores; every bucket is an honest count (or 0) — never a fabricated figure.
+interface Operations {
+  briefs?: {
+    total?: number;
+    by_board?: Record<string, number>;
+    in_review?: number;
+    ready_to_start?: number;
+    unassigned?: number;
+    blocked?: number;
+    stale?: number;
+  };
+  runs?: { window?: number; recent?: number; running?: number; failed_or_refused?: number; pending_review?: number };
+  approvals?: { pending_clearances?: number; pending_hires?: number };
+  mandates?: { total?: number; by_status?: Record<string, number>; strategy_proposed?: number };
+}
 interface CompanyStatus {
   initialized?: boolean;
   founder?: Founder | null;
   prime?: Founder | null;
   operative_count?: number;
   crew?: { total?: number; active?: number; pending?: number };
+  // Present when the bridge has the spine + task stores wired (always, live);
+  // absent only on the agent-only fallback read — render an honest unavailable.
+  operations?: Operations | null;
 }
 interface Adapter { name?: string; probe?: { status?: string } }
 interface RunRow {
@@ -408,6 +428,12 @@ export function Overview() {
           onReload={() => { void refreshActions(); reload(); }}
         />
       )}
+      {/* Operations snapshot — a glance summary of the whole company's work,
+          straight from `company.operations` (server-computed, tenant-scoped),
+          so the cockpit reads as one coherent snapshot instead of stitched
+          panels (dashboard-design §5). Read-only; each stat deep-links to where
+          it's worked. */}
+      {initialized && <OperationsSnapshot ops={company.operations} />}
       {/* Action Center — the one place for what needs the operator now. Prefers
           the live-refreshed feed, falling back to the mount-load snapshot. */}
       {initialized && (
@@ -640,6 +666,95 @@ const PRESSURES: [string, string, string, string][] = [
   ["needs_review", "review", "/runs", "in_review"],
   ["ready_to_start", "ready", "/briefs", "todo"],
 ];
+
+// A compact, read-only operations snapshot sourced from `company.operations`
+// (dashboard-design §5). One flat card (no nested cards) with three glance
+// groups — work in flight, what needs attention, governance — each stat a
+// deep link to where it's worked. Honest unavailable state when the summary is
+// absent (the agent-only fallback read). Never mutates anything.
+function OperationsSnapshot({ ops }: { ops?: Operations | null }) {
+  if (!ops) {
+    return (
+      <div className="card">
+        <h3 style={{ margin: 0 }}>Operations snapshot</h3>
+        <div className="empty">Operations summary unavailable right now.</div>
+      </div>
+    );
+  }
+  const b = ops.briefs ?? {};
+  const r = ops.runs ?? {};
+  const a = ops.approvals ?? {};
+  const m = ops.mandates ?? {};
+  const attention =
+    (b.unassigned ?? 0) + (b.blocked ?? 0) + (b.stale ?? 0) + (r.failed_or_refused ?? 0);
+  // [count, label, route, warn?] — `warn` colors a non-zero value as needs-you.
+  const groups: { label: string; items: [number, string, string, boolean][] }[] = [
+    {
+      label: "Work in flight",
+      items: [
+        [r.running ?? 0, "running", "/runs", false],
+        [b.ready_to_start ?? 0, "ready", "/briefs", false],
+        [r.pending_review ?? 0, "in review", "/runs", false],
+      ],
+    },
+    {
+      label: "Needs attention",
+      items: [
+        [b.unassigned ?? 0, "unassigned", "/briefs", true],
+        [b.blocked ?? 0, "blocked", "/briefs", true],
+        [b.stale ?? 0, "stale", "/briefs", true],
+        [r.failed_or_refused ?? 0, "recovery", "/runs", true],
+      ],
+    },
+    {
+      label: "Governance",
+      items: [
+        [a.pending_clearances ?? 0, "approvals", "/approvals", true],
+        [a.pending_hires ?? 0, "hires", "/approvals", true],
+        [m.strategy_proposed ?? 0, "strategy", "/mandates", true],
+        [m.total ?? 0, "mandates", "/mandates", false],
+      ],
+    },
+  ];
+  return (
+    <div className="card">
+      <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
+        <h3 style={{ margin: 0 }}>Operations snapshot</h3>
+        <div className="spacer" style={{ flex: 1 }} />
+        <span className="muted" style={{ fontSize: 12 }}>
+          {b.total ?? 0} Brief{(b.total ?? 0) === 1 ? "" : "s"} · {attention} need
+          {attention === 1 ? "s" : ""} attention
+        </span>
+      </div>
+      <div className="row wrap" style={{ gap: 16, alignItems: "flex-start" }}>
+        {groups.map((g) => (
+          <div key={g.label} style={{ flex: "1 1 180px", minWidth: 0 }}>
+            <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>{g.label}</div>
+            <div className="row wrap" style={{ gap: 14 }}>
+              {g.items.map(([n, label, to, warn]) => (
+                <Link
+                  key={label}
+                  to={to}
+                  title={`${n} ${label}`}
+                  style={{
+                    display: "inline-flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    minWidth: 52,
+                    textDecoration: "none",
+                  }}
+                >
+                  <b className={n ? (warn ? "warn" : "info") : ""} style={{ fontSize: 18 }}>{n}</b>
+                  <span className="muted" style={{ fontSize: 11 }}>{label}</span>
+                </Link>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 // The Overview cockpit (dashboard-design §5; roadmap §2 slice 9b). Surfaces the
 // SAME bounded guided-driver step the Chat Shift Room shows — Prime's ONE next

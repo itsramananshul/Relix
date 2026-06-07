@@ -121,16 +121,16 @@ fn bump_tally(map: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
     map.insert(key.to_string(), serde_json::json!(n));
 }
 
-pub fn handle_company_status(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
-    let tenant = ctx.tenant_id_or_default();
-    let founder = match store.find_founder(tenant) {
-        Ok(f) => f,
-        Err(e) => return internal(format!("company.status founder: {e}")),
-    };
-    let operatives = match store.list_operatives_for_tenant(tenant) {
-        Ok(v) => v,
-        Err(e) => return internal(format!("company.status roster: {e}")),
-    };
+/// Build the base `company.status` object (initialized / founder / prime /
+/// crew) shared by the agent-only first-run read and the operations-aware
+/// variant. Returns the JSON map PLUS the roster, which the operations summary
+/// reuses for its pending-hire count (no second roster read).
+fn company_status_base(
+    store: &AgentStore,
+    tenant: &str,
+) -> Result<(serde_json::Map<String, serde_json::Value>, Vec<AgentProfile>), AgentStoreError> {
+    let founder = store.find_founder(tenant)?;
+    let operatives = store.list_operatives_for_tenant(tenant)?;
     // Prime = the Founder's right hand (Lexicon) — the Operative whose role is
     // `prime`, who proposes the strategy + builds the team. `None` until one is
     // hired, so the dashboard can show "no Prime yet" honestly.
@@ -152,24 +152,208 @@ pub fn handle_company_status(store: &AgentStore, ctx: &InvocationCtx) -> Handler
         bump_tally(&mut by_status, st);
         bump_tally(&mut by_role, &o.role);
     }
-    let body = serde_json::json!({
-        "initialized": founder.is_some(),
-        "founder": founder.as_ref().map(operative_json),
-        // The Prime is the company's planning lead; null until hired.
-        "prime": prime.map(operative_json),
-        "operative_count": operatives.len(),
-        "crew": {
+    let mut map = serde_json::Map::new();
+    map.insert("initialized".into(), serde_json::json!(founder.is_some()));
+    map.insert(
+        "founder".into(),
+        serde_json::json!(founder.as_ref().map(operative_json)),
+    );
+    // The Prime is the company's planning lead; null until hired.
+    map.insert("prime".into(), serde_json::json!(prime.map(operative_json)));
+    map.insert("operative_count".into(), serde_json::json!(operatives.len()));
+    map.insert(
+        "crew".into(),
+        serde_json::json!({
             "total": operatives.len(),
             "active": active,
             "pending": pending,
             "by_status": by_status,
             "by_role": by_role,
-        },
-    });
-    match serde_json::to_vec(&body) {
+        }),
+    );
+    Ok((map, operatives))
+}
+
+pub fn handle_company_status(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let tenant = ctx.tenant_id_or_default();
+    let (map, _operatives) = match company_status_base(store, tenant) {
+        Ok(v) => v,
+        Err(e) => return internal(format!("company.status: {e}")),
+    };
+    match serde_json::to_vec(&serde_json::Value::Object(map)) {
         Ok(b) => HandlerOutcome::Ok(b),
         Err(e) => internal(format!("company.status encode: {e}")),
     }
+}
+
+/// Bounded recent-runs window the operations summary classifies (newest-first),
+/// mirroring the Action Center's run scan so the cockpit and the snapshot read
+/// the SAME ledger window.
+const OPS_RUN_WINDOW: i64 = 200;
+
+/// `company.status` WITH a read-only **operations** summary — a tenant-scoped
+/// company operations snapshot (company-model §5.4 / §8.2; dashboard-design §5)
+/// so the Overview cockpit can show "work in flight / blocked / review /
+/// approvals / mandates" at a glance instead of stitching separate panels.
+///
+/// Backward-compatible: the base `company.status` fields (initialized / founder
+/// / prime / crew) are unchanged; this only ADDS an `operations` object. The
+/// operations counts derive ONLY from EXISTING tenant-scoped store reads (the
+/// same helpers the Action Center uses), so they can never disagree with the
+/// gate and never fabricate a figure. Every operations read is best-effort: a
+/// transient sub-read failure degrades that bucket to `0`/empty rather than
+/// failing the core status read.
+pub fn handle_company_status_with_ops(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &TaskStore,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let tenant = ctx.tenant_id_or_default();
+    let (mut map, operatives) = match company_status_base(agent_store, tenant) {
+        Ok(v) => v,
+        Err(e) => return internal(format!("company.status: {e}")),
+    };
+    let operations = compute_operations(agent_store, spine_store, task_store, tenant, &operatives);
+    map.insert("operations".into(), operations);
+    match serde_json::to_vec(&serde_json::Value::Object(map)) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => internal(format!("company.status encode: {e}")),
+    }
+}
+
+/// Compute the read-only, tenant-scoped operations summary embedded in
+/// `company.status` (see [`handle_company_status_with_ops`]). PURE-ish: it only
+/// READS existing tenant-scoped store helpers and shapes the result — no
+/// mutation, no side effects. Best-effort by construction (a failed sub-read
+/// degrades that bucket to `0`/empty), so an empty company reads as calm zeros.
+fn compute_operations(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &TaskStore,
+    tenant: &str,
+    operatives: &[AgentProfile],
+) -> serde_json::Value {
+    // ── Briefs ──────────────────────────────────────────────────────────────
+    // Board buckets give the total + per-column shape; the operational signals
+    // (ready / unassigned / dependency-blocked / stale) reuse the EXACT bounded
+    // helpers the Action Center reads, so the cockpit snapshot and the feed can
+    // never disagree. The bounded lists (≤ ACTION_SRC_CAP) are a glance summary,
+    // not an audit — they match what the Action Center surfaces.
+    let mut by_board = serde_json::Map::new();
+    let mut brief_total = 0i64;
+    let mut in_review = 0i64;
+    if let Ok(rows) = task_store.board_summary_for_tenant(tenant) {
+        for (status, n) in rows {
+            brief_total += n;
+            if status == "in_review" {
+                in_review = n;
+            }
+            by_board.insert(status, serde_json::json!(n));
+        }
+    }
+    let ready = task_store
+        .list_ready_briefs_for_tenant(tenant, ACTION_SRC_CAP)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let unassigned = task_store
+        .list_unassigned_briefs_for_tenant(tenant, ACTION_SRC_CAP)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let blocked = task_store
+        .list_blocked_briefs_for_tenant(tenant, ACTION_SRC_CAP)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let stale = task_store
+        .list_stale_briefs_for_tenant(ACTION_STALE_IDLE_SECS, tenant, ACTION_SRC_CAP)
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    // ── Runs ────────────────────────────────────────────────────────────────
+    // Classified over a bounded recent window (newest-first). `recent` is the
+    // window size, not an all-time total — labelled as such on the wire.
+    let mut recent = 0i64;
+    let mut running = 0i64;
+    let mut failed_or_refused = 0i64;
+    let mut pending_review = 0i64;
+    if let Ok(runs) = task_store.list_runs_for_tenant(tenant, OPS_RUN_WINDOW) {
+        recent = runs.len() as i64;
+        for r in &runs {
+            match r.status.as_str() {
+                "running" => running += 1,
+                "failed" | "refused" | "interrupted" => failed_or_refused += 1,
+                _ => {}
+            }
+            if r.status == "done" && r.review.as_deref() == Some("pending_review") {
+                pending_review += 1;
+            }
+        }
+    }
+
+    // ── Approvals ───────────────────────────────────────────────────────────
+    // Pending Clearances (the unified decision queue) + pending hires (inert
+    // Operatives awaiting activation; reused from the roster — no extra read).
+    let pending_clearances = agent_store
+        .list_pending_approvals_for_tenant(ACTION_SRC_CAP, tenant)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let pending_hires = operatives
+        .iter()
+        .filter(|o| o.status.eq_ignore_ascii_case("pending"))
+        .count();
+
+    // ── Mandates ────────────────────────────────────────────────────────────
+    // Total + status tally (cheap, in-memory over the full list) + the count of
+    // strategies still `proposed` (the gate awaiting the Board's approval). The
+    // per-Mandate strategy probe is bounded to ACTION_SRC_CAP like the feed.
+    let mut mandate_total = 0i64;
+    let mut by_mandate_status = serde_json::Map::new();
+    let mut strategy_proposed = 0i64;
+    if let Ok(mandates) = spine_store.list_mandates(tenant, None) {
+        mandate_total = mandates.len() as i64;
+        for m in &mandates {
+            bump_tally(&mut by_mandate_status, m.status.trim());
+        }
+        for m in mandates.iter().take(ACTION_SRC_CAP) {
+            if spine_store
+                .strategy_status(tenant, &m.mandate_id)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some("proposed")
+            {
+                strategy_proposed += 1;
+            }
+        }
+    }
+
+    serde_json::json!({
+        "briefs": {
+            "total": brief_total,
+            "by_board": by_board,
+            "in_review": in_review,
+            "ready_to_start": ready,
+            "unassigned": unassigned,
+            "blocked": blocked,
+            "stale": stale,
+        },
+        "runs": {
+            "window": OPS_RUN_WINDOW,
+            "recent": recent,
+            "running": running,
+            "failed_or_refused": failed_or_refused,
+            "pending_review": pending_review,
+        },
+        "approvals": {
+            "pending_clearances": pending_clearances,
+            "pending_hires": pending_hires,
+        },
+        "mandates": {
+            "total": mandate_total,
+            "by_status": by_mandate_status,
+            "strategy_proposed": strategy_proposed,
+        },
+    })
 }
 
 /// `company.bootstrap_founder` — first-run owner action. Wire arg:
@@ -5481,6 +5665,143 @@ mod tests {
         assert!(globex.contains("\"operative_count\":0"), "got {globex}");
         assert!(globex.contains("\"prime\":null"), "got {globex}");
         assert!(globex.contains("\"total\":0"), "got {globex}");
+    }
+
+    // ── company.status operations summary (company-model §5.4/§8.2;
+    //    dashboard-design §5) ──────────────────────────────────────────────
+
+    /// Stand up a small company in `tenant`: bootstrap the Founder, hire one
+    /// active engineer, then propose + approve a Mandate so a real Brief tree
+    /// AND a pending designer hire exist. Returns the three stores so the test
+    /// can read the operations summary off live state.
+    fn seed_company_for_ops(tenant: &str) -> (AgentStore, SpineStore, TaskStore) {
+        let (agents, spine, task) = prime_stores();
+        ok_body(handle_bootstrap_founder(
+            &agents,
+            &fake_ctx_tenant(b"Ada|echo", tenant),
+        ));
+        agents
+            .create_agent(
+                "Eng", "engineer", "SWE", "eng", "eng", "founder",
+                &subject_of(b"eng"), "medium", tenant,
+            )
+            .unwrap();
+        let pid = json_of(ok_body(handle_prime_propose(
+            &agents,
+            &spine,
+            &fake_ctx_tenant(b"Build a web dashboard", tenant),
+        )))["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let _ = ok_body(handle_prime_approve(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx_tenant(pid.as_bytes(), tenant),
+        ));
+        (agents, spine, task)
+    }
+
+    #[test]
+    fn company_status_operations_summarizes_briefs_approvals_mandates() {
+        let (agents, spine, task) = seed_company_for_ops("default");
+        let v = json_of(ok_body(handle_company_status_with_ops(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(b""),
+        )));
+        // The backward-compatible base fields are untouched by the new summary.
+        assert_eq!(v["initialized"], true, "{v}");
+        assert!(
+            v["crew"]["total"].as_i64().unwrap() >= 2,
+            "founder + engineer at least: {v}"
+        );
+        // The operations summary is present and reflects the seeded company.
+        let ops = &v["operations"];
+        assert!(ops.is_object(), "operations object present: {v}");
+        assert_eq!(ops["mandates"]["total"], 1, "one Mandate: {ops}");
+        assert!(
+            ops["briefs"]["total"].as_i64().unwrap() >= 1,
+            "a Brief tree exists: {ops}"
+        );
+        // The approved plan files a pending designer hire (inert until approved).
+        assert!(
+            ops["approvals"]["pending_hires"].as_i64().unwrap() >= 1,
+            "a pending hire awaits approval: {ops}"
+        );
+        // No Shift has run yet → the runs window is calm.
+        assert_eq!(ops["runs"]["recent"], 0, "no runs yet: {ops}");
+        assert_eq!(ops["runs"]["running"], 0, "{ops}");
+    }
+
+    #[test]
+    fn company_status_operations_is_tenant_isolated() {
+        // Seed all the work in the `acme` Guild.
+        let (agents, spine, task) = seed_company_for_ops("acme");
+        let acme = json_of(ok_body(handle_company_status_with_ops(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx_tenant(b"", "acme"),
+        )));
+        assert!(
+            acme["operations"]["mandates"]["total"].as_i64().unwrap() >= 1,
+            "owning Guild sees its Mandate: {acme}"
+        );
+        assert!(
+            acme["operations"]["briefs"]["total"].as_i64().unwrap() >= 1,
+            "owning Guild sees its Briefs: {acme}"
+        );
+        // A DIFFERENT Guild's summary is all zeros — no Brief / run / approval /
+        // Mandate from `acme` leaks across the tenant boundary.
+        let globex = json_of(ok_body(handle_company_status_with_ops(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx_tenant(b"", "globex"),
+        )));
+        assert_eq!(globex["initialized"], false, "empty Guild: {globex}");
+        let ops = &globex["operations"];
+        assert_eq!(ops["briefs"]["total"], 0, "no Briefs leak: {ops}");
+        assert_eq!(ops["mandates"]["total"], 0, "no Mandates leak: {ops}");
+        assert_eq!(ops["approvals"]["pending_hires"], 0, "no hires leak: {ops}");
+        assert_eq!(
+            ops["approvals"]["pending_clearances"], 0,
+            "no Clearances leak: {ops}"
+        );
+        assert_eq!(ops["runs"]["recent"], 0, "no runs leak: {ops}");
+    }
+
+    #[test]
+    fn company_status_operations_empty_company_is_calm() {
+        // No company at all → every operations bucket reads as a calm zero/empty
+        // (never null-panics, never a fabricated figure).
+        let (agents, spine, task) = prime_stores();
+        let v = json_of(ok_body(handle_company_status_with_ops(
+            &agents,
+            &spine,
+            &task,
+            &fake_ctx(b""),
+        )));
+        assert_eq!(v["initialized"], false, "{v}");
+        let ops = &v["operations"];
+        assert_eq!(ops["briefs"]["total"], 0, "{ops}");
+        assert!(
+            ops["briefs"]["by_board"].as_object().unwrap().is_empty(),
+            "empty board: {ops}"
+        );
+        assert_eq!(ops["briefs"]["ready_to_start"], 0, "{ops}");
+        assert_eq!(ops["briefs"]["unassigned"], 0, "{ops}");
+        assert_eq!(ops["runs"]["recent"], 0, "{ops}");
+        assert_eq!(ops["runs"]["running"], 0, "{ops}");
+        assert_eq!(ops["runs"]["failed_or_refused"], 0, "{ops}");
+        assert_eq!(ops["runs"]["pending_review"], 0, "{ops}");
+        assert_eq!(ops["approvals"]["pending_clearances"], 0, "{ops}");
+        assert_eq!(ops["approvals"]["pending_hires"], 0, "{ops}");
+        assert_eq!(ops["mandates"]["total"], 0, "{ops}");
+        assert_eq!(ops["mandates"]["strategy_proposed"], 0, "{ops}");
     }
 
     #[test]
