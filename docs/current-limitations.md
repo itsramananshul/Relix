@@ -326,11 +326,11 @@ the approved work is already ready. What it does **not** do:
     `autonomous_prime_interval_secs` remain the env-derived knobs).
   - **Prime standing authority (v1) — opt-in, default OFF, *grant-gated*.** Prime
     now has **two** autonomy layers. Layer (a) above is the **approved-work
-    driver** (`RELIX_AUTONOMOUS_PRIME`): it only moves work that a human already
+    driver** (runtime toggle or `RELIX_AUTONOMOUS_PRIME` env override): it only moves work that a human already
     approved. Layer (b) is the **standing-authority driver**: when — and ONLY
     when — the Board has granted a bounded **standing approval** in the Guild, the
     same loop may also take the specific *approval* action the grant covers. This
-    is **not an env bypass**: enabling `RELIX_AUTONOMOUS_PRIME` runs the loop, but
+    is **not a loop-toggle bypass**: turning the loop on wakes the driver, but
     each of the three approval categories acts **only** while a
     `standing_approvals` row exists for the synthetic authority subject
     `__relix_autonomous_prime__` in that tenant. The categories are:
@@ -367,7 +367,7 @@ the approved work is already ready. What it does **not** do:
     routes. The live per-Guild category state is still reflected at
     `GET /v1/spine/prime/standing-authority`. **The normal approval system is not
     weakened**: granting in the dashboard does **not** enable autonomy — the loop
-    only acts when `RELIX_AUTONOMOUS_PRIME` is *also* set, and even then a category
+    only acts when the Prime loop is *also* effectively on (runtime toggle or env override), and even then a category
     acts only while its grant is live. With no standing grant, every approval gate
     stays human exactly as before — autonomy here only *adds* power when the Board
     has explicitly granted it, inside the bound it set.

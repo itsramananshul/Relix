@@ -329,7 +329,12 @@ export function Settings() {
         onChanged={reload}
       />
 
-      <PrimeStandingAuthorityPanel authority={primeAuthority} loading={loading} onChanged={reload} />
+      <PrimeStandingAuthorityPanel
+        authority={primeAuthority}
+        autonomy={autonomy}
+        loading={loading}
+        onChanged={reload}
+      />
 
       <AdminRecoveryPanel />
 
@@ -522,8 +527,8 @@ function AutonomousPrimeSwitchPanel({
 // Prime standing authority (company-model standing-approval semantics): the
 // operator control surface for the bounded powers the Board grants the
 // autonomous Prime to act on its behalf at specific approval gates. These are
-// STANDING APPROVALS, not env bypasses — enabling RELIX_AUTONOMOUS_PRIME only
-// runs the loop; each category acts ONLY while a `standing_approvals` row exists
+// STANDING APPROVALS, not loop toggles — enabling the runtime/env Prime loop
+// only wakes the driver; each category acts ONLY while a `standing_approvals` row exists
 // for the synthetic `__relix_autonomous_prime__` authority in this Guild. Grant
 // creates a bounded row through the EXISTING standing-approval routes
 // (`POST /v1/agents/:id/standing-approvals`); Revoke deletes the matching rows
@@ -545,15 +550,19 @@ interface StandingListRow {
 
 function PrimeStandingAuthorityPanel({
   authority,
+  autonomy,
   loading,
   onChanged,
 }: {
   authority: StandingAuthority;
+  autonomy: AutonomyState;
   loading: boolean;
   onChanged: () => void;
 }) {
   const authorityId = authority.authority_id ?? AUTONOMOUS_PRIME_AUTHORITY;
   const categories = authority.categories ?? [];
+  const loopEffective = !!autonomy.effective_enabled;
+  const loopSource = autonomy.source === "env" ? "env override" : "runtime toggle";
   // The category currently being granted/revoked (disables just its button), and
   // a single success/error banner for the last action.
   const [busy, setBusy] = useState<string | null>(null);
@@ -621,18 +630,24 @@ function PrimeStandingAuthorityPanel({
       <h3>Prime standing authority</h3>
       <p className="muted" style={{ marginTop: -2, marginBottom: 12 }}>
         Bounded powers the Board can grant the autonomous Prime to act on its behalf at specific
-        approval gates. These are <strong>standing approvals, not env bypasses</strong>: granting a
-        category here does <em>not</em> enable autonomy on its own — the loop only acts when{" "}
-        <span className="mono">RELIX_AUTONOMOUS_PRIME</span> is also on, and even then a category
+        approval gates. These are <strong>standing approvals, not loop toggles</strong>: granting a
+        category here does <em>not</em> wake Prime on its own — the autonomous Prime loop must be ON
+        via the runtime switch above or the env override, and even then a category
         acts <em>only</em> while its grant is live. Granting creates a bounded row (25 calls, expires
         in 24h) for the synthetic{" "}
         <span className="mono">{authorityId}</span> authority in this Guild; revoking removes it.
       </p>
-      {authority.driver_enabled === false && (
+      {!loopEffective && (
         <div className="banner" style={{ fontSize: 12 }}>
-          The autonomous Prime loop is <strong>off</strong> (<span className="mono">RELIX_AUTONOMOUS_PRIME</span>{" "}
-          is not set). Grants below are recorded but stay inert until the loop is enabled — they never
-          run autonomy by themselves.
+          The autonomous Prime loop is <strong>off</strong>. Grants below are recorded but stay inert
+          until the runtime switch above is turned on (or the env override is set) — they never run
+          autonomy by themselves.
+        </div>
+      )}
+      {loopEffective && categories.some((c) => c.active) && (
+        <div className="banner ok" style={{ fontSize: 12 }}>
+          The loop is ON via {loopSource}; live grants below can be consumed by Prime's bounded
+          autonomous approval actions.
         </div>
       )}
       {banner && <div className={"banner " + banner.kind} style={{ fontSize: 12 }}>{banner.msg}</div>}

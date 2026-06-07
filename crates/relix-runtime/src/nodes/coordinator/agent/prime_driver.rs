@@ -960,15 +960,15 @@ pub fn handle_prime_standing_authority(
         .collect();
     let body = json!({
         "authority_id": AUTONOMOUS_PRIME_AUTHORITY,
-        // The env switch only enables the *loop*; each approval category still
-        // requires its own standing-approval row — env is never an approval bypass.
+        // Legacy env-derived field retained for compatibility. The authoritative
+        // effective runtime/env loop state is `prime.autonomy_state`.
         "driver_enabled": driver_enabled,
         "hire_rig": hire_rig,
         "hire_rig_valid": hire_rig_valid,
         "categories": categories,
-        "note": "These are standing approvals granted to the synthetic Prime authority, not env bypasses. \
-                 Enabling RELIX_AUTONOMOUS_PRIME only runs the loop; each category above acts only when a \
-                 standing-approval row exists for this Guild. Grant/revoke via \
+        "note": "These are standing approvals granted to the synthetic Prime authority, not loop toggles. \
+                 The runtime toggle or RELIX_AUTONOMOUS_PRIME env override only wakes the loop; each category \
+                 above acts only when a standing-approval row exists for this Guild. Grant/revoke via \
                  POST/DELETE /v1/agents/__relix_autonomous_prime__/standing-approvals.",
     });
     ok_json(&body)
