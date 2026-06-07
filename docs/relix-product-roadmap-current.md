@@ -356,7 +356,12 @@ ledger entry or design section.
     duplicate accept **no-ops** (returns the same ordered ids), a crashed accept **resumes from the
     cursor** (creating only the missing children, then idempotently re-links + wires `after`→Snag
     edges), and a re-accept whose proposal hashes differently is **refused** (an accepted plan
-    cannot fork). All prior governance (parent context inheritance, assign-Key-gated hints, tenant
+    cannot fork). **Concurrent double-accept is orphan-free:** a per-decomposition in-process
+    materialization lock (one `Mutex<()>` per `(task_id, interaction_id)`, mirroring the per-Operative
+    start lock) serializes the whole accept so two racing accepts/resumes can never interleave a
+    child create with its cursor record — the loser blocks then no-ops or resumes, never leaving an
+    unlinked orphan child Brief (proven by a two-thread barrier race test). All prior governance
+    (parent context inheritance, assign-Key-gated hints, tenant
     isolation, delegation-depth) is unchanged. *Still deferred:* binding the accepted plan to an
     approval-bound **Dossier/document revision** (`execution §1.7/§1.8` — today the accepted-plan
     identity is the `suggest_tasks` interaction id, not a Dossier revision) and `owner`-liveness
@@ -639,7 +644,8 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
     unrelated warnings in `maintenance.rs`); `git diff --check` clean. *Now also shipped (partial):*
     exactly-once plan decomposition (§1.7 — durable `brief_decomposition_claims` ledger:
     fingerprint + `created_ids` resume cursor + crash-safe resume / no-op duplicate / no-fork
-    accept; see §P3 slice 10). *Still deferred:* binding the accepted plan to an approval-bound
+    accept + orphan-free concurrent accept via a per-decomposition materialization lock; see §P3
+    slice 10). *Still deferred:* binding the accepted plan to an approval-bound
     Dossier/document revision and approval-bound issue Dossiers/documents (§1.8).
 
 > After completing a slice: re-open the cited section, update the implementation map /

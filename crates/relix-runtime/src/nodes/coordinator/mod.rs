@@ -521,6 +521,20 @@ pub struct TaskStore {
     /// and measure capacity; this orders the start itself. Different Operatives
     /// get distinct locks, so unrelated work runs fully in parallel.
     start_locks: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
+    /// §1.7 (exactly-once decomposition): the in-process per-decomposition
+    /// **materialization lock** registry. One `Mutex<()>` per
+    /// `(task_id, interaction_id)` accepted-plan identity, created lazily,
+    /// serializes the WHOLE accept materialization (establish/validate the
+    /// durable claim → create-and-record each child → finalize) so two
+    /// concurrent accepts/resumes for the SAME card cannot interleave a child
+    /// `create_brief` with the cursor record and leave an unlinked orphan
+    /// child Brief. The loser blocks here, then re-reads the durable claim: a
+    /// `complete` claim no-ops; an `in_progress` claim (the winner errored
+    /// mid-plan) resumes from the durable cursor. The durable decomposition
+    /// claim remains the crash-safe linearization point; this lock is what
+    /// removes the concurrent-double-accept orphan window. Distinct cards get
+    /// distinct locks, so unrelated decompositions proceed in parallel.
+    decomposition_locks: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
     /// OBJECT-LEVEL billing-code resolver (company-model §6.6), injected
     /// once at wiring (the spine store). Set via
     /// [`set_object_billing_resolver`](Self::set_object_billing_resolver);
@@ -569,6 +583,7 @@ impl TaskStore {
             workspace_config:
                 crate::nodes::coordinator::heartbeat::resolve_workspace_config(),
             start_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            decomposition_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             object_billing: std::sync::OnceLock::new(),
         })
     }
@@ -588,6 +603,7 @@ impl TaskStore {
             workspace_config:
                 crate::nodes::coordinator::heartbeat::WorkspaceConfig::default(),
             start_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            decomposition_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             object_billing: std::sync::OnceLock::new(),
         })
     }
@@ -620,6 +636,25 @@ impl TaskStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(agent_id.trim().to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// §1.7: the in-process **materialization lock** for one decomposition
+    /// identity `(task_id, interaction_id)`. The same card shares one lock (so
+    /// concurrent accepts/resumes of it serialize and cannot orphan a child);
+    /// different cards get distinct locks (so unrelated decompositions run in
+    /// parallel). Poison-tolerant on the registry so a panicked materializer
+    /// can't wedge every future accept.
+    fn decomposition_lock(&self, task_id: &str, interaction_id: &str) -> Arc<Mutex<()>> {
+        // \u{1f} (unit separator) can't appear in an id, so the composite key
+        // is unambiguous.
+        let key = format!("{}\u{1f}{}", task_id.trim(), interaction_id.trim());
+        let mut map = self
+            .decomposition_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
@@ -2421,6 +2456,21 @@ impl TaskStore {
 
         // ── ACCEPT: materialize the proposal into real child Briefs exactly
         //    once, resumably (§1.7). ──
+        //
+        // Serialize the WHOLE materialization (claim establish → child
+        // create+record loop → finalize) per `(task_id, interaction_id)` so
+        // two concurrent accepts/resumes for the same card cannot interleave a
+        // child `create_brief` with the cursor record and leave an unlinked
+        // orphan child Brief. The loser blocks here, then re-reads the durable
+        // claim below: a `complete` claim no-ops (returning the recorded ids);
+        // an `in_progress` claim (the winner errored mid-plan) resumes from the
+        // durable cursor. The durable claim stays the crash-safe linearization
+        // point — this lock removes the concurrent-double-accept orphan window.
+        // Held until this function returns (every early return drops it).
+        let _decomp_lock = self.decomposition_lock(task_id, interaction_id);
+        let _decomp_guard = _decomp_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let proposal: brief::Proposal = proposal_json
             .as_deref()
             .and_then(|p| serde_json::from_str(p).ok())
@@ -2512,11 +2562,12 @@ impl TaskStore {
         // ── 3. Materialize children from the cursor forward. Each child is
         //    created, then its id is recorded on the claim's cursor with a
         //    compare-and-swap BEFORE moving on — so a crash resumes from the
-        //    last recorded id and never re-creates one. The CAS also serializes
-        //    racing accepts onto one cursor (the loser of a slot adopts the
-        //    winner's progress; its just-created orphan Brief is the
-        //    documented, rare cost of a true concurrent double-accept — the
-        //    sequential crash-retry path never produces one). ──
+        //    last recorded id and never re-creates one. The per-decomposition
+        //    materialization lock held above guarantees this loop runs
+        //    single-threaded for this card, so no concurrent accept can create
+        //    a child for a slot we then lose; the CAS below is the durable
+        //    cursor record (and crash-resume point), with the stale-cursor
+        //    re-adopt kept only as defensive belt-and-suspenders. ──
         let mut made_this_call = 0usize;
         loop {
             let idx = created.len();
@@ -2556,9 +2607,12 @@ impl TaskStore {
                 .map_err(CoordinatorError::Db)?
             };
             if advanced == 0 {
-                // Another worker advanced the cursor between our create and our
-                // record. Adopt the durable list (our `child` becomes an
-                // unlinked orphan — the rare concurrency cost) and continue.
+                // Defensive only: with the per-decomposition lock held this is
+                // unreachable in-process (no other writer can advance the
+                // cursor while we materialize). If it ever fires (e.g. a future
+                // cross-process writer), adopt the durable list and continue —
+                // `child` would then be an unlinked row, but the lock makes
+                // that path dead for the single-connection store.
                 let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
                 let ids: String = conn
                     .query_row(
@@ -22000,6 +22054,88 @@ mod tests {
             materialized_count(&s, &parent),
             1,
             "no duplicate materialized event"
+        );
+    }
+
+    // Helper: count brief/manual Task rows in a tenant. Every materialized
+    // child (and a test parent) is created via `create_brief`, which stamps
+    // `flow_template = 'brief/manual'`, so this is the total Brief row count —
+    // a CAS-loser orphan would show up here as an EXTRA, unlinked row.
+    fn count_brief_manual_tasks(s: &TaskStore, tenant: &str) -> i64 {
+        let conn = s.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE flow_template = 'brief/manual' AND tenant_id = ?1",
+            rusqlite::params![tenant],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    // §1.7 (orphan-free concurrent accept): two threads accept the SAME
+    // `suggest_tasks` card at once. The per-decomposition materialization lock
+    // serializes them, so EXACTLY the planned children are created and linked —
+    // the CAS slot-loser can never leave an extra, unlinked orphan child Brief.
+    // Both racers converge on the same ordered ids, and the plan materializes
+    // exactly once. (This is the real-thread proof; the deterministic resume
+    // tests above pin the crash path.)
+    #[test]
+    fn decomposition_concurrent_accepts_never_orphan_a_child() {
+        let s = Arc::new(TaskStore::in_memory().unwrap());
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        // A wider plan widens the race window the lock has to close.
+        let id = open_plan(&s, &parent, &["A", "B", "C", "D", "E"]);
+
+        // One brief/manual row exists right now: the parent itself.
+        assert_eq!(count_brief_manual_tasks(&s, "acme"), 1);
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let s = s.clone();
+            let parent = parent.clone();
+            let id = id.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                s.respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
+                    .unwrap()
+            }));
+        }
+        let results: Vec<Vec<String>> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Both accepts see the SAME materialized plan (same ordered child ids).
+        assert_eq!(
+            results[0], results[1],
+            "concurrent accepts converge on one plan"
+        );
+        assert_eq!(results[0].len(), 5, "the full plan, exactly once");
+
+        // Exactly the five planned children are linked as Sub-briefs — no dup.
+        let subs = s.list_subbriefs(&parent).unwrap();
+        assert_eq!(subs.len(), 5, "exactly the planned children, none duplicated");
+        for c in &results[0] {
+            assert!(subs.contains(c), "{c} must be linked under the parent");
+        }
+
+        // The orphan proof: total Brief rows = parent (1) + the five children.
+        // A CAS slot-loser orphan from the race would push this to 7+.
+        assert_eq!(
+            count_brief_manual_tasks(&s, "acme"),
+            1 + 5,
+            "no unlinked orphan child Brief survived the concurrent accept"
+        );
+
+        // The claim is complete with the ordered ids, materialized exactly once.
+        let (_, ids, status) = decomp_claim(&s, &parent, &id).unwrap();
+        assert_eq!(status, "complete");
+        assert_eq!(ids, results[0].join(","));
+        assert_eq!(
+            materialized_count(&s, &parent),
+            1,
+            "the plan materialized exactly once across both racers"
         );
     }
 
