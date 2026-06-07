@@ -405,6 +405,102 @@ pub async fn decide_clearance(
     }))
 }
 
+/// Bounded poll cadence for the Clearance stream. Pending Clearances change
+/// when an approval is raised, decided, or expires — `coord.approval.pending`
+/// has no dedicated push source — so the stream re-reads the SAME capability
+/// the `…/clearances` list route serves on this low, bounded interval and emits
+/// ONLY when the parsed list's fingerprint changes. Honest "polling-backed
+/// SSE", never a fake push, and it never spins (one read per tick, de-duped by
+/// fingerprint). Mirrors [`INTERACTIONS_POLL`].
+const CLEARANCES_POLL: Duration = Duration::from_millis(2500);
+
+/// A compact 64-bit fingerprint of a Clearance list's serialized JSON. PURE +
+/// deterministic for a given string (`DefaultHasher` is seeded with fixed
+/// keys), so an unchanged list hashes identically and pushes nothing. Fed the
+/// PARSED-then-reserialized array (not the raw TSV) so the `count=` line and
+/// other transport noise can't trigger a spurious push — the fingerprint tracks
+/// exactly what the stream emits. Used as the cheap "did the queue change?" gate.
+pub fn clearances_fingerprint(serialized: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serialized.hash(&mut h);
+    h.finish()
+}
+
+/// `GET /v1/spine/clearances/stream` — the dedicated REALTIME pending-Clearance
+/// stream for the Approvals hub (dashboard-design §10/§11). Tenant-scoped
+/// exactly like the `…/clearances` list route by proxying the SAME
+/// `coord.approval.pending` capability (the resolved tenant is captured at open
+/// time and re-applied to every downstream coord call) — no new privilege, no
+/// cross-Guild leak. The stream:
+///
+/// - emits the current Clearances immediately as `event: clearances` (JSON =
+///   the same array `…/clearances` returns, via [`parse_clearance_lines`]);
+/// - re-reads on a low, bounded interval and pushes again only when the parsed
+///   list's [`clearances_fingerprint`] changes, so a Clearance raised/decided/
+///   expired refreshes the hub (and an unchanged queue pushes nothing — the
+///   keep-alive `ping` only, never a spin);
+/// - emits `event: error` for transient mesh/gateway failures and KEEPS
+///   retrying (the queue read is idempotent, so a hiccup must not end the feed);
+/// - stops cleanly when the client disconnects (the stream future is dropped,
+///   releasing the stream-metrics guard).
+///
+/// This is honest polling-backed SSE — NOT a true event bus / websocket. It adds
+/// no persistent state or event table; it composes the existing read capability
+/// exactly like the polling list route, mirroring [`interactions_stream`].
+pub async fn clearances_stream(
+    State(state): State<AppState>,
+) -> Result<
+    Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, Json<ApiError>),
+> {
+    // Capture the resolved tenant NOW (inside the middleware scope); the stream
+    // body runs later, OUTSIDE that scope, and must re-apply it on each call.
+    let tenant_scope = current_tenant().unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    let opened_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let stream_guard = state
+        .stream_metrics
+        .open("clearances".to_string(), opened_at);
+
+    let s = stream! {
+        let _live_guard = stream_guard;
+        let mut last_fp: Option<u64> = None;
+        loop {
+            // Same source of truth + limit default as the `…/clearances` list
+            // route (25), re-scoped to the captured tenant on every tick.
+            let fetch = CURRENT_TENANT.scope(
+                tenant_scope.clone(),
+                call_peer(&state, "coord.approval.pending", b"25"),
+            );
+            match fetch.await {
+                Ok(body) => {
+                    let json = parse_clearance_lines(&body);
+                    let text = serde_json::to_string(&json)
+                        .unwrap_or_else(|_| "[]".to_string());
+                    let fp = clearances_fingerprint(&text);
+                    // De-dupe: only push when the pending queue actually changed.
+                    if last_fp != Some(fp) {
+                        yield Ok(Event::default().event("clearances").data(text));
+                        last_fp = Some(fp);
+                    }
+                }
+                Err((_status, err)) => {
+                    // The queue read is idempotent, so even a NOT_FOUND here is
+                    // transient (a mesh/gateway blip), never a per-resource
+                    // existence signal — surface it and keep trying.
+                    let payload = serde_json::json!({ "error": err.0.error }).to_string();
+                    yield Ok(Event::default().event("error").data(payload));
+                }
+            }
+            tokio::time::sleep(CLEARANCES_POLL).await;
+        }
+    };
+    Ok(Sse::new(s).keep_alive(KeepAlive::default().text("ping")))
+}
+
 // ── Prime Assistant ("describe what you want → plan") ────────────────
 
 #[derive(Debug, Deserialize)]
@@ -3218,6 +3314,48 @@ mod tests {
     }
 
     #[test]
+    fn clearances_fingerprint_is_stable_and_change_sensitive() {
+        // Same serialized list ⇒ same fingerprint (an unchanged queue pushes
+        // nothing), deterministic across calls (fixed-key hasher).
+        let a = r#"[{"approval_id":"ap_1","method":"agent.activate_hire"}]"#;
+        assert_eq!(
+            clearances_fingerprint(a),
+            clearances_fingerprint(a),
+            "identical queues must fingerprint identically"
+        );
+        // A new Clearance appearing changes the fingerprint, so the stream
+        // re-emits when the pending queue grows.
+        let b = r#"[{"approval_id":"ap_1","method":"agent.activate_hire"},{"approval_id":"ap_2","method":"strategy.gate"}]"#;
+        assert_ne!(
+            clearances_fingerprint(a),
+            clearances_fingerprint(b),
+            "a changed queue must fingerprint differently"
+        );
+        // An empty queue and a non-empty one differ (a first Clearance arriving
+        // triggers a push; a queue draining to empty does too).
+        assert_ne!(clearances_fingerprint("[]"), clearances_fingerprint(a));
+    }
+
+    #[test]
+    fn clearances_fingerprint_tracks_the_parsed_array_not_raw_tsv() {
+        // The stream feeds the fingerprint the PARSED-then-reserialized array,
+        // so the `count=` line `coord.approval.pending` prepends can never move
+        // it. Two raw bodies that differ only by the count summary must parse to
+        // the same array and thus fingerprint the same.
+        let raw_a = b"count=1\nap_1\tag_1\tagent.activate_hire\thire\t100\n";
+        let raw_b = b"count=1\tstale\nap_1\tag_1\tagent.activate_hire\thire\t100\n";
+        let fp = |raw: &[u8]| {
+            let json = parse_clearance_lines(raw);
+            clearances_fingerprint(&serde_json::to_string(&json).unwrap())
+        };
+        assert_eq!(
+            fp(raw_a),
+            fp(raw_b),
+            "the count summary line must not affect the fingerprint"
+        );
+    }
+
+    #[test]
     fn parse_event_lines_builds_array_and_skips_blanks() {
         // task.events is newline-delimited JSON objects; the composite
         // turns it into a real array and drops blank / unparseable lines.
@@ -3286,6 +3424,10 @@ mod tests {
             .route("/v1/spine/keys/:agent", get(keys))
             .route("/v1/spine/assign_check", get(assign_check))
             .route("/v1/spine/clearances", get(clearances))
+            // The static `…/clearances/stream` segment beside the sibling
+            // `:approval_id/decide` param — matchit gives the static path
+            // priority, so building both here proves they do not conflict.
+            .route("/v1/spine/clearances/stream", get(clearances_stream))
             .route(
                 "/v1/spine/clearances/:approval_id/decide",
                 post(decide_clearance),

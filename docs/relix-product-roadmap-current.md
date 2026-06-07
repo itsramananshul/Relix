@@ -844,6 +844,27 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    and nothing is auto-approved. *Verify:* `cargo test -p relix-web-bridge --bins spine::tests`
    + `relix-runtime` approval_pending tests green; `npm run build` green; dist rebuilt + committed.
 
+   **Live Clearance stream (follow-up slice) — ✅ DONE.** *Files changed:*
+   `crates/relix-web-bridge/src/spine.rs` (new `clearances_stream` handler + pure
+   `clearances_fingerprint` helper + two unit tests), `crates/relix-web-bridge/src/main.rs`
+   (route `GET /v1/spine/clearances/stream`; also added to the route-conflict test),
+   `apps/dashboard/src/api.ts` (`subscribeClearances` + `ClearanceStreamConn`),
+   `apps/dashboard/src/pages/Approvals.tsx` (subscribes on mount, renders from stream snapshots,
+   header live/reconnecting/unavailable chip, bounded polling fallback), rebuilt `dashboard-dist`.
+   *Adds:* the Approvals hub is now **live** — a dedicated SSE proxies the SAME
+   `coord.approval.pending` capability the `…/clearances` list route serves (captured tenant
+   re-applied per call — no new privilege, no cross-Guild leak), emits an initial
+   `event: clearances` snapshot, then pushes again only when the parsed queue's fingerprint changes
+   (a Clearance raised/decided/expired), with `event: error` on transient mesh blips while it keeps
+   retrying. The existing Refresh button and the decide → invalidate → reload flow are unchanged
+   (decisions still go through `/v1/spine/clearances/:id/decide`; the runtime cap owns
+   authorisation). *Honest caveat:* this is **polling-backed SSE** (~2.5s, fingerprint-gated) like
+   the interaction/Prime-status streams — NOT a true backend event bus / websocket; when the stream
+   can't connect the page falls back to a bounded ~7s refresh; the company action feed (direct
+   hires + budget alerts) still uses refresh/polling (no live backend source was fabricated for it).
+   *Verify:* `cargo test -p relix-web-bridge --bins` green (772 incl. the new fingerprint + route
+   tests); `cargo clippy -p relix-web-bridge` clean; `npm run build` green; dist rebuilt + committed.
+
 8. **Settings hub** — `dashboard-design.md §10`.
    **✅ DONE (partial).** *Files changed:* `apps/dashboard/src/pages/Settings.tsx` (+`api.ts`
    `runtimeState.list/get/reset`). Added an **Admin · session recovery** section on top of the

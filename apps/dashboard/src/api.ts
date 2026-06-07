@@ -887,6 +887,71 @@ export const clearances = {
     ),
 };
 
+// ── Dedicated pending-Clearance stream (SSE) ──────────────────────────────
+// Subscribe to the bridge's `/v1/spine/clearances/stream` feed so the Approvals
+// hub refreshes the moment the pending queue changes — a Clearance raised,
+// decided, or expired — instead of only on manual Refresh. Tenant-scoped
+// server-side (it proxies the SAME `coord.approval.pending` read the list route
+// serves); polling-backed (~2.5s) + fingerprint-gated, so an unchanged queue
+// pushes nothing. Honest polling-backed SSE — NOT a true event bus/websocket.
+// Cookie auth rides the same-origin EventSource. The page falls back to bounded
+// polling whenever this never reaches `live` (see Approvals.tsx).
+
+export type ClearanceStreamConn = "connecting" | "live" | "reconnecting" | "unavailable";
+
+// Open the Clearance stream. `onClearances` receives the full pending array on
+// the initial snapshot + every change (same shape as `clearances.list`'s data);
+// `onConn` reports honest connection state. Manages reconnect with capped
+// backoff. Returns an unsubscribe fn.
+export function subscribeClearances(
+  onClearances: (clearances: Clearance[]) => void,
+  onConn: (state: ClearanceStreamConn) => void,
+): () => void {
+  let es: EventSource | null = null;
+  let closed = false;
+  let attempts = 0;
+  let backoff = 1000;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const connect = () => {
+    if (closed) return;
+    onConn(attempts === 0 ? "connecting" : "reconnecting");
+    es = new EventSource("/v1/spine/clearances/stream", { withCredentials: true });
+    es.onopen = () => {
+      attempts = 0;
+      backoff = 1000;
+      onConn("live");
+    };
+    es.addEventListener("clearances", (e: MessageEvent) => {
+      try {
+        const arr = JSON.parse(e.data);
+        if (Array.isArray(arr)) onClearances(arr as Clearance[]);
+      } catch {
+        /* malformed frame — ignore, the next snapshot corrects it */
+      }
+    });
+    // NB: the server's transient `event: error` frames just precede the next
+    // snapshot; EventSource's own connection `error` is handled by `onerror`.
+    es.onerror = () => {
+      es?.close();
+      es = null;
+      if (closed) return;
+      attempts += 1;
+      onConn(attempts >= 3 ? "unavailable" : "reconnecting");
+      timer = setTimeout(connect, backoff);
+      backoff = Math.min(backoff * 2, 15000);
+    };
+  };
+
+  connect();
+  return () => {
+    closed = true;
+    if (timer) clearTimeout(timer);
+    es?.close();
+    es = null;
+  };
+}
+
 // One row of the server-computed `company.actions` feed (company-model §5.4 /
 // §8.2). Read-only; the Approvals hub consumes only the `hire`/`budget` items
 // (the `approval` items duplicate the Clearance list, which has the real

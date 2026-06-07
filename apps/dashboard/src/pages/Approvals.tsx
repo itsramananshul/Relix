@@ -1,10 +1,12 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   api,
   clearances,
   companyActions,
+  subscribeClearances,
   type Clearance,
+  type ClearanceStreamConn,
   type CompanyActionItem,
 } from "../api";
 import { useAsync } from "../components/common";
@@ -108,6 +110,20 @@ function expiry(raw: string | number | undefined): { text: string; expired: bool
 
 const SEV_TONE: Record<string, string> = { high: "blocked", medium: "in_progress", low: "backlog" };
 
+// Honest connection-state chip for the dedicated Clearance stream. `unavailable`
+// is paired at the call site with a bounded polling fallback, so the hub keeps
+// updating even when the live push can't connect — the title says so.
+const CLR_CONN_CHIP: Record<ClearanceStreamConn, { label: string; tone: string; title: string }> = {
+  connecting: { label: "connecting", tone: "backlog", title: "Opening the live Clearance stream…" },
+  live: { label: "live", tone: "done", title: "Live — Clearances refresh the moment the pending queue changes." },
+  reconnecting: { label: "reconnecting", tone: "in_progress", title: "Lost the live stream — reconnecting…" },
+  unavailable: {
+    label: "unavailable",
+    tone: "blocked",
+    title: "Live stream unavailable — falling back to periodic refresh so the hub still updates.",
+  },
+};
+
 // A budget action's stable id encodes its KIND (action_center.rs): committed-
 // Allowance planning vs money already spent vs a hard-stop. Surface that honestly
 // so the operator knows whether it is a spend alert or a planning item.
@@ -141,9 +157,45 @@ export function Approvals() {
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<"all" | GroupKey>("all");
 
+  // ── Live Clearance stream (dashboard-design §11) ─────────────────────────
+  // The dedicated polling-backed SSE feed pushes the full pending-Clearance
+  // array on connect + on every change, so the queue refreshes without a manual
+  // Refresh. `streamClr` is the live override (preferred over the fetched data
+  // when present); `clrConn` is the honest connection state for the header chip.
+  const [streamClr, setStreamClr] = useState<Clearance[] | null>(null);
+  const [clrConn, setClrConn] = useState<ClearanceStreamConn>("connecting");
+
   const refresh = useCallback(() => {
     reload();
   }, [reload]);
+
+  // Subscribe on mount; tear the EventSource down on unmount.
+  useEffect(() => {
+    const unsub = subscribeClearances(
+      (arr) => setStreamClr(arr),
+      (state) => setClrConn(state),
+    );
+    return () => {
+      unsub();
+      setStreamClr(null);
+    };
+  }, []);
+
+  // Drop the live override whenever a fresh fetch lands (initial load or a
+  // reload after a decision), so the freshly-fetched queue shows immediately
+  // instead of being masked by a now-stale stream frame. The stream
+  // re-establishes the override on its next push (identical content ⇒ no flicker).
+  useEffect(() => {
+    setStreamClr(null);
+  }, [data]);
+
+  // Fallback: when the live stream can't connect, poll the hub on a bounded
+  // interval so the Clearance queue still updates without the push.
+  useEffect(() => {
+    if (clrConn !== "unavailable") return;
+    const t = setInterval(() => reload(), 7000);
+    return () => clearInterval(t);
+  }, [clrConn, reload]);
 
   const setNoteFor = (id: string, v: string) =>
     setNotes((prev) => ({ ...prev, [id]: v }));
@@ -221,8 +273,10 @@ export function Approvals() {
   }
 
   const clrReport = data?.clr;
-  const clrList = clrReport?.data ?? [];
-  const clrError = clrReport?.error ?? null;
+  // Prefer the live stream snapshot when present; otherwise the fetched data.
+  const clrList = streamClr ?? clrReport?.data ?? [];
+  // A live stream supersedes a stale fetch error (the queue is being pushed).
+  const clrError = streamClr ? null : (clrReport?.error ?? null);
   const feed = data?.acts?.data ?? null;
   const feedError = data?.acts?.error ?? null;
   const allActions = feed?.actions ?? [];
@@ -344,6 +398,15 @@ export function Approvals() {
             </span>
           )}
           <div className="spacer" style={{ flex: 1 }} />
+          {/* Honest Clearance-stream state (dashboard-design §11): the pending
+              queue refreshes live; `unavailable` falls back to periodic refresh. */}
+          <span
+            className={"badge " + CLR_CONN_CHIP[clrConn].tone}
+            style={{ fontSize: 9, marginRight: 8 }}
+            title={CLR_CONN_CHIP[clrConn].title}
+          >
+            {CLR_CONN_CHIP[clrConn].label}
+          </span>
           <span className="muted" style={{ fontSize: 12, marginRight: 8 }}>computed from live state</span>
           <button className="btn ghost sm" onClick={refresh} disabled={loading}>
             {loading ? "…" : "Refresh"}
@@ -394,8 +457,9 @@ export function Approvals() {
         </div>
       )}
 
-      {/* Clearance availability / loading / empty (single honest state). */}
-      {loading ? (
+      {/* Clearance availability / loading / empty (single honest state). A live
+          stream snapshot satisfies the load even before the initial fetch lands. */}
+      {loading && !streamClr ? (
         <div className="card"><div className="loading">Loading Clearances…</div></div>
       ) : clrError ? (
         <div className="card">

@@ -666,6 +666,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/keys/:agent", get(spine::keys))
         .route("/v1/spine/assign_check", get(spine::assign_check))
         .route("/v1/spine/clearances", get(spine::clearances))
+        // The dedicated polling-backed Clearance stream. The static `stream`
+        // segment sits beside the sibling `:approval_id/decide` param of the
+        // decide route — axum/matchit gives the static path priority, so they
+        // do not conflict (same shape as `…/interactions/stream` vs
+        // `…/interactions/:iid`). Register before the param route for clarity.
+        .route(
+            "/v1/spine/clearances/stream",
+            get(spine::clearances_stream),
+        )
         .route(
             "/v1/spine/clearances/:approval_id/decide",
             post(spine::decide_clearance),
