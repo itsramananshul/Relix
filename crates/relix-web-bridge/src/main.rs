@@ -687,6 +687,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/spine/prime/start", post(spine::prime_start))
         .route("/v1/spine/prime/proposals", get(spine::prime_proposals))
         .route("/v1/spine/prime/proposals/:id", get(spine::prime_proposal))
+        // Read-only Prime standing-authority state (which approve categories are
+        // active for the Guild). Grants are managed via the standing-approval routes.
+        .route(
+            "/v1/spine/prime/standing-authority",
+            get(spine::prime_standing_authority),
+        )
         // Live Shift-Room status of a Prime work session: a dedicated
         // tenant-scoped SSE stream (preferred) + the polling snapshot (fallback).
         .route(

@@ -4993,6 +4993,62 @@ pub fn handle_approval_decide(
     HandlerOutcome::Ok(body.into_bytes())
 }
 
+/// Autonomous spawn-Clearance greenlight for the standing-authority Prime
+/// driver. It reuses the EXACT side effects `handle_approval_decide` applies to
+/// an approved spawn Clearance — the **store decide path**
+/// ([`AgentStore::decide_approval`] `Approved`) followed by the identical
+/// spawn-clearance hire-activation hop ([`AgentStore::approve_hire`]) — but
+/// without the interactive approver/token/task-resume machinery the manual
+/// route needs (a spawn Clearance carries no `task_id`, and the autonomous
+/// loop needs no bearer token). It is deliberately **narrow**:
+///
+/// - **Spawn Clearances only.** A non-`SPAWN_CLEARANCE_METHOD` approval is
+///   refused, so this can NEVER approve a tool / high-risk / budget approval.
+/// - **Tenant-scoped, no existence leak.** A clearance outside `tenant` reads
+///   as not-found (identical to truly absent).
+/// - **Pending-only + idempotent.** `decide_approval` refuses a terminal
+///   status, so a re-run never double-approves; `approve_hire` on an
+///   already-active hire is a safe no-op (NotFound is swallowed).
+///
+/// Returns the activated hire's `agent_id` on success.
+pub fn autonomous_approve_spawn_clearance(
+    store: &AgentStore,
+    tenant: &str,
+    approval_id: &str,
+) -> Result<String, String> {
+    let rec = match store.get_approval_record_for_tenant(approval_id, tenant) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Err(format!("clearance not found in this Guild: {approval_id}")),
+        Err(e) => return Err(format!("clearance load: {e}")),
+    };
+    if rec.method != crate::nodes::coordinator::agent::store::SPAWN_CLEARANCE_METHOD {
+        return Err(format!(
+            "approval {approval_id} is not a spawn Clearance (method={}) — autonomous Prime \
+             only greenlights spawn Clearances",
+            rec.method
+        ));
+    }
+    if rec.status != ApprovalStatus::Pending {
+        return Err(format!(
+            "clearance {approval_id} is not pending (status={})",
+            rec.status.as_wire()
+        ));
+    }
+    let hire_id = rec.agent_id.clone();
+    // THE store decide path — identical to what handle_approval_decide calls.
+    store
+        .decide_approval(approval_id, ApprovalStatus::Approved, "autonomous-prime", "autonomous Prime standing authority")
+        .map_err(|e| format!("decide: {e}"))?;
+    // Spawn-Clearance hire-activation hop — identical to handle_approval_decide's
+    // hop. A hire that is no longer pending (already activated) is a safe no-op.
+    match store.approve_hire(&hire_id) {
+        Ok(()) => {}
+        Err(AgentStoreError::NotFound(_)) => {}
+        Err(e) => return Err(format!("activate hire: {e}")),
+    }
+    Ok(hire_id)
+}
+
 // ── standing approval handlers ──────────────────────────
 
 #[derive(Debug, Deserialize)]

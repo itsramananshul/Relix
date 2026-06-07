@@ -304,15 +304,60 @@ the approved work is already ready. What it does **not** do:
     read-only in Settings beside the heartbeat + recovery lane
     (`/v1/spine/run-config`: `autonomous_prime_enabled` / `autonomous_prime_max` /
     `autonomous_prime_interval_secs`).
+  - **Prime standing authority (v1) — opt-in, default OFF, *grant-gated*.** Prime
+    now has **two** autonomy layers. Layer (a) above is the **approved-work
+    driver** (`RELIX_AUTONOMOUS_PRIME`): it only moves work that a human already
+    approved. Layer (b) is the **standing-authority driver**: when — and ONLY
+    when — the Board has granted a bounded **standing approval** in the Guild, the
+    same loop may also take the specific *approval* action the grant covers. This
+    is **not an env bypass**: enabling `RELIX_AUTONOMOUS_PRIME` runs the loop, but
+    each of the three approval categories acts **only** while a
+    `standing_approvals` row exists for the synthetic authority subject
+    `__relix_autonomous_prime__` in that tenant. The categories are:
+    `prime.proposal.approve` (autonomously approve a **proposed** Prime proposal
+    through the existing `prime.approve` path — the proposed set is
+    status-filtered + tenant-stamped, so a rejected / already-approved /
+    cross-Guild proposal is never approved, and an approved proposal leaves the
+    set so a re-tick never re-approves or double-consumes the grant),
+    `prime.hire.approve` (activate a **pending hire created by Prime/company
+    planning** — i.e. one surfaced by the Mandate's own Team Plan — bound to the
+    configured safe Rig `RELIX_AUTONOMOUS_PRIME_HIRE_RIG`, default `echo`,
+    validated against the known-Rig allowlist; an unknown Rig is **skipped**, not
+    silently bound; an existing Rig is never clobbered), and
+    `prime.clearance.approve` (greenlight a **pending spawn Clearance tied to the
+    Mandate's Team Plan**, reusing the store decide path's exact side effects —
+    `decide_approval` + the hire-activation hop — and refusing any non-spawn /
+    tool / budget / high-risk approval). Each autonomous approval **consumes** one
+    call of a bounded grant (`max_calls` / `max_cost_micros`); an unlimited grant
+    is not decremented (existing standing-approval semantics). It is **tenant-safe**
+    (a grant in Guild A never approves Guild B's proposal/hire/Clearance — the
+    check is per the candidate's own Guild), **bounded** (still ≤
+    `RELIX_AUTONOMOUS_PRIME_MAX` actions/tick), and **idempotent**. Grants are
+    made/revoked through the EXISTING `agent.standing_approval.*` routes
+    (`POST`/`DELETE /v1/agents/__relix_autonomous_prime__/standing-approvals`);
+    the live per-Guild category state is surfaced **read-only** in Settings and at
+    `GET /v1/spine/prime/standing-authority`. **The normal approval system is not
+    weakened**: with no standing grant, every approval gate stays human exactly as
+    before — autonomy here only *adds* power when the Board has explicitly granted
+    it.
   - What this still does **NOT** do: there is **no LLM/strategy reasoning** — the
-    autonomous driver only executes the deterministic next governed step over
-    already-approved work; it **does not author strategy, decide which
-    person/identity to hire, greenlight a Clearance, or take a goal from raw
-    intent to done on its own**. Proposing a plan, approving it, greenlighting
-    hires/Clearances, and the Guild-budget ceiling all remain the human/Board's.
-    The default Prime is still rules; a model can shape only the *interpretation*
-    of a propose request (never crew/governance). So the Board/human approval
-    gates are fully preserved — autonomy operates strictly **inside** them.
+    autonomous driver only executes the deterministic next governed step; it
+    **does not author strategy, decide which person/identity to hire, or invent a
+    goal from raw intent**. **Raw goal creation still starts from a submitted
+    goal/proposal** — Prime proposes a plan from a request; it never conjures a
+    goal from nothing. The standing-authority layer may *approve* a proposal,
+    *activate* a planning hire, or *greenlight* a planning Clearance — but only
+    **inside the bounded authority the Board explicitly granted** (the
+    `standing_approvals` row), only for items **attributable to Prime/company
+    planning** (a proposal in the proposed set; a hire/Clearance in the Mandate's
+    Team Plan), and never for an arbitrary tool/budget/high-risk approval. With
+    **no grant**, proposing/approving plans, greenlighting hires/Clearances, and
+    the Guild-budget ceiling all remain the human/Board's, exactly as before. The
+    default Prime is still rules; a model can shape only the *interpretation* of a
+    propose request (never crew/governance). So the Board/human approval gates are
+    preserved by default, and autonomy operates strictly **inside** them — either
+    after a human approval (layer a) or within an explicit standing grant
+    (layer b).
 - **Hiring is request → approve only.** Prime suggests *which roles* are
   missing and files them as `pending` hire requests on approval, but it does
   not decide *which person/identity* to hire, and a pending hire is inert until
@@ -515,13 +560,21 @@ safe, governance unchanged), and an **opt-in bounded *autonomous* Prime driver
 (v1)** (default OFF, `RELIX_AUTONOMOUS_PRIME`) now drives already-**approved**
 work forward on a timer — planning the team, orchestrating the Brief tree, and
 starting ready work through the same governed routes, bounded + idempotent +
-tenant-safe, with the autonomous budget hard-stop re-imposed on auto-start. The
-default Prime is still rules, the model only shapes the *interpretation* (never
-crew/governance), and the autonomous loop **never** auto-approves a strategy /
-hire / spawn / budget / Clearance gate — so approvals + hire decisions + the
-Guild budget ceiling stay human, and there is still no driver that **reasons
-about strategy itself** or takes a goal from raw intent to done autonomously.
-Autonomy operates strictly **inside** the Board's approval gates.
+tenant-safe, with the autonomous budget hard-stop re-imposed on auto-start. On
+top of that, an **opt-in standing-authority layer** lets the SAME loop also
+approve a proposal, activate a planning hire, or greenlight a planning Clearance
+— but **only inside a bounded standing approval the Board explicitly granted**
+to the synthetic `__relix_autonomous_prime__` authority for that Guild (never
+from env alone, never for an arbitrary tool/budget/high-risk approval, always
+tenant-scoped + consumed). The default Prime is still rules, the model only
+shapes the *interpretation* (never crew/governance), and with **no standing
+grant** the loop **never** auto-approves a strategy / hire / spawn / budget /
+Clearance gate — so by default approvals + hire decisions + the Guild budget
+ceiling stay human, raw goal creation still starts from a submitted
+goal/proposal, and there is still no driver that **reasons about strategy
+itself** or takes a goal from raw intent to done autonomously. Autonomy operates
+strictly **inside** the Board's gates — after a human approval, or within an
+explicit standing grant.
 
 ### Bridge persists every chat as a Task (fail-soft)
 

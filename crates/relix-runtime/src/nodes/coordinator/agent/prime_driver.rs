@@ -35,11 +35,12 @@ use serde_json::{Value, json};
 use crate::dispatch::{HandlerOutcome, InvocationCtx};
 use crate::nodes::coordinator::TaskStore;
 use crate::nodes::coordinator::agent::handlers::{
-    ReadinessView, brief_status_row, compute_readiness, handle_orchestrate, handle_prime_start,
-    handle_team_plan, internal, invalid,
+    ReadinessView, autonomous_approve_spawn_clearance, brief_status_row, compute_readiness,
+    handle_orchestrate, handle_prime_approve, handle_prime_start, handle_team_plan, internal,
+    invalid,
 };
 use crate::nodes::coordinator::agent::prime;
-use crate::nodes::coordinator::agent::store::AgentStore;
+use crate::nodes::coordinator::agent::store::{AgentStore, StandingApprovalMatch};
 use crate::nodes::coordinator::spine::SpineStore;
 
 /// The one-step advance keys the driver may execute on explicit operator
@@ -47,6 +48,84 @@ use crate::nodes::coordinator::spine::SpineStore;
 /// here — they stay human decisions.
 const ADVANCE_CREATE_TEAM_PLAN: &str = "create_team_plan";
 const ADVANCE_ORCHESTRATE: &str = "orchestrate_assign_ready";
+
+// ── PRIME STANDING AUTHORITY (v1) ──────────────────────────────────────────
+// The Board can grant the autonomous Prime loop bounded power to take specific
+// governed APPROVAL actions on its behalf — but ONLY through an explicit
+// `standing_approvals` row in the tenant, never from env alone. The grant is
+// recorded against a SYNTHETIC authority subject (not a real Operative) and one
+// of three narrow categories. This is "within powers you granted it", not a
+// hidden bypass: with no standing row the loop leaves every approval gate to the
+// human, exactly as before. (company-model standing-approval semantics.)
+
+/// The synthetic standing-authority subject the Board grants bounded autonomous
+/// Prime powers to. It is NOT a real Operative — it is a stable ASCII id used
+/// only as the `agent_id` of `standing_approvals` rows that authorize the
+/// autonomous Prime loop to take a governed approval action. Operators grant via
+/// the existing `agent.standing_approval.create`
+/// (`POST /v1/agents/__relix_autonomous_prime__/standing-approvals`) with one of
+/// the categories below.
+pub const AUTONOMOUS_PRIME_AUTHORITY: &str = "__relix_autonomous_prime__";
+
+/// Standing-authority category: autonomous approval / materialization of a
+/// PROPOSED Prime proposal (drives the existing `prime.approve` path).
+pub const CATEGORY_PROPOSAL_APPROVE: &str = "prime.proposal.approve";
+/// Standing-authority category: autonomous activation of a PENDING hire created
+/// by Prime / company planning, onto the configured safe Rig.
+pub const CATEGORY_HIRE_APPROVE: &str = "prime.hire.approve";
+/// Standing-authority category: autonomous greenlight of a PENDING spawn
+/// Clearance tied to Prime / company planning.
+pub const CATEGORY_CLEARANCE_APPROVE: &str = "prime.clearance.approve";
+
+/// The three standing-authority categories, in display order.
+pub const STANDING_AUTHORITY_CATEGORIES: &[&str] =
+    &[CATEGORY_PROPOSAL_APPROVE, CATEGORY_HIRE_APPROVE, CATEGORY_CLEARANCE_APPROVE];
+
+/// Default safe Rig the autonomous hire-approve binds when
+/// `RELIX_AUTONOMOUS_PRIME_HIRE_RIG` is unset — the safe-local `echo` built-in.
+pub const DEFAULT_AUTONOMOUS_HIRE_RIG: &str = "echo";
+
+/// Whole seconds since the epoch — standing approvals store `expires_at` /
+/// compare `now` in **seconds** (`store::unix_now`), so a standing check must
+/// pass seconds, not the millisecond clock the budget gate uses.
+fn now_secs_from_ms(now_ms: i64) -> i64 {
+    now_ms.div_euclid(1000)
+}
+
+/// A standing-authority match for the synthetic Prime authority in `tenant`.
+fn authority_match<'a>(tenant: &'a str, category: &'a str, now_secs: i64) -> StandingApprovalMatch<'a> {
+    StandingApprovalMatch {
+        agent_id: AUTONOMOUS_PRIME_AUTHORITY,
+        category,
+        method: "",
+        task_id: None,
+        session_id: None,
+        workspace_path: None,
+        tenant_id: Some(tenant),
+        estimated_cost_micros: 0,
+        now: now_secs,
+    }
+}
+
+/// Is a standing authority for `category` currently active in `tenant`?
+/// Gate-only (does not consume); a missing/expired/exhausted grant reads false.
+fn standing_active(agent_store: &AgentStore, tenant: &str, category: &str, now_secs: i64) -> bool {
+    agent_store
+        .has_active_standing_for(authority_match(tenant, category, now_secs))
+        .unwrap_or(false)
+}
+
+/// Consume ONE call of the active standing authority for `category` in `tenant`
+/// after an autonomous action actually succeeded. A bounded grant
+/// (`max_calls`/`max_cost`) is decremented; an unlimited grant returns `Some`
+/// without decrementing (existing `consume_active_standing_for` semantics). Best
+/// effort — a consume miss never undoes the action already taken.
+fn consume_standing(agent_store: &AgentStore, tenant: &str, category: &str, now_secs: i64) -> Option<String> {
+    agent_store
+        .consume_active_standing_for(authority_match(tenant, category, now_secs))
+        .ok()
+        .flatten()
+}
 
 /// Wire arg for `prime.next_step`: exactly one of `proposal_id` / `mandate_id`.
 #[derive(Debug, Default, Deserialize)]
@@ -723,6 +802,75 @@ pub fn handle_prime_advance(
     ok_json(&body)
 }
 
+/// The configured autonomous hire Rig: `RELIX_AUTONOMOUS_PRIME_HIRE_RIG`,
+/// trimmed, default [`DEFAULT_AUTONOMOUS_HIRE_RIG`] when unset/blank. The raw
+/// value is passed through unvalidated on purpose — the tick validates it
+/// against the known-Rig allowlist and **refuses/skips** a hire rather than
+/// silently binding a bad Rig, so a typo is surfaced (left pending) instead of
+/// quietly downgraded.
+pub fn configured_autonomous_hire_rig() -> String {
+    std::env::var("RELIX_AUTONOMOUS_PRIME_HIRE_RIG")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_AUTONOMOUS_HIRE_RIG)
+        .to_string()
+}
+
+/// `prime.standing_authority` — READ-ONLY. The Prime standing-authority state
+/// for the caller's Guild: whether each of the three categories is currently
+/// active (a non-expired, non-exhausted `standing_approvals` row exists for the
+/// synthetic authority subject in this tenant), plus the synthetic authority id,
+/// the grantable categories, and the configured autonomous hire Rig. Mutates
+/// nothing; surfaces NO secret. The grant/revoke routes are the existing
+/// `agent.standing_approval.*` (`/v1/agents/:id/standing-approvals`).
+pub fn handle_prime_standing_authority(
+    agent_store: &AgentStore,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let tenant = ctx.tenant_id_or_default();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let driver_enabled = crate::nodes::coordinator::heartbeat::parse_autonomous_prime_enabled(
+        std::env::var("RELIX_AUTONOMOUS_PRIME").ok().as_deref(),
+    );
+    let hire_rig = configured_autonomous_hire_rig();
+    let hire_rig_valid = crate::rig::is_known_rig(&hire_rig);
+    let descriptions = [
+        "Autonomously approve/materialize a proposed Prime proposal through the existing prime.approve path.",
+        "Autonomously activate a pending hire created by Prime/company planning, bound to the configured safe Rig.",
+        "Autonomously greenlight a pending spawn Clearance tied to Prime/company planning.",
+    ];
+    let categories: Vec<Value> = STANDING_AUTHORITY_CATEGORIES
+        .iter()
+        .zip(descriptions.iter())
+        .map(|(cat, desc)| {
+            json!({
+                "category": cat,
+                "active": standing_active(agent_store, tenant, cat, now_secs),
+                "description": desc,
+            })
+        })
+        .collect();
+    let body = json!({
+        "authority_id": AUTONOMOUS_PRIME_AUTHORITY,
+        // The env switch only enables the *loop*; each approval category still
+        // requires its own standing-approval row — env is never an approval bypass.
+        "driver_enabled": driver_enabled,
+        "hire_rig": hire_rig,
+        "hire_rig_valid": hire_rig_valid,
+        "categories": categories,
+        "note": "These are standing approvals granted to the synthetic Prime authority, not env bypasses. \
+                 Enabling RELIX_AUTONOMOUS_PRIME only runs the loop; each category above acts only when a \
+                 standing-approval row exists for this Guild. Grant/revoke via \
+                 POST/DELETE /v1/agents/__relix_autonomous_prime__/standing-approvals.",
+    });
+    ok_json(&body)
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // AUTONOMOUS PRIME DRIVER (v1) — opt-in, bounded (company-model §5.4/§8.2 the
 // Action Center "next governed step"; §12.5/§12.5B the Prime planner + Start).
@@ -880,6 +1028,7 @@ fn process_candidate(
     target: Value,
     actions: &mut usize,
     max: usize,
+    hire_rig: &str,
 ) -> PrimeAutonomyRecord {
     let mk = |phase: String,
               action: &'static str,
@@ -1000,6 +1149,111 @@ fn process_candidate(
         };
     }
 
+    // (B2) needs_hire_approval — STANDING-AUTHORITY governance automation. A
+    // pending spawn Clearance / hire is normally a human gate (left `blocked`),
+    // but when the Board granted the matching standing authority for THIS Guild
+    // the loop may greenlight it on the Board's behalf. Clearances first (mirrors
+    // `classify_mandate` priority — greenlighting a Clearance activates its hire),
+    // then bare pending hires. Both items are surfaced by `compute_readiness`
+    // from the Mandate's own Team Plan, so they are attributable to Prime/company
+    // planning by construction; a hire/Clearance outside this Mandate's plan never
+    // appears here and is never touched. At most ONE governance action per
+    // candidate per tick (the next tick re-classifies and handles the rest).
+    if step.phase == "needs_hire_approval" {
+        let now_secs = now_secs_from_ms(now_ms);
+
+        // Spawn Clearance — needs `prime.clearance.approve`.
+        if let Some(cid) = step
+            .pending_clearances
+            .first()
+            .and_then(|c| c.get("clearance_id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            if !standing_active(agent_store, tenant, CATEGORY_CLEARANCE_APPROVE, now_secs) {
+                return mk(
+                    phase,
+                    "none",
+                    "blocked",
+                    "pending spawn Clearance — no prime.clearance.approve standing authority for this Guild".into(),
+                    mandate_id,
+                );
+            }
+            if *actions >= max {
+                return mk(phase, "clearance_approve", "skipped", "tick action budget reached".into(), mandate_id);
+            }
+            return match autonomous_approve_spawn_clearance(agent_store, tenant, cid) {
+                Ok(hire_id) => {
+                    *actions += 1;
+                    let _ = consume_standing(agent_store, tenant, CATEGORY_CLEARANCE_APPROVE, now_secs);
+                    if let Some(mid) = mandate_id.as_deref() {
+                        chronicle_autonomous(
+                            task_store,
+                            mid,
+                            "prime.autonomous_clearance_approve",
+                            &format!(
+                                "autonomous Prime greenlit spawn Clearance {cid} (activated hire {hire_id}) on mandate {mid}"
+                            ),
+                        );
+                    }
+                    mk(phase, "clearance_approve", "advanced", format!("greenlit spawn Clearance {cid}"), mandate_id)
+                }
+                Err(e) => mk(phase, "clearance_approve", "blocked", format!("clearance greenlight refused: {e}"), mandate_id),
+            };
+        }
+
+        // Bare pending hire — needs `prime.hire.approve`.
+        if let Some(hid) = step
+            .pending_hires
+            .first()
+            .and_then(|h| h.get("agent_id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            if !standing_active(agent_store, tenant, CATEGORY_HIRE_APPROVE, now_secs) {
+                return mk(
+                    phase,
+                    "none",
+                    "blocked",
+                    "pending hire — no prime.hire.approve standing authority for this Guild".into(),
+                    mandate_id,
+                );
+            }
+            // A misconfigured Rig is SKIPPED (hire left pending), never silently
+            // bound — same known-Rig allowlist the manual approve_hire enforces.
+            if !crate::rig::is_known_rig(hire_rig) {
+                return mk(
+                    phase,
+                    "hire_approve",
+                    "skipped",
+                    format!("configured hire rig `{hire_rig}` is not a known Rig — leaving hire pending"),
+                    mandate_id,
+                );
+            }
+            if *actions >= max {
+                return mk(phase, "hire_approve", "skipped", "tick action budget reached".into(), mandate_id);
+            }
+            return match agent_store.approve_hire_with_rig(hid, Some(hire_rig), tenant) {
+                Ok(outcome) => {
+                    *actions += 1;
+                    let _ = consume_standing(agent_store, tenant, CATEGORY_HIRE_APPROVE, now_secs);
+                    let bound = outcome.rig.as_deref().unwrap_or(hire_rig);
+                    if let Some(mid) = mandate_id.as_deref() {
+                        chronicle_autonomous(
+                            task_store,
+                            mid,
+                            "prime.autonomous_hire_approve",
+                            &format!("autonomous Prime activated hire {hid} on rig {bound} for mandate {mid}"),
+                        );
+                    }
+                    mk(phase, "hire_approve", "advanced", format!("activated hire {hid} on rig {bound}"), mandate_id)
+                }
+                Err(e) => mk(phase, "hire_approve", "blocked", format!("hire activation refused: {e}"), mandate_id),
+            };
+        }
+        // Fall through (no actionable item) to the human-gate record below.
+    }
+
     // (C) Everything else needs a human gate, or is already running / done —
     // record it, act on nothing, write no event.
     let outcome = match step.phase {
@@ -1031,6 +1285,7 @@ pub fn autonomous_prime_tick(
     now_ms: i64,
     max: usize,
     tenant: Option<&str>,
+    hire_rig: &str,
 ) -> Result<Vec<PrimeAutonomyRecord>, String> {
     if max == 0 {
         return Ok(Vec::new());
@@ -1039,6 +1294,72 @@ pub fn autonomous_prime_tick(
     let mut actions = 0usize;
     // Bounded discovery — never an unbounded table scan.
     let discover_cap = max.saturating_mul(4).clamp(max, 50);
+    let now_secs = now_secs_from_ms(now_ms);
+
+    // PASS 0 — STANDING-AUTHORITY PROPOSAL APPROVAL. Only for a Guild that
+    // granted the `prime.proposal.approve` standing authority: approve PROPOSED
+    // Prime proposals through the EXISTING `prime.approve` path (which creates
+    // the Mandate + Briefs + crew assignments + pending hires). The proposed list
+    // is status-filtered (`status='proposed'`) and tenant-stamped, so a
+    // rejected / already-approved / cross-Guild proposal is never approved here,
+    // and the standing check is per the proposal's OWN Guild (no cross-tenant
+    // grant leak). Idempotent: once approved, the proposal leaves the proposed
+    // set, so a re-tick neither re-approves it nor consumes the grant again.
+    let proposed = spine_store
+        .list_proposed_prime_proposals(tenant, discover_cap)
+        .map_err(|e| format!("autonomous prime: list proposed: {e}"))?;
+    for p in proposed {
+        if actions >= max {
+            break;
+        }
+        // No authority for this proposal's Guild → leave it proposed, silently
+        // (no record, so an unauthorized tenant never spams the tick summary).
+        if !standing_active(agent_store, &p.tenant_id, CATEGORY_PROPOSAL_APPROVE, now_secs) {
+            continue;
+        }
+        let approve_ctx = autonomous_prime_ctx(&p.tenant_id, p.proposal_id.clone().into_bytes());
+        let rec = match handle_prime_approve(agent_store, spine_store, task_store, &approve_ctx) {
+            HandlerOutcome::Ok(b) => {
+                actions += 1;
+                let _ = consume_standing(agent_store, &p.tenant_id, CATEGORY_PROPOSAL_APPROVE, now_secs);
+                let v: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
+                let mid = v
+                    .get("mandate_id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                if let Some(m) = mid.as_deref() {
+                    chronicle_autonomous(
+                        task_store,
+                        m,
+                        "prime.autonomous_approve",
+                        &format!("autonomous Prime approved proposal {} (mandate {m})", p.proposal_id),
+                    );
+                }
+                PrimeAutonomyRecord {
+                    tenant: p.tenant_id.clone(),
+                    target_kind: "proposal",
+                    target_id: p.proposal_id.clone(),
+                    mandate_id: mid,
+                    phase: "needs_approval".to_string(),
+                    action: "approve",
+                    outcome: "approved",
+                    reason: "materialized proposed plan through the existing prime.approve path".to_string(),
+                }
+            }
+            HandlerOutcome::Err(e) => PrimeAutonomyRecord {
+                tenant: p.tenant_id.clone(),
+                target_kind: "proposal",
+                target_id: p.proposal_id.clone(),
+                mandate_id: None,
+                phase: "needs_approval".to_string(),
+                action: "approve",
+                outcome: "blocked",
+                reason: format!("autonomous approve refused: {}", e.cause),
+            },
+        };
+        records.push(rec);
+    }
 
     let proposals = spine_store
         .list_approved_prime_proposals(tenant, discover_cap)
@@ -1067,6 +1388,7 @@ pub fn autonomous_prime_tick(
             target,
             &mut actions,
             max,
+            hire_rig,
         ));
     }
 
@@ -1095,6 +1417,7 @@ pub fn autonomous_prime_tick(
                 target,
                 &mut actions,
                 max,
+                hire_rig,
             ));
         }
     }
@@ -1379,17 +1702,15 @@ mod tests {
 
     // ── AUTONOMOUS PRIME DRIVER (the opt-in loop) ──────────────────────────
 
-    use crate::nodes::coordinator::agent::handlers::{
-        handle_prime_approve, handle_prime_propose, handle_starter_crew,
-    };
+    use crate::nodes::coordinator::agent::handlers::{handle_prime_propose, handle_starter_crew};
 
     fn echo_registry() -> crate::rig::RigRegistry {
         crate::rig::RigRegistry::with_builtins().with_default("echo")
     }
 
     /// Run an autonomous Prime tick over one Guild with no metrics (budget gate
-    /// inert) — the common shape for the deterministic team-plan / orchestrate
-    /// tests below.
+    /// inert) and the safe-local `echo` hire Rig — the common shape for the
+    /// deterministic team-plan / orchestrate tests below.
     fn tick(
         agents: &AgentStore,
         spine: &SpineStore,
@@ -1398,7 +1719,47 @@ mod tests {
         max: usize,
         tenant: Option<&str>,
     ) -> Vec<PrimeAutonomyRecord> {
-        autonomous_prime_tick(agents, spine, tasks, reg, None, 0, max, tenant).unwrap()
+        autonomous_prime_tick(agents, spine, tasks, reg, None, 0, max, tenant, "echo").unwrap()
+    }
+
+    /// Like [`tick`], but with an explicit hire Rig so the standing-authority
+    /// hire tests can exercise the configured-Rig validation path.
+    fn tick_rig(
+        agents: &AgentStore,
+        spine: &SpineStore,
+        tasks: &Arc<TaskStore>,
+        reg: &crate::rig::RigRegistry,
+        max: usize,
+        tenant: Option<&str>,
+        hire_rig: &str,
+    ) -> Vec<PrimeAutonomyRecord> {
+        autonomous_prime_tick(agents, spine, tasks, reg, None, 0, max, tenant, hire_rig).unwrap()
+    }
+
+    /// Grant the synthetic Prime authority a bounded standing approval for
+    /// `category` in `tenant` (default `max_calls` unless overridden) — the Board
+    /// action the standing-authority driver consumes.
+    fn grant_standing(agents: &AgentStore, tenant: &str, category: &str, max_calls: Option<i64>) -> String {
+        agents
+            .create_scoped_standing(crate::nodes::coordinator::agent::store::StandingApprovalCreate {
+                agent_id: AUTONOMOUS_PRIME_AUTHORITY,
+                match_category: category,
+                match_path_glob: None,
+                scope_kind: None,
+                task_id: None,
+                session_id: None,
+                method_prefix: None,
+                workspace_path_glob: None,
+                // Far-future expiry in SECONDS (standing approvals compare `now`
+                // in seconds; the tick passes `now_ms=0` → `now_secs=0`).
+                expires_at: 9_999_999_999,
+                granted_by: "operator",
+                max_calls,
+                max_cost_micros: None,
+                note: "test grant",
+                tenant_id: tenant,
+            })
+            .unwrap()
     }
 
     // A) Default-off boundary: the tick is a pure helper — `max == 0` (the
@@ -1615,5 +1976,327 @@ mod tests {
             recs2.iter().all(|r| r.outcome != "started"),
             "a running proposal must not be double-started"
         );
+    }
+
+    // ── PRIME STANDING AUTHORITY (v1) ──────────────────────────────────────
+
+    /// Propose a deterministic plan and return its (proposed) proposal id.
+    fn propose_pid(agents: &AgentStore, spine: &SpineStore) -> String {
+        let _ = handle_starter_crew(agents, &fake_ctx_with_role(b"", "operator", b"caller"));
+        let ctx = fake_ctx_with_role(b"Build a sales dashboard", "operator", b"caller");
+        match handle_prime_propose(agents, spine, &ctx) {
+            HandlerOutcome::Ok(b) => serde_json::from_slice::<Value>(&b).unwrap()["proposal_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            HandlerOutcome::Err(e) => panic!("propose: {}", e.cause),
+        }
+    }
+
+    // H) No standing authority → a proposed proposal is left proposed (the loop
+    //    never approves a Prime proposal from env alone).
+    #[test]
+    fn autonomous_tick_without_standing_leaves_proposal_proposed() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let pid = propose_pid(&agents, &spine);
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 5, Some("default"));
+        assert!(
+            recs.iter().all(|r| r.outcome != "approved"),
+            "no standing authority ⇒ no autonomous approval"
+        );
+        assert_eq!(
+            spine.get_prime_proposal("default", &pid).unwrap().unwrap().status,
+            "proposed",
+            "the proposal must remain proposed"
+        );
+    }
+
+    // I) With `prime.proposal.approve` standing → the proposed proposal is
+    //    approved through the existing prime.approve path, the max bound is
+    //    honored, and a bounded grant's single call is consumed.
+    #[test]
+    fn autonomous_tick_with_standing_approves_proposal_bounded() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let pid = propose_pid(&agents, &spine);
+        // Bounded to exactly one approval.
+        grant_standing(&agents, "default", CATEGORY_PROPOSAL_APPROVE, Some(1));
+
+        // max=1 ⇒ only the approval action fires this tick.
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec = recs
+            .iter()
+            .find(|r| r.target_kind == "proposal" && r.outcome == "approved")
+            .expect("the proposed proposal is approved by the loop");
+        assert_eq!(rec.action, "approve");
+        assert_eq!(rec.phase, "needs_approval");
+
+        let row = spine.get_prime_proposal("default", &pid).unwrap().unwrap();
+        assert_eq!(row.status, "approved");
+        assert!(!row.mandate_id.is_empty(), "approval materialized a Mandate");
+        // Real Briefs were created through the governed approve path.
+        assert!(!tasks.list_briefs_by_mandate(&row.mandate_id, 50).unwrap().is_empty());
+
+        // The bounded (max_calls=1) grant is now exhausted.
+        assert!(
+            !agents.has_active_standing(AUTONOMOUS_PRIME_AUTHORITY, CATEGORY_PROPOSAL_APPROVE, 1).unwrap(),
+            "a bounded standing grant is consumed when the approval is taken"
+        );
+    }
+
+    // J) Re-tick idempotency: an already-approved proposal is not re-approved and
+    //    the standing grant is not consumed a second time. (`tokio::test` because
+    //    a larger budget lets the approved proposal proceed to Start, which funnels
+    //    through the run preflight's reactor.)
+    #[tokio::test]
+    async fn autonomous_tick_proposal_approval_is_idempotent() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let pid = propose_pid(&agents, &spine);
+        // Allow two calls so a (wrong) double-consume would be observable.
+        grant_standing(&agents, "default", CATEGORY_PROPOSAL_APPROVE, Some(2));
+
+        let _ = tick(&agents, &spine, &tasks, &reg, 5, Some("default"));
+        let row1 = spine.get_prime_proposal("default", &pid).unwrap().unwrap();
+        assert_eq!(row1.status, "approved");
+        let mandate1 = row1.mandate_id.clone();
+        let briefs1 = tasks.list_briefs_by_mandate(&mandate1, 50).unwrap().len();
+        let used1 = agents.list_standing_for_tenant(AUTONOMOUS_PRIME_AUTHORITY, "default").unwrap()[0].calls_used;
+        assert_eq!(used1, 1, "exactly one approval call consumed");
+
+        // Re-tick: the proposal is no longer proposed, so nothing re-approves it.
+        let recs2 = tick(&agents, &spine, &tasks, &reg, 5, Some("default"));
+        assert!(
+            recs2.iter().all(|r| !(r.target_id == pid && r.outcome == "approved")),
+            "an already-approved proposal must not be re-approved"
+        );
+        let row2 = spine.get_prime_proposal("default", &pid).unwrap().unwrap();
+        assert_eq!(row2.mandate_id, mandate1, "no second Mandate");
+        assert_eq!(
+            tasks.list_briefs_by_mandate(&mandate1, 50).unwrap().len(),
+            briefs1,
+            "no duplicate Briefs"
+        );
+        let used2 = agents.list_standing_for_tenant(AUTONOMOUS_PRIME_AUTHORITY, "default").unwrap()[0].calls_used;
+        assert_eq!(used2, 1, "the grant is not consumed again on a re-tick");
+    }
+
+    // K) Tenant isolation: a standing grant in Guild A never approves Guild B's
+    //    proposal. A cross-Guild tick (tenant=None) approves only the granted
+    //    Guild's proposal. (`tokio::test` — the granted Guild's approved work may
+    //    proceed to Start through the run preflight's reactor.)
+    #[tokio::test]
+    async fn standing_authority_is_tenant_isolated() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        // A proposed proposal in each Guild.
+        let pid_default = propose_pid(&agents, &spine);
+        let other_ctx = fake_ctx_tenant(b"Build a sales dashboard", "other");
+        let pid_other = match handle_prime_propose(&agents, &spine, &other_ctx) {
+            HandlerOutcome::Ok(b) => serde_json::from_slice::<Value>(&b).unwrap()["proposal_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            HandlerOutcome::Err(e) => panic!("propose other: {}", e.cause),
+        };
+        // Grant ONLY in "default".
+        grant_standing(&agents, "default", CATEGORY_PROPOSAL_APPROVE, None);
+
+        // Drive ALL Guilds.
+        let _ = tick(&agents, &spine, &tasks, &reg, 10, None);
+
+        assert_eq!(
+            spine.get_prime_proposal("default", &pid_default).unwrap().unwrap().status,
+            "approved",
+            "the granted Guild's proposal is approved"
+        );
+        assert_eq!(
+            spine.get_prime_proposal("other", &pid_other).unwrap().unwrap().status,
+            "proposed",
+            "a grant in `default` must never approve `other`'s proposal"
+        );
+    }
+
+    /// An approved Mandate carrying a single PENDING hire in its Team Plan — the
+    /// `needs_hire_approval` shape the hire-approve standing authority acts on.
+    fn mandate_with_pending_hire(agents: &AgentStore, spine: &SpineStore) -> (String, String) {
+        let m = approved_mandate(spine);
+        let pending = agents
+            .request_hire("P", "engineer", "P", "eng", "eng", "prime", "subj-p", "medium", "default")
+            .unwrap();
+        let hires = format!("[{{\"role\":\"engineer\",\"agent_id\":\"{pending}\"}}]");
+        spine
+            .record_team_plan(&TeamPlanRecord {
+                tenant_id: "default",
+                mandate_id: &m,
+                actor_id: "operator",
+                description: "x",
+                proposed_roles_json: "[]",
+                pending_hires_json: &hires,
+                clearance_ids_json: "[]",
+                denials_json: "[]",
+                next_steps_json: "[]",
+                status: "staffing",
+            })
+            .unwrap();
+        (m, pending)
+    }
+
+    // L) With `prime.hire.approve` standing → an attributable pending hire is
+    //    activated and bound to the configured safe Rig; without it, the hire
+    //    stays pending.
+    #[test]
+    fn standing_hire_approve_activates_pending_hire_on_configured_rig() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, pending) = mandate_with_pending_hire(&agents, &spine);
+        grant_standing(&agents, "default", CATEGORY_HIRE_APPROVE, Some(1));
+
+        let recs = tick_rig(&agents, &spine, &tasks, &reg, 1, Some("default"), "echo");
+        let rec = recs.iter().find(|r| r.target_id == m).expect("mandate considered");
+        assert_eq!(rec.phase, "needs_hire_approval");
+        assert_eq!(rec.action, "hire_approve");
+        assert_eq!(rec.outcome, "advanced");
+
+        let agent = agents.get_agent(&pending).unwrap().unwrap();
+        assert_eq!(agent.status, "active", "the hire is activated");
+        assert_eq!(agent.rig.as_deref(), Some("echo"), "bound to the configured Rig");
+        assert!(
+            !agents.has_active_standing(AUTONOMOUS_PRIME_AUTHORITY, CATEGORY_HIRE_APPROVE, 1).unwrap(),
+            "the bounded hire grant is consumed"
+        );
+    }
+
+    // M) An unknown configured hire Rig is REFUSED/SKIPPED — never silently
+    //    bound — and the hire is left pending (no consume).
+    #[test]
+    fn standing_hire_approve_refuses_unknown_rig() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, pending) = mandate_with_pending_hire(&agents, &spine);
+        grant_standing(&agents, "default", CATEGORY_HIRE_APPROVE, Some(1));
+
+        let recs = tick_rig(&agents, &spine, &tasks, &reg, 1, Some("default"), "bogus-rig");
+        let rec = recs.iter().find(|r| r.target_id == m).expect("mandate considered");
+        assert_eq!(rec.action, "hire_approve");
+        assert_eq!(rec.outcome, "skipped", "an unknown Rig is skipped, not bound");
+
+        let agent = agents.get_agent(&pending).unwrap().unwrap();
+        assert_eq!(agent.status, "pending", "the hire stays pending on a bad Rig");
+        assert!(agent.rig.is_none(), "no bad Rig was bound");
+        assert!(
+            agents.has_active_standing(AUTONOMOUS_PRIME_AUTHORITY, CATEGORY_HIRE_APPROVE, 1).unwrap(),
+            "a skipped action does not consume the grant"
+        );
+    }
+
+    // N) Without `prime.hire.approve` standing, even with the driver running, a
+    //    pending hire is left untouched (blocked, not activated).
+    #[test]
+    fn standing_hire_approve_requires_grant() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, pending) = mandate_with_pending_hire(&agents, &spine);
+        // No grant.
+        let recs = tick(&agents, &spine, &tasks, &reg, 5, Some("default"));
+        let rec = recs.iter().find(|r| r.target_id == m).expect("mandate considered");
+        assert_eq!(rec.outcome, "blocked");
+        assert_eq!(agents.get_agent(&pending).unwrap().unwrap().status, "pending");
+    }
+
+    // O) With `prime.clearance.approve` standing → an attributable pending spawn
+    //    Clearance is greenlit (activating its hire); an unrelated NON-spawn
+    //    approval is never touched.
+    #[test]
+    fn standing_clearance_approve_greenlights_attributable_clearance_only() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        let pending = agents
+            .request_hire("P", "engineer", "P", "eng", "eng", "prime", "subj-cl", "medium", "default")
+            .unwrap();
+        let cid = agents
+            .create_spawn_clearance(&pending, "subj-cl", "spawn the hire", &[], "default")
+            .unwrap();
+        let hires = format!("[{{\"role\":\"engineer\",\"agent_id\":\"{pending}\"}}]");
+        let clearances = format!("[\"{cid}\"]");
+        spine
+            .record_team_plan(&TeamPlanRecord {
+                tenant_id: "default",
+                mandate_id: &m,
+                actor_id: "operator",
+                description: "x",
+                proposed_roles_json: "[]",
+                pending_hires_json: &hires,
+                clearance_ids_json: &clearances,
+                denials_json: "[]",
+                next_steps_json: "[]",
+                status: "awaiting_clearance",
+            })
+            .unwrap();
+        // An UNRELATED non-spawn approval that must remain pending.
+        let arbitrary = agents
+            .create_approval(
+                "subj-x", "subj-x", "tool.shell", "tool", "hash", "run a tool", &[], None, 9_999_999_999, &[],
+                "default",
+            )
+            .unwrap();
+        grant_standing(&agents, "default", CATEGORY_CLEARANCE_APPROVE, Some(1));
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec = recs.iter().find(|r| r.target_id == m).expect("mandate considered");
+        assert_eq!(rec.phase, "needs_hire_approval");
+        assert_eq!(rec.action, "clearance_approve");
+        assert_eq!(rec.outcome, "advanced");
+
+        // The spawn Clearance is approved and the hire is now active.
+        assert_eq!(
+            agents.get_approval_record_for_tenant(&cid, "default").unwrap().unwrap().status.as_wire(),
+            "approved"
+        );
+        assert_eq!(agents.get_agent(&pending).unwrap().unwrap().status, "active");
+        // The unrelated tool approval is untouched.
+        assert_eq!(
+            agents.get_approval_record_for_tenant(&arbitrary, "default").unwrap().unwrap().status.as_wire(),
+            "pending",
+            "an arbitrary non-spawn approval is never auto-approved"
+        );
+    }
+
+    // P) The read-only `prime.standing_authority` surface reflects live grant
+    //    state for the caller's Guild.
+    #[test]
+    fn standing_authority_surface_reports_live_state() {
+        let (agents, _spine, _tasks) = stores();
+        grant_standing(&agents, "default", CATEGORY_HIRE_APPROVE, None);
+        let out = handle_prime_standing_authority(
+            &agents,
+            &fake_ctx_with_role(b"", "operator", b"caller"),
+        );
+        let v: Value = match out {
+            HandlerOutcome::Ok(b) => serde_json::from_slice(&b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("standing_authority errored: {}", e.cause),
+        };
+        assert_eq!(v["authority_id"], AUTONOMOUS_PRIME_AUTHORITY);
+        let cats = v["categories"].as_array().unwrap();
+        let active_of = |cat: &str| -> bool {
+            cats.iter()
+                .find(|c| c["category"] == cat)
+                .map(|c| c["active"].as_bool().unwrap())
+                .unwrap()
+        };
+        assert!(active_of(CATEGORY_HIRE_APPROVE), "the granted category is active");
+        assert!(!active_of(CATEGORY_PROPOSAL_APPROVE), "an ungranted category is inactive");
+        assert!(!active_of(CATEGORY_CLEARANCE_APPROVE));
     }
 }

@@ -3405,6 +3405,25 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // PRIME STANDING AUTHORITY (v1) — READ-ONLY. Reports, for the caller's Guild,
+    // whether each of the three autonomous-Prime standing-authority categories
+    // (proposal/hire/clearance approve) is currently active, plus the synthetic
+    // authority id + categories operators grant via the existing
+    // `agent.standing_approval.*` routes. Tenant-scoped; mutates nothing.
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "prime.standing_authority",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move {
+                    crate::nodes::coordinator::agent::prime_driver::handle_prime_standing_authority(
+                        &s, &ctx,
+                    )
+                }
+            })),
+        );
+    }
     // ACTION CENTER (company-model §5.4 / §8.2): one READ-ONLY feed of the
     // operator's next actions, computed from existing live state (approvals,
     // hires, the Brief board, the run ledger, the strategy gate). Tenant-scoped;
@@ -11367,6 +11386,12 @@ fn register_node_type_handlers(
                     .and_then(|v| v.trim().parse::<u64>().ok())
                     .filter(|n| *n >= 1)
                     .unwrap_or(30);
+                // The Rig the STANDING-AUTHORITY hire-approve binds (default
+                // safe-local `echo`). Passed through unvalidated on purpose — the
+                // tick refuses/skips a hire on an unknown Rig rather than silently
+                // binding a bad one, so a typo surfaces as a pending hire.
+                let prime_hire_rig =
+                    crate::nodes::coordinator::agent::prime_driver::configured_autonomous_hire_rig();
                 let task_store = store.clone();
                 let ag_store = agent_store.clone();
                 let registry = rig_registry.clone();
@@ -11381,6 +11406,7 @@ fn register_node_type_handlers(
                         let reg = registry.clone();
                         let mq = metrics_query.clone();
                         let spine = spine_arc.clone();
+                        let hire_rig = prime_hire_rig.clone();
                         let outcome = tokio::task::spawn_blocking(move || {
                             let now_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -11397,6 +11423,7 @@ fn register_node_type_handlers(
                                 now_ms,
                                 prime_max,
                                 None,
+                                &hire_rig,
                             )
                         })
                         .await;

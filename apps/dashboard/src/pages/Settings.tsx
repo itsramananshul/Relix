@@ -39,6 +39,20 @@ interface RunConfig {
   autonomous_prime_interval_secs?: number;
 }
 
+interface StandingAuthorityCategory {
+  category?: string;
+  active?: boolean;
+  description?: string;
+}
+interface StandingAuthority {
+  authority_id?: string;
+  driver_enabled?: boolean;
+  hire_rig?: string;
+  hire_rig_valid?: boolean;
+  categories?: StandingAuthorityCategory[];
+  note?: string;
+}
+
 function extractProviders(v: unknown): Provider[] {
   if (Array.isArray(v)) return v as Provider[];
   if (v && typeof v === "object") {
@@ -51,17 +65,19 @@ function extractProviders(v: unknown): Provider[] {
 export function Settings() {
   const { status, logout } = useAuth();
   const { data, loading, reload } = useAsync(async () => {
-    const [info, providers, adapters, runConfig] = await Promise.all([
+    const [info, providers, adapters, runConfig, primeAuthority] = await Promise.all([
       tryGet<Record<string, unknown>>("/v1/info", {}),
       tryGet<unknown>("/v1/config/providers", {}),
       tryGet<Adapter[]>("/v1/adapters", []),
       tryGet<RunConfig>("/v1/spine/run-config", {}),
+      tryGet<StandingAuthority>("/v1/spine/prime/standing-authority", {}),
     ]);
     return {
       info,
       providers: extractProviders(providers),
       adapters: Array.isArray(adapters) ? adapters : [],
       runConfig: runConfig ?? {},
+      primeAuthority: primeAuthority ?? {},
     };
   }, []);
 
@@ -69,6 +85,7 @@ export function Settings() {
   const providers = data?.providers ?? [];
   const adapters = data?.adapters ?? [];
   const runConfig = data?.runConfig ?? {};
+  const primeAuthority = data?.primeAuthority ?? {};
 
   return (
     <div className="grid">
@@ -288,6 +305,48 @@ export function Settings() {
           readiness, per-Operative wake/concurrency caps, and budget hard-stops. No LLM diagnosis or
           provider-quota polling.
         </p>
+      </div>
+
+      <div className="card" style={{ gridColumn: "1 / -1" }}>
+        <h3>Prime standing authority</h3>
+        <p className="muted" style={{ marginTop: -2, marginBottom: 12 }}>
+          Bounded powers the Board can grant the autonomous Prime to act on its behalf at specific
+          approval gates. These are <strong>standing approvals, not env bypasses</strong>: enabling{" "}
+          <span className="mono">RELIX_AUTONOMOUS_PRIME</span> only runs the loop — each category below
+          acts <em>only</em> while a standing-approval row exists for this Guild. Granted/revoked via{" "}
+          <span className="mono">/v1/agents/{primeAuthority.authority_id ?? "__relix_autonomous_prime__"}/standing-approvals</span>.
+        </p>
+        {loading ? (
+          <div className="loading">Loading…</div>
+        ) : (
+          <table className="table">
+            <tbody>
+              {(primeAuthority.categories ?? []).map((c) => (
+                <tr key={c.category}>
+                  <td className="mono" style={{ fontSize: 12 }}>{c.category}</td>
+                  <td>
+                    <span className={"badge " + (c.active ? "done" : "backlog")}>
+                      {c.active ? "enabled" : "disabled"}
+                    </span>
+                    <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>{c.description}</span>
+                  </td>
+                </tr>
+              ))}
+              {(primeAuthority.categories ?? []).length === 0 && (
+                <tr><td className="muted">Prime standing-authority state unavailable.</td></tr>
+              )}
+              <tr>
+                <td className="muted">Hire Rig</td>
+                <td>
+                  <span className="mono" style={{ fontSize: 12 }}>{primeAuthority.hire_rig ?? "echo"}</span>
+                  {primeAuthority.hire_rig_valid === false && (
+                    <span className="badge todo" style={{ marginLeft: 8 }}>unknown Rig — hires will be skipped</span>
+                  )}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        )}
       </div>
 
       <AdminRecoveryPanel />

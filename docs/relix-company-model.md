@@ -248,7 +248,7 @@ Some moves pause for a yes. The gate types:
 - **Budget override** — when an agent hits a hard budget stop, work pauses and an approval is raised: raise the budget and resume, resume once, or keep paused.
 - **High-risk action approval** — an action above an agent's risk ceiling or in an approval-required category pauses for a yes before it runs. (Relix already mints signed, one-shot approval tokens for exactly this, with standing approvals for "yes, for the next hour / 10 calls / $5.")
 
-The throughline: **approvals are uncircumventable** — there is no code path that lets a "requires approval" action proceed without a valid approval. (This is already true in Relix's gate; we keep it.)
+The throughline: **approvals are uncircumventable** — there is no code path that lets a "requires approval" action proceed without a valid approval. (This is already true in Relix's gate; we keep it.) The opt-in **autonomous Prime standing-authority** layer does not weaken this: it can take an approval action (approve a proposal, activate a planning hire, greenlight a planning Clearance) **only** by consuming a bounded **standing approval** the Board explicitly granted to the synthetic `__relix_autonomous_prime__` authority for that Guild — i.e. it operates *through* the grant, not around the gate. With no such grant every gate stays human, exactly as before. (Implementation: `docs/product-spine-implementation.md` "Prime standing authority"; gaps: `docs/current-limitations.md`.)
 
 ---
 

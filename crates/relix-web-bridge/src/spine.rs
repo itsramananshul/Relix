@@ -1930,6 +1930,17 @@ pub async fn run_config(
     json_passthrough(call_peer(&state, "run.workspace_config", b"").await?)
 }
 
+/// `GET /v1/spine/prime/standing-authority` — READ-ONLY Prime standing-authority
+/// state for the caller's Guild (which approve categories are currently active,
+/// the synthetic authority id, grantable categories, configured hire Rig).
+/// Tenant-scoped; mutates nothing. Grants are made/revoked through the existing
+/// `/v1/agents/:id/standing-approvals` routes.
+pub async fn prime_standing_authority(
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "prime.standing_authority", b"").await?)
+}
+
 /// `GET /v1/maintenance/summary` — operator storage + run-ledger overview
 /// (workspace count/bytes, run/event/artifact counts, warnings). Bounded,
 /// no secrets. Auth-gated by the bridge middleware like every `/v1/*`.

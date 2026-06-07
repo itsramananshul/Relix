@@ -859,6 +859,47 @@ impl SpineStore {
         Ok(rows)
     }
 
+    /// PROPOSED (not-yet-decided) Prime proposals — the autonomous Prime
+    /// **standing-authority** driver's proposal-approval candidate set. Bounded;
+    /// **oldest-first** so older pending work is approved first. Excludes
+    /// `approved` / `rejected` rows (so an already-approved proposal is never
+    /// re-approved and a rejected one is never resurrected). `tenant=None` spans
+    /// **all** Guilds (each row carries its own `tenant_id`, so the caller checks
+    /// standing authority per the row's own Guild); `tenant=Some(g)` scopes to
+    /// one Guild only.
+    pub fn list_proposed_prime_proposals(
+        &self,
+        tenant: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PrimeProposalRow>, SpineStoreError> {
+        let cap = limit.clamp(1, 200) as i64;
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let cols = "proposal_id, tenant_id, proposer_id, message, proposal_json,
+                    status, mandate_id, created_brief_ids, created_at, updated_at";
+        let rows = match tenant {
+            Some(t) => {
+                let t = normalize_tenant(t);
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {cols} FROM prime_proposals
+                     WHERE tenant_id = ?1 AND status = 'proposed'
+                     ORDER BY created_at ASC, rowid ASC LIMIT ?2"
+                ))?;
+                stmt.query_map(params![t, cap], row_to_prime_proposal)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            None => {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {cols} FROM prime_proposals
+                     WHERE status = 'proposed'
+                     ORDER BY created_at ASC, rowid ASC LIMIT ?1"
+                ))?;
+                stmt.query_map(params![cap], row_to_prime_proposal)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        };
+        Ok(rows)
+    }
+
     // ── mandates ─────────────────────────────────────────────
 
     /// Create a Mandate. Returns the freshly-allocated `mandate_id`.
