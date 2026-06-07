@@ -364,10 +364,25 @@ ledger entry or design section.
    the Crew page is URL-driven (`/agents?agent=<id>`) — opening that Operative's governance
    panel automatically, highlighting + scrolling its row/card into view, with View/Hide and a
    Copy-link affordance writing the query param so refresh/back/forward preserve the selection
-   (an unknown id renders an honest "no Operative matches …" banner, not a crash). *Remaining
-   gap:* there is still **no full, separate agent-detail tabbed route** (Overview/Instructions/
-   Skills/Runs/Budget per `dashboard-design §9`) — the governance panel is the inline §9
-   permission face, not the dedicated multi-tab agent page. **Full pan/zoom/pinch + Fit/Reset now ship** (the previously-deferred gap is
+   (an unknown id renders an honest "no Operative matches …" banner, not a crash). **The
+   per-Operative detail is now a full tabbed WORKBENCH (`dashboard-design §9`), not a row
+   expansion** (Crew/Operative detail slice): selecting an Operative (any Open button, a Lattice
+   deep link, or `/agents?agent=<id>`) opens a prominent employee-record panel with five tabs —
+   **Overview** (role/status/adapter/readiness, reports-to + clickable direct-reports, pressure
+   summary, open assigned Briefs from the board fetch, recent Shifts), **Permissions** (the intact
+   Keys + capability-powers + standing-approvals governance face — nothing removed), **Runs**
+   (this Operative's Shifts from the existing `/v1/runs` payload — status/trigger/rig/duration/
+   started + deep links to `/runs?run=<id>`), **Budget** (committed Allowance / risk ceiling /
+   concurrency / approval timeout, explicitly labelled *committed* not spent, with live spend
+   routed to the Costs page — never fabricated), and **Configuration** (adapter + autonomy/
+   heartbeat flags + org placement + identity + timestamps from `/v1/agents/:id`, with an honest
+   empty state for the charter/instruction-bundle + model config the read API does not yet
+   expose). The tab is URL-driven (`&tab=<tab>`, default Overview, unknown value falls back
+   safely) and Copy-link captures it; all five tabs reuse the page's existing fetches (the shared
+   detail cache + `/v1/runs` + the board columns) — **no new backend route and no extra fetch
+   loop**. *Remaining gap:* by design this stays the inline workbench on the Crew page (NOT a
+   separate `/agents/:id` router route — the query-param deep link is canonical); model lane /
+   instruction-bundle authoring is still not exposed by the agent read API. **Full pan/zoom/pinch + Fit/Reset now ship** (the previously-deferred gap is
    closed): the stage is one CSS `transform: translate() scale()` viewport driven by native
    PointerEvent (drag-pan + two-finger pinch) and a non-passive WheelEvent (cursor-anchored
    zoom), with explicit −/+/Fit/Reset controls, an auto-fit-once on first render (no jump on

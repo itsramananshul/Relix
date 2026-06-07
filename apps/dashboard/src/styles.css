@@ -498,6 +498,34 @@ a > .stat-card:hover { border-color: var(--text-faint); }
 }
 .op-group .pill-row { gap: 4px; }
 
+/* The Operative detail workbench (dashboard-design §9) — a prominent, tabbed
+   employee-record / command surface for the selected Operative. Flat, B&W,
+   no nested cards: an identity header, a tab bar, and a tab body. */
+.op-wb-wrap { margin-bottom: 14px; }
+.op-wb { border-color: var(--info); box-shadow: 0 0 0 1px var(--info) inset; padding: 14px 16px; }
+.op-wb-head {
+  display: flex; align-items: flex-start; gap: 12px; flex-wrap: wrap;
+  padding-bottom: 10px; border-bottom: 1px solid var(--border-soft);
+}
+.op-wb-head .op-wb-id { flex: 1; min-width: 0; }
+/* Tab bar — underline-style tabs (no boxes), keyboard-reachable buttons. */
+.op-tabs { display: flex; gap: 2px; flex-wrap: wrap; margin: 10px 0 0; border-bottom: 1px solid var(--border); }
+.op-tab {
+  background: none; border: none; cursor: pointer; color: var(--text-dim);
+  font-weight: 600; font-size: 12px; padding: 8px 12px; border-bottom: 2px solid transparent;
+  margin-bottom: -1px; display: inline-flex; align-items: center; gap: 6px;
+}
+.op-tab:hover { color: var(--text); }
+.op-tab.active { color: var(--text); border-bottom-color: var(--info); }
+.op-tab-n { font-size: 10px; color: var(--text-faint); background: var(--bg); border-radius: 999px; padding: 0 6px; }
+.op-tab-body { padding-top: 14px; }
+/* A compact one-line entry (assigned Brief / recent Shift) inside a tab. */
+.op-line {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 5px 0; border-bottom: 1px solid var(--border-soft);
+}
+.op-line:last-child { border-bottom: none; }
+
 /* Run transcript renderer (dashboard-design §8) — block-grouped "nice" view +
    compact "raw" dump, B&W with semantic-only color. Reused on the Runs page
    and embedded in the Brief workroom. */

@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, tryGet } from "../api";
 import { asArray, Badge, Empty, extractList, Section, useAsync } from "../components/common";
@@ -39,10 +39,23 @@ function fmtCents(c?: number | null): string {
   return "$" + (c / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-// One Operative's governance detail (`/v1/agents/:id`) — the Capability
-// powers half of the §9 permission panel: risk ceiling + the category/secret/
-// surface gates the admission pipeline already enforces. Read-only here.
+// One Operative's full detail (`/v1/agents/:id`). Beyond the Capability-powers
+// half of the §9 permission panel (risk ceiling + the category/secret/surface
+// gates the admission pipeline enforces), the same read carries the employee
+// record the Overview / Budget / Configuration tabs surface (org placement,
+// adapter, autonomy flags, allowance, timestamps). Read-only here.
 interface AgentDetail {
+  agent_id?: string;
+  name?: string;
+  role?: string;
+  title?: string;
+  department?: string;
+  team?: string;
+  created_by?: string;
+  status?: string;
+  subject_id?: string;
+  created_at?: number;
+  updated_at?: number;
   risk_ceiling?: string;
   approval_timeout_secs?: number;
   surface_allowlist?: string[];
@@ -51,6 +64,11 @@ interface AgentDetail {
   allow_sensitivity_tags?: string[];
   deny_sensitivity_tags?: string[];
   approval_required_categories?: string[];
+  rig?: string | null;
+  monthly_allowance_cents?: number | null;
+  max_concurrent_runs?: number;
+  wake_on_timer?: boolean;
+  wake_on_demand?: boolean;
 }
 
 // One standing approval (`/v1/agents/:id/standing-approvals`) — a pre-granted
@@ -111,8 +129,31 @@ interface CompanyStatus {
     by_role?: Record<string, number>;
   };
 }
-interface Card { assignee_agent_id?: string | null }
-interface RunRow { agent_id?: string; status?: string }
+// A board card (`/v1/spine/board/:col`) — enough to list an Operative's open
+// assigned Briefs (title + column + deep link) on the Overview tab.
+interface Card {
+  task_id?: string;
+  id?: string;
+  title?: string;
+  board_status?: string;
+  priority?: string;
+  assignee_agent_id?: string | null;
+}
+// A durable run row (`/v1/runs`) — already fetched for the live/running badge;
+// widened so the Runs + Overview tabs can show recent Shifts for an Operative
+// (status / trigger / rig / duration + a deep link) with no extra fetch.
+interface RunRow {
+  run_id?: string;
+  brief_id?: string;
+  agent_id?: string;
+  rig?: string;
+  status?: string;
+  trigger?: string;
+  started_at?: number;
+  duration_secs?: number;
+  summary?: string;
+  review?: string;
+}
 
 // Friendly labels for the rich readiness statuses.
 const STATUS_LABEL: Record<string, string> = {
@@ -125,6 +166,48 @@ const STATUS_LABEL: Record<string, string> = {
 };
 // Board columns counted as an Operative's open workload.
 const WORK_COLUMNS = ["todo", "in_progress", "in_review"];
+
+// The Operative-detail workbench tabs (dashboard-design §9). Overview is the
+// default; an unknown `?tab=` value falls back to it (param safety).
+const TABS = ["overview", "permissions", "runs", "budget", "configuration"] as const;
+type Tab = (typeof TABS)[number];
+const TAB_LABEL: Record<Tab, string> = {
+  overview: "Overview",
+  permissions: "Permissions",
+  runs: "Runs",
+  budget: "Budget",
+  configuration: "Configuration",
+};
+
+// Run status → badge tone (a compact mirror of the Runs page vocabulary).
+const RUN_TONE: Record<string, string> = {
+  running: "in_progress",
+  done: "done",
+  failed: "blocked",
+  cancelled: "blocked",
+  refused: "blocked",
+  interrupted: "blocked",
+  continued: "todo",
+};
+// Trigger source → short label. `heartbeat` is autonomous dispatch.
+function runTrigger(t?: string): string {
+  if (!t || t === "unknown") return "—";
+  return t === "heartbeat" ? "auto" : t;
+}
+// A run's duration: a live run counts up from started_at; a terminal run shows
+// its recorded seconds.
+function runDuration(r: RunRow): string {
+  if (r.status === "running" && r.started_at) {
+    return `${Math.max(0, Math.floor(Date.now() / 1000) - r.started_at)}s…`;
+  }
+  return typeof r.duration_secs === "number" ? `${r.duration_secs}s` : "—";
+}
+// Epoch-seconds → short local date+time; "—" when absent.
+function fmtDateTime(secs?: number): string {
+  if (!secs) return "—";
+  const d = new Date(secs * 1000);
+  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
+}
 
 export function Agents() {
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
@@ -140,11 +223,30 @@ export function Agents() {
   const [searchParams, setSearchParams] = useSearchParams();
   const openId = searchParams.get("agent");
   const [detailCache, setDetailCache] = useState<Record<string, OpDetail>>({});
-  // Writing the param preserves any other query params already present.
+  // The active workbench tab is URL-driven too (`?tab=runs`) so a deep link can
+  // land on a specific tab and back/forward restore it. An unknown value falls
+  // back to Overview without rewriting the URL (param safety).
+  const tabParam = searchParams.get("tab");
+  const activeTab: Tab = (TABS as readonly string[]).includes(tabParam ?? "")
+    ? (tabParam as Tab)
+    : "overview";
+  // Writing the agent param preserves the tab + any other query params already
+  // present; clearing the selection drops the tab too (it's meaningless alone).
   function setOpen(id: string | null) {
     const next = new URLSearchParams(searchParams);
-    if (id) next.set("agent", id);
-    else next.delete("agent");
+    if (id) {
+      next.set("agent", id);
+    } else {
+      next.delete("agent");
+      next.delete("tab");
+    }
+    setSearchParams(next, { replace: true });
+  }
+  // Switch the workbench tab, preserving the selected Operative + other params.
+  function setTab(tab: Tab) {
+    const next = new URLSearchParams(searchParams);
+    if (tab === "overview") next.delete("tab");
+    else next.set("tab", tab);
     setSearchParams(next, { replace: true });
   }
   // In-flight guard so the load effect never starts a duplicate fetch for the
@@ -216,9 +318,12 @@ export function Agents() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openId]);
 
-  // Copy a shareable deep link to this Operative's governance detail.
+  // Copy a shareable deep link to this Operative's workbench. The canonical
+  // form stays `?agent=<id>`; the active tab is appended only when it isn't the
+  // default Overview, so a shared link reopens exactly what's on screen.
   async function copyLink(agentId: string) {
-    const url = `${window.location.origin}${window.location.pathname}?agent=${encodeURIComponent(agentId)}`;
+    const tabSuffix = activeTab === "overview" ? "" : `&tab=${activeTab}`;
+    const url = `${window.location.origin}${window.location.pathname}?agent=${encodeURIComponent(agentId)}${tabSuffix}`;
     try {
       await navigator.clipboard.writeText(url);
       setBanner({ kind: "ok", msg: "Deep link copied to clipboard." });
@@ -236,15 +341,10 @@ export function Agents() {
   const byName = new Map(adapters.map((a) => [a.name ?? "", a]));
   const availCount = adapters.filter((a) => a.probe?.status === "available").length;
   const initialized = company.initialized ?? agents.length > 0;
-  // The Operative the URL points at (if any). When `?agent=` names an id that
-  // isn't in the loaded Crew, we render an honest banner rather than silently
-  // showing nothing — see `unknownSelection` below.
-  const selectedAgent = openId ? agents.find((a) => a.agent_id === openId) : undefined;
-  const unknownSelection = !!openId && !loading && initialized && !selectedAgent;
 
-  // Bring the selected row/card into view once the roster has rendered it.
+  // Bring the workbench panel into view once a known Operative is selected.
   // `block: "nearest"` avoids jumping when it's already visible; an unknown id
-  // leaves the ref null and the page simply stays put.
+  // renders no workbench, leaves the ref null, and the page simply stays put.
   useEffect(() => {
     if (openId && selectedRef.current) {
       selectedRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -292,6 +392,18 @@ export function Agents() {
     const a = agents.find((x) => x.agent_id === id);
     return a?.name ?? id.slice(0, 8);
   };
+
+  // The Operative the URL points at (if any). Resolved across the operatives
+  // list plus the server-resolved Founder/Prime (which may be carried only on
+  // `company.{founder,prime}`), so selecting leadership opens the workbench too.
+  // When `?agent=` names an id that isn't in the Crew at all, we render an honest
+  // banner rather than silently showing nothing — see `unknownSelection`.
+  const selectedAgent = openId
+    ? agents.find((a) => a.agent_id === openId) ??
+      [founder, prime].find((a) => a?.agent_id === openId) ??
+      undefined
+    : undefined;
+  const unknownSelection = !!openId && !loading && initialized && !selectedAgent;
 
   async function initCompany() {
     setBanner(null);
@@ -512,6 +624,266 @@ export function Agents() {
     );
   }
 
+  // The tabbed Operative-detail workbench — the §9 employee record / command
+  // surface. A single prominent panel (not a row expansion) for the selected
+  // Operative: an identity header, a tab bar, and a tab body. Every figure
+  // comes from data already loaded for the page (the shared detail cache,
+  // `/v1/runs`, the board columns) — no extra fetch loops, and each piece
+  // degrades to an honest empty state when its source is unavailable.
+  function workbench(a: Agent) {
+    const id = a.agent_id ?? "";
+    const d = detailCache[id];
+    const detail = d?.detail ?? null;
+    const keys = d?.keys ?? null;
+    // Org neighbours from the already-loaded roster.
+    const directReports = agents.filter((x) => x.reports_to === id);
+    // This Operative's Shifts, newest first, from the page's `/v1/runs` payload.
+    const agentRuns = runs
+      .filter((r) => r.agent_id === id)
+      .sort((x, y) => (y.started_at ?? 0) - (x.started_at ?? 0));
+    // Open assigned Briefs (todo / in progress / in review) from the board fetch.
+    const assigned = work.filter((c) => c.assignee_agent_id === id);
+    const openCount = workload.get(id) ?? 0;
+    const runningCount = running.get(id) ?? 0;
+    // Allowance + ceilings: prefer the full detail, fall back to Keys.
+    const allowanceCents = detail?.monthly_allowance_cents ?? keys?.monthly_allowance_cents ?? null;
+    const maxConcurrent = detail?.max_concurrent_runs ?? keys?.max_concurrent_runs ?? null;
+    const wakeTimer = detail?.wake_on_timer ?? keys?.wake_on_timer ?? false;
+    const wakeDemand = detail?.wake_on_demand ?? keys?.wake_on_demand ?? false;
+    const roleLabel = a.role ?? detail?.role ?? a.title ?? "operative";
+
+    const briefLink = (c: Card) => {
+      const bid = c.task_id ?? c.id ?? "";
+      return (
+        <Link to="/briefs" className="link" title={bid}>
+          {c.title || (bid ? bid.slice(0, 10) : "Brief")}
+        </Link>
+      );
+    };
+
+    return (
+      <div className="card op-wb" ref={selectedRef as React.RefObject<HTMLDivElement>}>
+        {/* Identity header — who this Operative is, at a glance. */}
+        <div className="op-wb-head">
+          <div className="op-wb-id">
+            <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+              <strong style={{ fontSize: 15 }}>{a.name ?? id.slice(0, 10) ?? "Operative"}</strong>
+              <span className="badge in_review" style={{ fontSize: 9 }}>{roleLabel}</span>
+              <Badge status={a.status ?? "active"} />
+              {runningCount > 0 && <span className="badge in_progress" style={{ fontSize: 9 }}>● running</span>}
+            </div>
+            <div className="muted" style={{ fontSize: 11, marginTop: 4, display: "flex", gap: 12, flexWrap: "wrap" }}>
+              <span className="mono">{id.slice(0, 16)}</span>
+              {a.reports_to && (
+                <span>
+                  reports to{" "}
+                  <span className="link" onClick={() => setOpen(a.reports_to ?? null)}>{nameOf(a.reports_to)}</span>
+                </span>
+              )}
+              <span>adapter {a.rig || "(none)"}</span>
+            </div>
+          </div>
+          <div className="row" style={{ gap: 6 }}>
+            <button className="btn ghost sm" title="Copy a deep link to this Operative" onClick={() => copyLink(id)}>Copy link</button>
+            <button className="btn ghost sm" onClick={() => setOpen(null)}>Close</button>
+          </div>
+        </div>
+
+        {/* Tab bar. */}
+        <div className="op-tabs" role="tablist">
+          {TABS.map((t) => (
+            <button
+              key={t}
+              role="tab"
+              aria-selected={activeTab === t}
+              className={"op-tab" + (activeTab === t ? " active" : "")}
+              onClick={() => setTab(t)}
+            >
+              {TAB_LABEL[t]}
+              {t === "runs" && agentRuns.length > 0 && <span className="op-tab-n">{agentRuns.length}</span>}
+            </button>
+          ))}
+        </div>
+
+        <div className="op-tab-body">
+          {!d ? (
+            <div className="loading" style={{ fontSize: 12 }}>Loading {a.name ?? "Operative"}…</div>
+          ) : activeTab === "permissions" ? (
+            operativeDetail(id)
+          ) : activeTab === "overview" ? (
+            <div className="op-detail">
+              <div className="op-group">
+                <div className="op-group-title">Summary</div>
+                <div className="kv-grid" style={{ fontSize: 12 }}>
+                  <div className="kv"><span className="muted">Role</span><span>{roleLabel}</span></div>
+                  <div className="kv"><span className="muted">Title</span><span>{a.title || detail?.title || "—"}</span></div>
+                  <div className="kv"><span className="muted">Status</span><span><Badge status={a.status ?? "active"} /></span></div>
+                  <div className="kv"><span className="muted">Adapter (Rig)</span><span>{a.rig || "(none)"}</span></div>
+                  <div className="kv"><span className="muted">Readiness</span><span>{rigStatusCell(a.rig)}</span></div>
+                  <div className="kv"><span className="muted">Reports to</span><span>{a.reports_to ? <span className="link" onClick={() => setOpen(a.reports_to ?? null)}>{nameOf(a.reports_to)}</span> : "—"}</span></div>
+                  <div className="kv"><span className="muted">Direct reports</span><span>{directReports.length}</span></div>
+                  <div className="kv"><span className="muted">Pressure</span><span>{openCount} open · {runningCount} running</span></div>
+                </div>
+              </div>
+
+              {directReports.length > 0 && (
+                <div className="op-group">
+                  <div className="op-group-title">Direct reports ({directReports.length})</div>
+                  <div className="ln-reports">
+                    {directReports.map((r) => (
+                      <button key={r.agent_id} className="ln-report link" onClick={() => setOpen(r.agent_id ?? null)}>
+                        {r.name ?? (r.agent_id ?? "").slice(0, 10)}
+                        <span className="muted" style={{ fontSize: 11 }}>{r.role ?? r.title ?? ""}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="op-group">
+                <div className="op-group-title">Assigned Briefs ({assigned.length})</div>
+                {assigned.length === 0 ? (
+                  <div className="muted" style={{ fontSize: 12 }}>No open Briefs assigned (todo / in progress / in review).</div>
+                ) : (
+                  <div style={{ fontSize: 12 }}>
+                    {assigned.map((c, i) => (
+                      <div key={(c.task_id ?? c.id ?? "") + i} className="op-line">
+                        {c.board_status && <span className={"badge " + (c.board_status ?? "todo")} style={{ fontSize: 9 }}>{c.board_status}</span>}
+                        {briefLink(c)}
+                        {c.priority && <span className="muted" style={{ fontSize: 10 }}>· {c.priority}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="op-group">
+                <div className="op-group-title">Recent Shifts</div>
+                {agentRuns.length === 0 ? (
+                  <div className="muted" style={{ fontSize: 12 }}>No Shifts recorded for this Operative in the recent run ledger.</div>
+                ) : (
+                  <div style={{ fontSize: 12 }}>
+                    {agentRuns.slice(0, 3).map((r, i) => (
+                      <div key={r.run_id ?? i} className="op-line">
+                        <span className={"badge " + (RUN_TONE[r.status ?? ""] ?? "todo")} style={{ fontSize: 9 }}>{r.status ?? "—"}</span>
+                        <span className="badge backlog" style={{ fontSize: 9 }}>{runTrigger(r.trigger)}</span>
+                        <span className="muted">{runDuration(r)}</span>
+                        {r.run_id && <Link to={`/runs?run=${encodeURIComponent(r.run_id)}`} className="link">{r.run_id.slice(0, 10)} ↗</Link>}
+                        <span className="muted" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 240 }}>{r.summary || ""}</span>
+                      </div>
+                    ))}
+                    {agentRuns.length > 3 && (
+                      <button className="btn ghost sm" style={{ marginTop: 6 }} onClick={() => setTab("runs")}>See all {agentRuns.length} →</button>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : activeTab === "runs" ? (
+            <div className="op-detail">
+              <div className="op-group">
+                <div className="op-group-title">Recent Shifts ({agentRuns.length})</div>
+                {agentRuns.length === 0 ? (
+                  <div className="muted" style={{ fontSize: 12 }}>
+                    No Shifts recorded for this Operative in the recent run ledger. This list is bounded to the
+                    recent <span className="mono">/v1/runs</span> window — older Shifts live on the Runs page.
+                  </div>
+                ) : (
+                  <div className="table-scroll">
+                    <table className="table" style={{ fontSize: 12 }}>
+                      <thead><tr><th>Status</th><th>Trigger</th><th>Rig</th><th>Brief</th><th>Duration</th><th>Started</th><th>Result</th><th></th></tr></thead>
+                      <tbody>
+                        {agentRuns.map((r, i) => (
+                          <tr key={r.run_id ?? i}>
+                            <td><span className={"badge " + (RUN_TONE[r.status ?? ""] ?? "todo")} style={{ fontSize: 9 }}>{r.status ?? "—"}</span></td>
+                            <td><span className="badge backlog" style={{ fontSize: 9 }}>{runTrigger(r.trigger)}</span></td>
+                            <td className="muted">{r.rig || "—"}</td>
+                            <td className="mono" style={{ fontSize: 11 }}>{(r.brief_id ?? "").slice(0, 10) || "—"}</td>
+                            <td className="muted">{runDuration(r)}</td>
+                            <td className="muted">{r.started_at ? new Date(r.started_at * 1000).toLocaleString() : "—"}</td>
+                            <td className="muted" style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.summary || (r.review ? r.review : "—")}</td>
+                            <td>{r.run_id && <Link to={`/runs?run=${encodeURIComponent(r.run_id)}`} className="link">open ↗</Link>}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : activeTab === "budget" ? (
+            <div className="op-detail">
+              <div className="op-group">
+                <div className="op-group-title">Allowance &amp; ceilings (committed)</div>
+                {!keys && !detail ? (
+                  <div className="muted" style={{ fontSize: 12 }}>Budget detail unavailable for this Operative.</div>
+                ) : (
+                  <div className="kv-grid" style={{ fontSize: 12 }}>
+                    <div className="kv"><span className="muted">Monthly Allowance (committed)</span><span>{allowanceCents != null ? fmtCents(allowanceCents) : "—"}</span></div>
+                    <div className="kv"><span className="muted">Risk ceiling</span><span>{detail?.risk_ceiling ? <span className="badge in_review" style={{ fontSize: 9 }}>{detail.risk_ceiling}</span> : "—"}</span></div>
+                    <div className="kv"><span className="muted">Max concurrent runs</span><span>{maxConcurrent ?? "—"}</span></div>
+                    <div className="kv"><span className="muted">Approval timeout</span><span>{detail?.approval_timeout_secs ? `${detail.approval_timeout_secs}s` : "—"}</span></div>
+                  </div>
+                )}
+              </div>
+              <div className="op-group">
+                <div className="op-group-title">Live spend</div>
+                <p className="muted" style={{ fontSize: 12, margin: 0 }}>
+                  The figure above is the <strong>committed</strong> monthly cap (capacity reserved), not money spent.
+                  Real month-to-date spend vs Allowance — the same ledger the dispatch gate enforces — is on the{" "}
+                  <Link to="/costs" className="link">Costs page</Link>. This tab never fabricates a spend number.
+                </p>
+              </div>
+            </div>
+          ) : (
+            // Configuration.
+            <div className="op-detail">
+              <div className="op-group">
+                <div className="op-group-title">Adapter (Rig)</div>
+                <div className="row" style={{ gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                  {rigSelect(a)}
+                  {rigStatusCell(a.rig)}
+                </div>
+              </div>
+              <div className="op-group">
+                <div className="op-group-title">Autonomy</div>
+                {!detail && !keys ? (
+                  <div className="muted" style={{ fontSize: 12 }}>Autonomy detail unavailable for this Operative.</div>
+                ) : (
+                  <div className="kv-grid" style={{ fontSize: 12 }}>
+                    <div className="kv"><span className="muted">Scheduled heartbeat</span><span>{wakeTimer ? <span className="badge done" style={{ fontSize: 9 }}>on</span> : <span className="badge backlog" style={{ fontSize: 9 }}>off</span>}</span></div>
+                    <div className="kv"><span className="muted">Wake on assignment</span><span>{wakeDemand ? <span className="badge done" style={{ fontSize: 9 }}>on</span> : <span className="badge backlog" style={{ fontSize: 9 }}>off</span>}</span></div>
+                    <div className="kv"><span className="muted">Max concurrent runs</span><span>{maxConcurrent ?? "—"}</span></div>
+                  </div>
+                )}
+              </div>
+              <div className="op-group">
+                <div className="op-group-title">Org placement &amp; identity</div>
+                <div className="kv-grid" style={{ fontSize: 12 }}>
+                  <div className="kv"><span className="muted">Title</span><span>{a.title || detail?.title || "—"}</span></div>
+                  <div className="kv"><span className="muted">Department</span><span>{detail?.department || "—"}</span></div>
+                  <div className="kv"><span className="muted">Team</span><span>{detail?.team || "—"}</span></div>
+                  <div className="kv"><span className="muted">Reports to</span><span>{a.reports_to ? <span className="link" onClick={() => setOpen(a.reports_to ?? null)}>{nameOf(a.reports_to)}</span> : "—"}</span></div>
+                  <div className="kv"><span className="muted">Identity (subject)</span><span className="mono" style={{ fontSize: 11 }}>{detail?.subject_id ? detail.subject_id.slice(0, 16) : "—"}</span></div>
+                  <div className="kv"><span className="muted">Created</span><span>{fmtDateTime(detail?.created_at)}</span></div>
+                  <div className="kv"><span className="muted">Updated</span><span>{fmtDateTime(detail?.updated_at)}</span></div>
+                </div>
+              </div>
+              <div className="op-group">
+                <div className="op-group-title">Charter &amp; model</div>
+                <p className="muted" style={{ fontSize: 12, margin: 0 }}>
+                  The instruction bundle (job description / charter) and per-Operative model config are not exposed by
+                  the read API yet — only writable through <span className="mono">PATCH /v1/agents/:id</span>. They'll
+                  surface here once the detail read carries them.
+                </p>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   function rigSelect(a: Agent) {
     const id = a.agent_id ?? "";
     return (
@@ -616,6 +988,12 @@ export function Agents() {
         <Link to="/settings" className="banner-cta">Adapters →</Link>
       </div>
 
+      {/* The selected Operative's detail workbench (dashboard-design §9) — a
+          prominent employee-record / command surface, not a row expansion. It
+          opens from any View button, a Lattice deep link, or `?agent=<id>`, and
+          scrolls into view. The roster below keeps the matching row highlighted. */}
+      {selectedAgent && <div className="op-wb-wrap">{workbench(selectedAgent)}</div>}
+
       {/* Roster at a glance — the company's shape: leadership tiers, active
           Operatives, pending hires, and how many are runnable right now. */}
       <div className="card roster-strip">
@@ -655,10 +1033,7 @@ export function Agents() {
 
       {/* Founder — shown separately as the org root. */}
       {founder && (
-        <div
-          className={"card" + (openId === founder.agent_id ? " selected" : "")}
-          ref={openId === founder.agent_id ? (selectedRef as React.RefObject<HTMLDivElement>) : undefined}
-        >
+        <div className={"card" + (openId === founder.agent_id ? " selected" : "")}>
           <h3>Founder</h3>
           <div className="row wrap" style={{ gap: 18, alignItems: "flex-start" }}>
             <div>
@@ -682,29 +1057,18 @@ export function Agents() {
               <span>{workload.get(founder.agent_id ?? "") ?? 0} open · {running.get(founder.agent_id ?? "") ?? 0} running</span>
             </div>
             <div>
-              <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>Permissions</div>
-              <div className="row" style={{ gap: 6 }}>
-                <button className="btn ghost sm" onClick={() => toggleDetail(founder.agent_id ?? "")}>
-                  {openId === founder.agent_id ? "Hide" : "View"}
-                </button>
-                {openId === founder.agent_id && (
-                  <button className="btn ghost sm" title="Copy a deep link to this Operative" onClick={() => copyLink(founder.agent_id ?? "")}>Copy link</button>
-                )}
-              </div>
+              <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>Workbench</div>
+              <button className="btn ghost sm" title="Open this Operative's detail workbench — Overview, Permissions, Runs, Budget, Configuration" onClick={() => toggleDetail(founder.agent_id ?? "")}>
+                {openId === founder.agent_id ? "Close" : "Open"}
+              </button>
             </div>
           </div>
-          {openId === founder.agent_id && (
-            <div style={{ marginTop: 10 }}>{operativeDetail(founder.agent_id ?? "")}</div>
-          )}
         </div>
       )}
 
       {/* Prime — the Founder's planning lead, shown distinctly. */}
       {prime ? (
-        <div
-          className={"card" + (openId === prime.agent_id ? " selected" : "")}
-          ref={openId === prime.agent_id ? (selectedRef as React.RefObject<HTMLDivElement>) : undefined}
-        >
+        <div className={"card" + (openId === prime.agent_id ? " selected" : "")}>
           <h3>Prime</h3>
           <div className="row wrap" style={{ gap: 18, alignItems: "flex-start" }}>
             <div>
@@ -731,20 +1095,12 @@ export function Agents() {
               <span>{workload.get(prime.agent_id ?? "") ?? 0} open · {running.get(prime.agent_id ?? "") ?? 0} running</span>
             </div>
             <div>
-              <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>Permissions</div>
-              <div className="row" style={{ gap: 6 }}>
-                <button className="btn ghost sm" onClick={() => toggleDetail(prime.agent_id ?? "")}>
-                  {openId === prime.agent_id ? "Hide" : "View"}
-                </button>
-                {openId === prime.agent_id && (
-                  <button className="btn ghost sm" title="Copy a deep link to this Operative" onClick={() => copyLink(prime.agent_id ?? "")}>Copy link</button>
-                )}
-              </div>
+              <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>Workbench</div>
+              <button className="btn ghost sm" title="Open this Operative's detail workbench — Overview, Permissions, Runs, Budget, Configuration" onClick={() => toggleDetail(prime.agent_id ?? "")}>
+                {openId === prime.agent_id ? "Close" : "Open"}
+              </button>
             </div>
           </div>
-          {openId === prime.agent_id && (
-            <div style={{ marginTop: 10 }}>{operativeDetail(prime.agent_id ?? "")}</div>
-          )}
         </div>
       ) : founder ? (
         // No dedicated `prime`-role Operative exists — and that's expected, not
@@ -845,18 +1201,14 @@ export function Agents() {
                   <th>Readiness</th>
                   <th>Open</th>
                   <th>Running</th>
-                  <th>Permissions</th>
+                  <th>Workbench</th>
                 </tr>
               </thead>
               <tbody>
                 {activeCrew.map((a, i) => {
                   const id = a.agent_id ?? "";
                   return (
-                    <Fragment key={id || i}>
-                    <tr
-                      className={openId === id ? "selected" : undefined}
-                      ref={openId === id ? (selectedRef as React.RefObject<HTMLTableRowElement>) : undefined}
-                    >
+                    <tr key={id || i} className={openId === id ? "selected" : undefined}>
                       <td>
                         <strong>{a.name ?? id.slice(0, 10) ?? "operative"}</strong>
                         <div className="mono" style={{ fontSize: 10 }}>{id.slice(0, 12)}</div>
@@ -873,22 +1225,11 @@ export function Agents() {
                           : <span className="muted">0</span>}
                       </td>
                       <td>
-                        <div className="row" style={{ gap: 6 }}>
-                          <button className="btn ghost sm" onClick={() => toggleDetail(id)} title="View this Operative's permissions — Keys, capability powers, standing approvals">
-                            {openId === id ? "Hide" : "View"}
-                          </button>
-                          {openId === id && (
-                            <button className="btn ghost sm" title="Copy a deep link to this Operative" onClick={() => copyLink(id)}>Copy link</button>
-                          )}
-                        </div>
+                        <button className="btn ghost sm" onClick={() => toggleDetail(id)} title="Open this Operative's detail workbench — Overview, Permissions, Runs, Budget, Configuration">
+                          {openId === id ? "Close" : "Open"}
+                        </button>
                       </td>
                     </tr>
-                    {openId === id && (
-                      <tr>
-                        <td colSpan={9} style={{ background: "var(--bg)" }}>{operativeDetail(id)}</td>
-                      </tr>
-                    )}
-                    </Fragment>
                   );
                 })}
               </tbody>
