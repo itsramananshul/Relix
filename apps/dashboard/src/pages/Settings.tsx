@@ -322,7 +322,7 @@ export function Settings() {
               <td className="muted" />
               <td className="muted" style={{ fontSize: 12 }}>
                 {autonomy.effective_enabled
-                  ? "Prime drives already-approved work forward on its own — plans the team, orchestrates the Brief tree, and starts ready work through the same governed routes — bounded per tick. It never auto-approves a strategy/hire/spawn/budget/Clearance gate (those stay human)."
+                  ? "Prime drives already-approved work forward on its own — plans the team, orchestrates the Brief tree, and starts ready work through the same governed routes — bounded per tick. Approval gates move only when a matching standing-authority grant is live; budget gates are never delegated."
                   : "approved Prime work waits for an operator to click Advance / Start in the Action Center"}
               </td>
             </tr>
@@ -510,8 +510,8 @@ function AutonomousPrimeSwitchPanel({
         Turn the autonomous Prime loop on/off for this Guild at runtime — no restart. When ON, Prime
         drives <strong>already-approved</strong> work forward on a timer (plans the team, orchestrates
         the Brief tree, starts ready work) through the same governed routes, bounded per tick. This is{" "}
-        <strong>not</strong> an approval bypass: it never approves a governed gate on its own — each
-        approval category still needs a live standing grant below.
+        <strong>not</strong> an approval bypass: a governed approval moves only when the matching
+        standing-authority grant below is live.
       </p>
 
       {banner && <div className={"banner " + banner.kind} style={{ fontSize: 12 }}>{banner.msg}</div>}
@@ -567,7 +567,10 @@ function AutonomousPrimeSwitchPanel({
                 <tbody>
                   {(tick.records ?? []).slice(0, 5).map((r, i) => (
                     <tr key={i}>
-                      <td className="mono">{r.target_kind ?? "?"}</td>
+                      <td className="mono">
+                        {r.target_kind ?? "?"}
+                        {r.target_id ? <span className="muted"> · {r.target_id.slice(0, 8)}</span> : null}
+                      </td>
                       <td>{r.phase ?? "—"}</td>
                       <td className="mono">{r.action ?? "—"}</td>
                       <td>
@@ -616,8 +619,8 @@ function AutonomousPrimeSwitchPanel({
           {runtimeOn && totalCats > 0 && grantedCount === 0 && (
             <div className="banner" style={{ fontSize: 12, marginTop: 10 }}>
               The loop is <strong>awake</strong> but no standing-authority category is granted — it will
-              drive already-approved work, but <strong>cannot approve</strong> a proposal / hire /
-              Clearance on its own until you grant standing authority below.
+              drive already-approved work, but <strong>cannot approve</strong> a proposal / strategy /
+              hire / Clearance until you grant standing authority below.
             </div>
           )}
           {!effectiveOn && grantedCount > 0 && (

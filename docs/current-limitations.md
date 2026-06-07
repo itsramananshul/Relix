@@ -283,9 +283,11 @@ the approved work is already ready. What it does **not** do:
     (`create_team_plan` / `orchestrate_assign_ready`) through the **same governed
     `prime.advance` path** the operator click uses, and for an already-approved
     proposal that reaches `ready_to_start` it starts the ready Briefs through the
-    **existing `prime.start` path** (no new runner). What it **never** does: it
-    **never auto-approves a strategy / hire / spawn / budget / Clearance gate**
-    (those stay human — a pending gate is recorded `blocked` and left untouched);
+    **existing `prime.start` path** (no new runner). By default it
+    **does not auto-approve a proposal / strategy / hire / spawn Clearance / budget gate**
+    (a pending gate is recorded `blocked` and left untouched); specific proposal,
+    strategy, hire, and spawn-Clearance approvals act only when the Board has
+    granted the matching standing authority below, and budget is never delegated.
     it **bypasses no execution guard** — `prime.start` already enforces
     approved-only / ready-only / active-assignee / adapter-resolvable / Claim, and
     the autonomous start additionally **re-imposes the autonomous budget
@@ -380,7 +382,7 @@ the approved work is already ready. What it does **not** do:
     (`POST`/`DELETE /v1/agents/__relix_autonomous_prime__/standing-approvals`) —
     the same routes real Operatives use, so **no duplicate approval system was
     invented**. **The Settings page is now an operator control surface, not
-    read-only:** each of the three categories shows enabled/disabled with a
+    read-only:** each of the four categories shows enabled/disabled with a
     **Grant** (when disabled) / **Revoke** (when enabled) button. Granting creates
     a bounded standing approval for the synthetic authority (default `expires_at =
     now + 24h`, `max_calls = 25`, no cost cap); revoking deletes every row for that

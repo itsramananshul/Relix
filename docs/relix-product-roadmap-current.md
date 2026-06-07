@@ -119,8 +119,10 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   `mandate.orchestrate` in `assign_ready` mode), re-reading state and **refusing as stale
   (HTTP 409, no side effects)** when the requested action is no longer current, through the
   same governed handler + Keys as the manual route. It is **not** self-approving: no
-  blind loop, never auto-approves a strategy/hire/spawn/budget gate, never runs a real
-  adapter (Start stays the explicit button), one click = one step. Bridge:
+  blind loop, no approval action inside the manual one-step driver, never runs a real
+  adapter (Start stays the explicit button), one click = one step. The separate
+  autonomous standing-authority layer can approve only the explicitly granted
+  proposal/strategy/hire/spawn-Clearance categories; budget is never delegated. Bridge:
   `GET /v1/spine/{prime/proposals,mandates}/:id/next-step` +
   `POST …/advance`; dashboard: the Chat Shift Room **and the Overview cockpit**
   ("Company operating status") show the next step + a restrained **Advance one step** button
@@ -536,9 +538,11 @@ ledger entry or design section.
    `prime.next_step` (READ-ONLY) names the ONE next governed step for a proposal/Mandate from live
    state; `prime.advance` runs **one** safe, explicitly-requested step (`propose_strategy` /
    `create_team_plan` / `orchestrate_assign_ready`) through the existing gated handler, re-reading state
-   and **refusing as stale (409) with no side effects** on mismatch. It **never** auto-approves a
-   strategy/hire/spawn/budget gate, **never** runs a real adapter (Start stays the explicit button), and
-   is **not** a blind loop — one click advances one step. **Prime Strategy Drafting v1 — SHIPPED:** a
+   and **refusing as stale (409) with no side effects** on mismatch. The manual one-step driver performs
+   no approval action, **never** runs a real adapter (Start stays the explicit button), and
+   is **not** a blind loop — one click advances one step. The autonomous standing-authority layer can approve
+   only the explicitly granted proposal/strategy/hire/spawn-Clearance categories; budget is never delegated.
+   **Prime Strategy Drafting v1 — SHIPPED:** a
    Mandate with no strategy yet is classified `needs_strategy_proposal` and the driver (manual click or
    the opt-in autonomous tick) can **DRAFT** a deterministic strategy doc and propose it through the
    existing `mandate.strategy.propose` path — *draft only*, left `proposed` for a human to approve, never
