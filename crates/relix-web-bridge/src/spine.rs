@@ -1513,8 +1513,8 @@ fn truncate_runs_snapshot(body: &[u8], limit: usize) -> String {
 /// Runs feed (dashboard-design §10/§11). Streams the SAME recent-run ledger
 /// rows `GET /v1/runs?limit=N` returns by proxying the SAME `brief.runs`
 /// capability (the resolved tenant is captured at open time and re-applied to
-/// every downstream coord call, exactly like the `/v1/runs` list route) — no
-/// new privilege, no cross-Guild leak beyond what the list already does. The
+/// every downstream coord call; the runtime filters the recent ledger by that
+/// tenant) — no new privilege, no cross-Guild leak. The
 /// stream:
 ///
 /// - emits the current runs immediately as `event: runs` (JSON = the same array

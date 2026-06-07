@@ -9830,10 +9830,18 @@ fn register_node_type_handlers(
                         let st = st.clone();
                         async move {
                             let brief_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
+                            let tenant = ctx.tenant_id_or_default().to_string();
                             let result = if brief_id.is_empty() {
-                                st.list_runs(100)
+                                st.list_runs_for_tenant(&tenant, 100)
                             } else {
-                                st.runs_for_brief(&brief_id, 100)
+                                match st.task_tenant(&brief_id) {
+                                    Ok(Some(t)) if t == tenant => st.runs_for_brief(&brief_id, 100),
+                                    Ok(None) if tenant == "default" => st.runs_for_brief(&brief_id, 100),
+                                    Ok(_) => Err(crate::nodes::coordinator::CoordinatorError::NotFound(
+                                        brief_id.clone(),
+                                    )),
+                                    Err(e) => Err(e),
+                                }
                             };
                             match result {
                                 Ok(runs) => match serde_json::to_vec(&runs) {
@@ -9847,6 +9855,16 @@ fn register_node_type_handlers(
                                         },
                                     ),
                                 },
+                                Err(crate::nodes::coordinator::CoordinatorError::NotFound(id)) => {
+                                    crate::dispatch::HandlerOutcome::Err(
+                                        relix_core::types::ErrorEnvelope {
+                                            kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                            cause: format!("brief.runs: not found: {id}"),
+                                            retry_hint: 0,
+                                            retry_after: None,
+                                        },
+                                    )
+                                }
                                 Err(e) => crate::dispatch::HandlerOutcome::Err(
                                     relix_core::types::ErrorEnvelope {
                                         kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
