@@ -664,6 +664,21 @@ export const primeDriver = {
       `/v1/spine/prime/proposals/${encodeURIComponent(proposalId)}/advance`,
       { action },
     ),
+  // Mandate-level twins of the two above — the SAME guided-driver routes, keyed
+  // by a Mandate id instead of a proposal id (company-model §5.4/§8.2 + §12.5;
+  // bridge `mandate_next_step` / `mandate_advance`). Same shapes, same
+  // guarantees: `nextStep` is READ-ONLY; a stale one-step `advance` returns
+  // HTTP 409 (re-read and try again, never retry the 409 blindly); the driver
+  // never auto-approves a strategy / hire / spawn / budget gate.
+  mandateNextStep: (mandateId: string) =>
+    api.get<PrimeNextStep>(
+      `/v1/spine/mandates/${encodeURIComponent(mandateId)}/next-step`,
+    ),
+  mandateAdvance: (mandateId: string, action: string) =>
+    api.post<PrimeAdvanceResult>(
+      `/v1/spine/mandates/${encodeURIComponent(mandateId)}/advance`,
+      { action },
+    ),
 };
 
 // ── Dedicated Prime Shift-Room status stream (SSE) ─────────────────────────

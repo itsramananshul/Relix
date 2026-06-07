@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, subscribeRunEvents, tryGet, tryGetReport } from "../api";
+import { ApiError, api, primeDriver, subscribeRunEvents, tryGet, tryGetReport, type PrimeNextStep } from "../api";
 import { Badge, extractList, useAsync } from "../components/common";
 import { HealthPanel } from "../components/HealthPanel";
 import { invalidate, useInvalidate } from "../invalidate";
@@ -100,6 +100,21 @@ interface Warn {
   cta?: string;
 }
 
+// Which work object the cockpit's guided-driver next step was computed for, so
+// "Advance one step" hits the matching route (proposal vs Mandate twin).
+type NextStepRef = { kind: "proposal" | "mandate"; id: string };
+
+// Best-effort wrapper for an optional driver read: a failure degrades to null
+// (so a missing/unavailable next step never blanks the Overview), exactly like
+// `tryGet` does for path GETs.
+async function bestEffort<T>(fn: () => Promise<T>): Promise<T | null> {
+  try {
+    return await fn();
+  } catch {
+    return null;
+  }
+}
+
 export function Overview() {
   const { data, loading, reload } = useAsync(async () => {
     // The board + company are the CORE of the Command Center — if they fail
@@ -120,6 +135,7 @@ export function Overview() {
       tryGet<CompanyActions | null>("/v1/spine/company/actions", null),
     ]);
     const mandates = await tryGet<unknown>("/v1/spine/mandates?limit=8", {});
+    const mandateRows = extractList<MandateRow>(mandates, ["mandates"]);
     // The newest Prime work session — if it's approved, pull its live Shift-Room
     // status for the compact "Active work" card (best-effort, optional surface).
     const proposals = await tryGet<ProposalRow[]>("/v1/spine/prime/proposals?limit=1", []);
@@ -131,6 +147,24 @@ export function Overview() {
             null,
           )
         : null;
+    // Cockpit guided-driver next step (dashboard-design §5; roadmap §2 slice 9b).
+    // Prefer the latest Prime proposal — the driver classifies its whole
+    // lifecycle (approval → strategy → team plan → orchestrate → board). If
+    // there's no proposal but a Mandate exists, use the Mandate twin route. Both
+    // are best-effort: a failure degrades to null and never blanks the Overview.
+    let nextStep: PrimeNextStep | null = null;
+    let nextStepRef: NextStepRef | null = null;
+    if (latestProposal?.proposal_id) {
+      nextStep = await bestEffort(() => primeDriver.nextStep(latestProposal.proposal_id!));
+      if (nextStep) nextStepRef = { kind: "proposal", id: latestProposal.proposal_id };
+    }
+    if (!nextStep) {
+      const mid = mandateRows[0]?.mandate_id ?? mandateRows[0]?.id;
+      if (mid) {
+        nextStep = await bestEffort(() => primeDriver.mandateNextStep(mid));
+        if (nextStep) nextStepRef = { kind: "mandate", id: mid };
+      }
+    }
     const coreError =
       boardR.error || companyR.error || runsR.error
         ? (boardR.error ?? companyR.error ?? runsR.error)
@@ -144,10 +178,12 @@ export function Overview() {
       runs: Array.isArray(runsR.data) ? runsR.data : [],
       runCfg: runCfg ?? {},
       maint: maint ?? null,
-      mandates: extractList<MandateRow>(mandates, ["mandates"]),
+      mandates: mandateRows,
       events: extractList<EventRow>(events),
       session: session ?? null,
       actions: actions ?? null,
+      nextStep,
+      nextStepRef,
       coreError,
     };
   }, []);
@@ -355,6 +391,17 @@ export function Overview() {
           <span className="banner-cta" onClick={reload} style={{ cursor: "pointer" }}>Retry →</span>
         </div>
       )}
+      {/* Company operating status — the cockpit: Prime's ONE next safe step
+          (guided driver) + a live pressure strip, so the operator knows what to
+          do next without reading internal routes (dashboard-design §5). */}
+      {initialized && (
+        <OperatingStatus
+          nextStep={data?.nextStep ?? null}
+          nextStepRef={data?.nextStepRef ?? null}
+          actions={liveActions ?? data?.actions ?? null}
+          onReload={() => { void refreshActions(); reload(); }}
+        />
+      )}
       {/* Action Center — the one place for what needs the operator now. Prefers
           the live-refreshed feed, falling back to the mount-load snapshot. */}
       {initialized && (
@@ -548,6 +595,193 @@ const CAT_LABEL: Record<string, string> = {
   blocked: "blocked",
   stale: "stale",
 };
+
+// Phase → chip tone for the cockpit. The next step's `label`/`reason` are
+// already plain language from the driver; this only colors the phase chip.
+const PHASE_TONE: Record<string, string> = {
+  needs_approval: "backlog",
+  needs_strategy: "backlog",
+  needs_hire_approval: "blocked",
+  needs_team_plan: "todo",
+  needs_orchestration: "todo",
+  running: "in_progress",
+  needs_review: "in_review",
+  blocked: "blocked",
+  done: "done",
+  unknown: "backlog",
+};
+
+// The board/run counts the next-step payload carries (`BriefCounts::to_json`).
+// [count key, chip label, tone] — only non-zero buckets are shown.
+const COCKPIT_COUNTS: [string, string, string][] = [
+  ["ready", "ready", "todo"],
+  ["running", "running", "in_progress"],
+  ["needs_review", "review", "in_review"],
+  ["blocked", "blocked", "blocked"],
+  ["done", "done", "done"],
+  ["unassigned", "unassigned", "backlog"],
+  ["failed", "failed", "blocked"],
+  ["refused", "refused", "blocked"],
+];
+
+// The Action-Center-derived pressure strip — the company's live pressures at a
+// glance, each linking to where it gets worked. [category key, label, route, tone].
+const PRESSURES: [string, string, string, string][] = [
+  ["approval", "approvals", "/approvals", "blocked"],
+  ["hire", "hires", "/approvals", "blocked"],
+  ["budget", "budget", "/costs", "blocked"],
+  ["failed_or_refused", "recovery", "/runs", "blocked"],
+  ["needs_review", "review", "/runs", "in_review"],
+  ["ready_to_start", "ready", "/briefs", "todo"],
+];
+
+// The Overview cockpit (dashboard-design §5; roadmap §2 slice 9b). Surfaces the
+// SAME bounded guided-driver step the Chat Shift Room shows — Prime's ONE next
+// safe governed step over the most relevant active object — plus a live pressure
+// strip from the Action Center, so the operator knows what to do next at a
+// glance. "Advance one step" runs AT MOST one governed step through the existing
+// gated route (proposal or Mandate twin); it never auto-approves a strategy /
+// hire / spawn / budget gate, never runs an adapter, and never loops.
+function OperatingStatus({
+  nextStep,
+  nextStepRef,
+  actions,
+  onReload,
+}: {
+  nextStep: PrimeNextStep | null;
+  nextStepRef: NextStepRef | null;
+  actions: CompanyActions | null;
+  onReload: () => void;
+}) {
+  const [advancing, setAdvancing] = useState(false);
+  const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
+
+  async function advance() {
+    if (!nextStep?.can_advance || !nextStep.advance_action || !nextStepRef) return;
+    setAdvancing(true);
+    setBanner(null);
+    try {
+      const res =
+        nextStepRef.kind === "proposal"
+          ? await primeDriver.advance(nextStepRef.id, nextStep.advance_action)
+          : await primeDriver.mandateAdvance(nextStepRef.id, nextStep.advance_action);
+      if (res.advanced) {
+        setBanner({ kind: "ok", msg: `Advanced one step${res.action ? ` · ${res.action}` : ""}.` });
+      } else if (res.refused) {
+        // The driver refused (e.g. a governance gate) — show its reason verbatim.
+        setBanner({ kind: "err", msg: `Refused: ${res.reason ?? res.refused}` });
+      }
+      onReload();
+    } catch (e) {
+      // A stale request (409) means the plan moved on between read and click —
+      // honest banner + reload the fresh next step; never retry the 409 blindly.
+      if (e instanceof ApiError && e.status === 409) {
+        setBanner({
+          kind: "err",
+          msg: "That step is no longer current — the plan moved on. Reloading the latest next step.",
+        });
+      } else {
+        setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Advance failed" });
+      }
+      onReload();
+    } finally {
+      setAdvancing(false);
+    }
+  }
+
+  // The pressure strip is best-effort from whichever Action Center feed we have.
+  const byCat = actions?.counts?.by_category ?? {};
+  const pressures = PRESSURES.map(([cat, label, to, tone]) => ({
+    label,
+    to,
+    tone,
+    n: byCat[cat] ?? 0,
+  })).filter((p) => p.n > 0);
+
+  return (
+    <div className="card">
+      <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
+        <h3 style={{ margin: 0 }}>Company operating status</h3>
+        <div className="spacer" style={{ flex: 1 }} />
+        <span className="muted" style={{ fontSize: 12 }}>Prime's next safe step</span>
+      </div>
+      {banner && (
+        <div className={"banner " + banner.kind} style={{ fontSize: 12, marginBottom: 8 }}>
+          {banner.msg}
+        </div>
+      )}
+
+      {nextStep ? (
+        <>
+          <div className="shift-room-row" style={{ alignItems: "flex-start" }}>
+            <span
+              className={"badge " + (PHASE_TONE[nextStep.phase] ?? "todo")}
+              style={{ fontSize: 9, minWidth: 76, textAlign: "center" }}
+              title={`phase: ${nextStep.phase}`}
+            >
+              {nextStep.can_advance ? "next step" : "operator step"}
+            </span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 13, fontWeight: 600 }}>{nextStep.label}</div>
+              {nextStep.reason && (
+                <div className="muted" style={{ fontSize: 11 }}>{nextStep.reason}</div>
+              )}
+              {!nextStep.can_advance && nextStep.route && (
+                <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>
+                  Take it here: <Link to={nextStep.route} className="link">{nextStep.route}</Link>
+                </div>
+              )}
+            </div>
+            {nextStep.can_advance && nextStep.advance_action ? (
+              <button
+                className="btn"
+                disabled={advancing}
+                onClick={advance}
+                title="Run this ONE governed step now through the existing gated route. The driver advances at most one step and never approves a strategy, hire, spawn, or budget gate."
+              >
+                {advancing ? "Advancing…" : "Advance one step"}
+              </button>
+            ) : nextStep.route ? (
+              <Link to={nextStep.route} className="btn sm ghost">Open →</Link>
+            ) : null}
+          </div>
+
+          {/* Board/run counts the next step is computed over (non-zero only). */}
+          {COCKPIT_COUNTS.some(([k]) => (nextStep.counts?.[k] ?? 0) > 0) && (
+            <div className="row wrap" style={{ gap: 6, marginTop: 8 }}>
+              {COCKPIT_COUNTS.filter(([k]) => (nextStep.counts?.[k] ?? 0) > 0).map(([k, label, tone]) => (
+                <span key={k} className={"badge " + tone} style={{ fontSize: 9 }}>
+                  {nextStep.counts[k]} {label}
+                </span>
+              ))}
+              <span className="muted" style={{ fontSize: 11 }}>
+                {nextStep.counts?.total_briefs ?? 0} Brief(s) in plan
+              </span>
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="empty">
+          No active Prime plan yet — <Link to="/chat" className="link">plan with Prime</Link> to
+          propose a Mandate, crew, and Briefs.
+        </div>
+      )}
+
+      {/* Pressure strip — live company pressures, each linking to where it's
+          worked. Sourced from the Action Center feed; hidden when nothing's hot. */}
+      {pressures.length > 0 && (
+        <div className="row wrap" style={{ gap: 8, marginTop: 10, alignItems: "center" }}>
+          <span className="muted" style={{ fontSize: 11 }}>Pressure</span>
+          {pressures.map((p) => (
+            <Link key={p.label} to={p.to} className={"badge " + p.tone} style={{ fontSize: 9 }}>
+              {p.n} {p.label}
+            </Link>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 // The Action Center — one ordered, deduped feed of what needs the operator,
 // computed server-side from live state (company-model §8.2). Each row links to

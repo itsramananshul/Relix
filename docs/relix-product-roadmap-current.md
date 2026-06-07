@@ -107,8 +107,14 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   blind loop, never auto-approves a strategy/hire/spawn/budget gate, never runs a real
   adapter (Start stays the explicit button), one click = one step. Bridge:
   `GET /v1/spine/{prime/proposals,mandates}/:id/next-step` +
-  `POST …/advance`; dashboard: the Chat Shift Room shows the next step + a restrained
-  **Advance one step** button when `can_advance`, else the route to take by hand.
+  `POST …/advance`; dashboard: the Chat Shift Room **and the Overview cockpit**
+  ("Company operating status") show the next step + a restrained **Advance one step** button
+  when `can_advance`, else the route to take by hand. The Overview cockpit picks the most
+  relevant active object (latest Prime proposal, else the latest Mandate via the twin route),
+  pairs the step with board/run counts from the payload + a live pressure strip from the
+  Action Center, is best-effort (a missing next step never blanks the Overview), and on a
+  stale `409` shows an honest banner + reloads the fresh step. Still one safe explicit step,
+  **not** an autonomous CEO loop.
 
 ### Briefs / Workroom (`relix-execution-and-issue-design.md` §1, §1.9)
 - **Two-pointer Claim** — `checkout_run` + `execution_run`, self-refresh, lease/release,
@@ -222,6 +228,13 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
 - **Action Center / The Desk** — `GET /v1/spine/company/actions`: ranked next-actions with
   severity chips, plain-language reasons, recovery-decision cards (root cause → one route),
   refreshed off SSE + low-frequency poll.
+- **Overview cockpit ("Company operating status")** — surfaces the Prime guided-driver's ONE
+  next safe step for the most relevant active object (latest proposal, else latest Mandate),
+  with the payload's board/run counts, a live Action-Center pressure strip (approvals / hires /
+  budget / recovery / review / ready), and a restrained **Advance one step** button when
+  `can_advance` (else the route to take by hand). Best-effort + honest empty/stale states; uses
+  the existing `prime.next_step` / `prime.advance` routes — no new backend authority. Still one
+  explicit governed step, not an autonomous CEO loop.
 - **Brief workroom** — Conversation thread + Chronicle ledger + answerable Requests panel;
   Shift lifecycle operated inline.
 - **Shell** — mobile off-canvas drawer + ⌘K command palette (navigation-only); client-side
