@@ -3362,10 +3362,11 @@ pub fn register_agent_capabilities(
                 let ts = ts.clone();
                 let mq = mq.clone();
                 async move {
-                    // Live-spend seam: the SAME metrics ledger + trailing-30-day
-                    // window the dispatch gate enforces. `None` → allowance-backed
+                    // Live-spend seam: the SAME metrics ledger + canonical
+                    // calendar-month window the dispatch gate enforces
+                    // (`heartbeat::allowance_window`). `None` → allowance-backed
                     // budget signals only (no fabricated spend figure).
-                    let spend = mq.map(handlers::MetricsSpendSource::trailing_30d);
+                    let spend = mq.map(handlers::MetricsSpendSource::current_month);
                     let spend_ref: Option<
                         &dyn crate::nodes::coordinator::agent::action_center::SpendSource,
                     > = spend.as_ref().map(|s| {
@@ -10654,14 +10655,15 @@ fn register_node_type_handlers(
                             // dispatch a Brief whose Operative is over its
                             // monthly Allowance or explicitly hard-stopped
                             // (allowance = 0). Spend is the Operative's
-                            // trailing-30-day cost from the metrics ledger.
+                            // month-to-date cost from the metrics ledger.
                             // Autonomous budget gate (relix-company-model
-                            // §3.6/§5.2D per-Operative Allowance + §6.6 Guild
+                            // §3.6/§5.2D per-Operative Allowance + §6/§6.6 Guild
                             // budget): the per-Operative hard-stop is authoritative
                             // and the Guild ceiling is ADDITIVE on top of it. Both
-                            // read the SAME metrics ledger + trailing-30-day window
-                            // the Action Center reports, and the Guild spend is
-                            // summed ONLY over the Brief's own Guild (tenant-safe).
+                            // read the SAME metrics ledger + canonical calendar-
+                            // month window (`heartbeat::allowance_window`) the
+                            // Action Center reports, and the Guild spend is summed
+                            // ONLY over the Brief's own Guild (tenant-safe).
                             move |card| {
                                 let now_ms = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)

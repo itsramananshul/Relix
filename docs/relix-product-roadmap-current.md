@@ -145,7 +145,8 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
 - **Keys enforced** — spawn, assign (every assignment path), manage, configure, secret
   allowlist (deny-by-default), instruction-bundle-as-charter.
 - **Allowance hard-stop** — heartbeat refuses a Brief when the Operative is over Allowance
-  (trailing-30-day, best-effort); `brief.budget_refused` event.
+  (**current UTC calendar-month** window via the canonical `heartbeat::allowance_window`,
+  best-effort); `brief.budget_refused` event.
 - **Guild spend hard-stop (autonomous)** — the autonomous heartbeat path now also
   refuses a Brief when its **Guild** is over its monthly budget, mirroring the
   per-Operative stop and additive on top of it (`guild.budget_refused` event,
@@ -156,9 +157,16 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   another Guild resolves not-found.
 - **Chronicle** — hash-chained events for every run transition, interaction, and Prime
   action; **durable activity ledger** `/v1/activity/recent` (`bridge-activity.jsonl`).
-- **Live spend telemetry** — Action Center surfaces real trailing-30d spend vs Allowance
+- **Live spend telemetry** — Action Center surfaces real month-to-date spend vs Allowance
   through the gate's own `MetricsSpendSource` (commit `579fa8c5`, ledger-reconciled in
-  `177c93ef`).
+  `177c93ef`); the window is the canonical UTC calendar month (`allowance_window`), the
+  exact source + window the dispatch gate enforces.
+- **Allowance calendar-month windowing** — the per-Operative Allowance and Guild-budget
+  hard-stops bill against the **current UTC calendar month** via a single canonical
+  `heartbeat::allowance_window(now_ms)` (inclusive month start → reset edge), replacing the
+  trailing-30-day approximation. Reset is implicit (spend is re-summed from the live month
+  start); the gate and the Action Center read the identical window so they can never
+  disagree (`company-model §6/§6.6`).
 
 ### Dashboard (`relix-dashboard-design.md`)
 - **React SPA is THE dashboard** — `apps/dashboard` built to
@@ -215,12 +223,16 @@ ledger entry or design section.
    budget, mirroring the per-Operative hard-stop and additive on top of it
    (`guild.budget_refused` / `over_guild_budget`), tenant-safe (the Guild spend is summed
    over only the Brief's own Guild). Manual `brief.run` / `prime.start` stay sovereign
-   (operator-initiated, no Guild gate). *Remaining (deferred, see §3 P1.3 / §5 slice 9-10):*
-   the spend window is trailing-30-day (not calendar-month with reset), and there is still
-   no issue-tree cost rollup or billing-code attribution (`company-model §6.6`; ledger
-   "Guild-level spend hard-stop (autonomous)" = DONE).
-3. **[BE] Allowance windowing** — trailing-30-day approximates the doc's calendar-month
-   window; no reset bookkeeping, no issue-tree cost rollup, no billing-code attribution.
+   (operator-initiated, no Guild gate). *Remaining (deferred, see §5 slice 10):* no
+   issue-tree cost rollup or billing-code attribution (`company-model §6.6`; ledger
+   "Guild-level spend hard-stop (autonomous)" = DONE). *(The spend window is now the UTC
+   calendar month with reset — slice 9 = DONE.)*
+3. **[BE] Allowance windowing** — **DONE** (§5 slice 9). The per-Operative and Guild
+   hard-stops + the Action Center live-spend feed now bill against the **current UTC
+   calendar month** via the single canonical `heartbeat::allowance_window(now_ms)`
+   (inclusive month start → reset edge), replacing the trailing-30-day approximation; reset
+   is implicit (spend re-summed from the live month start). *Still deferred:* issue-tree
+   cost rollup + billing-code attribution (`company-model §6.6` → slice 10).
 
 **P2 — product-feel surfaces (mostly frontend on data that already exists)**
 4. **[FE] The Lattice (org chart)** — pan/zoom org-tree view is **not started**
@@ -363,10 +375,30 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    (admin recovery pointers, maintenance, run-workspace context mode, theme). *Adds:* a real
    settings home, not a stub. *Verify:* rebuild dist; manual.
 
-9. **Allowance calendar-month windowing + reset bookkeeping** — `company-model.md §6`.
-   *Files:* metrics/allowance enforcer in coordinator, `action_center.rs`. *Adds:*
-   calendar-month window with reset, replacing trailing-30d approximation; near-band
-   configurable. *Test:* month-boundary reset test. *Verify:* `cargo test`; ledger updated.
+9. **Allowance calendar-month windowing + reset bookkeeping** — `company-model.md §6/§6.6`.
+   **✅ DONE.** *Files changed:* `crates/relix-runtime/src/nodes/coordinator/heartbeat.rs`
+   (new canonical `allowance_window(now_ms) -> AllowanceWindow { start_ms, cutoff_ms,
+   resets_at_ms }` = the current **UTC calendar month**, inclusive month start →
+   next-month reset edge, with zero-dep Hinnant `civil_from_days`/`days_from_civil`;
+   `dispatch_budget_admits` now derives `since_ms` from it instead of `now − 30d`; the
+   month-boundary/leap/Dec→Jan reset test; the metrics-seeded budget tests pin their rows to
+   the window start so they're deterministic at a month boundary),
+   `crates/relix-runtime/src/nodes/coordinator/agent/handlers.rs`
+   (`MetricsSpendSource::trailing_30d` → `current_month`, window from `allowance_window`;
+   real-ledger live-spend tests seed relative to the window),
+   `crates/relix-runtime/src/controller_runtime.rs` (call-site rename + comments),
+   `crates/relix-runtime/src/nodes/coordinator/agent/action_center.rs` (operator copy
+   "last 30 days" → "this month"; doc + test assertion). *Adds:* one canonical
+   calendar-month window both the dispatch gate and the Action Center read, so they can never
+   disagree; reset is implicit (spend re-summed from the live month start — no stored
+   counter to clear); `resets_at_ms` is the bookkeeping value the surface can show. *Why
+   UTC:* the mesh has no per-Guild billing timezone; a single stable zone keeps gate + feed +
+   tests in agreement, and a future per-Guild zone changes only that one function. *Pinned:*
+   window opens at the inclusive month start, resets at the next month's first instant; 1ms
+   before the boundary belongs to the previous month; Feb 2024 is 29 days; December rolls
+   into the next January. *Verified:* targeted + full `cargo test -p relix-runtime` green;
+   `cargo check`/`cargo clippy` clean on the touched code. *Remaining (deferred → slice 10):*
+   issue-tree cost rollup + billing-code attribution (`company-model §6.6`).
 
 10. **Stale-run adoption by terminal evidence** — `execution-and-issue-design.md §1.4/§7.1`.
     **✅ DONE.** *Files changed:* `crates/relix-runtime/src/nodes/coordinator/mod.rs` (new

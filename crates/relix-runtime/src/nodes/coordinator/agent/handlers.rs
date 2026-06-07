@@ -1333,8 +1333,9 @@ pub fn handle_company_actions(
 }
 
 /// `company.actions` with an optional authoritative **live-spend** source — the
-/// SAME month-to-date ledger + trailing-30-day window the dispatch/refusal gate
-/// enforces (`MetricsQuery::cost_since`, the `over_allowance` path). When
+/// SAME month-to-date ledger + canonical calendar-month window the dispatch/
+/// refusal gate enforces (`MetricsQuery::cost_since`, the `over_allowance`
+/// path; `heartbeat::allowance_window`). When
 /// `spend` is `Some`, the feed adds actual-spend budget alerts (per-Operative
 /// over/near Allowance + Guild over/near budget) keyed off real recorded cost;
 /// when `None`, NO spend item is emitted (the allowance-committed planning
@@ -1466,8 +1467,9 @@ pub fn handle_company_actions_with_spend(
 
     //     (c) LIVE SPEND (Part B) — actual recorded month-to-date cost from the
     //         SAME authoritative source + window the dispatch/refusal gate
-    //         enforces (`MetricsQuery::cost_since` over the trailing 30 days,
-    //         `heartbeat::allowance_admits`). Read ONLY through the `SpendSource`
+    //         enforces (`MetricsQuery::cost_since` over the current UTC calendar
+    //         month, `heartbeat::allowance_window` + `allowance_admits`). Read
+    //         ONLY through the `SpendSource`
     //         seam, so when no ledger is wired (`spend == None`) NO spend item is
     //         emitted — the feed never fabricates a figure.
     //
@@ -1595,28 +1597,30 @@ pub fn handle_company_actions_with_spend(
 
 /// Production [`action_center::SpendSource`] — the authoritative month-to-date
 /// spend the dispatch/refusal gate enforces, exposed READ-ONLY to the Action
-/// Center. Wraps a [`crate::metrics::MetricsQuery`] and pins the SAME trailing
-/// window the heartbeat Allowance gate computes (`now − 30d`), so the feed can
-/// never disagree with the gate by reading a different source or window. A
-/// ledger read error degrades to `None` (no spend signal) — never a fabricated
-/// `0`.
+/// Center. Wraps a [`crate::metrics::MetricsQuery`] and pins the SAME canonical
+/// window the heartbeat Allowance gate computes
+/// ([`crate::nodes::coordinator::heartbeat::allowance_window`] — the current UTC
+/// calendar month), so the feed can never disagree with the gate by reading a
+/// different source or window. A ledger read error degrades to `None` (no spend
+/// signal) — never a fabricated `0`.
 pub struct MetricsSpendSource {
     query: crate::metrics::MetricsQuery,
     since_ms: i64,
 }
 
 impl MetricsSpendSource {
-    /// Build a source whose window is the trailing 30 days ending now — the
-    /// exact window the heartbeat budget closure uses
-    /// (`controller_runtime`: `now − 30 * 86_400 * 1000` ms).
-    pub fn trailing_30d(query: crate::metrics::MetricsQuery) -> Self {
+    /// Build a source whose window is the current UTC calendar month — the exact
+    /// window the heartbeat budget gate uses
+    /// ([`crate::nodes::coordinator::heartbeat::allowance_window`]); spend is
+    /// summed from the month's first instant (inclusive) up to now.
+    pub fn current_month(query: crate::metrics::MetricsQuery) -> Self {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         Self {
             query,
-            since_ms: now_ms - 30 * 86_400 * 1000,
+            since_ms: crate::nodes::coordinator::heartbeat::allowance_window(now_ms).start_ms,
         }
     }
 }
@@ -7573,12 +7577,12 @@ mod tests {
 
     // ── Live spend through the REAL ledger: the same tests as above, but driven
     //    end-to-end through the PRODUCTION seam — a real `MetricsStore` →
-    //    `MetricsQuery` → `MetricsSpendSource::trailing_30d` (the exact type +
+    //    `MetricsQuery` → `MetricsSpendSource::current_month` (the exact type +
     //    window `register_agent_capabilities` wires at boot), not a hand-rolled
     //    `FakeSpend`. Closes the impl-map gap: the spend SOURCE was previously
     //    exercised only with a fake. ──────────────────────────────────────────
 
-    /// Wall-clock now in unix-ms — matches `MetricsSpendSource::trailing_30d`'s
+    /// Wall-clock now in unix-ms — matches `MetricsSpendSource::current_month`'s
     /// own clock so seeded timestamps land on the intended side of the window.
     fn now_unix_ms() -> i64 {
         std::time::SystemTime::now()
@@ -7624,7 +7628,7 @@ mod tests {
         // Same scenario as `..._over_and_near_allowance`, but the spend signal
         // flows through the production `MetricsSpendSource` over a real
         // in-memory `MetricsStore`/`MetricsQuery` — proving the handler reads
-        // actual ledger cost, sums multiple rows, and honours the trailing-30d
+        // actual ledger cost, sums multiple rows, and honours the calendar-month
         // window, not just that it trusts a fake's number.
         let (agents, spine, task) = prime_stores();
         let over = agents
@@ -7644,8 +7648,13 @@ mod tests {
 
         let store = crate::metrics::MetricsStore::in_memory().unwrap();
         let now = now_unix_ms();
-        let recent = now - 1_000; // 1s ago — inside the trailing-30d window.
-        let stale = now - 31 * 86_400 * 1000; // 31d ago — OUTSIDE the window.
+        // Derive seed timestamps from the canonical calendar-month window so the
+        // test is deterministic at any clock: `recent` sits at the month's first
+        // instant (inclusive — counted); `stale` is 1ms before it (previous
+        // month — excluded).
+        let win = crate::nodes::coordinator::heartbeat::allowance_window(now);
+        let recent = win.start_ms; // this month — inside the window.
+        let stale = win.start_ms - 1; // last month — OUTSIDE the window.
         store
             .insert_batch(&[
                 // over: $150 + $100 = $250 of $200 (125%) → High. Split across
@@ -7653,7 +7662,7 @@ mod tests {
                 // reads a single row.
                 spend_row(&over, "default", recent, 150_000_000),
                 spend_row(&over, "default", recent, 100_000_000),
-                // A huge STALE row for `over` that — were the 30d window ignored
+                // A huge STALE row for `over` that — were the month window ignored
                 // — would blow the figure far past $250. Its exclusion is what
                 // pins the window behaviour.
                 spend_row(&over, "default", stale, 5_000_000_000),
@@ -7664,7 +7673,7 @@ mod tests {
 
         // The EXACT production type + window wired in `register_agent_capabilities`.
         let spend =
-            MetricsSpendSource::trailing_30d(crate::metrics::MetricsQuery::new(store));
+            MetricsSpendSource::current_month(crate::metrics::MetricsQuery::new(store));
 
         let v = json_of(ok_body(handle_company_actions_with_spend(
             &agents,
@@ -7725,15 +7734,19 @@ mod tests {
 
         let store = crate::metrics::MetricsStore::in_memory().unwrap();
         let now = now_unix_ms();
+        // Seed at the canonical month-window start so both rows count in-window
+        // regardless of the wall clock (deterministic at a month boundary too).
+        let in_window =
+            crate::nodes::coordinator::heartbeat::allowance_window(now).start_ms;
         // BOTH Operatives are over their $200 cap in the SHARED ledger ($250 each).
         store
             .insert_batch(&[
-                spend_row(&acme, "acme", now - 1_000, 250_000_000),
-                spend_row(&globex, "globex", now - 1_000, 250_000_000),
+                spend_row(&acme, "acme", in_window, 250_000_000),
+                spend_row(&globex, "globex", in_window, 250_000_000),
             ])
             .unwrap();
         let spend =
-            MetricsSpendSource::trailing_30d(crate::metrics::MetricsQuery::new(store));
+            MetricsSpendSource::current_month(crate::metrics::MetricsQuery::new(store));
 
         // acme's feed surfaces acme's Operative ONLY.
         let a = json_of(ok_body(handle_company_actions_with_spend(

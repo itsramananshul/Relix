@@ -145,6 +145,87 @@ pub const GUILD_BUDGET_STATUS: &str = "over_guild_budget";
 /// One US cent expressed in micro-USD (the metrics cost unit).
 pub const MICROS_PER_CENT: u64 = 10_000;
 
+/// Milliseconds in one day.
+const MS_PER_DAY: i64 = 86_400_000;
+
+/// Boundaries of the monthly **Allowance window** — the calendar period the
+/// autonomous per-Operative Allowance and Guild-budget hard-stops bill against
+/// (relix-company-model §6 "execution / Budgets" + §6.6 "Cost rollup &
+/// attribution"; lexicon: "Allowance").
+///
+/// The window is the **current calendar month in UTC**:
+/// - `start_ms` — the first instant of the month (00:00:00.000 UTC),
+///   **inclusive**, matching `MetricsQuery::cost_since`'s `timestamp_ms >= since`
+///   bound exactly;
+/// - `cutoff_ms` — the upper edge of month-to-date spend (= the `now_ms` passed
+///   in);
+/// - `resets_at_ms` — the first instant of the **next** month (the reset
+///   boundary). There is no stored counter to clear: month-to-date spend is
+///   always re-summed from the live `start_ms`, so a new month is a fresh window
+///   **by construction** — `resets_at_ms` is the bookkeeping value the operator
+///   surface can show as "resets at …".
+///
+/// **UTC is deliberate and fixed.** The mesh carries no per-Guild billing
+/// timezone, so a single stable zone keeps the dispatch gate, the Action Center
+/// live-spend feed, and tests in exact agreement. If a per-Guild billing
+/// timezone is ever introduced, it changes only this one function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllowanceWindow {
+    /// First instant of the current calendar month, unix-ms, UTC, inclusive.
+    pub start_ms: i64,
+    /// Month-to-date cutoff (the `now_ms` the window was computed for), unix-ms.
+    pub cutoff_ms: i64,
+    /// First instant of the next calendar month, unix-ms, UTC — the reset edge.
+    pub resets_at_ms: i64,
+}
+
+/// THE canonical Allowance window for a wall-clock `now_ms` (unix-ms).
+///
+/// Every Allowance / Guild-budget spend read MUST derive its window start from
+/// here — the autonomous dispatch gate ([`dispatch_budget_admits`]) and the
+/// Action Center's live-spend seam (`MetricsSpendSource::current_month`) both do,
+/// so the gate and the feed can never disagree by computing the window two ways.
+pub fn allowance_window(now_ms: i64) -> AllowanceWindow {
+    let (y, m, _d) = civil_from_days(now_ms.div_euclid(MS_PER_DAY));
+    let start_day = days_from_civil(y, m, 1);
+    let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    let reset_day = days_from_civil(ny, nm, 1);
+    AllowanceWindow {
+        start_ms: start_day * MS_PER_DAY,
+        cutoff_ms: now_ms,
+        resets_at_ms: reset_day * MS_PER_DAY,
+    }
+}
+
+/// Days-since-Unix-epoch → `(year, month, day)`, Howard Hinnant's branch-free
+/// `civil_from_days` (proleptic Gregorian, zero-dependency, exact). `month` is
+/// 1–12, `day` is 1–31.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d)
+}
+
+/// `(year, month, day)` → days-since-Unix-epoch, Howard Hinnant's
+/// `days_from_civil` (the inverse of [`civil_from_days`]). `month` is 1–12.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let m = m as i64;
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
 /// Pure per-Operative monthly Allowance verdict.
 ///
 /// - `allowance_cents`: the Operative's configured monthly cap
@@ -197,8 +278,9 @@ pub fn allowance_admits(allowance_cents: Option<i64>, spend_micros: u64) -> Budg
 ///   NOT a company-wide hard-stop; that deliberately differs from the
 ///   per-Operative `0` = hard-stop, because the Guild budget is an Option whose
 ///   "unset" sentinel is `None`/`0`).
-/// - `guild_spend_micros`: the Guild's trailing-30-day spend in micro-USD — the
-///   SUM of THIS Guild's active Operatives' `cost_since` (never a cross-tenant
+/// - `guild_spend_micros`: the Guild's month-to-date spend in micro-USD — the
+///   SUM of THIS Guild's active Operatives' `cost_since` over the canonical
+///   [`allowance_window`] (current UTC calendar month; never a cross-tenant
 ///   `cost_since(None, …)`), the exact figure the Action Center's
 ///   `company_spend_item` reports.
 ///
@@ -237,8 +319,9 @@ pub fn guild_allowance_admits(
 /// gate allows, so it can never weaken per-Operative enforcement.
 ///
 /// **Tenant isolation:** the Guild spend is the SUM of the Brief's OWN Guild's
-/// active Operatives' trailing-30-day `cost_since` (resolved via
-/// `task_tenant` → `list_active_for_tenant`), never a cross-tenant
+/// active Operatives' `cost_since` over the canonical [`allowance_window`]
+/// (current UTC calendar month), resolved via
+/// `task_tenant` → `list_active_for_tenant`, never a cross-tenant
 /// `cost_since(None, …)` — so another Guild's spend can never trip this Guild's
 /// cap. This mirrors the Action Center's `company_spend_item` exactly.
 ///
@@ -258,7 +341,10 @@ pub fn dispatch_budget_admits(
     let Some(assignee) = card.assignee_agent_id.as_deref() else {
         return BudgetAdmission::Allow;
     };
-    let since_ms = now_ms - 30 * 86_400 * 1000;
+    // Canonical Allowance window: the current UTC calendar month, inclusive of
+    // its first instant (relix-company-model §6/§6.6). The Action Center reads
+    // the SAME window via `MetricsSpendSource::current_month`.
+    let since_ms = allowance_window(now_ms).start_ms;
 
     // (1) Per-Operative Allowance hard-stop — authoritative, never weakened.
     if let Some(agent) = agent_store.get_agent(assignee).ok().flatten() {
@@ -2836,9 +2922,55 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn allowance_window_is_the_current_utc_calendar_month() {
+        // Concrete, well-known UTC midnights (seconds since epoch):
+        //   2021-01-01 = 1_609_459_200, 2021-02-01 = 1_612_137_600.
+        const JAN_2021: i64 = 1_609_459_200_000;
+        const FEB_2021: i64 = 1_612_137_600_000;
+
+        // Any instant inside January 2021 → the whole of January is the window.
+        let mid_jan = JAN_2021 + 10 * MS_PER_DAY + 12 * 3_600_000; // Jan 11 12:00Z
+        let w = allowance_window(mid_jan);
+        assert_eq!(w.start_ms, JAN_2021, "window opens at the month's first instant");
+        assert_eq!(w.cutoff_ms, mid_jan, "cutoff is the supplied now");
+        assert_eq!(w.resets_at_ms, FEB_2021, "reset edge is next month's first instant");
+        assert_eq!(w.start_ms % MS_PER_DAY, 0, "start aligns to a UTC midnight");
+
+        // The first instant of the month is INCLUSIVE (matches `cost_since`'s
+        // `timestamp_ms >= since`): a window computed exactly at the boundary
+        // still opens at that boundary, not the previous month.
+        assert_eq!(allowance_window(JAN_2021).start_ms, JAN_2021);
+
+        // Reset bookkeeping: feeding the reset edge yields a fresh window that
+        // opens exactly at that edge — month-to-date spend resets by
+        // construction (a new window summed from the new start).
+        assert_eq!(allowance_window(FEB_2021).start_ms, FEB_2021);
+        // 1ms before the boundary still belongs to the previous month, which
+        // resets precisely at the boundary.
+        assert_eq!(allowance_window(JAN_2021 - 1).resets_at_ms, JAN_2021);
+
+        // Leap February (2024): the window is 29 days long.
+        const FEB_2024: i64 = 1_706_745_600_000; // 2024-02-01
+        let leap = allowance_window(FEB_2024 + 14 * MS_PER_DAY); // Feb 15 2024
+        assert_eq!(leap.start_ms, FEB_2024);
+        assert_eq!(
+            (leap.resets_at_ms - leap.start_ms) / MS_PER_DAY,
+            29,
+            "Feb 2024 is a leap month"
+        );
+
+        // December → January rollover crosses the year boundary correctly.
+        const DEC_2023: i64 = 1_701_388_800_000; // 2023-12-01
+        const JAN_2024: i64 = 1_704_067_200_000; // 2024-01-01
+        let dec = allowance_window(DEC_2023 + 14 * MS_PER_DAY); // Dec 15 2023
+        assert_eq!(dec.start_ms, DEC_2023);
+        assert_eq!(dec.resets_at_ms, JAN_2024, "December resets into the next January");
+    }
+
     /// A priced AI invocation row attributed to `agent_id` in `tenant` — the
     /// dispatch gate / Action Center count cost by the Operative's `agent_id`
-    /// (`agent_name` must equal `agent_id`) within the trailing-30d window.
+    /// (`agent_name` must equal `agent_id`) within the calendar-month window.
     fn guild_spend_row(
         agent_id: &str,
         tenant: &str,
@@ -2896,11 +3028,14 @@ mod tests {
         let brief = ready_brief_in_tenant(&s, "work", &eng, "guild-a");
         let card = s.brief_card(&brief).unwrap().unwrap();
 
-        // Guild budget $200; the Guild has spent $250 → over.
+        // Guild budget $200; the Guild has spent $250 → over. Seed at the
+        // canonical window start so the row is unconditionally in-month
+        // (deterministic at any clock, including the first second of a month).
         spine.set_guild_allowance("guild-a", Some(20_000)).unwrap();
+        let in_window = allowance_window(now_ms()).start_ms;
         let mstore = crate::metrics::MetricsStore::in_memory().unwrap();
         mstore
-            .insert_batch(&[guild_spend_row(&eng, "guild-a", now_ms() - 1_000, 250_000_000)])
+            .insert_batch(&[guild_spend_row(&eng, "guild-a", in_window, 250_000_000)])
             .unwrap();
         let mq = crate::metrics::MetricsQuery::new(mstore);
 
@@ -2953,9 +3088,10 @@ mod tests {
 
         // BOTH the Operative AND the Guild are over budget.
         spine.set_guild_allowance("guild-a", Some(20_000)).unwrap();
+        let in_window = allowance_window(now_ms()).start_ms;
         let mstore = crate::metrics::MetricsStore::in_memory().unwrap();
         mstore
-            .insert_batch(&[guild_spend_row(&eng, "guild-a", now_ms() - 1_000, 250_000_000)])
+            .insert_batch(&[guild_spend_row(&eng, "guild-a", in_window, 250_000_000)])
             .unwrap();
         let mq = crate::metrics::MetricsQuery::new(mstore);
 
@@ -2995,9 +3131,10 @@ mod tests {
         // BOTH Guilds have a $200 budget; only guild-a has spent ($250).
         spine.set_guild_allowance("guild-a", Some(20_000)).unwrap();
         spine.set_guild_allowance("guild-b", Some(20_000)).unwrap();
+        let in_window = allowance_window(now_ms()).start_ms;
         let mstore = crate::metrics::MetricsStore::in_memory().unwrap();
         mstore
-            .insert_batch(&[guild_spend_row(&eng_a, "guild-a", now_ms() - 1_000, 250_000_000)])
+            .insert_batch(&[guild_spend_row(&eng_a, "guild-a", in_window, 250_000_000)])
             .unwrap();
         let mq = crate::metrics::MetricsQuery::new(mstore);
 

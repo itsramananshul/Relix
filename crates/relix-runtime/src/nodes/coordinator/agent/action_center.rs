@@ -418,8 +418,9 @@ pub fn allowance_hardstop_item(p: &AgentProfile) -> ActionItem {
 
 /// A read-only view of authoritative **month-to-date spend** — the SAME source
 /// and window the dispatch/refusal gate enforces (`MetricsQuery::cost_since`
-/// summing `cost_micros` over the trailing 30 days; see the heartbeat Allowance
-/// gate in `controller_runtime` and `heartbeat::allowance_admits`).
+/// summing `cost_micros` over the current UTC calendar month; see
+/// `heartbeat::allowance_window`, the heartbeat Allowance gate in
+/// `controller_runtime`, and `heartbeat::allowance_admits`).
 ///
 /// The Action Center reads spend ONLY through this seam so that:
 /// - it can never fabricate a spend figure — the production impl is backed by
@@ -430,15 +431,17 @@ pub fn allowance_hardstop_item(p: &AgentProfile) -> ActionItem {
 ///   Operative ids it already resolved from the caller's OWN tenant roster, so
 ///   no cross-tenant or company-wide (`cost_since(None, …)`) total is ever read.
 pub trait SpendSource {
-    /// Trailing-30-day spend for ONE Operative, in micro-USD. `None` means the
+    /// Month-to-date spend (current UTC calendar month) for ONE Operative, in
+    /// micro-USD. `None` means the
     /// ledger could not answer (treated as "no spend signal" — never silently
     /// as `0`, so a transient read failure can't fabricate or suppress an alert
     /// dishonestly).
     fn operative_spend_micros(&self, agent_id: &str) -> Option<u64>;
 }
 
-/// **Live spend alert (Part B)** — an active Operative's ACTUAL trailing-30-day
-/// spend against its configured Allowance, read from the SAME metrics ledger +
+/// **Live spend alert (Part B)** — an active Operative's ACTUAL month-to-date
+/// spend (current UTC calendar month) against its configured Allowance, read
+/// from the SAME metrics ledger +
 /// window the dispatch gate enforces (`MetricsQuery::cost_since`). `over = true`
 /// means spend has reached/passed the cap — the gate's `over_allowance` refusal
 /// threshold (High); otherwise it is *near* the cap (≥ [`SPEND_NEAR_PCT`] —
@@ -460,7 +463,7 @@ pub fn operative_spend_item(
         (
             format!("Spend over Allowance — {}", p.name),
             format!(
-                "spent {} of the {} monthly Allowance ({pct}%) in the last 30 days — at/over the cap; \
+                "spent {} of the {} monthly Allowance ({pct}%) this month — at/over the cap; \
                  the dispatch gate now refuses this Operative. Raise the Allowance to resume",
                 fmt_micros(spend_micros),
                 fmt_cents(cap_cents),
@@ -471,7 +474,7 @@ pub fn operative_spend_item(
         (
             format!("Spend near Allowance — {}", p.name),
             format!(
-                "spent {} of the {} monthly Allowance ({pct}%) in the last 30 days — approaching the cap",
+                "spent {} of the {} monthly Allowance ({pct}%) this month — approaching the cap",
                 fmt_micros(spend_micros),
                 fmt_cents(cap_cents),
             ),
@@ -496,8 +499,9 @@ pub fn operative_spend_item(
     }
 }
 
-/// **Live spend alert (Part B)** — the Guild's ACTUAL trailing-30-day spend (the
-/// sum of THIS tenant's active Operatives' `cost_since`, never a cross-tenant
+/// **Live spend alert (Part B)** — the Guild's ACTUAL month-to-date spend
+/// (current UTC calendar month — the sum of THIS tenant's active Operatives'
+/// `cost_since`, never a cross-tenant
 /// `cost_since(None, …)`) against its configured monthly budget. `over = true`
 /// means actual spend has reached/passed the budget (High); otherwise it is
 /// *near* it (≥ [`SPEND_NEAR_PCT`] — Medium). DISTINCT from the committed-
@@ -514,7 +518,7 @@ pub fn company_spend_item(spend_micros: u64, budget_cents: i64, over: bool) -> A
         (
             "Guild spend over budget".to_string(),
             format!(
-                "the Guild has spent {} of its {} monthly budget ({pct}%) in the last 30 days — over \
+                "the Guild has spent {} of its {} monthly budget ({pct}%) this month — over \
                  budget; the autonomous dispatch gate now refuses this Guild's Briefs. Raise the \
                  budget or trim Operative spend (manual runs stay sovereign)",
                 fmt_micros(spend_micros),
@@ -526,7 +530,7 @@ pub fn company_spend_item(spend_micros: u64, budget_cents: i64, over: bool) -> A
         (
             "Guild spend near budget".to_string(),
             format!(
-                "the Guild has spent {} of its {} monthly budget ({pct}%) in the last 30 days — \
+                "the Guild has spent {} of its {} monthly budget ({pct}%) this month — \
                  approaching the cap",
                 fmt_micros(spend_micros),
                 fmt_cents(budget_cents),
@@ -882,7 +886,7 @@ mod tests {
         assert!(over.reason.contains("over budget"));
         assert!(over.reason.contains("$150.00"));
         assert!(over.reason.contains("150%"));
-        assert!(over.reason.contains("30 days"), "window stated: {}", over.reason);
+        assert!(over.reason.contains("this month"), "window stated: {}", over.reason);
 
         // $85 spent of a $100 budget → near (Medium).
         let near = company_spend_item(85_000_000, 10_000, false);

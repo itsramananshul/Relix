@@ -301,6 +301,32 @@ When a manager delegates, the subordinate's costs **roll up** to the requester. 
 - **The work tree** — because sub-issues hang under their parent, the cost of all descendant work aggregates into the parent issue's subtree total. The planner's issue shows the cost of the whole effort it spawned.
 - **Billing code & request depth** — work handed across teams carries a billing code so its cost attributes to the requesting team, and a "delegation depth" counter shows how many hops deep a cascade went. (Relix already tracks cost per agent/issue/run; we add the tree-rollup and the cross-team tag.)
 
+> **Implementation note — the Allowance/budget window (SHIPPED).** The autonomous
+> per-Operative **Allowance** hard-stop and the additive **Guild** budget
+> hard-stop bill against a single canonical window: the **current calendar month
+> in UTC**. There is **one** window function
+> (`heartbeat::allowance_window(now_ms)`) that every spend read derives from — the
+> dispatch gate (`dispatch_budget_admits`) and the Action Center's live-spend
+> seam (`MetricsSpendSource::current_month`) both call it, so the gate and the
+> Desk can never disagree by computing the window two different ways.
+> - **Boundaries.** The window opens at the month's first instant
+>   (00:00:00.000 UTC, **inclusive** — matching the ledger's
+>   `timestamp_ms >= since` sum) and month-to-date spend is summed up to *now*;
+>   `resets_at_ms` is the first instant of the next month — the reset edge.
+> - **Reset bookkeeping.** There is no stored counter to clear: spend is always
+>   re-summed from the live month start, so a new month is a fresh window **by
+>   construction** (the reset is implicit in the moving `start_ms`).
+> - **UTC is deliberate and fixed.** The mesh carries no per-Guild billing
+>   timezone, so a single stable zone keeps the gate, the feed, and tests in
+>   agreement. If a per-Guild billing timezone is ever introduced, it changes
+>   only that one function.
+> - **Manual sovereignty unchanged.** Only the autonomous heartbeat path passes
+>   through this gate; a manual `brief.run` / `prime.start` never does (the Board
+>   is sovereign).
+> - **Still deferred (honest):** issue-tree **cost rollup** and **billing-code**
+>   cross-team attribution (the two mechanisms above) are not yet built — the
+>   window/reset work does not add them.
+
 ---
 
 ## 7. The chat companion — the reasoning front door
