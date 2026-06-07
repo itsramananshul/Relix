@@ -1798,6 +1798,17 @@ pub fn preflight_run(
             workspace_bytes: None,
         }));
     }
+    // PHASE 3 start lock (execution §2.6): serialize concurrent start passes
+    // for the SAME Operative across the check-then-claim critical section
+    // below, so two passes can't both claim a run slot / double-start this
+    // Operative/Brief execution path. Distinct from the per-Brief DB Claim and
+    // from the live-run count. Different Operatives lock independently, so
+    // unrelated work proceeds in parallel. Held only across this synchronous
+    // claim+commit (never across the adapter run), so it cannot go stale.
+    let start_lock = store.agent_start_lock(&assignee);
+    let _start_guard = start_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Single-owner: claim the Brief so a duplicate concurrent run can't
     // start. A live claim by another run → refuse.
     let run_id = format!("run_{}", uuid::Uuid::new_v4());
@@ -3557,6 +3568,80 @@ mod tests {
         let runs = s.runs_for_brief(&id, 5).unwrap();
         assert_eq!(runs.len(), 2);
         assert!(runs.iter().all(|r| r.workspace.is_some()));
+    }
+
+    #[test]
+    fn preflight_run_refuses_already_running_when_another_run_holds_the_claim() {
+        // execution-and-issue-design §1.4/§7.1 (LOCKED two-pointer Claim): the
+        // manual start path refuses with `already_running` when a DIFFERENT
+        // active execution already owns the Brief's Claim. This is the refusal
+        // the HTTP bridge maps to 409 Conflict (never a retryable 200).
+        let (s, _tmp) = store_ws();
+        let reg = echo_registry();
+        let id = ready_brief(&s, "contended manual start", "agt_a");
+        // A different worker already holds a live Claim on the Brief.
+        assert!(s
+            .claim_brief_for_run(&id, "other_agent", 300, Some("other_run"))
+            .unwrap());
+
+        let report = match preflight_run(&s, &reg, None, 300, &id, Some("echo"), "x".into()).unwrap()
+        {
+            Preflight::Refused(r) => r,
+            Preflight::Ready(_) => panic!("expected a conflict refusal, got a ready run"),
+        };
+        assert_eq!(report.status, "already_running", "got: {report:?}");
+        assert!(report.run_id.is_none(), "a conflict opens no run row");
+        // The other worker's Claim is untouched — the loser never stole it.
+        assert_eq!(s.claim_holder(&id).unwrap().unwrap().0, "other_agent");
+        // No run row was opened for the refused start.
+        assert!(s.runs_for_brief(&id, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_starts_one_wins_loser_gets_conflict_and_a_retry_loses_again() {
+        // execution-and-issue-design §1.4/§7.1 + §2.6 (per-Operative start
+        // lock): two starts race the SAME Brief held by a live external Claim.
+        // The start path is serialized per Operative and every contender is
+        // refused `already_running` (→ HTTP 409). The rule the loser honors:
+        // NEVER retry a 409 — a retry while the holder is live loses again.
+        let (s, _tmp) = store_ws();
+        let s = std::sync::Arc::new(s);
+        let reg = std::sync::Arc::new(echo_registry());
+        let id = ready_brief(&s, "race", "agt_a");
+        // An external worker holds the live Claim, so BOTH contenders below
+        // (which resolve the Brief's assignee, agt_a) must lose deterministically.
+        assert!(s
+            .claim_brief_for_run(&id, "other_agent", 300, Some("other_run"))
+            .unwrap());
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for prompt in ["a", "b"] {
+            let s = s.clone();
+            let reg = reg.clone();
+            let id = id.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                preflight_run(&s, &reg, None, 300, &id, Some("echo"), prompt.into()).unwrap()
+            }));
+        }
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let conflicts = outcomes
+            .iter()
+            .filter(|o| matches!(o, Preflight::Refused(r) if r.status == "already_running"))
+            .count();
+        assert_eq!(conflicts, 2, "both contenders lose to the live external Claim");
+        // No run rows were opened; the external Claim still stands.
+        assert!(s.runs_for_brief(&id, 5).unwrap().is_empty());
+        assert_eq!(s.claim_holder(&id).unwrap().unwrap().0, "other_agent");
+
+        // NEVER retry a 409: another start while the holder is live conflicts again.
+        let retry = preflight_run(&s, &reg, None, 300, &id, Some("echo"), "retry".into()).unwrap();
+        assert!(
+            matches!(retry, Preflight::Refused(r) if r.status == "already_running"),
+            "a retry of a 409 conflict loses again — clients must not retry"
+        );
     }
 
     // ── Run transcript + cancellation ───────────────────────────

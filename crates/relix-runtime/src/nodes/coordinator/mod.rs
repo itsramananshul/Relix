@@ -474,6 +474,16 @@ pub struct TaskStore {
     /// from env at open. Governs whether `copy_repo` snapshots project
     /// context into each run sandbox.
     workspace_config: crate::nodes::coordinator::heartbeat::WorkspaceConfig,
+    /// PHASE 3 (start lock): the in-process per-Operative **start lock**
+    /// registry. One `Mutex<()>` per Operative id, created lazily, serializes
+    /// the check-then-claim critical section of a run start so two concurrent
+    /// start passes for the SAME Operative can't both claim a run slot /
+    /// double-start the same Operative/Brief execution path
+    /// (relix-execution-and-issue-design §2.6). Distinct from the per-Brief DB
+    /// Claim and from the per-Operative live-run *count*: those guard the Brief
+    /// and measure capacity; this orders the start itself. Different Operatives
+    /// get distinct locks, so unrelated work runs fully in parallel.
+    start_locks: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 /// Resolve the scoped-run workspace base. `RELIX_RUN_WORKSPACE_ROOT`
@@ -513,6 +523,7 @@ impl TaskStore {
             workspace_root: resolve_workspace_root(&cfg.db_path),
             workspace_config:
                 crate::nodes::coordinator::heartbeat::resolve_workspace_config(),
+            start_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -530,7 +541,32 @@ impl TaskStore {
             ),
             workspace_config:
                 crate::nodes::coordinator::heartbeat::WorkspaceConfig::default(),
+            start_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
+    }
+
+    /// PHASE 3 (start lock): return the in-process **start lock** for one
+    /// Operative, creating it lazily. Hold its guard across the synchronous
+    /// claim+commit of a run start (see [`heartbeat::preflight_run`]) so two
+    /// concurrent start passes for the SAME Operative are serialized — they
+    /// can't both claim a run slot or double-start the same Operative/Brief
+    /// execution path (relix-execution-and-issue-design §2.6). This is
+    /// deliberately **distinct from the live-run claim count**: the count
+    /// measures how many runs an Operative already holds; this lock orders the
+    /// check-then-claim itself so that count can't be read stale by two racing
+    /// passes. Different Operatives return different locks, so unrelated work
+    /// proceeds in parallel. The lock is only ever held across the short
+    /// synchronous start critical section (never across an adapter run), so it
+    /// cannot go stale — no timeout is needed. A poisoned lock is recovered
+    /// (the guarded state is just a `()` marker).
+    pub fn agent_start_lock(&self, agent_id: &str) -> Arc<Mutex<()>> {
+        let mut map = self
+            .start_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.entry(agent_id.trim().to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// The base directory under which each run's scoped workspace folder
@@ -18763,6 +18799,77 @@ mod tests {
             s.claim_brief("nope", "agt_a", 300),
             Err(CoordinatorError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn agent_start_lock_is_per_operative_and_reused() {
+        // execution-and-issue-design §2.6: the in-process start lock is keyed
+        // per Operative. Same Operative → the SAME lock (so concurrent starts
+        // for that Operative serialize); different Operatives → distinct locks
+        // (so unrelated work proceeds in parallel).
+        let s = store();
+        let a1 = s.agent_start_lock("agt_a");
+        let a2 = s.agent_start_lock(" agt_a "); // trimmed → same key
+        let b = s.agent_start_lock("agt_b");
+        assert!(
+            Arc::ptr_eq(&a1, &a2),
+            "the same Operative shares one start lock"
+        );
+        assert!(
+            !Arc::ptr_eq(&a1, &b),
+            "different Operatives get distinct start locks"
+        );
+    }
+
+    #[test]
+    fn concurrent_claims_by_distinct_operatives_one_wins_loser_conflicts() {
+        // execution-and-issue-design §1.4/§7.1 (LOCKED two-pointer Claim):
+        // two DIFFERENT Operatives race to Claim the same Brief. Exactly ONE
+        // wins; the other gets a conflict (`Ok(false)`) — the refusal the HTTP
+        // bridge surfaces as 409. The rule the loser must honor: NEVER retry a
+        // 409 — a retry while the winner holds a live Claim only loses again.
+        let s = Arc::new(store());
+        let id = s
+            .create(
+                "contended",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for (agent, run) in [("agt_a", "run_a"), ("agt_b", "run_b")] {
+            let s = s.clone();
+            let id = id.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                s.claim_brief_for_run(&id, agent, 300, Some(run)).unwrap()
+            }));
+        }
+        let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let winners = results.iter().filter(|won| **won).count();
+        assert_eq!(
+            winners, 1,
+            "exactly one Operative wins the Claim; the other conflicts"
+        );
+
+        // Identify the loser and prove NEVER-retry-a-409: a retry by the loser
+        // while the winner still holds a live Claim conflicts again.
+        let holder = s.claim_holder(&id).unwrap().unwrap().0;
+        let loser = if holder == "agt_a" { "agt_b" } else { "agt_a" };
+        assert!(
+            !s.claim_brief_for_run(&id, loser, 300, Some("retry")).unwrap(),
+            "retrying a 409 conflict loses again — clients must not retry"
+        );
+        // The winner's Claim is untouched by the loser's retry.
+        assert_eq!(s.claim_holder(&id).unwrap().unwrap().0, holder);
     }
 
     #[test]

@@ -1208,6 +1208,11 @@ pub struct RunBriefRequest {
 /// a clear unavailable refusal, plus `rig`, `summary`, optional
 /// `install_hint`). The execution result is also chronicled on the Brief
 /// (read back via `/v1/spine/briefs/:id/events`).
+///
+/// A **Claim conflict** — another active execution already owns this Brief's
+/// Claim (`status = already_running`) — is surfaced as **`409 Conflict`**, not
+/// a `200` the dashboard might blindly retry. Per the LOCKED two-pointer Claim
+/// (execution §1.4/§7.1): never retry a 409; pick other work.
 pub async fn run_brief(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1228,7 +1233,9 @@ pub async fn run_brief(
         None => id,
     };
     let resp = call_peer(&state, "brief.run", arg.as_bytes()).await?;
-    json_passthrough(resp)
+    // A Claim conflict (`already_running`) returns `409 Conflict`, never a
+    // `200` the dashboard might blindly retry; all other outcomes stay `200`.
+    run_report_response(resp)
 }
 
 /// `GET /v1/runs` — the recent execution runs across all Briefs (the
@@ -1952,13 +1959,24 @@ fn bad(msg: &str) -> (StatusCode, Json<ApiError>) {
 /// Wrap a raw mesh body (already JSON for these capabilities) in a
 /// `200 application/json` response. An empty body becomes `null`.
 fn json_passthrough(body: Vec<u8>) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_with_status(StatusCode::OK, body)
+}
+
+/// Like [`json_passthrough`] but with an explicit HTTP status, preserving the
+/// structured JSON body. Used to surface a `brief.run` Claim **conflict** as a
+/// `409` that still carries the structured `RunReport` (so the dashboard sees
+/// *why* it conflicted), rather than a generic `200` refusal it might retry.
+fn json_with_status(
+    status: StatusCode,
+    body: Vec<u8>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
     let payload = if body.is_empty() {
         b"null".to_vec()
     } else {
         body
     };
     Response::builder()
-        .status(StatusCode::OK)
+        .status(status)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(payload))
         .map_err(|e| {
@@ -1969,6 +1987,41 @@ fn json_passthrough(body: Vec<u8>) -> Result<Response, (StatusCode, Json<ApiErro
                 }),
             )
         })
+}
+
+/// The `RunReport.status` that means **another active execution already owns
+/// the Brief's Claim**, so this start cannot proceed — a true conflict, not a
+/// precondition the caller can fix. `brief.run` returns it as an `Ok`
+/// `RunReport` (not a mesh error), so the bridge inspects the body and maps it
+/// onto a `409 Conflict`. relix-execution-and-issue-design §1.4/§7.1 (LOCKED
+/// two-pointer Claim): "If zero rows match, it's a 409 conflict — the agent
+/// backs off and picks other work. **Never retry a 409.**"
+const RUN_CONFLICT_STATUS: &str = "already_running";
+
+/// Map a `brief.run` `RunReport` body onto an honest HTTP status. A Claim
+/// conflict (`already_running`) becomes **409 Conflict** carrying the
+/// structured report; EVERY other outcome — a real run (`running`/`done`/
+/// `failed`/`continued`) and the precondition refusals (`unassigned`/
+/// `no_adapter`/`adapter_unavailable`/`workspace_error`/…) — passes through
+/// unchanged as `200`. Precondition refusals are deliberately NOT 409: they
+/// describe a fixable setup gap, not a lost race, and a client may legitimately
+/// retry after fixing it. The 409 is reserved for the one case a blind retry
+/// must never be attempted on.
+fn run_report_response(body: Vec<u8>) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let is_conflict = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("status")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some(RUN_CONFLICT_STATUS);
+    if is_conflict {
+        json_with_status(StatusCode::CONFLICT, body)
+    } else {
+        json_passthrough(body)
+    }
 }
 
 /// Map a coordinator error envelope (`kind` + `cause`) onto an honest
@@ -2151,6 +2204,55 @@ mod tests {
         let (status, body) = bad("q required");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0.error, "q required");
+    }
+
+    #[test]
+    fn run_report_conflict_is_a_409_never_a_retryable_200() {
+        // execution-and-issue-design §1.4/§7.1 (LOCKED two-pointer Claim):
+        // a Claim conflict — another active execution already owns the Brief's
+        // Claim (`status = already_running`) — MUST surface as 409 Conflict,
+        // NOT a 200 the dashboard might blindly retry. The rule a client must
+        // honor on this code: NEVER retry a 409 (a retry only loses the race
+        // again); back off and pick other work.
+        let conflict = run_report_response(
+            br#"{"brief_id":"REL-1","status":"already_running","rig":"echo",
+                 "summary":"another run holds the Claim on this Brief"}"#
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            conflict.status(),
+            StatusCode::CONFLICT,
+            "an already_running Claim conflict must be 409, not a retryable 200"
+        );
+        // The structured RunReport body is preserved on the 409 so the client
+        // can show the reason.
+        assert_eq!(
+            conflict.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn run_report_real_outcomes_and_preconditions_stay_200() {
+        // A live/terminal run is a 200 — the client polls /v1/runs for it.
+        for status in ["running", "done", "failed", "continued"] {
+            let body = format!(r#"{{"brief_id":"REL-1","status":"{status}","rig":"echo","summary":"ok"}}"#);
+            let resp = run_report_response(body.into_bytes()).unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{status} must be 200");
+        }
+        // Precondition refusals describe a FIXABLE setup gap, not a lost race,
+        // so they are deliberately NOT 409 — a client may retry after fixing
+        // the cause. Only `already_running` is the never-retry conflict.
+        for status in ["unassigned", "no_adapter", "adapter_unavailable", "workspace_error"] {
+            let body = format!(r#"{{"brief_id":"REL-1","status":"{status}","rig":"","summary":"x"}}"#);
+            let resp = run_report_response(body.into_bytes()).unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{status} is a precondition refusal, not a 409 conflict"
+            );
+        }
     }
 
     #[test]

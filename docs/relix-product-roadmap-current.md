@@ -97,7 +97,10 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
 
 ### Briefs / Workroom (`relix-execution-and-issue-design.md` §1, §1.9)
 - **Two-pointer Claim** — `checkout_run` + `execution_run`, self-refresh, lease/release,
-  lock clearing on assignee/state change (the LOCKED model, §7.1 — *partial*, see gaps).
+  lock clearing on assignee/state change (the LOCKED model, §7.1). A Claim **conflict** on
+  the run start path now returns **HTTP `409`** (never a retryable `200`), and an in-process
+  **per-Operative start lock** serializes concurrent starts (§1.4/§2.6). *Still partial:*
+  stale-run adoption by terminal evidence (see gaps / §5 slice 10).
 - **Entry guards** — `in_progress` requires assignee + no unresolved Snags; `in_review`
   requires a real reviewer.
 - **Brief detail API** — `brief.detail` returns the full product object (fields,
@@ -172,10 +175,13 @@ Tagged **[BE]** backend, **[FE]** frontend, **[DOC]** docs-only. Each cites the 
 ledger entry or design section.
 
 **P1 — correctness & governance honesty**
-1. **[BE] Claim HTTP 409 semantics + per-agent start lock** — two-pointer Claim is partial:
-   no `409` conflict surface, no dedicated per-agent start lock distinct from claim counts,
-   no stale-run *adoption by terminal evidence* (`execution §1.4`/`§7.1` LOCKED; ledger
-   "Claim two-pointer model" = PARTIAL).
+1. **[BE] Claim stale-run adoption by terminal evidence** — the `409` conflict surface and
+   the per-Operative start lock **shipped** (roadmap §5 slice 1: `brief.run` maps a Claim
+   conflict `already_running` → HTTP `409`, never a retryable `200`; an in-process
+   per-Operative start lock serializes concurrent starts; "never retry a 409" pinned in
+   tests). What remains of the two-pointer Claim is **stale-run *adoption by terminal
+   evidence*** — see §5 slice 10 (`execution §1.4`/`§7.1` LOCKED; ledger "Claim HTTP 409 +
+   per-Operative start lock" = DONE, "stale-run adoption" = PARTIAL).
 2. **[BE] Guild-level spend hard-stop** — only per-Operative Allowance is enforced; the
    Guild cap is **alert-only** today (`company-model §6.6`; ledger "Operative Allowance" &
    "Action Center" = PARTIAL). Manual `brief.run` is intentionally *not* Allowance-gated
@@ -237,11 +243,16 @@ instruction and a doc update.
 
 Each slice = one green, doc-conformant, pushable commit. Pick the top undone one.
 
-1. **Claim 409 + per-agent start lock** — `execution-and-issue-design.md §1.4/§7.1`.
-   *Files:* coordinator agent store/handlers (`crates/relix-runtime/src/nodes/coordinator/agent/`),
-   `crates/relix-web-bridge/src/spine.rs`. *Adds:* zero-row claim → `409`; per-agent start
-   lock distinct from claim count. *Test:* concurrent-claim test asserting one `409`, no
-   retry; pin "never retry a 409". *Verify:* `cargo test` touched crate + workspace.
+1. **Claim 409 + per-agent start lock** — `execution-and-issue-design.md §1.4/§7.1/§2.6`.
+   **✅ DONE.** *Files changed:* `crates/relix-runtime/src/nodes/coordinator/mod.rs` (per-Operative
+   start-lock registry + `agent_start_lock` + tests), `…/coordinator/heartbeat.rs` (acquire the
+   start lock across the claim+commit in `preflight_run`; manual-path conflict + concurrent-start
+   tests), `crates/relix-web-bridge/src/spine.rs` (`run_report_response`/`json_with_status`: a
+   Claim conflict `already_running` → `409 Conflict` carrying the structured `RunReport`; real +
+   precondition statuses stay `200`; tests). *Pinned:* "never retry a 409" in test names/comments.
+   *Verified:* targeted + full `cargo test` on both touched crates green; `cargo check`/`clippy`
+   clean for the changes; `git diff --check` clean. *Remaining of this Claim line → slice 10
+   (stale-run adoption by terminal evidence).*
 
 2. **Guild-level spend hard-stop (autonomous)** — `company-model.md §6.6`.
    *Files:* `action_center.rs`, heartbeat dispatch in coordinator, `spine.rs`. *Adds:* a
