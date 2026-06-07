@@ -120,12 +120,88 @@ const READINESS_TONE: Record<string, string> = {
 };
 
 // A chat-log entry is plain text, a Prime proposal card, an approval result,
-// or a Start-to-Shift result.
+// a Start-to-Shift result, or a single companion-action result.
 type Entry =
   | { role: "user" | "assistant"; kind: "text"; text: string }
+  | { role: "assistant"; kind: "companion"; data: CompanionResponse }
   | { role: "assistant"; kind: "proposal"; data: ProposalResponse; done?: boolean }
   | { role: "assistant"; kind: "approved"; data: ApproveResponse; done?: boolean }
   | { role: "assistant"; kind: "started"; data: StartResponse };
+
+// ── Persistent local chat session (dashboard-design §13) ────────────────────
+// The chat log is kept in the browser under a versioned key so a refresh does
+// NOT wipe the conversation. This is LOCAL UI HISTORY ONLY — it is not the
+// server/audit record (every governed action still lands in the Chronicle).
+// We persist only safe UI data already shown on the page (ids, titles, counts,
+// replies) — never tokens/passwords/secrets — and keep a hard cap so the store
+// can't grow without bound. A corrupt/foreign value resets cleanly.
+const CHAT_STORAGE_KEY = "relix.chat.v1";
+const CHAT_MAX_ENTRIES = 50;
+const GREETING: Entry = {
+  role: "assistant",
+  kind: "text",
+  text:
+    "I'm Prime, your company planner. Describe a goal and I'll propose a governed plan — Mandate, crew, hires, and Briefs — for you to approve. Nothing is created or run until you approve.",
+};
+
+function isEntry(e: unknown): e is Entry {
+  if (!e || typeof e !== "object") return false;
+  const o = e as Record<string, unknown>;
+  return (o.role === "user" || o.role === "assistant") && typeof o.kind === "string";
+}
+
+// Load the persisted log; reset cleanly to the greeting on any parse/shape error.
+function loadLog(): Entry[] {
+  try {
+    const raw = typeof localStorage !== "undefined" ? localStorage.getItem(CHAT_STORAGE_KEY) : null;
+    if (!raw) return [GREETING];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [GREETING];
+    const clean = parsed.filter(isEntry).slice(-CHAT_MAX_ENTRIES);
+    return clean.length > 0 ? clean : [GREETING];
+  } catch {
+    try {
+      localStorage.removeItem(CHAT_STORAGE_KEY);
+    } catch {
+      /* storage unavailable — fall through to the in-memory greeting */
+    }
+    return [GREETING];
+  }
+}
+
+// Quick-action chips (dashboard-design §13: "command discoverability"). Safe
+// READ commands (`send:"command"`) dispatch straight to the governed companion
+// route; WRITE templates only POPULATE the input so the operator edits the
+// real ids/text before sending — the chat never fires a write blind.
+type Chip = { label: string; text: string; send?: "command" };
+const QUICK_CHIPS: Chip[] = [
+  { label: "What needs attention", text: "what needs attention", send: "command" },
+  { label: "What is blocked", text: "what is blocked", send: "command" },
+  { label: "What is running", text: "what is running", send: "command" },
+  { label: "Who is on the crew", text: "who is on the crew", send: "command" },
+  { label: "Create brief", text: "create brief: " },
+  { label: "Plan package", text: "plan package <brief_id>: <goal> => child: <step>; child high: <step>" },
+];
+
+// Inferred, SAFE route hand-off for a companion action (dashboard-design §13:
+// "the chat hands off to the board"). Maps the validated action name to the
+// surface where that work is seen — never a mutation.
+const COMPANION_ROUTES: Record<string, { to: string; label: string }> = {
+  attention: { to: "/", label: "Open The Desk →" },
+  blocked: { to: "/briefs", label: "Open board →" },
+  running: { to: "/runs", label: "Open Shifts →" },
+  roster: { to: "/agents", label: "Open Crew →" },
+  overdue: { to: "/briefs", label: "Open board →" },
+  board: { to: "/briefs", label: "Open board →" },
+  search: { to: "/briefs", label: "Open board →" },
+  create_brief: { to: "/briefs", label: "Open board →" },
+  create_mandate: { to: "/mandates", label: "Open Mandates →" },
+  move: { to: "/briefs", label: "Open board →" },
+  assign: { to: "/briefs", label: "Open board →" },
+  pin: { to: "/briefs", label: "Open board →" },
+  comment: { to: "/briefs", label: "Open board →" },
+  plan_package: { to: "/briefs", label: "Open board →" },
+};
 
 const INTENT_TONE: Record<string, string> = {
   build: "done",
@@ -135,14 +211,8 @@ const INTENT_TONE: Record<string, string> = {
 };
 
 export function Chat() {
-  const [log, setLog] = useState<Entry[]>([
-    {
-      role: "assistant",
-      kind: "text",
-      text:
-        "I'm Prime, your company planner. Describe a goal and I'll propose a governed plan — Mandate, crew, hires, and Briefs — for you to approve. Nothing is created or run until you approve.",
-    },
-  ]);
+  // Hydrate from the persisted local session so a refresh keeps the conversation.
+  const [log, setLog] = useState<Entry[]>(loadLog);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   // Opt into the model-assisted Prime planner (company-model §12.5A). Off by
@@ -150,16 +220,50 @@ export function Chat() {
   // even then it falls back deterministically if no model is reachable.
   const [useAi, setUseAi] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Persist the (capped) log after every change. Best-effort — a storage
+  // failure (private mode / quota) must never break the chat.
+  useEffect(() => {
+    try {
+      localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(log.slice(-CHAT_MAX_ENTRIES)));
+    } catch {
+      /* storage unavailable — the chat still works in-memory for this session */
+    }
+  }, [log]);
 
   function scroll() {
     requestAnimationFrame(() => logRef.current?.scrollTo(0, logRef.current.scrollHeight));
   }
 
-  // "Plan with Prime" — propose a governed plan (creates nothing).
-  async function plan() {
-    const message = text.trim();
+  // Wipe the LOCAL history and restore the initial Prime greeting. Confirmed,
+  // because it discards the visible conversation (not the server Chronicle).
+  function clearChat() {
+    if (busy) return;
+    if (!window.confirm("Clear this local chat history? Governed actions stay in the Chronicle.")) return;
+    setLog([GREETING]);
+    scroll();
+  }
+
+  // A chip either dispatches a safe read command directly, or populates the
+  // input with a write template for the operator to edit first.
+  function onChip(c: Chip) {
+    if (busy) return;
+    if (c.send === "command") {
+      send(c.text);
+    } else {
+      setText(c.text);
+      inputRef.current?.focus();
+    }
+  }
+
+  // "Plan with Prime" — propose a governed plan (creates nothing). An explicit
+  // `override` (from a chip) is used verbatim and leaves the operator's draft.
+  async function plan(override?: string) {
+    const fromInput = override === undefined;
+    const message = (override ?? text).trim();
     if (!message || busy) return;
-    setText("");
+    if (fromInput) setText("");
     setLog((l) => [...l, { role: "user", kind: "text", text: message }]);
     setBusy(true);
     try {
@@ -228,20 +332,19 @@ export function Chat() {
   // Quick companion command (single governed action). With "Use AI" checked the
   // model SELECTS the action (validated server-side into the same governed path);
   // otherwise the deterministic parser chooses it. Either way it's one action.
-  async function send() {
-    const message = text.trim();
+  async function send(override?: string) {
+    const fromInput = override === undefined;
+    const message = (override ?? text).trim();
     if (!message || busy) return;
-    setText("");
+    if (fromInput) setText("");
     setLog((l) => [...l, { role: "user", kind: "text", text: message }]);
     setBusy(true);
     try {
       const body = useAi ? { message, mode: "ai" } : { message };
       const res = await api.post<CompanionResponse>("/v1/spine/companion", body);
-      const reply =
-        res.reply ||
-        (res.action ? `Done: ${res.action}` : "OK.") +
-          (res.result ? "\n\n" + JSON.stringify(res.result, null, 2) : "");
-      setLog((l) => [...l, { role: "assistant", kind: "text", text: reply }]);
+      // Render a compact result card (action chip + reply + provenance + route
+      // hand-off + raw disclosure) rather than dumping JSON into the bubble.
+      setLog((l) => [...l, { role: "assistant", kind: "companion", data: res }]);
     } catch (e) {
       setLog((l) => [
         ...l,
@@ -255,6 +358,15 @@ export function Chat() {
 
   return (
     <div className="chat" style={{ height: "calc(100vh - 96px)" }}>
+      <div className="chat-bar">
+        <span className="muted" style={{ fontSize: 11 }} title="Kept in this browser only — not the server/audit record. Governed actions land in the Chronicle.">
+          Local history · this browser only
+        </span>
+        <div className="spacer" />
+        <button className="btn ghost sm" onClick={clearChat} disabled={busy} title="Clear this local conversation and restore the Prime greeting (does not touch the Chronicle)">
+          Clear chat
+        </button>
+      </div>
       <div className="chat-log" ref={logRef}>
         {log.map((m, i) => {
           if (m.kind === "text") {
@@ -263,6 +375,9 @@ export function Chat() {
                 {m.text}
               </div>
             );
+          }
+          if (m.kind === "companion") {
+            return <CompanionCard key={i} data={m.data} />;
           }
           if (m.kind === "proposal") {
             return <ProposalCard key={i} entry={m} onApprove={() => m.data.proposal_id && approve(m.data.proposal_id, i)} busy={busy} />;
@@ -274,13 +389,37 @@ export function Chat() {
         })}
         {busy && <div className="msg assistant muted">…thinking</div>}
       </div>
+      {/* Command discoverability — read chips fire safely; write templates fill the input. */}
+      <div className="chat-chips">
+        {QUICK_CHIPS.map((c) => (
+          <button
+            key={c.label}
+            className="chip"
+            disabled={busy}
+            onClick={() => onChip(c)}
+            title={c.send === "command" ? "Run this read command" : "Fill the input with a template to edit, then send"}
+          >
+            {c.label}
+          </button>
+        ))}
+      </div>
       <div className="chat-input">
         <input
+          ref={inputRef}
           className="input"
           placeholder="Describe what you want to build, or type a quick command…"
           value={text}
           onChange={(e) => setText(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && plan()}
+          onKeyDown={(e) => {
+            if (e.key !== "Enter") return;
+            // Enter = Plan with Prime (the established default); Ctrl/⌘+Enter = Command.
+            if (e.ctrlKey || e.metaKey) {
+              e.preventDefault();
+              send();
+            } else {
+              plan();
+            }
+          }}
         />
         <label
           className="muted"
@@ -290,14 +429,67 @@ export function Chat() {
           <input type="checkbox" checked={useAi} onChange={(e) => setUseAi(e.target.checked)} disabled={busy} />
           Use AI
         </label>
-        <button className="btn" onClick={plan} disabled={busy || !text.trim()} title="Propose a governed plan (creates nothing until you approve)">
+        <button className="btn" onClick={() => plan()} disabled={busy || !text.trim()} title="Propose a governed plan (Enter) — creates nothing until you approve">
           Plan with Prime
         </button>
-        <button className="btn ghost" onClick={send} disabled={busy || !text.trim()} title="Run a single quick command">
+        <button className="btn ghost" onClick={() => send()} disabled={busy || !text.trim()} title="Run a single quick command (Ctrl/⌘+Enter)">
           Command
         </button>
       </div>
     </div>
+  );
+}
+
+// Compact companion-action result (dashboard-design §13). Renders an action
+// chip, the reply text, an honest AI-provenance chip when present, a safe
+// route hand-off to the board, and the raw result behind a disclosure — never
+// a raw JSON dump in the bubble.
+function CompanionCard({ data }: { data: CompanionResponse }) {
+  const action = data.action;
+  const reply = data.reply || (action ? `Done: ${action}` : "OK.");
+  const route = action ? COMPANION_ROUTES[action] : undefined;
+  const hasResult = data.result !== undefined && data.result !== null;
+  return (
+    <div className="panel-msg">
+      <div className="panel">
+        <div className="panel-head">
+          {action && <span className="badge todo" style={{ fontSize: 9 }}>{action}</span>}
+          <span className="panel-title">Companion</span>
+          <div className="spacer" style={{ flex: 1 }} />
+          <CompanionAiBadge mode={data.ai_mode} aiUsed={data.ai_used} reason={data.ai_reason} />
+        </div>
+        <div style={{ fontSize: 13, marginTop: 8, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{reply}</div>
+        {route && (
+          <div className="chat-links">
+            <Link to={route.to} className="link" style={{ fontSize: 12 }}>{route.label}</Link>
+          </div>
+        )}
+        {hasResult && (
+          <details className="chat-raw">
+            <summary>Raw result</summary>
+            <pre>{JSON.stringify(data.result, null, 2)}</pre>
+          </details>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Honest provenance for a companion action. The `ai_*` fields are present ONLY
+// for `mode:"ai"`; the deterministic path emits none, so this renders nothing.
+function CompanionAiBadge({ mode, aiUsed, reason }: { mode?: string; aiUsed?: boolean; reason?: string }) {
+  const m = mode ?? (aiUsed ? "llm_used" : "");
+  const META: Record<string, { tone: string; label: string }> = {
+    llm_used: { tone: "done", label: "AI-selected" },
+    fallback: { tone: "backlog", label: "AI → rule-based" },
+    unavailable: { tone: "backlog", label: "AI unavailable → rule-based" },
+  };
+  const meta = META[m];
+  if (!meta) return null;
+  return (
+    <span className={"badge " + meta.tone} style={{ fontSize: 9 }} title={reason}>
+      {meta.label}
+    </span>
   );
 }
 

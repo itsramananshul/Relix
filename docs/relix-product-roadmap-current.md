@@ -538,6 +538,18 @@ ledger entry or design section.
    an AI success. The dashboard's "Use AI" checkbox now drives the Command button too. **Still one
    turn → one validated action; no autonomous planner/agent loop** (`current-limitations.md`; ledger
    "Mandate orchestration" still not autonomous).
+   **Companion chat *console* now FRONTEND SHIPPED (product polish, `dashboard-design §13`):** the Chat
+   page is a usable operating console, not a stateless command box — over the SAME governed routes (no
+   new mutation path). It **persists the chat log locally** (versioned `localStorage` key `relix.chat.v1`,
+   latest-50 cap, clean reset on a corrupt value, a confirmed **Clear chat**) so a refresh keeps the
+   conversation — **browser-local UI history only, NOT the server/audit record** (governed actions still
+   land in the Chronicle); adds a **command-chip row** (safe read chips fire directly; write templates
+   only populate the input to edit first); renders a companion response as a **compact result card**
+   (action chip + reply + honest AI-provenance chip + a safe route hand-off to the board + raw result
+   behind a `<details>` disclosure) instead of a raw-JSON dump; and keeps the input muscle memory
+   (**Enter = Plan with Prime**, **Ctrl/⌘+Enter = Command**). *Honest scope:* frontend only — no backend/
+   capability/governance change, the persisted log is not synced, and it is still one turn → one
+   validated action.
 10. **[BE] Exactly-once decomposition + auto-wake promotion** — **both parts are now BACKEND
     SHIPPED** (exactly-once decomposition partial; see below). **Auto-wake promotion**
     (`execution §1.6/§3.1`; see §5 slice 12). When a Brief reaches a
