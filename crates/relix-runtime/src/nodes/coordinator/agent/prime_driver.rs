@@ -23,14 +23,16 @@
 //!     auto-advanced. Every step goes through the same governed handler + Keys as
 //!     the manual route.
 
+use std::sync::Arc;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::dispatch::{HandlerOutcome, InvocationCtx};
 use crate::nodes::coordinator::TaskStore;
 use crate::nodes::coordinator::agent::handlers::{
-    ReadinessView, brief_status_row, compute_readiness, handle_orchestrate, handle_team_plan,
-    internal, invalid,
+    ReadinessView, brief_status_row, compute_readiness, handle_orchestrate, handle_prime_start,
+    handle_team_plan, internal, invalid,
 };
 use crate::nodes::coordinator::agent::prime;
 use crate::nodes::coordinator::agent::store::AgentStore;
@@ -716,6 +718,385 @@ pub fn handle_prime_advance(
     ok_json(&body)
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// AUTONOMOUS PRIME DRIVER (v1) — opt-in, bounded (company-model §5.4/§8.2 the
+// Action Center "next governed step"; §12.5/§12.5B the Prime planner + Start).
+//
+// This is the **loop** the guided driver was missing: instead of the operator
+// clicking "Advance one step" over and over, a timer drives already-approved
+// Prime work forward on its own. It is emphatically NOT "an AI CEO that does
+// whatever it wants" — every action goes through the SAME governed handler the
+// operator click uses, it advances ONLY the safe steps `prime.advance` already
+// allows (`create_team_plan` / `orchestrate_assign_ready`) plus starting ready
+// work for an already-approved proposal through the existing `prime.start`
+// path, and it NEVER auto-approves a strategy / hire / spawn / budget /
+// Clearance gate (those stay human). Bounded per tick, idempotent (each tick
+// re-classifies, so team plans / orchestration trees / started Shifts never
+// duplicate), and tenant-safe (each candidate is processed under its OWN Guild).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// What one autonomous Prime tick did with one candidate (for logs + tests).
+/// Durable provenance for an actual action lives in the Chronicle event the
+/// handler / this driver writes; this is the in-memory tick summary.
+#[derive(Debug, Clone)]
+pub struct PrimeAutonomyRecord {
+    /// The Guild the candidate (and its action) belongs to.
+    pub tenant: String,
+    /// `proposal` or `mandate`.
+    pub target_kind: &'static str,
+    /// The proposal_id or mandate_id processed.
+    pub target_id: String,
+    /// The resolved Mandate id (when known).
+    pub mandate_id: Option<String>,
+    /// The classified next-step phase (`needs_team_plan` / `needs_orchestration`
+    /// / `ready_to_start` / `needs_approval` / …).
+    pub phase: String,
+    /// The action attempted: `create_team_plan` / `orchestrate_assign_ready` /
+    /// `start` / `none`.
+    pub action: &'static str,
+    /// `advanced` / `started` / `skipped` / `blocked`.
+    pub outcome: &'static str,
+    /// A short, secret-free reason for the outcome.
+    pub reason: String,
+}
+
+/// Build the synthetic **autonomous Prime** invocation context for `tenant`.
+/// Role `operator` because the autonomous loop is the **Board's sovereign
+/// automation** over already-approved work — exactly what the operator does by
+/// clicking Advance / Start — so it takes the same sovereign path through the
+/// spawn / assign Keys that the manual `prime.advance` / `prime.start` already
+/// take. It grants NO new authority: the handlers' own gates (strategy approved,
+/// ready team, no pending hires / Clearances, active assignee, Claim, adapter,
+/// budget on the autonomous boundary) all still apply.
+pub(crate) fn autonomous_prime_ctx(tenant: &str, args: Vec<u8>) -> InvocationCtx {
+    use relix_core::identity::VerifiedIdentity;
+    use relix_core::types::{NodeId, RequestId, TraceId};
+    InvocationCtx {
+        caller: VerifiedIdentity {
+            subject_id: NodeId::from_pubkey(b"relix:autonomous-prime"),
+            name: "autonomous-prime".into(),
+            org_id: NodeId::from_pubkey(b"relix:org"),
+            groups: vec![],
+            role: "operator".into(),
+            clearance: String::new(),
+            bundle_id: [0; 32],
+        },
+        trace_id: TraceId::new(),
+        request_id: RequestId::new(),
+        args,
+        tenant_id: Some(tenant.to_string()),
+    }
+}
+
+/// Append ONE Chronicle event for an actual autonomous action onto the Mandate's
+/// first (parent / orchestration-root) Brief — sparingly, only when a Brief
+/// exists. No Brief yet (e.g. a team-plan before orchestration) → record-only,
+/// no event, so an idle loop never spams the Chronicle.
+fn chronicle_autonomous(task_store: &TaskStore, mandate_id: &str, event_type: &str, detail: &str) {
+    if let Ok(briefs) = task_store.list_briefs_by_mandate(mandate_id, 1)
+        && let Some(first) = briefs.first()
+    {
+        let _ = task_store.append_event(&first.task_id, event_type, detail);
+    }
+}
+
+/// Pre-gate the autonomous **start** of an approved proposal's ready Briefs with
+/// the SAME budget hard-stop the autonomous heartbeat applies per Brief
+/// ([`heartbeat::dispatch_budget_admits`] — per-Operative Allowance + additive
+/// Guild budget). `prime.start` itself is the sovereign manual path and takes no
+/// budget gate; this re-imposes the gate at the **autonomous** boundary so the
+/// loop never auto-starts an over-budget Brief. Conservative: if ANY currently-
+/// ready Brief of the proposal is over budget, the whole autonomous start is
+/// refused (the operator's manual Start stays sovereign; the heartbeat still
+/// gates per Brief). When metrics/spine are unavailable the gate is inert
+/// (allows), mirroring the heartbeat.
+fn start_budget_admitted(
+    task_store: &TaskStore,
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    metrics: Option<&crate::metrics::MetricsQuery>,
+    tenant: &str,
+    proposal_id: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    let row = match spine_store.get_prime_proposal(tenant, proposal_id) {
+        Ok(Some(r)) => r,
+        // Can't read the proposal → don't fabricate a stop; let prime.start
+        // classify (it is tenant-gated and refuses a non-approved proposal).
+        _ => return Ok(()),
+    };
+    let created: Vec<String> = serde_json::from_str(&row.created_brief_ids).unwrap_or_default();
+    if created.is_empty() {
+        return Ok(());
+    }
+    let ready: std::collections::HashSet<String> = task_store
+        .list_ready_briefs(500)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| c.task_id)
+        .collect();
+    for id in &created {
+        if !ready.contains(id) {
+            continue;
+        }
+        if let Ok(Some(card)) = task_store.brief_card(id)
+            && let crate::nodes::coordinator::heartbeat::BudgetAdmission::Refuse { reason, .. } =
+                crate::nodes::coordinator::heartbeat::dispatch_budget_admits(
+                    &card,
+                    task_store,
+                    agent_store,
+                    Some(spine_store),
+                    metrics,
+                    now_ms,
+                )
+        {
+            return Err(reason);
+        }
+    }
+    Ok(())
+}
+
+/// Process ONE autonomous candidate: classify its next governed step and, when
+/// it is a safe auto-advanceable step (or a ready-to-start approved proposal),
+/// execute exactly that one step through the existing governed handler. Counts a
+/// real mutation against `actions` (so the tick stays bounded by `max`); a human
+/// gate / already-running / done step records and acts on nothing.
+#[allow(clippy::too_many_arguments)]
+fn process_candidate(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &Arc<TaskStore>,
+    registry: &crate::rig::RigRegistry,
+    metrics: Option<&crate::metrics::MetricsQuery>,
+    now_ms: i64,
+    tenant: &str,
+    kind: &'static str,
+    target_id: &str,
+    target: Value,
+    actions: &mut usize,
+    max: usize,
+) -> PrimeAutonomyRecord {
+    let mk = |phase: String,
+              action: &'static str,
+              outcome: &'static str,
+              reason: String,
+              mandate_id: Option<String>|
+     -> PrimeAutonomyRecord {
+        PrimeAutonomyRecord {
+            tenant: tenant.to_string(),
+            target_kind: kind,
+            target_id: target_id.to_string(),
+            mandate_id,
+            phase,
+            action,
+            outcome,
+            reason,
+        }
+    };
+
+    // Classify the one next governed step (READ-ONLY) under this candidate's
+    // own tenant.
+    let read_ctx = autonomous_prime_ctx(tenant, target.to_string().into_bytes());
+    let step = match compute_next_step(agent_store, spine_store, task_store, &read_ctx) {
+        Ok(s) => s,
+        Err(_) => {
+            return mk("unknown".into(), "none", "skipped", "target not classifiable".into(), None);
+        }
+    };
+    let phase = step.phase.to_string();
+    let mandate_id = step.mandate_id.clone();
+
+    // (A) Safe auto-advance steps — create_team_plan / orchestrate_assign_ready
+    // — through the SAME governed advance path the operator click uses (it
+    // re-reads state + refuses a stale action with no side effects).
+    if step.can_advance
+        && let Some(action) = step.advance_action
+    {
+        if *actions >= max {
+            return mk(phase, action, "skipped", "tick action budget reached".into(), mandate_id);
+        }
+        let mut adv = target.clone();
+        adv["action"] = json!(action);
+        let adv_ctx = autonomous_prime_ctx(tenant, adv.to_string().into_bytes());
+        return match handle_prime_advance(agent_store, spine_store, task_store, &adv_ctx) {
+            HandlerOutcome::Ok(b) => {
+                let v: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
+                if v.get("advanced").and_then(Value::as_bool) == Some(true) {
+                    *actions += 1;
+                    if let Some(mid) = mandate_id.as_deref() {
+                        chronicle_autonomous(
+                            task_store,
+                            mid,
+                            "prime.autonomous_advance",
+                            &format!("autonomous Prime advanced `{action}` on mandate {mid}"),
+                        );
+                    }
+                    mk(phase, action, "advanced", format!("ran governed `{action}`"), mandate_id)
+                } else {
+                    let refused =
+                        v.get("refused").and_then(Value::as_str).unwrap_or("not_advanced").to_string();
+                    mk(phase, action, "skipped", format!("advance not applied: {refused}"), mandate_id)
+                }
+            }
+            // Governance refusal / error — propagate honestly, take no credit.
+            HandlerOutcome::Err(e) => {
+                mk(phase, action, "blocked", format!("advance refused: {}", e.cause), mandate_id)
+            }
+        };
+    }
+
+    // (B) ready_to_start — start ready work for an already-APPROVED Prime
+    // proposal through the existing governed `prime.start` path, gated by the
+    // autonomous budget hard-stop. A bare Mandate's runs are deliberately left
+    // to the heartbeat / `brief.run` (no new start policy invented).
+    if step.phase == "ready_to_start" {
+        let Some(pid) = step.proposal_id.clone() else {
+            return mk(
+                phase,
+                "none",
+                "skipped",
+                "bare Mandate ready — runs left to heartbeat/brief.run".into(),
+                mandate_id,
+            );
+        };
+        if *actions >= max {
+            return mk(phase, "start", "skipped", "tick action budget reached".into(), mandate_id);
+        }
+        if let Err(reason) =
+            start_budget_admitted(task_store, agent_store, spine_store, metrics, tenant, &pid, now_ms)
+        {
+            return mk(phase, "start", "blocked", format!("budget hard-stop: {reason}"), mandate_id);
+        }
+        let start_ctx = autonomous_prime_ctx(tenant, pid.clone().into_bytes());
+        return match handle_prime_start(agent_store, spine_store, task_store, registry, &start_ctx) {
+            HandlerOutcome::Ok(b) => {
+                let v: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
+                let started = v.get("started").and_then(Value::as_array).map_or(0, Vec::len);
+                if started > 0 {
+                    *actions += 1;
+                    if let Some(mid) = mandate_id.as_deref() {
+                        chronicle_autonomous(
+                            task_store,
+                            mid,
+                            "prime.autonomous_start",
+                            &format!(
+                                "autonomous Prime started {started} ready Shift(s) for proposal {pid}"
+                            ),
+                        );
+                    }
+                    mk(phase, "start", "started", format!("started {started} ready Shift(s)"), mandate_id)
+                } else {
+                    mk(phase, "start", "skipped", "no ready Shift actually started".into(), mandate_id)
+                }
+            }
+            HandlerOutcome::Err(e) => {
+                mk(phase, "start", "blocked", format!("start refused: {}", e.cause), mandate_id)
+            }
+        };
+    }
+
+    // (C) Everything else needs a human gate, or is already running / done —
+    // record it, act on nothing, write no event.
+    let outcome = match step.phase {
+        "needs_approval" | "needs_hire_approval" | "blocked" => "blocked",
+        _ => "skipped",
+    };
+    mk(phase, "none", outcome, step.reason.clone(), mandate_id)
+}
+
+/// Run ONE opt-in autonomous Prime tick: discover up to a bounded set of
+/// candidates (approved Prime proposals first — they carry Start — then live
+/// Mandates not already covered by a proposal) and apply at most `max` safe
+/// governed actions across them, returning one [`PrimeAutonomyRecord`] per
+/// candidate considered. Pure of any sleeping/timer — the controller calls it on
+/// an interval inside `spawn_blocking`.
+///
+/// Tenant-safe: `tenant=None` spans **all** Guilds (each candidate carries its
+/// own `tenant_id` and is processed under it); `tenant=Some(g)` scopes to one
+/// Guild. Idempotent: each tick re-classifies live state, so a team plan /
+/// orchestration tree / started Shift is never duplicated and an already-
+/// running Brief is never double-started. Bounded: `max` caps actions per tick.
+#[allow(clippy::too_many_arguments)]
+pub fn autonomous_prime_tick(
+    agent_store: &AgentStore,
+    spine_store: &SpineStore,
+    task_store: &Arc<TaskStore>,
+    registry: &crate::rig::RigRegistry,
+    metrics: Option<&crate::metrics::MetricsQuery>,
+    now_ms: i64,
+    max: usize,
+    tenant: Option<&str>,
+) -> Result<Vec<PrimeAutonomyRecord>, String> {
+    if max == 0 {
+        return Ok(Vec::new());
+    }
+    let mut records: Vec<PrimeAutonomyRecord> = Vec::new();
+    let mut actions = 0usize;
+    // Bounded discovery — never an unbounded table scan.
+    let discover_cap = max.saturating_mul(4).clamp(max, 50);
+
+    let proposals = spine_store
+        .list_approved_prime_proposals(tenant, discover_cap)
+        .map_err(|e| format!("autonomous prime: list proposals: {e}"))?;
+    // Mandate ids already covered by a processed proposal — so the bare-Mandate
+    // pass does not double-process the same Mandate.
+    let mut seen_mandates: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in proposals {
+        if actions >= max {
+            break;
+        }
+        if !p.mandate_id.is_empty() {
+            seen_mandates.insert(p.mandate_id.clone());
+        }
+        let target = json!({ "proposal_id": p.proposal_id.clone() });
+        records.push(process_candidate(
+            agent_store,
+            spine_store,
+            task_store,
+            registry,
+            metrics,
+            now_ms,
+            &p.tenant_id,
+            "proposal",
+            &p.proposal_id,
+            target,
+            &mut actions,
+            max,
+        ));
+    }
+
+    if actions < max {
+        let mandates = spine_store
+            .list_active_mandates(tenant, discover_cap)
+            .map_err(|e| format!("autonomous prime: list mandates: {e}"))?;
+        for m in mandates {
+            if actions >= max {
+                break;
+            }
+            if seen_mandates.contains(&m.mandate_id) {
+                continue;
+            }
+            let target = json!({ "mandate_id": m.mandate_id.clone() });
+            records.push(process_candidate(
+                agent_store,
+                spine_store,
+                task_store,
+                registry,
+                metrics,
+                now_ms,
+                &m.tenant_id,
+                "mandate",
+                &m.mandate_id,
+                target,
+                &mut actions,
+                max,
+            ));
+        }
+    }
+
+    Ok(records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,5 +1370,245 @@ mod tests {
         );
         assert!(matches!(out, HandlerOutcome::Err(_)));
         assert!(spine.latest_team_plan("default", &m).unwrap().is_none());
+    }
+
+    // ── AUTONOMOUS PRIME DRIVER (the opt-in loop) ──────────────────────────
+
+    use crate::nodes::coordinator::agent::handlers::{
+        handle_prime_approve, handle_prime_propose, handle_starter_crew,
+    };
+
+    fn echo_registry() -> crate::rig::RigRegistry {
+        crate::rig::RigRegistry::with_builtins().with_default("echo")
+    }
+
+    /// Run an autonomous Prime tick over one Guild with no metrics (budget gate
+    /// inert) — the common shape for the deterministic team-plan / orchestrate
+    /// tests below.
+    fn tick(
+        agents: &AgentStore,
+        spine: &SpineStore,
+        tasks: &Arc<TaskStore>,
+        reg: &crate::rig::RigRegistry,
+        max: usize,
+        tenant: Option<&str>,
+    ) -> Vec<PrimeAutonomyRecord> {
+        autonomous_prime_tick(agents, spine, tasks, reg, None, 0, max, tenant).unwrap()
+    }
+
+    // A) Default-off boundary: the tick is a pure helper — `max == 0` (the
+    //    controller passes a clamped 1..=10, but a guard proves no action ever
+    //    fires with a zero bound) returns no records / takes no action.
+    #[test]
+    fn autonomous_tick_with_zero_bound_does_nothing() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        runnable_operative(&agents, "engineer", "subj-e");
+        let recs = tick(&agents, &spine, &tasks, &reg, 0, Some("default"));
+        assert!(recs.is_empty());
+        // No Team Plan was recorded.
+        assert!(spine.latest_team_plan("default", &m).unwrap().is_none());
+    }
+
+    // B) An approved Mandate at `needs_team_plan` is advanced by the loop through
+    //    the SAME governed team-plan route (adopts the active crew, mints no
+    //    hires).
+    #[test]
+    fn autonomous_tick_advances_needs_team_plan() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        runnable_operative(&agents, "engineer", "subj-e");
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec = recs.iter().find(|r| r.target_id == m).expect("mandate considered");
+        assert_eq!(rec.phase, "needs_team_plan");
+        assert_eq!(rec.action, "create_team_plan");
+        assert_eq!(rec.outcome, "advanced");
+        // A Team Plan now exists, recorded through the governed route.
+        assert!(spine.latest_team_plan("default", &m).unwrap().is_some());
+    }
+
+    // C) A ready team at `needs_orchestration` is advanced by the loop through the
+    //    existing orchestration gate (creates + assigns the Brief tree).
+    #[test]
+    fn autonomous_tick_advances_needs_orchestration() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        let agent_id = agents
+            .create_agent("W", "engineer", "W", "eng", "eng", "prime", "subj-w", "medium", "default")
+            .unwrap();
+        let hires = format!("[{{\"role\":\"engineer\",\"agent_id\":\"{agent_id}\"}}]");
+        spine
+            .record_team_plan(&TeamPlanRecord {
+                tenant_id: "default",
+                mandate_id: &m,
+                actor_id: "operator",
+                description: "build it",
+                proposed_roles_json: "[]",
+                pending_hires_json: &hires,
+                clearance_ids_json: "[]",
+                denials_json: "[]",
+                next_steps_json: "[]",
+                status: "staffing",
+            })
+            .unwrap();
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let rec = recs.iter().find(|r| r.target_id == m).expect("mandate considered");
+        assert_eq!(rec.phase, "needs_orchestration");
+        assert_eq!(rec.action, "orchestrate_assign_ready");
+        assert_eq!(rec.outcome, "advanced");
+        // The real Brief tree was created + assigned under the Mandate.
+        assert_eq!(tasks.list_briefs_by_mandate(&m, 50).unwrap().len(), 3);
+    }
+
+    // D) Idempotency: re-ticking after the orchestration tree exists never
+    //    creates a SECOND tree — `mandate.orchestrate` reuses Briefs by source
+    //    marker, so the Brief count is stable across repeated ticks (the loop may
+    //    re-run the idempotent orchestrate to assign a still-unassigned track,
+    //    but it duplicates nothing).
+    #[test]
+    fn autonomous_tick_orchestration_is_idempotent() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        let agent_id = agents
+            .create_agent("W", "engineer", "W", "eng", "eng", "prime", "subj-w", "medium", "default")
+            .unwrap();
+        let hires = format!("[{{\"role\":\"engineer\",\"agent_id\":\"{agent_id}\"}}]");
+        spine
+            .record_team_plan(&TeamPlanRecord {
+                tenant_id: "default",
+                mandate_id: &m,
+                actor_id: "operator",
+                description: "build it",
+                proposed_roles_json: "[]",
+                pending_hires_json: &hires,
+                clearance_ids_json: "[]",
+                denials_json: "[]",
+                next_steps_json: "[]",
+                status: "staffing",
+            })
+            .unwrap();
+
+        let _ = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let after_first = tasks.list_briefs_by_mandate(&m, 50).unwrap().len();
+        assert_eq!(after_first, 3);
+        // Two more ticks must not create a single extra Brief (no duplicate tree).
+        let _ = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        let _ = tick(&agents, &spine, &tasks, &reg, 1, Some("default"));
+        assert_eq!(
+            tasks.list_briefs_by_mandate(&m, 50).unwrap().len(),
+            after_first,
+            "repeated ticks must not duplicate the orchestration tree"
+        );
+    }
+
+    // E) Governance: the loop NEVER auto-approves a pending hire — it records a
+    //    blocked result and leaves the hire `pending`.
+    #[test]
+    fn autonomous_tick_does_not_auto_approve_pending_hire() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine);
+        let pending = agents
+            .request_hire("P", "engineer", "P", "eng", "eng", "prime", "subj-p", "medium", "default")
+            .unwrap();
+        let hires = format!("[{{\"role\":\"engineer\",\"agent_id\":\"{pending}\"}}]");
+        spine
+            .record_team_plan(&TeamPlanRecord {
+                tenant_id: "default",
+                mandate_id: &m,
+                actor_id: "operator",
+                description: "x",
+                proposed_roles_json: "[]",
+                pending_hires_json: &hires,
+                clearance_ids_json: "[]",
+                denials_json: "[]",
+                next_steps_json: "[]",
+                status: "staffing",
+            })
+            .unwrap();
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 5, Some("default"));
+        let rec = recs.iter().find(|r| r.target_id == m).expect("mandate considered");
+        assert_eq!(rec.phase, "needs_hire_approval");
+        assert_eq!(rec.action, "none");
+        assert_eq!(rec.outcome, "blocked");
+        // The hire is still pending — the loop greenlit nothing, created no Briefs.
+        assert_eq!(agents.get_agent(&pending).unwrap().unwrap().status, "pending");
+        assert!(tasks.list_briefs_by_mandate(&m, 50).unwrap().is_empty());
+    }
+
+    // F) Tenant isolation: a tick for Guild "other" never acts on a "default"
+    //    Mandate.
+    #[test]
+    fn autonomous_tick_is_tenant_isolated() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = approved_mandate(&spine); // tenant "default"
+        runnable_operative(&agents, "engineer", "subj-e");
+
+        let recs = tick(&agents, &spine, &tasks, &reg, 5, Some("other"));
+        assert!(
+            recs.iter().all(|r| r.target_id != m),
+            "a tick for `other` must not consider a `default` Mandate"
+        );
+        // No Team Plan was created for the default Mandate.
+        assert!(spine.latest_team_plan("default", &m).unwrap().is_none());
+    }
+
+    // G) End-to-end Start: an approved Prime PROPOSAL that reaches ready_to_start
+    //    is started by the loop through the existing governed `prime.start` path,
+    //    and a second tick does not double-start the now-running/started work.
+    #[tokio::test]
+    async fn autonomous_tick_starts_ready_approved_proposal() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        // Empty company → starter crew (Founder + safe-local echo workers).
+        let _ = handle_starter_crew(&agents, &fake_ctx_with_role(b"", "operator", b"caller"));
+        // Propose → approve creates the Mandate + Briefs + crew assignments.
+        let propose_ctx = fake_ctx_with_role(b"Build a sales dashboard", "operator", b"caller");
+        let propose = match handle_prime_propose(&agents, &spine, &propose_ctx) {
+            HandlerOutcome::Ok(b) => {
+                let v: Value = serde_json::from_slice(&b).unwrap();
+                v["proposal_id"].as_str().unwrap().to_string()
+            }
+            HandlerOutcome::Err(e) => panic!("propose: {}", e.cause),
+        };
+        let approve_ctx = fake_ctx_with_role(propose.as_bytes(), "operator", b"caller");
+        match handle_prime_approve(&agents, &spine, &tasks, &approve_ctx) {
+            HandlerOutcome::Ok(_) => {}
+            HandlerOutcome::Err(e) => panic!("approve: {}", e.cause),
+        }
+
+        // The loop discovers the approved proposal and starts its ready Briefs.
+        let recs = tick(&agents, &spine, &tasks, &reg, 5, Some("default"));
+        let rec = recs
+            .iter()
+            .find(|r| r.target_kind == "proposal" && r.outcome == "started")
+            .expect("an approved proposal's ready work is started by the loop");
+        assert_eq!(rec.phase, "ready_to_start");
+        assert_eq!(rec.action, "start");
+        let runs_after_first = tasks.list_runs_for_tenant("default", 100).unwrap().len();
+        assert!(runs_after_first > 0, "at least one Shift run was opened");
+
+        // Idempotency: a second immediate tick does not re-start the already
+        // claimed/running Briefs (no new started records, no extra runs).
+        let recs2 = tick(&agents, &spine, &tasks, &reg, 5, Some("default"));
+        assert!(
+            recs2.iter().all(|r| r.outcome != "started"),
+            "a running proposal must not be double-started"
+        );
     }
 }

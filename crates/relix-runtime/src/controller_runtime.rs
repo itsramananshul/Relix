@@ -9921,6 +9921,25 @@ fn register_node_type_handlers(
                                 crate::nodes::coordinator::heartbeat::parse_autonomous_recovery_max(
                                     std::env::var("RELIX_AUTONOMOUS_RECOVERY_MAX").ok().as_deref(),
                                 );
+                            // Opt-in autonomous Prime driver (company-model
+                            // §5.4/§8.2/§12.5B). Default OFF + bounded; surfaced
+                            // so Settings shows it alongside the heartbeat + the
+                            // autonomous recovery lane.
+                            let autonomous_prime_enabled =
+                                crate::nodes::coordinator::heartbeat::parse_autonomous_prime_enabled(
+                                    std::env::var("RELIX_AUTONOMOUS_PRIME").ok().as_deref(),
+                                );
+                            let autonomous_prime_max =
+                                crate::nodes::coordinator::heartbeat::parse_autonomous_prime_max(
+                                    std::env::var("RELIX_AUTONOMOUS_PRIME_MAX").ok().as_deref(),
+                                );
+                            let autonomous_prime_interval_secs = std::env::var(
+                                "RELIX_AUTONOMOUS_PRIME_INTERVAL_SECS",
+                            )
+                            .ok()
+                            .and_then(|v| v.trim().parse::<u64>().ok())
+                            .filter(|n| *n >= 1)
+                            .unwrap_or(30);
                             let body = serde_json::json!({
                                 "context": cfg.context.as_str(),
                                 "project_root": cfg.project_root.to_string_lossy(),
@@ -9932,6 +9951,9 @@ fn register_node_type_handlers(
                                 "heartbeat_interval_secs": heartbeat_interval_secs,
                                 "autonomous_recovery_enabled": autonomous_recovery_enabled,
                                 "autonomous_recovery_max": autonomous_recovery_max,
+                                "autonomous_prime_enabled": autonomous_prime_enabled,
+                                "autonomous_prime_max": autonomous_prime_max,
+                                "autonomous_prime_interval_secs": autonomous_prime_interval_secs,
                             });
                             match serde_json::to_vec(&body) {
                                 Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
@@ -11317,6 +11339,102 @@ fn register_node_type_handlers(
                 max = recovery_max,
                 "coordinator startup: autonomous retry lane spawned (RELIX_AUTONOMOUS_RECOVERY)"
             );
+        }
+        // OPT-IN autonomous PRIME driver (company-model §5.4/§8.2 the Action
+        // Center "next governed step"; §12.5/§12.5B the Prime planner + Start).
+        // Default OFF via RELIX_AUTONOMOUS_PRIME so it never surprises an
+        // operator. When on, a timer drives already-APPROVED Prime/company work
+        // forward without the operator clicking "Advance one step" over and over:
+        // it advances ONLY the safe governed steps `prime.advance` already allows
+        // (`create_team_plan` / `orchestrate_assign_ready`) and starts ready
+        // Briefs of an already-approved proposal through the existing
+        // `prime.start` path (gated by the SAME autonomous budget hard-stop the
+        // heartbeat applies). It NEVER auto-approves a strategy / hire / spawn /
+        // budget / Clearance gate — those stay human. Bounded per tick
+        // (RELIX_AUTONOMOUS_PRIME_MAX, default 1, clamp 1..=10), idempotent (each
+        // tick re-classifies live state), and tenant-safe (each candidate under
+        // its own Guild). Needs the SpineStore (where approved proposals live);
+        // inert when it is unavailable. Mirrors the recovery lane's structure.
+        if crate::nodes::coordinator::heartbeat::parse_autonomous_prime_enabled(
+            std::env::var("RELIX_AUTONOMOUS_PRIME").ok().as_deref(),
+        ) {
+            if let Some(spine_arc) = spine_store_for_agent_caps.clone() {
+                let prime_max = crate::nodes::coordinator::heartbeat::parse_autonomous_prime_max(
+                    std::env::var("RELIX_AUTONOMOUS_PRIME_MAX").ok().as_deref(),
+                );
+                let prime_interval_secs = std::env::var("RELIX_AUTONOMOUS_PRIME_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .filter(|n| *n >= 1)
+                    .unwrap_or(30);
+                let task_store = store.clone();
+                let ag_store = agent_store.clone();
+                let registry = rig_registry.clone();
+                let metrics_query = metrics.map(|m| m.query.clone());
+                tokio::spawn(async move {
+                    let mut ticker =
+                        tokio::time::interval(std::time::Duration::from_secs(prime_interval_secs));
+                    loop {
+                        ticker.tick().await;
+                        let ts = task_store.clone();
+                        let ags = ag_store.clone();
+                        let reg = registry.clone();
+                        let mq = metrics_query.clone();
+                        let spine = spine_arc.clone();
+                        let outcome = tokio::task::spawn_blocking(move || {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0);
+                            // tenant=None: drive all Guilds, each candidate under
+                            // its OWN derived tenant (no cross-Guild leak).
+                            crate::nodes::coordinator::agent::prime_driver::autonomous_prime_tick(
+                                &ags,
+                                &spine,
+                                &ts,
+                                &reg,
+                                mq.as_ref(),
+                                now_ms,
+                                prime_max,
+                                None,
+                            )
+                        })
+                        .await;
+                        match outcome {
+                            Ok(Ok(records)) => {
+                                let advanced =
+                                    records.iter().filter(|r| r.outcome == "advanced").count();
+                                let started =
+                                    records.iter().filter(|r| r.outcome == "started").count();
+                                if advanced > 0 || started > 0 {
+                                    tracing::info!(
+                                        advanced,
+                                        started,
+                                        considered = records.len(),
+                                        "autonomous prime: drove approved work forward"
+                                    );
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = %e, "autonomous prime: tick failed")
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "autonomous prime: tick join error")
+                            }
+                        }
+                    }
+                });
+                tracing::info!(
+                    interval_secs = prime_interval_secs,
+                    max = prime_max,
+                    "coordinator startup: autonomous Prime driver spawned (RELIX_AUTONOMOUS_PRIME)"
+                );
+            } else {
+                tracing::warn!(
+                    "RELIX_AUTONOMOUS_PRIME is set but the SpineStore is unavailable — \
+                     autonomous Prime driver not spawned"
+                );
+            }
         }
         // NOT-DONE 2: spawn the legacy-token orphaned-task fail
         // pass in the BACKGROUND so it does not block the

@@ -2327,6 +2327,26 @@ pub fn parse_autonomous_recovery_max(raw: Option<&str>) -> usize {
         .clamp(1, 10)
 }
 
+/// Parse the opt-in autonomous-Prime switch (`RELIX_AUTONOMOUS_PRIME`).
+/// **Default OFF** — the autonomous Prime driver never runs unless explicitly
+/// enabled. Accepts the same truthy spellings as the heartbeat / recovery
+/// switches (`1`/`true`/`yes`/`on`, case-insensitive, whitespace-trimmed).
+pub fn parse_autonomous_prime_enabled(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// Parse the per-tick bound (`RELIX_AUTONOMOUS_PRIME_MAX`) — the max number of
+/// autonomous Prime actions (team-plan / orchestrate / start) per tick. Default
+/// 1, clamped to `1..=10` so a tick can never stampede.
+pub fn parse_autonomous_prime_max(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, 10)
+}
+
 /// The per-candidate decision the recovery tick asks its caller to make. Keeps
 /// the agent-store / budget policy in the caller (as [`dispatch_batch`] does
 /// with its closures), so the tick itself stays decoupled and unit-testable.
@@ -6749,6 +6769,25 @@ mod tests {
         assert_eq!(parse_autonomous_recovery_max(Some("0")), 1);
         assert_eq!(parse_autonomous_recovery_max(Some("999")), 10);
         assert_eq!(parse_autonomous_recovery_max(Some("nope")), 1);
+    }
+
+    #[test]
+    fn autonomous_prime_switch_is_off_and_bounded_by_default() {
+        // Default OFF — the autonomous Prime driver never runs unless enabled.
+        assert!(!parse_autonomous_prime_enabled(None));
+        assert!(!parse_autonomous_prime_enabled(Some("")));
+        assert!(!parse_autonomous_prime_enabled(Some("0")));
+        assert!(!parse_autonomous_prime_enabled(Some("off")));
+        assert!(parse_autonomous_prime_enabled(Some("1")));
+        assert!(parse_autonomous_prime_enabled(Some("true")));
+        assert!(parse_autonomous_prime_enabled(Some("yes")));
+        assert!(parse_autonomous_prime_enabled(Some(" On ")));
+        // Bounded — default 1, clamped to 1..=10 (never 0, never unbounded).
+        assert_eq!(parse_autonomous_prime_max(None), 1);
+        assert_eq!(parse_autonomous_prime_max(Some("4")), 4);
+        assert_eq!(parse_autonomous_prime_max(Some("0")), 1);
+        assert_eq!(parse_autonomous_prime_max(Some("999")), 10);
+        assert_eq!(parse_autonomous_prime_max(Some("nope")), 1);
     }
 
     #[test]

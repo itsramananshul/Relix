@@ -820,6 +820,45 @@ impl SpineStore {
         Ok(rows)
     }
 
+    /// Approved Prime proposals that already materialised a Mandate — the
+    /// autonomous Prime driver's primary candidate set (these carry the
+    /// `prime.start` capability). Bounded; **oldest-first** so older approved
+    /// work progresses first. `tenant=None` spans **all** Guilds (each row
+    /// carries its own `tenant_id`, so a cross-Guild tick processes each under
+    /// its own tenant); `tenant=Some(g)` scopes to one Guild only.
+    pub fn list_approved_prime_proposals(
+        &self,
+        tenant: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PrimeProposalRow>, SpineStoreError> {
+        let cap = limit.clamp(1, 200) as i64;
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let cols = "proposal_id, tenant_id, proposer_id, message, proposal_json,
+                    status, mandate_id, created_brief_ids, created_at, updated_at";
+        let rows = match tenant {
+            Some(t) => {
+                let t = normalize_tenant(t);
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {cols} FROM prime_proposals
+                     WHERE tenant_id = ?1 AND status = 'approved' AND mandate_id <> ''
+                     ORDER BY created_at ASC, rowid ASC LIMIT ?2"
+                ))?;
+                stmt.query_map(params![t, cap], row_to_prime_proposal)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            None => {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {cols} FROM prime_proposals
+                     WHERE status = 'approved' AND mandate_id <> ''
+                     ORDER BY created_at ASC, rowid ASC LIMIT ?1"
+                ))?;
+                stmt.query_map(params![cap], row_to_prime_proposal)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        };
+        Ok(rows)
+    }
+
     // ── mandates ─────────────────────────────────────────────
 
     /// Create a Mandate. Returns the freshly-allocated `mandate_id`.
@@ -921,6 +960,44 @@ impl SpineStore {
         } else {
             stmt.query_map(params![tenant], row_to_mandate)?
                 .collect::<rusqlite::Result<_>>()?
+        };
+        Ok(rows)
+    }
+
+    /// Live (`planned` / `active`) Mandates — the autonomous Prime driver's
+    /// bare-Mandate candidate set (it may plan / orchestrate these; per-Brief
+    /// runs are left to the heartbeat / `brief.run`). Bounded; **oldest-first**.
+    /// `tenant=None` spans **all** Guilds (each row carries its own `tenant_id`),
+    /// `tenant=Some(g)` scopes to one Guild only.
+    pub fn list_active_mandates(
+        &self,
+        tenant: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Mandate>, SpineStoreError> {
+        let cap = limit.clamp(1, 200) as i64;
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let cols = "mandate_id, tenant_id, title, description, owner_agent_id,
+                    status, parent_mandate_id, billing_code, created_at, updated_at";
+        let rows = match tenant {
+            Some(t) => {
+                let t = normalize_tenant(t);
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {cols} FROM mandates
+                     WHERE tenant_id = ?1 AND status IN ('planned', 'active')
+                     ORDER BY created_at ASC, rowid ASC LIMIT ?2"
+                ))?;
+                stmt.query_map(params![t, cap], row_to_mandate)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            None => {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {cols} FROM mandates
+                     WHERE status IN ('planned', 'active')
+                     ORDER BY created_at ASC, rowid ASC LIMIT ?1"
+                ))?;
+                stmt.query_map(params![cap], row_to_mandate)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
         };
         Ok(rows)
     }

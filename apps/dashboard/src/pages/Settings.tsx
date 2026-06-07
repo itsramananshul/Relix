@@ -34,6 +34,9 @@ interface RunConfig {
   heartbeat_interval_secs?: number;
   autonomous_recovery_enabled?: boolean;
   autonomous_recovery_max?: number;
+  autonomous_prime_enabled?: boolean;
+  autonomous_prime_max?: number;
+  autonomous_prime_interval_secs?: number;
 }
 
 function extractProviders(v: unknown): Provider[] {
@@ -250,13 +253,38 @@ export function Settings() {
                   : "failed Shifts wait for an operator to click Retry on the Runs page"}
               </td>
             </tr>
+            <tr>
+              <td className="muted">Autonomous Prime</td>
+              <td>
+                <span className={"badge " + (runConfig.autonomous_prime_enabled ? "done" : "backlog")}>
+                  {runConfig.autonomous_prime_enabled ? "enabled" : "disabled"}
+                </span>
+                {runConfig.autonomous_prime_enabled && (
+                  <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>
+                    up to {runConfig.autonomous_prime_max ?? 1} action/tick, every{" "}
+                    {runConfig.autonomous_prime_interval_secs ?? 30}s
+                  </span>
+                )}
+              </td>
+            </tr>
+            <tr>
+              <td className="muted" />
+              <td className="muted" style={{ fontSize: 12 }}>
+                {runConfig.autonomous_prime_enabled
+                  ? "Prime drives already-approved work forward on its own — plans the team, orchestrates the Brief tree, and starts ready work through the same governed routes — bounded per tick. It never auto-approves a strategy/hire/spawn/budget/Clearance gate (those stay human)."
+                  : "approved Prime work waits for an operator to click Advance / Start in the Action Center"}
+              </td>
+            </tr>
           </tbody>
         </table>
         <p className="muted" style={{ fontSize: 11, marginTop: 8 }}>
           Toggle the heartbeat via <span className="mono">RELIX_HEARTBEAT_ENABLED</span> (off by default);
           pacing via <span className="mono">RELIX_HEARTBEAT_INTERVAL_SECS</span>. The opt-in autonomous
           retry lane is <span className="mono">RELIX_AUTONOMOUS_RECOVERY</span> (off by default), bounded by{" "}
-          <span className="mono">RELIX_AUTONOMOUS_RECOVERY_MAX</span>. Autonomous runs still honor adapter
+          <span className="mono">RELIX_AUTONOMOUS_RECOVERY_MAX</span>. The opt-in autonomous Prime driver is{" "}
+          <span className="mono">RELIX_AUTONOMOUS_PRIME</span> (off by default), paced by{" "}
+          <span className="mono">RELIX_AUTONOMOUS_PRIME_INTERVAL_SECS</span> and bounded by{" "}
+          <span className="mono">RELIX_AUTONOMOUS_PRIME_MAX</span>. Autonomous runs still honor adapter
           readiness, per-Operative wake/concurrency caps, and budget hard-stops. No LLM diagnosis or
           provider-quota polling.
         </p>

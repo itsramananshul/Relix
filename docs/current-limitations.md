@@ -253,7 +253,8 @@ when you click Start. What it does **not** do:
   ready Briefs into real Shifts through the same governed run path as a manual
   run (approved-only, ready-only, every skipped Brief reported with a reason) —
   but it is still an operator-initiated gate, not an auto-pilot.
-- **There is a bounded "guided driver" (v1), NOT a full autonomous driver.**
+- **There is a bounded "guided driver" (v1) AND an opt-in bounded *autonomous*
+  Prime driver (v1) — NOT an autonomous CEO that reasons about strategy itself.**
   `prime.next_step` (READ-ONLY) classifies the ONE next governed step for a
   proposal or Mandate over live state — approval, strategy gate, team plan + live
   readiness (hires / Clearances), the Brief board, and the run ledger
@@ -265,13 +266,50 @@ when you click Start. What it does **not** do:
   mode). It re-reads state and **refuses (no side effects, HTTP 409) when the
   requested action is no longer the current next step**, executes through the same
   governed handler + Keys as the manual route, and surfaces every governance
-  refusal honestly. What it explicitly does **NOT** do: there is **no blind
-  autonomous loop**; it **never** auto-approves a strategy / hire / spawn / budget
-  gate (those stay human); it **never** runs a real adapter — `start_work` is
-  routed to the existing explicit Prime **Start** button, not auto-advanced; and a
-  single click advances **one** step only. So there is still no driver that takes
-  a goal end-to-end (propose → approve → staff → orchestrate → run) on its own —
-  this is one-step, operator-clicked advancement through existing governed routes.
+  refusal honestly.
+  - **The autonomous Prime driver (v1) closes the "Prime is not autonomous"
+    caveat — opt-in, default OFF, bounded.** Behind an explicit switch
+    (`RELIX_AUTONOMOUS_PRIME`, **off by default**, paced via
+    `RELIX_AUTONOMOUS_PRIME_INTERVAL_SECS` default 30s, bounded per tick by
+    `RELIX_AUTONOMOUS_PRIME_MAX`, default `1`, clamp `1..=10`) a timer now drives
+    already-**approved** Prime/company work forward **without the operator
+    clicking "Advance one step" over and over**. Each tick discovers active
+    candidates (approved Prime proposals first — they carry Start — then live
+    Mandates), re-classifies each with the SAME `prime.next_step` logic, and
+    applies at most `max` actions: it auto-advances the safe steps
+    (`create_team_plan` / `orchestrate_assign_ready`) through the **same governed
+    `prime.advance` path** the operator click uses, and for an already-approved
+    proposal that reaches `ready_to_start` it starts the ready Briefs through the
+    **existing `prime.start` path** (no new runner). What it **never** does: it
+    **never auto-approves a strategy / hire / spawn / budget / Clearance gate**
+    (those stay human — a pending gate is recorded `blocked` and left untouched);
+    it **bypasses no execution guard** — `prime.start` already enforces
+    approved-only / ready-only / active-assignee / adapter-resolvable / Claim, and
+    the autonomous start additionally **re-imposes the autonomous budget
+    hard-stop** (`heartbeat::dispatch_budget_admits` — per-Operative Allowance +
+    additive Guild budget) that the sovereign manual `prime.start` deliberately
+    skips, so the loop never auto-starts an over-budget Brief (a manual Start
+    stays sovereign). It is **idempotent** (each tick re-classifies live state, so
+    team plans / orchestration trees / started Shifts are never duplicated and an
+    already-claimed/running Brief is never double-started), **tenant-safe** (a tick
+    spans all Guilds with each candidate processed under its **own** Guild, or one
+    Guild when scoped), and **bounded** (≤ `max` actions/tick). It chronicles a
+    distinct `prime.autonomous_advance` / `prime.autonomous_start` event on the
+    Mandate's parent Brief for an actual action only (never per skipped gate). A
+    **bare Mandate** is planned/orchestrated but its per-Brief runs are left to the
+    heartbeat / `brief.run` (no new bare-Mandate start policy invented). Surfaced
+    read-only in Settings beside the heartbeat + recovery lane
+    (`/v1/spine/run-config`: `autonomous_prime_enabled` / `autonomous_prime_max` /
+    `autonomous_prime_interval_secs`).
+  - What this still does **NOT** do: there is **no LLM/strategy reasoning** — the
+    autonomous driver only executes the deterministic next governed step over
+    already-approved work; it **does not author strategy, decide which
+    person/identity to hire, greenlight a Clearance, or take a goal from raw
+    intent to done on its own**. Proposing a plan, approving it, greenlighting
+    hires/Clearances, and the Guild-budget ceiling all remain the human/Board's.
+    The default Prime is still rules; a model can shape only the *interpretation*
+    of a propose request (never crew/governance). So the Board/human approval
+    gates are fully preserved — autonomy operates strictly **inside** them.
 - **Hiring is request → approve only.** Prime suggests *which roles* are
   missing and files them as `pending` hire requests on approval, but it does
   not decide *which person/identity* to hire, and a pending hire is inert until
@@ -466,14 +504,21 @@ In short: the *governance rails* of a company are in place and tenant-safe,
 the Shift Room makes the post-start loop legible (what ran / finished / is
 blocked / needs review, with the next action one click away) over a dedicated
 low-latency status stream (polling fallback, honest badge), a model can
-now draft the plan **opt-in** behind a server-authoritative validator, and a
-bounded **guided driver (v1)** now names the ONE next governed step and can
+now draft the plan **opt-in** behind a server-authoritative validator, a
+bounded **guided driver (v1)** names the ONE next governed step and can
 advance **one** safe step at a time on explicit operator click (`prime.next_step`
 / `prime.advance` — `create_team_plan` / `orchestrate_assign_ready` only, stale-
-safe, governance unchanged) — but the default Prime is still rules, the model
-only shapes the *interpretation* (never crew/governance), approvals + hire
-decisions + Start stay human, and there is still no **autonomous** driver that
-reasons about strategy + team + work end to end on its own.
+safe, governance unchanged), and an **opt-in bounded *autonomous* Prime driver
+(v1)** (default OFF, `RELIX_AUTONOMOUS_PRIME`) now drives already-**approved**
+work forward on a timer — planning the team, orchestrating the Brief tree, and
+starting ready work through the same governed routes, bounded + idempotent +
+tenant-safe, with the autonomous budget hard-stop re-imposed on auto-start. The
+default Prime is still rules, the model only shapes the *interpretation* (never
+crew/governance), and the autonomous loop **never** auto-approves a strategy /
+hire / spawn / budget / Clearance gate — so approvals + hire decisions + the
+Guild budget ceiling stay human, and there is still no driver that **reasons
+about strategy itself** or takes a goal from raw intent to done autonomously.
+Autonomy operates strictly **inside** the Board's approval gates.
 
 ### Bridge persists every chat as a Task (fail-soft)
 
