@@ -14,8 +14,8 @@
 > on "what is true right now" — fix the gap, don't paper over it.
 >
 > **Last reconciled:** 2026-06-06 against the implementation ledger (through commit
-> `3c3c533c`, Live Spend Telemetry Pack era), the Paperclip audit files listed below, and
-> the design docs listed below.
+> `1f648871`, Allowance calendar-month windowing + Guild autonomous hard-stop era), the
+> Paperclip audit files listed below, and the design docs listed below.
 
 Paperclip audit sources this roadmap must stay grounded in (read these before product
 direction work, not as optional inspiration):
@@ -330,16 +330,19 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    one Operative, the Guild gate bounds the whole Guild's autonomous spend so a fleet of
    in-budget Operatives can't collectively overrun the company ceiling; a per-Operative
    refusal takes precedence and is never weakened. *Tenant isolation:* the Guild spend is the
-   sum of the Brief's OWN Guild's active Operatives' trailing-30-day `cost_since` (never a
-   cross-tenant `cost_since(None, …)`) — the same figure + window the Action Center reports.
+   sum of the Brief's OWN Guild's active Operatives' `cost_since` over the canonical Allowance
+   window (now the current UTC calendar month, slice 9; trailing-30-day at the time of this
+   slice) — never a cross-tenant `cost_since(None, …)` — the same figure + window the Action
+   Center reports.
    *Pinned:* over-Guild-budget autonomous Brief refused + parked + chronicled as
    `guild.budget_refused`; under-budget / no-budget allowed; per-Operative stop takes
    precedence; cross-tenant spend does not trip another Guild's cap; manual `preflight_run`
    stays sovereign for the same over-budget Brief. *Verified:* full `cargo test -p
    relix-runtime` green (3944 lib tests, +6); `cargo check` clean; `cargo clippy` clean on the
    touched code (2 pre-existing unrelated warnings only); `git diff --check` clean. *Remaining
-   spend caveats (deferred):* trailing-30-day window (not calendar-month with reset → slice 9);
-   no issue-tree cost rollup / billing-code attribution (`company-model §6.6` → slice 10).
+   spend caveats (deferred):* no issue-tree cost rollup / billing-code attribution
+   (`company-model §6.6` → slice 10). *(The calendar-month spend window with implicit reset
+   shipped in slice 9 = DONE.)*
 
 3. **The Lattice org-chart view** — `dashboard-design.md §9`.
    *Files:* new `apps/dashboard/src/pages/Lattice.tsx` (or extend Agents.tsx), `nav.ts`;
