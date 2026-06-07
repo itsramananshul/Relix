@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { api, tryGet } from "../api";
+import { api, tryGet, tryGetReport } from "../api";
 import { asArray, extractList, Section, useAsync } from "../components/common";
 import { BriefDetail } from "../components/BriefDetail";
 import { invalidate, useInvalidate } from "../invalidate";
@@ -18,6 +18,28 @@ interface Card {
   // route so the card can show a "Blocked by X" chip without opening the
   // detail (relix-dashboard-design §6). Absent/empty when nothing blocks it.
   blocked_by?: string[];
+}
+
+// The bounded slice of a Brief's full detail (`GET /v1/spine/briefs/:id`) the
+// Plan view needs to render the goal-facing workflow checklist (dashboard-design
+// §6/§7). Only RELATION + state fields are read here — board status / priority /
+// assignee come from the already-loaded board card, latest-run from `/v1/runs`,
+// so the Plan view adds no per-card run fetch. `parents`/`subbriefs` are
+// same-Guild relation ids the server already tenant-filters.
+interface PlanDetail {
+  parents?: string[];
+  subbriefs?: string[];
+  blocking?: string[];
+  snags?: string[];
+  blocked?: boolean;
+  delegation_depth?: number;
+}
+// One cached Plan-detail fetch outcome (mirrors Agents.tsx's detail-cache +
+// in-flight-guard pattern): a present entry — even with `detail:null` + an
+// `error` — means "loaded / attempted", so the bounded loader never re-fetches.
+interface PlanEntry {
+  detail: PlanDetail | null;
+  error: string | null;
 }
 
 interface Operative {
@@ -70,6 +92,11 @@ const REFUSALS: Record<string, string> = {
   failed: "run failed",
   continued: "run continued (more work to do)",
 };
+
+// Plan view bounds its best-effort detail fetches to the first N visible cards
+// (dashboard-design §6: the list owns the brains, but stays honest about cost) —
+// beyond this the rows still render flat from the board, with a capped note.
+const PLAN_DETAIL_CAP = 80;
 
 const COLUMNS = ["backlog", "todo", "in_progress", "in_review", "done"];
 const COLUMN_LABEL: Record<string, string> = {
@@ -151,6 +178,41 @@ export function Briefs() {
   // the detail panel still opens (it fetches the Brief by id on its own).
   const selectedRef = useRef<HTMLDivElement | null>(null);
 
+  // Board ↔ Plan view is URL-driven (`/briefs?view=plan`) so the goal-facing
+  // checklist is shareable and survives refresh/back-forward, alongside the
+  // existing `?brief=` selection + the mandate filter (dashboard-design §6).
+  // Board is the default; an absent/unknown `view` falls back to it.
+  const isPlan = searchParams.get("view") === "plan";
+  function setView(plan: boolean) {
+    const next = new URLSearchParams(searchParams);
+    if (plan) next.set("view", "plan");
+    else next.delete("view");
+    setSearchParams(next, { replace: true });
+  }
+  // Plan-view detail cache + in-flight guard — the exact pattern Agents.tsx
+  // uses: a present entry (even null/error) marks "loaded", and the in-flight
+  // set stops a re-render from starting a duplicate fetch before the entry
+  // lands. Persists across Board/Plan toggles so re-opening Plan is instant and
+  // never re-fetches; relations are structural and change rarely (caveat: a
+  // relation added mid-session shows on the next full board reload of new ids).
+  const [planCache, setPlanCache] = useState<Record<string, PlanEntry>>({});
+  const planInflight = useRef<Set<string>>(new Set());
+
+  // Boundedly fetch one visible card's relation detail via the existing
+  // `/v1/spine/briefs/:id` route. `tryGetReport` so a per-card failure is
+  // recorded (not silently dropped) — the Plan view still renders that row flat
+  // and raises ONE inline warning. Guarded by the cache + in-flight set.
+  async function loadPlanDetail(id: string) {
+    if (!id || id in planCache || planInflight.current.has(id)) return;
+    planInflight.current.add(id);
+    const r = await tryGetReport<PlanDetail>(
+      `/v1/spine/briefs/${encodeURIComponent(id)}`,
+      {},
+    );
+    setPlanCache((m) => ({ ...m, [id]: { detail: r.error ? null : r.data, error: r.error } }));
+    planInflight.current.delete(id);
+  }
+
   const { data, loading, error, reload } = useAsync(async () => {
     const byCol: Record<string, Card[]> = {};
     const [, ops, adapters, runs, mandates] = await Promise.all([
@@ -196,6 +258,114 @@ export function Briefs() {
     const b = r.brief_id ?? "";
     if (b && !latestRun.has(b)) latestRun.set(b, r);
   }
+
+  // The single mandate-filter predicate, shared by the board columns and the
+  // Plan view so both show exactly the same visible cards.
+  const mandateMatch = (c: Card) =>
+    mandateFilter === "all"
+      ? true
+      : mandateFilter === "none"
+        ? !c.mandate_id
+        : c.mandate_id === mandateFilter;
+
+  // ── Plan-view model (dashboard-design §6 "workflow checklist") ────────────
+  // A flat visible-card index built from ALL loaded board columns AFTER the
+  // mandate filter, plus a parent→child forest assembled from the bounded Plan
+  // detail cache. Computed every render (cheap: a few maps over the loaded
+  // board) and reused by BOTH the Plan checklist and the small progress cue on
+  // board cards — so a board card only shows a cue once the Plan cache exists.
+  const allVisibleCards = COLUMNS.flatMap((col) => data?.board?.[col] ?? []).filter(mandateMatch);
+  const visibleById = new Map<string, Card>();
+  const orderIndex = new Map<string, number>();
+  allVisibleCards.forEach((c, i) => {
+    const id = cardId(c);
+    if (id) {
+      visibleById.set(id, c);
+      orderIndex.set(id, i);
+    }
+  });
+  // Edges, deduped, from BOTH directions in the cache (a card's `parents` and
+  // its `subbriefs`) but only when BOTH ends are visible — so we never invent a
+  // child outside the loaded window. A card with no loaded detail simply has no
+  // edges and renders as a flat root (honest fallback).
+  const childrenByParent = new Map<string, string[]>();
+  const childIds = new Set<string>();
+  const addEdge = (parent: string, child: string) => {
+    if (!parent || !child || parent === child) return;
+    const arr = childrenByParent.get(parent) ?? [];
+    if (!arr.includes(child)) {
+      arr.push(child);
+      childrenByParent.set(parent, arr);
+    }
+    childIds.add(child);
+  };
+  for (const c of allVisibleCards) {
+    const id = cardId(c);
+    const pd = planCache[id]?.detail;
+    if (!pd) continue;
+    for (const p of pd.parents ?? []) if (visibleById.has(p)) addEdge(p, id);
+    for (const s of pd.subbriefs ?? []) if (visibleById.has(s)) addEdge(id, s);
+  }
+  // Keep children in board order (backlog→done, then board position).
+  for (const arr of childrenByParent.values()) {
+    arr.sort((a, b) => (orderIndex.get(a) ?? 0) - (orderIndex.get(b) ?? 0));
+  }
+  const planRoots = allVisibleCards.filter((c) => !childIds.has(cardId(c)));
+
+  // The workflow state of one card, for progress counts + the row chip. `done`
+  // wins first (a done card isn't "blocked"); then a real blocker (board's
+  // unresolved same-Guild blockers, or a loaded Snag); then live/in-flight; else
+  // remaining (backlog/todo). Drawn only from REAL signals — never fabricated.
+  const cardState = (c: Card): "done" | "running" | "blocked" | "remaining" => {
+    const id = cardId(c);
+    if (c.board_status === "done") return "done";
+    if ((c.blocked_by?.length ?? 0) > 0 || planCache[id]?.detail?.blocked) return "blocked";
+    if (
+      latestRun.get(id)?.status === "running" ||
+      c.board_status === "in_progress" ||
+      c.board_status === "in_review"
+    )
+      return "running";
+    return "remaining";
+  };
+  // The VISIBLE descendant ids of a card (its loaded subtree), cycle-guarded.
+  const descendantIds = (id: string): string[] => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const stack = [...(childrenByParent.get(id) ?? [])];
+    while (stack.length) {
+      const x = stack.pop()!;
+      if (seen.has(x)) continue;
+      seen.add(x);
+      out.push(x);
+      for (const k of childrenByParent.get(x) ?? []) stack.push(k);
+    }
+    return out;
+  };
+  // Progress over a card's VISIBLE LOADED subtree (null when it has none) — the
+  // honest "computed only from visible children" rule (dashboard-design §6).
+  const progressOf = (id: string) => {
+    const ds = descendantIds(id);
+    if (ds.length === 0) return null;
+    let done = 0,
+      running = 0,
+      blocked = 0,
+      remaining = 0;
+    for (const d of ds) {
+      const c = visibleById.get(d);
+      if (!c) continue;
+      const s = cardState(c);
+      if (s === "done") done++;
+      else if (s === "running") running++;
+      else if (s === "blocked") blocked++;
+      else remaining++;
+    }
+    return { done, running, blocked, remaining, total: ds.length };
+  };
+  // Honest coverage of the Plan view's bounded detail load.
+  const planTargets = allVisibleCards.slice(0, PLAN_DETAIL_CAP).map(cardId).filter(Boolean);
+  const planCapped = allVisibleCards.length > PLAN_DETAIL_CAP;
+  const planHadError = planTargets.some((id) => planCache[id]?.error);
 
   async function assign(c: Card, agentId: string) {
     setBanner(null);
@@ -303,6 +473,16 @@ export function Briefs() {
 
   const initialized = operatives.length > 0;
 
+  // While Plan view is active, lazily + boundedly fetch relation detail for the
+  // first N visible cards (the cap), each guarded so nothing re-fetches. Runs on
+  // entering Plan view, on a board reload (new ids), and on a mandate-filter
+  // change (a different visible set). Re-fetches are no-ops (cache + in-flight).
+  useEffect(() => {
+    if (!isPlan) return;
+    for (const id of planTargets) loadPlanDetail(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlan, data, mandateFilter]);
+
   // After the board renders (data load or reload), bring the selected card into
   // view. `block: "nearest"` avoids jumping when it is already visible.
   useEffect(() => {
@@ -311,12 +491,148 @@ export function Briefs() {
     }
   }, [selected, data]);
 
+  // Render one Plan row + its visible children, recursively (dashboard-design
+  // §6 numbered workflow checklist). `number` is the dotted plan index (1, 1.1,
+  // …); `depth` drives the indent. `seen` guards against a relation cycle and
+  // stops a multi-parent child from rendering twice. Every chip is a REAL signal
+  // from the loaded board card / run ledger / cached relations — never invented.
+  function renderPlanRow(
+    c: Card,
+    number: string,
+    depth: number,
+    seen: Set<string>,
+  ): JSX.Element | null {
+    const id = cardId(c);
+    if (seen.has(id)) return null;
+    seen.add(id);
+    const op = c.assignee_agent_id ? opById.get(c.assignee_agent_id) : undefined;
+    const mTitle = c.mandate_id ? mandateTitle.get(c.mandate_id) || c.mandate_id.slice(0, 8) : null;
+    const lr = latestRun.get(id);
+    const prog = progressOf(id);
+    const pd = planCache[id]?.detail;
+    const bb = c.blocked_by ?? [];
+    const snagN = pd?.snags?.length ?? 0;
+    const hiddenChildren = (pd?.subbriefs ?? []).filter((s) => !visibleById.has(s)).length;
+    const kids = (childrenByParent.get(id) ?? [])
+      .map((k) => visibleById.get(k))
+      .filter((x): x is Card => !!x);
+    return (
+      <Fragment key={id}>
+        <div
+          className={"plan-row" + (selected === id ? " selected" : "")}
+          style={{ paddingLeft: 8 + Math.min(depth, 6) * 18 }}
+          ref={selected === id ? selectedRef : undefined}
+        >
+          <span className="plan-num mono">{number}</span>
+          <div className="plan-main">
+            <div className="plan-title-row">
+              <span
+                className="plan-title"
+                title="Open Brief detail + Chronicle"
+                onClick={() => setSelected(selected === id ? null : id)}
+              >
+                {c.title ?? "(untitled)"}
+              </span>
+              {c.board_status && (
+                <span className={"badge " + c.board_status} style={{ fontSize: 10 }}>
+                  {COLUMN_LABEL[c.board_status] ?? c.board_status}
+                </span>
+              )}
+              {c.priority && <span className="badge" style={{ fontSize: 10 }}>{c.priority}</span>}
+              {op ? (
+                <span className="muted" style={{ fontSize: 11 }} title={c.assignee_agent_id ?? ""}>
+                  {op.name ?? "operative"}{op.role === "founder" ? " (Founder)" : ""}
+                </span>
+              ) : c.assignee_agent_id ? (
+                <span className="muted mono" style={{ fontSize: 10 }}>{c.assignee_agent_id.slice(0, 8)}</span>
+              ) : (
+                <span className="muted" style={{ fontSize: 11 }}>unassigned</span>
+              )}
+              {mTitle && (
+                <Link to="/mandates" className="muted" style={{ fontSize: 10 }} title={"part of mandate " + c.mandate_id}>
+                  ◎ {mTitle}
+                </Link>
+              )}
+              {(bb.length > 0 || snagN > 0) && (
+                <span
+                  className="badge blocked"
+                  style={{ fontSize: 10, maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" }}
+                  title={
+                    bb.length
+                      ? `Blocked by ${bb.length} Brief${bb.length === 1 ? "" : "s"}: ${bb.join(", ")}`
+                      : `${snagN} unresolved Snag${snagN === 1 ? "" : "s"} — open the Brief to see them`
+                  }
+                >
+                  ⛔ {bb.length === 1
+                    ? `Blocked by ${bb[0]}`
+                    : bb.length > 1
+                      ? `Blocked by ${bb.length}`
+                      : `${snagN} snag${snagN === 1 ? "" : "s"}`}
+                </span>
+              )}
+              {lr && (
+                <span className="plan-run">
+                  <span className={"badge " + (RUN_TONE[lr.status ?? ""] ?? "todo")} style={{ fontSize: 10 }}>
+                    {lr.status ?? "—"}
+                  </span>
+                  {lr.run_id && (
+                    <Link to={`/runs?run=${encodeURIComponent(lr.run_id)}`} className="link" style={{ fontSize: 11 }}>
+                      run →
+                    </Link>
+                  )}
+                </span>
+              )}
+            </div>
+            {prog && (
+              <div className="plan-progress">
+                <span className="badge done" style={{ fontSize: 10 }}>{prog.done} done</span>
+                {prog.running > 0 && <span className="badge in_progress" style={{ fontSize: 10 }}>{prog.running} running</span>}
+                {prog.blocked > 0 && <span className="badge blocked" style={{ fontSize: 10 }}>{prog.blocked} blocked</span>}
+                <span className="muted" style={{ fontSize: 11 }}>
+                  {prog.remaining} remaining · {prog.total} visible child{prog.total === 1 ? "" : "ren"}
+                </span>
+              </div>
+            )}
+            {hiddenChildren > 0 && (
+              <div className="muted" style={{ fontSize: 10 }}>
+                + {hiddenChildren} child Brief{hiddenChildren === 1 ? "" : "s"} not in this view
+              </div>
+            )}
+          </div>
+        </div>
+        {kids.map((k, i) => renderPlanRow(k, `${number}.${i + 1}`, depth + 1, seen))}
+      </Fragment>
+    );
+  }
+
   return (
     <div className="grid">
       <Section
         title="Issue board"
         action={
           <div className="row" style={{ gap: 8 }}>
+            {/* Board ↔ Plan toggle (dashboard-design §6). Board keeps the
+                kanban; Plan reads the same cards as a goal-facing checklist. */}
+            <div className="seg" role="tablist" aria-label="Briefs view">
+              <button
+                className={"seg-btn" + (!isPlan ? " active" : "")}
+                role="tab"
+                aria-selected={!isPlan}
+                onClick={() => setView(false)}
+                title="Kanban board — drag/drop, assign, run"
+              >
+                Board
+              </button>
+              <button
+                className={"seg-btn" + (isPlan ? " active" : "")}
+                role="tab"
+                aria-selected={isPlan}
+                onClick={() => setView(true)}
+                title="Goal-facing plan — numbered workflow checklist with nesting + progress"
+              >
+                Plan
+              </button>
+            </div>
             {mandates.length > 0 && (
               <select className="select" style={{ width: 180, fontSize: 12 }} value={mandateFilter} onChange={(e) => setMandateFilter(e.target.value)} title="Filter by Mandate">
                 <option value="all">All mandates</option>
@@ -386,6 +702,30 @@ export function Briefs() {
             No Briefs yet. Click <strong>+ New Brief</strong> to create your first unit of work,
             then assign it to an Operative and run it.
           </div>
+        ) : isPlan ? (
+          /* Plan view (dashboard-design §6) — the SAME visible board cards read
+             as a goal-facing, numbered workflow checklist: nesting + progress
+             from the bounded relation cache, run state from the run ledger, each
+             row deep-linking the existing detail panel via `?brief=`. */
+          <div className="plan-list">
+            <div className="plan-caption">
+              Visible workflow — numbered from the loaded board, after the mandate filter. Nesting
+              + progress are computed only from the Briefs in view
+              {planCapped
+                ? `; relation detail loaded for the first ${PLAN_DETAIL_CAP} of ${allVisibleCards.length} cards (the rest render flat).`
+                : "."}
+            </div>
+            {planHadError && (
+              <div className="banner err" style={{ marginBottom: 10 }}>
+                Some Brief details couldn't load — those rows render flat (no nesting/progress).
+                The visible list itself is still complete.
+              </div>
+            )}
+            {(() => {
+              const seen = new Set<string>();
+              return planRoots.map((r, i) => renderPlanRow(r, `${i + 1}`, 0, seen));
+            })()}
+          </div>
         ) : (
           <>
             {moveNote && (
@@ -396,13 +736,7 @@ export function Briefs() {
             )}
             <div className="board">
             {COLUMNS.map((col) => {
-              const cards = (data?.board?.[col] ?? []).filter((c) =>
-                mandateFilter === "all"
-                  ? true
-                  : mandateFilter === "none"
-                    ? !c.mandate_id
-                    : c.mandate_id === mandateFilter,
-              );
+              const cards = (data?.board?.[col] ?? []).filter(mandateMatch);
               // A column accepts a drop when a card from a DIFFERENT column is
               // being dragged. Same-column hover gets no affordance.
               const droppable = !!drag && drag.from !== col;
@@ -508,6 +842,19 @@ export function Briefs() {
                             </span>
                           </div>
                         )}
+
+                        {/* Sub-brief progress cue — shown ONLY when the Plan
+                            view has already populated the relation cache (board
+                            cards never fetch detail on their own), computed from
+                            the same visible-subtree counts as the Plan view. */}
+                        {(() => {
+                          const p = progressOf(cardId(c));
+                          return p ? (
+                            <div className="plan-cue" title="Visible sub-brief progress (from the Plan view)">
+                              ▣ {p.done}/{p.total} done{p.blocked > 0 ? ` · ${p.blocked} blocked` : ""}
+                            </div>
+                          ) : null;
+                        })()}
 
                         {lr && (
                           <div className="card-run">

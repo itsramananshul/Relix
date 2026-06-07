@@ -187,6 +187,34 @@ label.field span { display: block; font-size: 12px; color: var(--text-dim); marg
 @media (max-width: 720px) { .kv-grid { grid-template-columns: 1fr; } }
 /* Latest-run context strip on a board card (status / trigger / review-apply). */
 .card-run { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--border-soft); }
+/* Sub-brief progress cue on a board card — only shows once the Plan view has
+   populated the relation cache (board cards never fetch detail themselves). */
+.plan-cue { margin-top: 6px; font-size: 10px; color: var(--text-faint); }
+
+/* ── Briefs: Board ↔ Plan toggle + the goal-facing Plan view (design §6/§7) ──
+   A segmented Board/Plan control + a dense, B&W, numbered workflow checklist
+   that reads the same loaded board cards. No nested cards, no decoration; indent
+   is inline (depth-driven), rows wrap/truncate rather than overlap on narrow
+   widths. Color stays semantic-only (status/priority badges). */
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.seg-btn { background: transparent; color: var(--text-dim); border: none; padding: 5px 12px; font-size: 12px; font-weight: 600; cursor: pointer; }
+.seg-btn:hover { background: var(--bg-elev); color: var(--text); }
+.seg-btn.active { background: var(--bg-elev); color: var(--text); }
+.seg-btn + .seg-btn { border-left: 1px solid var(--border); }
+
+.plan-list { display: flex; flex-direction: column; }
+.plan-caption { color: var(--text-faint); font-size: 12px; margin-bottom: 8px; }
+.plan-row { display: flex; gap: 10px; align-items: flex-start; padding: 8px; border-bottom: 1px solid var(--border-soft); }
+.plan-row:hover { background: var(--bg-raised); }
+/* Selected row — the same info-toned left rail the board card / roster row use. */
+.plan-row.selected { box-shadow: inset 2px 0 0 var(--info); background: var(--bg-raised); }
+.plan-num { flex: 0 0 auto; min-width: 34px; color: var(--text-faint); font-size: 11px; padding-top: 2px; }
+.plan-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.plan-title-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; min-width: 0; }
+.plan-title { font-size: 13px; font-weight: 500; cursor: pointer; word-break: break-word; }
+.plan-title:hover { text-decoration: underline; }
+.plan-run { display: inline-flex; gap: 6px; align-items: center; }
+.plan-progress { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
 /* ── Split workspace: board + contextual properties panel (design §2/§7) ──
    When an entity (a Brief) is selected, the board and its detail sit side by

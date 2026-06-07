@@ -237,7 +237,9 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   `crates/relix-web-bridge/dashboard-dist`; legacy `dashboard.html` and `spine_dashboard.html`
   **deleted**; `/spine` is a 308 → `/dashboard`; missing bundle returns honest 503; a
   dist-parity gate (CI + `scripts/check-dashboard-dist.ps1`) keeps the committed bundle in sync.
-- **Work-object IA** — Overview, Briefs (board + drag-drop + contextual detail panel),
+- **Work-object IA** — Overview, Briefs (**Board / Plan toggle** — kanban with drag-drop +
+  contextual detail panel, and a goal-facing numbered workflow checklist; see the Briefs Plan
+  view slice below),
   Agents (Roster + per-Operative Keys panel), Mandates (governed strategy→orchestrate
   workflow), Runs, Chat (Prime), Company, Settings, Scheduled.
 - **Action Center / The Desk** — `GET /v1/spine/company/actions`: ranked next-actions with
@@ -979,7 +981,14 @@ Relix *feels like a real product, not a mock-up*, when all of these are true (fr
 - **The org is visible** — the Lattice shows the company as a company; the Roster shows Keys
   and Allowance per Operative.
 - **Work reads as a goal-facing plan** — Briefs render as numbered workflow checklists with
-  sub-brief nesting and progress, not a flat log.
+  sub-brief nesting and progress, not a flat log. **Shipped (bounded):** the Briefs page has a
+  **Board / Plan** toggle (`?view=plan`); Plan renders the loaded board cards as a numbered
+  (`1`, `1.1`, …) checklist with parent/child nesting, status/priority/assignee/mandate chips,
+  blocker chips, latest-run state + deep link, and a per-parent progress strip — all computed
+  ONLY from the visible window (relation detail bounded-fetched for the first 80 cards; the
+  rest render flat, labelled honestly). **Still partial:** no whole-tree (beyond the loaded
+  board) rollup, no cross-route/realtime progress push, and relation detail is cached per
+  session (a relation added mid-session shows on the next board reload of new ids).
 - **Live, not polled** — a running Shift shows a pulsing Live indicator and a streaming
   transcript in the Brief thread; the Desk updates without a manual refresh.
 - **Cost is legible** — every Brief/Operative/Guild shows spend vs Allowance; over-cap is a
