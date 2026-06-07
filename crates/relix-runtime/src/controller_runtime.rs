@@ -9499,7 +9499,7 @@ fn register_node_type_handlers(
                                     let agent = card
                                         .assignee_agent_id
                                         .as_deref()
-                                        .and_then(|a| ags.get_agent(a).ok().flatten());
+                                        .and_then(|a| ags.get_agent_for_tenant(a, &tenant).ok().flatten());
                                     // The Operative's stored model/effort hints —
                                     // a supported CLI Rig maps them to its
                                     // `--model` / `-c model_reasoning_effort` flags.

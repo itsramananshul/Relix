@@ -1084,7 +1084,7 @@ pub fn handle_prime_start(
                 let agent = card
                     .assignee_agent_id
                     .as_deref()
-                    .and_then(|a| agent_store.get_agent(a).ok().flatten());
+                    .and_then(|a| agent_store.get_agent_for_tenant(a, tenant).ok().flatten());
                 let prefs = agent
                     .as_ref()
                     .map(|a| {
