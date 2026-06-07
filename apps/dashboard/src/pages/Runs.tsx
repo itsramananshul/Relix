@@ -53,6 +53,13 @@ interface RunRecord {
   trigger?: string;
   /// When status === "refused": why the run never started.
   refusal_reason?: string;
+  // Recovery DIAGNOSIS (execution-and-issue §3.3b) — stamped on terminal /
+  // refused runs. Informs operator decisions; NOT an autonomous retry.
+  failure_class?: string;
+  retryable?: boolean;
+  retry_budget_remaining?: number;
+  recovery_action?: string;
+  recovery_route?: string;
 }
 
 // One file in a safe-apply plan (`/v1/runs/:id/diff` → plan.items).
@@ -186,6 +193,21 @@ function triggerLabel(t?: string): string {
   if (!t || t === "unknown") return "—";
   if (t === "heartbeat") return "auto";
   return t;
+}
+
+// Recovery-diagnosis action key → plain-language operator guidance
+// (execution-and-issue §3.3b). Mirrors the backend `recovery_action` keys.
+function recoveryActionLabel(action?: string): string {
+  switch (action) {
+    case "assign_agent": return "Assign an Operative";
+    case "configure_rig": return "Configure the Rig";
+    case "raise_allowance": return "Raise the Allowance";
+    case "review_runtime": return "Review runtime settings";
+    case "retry_later": return "Retry the Shift later";
+    case "inspect_run": return "Inspect the run";
+    case "none": return "Inspect the run";
+    default: return action ?? "Inspect the run";
+  }
 }
 
 // Run status → badge tone. `running` is in-flight; the rest are terminal.
@@ -581,6 +603,9 @@ export function Runs() {
                           {r.status === "refused" && r.refusal_reason && (
                             <span className="badge blocked" style={{ fontSize: 9, marginLeft: 4 }} title="why the run didn't start">{r.refusal_reason}</span>
                           )}
+                          {r.status !== "refused" && r.failure_class && (
+                            <span className="badge blocked" style={{ fontSize: 9, marginLeft: 4 }} title="diagnosed failure class">{r.failure_class}</span>
+                          )}
                           {r.status === "done" && r.review && r.review !== "pending_review" && (
                             <span className={"badge " + (r.review === "accepted" ? "done" : "blocked")} style={{ fontSize: 9, marginLeft: 4 }} title={"review: " + r.review}>{r.review === "accepted" ? "✓" : "✕"}</span>
                           )}
@@ -617,6 +642,34 @@ export function Runs() {
                               )}
                               <Link to="/briefs" className="btn ghost sm" onClick={(e) => e.stopPropagation()}>← Briefs</Link>
                             </div>
+                            {/* Recovery diagnosis — operational, not a retry engine.
+                                Shows the failure class, retryable verdict + remaining
+                                budget, and the recommended fix → route. */}
+                            {(r.failure_class || r.recovery_action) &&
+                              r.status !== "running" &&
+                              r.status !== "done" &&
+                              r.status !== "continued" && (
+                                <div className="run-diag" onClick={(e) => e.stopPropagation()} style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, fontSize: 11, marginBottom: 8 }}>
+                                  <strong style={{ fontSize: 11 }}>Recovery</strong>
+                                  {r.failure_class && (
+                                    <span className="badge blocked" style={{ fontSize: 9 }} title="diagnosed failure class">{r.failure_class}</span>
+                                  )}
+                                  {r.retryable !== undefined && (
+                                    <span className={"badge " + (r.retryable ? "in_progress" : "todo")} style={{ fontSize: 9 }} title="whether a retry may help">
+                                      {r.retryable ? "retryable" : "not retryable"}
+                                    </span>
+                                  )}
+                                  {typeof r.retry_budget_remaining === "number" && r.retry_budget_remaining > 0 && (
+                                    <span className="muted" title="operator-facing retry budget (not an auto-retry)">budget {r.retry_budget_remaining}</span>
+                                  )}
+                                  {r.recovery_action && (
+                                    <span className="muted">→ {recoveryActionLabel(r.recovery_action)}</span>
+                                  )}
+                                  {r.recovery_route && r.recovery_action !== "inspect_run" && r.recovery_action !== "none" && (
+                                    <Link to={r.recovery_route} className="btn ghost sm" onClick={(e) => e.stopPropagation()}>Fix setup ↗</Link>
+                                  )}
+                                </div>
+                              )}
                             {r.status === "running" && (
                               <div className="row" style={{ marginBottom: 6 }}>
                                 <div className="spacer" style={{ flex: 1 }} />

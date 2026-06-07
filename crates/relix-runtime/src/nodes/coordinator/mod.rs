@@ -1736,6 +1736,11 @@ impl TaskStore {
                     review: r.review,
                     apply_status: r.apply_status,
                     refusal_reason: r.refusal_reason,
+                    failure_class: r.failure_class,
+                    retryable: r.retryable,
+                    retry_budget_remaining: r.retry_budget_remaining,
+                    recovery_action: r.recovery_action,
+                    recovery_route: r.recovery_route,
                     artifact_count,
                     total_runs,
                 })
@@ -4828,7 +4833,10 @@ impl TaskStore {
     /// EXCLUDES `not_found` (no Brief to attach to) and `already_running`
     /// (a run is already in flight — recording a refusal on a double-click
     /// would just be noise; the live run is the answer). `over_allowance`
-    /// covers the autonomous (heartbeat) Allowance hard-stop.
+    /// covers the autonomous (heartbeat) per-Operative Allowance hard-stop;
+    /// `over_guild_budget` covers the autonomous Guild-budget hard-stop — both
+    /// earn a durable refused row so run history / the Action Center can explain
+    /// the governance ceiling that refused the run.
     pub fn refusal_is_durable(reason: &str) -> bool {
         matches!(
             reason,
@@ -4838,6 +4846,7 @@ impl TaskStore {
                 | "workspace_error"
                 | "workspace_context_error"
                 | "over_allowance"
+                | "over_guild_budget"
         )
     }
 
@@ -4888,6 +4897,12 @@ impl TaskStore {
                 return Ok(None); // Brief vanished — nothing written
             }
         }
+        // Stamp the durable recovery diagnosis (execution-and-issue §3.3b) so the
+        // Brief workroom + Action Center can show an honest failure-class +
+        // recommended fix. A refusal is conservatively non-retryable (needs an
+        // operator fix first). Best-effort — never fails the refusal record.
+        let diag = RunDiagnosis::for_refusal(reason, brief_id, &run_id);
+        let _ = self.set_run_diagnosis(&run_id, &diag);
         // Chronicle the refusal — payload is the static reason + Rig (safe).
         let note = if rig.trim().is_empty() {
             format!("run refused: {reason} — {summary}")
@@ -4939,6 +4954,44 @@ impl TaskStore {
                  review = CASE WHEN ?1 = 'done' THEN 'pending_review' ELSE review END
              WHERE run_id = ?4",
             params![status, summary, now, run_id],
+        )
+        .map_err(CoordinatorError::Db)?;
+        drop(conn);
+        // Stamp the terminal recovery diagnosis (execution-and-issue §3.3b). The
+        // `rig_retryable` signal isn't available here (only the status), so a
+        // `failed` run is classified conservatively as non-retryable `unknown`;
+        // the dispatch finalize path re-stamps `failed` with the real
+        // `RigOutcome` retryable signal (see `set_run_diagnosis`). `interrupted`
+        // (stale-run recovery) and `cancelled` are classified honestly from the
+        // status alone. Best-effort.
+        let diag = RunDiagnosis::for_terminal(status, None, run_id);
+        let _ = self.set_run_diagnosis(run_id, &diag);
+        Ok(())
+    }
+
+    /// Stamp the recovery DIAGNOSIS (execution-and-issue §3.3b) onto a run row.
+    /// PURE persistence of a derived classification — it spawns no retry, polls
+    /// no provider, and never mutates board/claim state. No-op when the run_id
+    /// is unknown. Best-effort caller-side (a diagnosis write never fails a run).
+    pub fn set_run_diagnosis(
+        &self,
+        run_id: &str,
+        diag: &RunDiagnosis,
+    ) -> Result<(), CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        conn.execute(
+            "UPDATE brief_runs
+             SET failure_class = ?1, retryable = ?2, retry_budget_remaining = ?3,
+                 recovery_action = ?4, recovery_route = ?5
+             WHERE run_id = ?6",
+            params![
+                diag.failure_class,
+                diag.retryable,
+                diag.retry_budget_remaining,
+                diag.recovery_action,
+                diag.recovery_route,
+                run_id,
+            ],
         )
         .map_err(CoordinatorError::Db)?;
         Ok(())
@@ -6010,7 +6063,9 @@ impl TaskStore {
                         review, review_note, reviewed_at,
                         apply_status, applied_at, apply_note, applied_files, failed_files,
                         trigger, provider, model, input_tokens, output_tokens,
-                        cached_input_tokens, cost_micros, session_id, refusal_reason
+                        cached_input_tokens, cost_micros, session_id, refusal_reason,
+                        failure_class, retryable, retry_budget_remaining,
+                        recovery_action, recovery_route
                  FROM brief_runs
                  ORDER BY started_at DESC, rowid DESC
                  LIMIT ?1",
@@ -6048,7 +6103,9 @@ impl TaskStore {
                         r.review, r.review_note, r.reviewed_at,
                         r.apply_status, r.applied_at, r.apply_note, r.applied_files, r.failed_files,
                         r.trigger, r.provider, r.model, r.input_tokens, r.output_tokens,
-                        r.cached_input_tokens, r.cost_micros, r.session_id, r.refusal_reason
+                        r.cached_input_tokens, r.cost_micros, r.session_id, r.refusal_reason,
+                        r.failure_class, r.retryable, r.retry_budget_remaining,
+                        r.recovery_action, r.recovery_route
                  FROM brief_runs r
                  JOIN tasks t ON t.task_id = r.brief_id
                  WHERE COALESCE(t.tenant_id, 'default') = ?1
@@ -6082,7 +6139,9 @@ impl TaskStore {
                         review, review_note, reviewed_at,
                         apply_status, applied_at, apply_note, applied_files, failed_files,
                         trigger, provider, model, input_tokens, output_tokens,
-                        cached_input_tokens, cost_micros, session_id, refusal_reason
+                        cached_input_tokens, cost_micros, session_id, refusal_reason,
+                        failure_class, retryable, retry_budget_remaining,
+                        recovery_action, recovery_route
                  FROM brief_runs
                  WHERE brief_id = ?1
                  ORDER BY started_at DESC, rowid DESC
@@ -6141,7 +6200,9 @@ impl TaskStore {
                         review, review_note, reviewed_at,
                         apply_status, applied_at, apply_note, applied_files, failed_files,
                         trigger, provider, model, input_tokens, output_tokens,
-                        cached_input_tokens, cost_micros, session_id, refusal_reason
+                        cached_input_tokens, cost_micros, session_id, refusal_reason,
+                        failure_class, retryable, retry_budget_remaining,
+                        recovery_action, recovery_route
                  FROM brief_runs WHERE run_id = ?1",
                 params![run_id],
                 RunRecord::from_row,
@@ -10987,6 +11048,27 @@ pub struct RunRecord {
     /// `cancelled`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal_reason: Option<String>,
+    /// Recovery DIAGNOSIS (execution-and-issue §3.3b), stamped on a terminal /
+    /// refused run. A stable failure bucket (see [`RunDiagnosis::failure_class`]).
+    /// `None` on a `running` row / legacy rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    /// `Some(true)` when a retry MAY make sense, `Some(false)` when it won't,
+    /// `None` when not applicable (a clean success / `running` / legacy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    /// A small operator-facing retry budget (0 or 1) — NOT an auto-retry tally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_budget_remaining: Option<i64>,
+    /// Stable recommended-action key (`assign_agent` / `configure_rig` /
+    /// `raise_allowance` / `review_runtime` / `inspect_run` / `retry_later` /
+    /// `none`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_action: Option<String>,
+    /// The dashboard route that fixes it (`/briefs?brief=<id>` / `/settings` /
+    /// `/agents` / `/costs` / `/runs?run=<id>`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_route: Option<String>,
 }
 
 /// One reviewable run artifact (`run_artifacts`) — metadata about a file
@@ -11181,7 +11263,151 @@ impl RunRecord {
             cost_micros: r.get(26)?,
             session_id: r.get(27)?,
             refusal_reason: r.get(28)?,
+            failure_class: r.get(29)?,
+            retryable: r.get(30)?,
+            retry_budget_remaining: r.get(31)?,
+            recovery_action: r.get(32)?,
+            recovery_route: r.get(33)?,
         })
+    }
+}
+
+/// The recovery DIAGNOSIS of a run (execution-and-issue §3.3b) — a PURE,
+/// derived classification of a terminal / refused Shift. It informs operator
+/// decisions; it is **not** an autonomous retry engine, a blind auto-retry
+/// loop, or provider quota polling. Every field is computed deterministically
+/// from the run's terminal status / durable refusal reason (plus, for a real
+/// Rig failure, the [`crate::rig::RigOutcome`] `retryable` signal) by the pure
+/// [`RunDiagnosis::for_terminal`] / [`RunDiagnosis::for_refusal`] constructors.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct RunDiagnosis {
+    /// A stable failure bucket: `precondition` / `governance` / `budget` /
+    /// `adapter_unavailable` / `workspace` / `timeout` / `cancelled` /
+    /// `interrupted` / `transient` / `permanent` / `unknown`. `None` for a
+    /// clean success (`done` / `continued`).
+    pub failure_class: Option<String>,
+    /// `Some(true)` if retry MAY help, `Some(false)` if it won't, `None` if not
+    /// applicable.
+    pub retryable: Option<bool>,
+    /// A small operator-facing budget (0 or 1), never an auto-retry tally.
+    pub retry_budget_remaining: Option<i64>,
+    /// Stable recommended-action key (`assign_agent` / `configure_rig` /
+    /// `raise_allowance` / `review_runtime` / `inspect_run` / `retry_later` /
+    /// `none`).
+    pub recovery_action: Option<String>,
+    /// The dashboard route that fixes it.
+    pub recovery_route: Option<String>,
+}
+
+impl RunDiagnosis {
+    fn s(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    /// Diagnose a TERMINAL run from its status (`done` / `continued` /
+    /// `failed` / `cancelled` / `interrupted`). For a real Rig `failed`, pass
+    /// the [`crate::rig::RigOutcome`] `retryable` signal as `rig_retryable`
+    /// (a timeout/transient failure ⇒ `Some(true)`; a governance / permanent /
+    /// auth / config / tool-permission failure ⇒ `Some(false)`); pass `None`
+    /// when the signal isn't available (classified conservatively as
+    /// non-retryable). A clean `done` / `continued` carries NO scary recovery
+    /// metadata (no class, `recovery_action = none`). A non-terminal / unknown
+    /// status yields an empty diagnosis.
+    pub fn for_terminal(status: &str, rig_retryable: Option<bool>, run_id: &str) -> Self {
+        let run_route = || Some(format!("/runs?run={run_id}"));
+        match status {
+            // Clean success — never a recovery card. `retryable=false` (nothing
+            // to retry), no failure class, no route.
+            "done" | "continued" => Self {
+                failure_class: None,
+                retryable: Some(false),
+                retry_budget_remaining: None,
+                recovery_action: Self::s("none"),
+                recovery_route: None,
+            },
+            "failed" => match rig_retryable {
+                // Transient (timeout / upstream hiccup): a retry MAY help — one
+                // operator-facing retry of budget.
+                Some(true) => Self {
+                    failure_class: Self::s("transient"),
+                    retryable: Some(true),
+                    retry_budget_remaining: Some(1),
+                    recovery_action: Self::s("retry_later"),
+                    recovery_route: run_route(),
+                },
+                // Hard failure (governance / permanent / auth / config / tool
+                // permission denial): retry won't help — inspect.
+                Some(false) => Self {
+                    failure_class: Self::s("permanent"),
+                    retryable: Some(false),
+                    retry_budget_remaining: Some(0),
+                    recovery_action: Self::s("inspect_run"),
+                    recovery_route: run_route(),
+                },
+                // No signal — classify conservatively as non-retryable, honestly
+                // `unknown` (don't encourage a blind retry).
+                None => Self {
+                    failure_class: Self::s("unknown"),
+                    retryable: Some(false),
+                    retry_budget_remaining: Some(0),
+                    recovery_action: Self::s("inspect_run"),
+                    recovery_route: run_route(),
+                },
+            },
+            // Operator cancel — not auto-retryable; the operator decides.
+            "cancelled" => Self {
+                failure_class: Self::s("cancelled"),
+                retryable: Some(false),
+                retry_budget_remaining: Some(0),
+                recovery_action: Self::s("inspect_run"),
+                recovery_route: run_route(),
+            },
+            // Process gone — re-claimed automatically (retryable), inspect if it
+            // recurs.
+            "interrupted" => Self {
+                failure_class: Self::s("interrupted"),
+                retryable: Some(true),
+                retry_budget_remaining: Some(1),
+                recovery_action: Self::s("inspect_run"),
+                recovery_route: run_route(),
+            },
+            // `running` / anything unexpected — no diagnosis.
+            _ => Self::default(),
+        }
+    }
+
+    /// Diagnose a durable REFUSED run from its machine reason (the durable
+    /// refusal taxonomy — see [`TaskStore::refusal_is_durable`]). A refusal is
+    /// **never** marked retryable: it needs an operator fix first (assign /
+    /// configure / raise the cap / review runtime), so the recommended action
+    /// and route point at the EXISTING governed fix. An unknown reason falls
+    /// back to inspecting the run.
+    pub fn for_refusal(reason: &str, brief_id: &str, run_id: &str) -> Self {
+        let (class, action, route): (&str, &str, String) = match reason {
+            "unassigned" => (
+                "precondition",
+                "assign_agent",
+                format!("/briefs?brief={brief_id}"),
+            ),
+            "no_adapter" | "adapter_unavailable" => {
+                ("adapter_unavailable", "configure_rig", "/settings".into())
+            }
+            "over_allowance" => ("budget", "raise_allowance", "/agents".into()),
+            "over_guild_budget" => ("budget", "raise_allowance", "/costs".into()),
+            "workspace_error" | "workspace_context_error" => {
+                ("workspace", "review_runtime", "/settings".into())
+            }
+            _ => ("unknown", "inspect_run", format!("/runs?run={run_id}")),
+        };
+        Self {
+            failure_class: Self::s(class),
+            // A refusal needs an operator fix first — conservatively NOT a blind
+            // retry. The recommended action is the real fix.
+            retryable: Some(false),
+            retry_budget_remaining: Some(0),
+            recovery_action: Self::s(action),
+            recovery_route: Some(route),
+        }
     }
 }
 
@@ -16566,6 +16792,26 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             -- `no_adapter`, `adapter_unavailable`, `workspace_error`,
             -- `workspace_context_error`). NULL for runs that actually ran.
             refusal_reason TEXT,
+            -- Brief/Shift recovery DIAGNOSIS (execution-and-issue §3.3b). Stamped
+            -- when a run reaches a terminal state (`done` / `failed` / `continued`
+            -- / `cancelled` / `interrupted`) or is recorded `refused`. PURE,
+            -- derived classification — NOT an autonomous retry engine and NOT a
+            -- live auto-retry counter. `failure_class` is a stable bucket
+            -- (`precondition` / `governance` / `budget` / `adapter_unavailable` /
+            -- `workspace` / `timeout` / `cancelled` / `interrupted` / `transient` /
+            -- `permanent` / `unknown`); `retryable` is 1 (retry MAY help) / 0 (it
+            -- won't) / NULL (n/a — a clean success); `retry_budget_remaining` is a
+            -- small operator-facing budget (0 or 1), never an auto-retry tally;
+            -- `recovery_action` is a stable key (`assign_agent` / `configure_rig` /
+            -- `raise_allowance` / `review_runtime` / `inspect_run` / `retry_later` /
+            -- `none`); `recovery_route` is the dashboard route that fixes it
+            -- (`/briefs?brief=<id>` / `/settings` / `/agents` / `/costs` /
+            -- `/runs?run=<id>`). All NULL for a `running` row / legacy rows.
+            failure_class          TEXT,
+            retryable              INTEGER,
+            retry_budget_remaining INTEGER,
+            recovery_action        TEXT,
+            recovery_route         TEXT,
             FOREIGN KEY (brief_id) REFERENCES tasks(task_id)
         );
         CREATE INDEX IF NOT EXISTS brief_runs_by_brief
@@ -16882,6 +17128,17 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         // rewrites a past run's bill. NULL = unattributed run. The Brief-tree
         // cost rollup groups on this column.
         "ALTER TABLE brief_runs ADD COLUMN billing_code TEXT",
+        // BRIEF/SHIFT RECOVERY DIAGNOSIS (execution-and-issue §3.3b): a pure,
+        // derived classification stamped on terminal/refused runs so the Action
+        // Center + Brief workroom can show an honest failure-class, retryable
+        // verdict, small operator-facing retry budget, and a recommended action
+        // + route. Additive + nullable — legacy/running rows carry no diagnosis.
+        // NOT an autonomous retry engine and NOT provider quota polling.
+        "ALTER TABLE brief_runs ADD COLUMN failure_class TEXT",
+        "ALTER TABLE brief_runs ADD COLUMN retryable INTEGER",
+        "ALTER TABLE brief_runs ADD COLUMN retry_budget_remaining INTEGER",
+        "ALTER TABLE brief_runs ADD COLUMN recovery_action TEXT",
+        "ALTER TABLE brief_runs ADD COLUMN recovery_route TEXT",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the
@@ -19477,6 +19734,158 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(s.run_count_for_brief(&b).unwrap(), 1, "only the durable refusal persisted");
+    }
+
+    // ── Brief/Shift recovery diagnosis (execution-and-issue §3.3b) ───────────
+
+    #[test]
+    fn diagnose_refusal_maps_each_reason_to_stable_class_action_route() {
+        // Each durable refusal reason → a stable failure-class + recommended
+        // action key + the EXISTING governed route, and a refusal is NEVER
+        // retryable (it needs an operator fix first).
+        let cases = [
+            ("unassigned", "precondition", "assign_agent", "/briefs?brief=b1"),
+            ("no_adapter", "adapter_unavailable", "configure_rig", "/settings"),
+            ("adapter_unavailable", "adapter_unavailable", "configure_rig", "/settings"),
+            ("over_allowance", "budget", "raise_allowance", "/agents"),
+            ("over_guild_budget", "budget", "raise_allowance", "/costs"),
+            ("workspace_error", "workspace", "review_runtime", "/settings"),
+            ("workspace_context_error", "workspace", "review_runtime", "/settings"),
+        ];
+        for (reason, class, action, route) in cases {
+            let d = RunDiagnosis::for_refusal(reason, "b1", "run-x");
+            assert_eq!(d.failure_class.as_deref(), Some(class), "class for {reason}");
+            assert_eq!(d.recovery_action.as_deref(), Some(action), "action for {reason}");
+            assert_eq!(d.recovery_route.as_deref(), Some(route), "route for {reason}");
+            assert_eq!(d.retryable, Some(false), "a refusal is not blind-retryable: {reason}");
+            assert_eq!(d.retry_budget_remaining, Some(0), "no retry budget for {reason}");
+        }
+        // An unknown reason falls back to inspect-the-run (never blank).
+        let d = RunDiagnosis::for_refusal("mystery", "b1", "run-x");
+        assert_eq!(d.failure_class.as_deref(), Some("unknown"));
+        assert_eq!(d.recovery_action.as_deref(), Some("inspect_run"));
+        assert_eq!(d.recovery_route.as_deref(), Some("/runs?run=run-x"));
+    }
+
+    #[test]
+    fn diagnose_terminal_retryable_vs_not_and_clean_success() {
+        // A transient (timeout) Rig failure preserves retryable + a nonzero
+        // operator-facing budget.
+        let t = RunDiagnosis::for_terminal("failed", Some(true), "r1");
+        assert_eq!(t.failure_class.as_deref(), Some("transient"));
+        assert_eq!(t.retryable, Some(true));
+        assert_eq!(t.retry_budget_remaining, Some(1), "retryable failure keeps a budget");
+        assert_eq!(t.recovery_action.as_deref(), Some("retry_later"));
+        assert_eq!(t.recovery_route.as_deref(), Some("/runs?run=r1"));
+
+        // A hard (governance / permanent / auth / config) Rig failure is honest
+        // about being non-retryable.
+        let p = RunDiagnosis::for_terminal("failed", Some(false), "r1");
+        assert_eq!(p.failure_class.as_deref(), Some("permanent"));
+        assert_eq!(p.retryable, Some(false));
+        assert_eq!(p.retry_budget_remaining, Some(0));
+        assert_eq!(p.recovery_action.as_deref(), Some("inspect_run"));
+
+        // No Rig signal → conservatively non-retryable `unknown` (never a blind
+        // retry).
+        let u = RunDiagnosis::for_terminal("failed", None, "r1");
+        assert_eq!(u.failure_class.as_deref(), Some("unknown"));
+        assert_eq!(u.retryable, Some(false));
+
+        // cancelled / interrupted are classified honestly.
+        let c = RunDiagnosis::for_terminal("cancelled", None, "r1");
+        assert_eq!(c.failure_class.as_deref(), Some("cancelled"));
+        assert_eq!(c.retryable, Some(false), "operator cancel is not auto-retryable");
+        let i = RunDiagnosis::for_terminal("interrupted", None, "r1");
+        assert_eq!(i.failure_class.as_deref(), Some("interrupted"));
+        assert_eq!(i.retryable, Some(true), "interrupted is re-claimed automatically");
+        assert_eq!(i.retry_budget_remaining, Some(1));
+
+        // A clean success carries NO scary recovery-card metadata.
+        for ok in ["done", "continued"] {
+            let d = RunDiagnosis::for_terminal(ok, None, "r1");
+            assert!(d.failure_class.is_none(), "{ok} has no failure class");
+            assert_eq!(d.retryable, Some(false), "{ok} has nothing to retry");
+            assert!(d.retry_budget_remaining.is_none(), "{ok} has no retry budget");
+            assert_eq!(d.recovery_action.as_deref(), Some("none"));
+            assert!(d.recovery_route.is_none(), "{ok} has no recovery route");
+        }
+    }
+
+    #[test]
+    fn record_refused_run_persists_diagnosis_metadata() {
+        let s = store();
+        let b = s
+            .create_brief("acme", "no rig", "subj", None, None, None, None)
+            .unwrap();
+        s.record_refused_run(&b, "agt_a", "", "no_adapter", "no rig configured", "manual")
+            .unwrap();
+        let lr = s.latest_run_for_brief(&b).unwrap().expect("a refused run");
+        assert_eq!(lr.status, "refused");
+        assert_eq!(lr.failure_class.as_deref(), Some("adapter_unavailable"));
+        assert_eq!(lr.retryable, Some(false));
+        assert_eq!(lr.recovery_action.as_deref(), Some("configure_rig"));
+        assert_eq!(lr.recovery_route.as_deref(), Some("/settings"));
+        // Brief detail surfaces the same diagnosis on the LatestRun summary.
+        let d = s
+            .brief_detail_for_tenant(&b, "acme")
+            .unwrap()
+            .unwrap()
+            .latest_run
+            .unwrap();
+        assert_eq!(d.failure_class.as_deref(), Some("adapter_unavailable"));
+        assert_eq!(d.recovery_action.as_deref(), Some("configure_rig"));
+        assert_eq!(d.recovery_route.as_deref(), Some("/settings"));
+    }
+
+    #[test]
+    fn record_run_finish_stamps_terminal_diagnosis() {
+        let s = store();
+        let b = s
+            .create_brief("acme", "runnable", "subj", None, None, None, None)
+            .unwrap();
+        let ws = RunWorkspaceInfo::default();
+
+        // A clean `done` run carries no scary recovery metadata.
+        s.record_run_start("run_ok", &b, "agt_a", "echo", "manual", &ws)
+            .unwrap();
+        s.record_run_finish("run_ok", "done", "all good").unwrap();
+        let ok = s.get_run("run_ok").unwrap().unwrap();
+        assert!(ok.failure_class.is_none(), "a done run has no failure class");
+        assert_eq!(ok.recovery_action.as_deref(), Some("none"));
+        assert!(ok.recovery_route.is_none());
+
+        // A stale-run recovery `interrupted` is diagnosed honestly (retryable —
+        // it is re-claimed automatically).
+        s.record_run_start("run_int", &b, "agt_a", "echo", "manual", &ws)
+            .unwrap();
+        s.record_run_finish("run_int", "interrupted", "process gone")
+            .unwrap();
+        let it = s.get_run("run_int").unwrap().unwrap();
+        assert_eq!(it.failure_class.as_deref(), Some("interrupted"));
+        assert_eq!(it.retryable, Some(true));
+        assert_eq!(it.retry_budget_remaining, Some(1));
+        assert_eq!(it.recovery_route.as_deref(), Some("/runs?run=run_int"));
+
+        // `set_run_diagnosis` is the precise override used by the dispatch
+        // finalize for a real Rig failure (transient → retryable).
+        s.record_run_start("run_fail", &b, "agt_a", "echo", "manual", &ws)
+            .unwrap();
+        s.record_run_finish("run_fail", "failed", "boom").unwrap();
+        // record_run_finish (status-only) is conservative `unknown`/non-retryable…
+        let before = s.get_run("run_fail").unwrap().unwrap();
+        assert_eq!(before.failure_class.as_deref(), Some("unknown"));
+        assert_eq!(before.retryable, Some(false));
+        // …then the finalize re-stamps with the RigOutcome retryable signal.
+        s.set_run_diagnosis(
+            "run_fail",
+            &RunDiagnosis::for_terminal("failed", Some(true), "run_fail"),
+        )
+        .unwrap();
+        let after = s.get_run("run_fail").unwrap().unwrap();
+        assert_eq!(after.failure_class.as_deref(), Some("transient"));
+        assert_eq!(after.retryable, Some(true));
+        assert_eq!(after.retry_budget_remaining, Some(1));
     }
 
     #[test]

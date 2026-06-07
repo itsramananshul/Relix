@@ -525,6 +525,21 @@ pub struct LatestRun {
     /// hard-stop). `None` for runs that actually executed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal_reason: Option<String>,
+    /// Recovery DIAGNOSIS (execution-and-issue §3.3b) for a terminal / refused
+    /// Shift: a stable failure-class bucket, a retryable verdict, a small
+    /// operator-facing retry budget, and a recommended action + route. `None`
+    /// on a `running` row / legacy rows. Informs operator decisions — NOT an
+    /// autonomous retry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_budget_remaining: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_route: Option<String>,
     /// Changed-file count this run produced.
     pub artifact_count: i64,
     /// Total Shifts (runs) recorded on this Brief.

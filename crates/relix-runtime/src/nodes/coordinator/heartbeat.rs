@@ -2528,6 +2528,17 @@ fn execute_ready_inner(
     };
     let _ = store.append_run_event(&run_id, term_kind, "relix", &summary, None, true);
     let _ = store.record_run_finish(&run_id, status, &summary);
+    // A real Rig `failed` carries the `RigOutcome` retryable signal that
+    // `record_run_finish` (status-only) can't see — re-stamp the diagnosis with
+    // it so a transient (timeout) failure reads `retryable` and a hard
+    // (governance / permanent / auth / config) failure reads non-retryable
+    // (execution-and-issue §3.3b). `done` / `continued` / `cancelled` /
+    // `interrupted` are already classified honestly from the status alone.
+    if status == "failed" {
+        let rig_retryable = matches!(&outcome, RigOutcome::Failed { retryable: true, .. });
+        let diag = super::RunDiagnosis::for_terminal(status, Some(rig_retryable), &run_id);
+        let _ = store.set_run_diagnosis(&run_id, &diag);
+    }
     // Persist per-(tenant, agent, rig, brief) adapter runtime state (TG2): the
     // resumable session id, accumulated usage/cost, and the latest run status.
     // `last_error` is the failure reason on a non-success terminal state, else

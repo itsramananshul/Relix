@@ -62,10 +62,32 @@ does **not** do:
   but the SOL VM is synchronous and there is no durable replay (see
   "No durable replay / no flow snapshots" below) — reset is "forget
   the wedged pointer", not "resume from a snapshot".
-- **There is no diagnosis / retry-budget layer.** Reset deletes the
-  row; it does **not** classify a failure as retryable-vs-not, and
-  there is no per-run failure-class or retry budget attached to the
-  session. That recovery-diagnosis layer remains future work.
+- **The per-SESSION reset still has no diagnosis of its own.** Reset
+  deletes the `agent_runtime_state` row; it does **not** classify the
+  session and does not replay it (see "Session resume is
+  stored-not-replayed" above). The **run-level** diagnosis layer below
+  is a *separate*, now-shipped surface attached to the durable
+  `brief_runs` Shift ledger — not to this session row. Wiring a session
+  reset to that run diagnosis is future work.
+  - **Durable Brief/Shift run diagnosis (v1) — SHIPPED.** Every terminal
+    or refused `brief_runs` Shift is now stamped with a pure, derived
+    **recovery diagnosis** (`failure_class` / `retryable` /
+    `retry_budget_remaining` / `recovery_action` / `recovery_route`): a
+    stable failure-class bucket (`precondition` / `governance` / `budget`
+    / `adapter_unavailable` / `workspace` / `timeout` / `cancelled` /
+    `interrupted` / `transient` / `permanent` / `unknown`), a
+    retryable-vs-not verdict (a timeout/transient Rig failure → retryable;
+    a governance / permanent / auth / config / tool-permission failure,
+    and every refusal → not retryable), a **small operator-facing** retry
+    budget (0 or 1, **not** an auto-retry counter), and a recommended
+    action + dashboard route. It surfaces on `RunRecord` / `brief.runs` /
+    the Brief detail's `latest_run` and drives the Action Center
+    `failed_or_refused` recovery card + the Runs-page recovery strip. What
+    it is **NOT**: it is **diagnosis + operator guidance only** — there is
+    **no autonomous retry orchestration**, **no blind auto-retry loop**,
+    and **no provider quota polling**; the operator still clicks the
+    recommended fix. The task-level `task.retry` recovery (a separate
+    layer on the Task ledger) is unchanged.
 
 ### Run-workspace review/apply is inspect-and-copy, not a full VCS workflow
 
@@ -260,12 +282,21 @@ when you click Start. What it does **not** do:
       Guild over-budget is surfaced for the operator, not auto-enforced. Real
       per-Operative over-spend continues to surface *reactively* as the
       `over_allowance` recovery card as well.
-  - What it still does **not** do: classify a true **retryable-vs-not** (there is
-    no diagnosis layer and no per-run failure-class/retry-budget — recovery cards
-    map the durable refusal taxonomy to a recommended action + route, no more);
-    classify the finer `blocked` sub-reasons as distinct reasons; or push every
-    field in hard-realtime (the refresh is event-trigger + poll; the feed is
-    capped at 60 with an honest `truncated` flag).
+  - **The `failed_or_refused` recovery card now carries a true
+    retryable-vs-not verdict** — drawn from the durable per-run diagnosis layer
+    (`failure_class` / `retryable` / `retry_budget_remaining` on `brief_runs`;
+    see "Durable Brief/Shift run diagnosis" above). The card prefers the run's
+    stamped `recovery_action` / `recovery_route` (falling back to the older
+    refusal-reason → action/route map for legacy rows), and rides the
+    failure-class + retryable + remaining-budget along so the dashboard shows an
+    honest recovery-class + retryable badge. It is **conservative**: a refusal is
+    never marked retryable (it needs an operator fix first), and the card still
+    invents **no retry button** — it points at the EXISTING governed route.
+  - What it still does **not** do: classify the finer `blocked` sub-reasons as
+    distinct reasons; run **autonomous** retry/recovery (the diagnosis informs
+    the operator, it does not act); poll provider quotas; or push every field in
+    hard-realtime (the refresh is event-trigger + poll; the feed is capped at 60
+    with an honest `truncated` flag).
 
 In short: the *governance rails* of a company are in place and tenant-safe,
 the Shift Room makes the post-start loop legible (what ran / finished / is

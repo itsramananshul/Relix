@@ -169,6 +169,21 @@ pub struct ActionItem {
     /// secret. Omitted when there is nothing safe to suggest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_rig: Option<String>,
+    /// **Recovery DIAGNOSIS** (execution-and-issue §3.3b) — set only on a
+    /// `failed_or_refused` card built from a run's durable diagnosis metadata.
+    /// The stable failure-class bucket so the dashboard can show a recovery-class
+    /// chip. Omitted on every non-recovery card.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    /// Whether a retry MAY help (`Some(true)`) or won't (`Some(false)`). Drives
+    /// the retryable badge. Conservative: a refusal is never `true`. Omitted on
+    /// non-recovery cards.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    /// A small operator-facing retry budget (0 or 1) — NOT an auto-retry tally.
+    /// Omitted on non-recovery cards.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_budget_remaining: Option<i64>,
 }
 
 impl ActionItem {
@@ -278,6 +293,9 @@ pub fn approval_item(a: &ApprovalRecord) -> ActionItem {
         updated_at: None,
         action_api: None,
         suggested_rig: None,
+        failure_class: None,
+        retryable: None,
+        retry_budget_remaining: None,
     }
 }
 
@@ -307,6 +325,9 @@ pub fn hire_item(p: &AgentProfile) -> ActionItem {
         // No secret — just the safe-local Rig name and the public route shape.
         action_api: Some(format!("POST /v1/agents/{}/approve-hire", p.agent_id)),
         suggested_rig: Some(crate::rig::SAFE_LOCAL_RIG.to_string()),
+        failure_class: None,
+        retryable: None,
+        retry_budget_remaining: None,
     }
 }
 
@@ -387,6 +408,9 @@ pub fn budget_committed_item(committed_cents: i64, budget_cents: i64, over: bool
         updated_at: None,
         action_api: None,
         suggested_rig: None,
+        failure_class: None,
+        retryable: None,
+        retry_budget_remaining: None,
     }
 }
 
@@ -413,6 +437,9 @@ pub fn allowance_hardstop_item(p: &AgentProfile) -> ActionItem {
         updated_at: None,
         action_api: None,
         suggested_rig: None,
+        failure_class: None,
+        retryable: None,
+        retry_budget_remaining: None,
     }
 }
 
@@ -496,6 +523,9 @@ pub fn operative_spend_item(
         updated_at: None,
         action_api: None,
         suggested_rig: None,
+        failure_class: None,
+        retryable: None,
+        retry_budget_remaining: None,
     }
 }
 
@@ -553,6 +583,9 @@ pub fn company_spend_item(spend_micros: u64, budget_cents: i64, over: bool) -> A
         updated_at: None,
         action_api: None,
         suggested_rig: None,
+        failure_class: None,
+        retryable: None,
+        retry_budget_remaining: None,
     }
 }
 
@@ -578,6 +611,9 @@ pub fn strategy_item(m: &Mandate) -> ActionItem {
         updated_at: Some(m.updated_at),
         action_api: None,
         suggested_rig: None,
+        failure_class: None,
+        retryable: None,
+        retry_budget_remaining: None,
     }
 }
 
@@ -601,6 +637,9 @@ pub fn ready_item(c: &BriefCard) -> ActionItem {
         updated_at: None,
         action_api: None,
         suggested_rig: None,
+        failure_class: None,
+        retryable: None,
+        retry_budget_remaining: None,
     }
 }
 
@@ -638,6 +677,9 @@ pub fn blocked_item(c: &BriefCard, unassigned: bool) -> ActionItem {
         updated_at: None,
         action_api: None,
         suggested_rig: None,
+        failure_class: None,
+        retryable: None,
+        retry_budget_remaining: None,
     }
 }
 
@@ -662,6 +704,9 @@ pub fn stale_item(c: &BriefCard) -> ActionItem {
         updated_at: None,
         action_api: None,
         suggested_rig: None,
+        failure_class: None,
+        retryable: None,
+        retry_budget_remaining: None,
     }
 }
 
@@ -683,6 +728,9 @@ pub fn needs_review_item(r: &RunRecord) -> ActionItem {
         updated_at: r.finished_at,
         action_api: None,
         suggested_rig: None,
+        failure_class: None,
+        retryable: None,
+        retry_budget_remaining: None,
     }
 }
 
@@ -759,12 +807,44 @@ fn recovery_reco(r: &RunRecord) -> (String, String, String) {
     }
 }
 
+/// Map a stable `recovery_action` key (the durable run diagnosis,
+/// execution-and-issue §3.3b) to its operator-facing label. Falls back to the
+/// raw key for an unknown value so the card is never blank.
+fn action_label_for(key: &str) -> String {
+    match key {
+        "assign_agent" => "Assign an Operative",
+        "configure_rig" => "Configure the Rig",
+        "raise_allowance" => "Raise the Allowance",
+        "review_runtime" => "Review runtime settings",
+        "retry_later" => "Retry the Shift later",
+        "inspect_run" => "Inspect the run",
+        "none" => "Inspect the run",
+        other => other,
+    }
+    .to_string()
+}
+
 /// A Shift that failed / was refused / was interrupted and needs operator
-/// attention — a read-only recovery-decision card (Part B). The reason states
-/// the root cause and the action/route points at the EXISTING governed fix
-/// (assign · configure Rig · raise Allowance · review runtime · inspect).
+/// attention — a read-only recovery-decision card (Part B). When the run carries
+/// the **durable recovery diagnosis** (`failure_class` / `recovery_action` /
+/// `recovery_route` / `retryable`, stamped on the terminal/refused run —
+/// execution-and-issue §3.3b) the card uses it: the recommended action + route
+/// come from the metadata, and the failure-class / retryable / retry-budget ride
+/// along so the dashboard can show an honest recovery-class + retryable badge.
+/// When the metadata is absent (legacy rows) it falls back to the refusal-reason
+/// mapping in [`recovery_reco`]. CONSERVATIVE: the card never invents a retry —
+/// it surfaces the diagnosis and the EXISTING governed route that fixes it.
 pub fn failed_item(r: &RunRecord) -> ActionItem {
-    let (reason, action_label, route) = recovery_reco(r);
+    // Plain-language reason (always from the run's own state — the durable
+    // diagnosis classifies, it does not author prose).
+    let (reason, fallback_label, fallback_route) = recovery_reco(r);
+    // Prefer the durable diagnosis route/action when stamped; else the fallback.
+    let action_label = r
+        .recovery_action
+        .as_deref()
+        .map(action_label_for)
+        .unwrap_or(fallback_label);
+    let route = r.recovery_route.clone().unwrap_or(fallback_route);
     ActionItem {
         id: format!("failed:{}", r.run_id),
         category: ActionCategory::FailedOrRefused,
@@ -780,6 +860,12 @@ pub fn failed_item(r: &RunRecord) -> ActionItem {
         updated_at: r.finished_at,
         action_api: None,
         suggested_rig: None,
+        // Carry the diagnosis so the dashboard renders a recovery-class chip +
+        // retryable badge + remaining retry budget (conservative — only what the
+        // run actually recorded).
+        failure_class: r.failure_class.clone(),
+        retryable: r.retryable,
+        retry_budget_remaining: r.retry_budget_remaining,
     }
 }
 
@@ -803,6 +889,9 @@ mod tests {
             updated_at: None,
             action_api: None,
             suggested_rig: None,
+            failure_class: None,
+            retryable: None,
+            retry_budget_remaining: None,
         }
     }
 
@@ -934,6 +1023,11 @@ mod tests {
             cost_micros: None,
             session_id: None,
             refusal_reason: refusal.map(|s| s.to_string()),
+            failure_class: None,
+            retryable: None,
+            retry_budget_remaining: None,
+            recovery_action: None,
+            recovery_route: None,
         }
     }
 
@@ -957,6 +1051,53 @@ mod tests {
             assert_eq!(it.route.as_deref(), Some(route), "route for {reason_code}");
             assert!(!it.reason.trim().is_empty(), "reason for {reason_code}");
         }
+    }
+
+    #[test]
+    fn failed_card_uses_durable_diagnosis_metadata_when_present() {
+        // A run that carries the durable recovery diagnosis (execution §3.3b)
+        // drives the card: the action/route come from the metadata and the
+        // failure-class / retryable / retry-budget ride along for the badges.
+        let mut r = run("failed", None, "timed out");
+        r.failure_class = Some("transient".to_string());
+        r.retryable = Some(true);
+        r.retry_budget_remaining = Some(1);
+        r.recovery_action = Some("retry_later".to_string());
+        r.recovery_route = Some("/runs?run=run-1".to_string());
+        let it = failed_item(&r);
+        assert_eq!(it.category, ActionCategory::FailedOrRefused);
+        assert_eq!(it.action_label, "Retry the Shift later", "label from metadata");
+        assert_eq!(it.route.as_deref(), Some("/runs?run=run-1"), "route from metadata");
+        assert_eq!(it.failure_class.as_deref(), Some("transient"));
+        assert_eq!(it.retryable, Some(true));
+        assert_eq!(it.retry_budget_remaining, Some(1));
+        // Plain-language reason is still surfaced (from the run summary).
+        assert!(it.reason.contains("timed out"));
+
+        // A refused run's stamped metadata drives an honest, NON-retryable card.
+        let mut g = run("refused", Some("over_guild_budget"), "");
+        g.failure_class = Some("budget".to_string());
+        g.retryable = Some(false);
+        g.retry_budget_remaining = Some(0);
+        g.recovery_action = Some("raise_allowance".to_string());
+        g.recovery_route = Some("/costs".to_string());
+        let it = failed_item(&g);
+        assert_eq!(it.action_label, "Raise the Allowance");
+        assert_eq!(it.route.as_deref(), Some("/costs"));
+        assert_eq!(it.retryable, Some(false), "a refusal card is never retryable");
+        assert_eq!(it.failure_class.as_deref(), Some("budget"));
+    }
+
+    #[test]
+    fn failed_card_falls_back_to_refusal_mapping_without_metadata() {
+        // A legacy run with NO durable diagnosis still produces the old,
+        // refusal-reason-driven card (back-compat) and carries no badges.
+        let it = failed_item(&run("refused", Some("unassigned"), ""));
+        assert_eq!(it.action_label, "Assign an Operative");
+        assert_eq!(it.route.as_deref(), Some("/briefs?brief=brief-1"));
+        assert!(it.failure_class.is_none(), "no metadata → no recovery-class chip");
+        assert!(it.retryable.is_none(), "no metadata → no retryable badge");
+        assert!(it.retry_budget_remaining.is_none());
     }
 
     #[test]

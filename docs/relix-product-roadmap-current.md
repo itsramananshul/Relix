@@ -348,9 +348,28 @@ ledger entry or design section.
    Health/Maintenance/Adapter/run-sandbox/heartbeat sections. *Honest gaps:* the budget-alert
    decision still lives on its own route (no inline decide route exists); strategy/budget/high-risk
    Clearances decide through the same generic `decide` (no per-type typed payload editor yet); the
-   stored session id is surfaced only as a **masked/truncated** summary, session **resume is still
-   stored-not-replayed**, and there is **no diagnosis / retry-budget layer** (reset forgets the row;
-   it does not classify retryable-vs-not).
+   stored session id is surfaced only as a **masked/truncated** summary, and session **resume is
+   still stored-not-replayed**. The **per-SESSION reset** still has no diagnosis of its own (it
+   forgets the row) — but the separate, now-shipped **run-level** Brief/Shift diagnosis layer (§P1
+   slice 3d) does classify retryable-vs-not on the durable `brief_runs` ledger.
+3d. **[BE/FE] Brief/Shift recovery diagnosis (v1)** — **SHIPPED** (`execution-and-issue §3.3b`,
+   `dashboard-design §5.2/§8`). Every terminal or refused `brief_runs` Shift is stamped with a pure,
+   derived recovery diagnosis: additive `failure_class` / `retryable` / `retry_budget_remaining` /
+   `recovery_action` / `recovery_route` columns, a stable `failure_class` bucket (`precondition` /
+   `governance` / `budget` / `adapter_unavailable` / `workspace` / `timeout` / `cancelled` /
+   `interrupted` / `transient` / `permanent` / `unknown`), a true retryable-vs-not verdict
+   (timeout/transient Rig failure → retryable; governance / permanent / auth / config / tool-permission
+   failure + every refusal → not retryable), a **small operator-facing** retry budget (0 or 1, NOT an
+   auto-retry counter), and a recommended action + dashboard route. Pure classifiers
+   (`RunDiagnosis::for_terminal` / `for_refusal`) are stamped at the run chokepoints
+   (`record_run_finish` + the dispatch finalize re-stamp with the real `RigOutcome` retryable signal;
+   `record_refused_run`); surfaced on `RunRecord` / `brief.runs` / the Brief detail `latest_run`; the
+   Action Center `failed_or_refused` card prefers the durable metadata (falling back to the refusal
+   map) and rides failure-class + retryable + budget badges; the Runs page shows a recovery strip.
+   `over_guild_budget` is now a durable refused row too. *Honest scope:* diagnosis + operator guidance
+   ONLY — **no autonomous retry orchestration**, **no blind auto-retry loop**, **no provider quota
+   polling**, and **no fake retry button** (it points at the EXISTING governed route). The task-level
+   `task.retry` recovery is a separate, unchanged layer.
 
 **P3 — depth / autonomy**
 9. **[BE/FE] Smarter companion** — **BACKEND SHIPPED (now AI-assisted action selection, opt-in +
@@ -656,8 +675,10 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
     the operator can see and recover every adapter session in the Guild without first typing one agent
     id. Tenant-safe: the store filters by `tenant_id` exactly like the per-agent path; a foreign-Guild
     row never appears. *Honest remaining:* the stored session id is shown only as a **masked/truncated**
-    summary; session **resume is still stored-not-replayed**; there is **no diagnosis / retry-budget
-    layer** (reset forgets the row, it does not classify retryable-vs-not). *Verified:* targeted
+    summary; session **resume is still stored-not-replayed**; and the per-SESSION reset has no
+    diagnosis of its own (it forgets the row). *(The separate **run-level** Brief/Shift diagnosis
+    layer — failure-class/retryable/retry-budget on `brief_runs` — has since SHIPPED; see §P1 slice
+    3d.)* *Verified:* targeted
     `cargo test -p relix-runtime --lib runtime_state` (5) green; `cargo test -p relix-web-bridge
     spine::tests --bins` green; `cargo check`/`cargo clippy` clean on the touched code; `npm run build`
     green; dist rebuilt + committed (parity gate); `git diff --check` clean.
