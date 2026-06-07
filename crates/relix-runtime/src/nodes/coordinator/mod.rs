@@ -765,7 +765,153 @@ impl TaskStore {
             )
             .map_err(CoordinatorError::Db)?;
         }
+        // PHASE 3 (supervisory auto-wake): a Brief reaching a terminal column is
+        // the single event that sequences follow-up work
+        // (relix-execution-and-issue-design §1.6 / §3.1). Promote it HERE, at
+        // the central board-transition seam, so EVERY done/cancel path (manual
+        // `brief.move`, the apply-driven `complete_reviewed_brief`, …) fires the
+        // same wakes — never one UI route. Release the board lock first: the
+        // shared `request_brief_wakeup` enqueue locks the connection itself.
+        //
+        // - **done** resolves blockers AND can complete a parent's slice.
+        // - **cancelled** does NOT resolve a blocker (LOCKED, §1.6), but a
+        //   cancelled child is still terminal, so it can complete a parent's
+        //   slice — without it, a last-to-finish *cancelled* child would leave
+        //   the planner un-woken.
+        let entered_done = from != "done" && to == "done";
+        let entered_cancelled = from != "cancelled" && to == "cancelled";
+        drop(conn);
+        if entered_done {
+            self.promote_blockers_resolved(task_id)?;
+            self.promote_children_completed(task_id)?;
+        } else if entered_cancelled {
+            self.promote_children_completed(task_id)?;
+        }
         Ok((from, to.to_string()))
+    }
+
+    /// PHASE 3 (supervisory auto-wake — **blockers-resolved**): a Brief just
+    /// reached board `done`; offer a wakeup to every same-Guild dependent that
+    /// was `blocked_on` it (relix-execution-and-issue-design §1.6 / §3.1).
+    ///
+    /// The shared [`Self::request_brief_wakeup`] enqueue applies the readiness
+    /// guard itself: a dependent still waiting on ANOTHER unfinished blocker is
+    /// `skipped` (NOT woken yet), a dependent already being run coalesces/defers,
+    /// and a now-fully-unblocked dependent is `queued`. Only a `done` blocker
+    /// resolves a Snag — a `cancelled` blocker keeps the dependent's
+    /// `self_unresolved_blockers` count > 0, so it is never woken here (matching
+    /// [`Self::is_blocked`]; this method is only called on the `done` edge).
+    ///
+    /// **Tenant-safe:** only same-Guild dependents are enumerated
+    /// ([`Self::list_blocking_for_tenant`]), so a cross-Guild `blocked_on` edge
+    /// can neither wake nor reveal another Guild's Brief.
+    fn promote_blockers_resolved(&self, done_brief: &str) -> Result<(), CoordinatorError> {
+        let Some(tenant) = self.task_tenant(done_brief)? else {
+            return Ok(()); // Brief vanished mid-transition — nothing to do.
+        };
+        for dependent in self.list_blocking_for_tenant(done_brief, &tenant)? {
+            self.offer_supervisory_wake(&dependent, "blockers-resolved")?;
+        }
+        Ok(())
+    }
+
+    /// PHASE 3 (supervisory auto-wake — **children-completed**): a Sub-brief
+    /// just reached a terminal column (`done` or `cancelled`). For every
+    /// same-Guild parent that spawned it, if ALL of that parent's same-Guild
+    /// Sub-briefs are now terminal, offer the parent assignee a wakeup so the
+    /// planner reviews the finished slice and assigns the next
+    /// (relix-execution-and-issue-design §1.6 / §3.1).
+    ///
+    /// **Terminal vocabulary (explicit):** `done` OR `cancelled` both count as
+    /// terminal for the parent continuation wake — the same local semantics as
+    /// [`Self::list_briefs_with_all_children_done`]. A failed Shift parks its
+    /// Brief in `blocked` (not a terminal column), so a still-failing child
+    /// keeps the parent un-woken until it is resolved or cancelled.
+    ///
+    /// **Tenant-safe:** only same-Guild parents are enumerated
+    /// ([`Self::parent_briefs_for_tenant`]) and only same-Guild Sub-briefs are
+    /// counted ([`Self::all_subbriefs_terminal_in_tenant`]), so a cross-Guild
+    /// edge can neither satisfy nor reveal another Guild's tree.
+    fn promote_children_completed(&self, finished_child: &str) -> Result<(), CoordinatorError> {
+        let Some(tenant) = self.task_tenant(finished_child)? else {
+            return Ok(());
+        };
+        for parent in self.parent_briefs_for_tenant(finished_child, &tenant)? {
+            if self.all_subbriefs_terminal_in_tenant(&parent, &tenant)? {
+                self.offer_supervisory_wake(&parent, "children-completed")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Offer one supervisory wakeup with a STABLE reason string
+    /// (`blockers-resolved` / `children-completed`), honestly.
+    ///
+    /// An assigned Brief goes through the shared [`Self::request_brief_wakeup`]
+    /// enqueue (source `automation`), which applies every gate
+    /// (terminal/blocked/claim/coalesce) — so a repeated terminal transition
+    /// coalesces into the live/queued wake rather than opening a second queued
+    /// run. A Brief with NO assignee invents no one to wake: it records an
+    /// honest, visible `brief.wakeup_skipped` Chronicle note (the same event
+    /// type the enqueue uses for its own skips) so the history shows the slice
+    /// resolved but had nobody to continue it.
+    fn offer_supervisory_wake(&self, brief: &str, reason: &str) -> Result<(), CoordinatorError> {
+        let assignee = self
+            .brief_fields(brief)?
+            .and_then(|f| f.assignee_agent_id)
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty());
+        match assignee {
+            Some(agent) => {
+                let _ = self.request_brief_wakeup(brief, &agent, "automation", reason, None)?;
+            }
+            None => {
+                let _ = self.append_event(
+                    brief,
+                    "brief.wakeup_skipped",
+                    &format!("automation:{reason}: assignee required"),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// True when `parent` has ≥1 same-Guild Sub-brief AND every same-Guild
+    /// Sub-brief is terminal (`done` or `cancelled`). The children-completed
+    /// readiness check; tenant-scoped so a cross-Guild child can neither satisfy
+    /// nor block the verdict.
+    fn all_subbriefs_terminal_in_tenant(
+        &self,
+        parent: &str,
+        tenant: &str,
+    ) -> Result<bool, CoordinatorError> {
+        let t = norm_tenant(tenant);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_edges e
+                 JOIN tasks c ON c.task_id = e.related_task_id
+                 WHERE e.task_id = ?1 AND e.edge_type = 'spawned'
+                   AND COALESCE(c.tenant_id, 'default') = ?2",
+                params![parent, t],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
+        if total == 0 {
+            return Ok(false);
+        }
+        let active: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_edges e
+                 JOIN tasks c ON c.task_id = e.related_task_id
+                 WHERE e.task_id = ?1 AND e.edge_type = 'spawned'
+                   AND COALESCE(c.tenant_id, 'default') = ?2
+                   AND c.board_status NOT IN ('done', 'cancelled')",
+                params![parent, t],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
+        Ok(active == 0)
     }
 
     /// Productized **review-to-done** (company-model §12.5B / §12.6). The
@@ -18277,6 +18423,208 @@ mod tests {
             .map(|c| c.task_id)
             .collect();
         assert!(!still.contains(&w2)); // cancelled blocker keeps it blocked
+    }
+
+    // ---- PHASE 3 supervisory auto-wake at the board-transition seam ----
+    // (relix-execution-and-issue-design §1.6 / §3.1)
+
+    /// Create a Brief opened in `todo` (the supervisory-wake test fixture).
+    fn mk_todo(s: &TaskStore, title: &str) -> String {
+        let id = s
+            .create(
+                title,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        s.set_board_status(&id, "todo").unwrap();
+        id
+    }
+
+    /// Drive a Brief through the happy path to board `done` (the central seam
+    /// that promotes supervisory wakes).
+    fn drive_to_done(s: &TaskStore, id: &str) {
+        move_to_progress(s, id);
+        move_to_review(s, id);
+        s.set_board_status(id, "done").unwrap();
+    }
+
+    /// The currently-`queued` wakeups for a Brief (the ones a heartbeat would
+    /// claim) — what a duplicate-free auto-wake produces exactly one of.
+    fn queued_wakeups(s: &TaskStore, task: &str) -> Vec<BriefWakeupRow> {
+        s.list_brief_wakeups(task, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|w| w.status == "queued")
+            .collect()
+    }
+
+    #[test]
+    fn auto_wake_blocker_done_wakes_dependent_when_all_blockers_done() {
+        let s = store();
+        let a = mk_todo(&s, "blocker-a");
+        let b = mk_todo(&s, "dependent-b");
+        s.set_brief_field(&b, "assignee", "agt_b").unwrap();
+        s.add_snag(&b, &a).unwrap();
+
+        // Before A is done, B has no wakeup.
+        assert!(queued_wakeups(&s, &b).is_empty());
+
+        // A → done at the central seam fires the blockers-resolved wake.
+        drive_to_done(&s, &a);
+
+        let q = queued_wakeups(&s, &b);
+        assert_eq!(q.len(), 1, "B has exactly one queued wakeup");
+        assert_eq!(q[0].reason, "blockers-resolved");
+        assert_eq!(q[0].source, "automation");
+        assert_eq!(q[0].agent_id, "agt_b");
+    }
+
+    #[test]
+    fn auto_wake_holds_dependent_until_every_blocker_is_done() {
+        let s = store();
+        let a1 = mk_todo(&s, "blocker-a1");
+        let a2 = mk_todo(&s, "blocker-a2");
+        let b = mk_todo(&s, "dependent-b");
+        s.set_brief_field(&b, "assignee", "agt_b").unwrap();
+        s.add_snag(&b, &a1).unwrap();
+        s.add_snag(&b, &a2).unwrap();
+
+        // First blocker done — B still blocked by a2 → NOT woken yet.
+        drive_to_done(&s, &a1);
+        assert!(
+            queued_wakeups(&s, &b).is_empty(),
+            "B is still blocked by a2; no wake yet"
+        );
+
+        // Second blocker done — B is now fully unblocked → exactly one wake.
+        drive_to_done(&s, &a2);
+        let q = queued_wakeups(&s, &b);
+        assert_eq!(q.len(), 1, "one wake once all blockers are done");
+        assert_eq!(q[0].reason, "blockers-resolved");
+    }
+
+    #[test]
+    fn auto_wake_children_completed_wakes_parent_only_when_all_terminal() {
+        let s = store();
+        let parent = mk_todo(&s, "planner-parent");
+        s.set_brief_field(&parent, "assignee", "agt_planner").unwrap();
+        let c1 = mk_todo(&s, "child-1");
+        let c2 = mk_todo(&s, "child-2");
+        s.link_subbrief(&parent, &c1).unwrap();
+        s.link_subbrief(&parent, &c2).unwrap();
+
+        // First child done — c2 still active → parent NOT woken.
+        drive_to_done(&s, &c1);
+        assert!(
+            queued_wakeups(&s, &parent).is_empty(),
+            "parent waits until every child is terminal"
+        );
+
+        // Last child done — all children terminal → parent woken once.
+        drive_to_done(&s, &c2);
+        let q = queued_wakeups(&s, &parent);
+        assert_eq!(q.len(), 1, "parent woken once when the slice completes");
+        assert_eq!(q[0].reason, "children-completed");
+        assert_eq!(q[0].agent_id, "agt_planner");
+    }
+
+    #[test]
+    fn auto_wake_cancelled_child_counts_as_terminal_for_parent() {
+        // A *cancelled* last child still completes the parent's slice (the
+        // local terminal vocabulary is done OR cancelled), and the cancel
+        // transition itself is the trigger — so the planner is not stranded.
+        let s = store();
+        let parent = mk_todo(&s, "planner-parent");
+        s.set_brief_field(&parent, "assignee", "agt_planner").unwrap();
+        let c1 = mk_todo(&s, "child-1");
+        let c2 = mk_todo(&s, "child-2");
+        s.link_subbrief(&parent, &c1).unwrap();
+        s.link_subbrief(&parent, &c2).unwrap();
+
+        drive_to_done(&s, &c1);
+        assert!(queued_wakeups(&s, &parent).is_empty());
+
+        // Cancel the last child — the parent's slice is now wholly terminal.
+        s.set_board_status(&c2, "cancelled").unwrap();
+        let q = queued_wakeups(&s, &parent);
+        assert_eq!(q.len(), 1, "a cancelled last child still wakes the parent");
+        assert_eq!(q[0].reason, "children-completed");
+    }
+
+    #[test]
+    fn auto_wake_missing_assignee_records_event_but_no_wakeup() {
+        let s = store();
+        let a = mk_todo(&s, "blocker-a");
+        let b = mk_todo(&s, "dependent-b"); // intentionally NO assignee
+        s.add_snag(&b, &a).unwrap();
+
+        drive_to_done(&s, &a);
+
+        // No assignee → no wakeup row of any status was enqueued for B.
+        assert!(
+            s.list_brief_wakeups(&b, 50).unwrap().is_empty(),
+            "an unassigned dependent gets no wakeup (no invented assignee)"
+        );
+        // …but the resolution is honest/visible in the Chronicle.
+        let conn = s.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_events
+                 WHERE task_id = ?1 AND event_type = 'brief.wakeup_skipped'
+                   AND payload LIKE 'automation:blockers-resolved:%assignee required'",
+                params![b],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "an honest assignee-required skip event is recorded");
+    }
+
+    #[test]
+    fn auto_wake_does_not_cross_guild_boundary() {
+        // A bad cross-Guild blocked_on edge must neither wake nor leak the
+        // other Guild's Brief.
+        let s = store();
+        let a = mk_todo(&s, "blocker-a"); // Guild g1
+        let b = mk_todo(&s, "dependent-b"); // Guild g2
+        s.set_task_tenant(&a, "g1").unwrap();
+        s.set_task_tenant(&b, "g2").unwrap();
+        s.set_brief_field(&b, "assignee", "agt_b").unwrap();
+        s.add_snag(&b, &a).unwrap(); // cross-Guild edge
+
+        drive_to_done(&s, &a);
+
+        assert!(
+            s.list_brief_wakeups(&b, 50).unwrap().is_empty(),
+            "a cross-Guild dependent is never woken by another Guild's done Brief"
+        );
+    }
+
+    #[test]
+    fn auto_wake_repeated_done_transition_does_not_duplicate() {
+        let s = store();
+        let a = mk_todo(&s, "blocker-a");
+        let b = mk_todo(&s, "dependent-b");
+        s.set_brief_field(&b, "assignee", "agt_b").unwrap();
+        s.add_snag(&b, &a).unwrap();
+
+        drive_to_done(&s, &a);
+        assert_eq!(queued_wakeups(&s, &b).len(), 1, "first done queues one wake");
+
+        // Re-open A and complete it again — the second done coalesces into the
+        // existing queued wake rather than opening a second queued run.
+        s.set_board_status(&a, "in_progress").unwrap();
+        drive_to_done(&s, &a);
+        assert_eq!(
+            queued_wakeups(&s, &b).len(),
+            1,
+            "a repeated done transition does not duplicate the queued wake"
+        );
     }
 
     #[test]

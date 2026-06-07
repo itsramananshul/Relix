@@ -122,6 +122,14 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   dependencies, idempotent accept, children inheriting parent context.
 - **Desk / Inbox reads** — `/v1/spine/inbox`, `/v1/spine/briefs/:id/thread`,
   `/v1/spine/unassigned`; board cards surface unresolved same-Guild blockers.
+- **Supervisory auto-wake** (`execution §1.6/§3.1`) — the central `set_board_status`
+  transition seam promotes first-class follow-up wakes, event-driven (no busy-poll): a Brief
+  reaching `done` wakes every same-Guild dependent whose blockers are now all resolved
+  (`blockers-resolved`); a child reaching `done`/`cancelled` wakes a same-Guild parent once
+  all its same-Guild Sub-briefs are terminal (`children-completed`). Both go through the
+  persistent wakeup queue's shared enqueue (coalesce/defer/skip — no duplicate runs),
+  tenant-safe, and honest when a target has no assignee (a `brief.wakeup_skipped` Chronicle
+  note, never an invented assignee). A `cancelled` blocker never resolves a dependent (LOCKED).
 
 ### Runs / Shifts / Rigs (`relix-agent-adapters.md`; execution §run-artifacts)
 - **Universal Rig probe** — `ProcessRig::probe()` returns six honest statuses; dashboard
@@ -326,10 +334,18 @@ ledger entry or design section.
 9. **[BE/FE] Smarter companion** — `prime.propose` AI mode is opt-in and rule-validated;
    replacing the deterministic planner with an LLM driving the governed spine APIs is
    future (`current-limitations.md`; ledger "Mandate orchestration" still not autonomous).
-10. **[BE] Exactly-once decomposition + auto-wake promotion** — deferred
-    (`execution §1.7`). The **cost-tree rollup + billing-code attribution** part of this
-    line is now **backend SHIPPED** (see §P1 slice 3b); only the frontend Costs surface
-    (§P2 slice 5) consumes it.
+10. **[BE] Exactly-once decomposition + auto-wake promotion** — **auto-wake promotion is
+    now BACKEND SHIPPED** (`execution §1.6/§3.1`; see §5 slice 12). When a Brief reaches a
+    terminal column at the central `set_board_status` seam, Relix sequences follow-up work
+    event-driven (no busy-poll): a `done` Brief promotes a `blockers-resolved` wakeup to each
+    same-Guild dependent that is now fully unblocked, and a `done`/`cancelled` child promotes a
+    `children-completed` wakeup to a same-Guild parent once all its same-Guild Sub-briefs are
+    terminal — through the existing persistent wakeup queue (coalesce/defer/skip, no duplicate
+    runs), tenant-safe, and honest about a missing assignee. The **cost-tree rollup +
+    billing-code attribution** part of this line is also **backend SHIPPED** (see §P1 slice 3b);
+    only the frontend Costs surface (§P2 slice 5) consumes it. *Still deferred:* **exactly-once
+    plan decomposition** (`execution §1.7` — the crash-safe decomposition claim) and
+    approval-bound issue **Dossiers/documents** (`execution §1.8`) are not yet implemented.
 
 ---
 
@@ -573,6 +589,39 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
     owner's checkout context in place (full Paperclip "adopt the prior checkout run"); the
     reclaim is wired into the manual/Prime start chokepoint, while the autonomous heartbeat
     path still relies on the age-based sweep for the same condition.
+
+12. **Supervisory auto-wake promotion (blockers-resolved + children-completed)** —
+    `execution-and-issue-design.md §1.6/§3.1`.
+    **✅ DONE.** *Files changed:* `crates/relix-runtime/src/nodes/coordinator/mod.rs`
+    (`set_board_status` now fires at the central terminal-transition seam:
+    `promote_blockers_resolved` on entering `done`, `promote_children_completed` on entering
+    `done` OR `cancelled`; the shared `offer_supervisory_wake` enqueue helper; the
+    `all_subbriefs_terminal_in_tenant` readiness check; 7 store tests). *Adds:* first-class,
+    event-driven follow-up sequencing — no busy-poll. A `done` Brief offers a wakeup to every
+    **same-Guild** dependent that was `blocked_on` it; the shared `request_brief_wakeup` enqueue
+    applies the readiness guard, so a dependent still waiting on ANOTHER unfinished blocker is
+    `skipped` (not woken) and a now-fully-unblocked dependent is `queued`. A `done`/`cancelled`
+    child offers a wakeup to each **same-Guild** parent once ALL its same-Guild Sub-briefs are
+    terminal. Stable reasons `blockers-resolved` / `children-completed`, source `automation`.
+    *Why the seam:* every done/cancel path (manual `brief.move`, the apply-driven
+    `complete_reviewed_brief`, board recovery) flows through `set_board_status`, so the promotion
+    lives once, not per UI route; the board lock is released before enqueuing (the enqueue locks
+    the connection itself). *Tenant isolation:* only same-Guild dependents/parents are
+    enumerated (`list_blocking_for_tenant` / `parent_briefs_for_tenant`) and only same-Guild
+    Sub-briefs counted — a cross-Guild edge can neither wake nor leak another Guild's Brief.
+    *Honest semantics:* only `done` resolves a blocker (a `cancelled` blocker keeps the
+    dependent blocked, LOCKED §1.6); a `cancelled` child DOES count as terminal for the parent
+    continuation wake (matching `list_briefs_with_all_children_done`); a missing assignee invents
+    no one — it records a `brief.wakeup_skipped` Chronicle note. *No duplicate runs:* a repeated
+    terminal transition coalesces into the live/queued wake. *Pinned:* blocker done wakes a
+    fully-unblocked dependent; a second unfinished blocker holds the wake until it too is done;
+    child completion wakes the parent only when all same-Guild children are terminal (incl. a
+    cancelled last child); a missing assignee records an event but no wakeup; a cross-Guild edge
+    does not wake/leak; a repeated done transition does not duplicate. *Verified:* targeted
+    `auto_wake_*` (7) green; full `cargo test -p relix-runtime --lib` green (3977 lib tests, +7);
+    `cargo check -p relix-runtime` clean; `cargo clippy` clean on the touched code (2 pre-existing
+    unrelated warnings in `maintenance.rs`); `git diff --check` clean. *Still deferred:*
+    exactly-once plan decomposition (§1.7) and approval-bound Dossiers/documents (§1.8).
 
 > After completing a slice: re-open the cited section, update the implementation map /
 > divergence ledger in `product-spine-implementation.md`, and update this file's §2/§3 so
