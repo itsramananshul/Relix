@@ -907,6 +907,112 @@ impl SpineStore {
         Ok(rows)
     }
 
+    // ── runtime settings (tenant-scoped product toggles) ─────
+    //
+    // A small generic key→value store for tenant-scoped RUNTIME switches an
+    // operator flips from the product (no restart / no env edit). Deliberately
+    // generic so future runtime toggles reuse it; only the autonomous-Prime
+    // switch is exposed today. No existence leak: a read for an unset
+    // tenant+key returns `None`, exactly like a never-written value.
+
+    /// Read the raw string value of a runtime setting for `tenant_id`+`key`.
+    /// `None` when unset (a missing row reads identically to an unset value).
+    pub fn get_runtime_setting(
+        &self,
+        tenant_id: &str,
+        key: &str,
+    ) -> Result<Option<String>, SpineStoreError> {
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT value FROM runtime_settings WHERE tenant_id = ?1 AND key = ?2",
+                params![normalize_tenant(tenant_id), key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Upsert a runtime setting for `tenant_id`+`key`. `updated_by` records who
+    /// last flipped it (operator subject / label) for the audit trail.
+    pub fn set_runtime_setting(
+        &self,
+        tenant_id: &str,
+        key: &str,
+        value: &str,
+        updated_by: &str,
+    ) -> Result<(), SpineStoreError> {
+        if key.trim().is_empty() {
+            return Err(SpineStoreError::BadInput(
+                "runtime setting key required".into(),
+            ));
+        }
+        let tenant = normalize_tenant(tenant_id);
+        let now = unix_now();
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        conn.execute(
+            "INSERT INTO runtime_settings (tenant_id, key, value, updated_at, updated_by)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(tenant_id, key)
+                 DO UPDATE SET value = ?3, updated_at = ?4, updated_by = ?5",
+            params![tenant, key, value, now, updated_by],
+        )?;
+        Ok(())
+    }
+
+    /// Read a runtime setting as a bool for `tenant_id`+`key`. `None` when
+    /// unset; `Some(true/false)` parsed from any truthy/falsey spelling so a
+    /// value written by the bool setter (canonical `1`/`0`) or by hand is read
+    /// consistently.
+    pub fn get_runtime_setting_bool(
+        &self,
+        tenant_id: &str,
+        key: &str,
+    ) -> Result<Option<bool>, SpineStoreError> {
+        Ok(self
+            .get_runtime_setting(tenant_id, key)?
+            .map(|v| runtime_truthy(&v)))
+    }
+
+    /// Set a bool runtime setting for `tenant_id`+`key`, stored canonically as
+    /// `1`/`0` so the [`list_tenants_with_runtime_bool`] filter is exact.
+    ///
+    /// [`list_tenants_with_runtime_bool`]: Self::list_tenants_with_runtime_bool
+    pub fn set_runtime_setting_bool(
+        &self,
+        tenant_id: &str,
+        key: &str,
+        enabled: bool,
+        updated_by: &str,
+    ) -> Result<(), SpineStoreError> {
+        self.set_runtime_setting(tenant_id, key, if enabled { "1" } else { "0" }, updated_by)
+    }
+
+    /// List the tenants whose runtime bool `key` is currently **truthy** —
+    /// the autonomous-Prime watcher's per-Guild enable set when the env
+    /// override is off. Bounded read; tenant order is stable (by tenant id).
+    /// Matches any truthy spelling, not just the canonical `1`, so a
+    /// hand-written value still counts.
+    pub fn list_tenants_with_runtime_bool(
+        &self,
+        key: &str,
+    ) -> Result<Vec<String>, SpineStoreError> {
+        let conn = self.conn.lock().map_err(|_| SpineStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT tenant_id, value FROM runtime_settings WHERE key = ?1 ORDER BY tenant_id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![key], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, v)| runtime_truthy(v))
+            .map(|(t, _)| t)
+            .collect())
+    }
+
     // ── mandates ─────────────────────────────────────────────
 
     /// Create a Mandate. Returns the freshly-allocated `mandate_id`.
@@ -1617,7 +1723,18 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              updated_at        INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS prime_proposals_tenant
-             ON prime_proposals(tenant_id, created_at);",
+             ON prime_proposals(tenant_id, created_at);
+
+         CREATE TABLE IF NOT EXISTS runtime_settings (
+             tenant_id  TEXT NOT NULL,
+             key        TEXT NOT NULL,
+             value      TEXT NOT NULL,
+             updated_at INTEGER NOT NULL,
+             updated_by TEXT NOT NULL DEFAULT '',
+             PRIMARY KEY (tenant_id, key)
+         );
+         CREATE INDEX IF NOT EXISTS runtime_settings_key
+             ON runtime_settings(key);",
     )?;
     // Defensive additive column: a Guild's monthly Allowance (cents).
     // Tolerates a guilds table created before this column existed.
@@ -1750,6 +1867,17 @@ fn non_empty(s: &str) -> Option<&str> {
     if t.is_empty() { None } else { Some(t) }
 }
 
+/// Interpret a stored runtime-setting value as a bool. The bool setter writes
+/// the canonical `1`/`0`, but this also accepts the same truthy spellings the
+/// env switches use (`1`/`true`/`yes`/`on`, case-insensitive, trimmed) so a
+/// hand-written value reads consistently; everything else is false.
+fn runtime_truthy(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn row_to_team_plan(r: &rusqlite::Row) -> rusqlite::Result<TeamPlan> {
     Ok(TeamPlan {
         plan_id: r.get(0)?,
@@ -1852,6 +1980,73 @@ mod tests {
 
     fn store() -> SpineStore {
         SpineStore::in_memory().unwrap()
+    }
+
+    #[test]
+    fn runtime_setting_persists_and_reads_bool() {
+        let s = store();
+        // Unset reads as None (no existence leak — a never-written value).
+        assert_eq!(s.get_runtime_setting("acme", "k").unwrap(), None);
+        assert_eq!(s.get_runtime_setting_bool("acme", "k").unwrap(), None);
+
+        // Set bool true → canonical "1" stored, reads back true.
+        s.set_runtime_setting_bool("acme", "k", true, "operator")
+            .unwrap();
+        assert_eq!(
+            s.get_runtime_setting("acme", "k").unwrap().as_deref(),
+            Some("1")
+        );
+        assert_eq!(s.get_runtime_setting_bool("acme", "k").unwrap(), Some(true));
+
+        // Flip to false → "0", reads back false (NOT None — explicitly off).
+        s.set_runtime_setting_bool("acme", "k", false, "operator")
+            .unwrap();
+        assert_eq!(
+            s.get_runtime_setting_bool("acme", "k").unwrap(),
+            Some(false)
+        );
+
+        // A hand-written truthy spelling is still read as true.
+        s.set_runtime_setting("acme", "k", "ON", "cli").unwrap();
+        assert_eq!(s.get_runtime_setting_bool("acme", "k").unwrap(), Some(true));
+    }
+
+    #[test]
+    fn runtime_setting_is_tenant_isolated() {
+        let s = store();
+        s.set_runtime_setting_bool("acme", "flag", true, "operator")
+            .unwrap();
+        // Another Guild never sees acme's value.
+        assert_eq!(s.get_runtime_setting_bool("globex", "flag").unwrap(), None);
+        assert_eq!(
+            s.get_runtime_setting_bool("acme", "flag").unwrap(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn list_tenants_with_runtime_bool_returns_only_truthy() {
+        let s = store();
+        s.set_runtime_setting_bool("acme", "flag", true, "op")
+            .unwrap();
+        s.set_runtime_setting_bool("globex", "flag", false, "op")
+            .unwrap();
+        s.set_runtime_setting_bool("initech", "flag", true, "op")
+            .unwrap();
+        // A different key never bleeds into this key's enabled set.
+        s.set_runtime_setting_bool("acme", "other", true, "op")
+            .unwrap();
+
+        let enabled = s.list_tenants_with_runtime_bool("flag").unwrap();
+        assert_eq!(enabled, vec!["acme".to_string(), "initech".to_string()]);
+
+        // Flipping initech off removes it from the set.
+        s.set_runtime_setting_bool("initech", "flag", false, "op")
+            .unwrap();
+        assert_eq!(
+            s.list_tenants_with_runtime_bool("flag").unwrap(),
+            vec!["acme".to_string()]
+        );
     }
 
     #[test]

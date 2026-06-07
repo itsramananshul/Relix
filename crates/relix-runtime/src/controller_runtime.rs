@@ -3424,6 +3424,41 @@ pub fn register_agent_capabilities(
             })),
         );
     }
+    // PRIME RUNTIME AUTONOMY SWITCH (v1) — turn the autonomous Prime LOOP
+    // ON/OFF for the caller's Guild at runtime (no restart), persisted in the
+    // SpineStore. `prime.autonomy_state` is READ-ONLY (effective state + source
+    // + env override + knobs); `prime.autonomy_set` is the role-gated mutation
+    // (`{enabled:bool}`). NOT an approval bypass — ON only wakes the loop over
+    // already-approved work; each governed approval still needs a live standing
+    // grant. Both tenant-scoped; need the SpineStore.
+    if let Some(spine) = spine_store.clone() {
+        let s = spine.clone();
+        bridge.register(
+            "prime.autonomy_state",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move {
+                    crate::nodes::coordinator::agent::prime_driver::handle_prime_autonomy_state(
+                        &s, &ctx,
+                    )
+                }
+            })),
+        );
+    }
+    if let Some(spine) = spine_store.clone() {
+        let s = spine.clone();
+        bridge.register(
+            "prime.autonomy_set",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move {
+                    crate::nodes::coordinator::agent::prime_driver::handle_prime_autonomy_set(
+                        &s, &ctx,
+                    )
+                }
+            })),
+        );
+    }
     // ACTION CENTER (company-model §5.4 / §8.2): one READ-ONLY feed of the
     // operator's next actions, computed from existing live state (approvals,
     // hires, the Brief board, the run ledger, the strategy gate). Tenant-scoped;
@@ -11401,110 +11436,157 @@ fn register_node_type_handlers(
                 "coordinator startup: autonomous retry lane spawned (RELIX_AUTONOMOUS_RECOVERY)"
             );
         }
-        // OPT-IN autonomous PRIME driver (company-model §5.4/§8.2 the Action
-        // Center "next governed step"; §12.5/§12.5B the Prime planner + Start).
-        // Default OFF via RELIX_AUTONOMOUS_PRIME so it never surprises an
-        // operator. When on, a timer drives already-APPROVED Prime/company work
-        // forward without the operator clicking "Advance one step" over and over:
-        // it advances ONLY the safe governed steps `prime.advance` already allows
+        // RUNTIME-CONTROLLABLE autonomous PRIME driver (Prime Runtime Autonomy
+        // Switch v1 + company-model §5.4/§8.2 the Action Center "next governed
+        // step"; §12.5/§12.5B the Prime planner + Start). Previously the loop
+        // only spawned when the boot-time env RELIX_AUTONOMOUS_PRIME was set;
+        // now a DORMANT watcher spawns whenever the SpineStore exists, and EACH
+        // TICK decides what to drive from the persisted per-Guild runtime
+        // setting + the env override — so an operator turns it on/off from the
+        // product with no restart:
+        //   * env override ON               → drive ALL Guilds (legacy behaviour);
+        //   * env off, runtime ON for some  → drive only those Guild(s);
+        //   * neither                       → dormant (one cheap SQL read, sleep).
+        // Safety is UNCHANGED: ON only wakes the loop over already-APPROVED work
+        // — it advances only the safe governed steps `prime.advance` allows
         // (`create_team_plan` / `orchestrate_assign_ready`) and starts ready
-        // Briefs of an already-approved proposal through the existing
-        // `prime.start` path (gated by the SAME autonomous budget hard-stop the
-        // heartbeat applies). It NEVER auto-approves a strategy / hire / spawn /
-        // budget / Clearance gate — those stay human. Bounded per tick
-        // (RELIX_AUTONOMOUS_PRIME_MAX, default 1, clamp 1..=10), idempotent (each
-        // tick re-classifies live state), and tenant-safe (each candidate under
-        // its own Guild). Needs the SpineStore (where approved proposals live);
-        // inert when it is unavailable. Mirrors the recovery lane's structure.
-        if crate::nodes::coordinator::heartbeat::parse_autonomous_prime_enabled(
-            std::env::var("RELIX_AUTONOMOUS_PRIME").ok().as_deref(),
-        ) {
-            if let Some(spine_arc) = spine_store_for_agent_caps.clone() {
-                let prime_max = crate::nodes::coordinator::heartbeat::parse_autonomous_prime_max(
-                    std::env::var("RELIX_AUTONOMOUS_PRIME_MAX").ok().as_deref(),
-                );
-                let prime_interval_secs = std::env::var("RELIX_AUTONOMOUS_PRIME_INTERVAL_SECS")
-                    .ok()
-                    .and_then(|v| v.trim().parse::<u64>().ok())
-                    .filter(|n| *n >= 1)
-                    .unwrap_or(30);
-                // The Rig the STANDING-AUTHORITY hire-approve binds (default
-                // safe-local `echo`). Passed through unvalidated on purpose — the
-                // tick refuses/skips a hire on an unknown Rig rather than silently
-                // binding a bad one, so a typo surfaces as a pending hire.
-                let prime_hire_rig =
-                    crate::nodes::coordinator::agent::prime_driver::configured_autonomous_hire_rig(
-                    );
-                let task_store = store.clone();
-                let ag_store = agent_store.clone();
-                let registry = rig_registry.clone();
-                let metrics_query = metrics.map(|m| m.query.clone());
-                tokio::spawn(async move {
-                    let mut ticker =
-                        tokio::time::interval(std::time::Duration::from_secs(prime_interval_secs));
-                    loop {
-                        ticker.tick().await;
-                        let ts = task_store.clone();
-                        let ags = ag_store.clone();
-                        let reg = registry.clone();
-                        let mq = metrics_query.clone();
-                        let spine = spine_arc.clone();
-                        let hire_rig = prime_hire_rig.clone();
-                        let outcome = tokio::task::spawn_blocking(move || {
-                            let now_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as i64)
-                                .unwrap_or(0);
-                            // tenant=None: drive all Guilds, each candidate under
-                            // its OWN derived tenant (no cross-Guild leak).
-                            crate::nodes::coordinator::agent::prime_driver::autonomous_prime_tick(
-                                &ags,
-                                &spine,
-                                &ts,
-                                &reg,
-                                mq.as_ref(),
-                                now_ms,
-                                prime_max,
-                                None,
-                                &hire_rig,
-                            )
-                        })
-                        .await;
-                        match outcome {
-                            Ok(Ok(records)) => {
-                                let advanced =
-                                    records.iter().filter(|r| r.outcome == "advanced").count();
-                                let started =
-                                    records.iter().filter(|r| r.outcome == "started").count();
-                                if advanced > 0 || started > 0 {
-                                    tracing::info!(
-                                        advanced,
-                                        started,
-                                        considered = records.len(),
-                                        "autonomous prime: drove approved work forward"
-                                    );
+        // approved-proposal Briefs through `prime.start` (gated by the SAME
+        // autonomous budget hard-stop), and NEVER auto-approves a strategy /
+        // hire / spawn / budget / Clearance gate unless a live standing grant
+        // covers it. Bounded per tick (RELIX_AUTONOMOUS_PRIME_MAX), idempotent
+        // (each tick re-classifies live state), tenant-safe (each candidate
+        // under its OWN Guild). Needs the SpineStore (where the runtime setting
+        // + approved proposals live); not spawned when it is unavailable.
+        if let Some(spine_arc) = spine_store_for_agent_caps.clone() {
+            let prime_max = crate::nodes::coordinator::heartbeat::parse_autonomous_prime_max(
+                std::env::var("RELIX_AUTONOMOUS_PRIME_MAX").ok().as_deref(),
+            );
+            let prime_interval_secs = std::env::var("RELIX_AUTONOMOUS_PRIME_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(30);
+            // The Rig the STANDING-AUTHORITY hire-approve binds (default
+            // safe-local `echo`). Passed through unvalidated on purpose — the
+            // tick refuses/skips a hire on an unknown Rig rather than silently
+            // binding a bad one, so a typo surfaces as a pending hire.
+            let prime_hire_rig =
+                crate::nodes::coordinator::agent::prime_driver::configured_autonomous_hire_rig();
+            let env_at_boot = crate::nodes::coordinator::heartbeat::parse_autonomous_prime_enabled(
+                std::env::var("RELIX_AUTONOMOUS_PRIME").ok().as_deref(),
+            );
+            let task_store = store.clone();
+            let ag_store = agent_store.clone();
+            let registry = rig_registry.clone();
+            let metrics_query = metrics.map(|m| m.query.clone());
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_secs(prime_interval_secs));
+                loop {
+                    ticker.tick().await;
+                    let ts = task_store.clone();
+                    let ags = ag_store.clone();
+                    let reg = registry.clone();
+                    let mq = metrics_query.clone();
+                    let spine = spine_arc.clone();
+                    let hire_rig = prime_hire_rig.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        use crate::nodes::coordinator::agent::prime_driver::{
+                            AutonomyDrive, RUNTIME_KEY_AUTONOMOUS_PRIME, autonomous_prime_tick,
+                            plan_autonomy_drive,
+                        };
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        // Re-read the env override each tick (cheap; normally
+                        // static, but honour a live change). When env is off the
+                        // persisted per-Guild runtime setting decides which
+                        // Guilds (if any) to drive — a runtime-off Guild is never
+                        // driven.
+                        let env_enabled =
+                            crate::nodes::coordinator::heartbeat::parse_autonomous_prime_enabled(
+                                std::env::var("RELIX_AUTONOMOUS_PRIME").ok().as_deref(),
+                            );
+                        let enabled_tenants = if env_enabled {
+                            Vec::new()
+                        } else {
+                            spine
+                                .list_tenants_with_runtime_bool(RUNTIME_KEY_AUTONOMOUS_PRIME)
+                                .unwrap_or_default()
+                        };
+                        let mut records = Vec::new();
+                        match plan_autonomy_drive(env_enabled, enabled_tenants) {
+                            // Nothing enabled — do nothing this tick.
+                            AutonomyDrive::Dormant => {}
+                            // Env override on — drive ALL Guilds (tenant=None),
+                            // each candidate under its own derived tenant.
+                            AutonomyDrive::AllGuilds => {
+                                let mut r = autonomous_prime_tick(
+                                    &ags,
+                                    &spine,
+                                    &ts,
+                                    &reg,
+                                    mq.as_ref(),
+                                    now_ms,
+                                    prime_max,
+                                    None,
+                                    &hire_rig,
+                                )?;
+                                records.append(&mut r);
+                            }
+                            // Env off — drive ONLY the runtime-enabled Guild(s),
+                            // each scoped to its own tenant (bounded per Guild).
+                            AutonomyDrive::Tenants(tenants) => {
+                                for t in tenants {
+                                    let mut r = autonomous_prime_tick(
+                                        &ags,
+                                        &spine,
+                                        &ts,
+                                        &reg,
+                                        mq.as_ref(),
+                                        now_ms,
+                                        prime_max,
+                                        Some(&t),
+                                        &hire_rig,
+                                    )?;
+                                    records.append(&mut r);
                                 }
                             }
-                            Ok(Err(e)) => {
-                                tracing::warn!(error = %e, "autonomous prime: tick failed")
-                            }
-                            Err(e) => {
-                                tracing::error!(error = %e, "autonomous prime: tick join error")
+                        }
+                        Ok::<_, String>(records)
+                    })
+                    .await;
+                    match outcome {
+                        Ok(Ok(records)) => {
+                            let advanced =
+                                records.iter().filter(|r| r.outcome == "advanced").count();
+                            let started = records.iter().filter(|r| r.outcome == "started").count();
+                            if advanced > 0 || started > 0 {
+                                tracing::info!(
+                                    advanced,
+                                    started,
+                                    considered = records.len(),
+                                    "autonomous prime: drove approved work forward"
+                                );
                             }
                         }
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "autonomous prime: tick failed")
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "autonomous prime: tick join error")
+                        }
                     }
-                });
-                tracing::info!(
-                    interval_secs = prime_interval_secs,
-                    max = prime_max,
-                    "coordinator startup: autonomous Prime driver spawned (RELIX_AUTONOMOUS_PRIME)"
-                );
-            } else {
-                tracing::warn!(
-                    "RELIX_AUTONOMOUS_PRIME is set but the SpineStore is unavailable — \
-                     autonomous Prime driver not spawned"
-                );
-            }
+                }
+            });
+            tracing::info!(
+                interval_secs = prime_interval_secs,
+                max = prime_max,
+                env_override = env_at_boot,
+                "coordinator startup: autonomous Prime watcher spawned (runtime-controllable; \
+                 env override + persisted per-Guild runtime toggle)"
+            );
         }
         // NOT-DONE 2: spawn the legacy-token orphaned-task fail
         // pass in the BACKGROUND so it does not block the

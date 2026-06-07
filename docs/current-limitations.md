@@ -300,10 +300,30 @@ the approved work is already ready. What it does **not** do:
     distinct `prime.autonomous_advance` / `prime.autonomous_start` event on the
     Mandate's parent Brief for an actual action only (never per skipped gate). A
     **bare Mandate** is planned/orchestrated but its per-Brief runs are left to the
-    heartbeat / `brief.run` (no new bare-Mandate start policy invented). Surfaced
-    read-only in Settings beside the heartbeat + recovery lane
+    heartbeat / `brief.run` (no new bare-Mandate start policy invented).
+    **The loop is now controllable from the product at runtime — no restart, no
+    env edit (Prime Runtime Autonomy Switch v1).** A **dormant watcher** is
+    spawned whenever the coordinator's `SpineStore` exists, and each tick decides
+    what to drive from a **tenant-scoped persisted runtime setting** + the env
+    override: env `RELIX_AUTONOMOUS_PRIME` ON ⇒ drive **all** Guilds (the legacy
+    behaviour, kept as a **global boot override**); env off ⇒ drive only the
+    Guild(s) whose **persisted runtime toggle** is on (a runtime-off Guild is
+    never driven); neither ⇒ dormant (one cheap SQL read, then sleep). The
+    setting lives in the coordinator DB (`runtime_settings(tenant_id, key)`),
+    flipped by the **role-gated** `prime.autonomy_set` (operator/admin only;
+    `PUT /v1/spine/prime/autonomy {enabled}`) and read by `prime.autonomy_state`
+    (`GET /v1/spine/prime/autonomy` → `runtime_enabled` / `env_enabled` /
+    `effective_enabled` / `source` ∈ {`env`,`runtime`,`off`} + the
+    max/interval/hire-Rig knobs). **Turning the loop ON is NOT an approval
+    bypass** — it only wakes the driver over already-approved work; each governed
+    approval still requires its own live standing grant (above). When the env
+    override is set the runtime OFF control can only clear the persisted row;
+    effective stays ON for every Guild until the env is changed + the coordinator
+    restarts (the dashboard says so). The Settings page now exposes a live
+    **Turn ON / Turn OFF** control (effective state + source + env-override
+    caveat), beside the still-read-only heartbeat + recovery surfaces
     (`/v1/spine/run-config`: `autonomous_prime_enabled` / `autonomous_prime_max` /
-    `autonomous_prime_interval_secs`).
+    `autonomous_prime_interval_secs` remain the env-derived knobs).
   - **Prime standing authority (v1) — opt-in, default OFF, *grant-gated*.** Prime
     now has **two** autonomy layers. Layer (a) above is the **approved-work
     driver** (`RELIX_AUTONOMOUS_PRIME`): it only moves work that a human already

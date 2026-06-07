@@ -53,6 +53,18 @@ interface StandingAuthority {
   note?: string;
 }
 
+interface AutonomyState {
+  runtime_enabled?: boolean;
+  env_enabled?: boolean;
+  effective_enabled?: boolean;
+  source?: string; // "env" | "runtime" | "off"
+  env_override?: boolean;
+  autonomous_prime_max?: number;
+  autonomous_prime_interval_secs?: number;
+  hire_rig?: string;
+  note?: string;
+}
+
 function extractProviders(v: unknown): Provider[] {
   if (Array.isArray(v)) return v as Provider[];
   if (v && typeof v === "object") {
@@ -65,12 +77,13 @@ function extractProviders(v: unknown): Provider[] {
 export function Settings() {
   const { status, logout } = useAuth();
   const { data, loading, reload } = useAsync(async () => {
-    const [info, providers, adapters, runConfig, primeAuthority] = await Promise.all([
+    const [info, providers, adapters, runConfig, primeAuthority, autonomy] = await Promise.all([
       tryGet<Record<string, unknown>>("/v1/info", {}),
       tryGet<unknown>("/v1/config/providers", {}),
       tryGet<Adapter[]>("/v1/adapters", []),
       tryGet<RunConfig>("/v1/spine/run-config", {}),
       tryGet<StandingAuthority>("/v1/spine/prime/standing-authority", {}),
+      tryGet<AutonomyState>("/v1/spine/prime/autonomy", {}),
     ]);
     return {
       info,
@@ -78,6 +91,7 @@ export function Settings() {
       adapters: Array.isArray(adapters) ? adapters : [],
       runConfig: runConfig ?? {},
       primeAuthority: primeAuthority ?? {},
+      autonomy: autonomy ?? {},
     };
   }, []);
 
@@ -86,6 +100,7 @@ export function Settings() {
   const adapters = data?.adapters ?? [];
   const runConfig = data?.runConfig ?? {};
   const primeAuthority = data?.primeAuthority ?? {};
+  const autonomy = data?.autonomy ?? {};
 
   return (
     <div className="grid">
@@ -273,21 +288,20 @@ export function Settings() {
             <tr>
               <td className="muted">Autonomous Prime</td>
               <td>
-                <span className={"badge " + (runConfig.autonomous_prime_enabled ? "done" : "backlog")}>
-                  {runConfig.autonomous_prime_enabled ? "enabled" : "disabled"}
+                <span className={"badge " + (autonomy.effective_enabled ? "done" : "backlog")}>
+                  {autonomy.effective_enabled ? "enabled" : "disabled"}
                 </span>
-                {runConfig.autonomous_prime_enabled && (
-                  <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>
-                    up to {runConfig.autonomous_prime_max ?? 1} action/tick, every{" "}
-                    {runConfig.autonomous_prime_interval_secs ?? 30}s
-                  </span>
-                )}
+                <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>
+                  {autonomy.effective_enabled
+                    ? `${autonomy.source === "env" ? "on via env override" : "on via runtime toggle"} — up to ${autonomy.autonomous_prime_max ?? 1} action/tick, every ${autonomy.autonomous_prime_interval_secs ?? 30}s`
+                    : "off — toggle it below (no restart needed)"}
+                </span>
               </td>
             </tr>
             <tr>
               <td className="muted" />
               <td className="muted" style={{ fontSize: 12 }}>
-                {runConfig.autonomous_prime_enabled
+                {autonomy.effective_enabled
                   ? "Prime drives already-approved work forward on its own — plans the team, orchestrates the Brief tree, and starts ready work through the same governed routes — bounded per tick. It never auto-approves a strategy/hire/spawn/budget/Clearance gate (those stay human)."
                   : "approved Prime work waits for an operator to click Advance / Start in the Action Center"}
               </td>
@@ -298,14 +312,22 @@ export function Settings() {
           Toggle the heartbeat via <span className="mono">RELIX_HEARTBEAT_ENABLED</span> (off by default);
           pacing via <span className="mono">RELIX_HEARTBEAT_INTERVAL_SECS</span>. The opt-in autonomous
           retry lane is <span className="mono">RELIX_AUTONOMOUS_RECOVERY</span> (off by default), bounded by{" "}
-          <span className="mono">RELIX_AUTONOMOUS_RECOVERY_MAX</span>. The opt-in autonomous Prime driver is{" "}
-          <span className="mono">RELIX_AUTONOMOUS_PRIME</span> (off by default), paced by{" "}
+          <span className="mono">RELIX_AUTONOMOUS_RECOVERY_MAX</span>. The autonomous Prime loop is now
+          a <strong>runtime toggle</strong> (below) — <span className="mono">RELIX_AUTONOMOUS_PRIME</span> still
+          works as a global boot override, paced by{" "}
           <span className="mono">RELIX_AUTONOMOUS_PRIME_INTERVAL_SECS</span> and bounded by{" "}
           <span className="mono">RELIX_AUTONOMOUS_PRIME_MAX</span>. Autonomous runs still honor adapter
           readiness, per-Operative wake/concurrency caps, and budget hard-stops. No LLM diagnosis or
           provider-quota polling.
         </p>
       </div>
+
+      <AutonomousPrimeSwitchPanel
+        autonomy={autonomy}
+        authority={primeAuthority}
+        loading={loading}
+        onChanged={reload}
+      />
 
       <PrimeStandingAuthorityPanel authority={primeAuthority} loading={loading} onChanged={reload} />
 
@@ -371,6 +393,128 @@ export function Settings() {
         )}
       </div>
       </div>
+    </div>
+  );
+}
+
+// Prime Runtime Autonomy Switch (v1): the operator control to turn the
+// autonomous Prime LOOP on/off for this Guild at runtime — no restart, no env
+// edit. The setting is tenant-scoped + persisted in the coordinator DB. This is
+// NOT an approval bypass: ON only wakes the loop over already-approved work;
+// each governed approval still needs a live standing grant (the panel below).
+// The env var RELIX_AUTONOMOUS_PRIME stays a GLOBAL boot override — while it is
+// set the loop runs for every Guild and the OFF control can only clear the
+// persisted row (effective stays ON until the env is changed + restart).
+function AutonomousPrimeSwitchPanel({
+  autonomy,
+  authority,
+  loading,
+  onChanged,
+}: {
+  autonomy: AutonomyState;
+  authority: StandingAuthority;
+  loading: boolean;
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
+
+  const runtimeOn = !!autonomy.runtime_enabled;
+  const envOverride = !!autonomy.env_override;
+  const effectiveOn = !!autonomy.effective_enabled;
+  const grantedCount = (authority.categories ?? []).filter((c) => c.active).length;
+  const totalCats = (authority.categories ?? []).length;
+
+  async function setEnabled(enabled: boolean) {
+    setBusy(true);
+    setBanner(null);
+    try {
+      await api.put("/v1/spine/prime/autonomy", { enabled });
+      setBanner({
+        kind: "ok",
+        msg: enabled
+          ? "Autonomous Prime loop turned ON for this Guild (no restart needed)."
+          : "Autonomous Prime loop turned OFF for this Guild.",
+      });
+      onChanged();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Toggle failed" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card" style={{ gridColumn: "1 / -1" }}>
+      <div className="row" style={{ marginBottom: 8 }}>
+        <h3 style={{ margin: 0 }}>Autonomous Prime loop</h3>
+        <div className="spacer" style={{ flex: 1 }} />
+        <span className={"badge " + (effectiveOn ? "done" : "backlog")}>
+          {effectiveOn
+            ? autonomy.source === "env"
+              ? "on (env override)"
+              : "on"
+            : "off"}
+        </span>
+      </div>
+      <p className="muted" style={{ marginTop: -2, marginBottom: 12 }}>
+        Turn the autonomous Prime loop on/off for this Guild at runtime — no restart. When ON, Prime
+        drives <strong>already-approved</strong> work forward on a timer (plans the team, orchestrates
+        the Brief tree, starts ready work) through the same governed routes, bounded per tick. This is{" "}
+        <strong>not</strong> an approval bypass: it never approves a governed gate on its own — each
+        approval category still needs a live standing grant below.
+      </p>
+
+      {banner && <div className={"banner " + banner.kind} style={{ fontSize: 12 }}>{banner.msg}</div>}
+
+      {loading ? (
+        <div className="loading">Loading…</div>
+      ) : (
+        <>
+          <div className="row wrap" style={{ gap: 10, alignItems: "center" }}>
+            {runtimeOn ? (
+              <button className="btn ghost" disabled={busy} onClick={() => void setEnabled(false)}>
+                {busy ? "…" : "Turn OFF"}
+              </button>
+            ) : (
+              <button className="btn" disabled={busy} onClick={() => void setEnabled(true)}>
+                {busy ? "…" : "Turn ON"}
+              </button>
+            )}
+            <span className="muted" style={{ fontSize: 12 }}>
+              Runtime setting: <strong>{runtimeOn ? "on" : "off"}</strong>
+              {" · "}up to {autonomy.autonomous_prime_max ?? 1} action/tick, every{" "}
+              {autonomy.autonomous_prime_interval_secs ?? 30}s
+            </span>
+          </div>
+
+          {/* Env override: the OFF control can only clear the persisted row. */}
+          {envOverride && (
+            <div className="banner" style={{ fontSize: 12, marginTop: 10 }}>
+              <span className="mono">RELIX_AUTONOMOUS_PRIME</span> is set as a global boot override, so
+              the loop is effectively <strong>ON for every Guild</strong>. Turning it off here only
+              clears this Guild's persisted runtime setting — it cannot fully disable the loop until the
+              env var is unset and the coordinator restarts.
+            </div>
+          )}
+
+          {/* Cross-hints between the loop switch and standing grants. */}
+          {runtimeOn && totalCats > 0 && grantedCount === 0 && (
+            <div className="banner" style={{ fontSize: 12, marginTop: 10 }}>
+              The loop is <strong>awake</strong> but no standing-authority category is granted — it will
+              drive already-approved work, but <strong>cannot approve</strong> a proposal / hire /
+              Clearance on its own until you grant standing authority below.
+            </div>
+          )}
+          {!effectiveOn && grantedCount > 0 && (
+            <div className="banner" style={{ fontSize: 12, marginTop: 10 }}>
+              {grantedCount} standing-authority {grantedCount === 1 ? "grant is" : "grants are"} live, but
+              the loop is <strong>off</strong> — Prime has permission but is asleep. Turn it ON for the
+              grants to take effect.
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }

@@ -717,6 +717,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/spine/prime/standing-authority",
             get(spine::prime_standing_authority),
         )
+        // Prime Runtime Autonomy Switch (v1): turn the autonomous Prime loop
+        // on/off for the Guild at runtime (GET state / PUT {enabled}). Persisted
+        // tenant-scoped in the coordinator DB; role-gated; not an approval bypass.
+        .route(
+            "/v1/spine/prime/autonomy",
+            get(spine::prime_autonomy).put(spine::prime_autonomy_set),
+        )
         // Live Shift-Room status of a Prime work session: a dedicated
         // tenant-scoped SSE stream (preferred) + the polling snapshot (fallback).
         .route(

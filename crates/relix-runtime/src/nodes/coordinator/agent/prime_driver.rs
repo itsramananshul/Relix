@@ -35,9 +35,9 @@ use serde_json::{Value, json};
 use crate::dispatch::{HandlerOutcome, InvocationCtx};
 use crate::nodes::coordinator::TaskStore;
 use crate::nodes::coordinator::agent::handlers::{
-    ReadinessView, autonomous_approve_spawn_clearance, brief_status_row, compute_readiness,
-    handle_orchestrate, handle_prime_approve, handle_prime_start, handle_team_plan, internal,
-    invalid,
+    ReadinessView, autonomous_approve_spawn_clearance, brief_status_row, caller_is_operator,
+    compute_readiness, handle_orchestrate, handle_prime_approve, handle_prime_start,
+    handle_team_plan, internal, invalid, policy_denied,
 };
 use crate::nodes::coordinator::agent::prime;
 use crate::nodes::coordinator::agent::store::{AgentStore, StandingApprovalMatch};
@@ -87,6 +87,68 @@ pub const STANDING_AUTHORITY_CATEGORIES: &[&str] = &[
 /// Default safe Rig the autonomous hire-approve binds when
 /// `RELIX_AUTONOMOUS_PRIME_HIRE_RIG` is unset — the safe-local `echo` built-in.
 pub const DEFAULT_AUTONOMOUS_HIRE_RIG: &str = "echo";
+
+// ── PRIME RUNTIME AUTONOMY SWITCH (v1) ──────────────────────────────────────
+// The autonomous Prime *loop* (layer (a) above) was previously gated only by
+// the boot-time env `RELIX_AUTONOMOUS_PRIME`. The runtime switch lets an
+// operator turn the loop ON/OFF per Guild from the product at runtime — no
+// restart, no env edit — persisted in the coordinator's SpineStore. This is
+// emphatically NOT an approval bypass: turning the loop ON only wakes the
+// driver; each governed approval still requires its own live standing grant
+// (the categories above), and even the approved-work driver still goes through
+// the same governed handlers + budget hard-stop. The env var stays a GLOBAL
+// boot override: env ON ⇒ effective ON for every Guild (and the runtime OFF
+// control can only clear the persisted row, not override env until restart);
+// env OFF/unset ⇒ the persisted per-tenant setting decides.
+
+/// SpineStore `runtime_settings.key` for the per-Guild autonomous-Prime loop
+/// toggle. Generic table, one exposed key today.
+pub const RUNTIME_KEY_AUTONOMOUS_PRIME: &str = "autonomous_prime_enabled";
+
+/// The effective autonomous-Prime state for one Guild, given the global env
+/// override and the persisted per-tenant runtime setting. Pure + testable.
+/// Returns `(effective_enabled, source)` where `source` is `"env"` (env
+/// override wins), `"runtime"` (persisted tenant setting on), or `"off"`.
+pub fn effective_autonomy(env_enabled: bool, runtime_enabled: bool) -> (bool, &'static str) {
+    if env_enabled {
+        (true, "env")
+    } else if runtime_enabled {
+        (true, "runtime")
+    } else {
+        (false, "off")
+    }
+}
+
+/// What the dormant autonomous-Prime watcher should drive on a tick. Pure +
+/// testable so the controller loop carries no policy of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutonomyDrive {
+    /// Nothing to do this tick (env off and no Guild has the runtime toggle on).
+    Dormant,
+    /// Env override is ON — drive ALL Guilds (`autonomous_prime_tick(tenant=None)`),
+    /// exactly the legacy behaviour.
+    AllGuilds,
+    /// Env off but these specific Guilds have the runtime toggle on — drive each
+    /// under its OWN Guild (`tenant=Some(g)`), never a Guild whose toggle is off.
+    Tenants(Vec<String>),
+}
+
+/// Decide what the watcher drives this tick. The env override takes precedence
+/// (drive all Guilds); otherwise drive only the Guilds whose persisted runtime
+/// setting is on; an empty enabled set is dormant. A Guild whose runtime
+/// setting is off is NEVER driven unless the env override is on.
+pub fn plan_autonomy_drive(
+    env_enabled: bool,
+    runtime_enabled_tenants: Vec<String>,
+) -> AutonomyDrive {
+    if env_enabled {
+        AutonomyDrive::AllGuilds
+    } else if runtime_enabled_tenants.is_empty() {
+        AutonomyDrive::Dormant
+    } else {
+        AutonomyDrive::Tenants(runtime_enabled_tenants)
+    }
+}
 
 /// Whole seconds since the epoch — standing approvals store `expires_at` /
 /// compare `now` in **seconds** (`store::unix_now`), so a standing check must
@@ -910,6 +972,112 @@ pub fn handle_prime_standing_authority(
                  POST/DELETE /v1/agents/__relix_autonomous_prime__/standing-approvals.",
     });
     ok_json(&body)
+}
+
+/// Wire arg for `prime.autonomy_set`: the desired runtime ON/OFF state.
+#[derive(Debug, Deserialize)]
+struct AutonomySetArgs {
+    enabled: bool,
+}
+
+/// Read the live env-derived autonomous-Prime knobs (enabled / max / interval /
+/// hire Rig). Centralised so the read capability and the bridge surface one set
+/// of figures.
+fn env_autonomy_knobs() -> (bool, usize, u64, String) {
+    let env_enabled = crate::nodes::coordinator::heartbeat::parse_autonomous_prime_enabled(
+        std::env::var("RELIX_AUTONOMOUS_PRIME").ok().as_deref(),
+    );
+    let max = crate::nodes::coordinator::heartbeat::parse_autonomous_prime_max(
+        std::env::var("RELIX_AUTONOMOUS_PRIME_MAX").ok().as_deref(),
+    );
+    let interval = std::env::var("RELIX_AUTONOMOUS_PRIME_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(30);
+    (env_enabled, max, interval, configured_autonomous_hire_rig())
+}
+
+/// Build the autonomy-state JSON for the caller's Guild from the persisted
+/// runtime setting + the env override. Shared by the read capability and the
+/// mutation's response so a toggle returns the exact same shape a fresh read
+/// would. `runtime_enabled` is the persisted per-tenant value (default off).
+fn autonomy_state_json(runtime_enabled: bool) -> Value {
+    let (env_enabled, max, interval, hire_rig) = env_autonomy_knobs();
+    let (effective_enabled, source) = effective_autonomy(env_enabled, runtime_enabled);
+    json!({
+        "runtime_enabled": runtime_enabled,
+        "env_enabled": env_enabled,
+        "effective_enabled": effective_enabled,
+        "source": source,
+        "autonomous_prime_max": max,
+        "autonomous_prime_interval_secs": interval,
+        "hire_rig": hire_rig,
+        // The env var is a GLOBAL boot override: while it is set the loop runs
+        // for every Guild and the runtime OFF control can only clear the
+        // persisted row (effective stays ON until the env is changed + restart).
+        "env_override": env_enabled,
+        // Honest safety note: turning the loop ON is NOT an approval bypass.
+        "note": "Turning autonomous Prime ON only wakes the loop over already-approved work. \
+                 It never approves a governed gate on its own — each approval category still \
+                 requires a live standing grant (see Prime standing authority). When env \
+                 RELIX_AUTONOMOUS_PRIME is set it is a global override: the loop runs for every \
+                 Guild and this runtime toggle cannot fully disable it until the env is changed.",
+    })
+}
+
+/// `prime.autonomy_state` — READ-ONLY. The effective autonomous-Prime loop state
+/// for the caller's Guild: the persisted runtime toggle, the env override, the
+/// effective state + its source, plus the live max/interval/hire-Rig knobs and
+/// the standing-grant caveat. Tenant-scoped; mutates nothing; surfaces no
+/// secret.
+pub fn handle_prime_autonomy_state(
+    spine_store: &SpineStore,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let tenant = ctx.tenant_id_or_default();
+    let runtime_enabled = spine_store
+        .get_runtime_setting_bool(tenant, RUNTIME_KEY_AUTONOMOUS_PRIME)
+        .unwrap_or(None)
+        .unwrap_or(false);
+    ok_json(&autonomy_state_json(runtime_enabled))
+}
+
+/// `prime.autonomy_set` — turn the autonomous-Prime loop ON/OFF for the caller's
+/// Guild at runtime (no restart). Arg (JSON): `{"enabled": bool}`. Persists the
+/// tenant-scoped runtime setting in the SpineStore. ROLE-GATED to the
+/// Founder/Board (operator/admin) — a normal worker subject can never flip it.
+/// This is **not** an approval bypass: even ON, the loop only drives
+/// already-approved work, and each governed approval still needs its own live
+/// standing grant. When the env override is set, the persisted value is still
+/// written (so it takes effect if env is later cleared) but the response's
+/// `effective_enabled` honestly reflects that env keeps the loop ON.
+pub fn handle_prime_autonomy_set(spine_store: &SpineStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    // Same admin gate as other Board-only runtime controls (agent.create etc.):
+    // only an operator/admin caller may change a Guild's autonomy setting.
+    if !caller_is_operator(ctx) {
+        return policy_denied(
+            "prime.autonomy_set is operator/admin-only — a worker subject cannot toggle \
+             autonomous Prime"
+                .to_string(),
+        );
+    }
+    let args: AutonomySetArgs = match serde_json::from_slice(&ctx.args) {
+        Ok(a) => a,
+        Err(e) => return invalid(format!("prime.autonomy_set: bad args: {e}")),
+    };
+    let tenant = ctx.tenant_id_or_default();
+    let updated_by = ctx.caller.subject_id.to_string();
+    if let Err(e) = spine_store.set_runtime_setting_bool(
+        tenant,
+        RUNTIME_KEY_AUTONOMOUS_PRIME,
+        args.enabled,
+        &updated_by,
+    ) {
+        return internal(format!("prime.autonomy_set persist: {e}"));
+    }
+    // Return the fresh state (the persisted value we just wrote + env override).
+    ok_json(&autonomy_state_json(args.enabled))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2774,5 +2942,122 @@ mod tests {
             !active_of(CATEGORY_PROPOSAL_APPROVE),
             "revoking the row flips the read surface inactive"
         );
+    }
+
+    // ── PRIME RUNTIME AUTONOMY SWITCH (v1) ──────────────────────────────────
+
+    // Q) The pure effective-state resolver: env wins, else runtime, else off.
+    #[test]
+    fn effective_autonomy_resolves_source() {
+        assert_eq!(effective_autonomy(false, false), (false, "off"));
+        assert_eq!(effective_autonomy(false, true), (true, "runtime"));
+        assert_eq!(effective_autonomy(true, false), (true, "env"));
+        // Env override wins even if runtime is also on.
+        assert_eq!(effective_autonomy(true, true), (true, "env"));
+    }
+
+    // R) The pure drive planner: env → all guilds; else only the runtime-on
+    //    tenants; an empty enabled set is dormant. A runtime-off tenant is
+    //    NEVER driven unless env override is on.
+    #[test]
+    fn plan_autonomy_drive_decides_what_to_run() {
+        assert_eq!(plan_autonomy_drive(false, vec![]), AutonomyDrive::Dormant);
+        assert_eq!(
+            plan_autonomy_drive(false, vec!["acme".into(), "globex".into()]),
+            AutonomyDrive::Tenants(vec!["acme".into(), "globex".into()])
+        );
+        // Env override drives ALL guilds regardless of the runtime list.
+        assert_eq!(plan_autonomy_drive(true, vec![]), AutonomyDrive::AllGuilds);
+        assert_eq!(
+            plan_autonomy_drive(true, vec!["acme".into()]),
+            AutonomyDrive::AllGuilds
+        );
+    }
+
+    // S) The read capability defaults OFF and reflects a persisted ON, and the
+    //    setter persists + is tenant-scoped. (Env is unset in the test env, so
+    //    effective == runtime here.)
+    #[test]
+    fn autonomy_state_read_and_set_roundtrip() {
+        let (_, spine, _) = stores();
+
+        // Default: nothing persisted → off / source off.
+        let v = match handle_prime_autonomy_state(&spine, &fake_ctx_tenant(b"", "acme")) {
+            HandlerOutcome::Ok(b) => serde_json::from_slice::<Value>(&b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("state errored: {}", e.cause),
+        };
+        assert_eq!(v["runtime_enabled"], false);
+        assert_eq!(v["effective_enabled"], false);
+        assert_eq!(v["source"], "off");
+
+        // Turn it ON for acme.
+        let set = json!({ "enabled": true }).to_string();
+        let v = match handle_prime_autonomy_set(&spine, &fake_ctx_tenant(set.as_bytes(), "acme")) {
+            HandlerOutcome::Ok(b) => serde_json::from_slice::<Value>(&b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("set errored: {}", e.cause),
+        };
+        assert_eq!(v["runtime_enabled"], true);
+        assert_eq!(v["effective_enabled"], true);
+        assert_eq!(v["source"], "runtime");
+
+        // A fresh read of acme reflects ON; another Guild stays OFF (isolation).
+        let acme = match handle_prime_autonomy_state(&spine, &fake_ctx_tenant(b"", "acme")) {
+            HandlerOutcome::Ok(b) => serde_json::from_slice::<Value>(&b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("state errored: {}", e.cause),
+        };
+        assert_eq!(acme["runtime_enabled"], true);
+        let globex = match handle_prime_autonomy_state(&spine, &fake_ctx_tenant(b"", "globex")) {
+            HandlerOutcome::Ok(b) => serde_json::from_slice::<Value>(&b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("state errored: {}", e.cause),
+        };
+        assert_eq!(globex["runtime_enabled"], false);
+
+        // Turn it back OFF.
+        let off = json!({ "enabled": false }).to_string();
+        let v = match handle_prime_autonomy_set(&spine, &fake_ctx_tenant(off.as_bytes(), "acme")) {
+            HandlerOutcome::Ok(b) => serde_json::from_slice::<Value>(&b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("set errored: {}", e.cause),
+        };
+        assert_eq!(v["runtime_enabled"], false);
+        assert_eq!(v["source"], "off");
+    }
+
+    // T) The setter is role-gated: a worker subject cannot flip it.
+    #[test]
+    fn autonomy_set_is_operator_only() {
+        let (_, spine, _) = stores();
+        let set = json!({ "enabled": true }).to_string();
+        let out = handle_prime_autonomy_set(
+            &spine,
+            &fake_ctx_with_role(set.as_bytes(), "agent", b"worker"),
+        );
+        match out {
+            HandlerOutcome::Err(e) => {
+                assert_eq!(e.kind, relix_core::types::error_kinds::POLICY_DENIED)
+            }
+            HandlerOutcome::Ok(_) => panic!("a worker must not toggle autonomy"),
+        }
+        // And nothing was persisted.
+        assert_eq!(
+            spine
+                .get_runtime_setting_bool("default", RUNTIME_KEY_AUTONOMOUS_PRIME)
+                .unwrap(),
+            None
+        );
+    }
+
+    // U) A malformed body is a clean invalid-args refusal (→ 400 at the bridge),
+    //    not a panic or a silent default.
+    #[test]
+    fn autonomy_set_rejects_malformed_body() {
+        let (_, spine, _) = stores();
+        let out =
+            handle_prime_autonomy_set(&spine, &fake_ctx_with_role(b"not json", "operator", b"c"));
+        match out {
+            HandlerOutcome::Err(e) => {
+                assert_eq!(e.kind, relix_core::types::error_kinds::INVALID_ARGS)
+            }
+            HandlerOutcome::Ok(_) => panic!("malformed body must be refused"),
+        }
     }
 }

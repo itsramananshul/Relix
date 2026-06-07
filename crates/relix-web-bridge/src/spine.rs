@@ -1970,6 +1970,38 @@ pub async fn prime_standing_authority(
     json_passthrough(call_peer(&state, "prime.standing_authority", b"").await?)
 }
 
+/// `GET /v1/spine/prime/autonomy` — READ-ONLY effective state of the autonomous
+/// Prime LOOP for the caller's Guild: the persisted runtime toggle, the env
+/// override, the effective state + source, and the live max/interval/hire-Rig
+/// knobs. Tenant-scoped; mutates nothing.
+pub async fn prime_autonomy(
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    json_passthrough(call_peer(&state, "prime.autonomy_state", b"").await?)
+}
+
+/// Body for the runtime autonomy toggle: the desired ON/OFF state.
+#[derive(Debug, Deserialize)]
+pub struct AutonomySetRequest {
+    pub enabled: bool,
+}
+
+/// `PUT /v1/spine/prime/autonomy` — turn the autonomous Prime loop ON/OFF for
+/// the caller's Guild at runtime (no restart). Body `{ "enabled": bool }`.
+/// Proxies `prime.autonomy_set`, which persists the tenant-scoped runtime
+/// setting. Role-gated to the Founder/Board on the coordinator: a denial maps to
+/// **403** (via `coordinator_err_status`); a malformed body is **400** (the JSON
+/// extractor / the coordinator's invalid-args). NOT an approval bypass — even
+/// ON, the loop only drives already-approved work and each governed approval
+/// still needs a live standing grant.
+pub async fn prime_autonomy_set(
+    State(state): State<AppState>,
+    Json(req): Json<AutonomySetRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let arg = serde_json::json!({ "enabled": req.enabled }).to_string();
+    json_passthrough(call_peer(&state, "prime.autonomy_set", arg.as_bytes()).await?)
+}
+
 /// `GET /v1/maintenance/summary` — operator storage + run-ledger overview
 /// (workspace count/bytes, run/event/artifact counts, warnings). Bounded,
 /// no secrets. Auth-gated by the bridge middleware like every `/v1/*`.

@@ -4313,7 +4313,7 @@ pub(crate) fn caller_is_operator(ctx: &InvocationCtx) -> bool {
 }
 
 /// Build a `POLICY_DENIED` outcome with a readable cause.
-fn policy_denied(cause: String) -> HandlerOutcome {
+pub(crate) fn policy_denied(cause: String) -> HandlerOutcome {
     HandlerOutcome::Err(ErrorEnvelope {
         kind: error_kinds::POLICY_DENIED,
         cause,
