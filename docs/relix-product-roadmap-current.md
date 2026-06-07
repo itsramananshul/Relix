@@ -138,6 +138,12 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
   allowlist (deny-by-default), instruction-bundle-as-charter.
 - **Allowance hard-stop** — heartbeat refuses a Brief when the Operative is over Allowance
   (trailing-30-day, best-effort); `brief.budget_refused` event.
+- **Guild spend hard-stop (autonomous)** — the autonomous heartbeat path now also
+  refuses a Brief when its **Guild** is over its monthly budget, mirroring the
+  per-Operative stop and additive on top of it (`guild.budget_refused` event,
+  `over_guild_budget` refused run). Tenant-safe: the Guild spend is summed over
+  only the Brief's own Guild's active Operatives (`company-model §6/§6.6`). Manual
+  `brief.run` / `prime.start` stay sovereign (no Guild gate).
 - **Tenant isolation** — product agent/governance routes are tenant-scoped; a known id from
   another Guild resolves not-found.
 - **Chronicle** — hash-chained events for every run transition, interaction, and Prime
@@ -189,10 +195,15 @@ ledger entry or design section.
    terminal evidence*** — see §5 slice 10 (`execution §1.4`/`§7.1` LOCKED; ledger "Claim HTTP
    409 + per-Operative start lock + duplicate-start guard" = DONE, "stale-run adoption" =
    PARTIAL).
-2. **[BE] Guild-level spend hard-stop** — only per-Operative Allowance is enforced; the
-   Guild cap is **alert-only** today (`company-model §6.6`; ledger "Operative Allowance" &
-   "Action Center" = PARTIAL). Manual `brief.run` is intentionally *not* Allowance-gated
-   (operator sovereign) — documented, but the Guild ceiling should still bind autonomous spend.
+2. **[BE] Guild-level spend hard-stop** — **SHIPPED for autonomous dispatch** (roadmap §5
+   slice 2): the heartbeat path now refuses a Brief when its Guild is over its monthly
+   budget, mirroring the per-Operative hard-stop and additive on top of it
+   (`guild.budget_refused` / `over_guild_budget`), tenant-safe (the Guild spend is summed
+   over only the Brief's own Guild). Manual `brief.run` / `prime.start` stay sovereign
+   (operator-initiated, no Guild gate). *Remaining (deferred, see §3 P1.3 / §5 slice 9-10):*
+   the spend window is trailing-30-day (not calendar-month with reset), and there is still
+   no issue-tree cost rollup or billing-code attribution (`company-model §6.6`; ledger
+   "Guild-level spend hard-stop (autonomous)" = DONE).
 3. **[BE] Allowance windowing** — trailing-30-day approximates the doc's calendar-month
    window; no reset bookkeeping, no issue-tree cost rollup, no billing-code attribution.
 
@@ -273,11 +284,35 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    `git diff --check` clean. *Remaining of this Claim line → slice 10 (stale-run adoption by
    terminal evidence).*
 
-2. **Guild-level spend hard-stop (autonomous)** — `company-model.md §6.6`.
-   *Files:* `action_center.rs`, heartbeat dispatch in coordinator, `spine.rs`. *Adds:* a
-   Guild-cap gate on the autonomous path mirroring the per-Operative hard-stop; honest event
-   (`guild.budget_refused`). *Test:* over-Guild-cap autonomous Brief is refused; manual run
-   stays sovereign. *Verify:* `cargo test`; ledger entry updated PARTIAL→DONE-for-autonomous.
+2. **Guild-level spend hard-stop (autonomous)** — `company-model.md §6/§6.6`.
+   **✅ DONE.** *Files changed:* `crates/relix-runtime/src/nodes/coordinator/heartbeat.rs`
+   (the pure `guild_allowance_admits` verdict; `BudgetAdmission::Refuse` now carries the
+   Chronicle `event` + refused-run `status` so a Guild stop reads `guild.budget_refused` /
+   `over_guild_budget` and a per-Operative stop reads `brief.budget_refused` /
+   `over_allowance`; `dispatch_budget_admits` composing per-Operative-then-Guild,
+   tenant-safe; the dispatch path uses the carried event/status; tests),
+   `crates/relix-runtime/src/controller_runtime.rs` (the live heartbeat `admit_budget`
+   closure now calls `dispatch_budget_admits` with the SpineStore + metrics + the Brief's
+   own Guild), `crates/relix-runtime/src/nodes/coordinator/mod.rs` (`TaskStore::task_tenant`
+   made `pub` so the gate resolves a Brief's Guild without leaking another tenant's spend),
+   `crates/relix-runtime/src/nodes/coordinator/agent/action_center.rs` (the "Guild spend over
+   budget" card copy now states the autonomous dispatch gate refuses; manual runs sovereign).
+   *Adds:* a Guild-cap gate on the autonomous path mirroring the per-Operative hard-stop and
+   **additive** to it (per-Operative enforcement unchanged + authoritative); honest distinct
+   event (`guild.budget_refused`). *Why additive + precedence:* the per-Operative gate bounds
+   one Operative, the Guild gate bounds the whole Guild's autonomous spend so a fleet of
+   in-budget Operatives can't collectively overrun the company ceiling; a per-Operative
+   refusal takes precedence and is never weakened. *Tenant isolation:* the Guild spend is the
+   sum of the Brief's OWN Guild's active Operatives' trailing-30-day `cost_since` (never a
+   cross-tenant `cost_since(None, …)`) — the same figure + window the Action Center reports.
+   *Pinned:* over-Guild-budget autonomous Brief refused + parked + chronicled as
+   `guild.budget_refused`; under-budget / no-budget allowed; per-Operative stop takes
+   precedence; cross-tenant spend does not trip another Guild's cap; manual `preflight_run`
+   stays sovereign for the same over-budget Brief. *Verified:* full `cargo test -p
+   relix-runtime` green (3944 lib tests, +6); `cargo check` clean; `cargo clippy` clean on the
+   touched code (2 pre-existing unrelated warnings only); `git diff --check` clean. *Remaining
+   spend caveats (deferred):* trailing-30-day window (not calendar-month with reset → slice 9);
+   no issue-tree cost rollup / billing-code attribution (`company-model §6.6` → slice 10).
 
 3. **The Lattice org-chart view** — `dashboard-design.md §9`.
    *Files:* new `apps/dashboard/src/pages/Lattice.tsx` (or extend Agents.tsx), `nav.ts`;

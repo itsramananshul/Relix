@@ -10573,6 +10573,12 @@ fn register_node_type_handlers(
             // disabled, in which case only an explicit zero Allowance
             // hard-stops (a positive cap can't be spend-checked).
             let metrics_query = metrics.map(|m| m.query.clone());
+            // SpineStore for the Guild-level budget hard-stop on the autonomous
+            // path (relix-company-model §6.6): resolve a Brief's Guild + its
+            // monthly budget. `None` when the SpineStore failed to open, in
+            // which case the Guild gate is inert (per-Operative Allowance still
+            // enforced).
+            let spine_store_hb = spine_store_for_agent_caps.clone();
             // Per-run bridge-back tokens the dispatch loop mints +
             // injects so a running agent can call Relix's API back.
             let bridge_tokens = crate::rig::bridge::BridgeTokenStore::global();
@@ -10586,10 +10592,13 @@ fn register_node_type_handlers(
                     let reg = registry.clone();
                     let bt = bridge_tokens.clone();
                     let mq = metrics_query.clone();
+                    let spine = spine_store_hb.clone();
                     let outcome = tokio::task::spawn_blocking(move || {
                         let ags_for_timer = ags.clone();
                         let ags_for_caps = ags.clone();
                         let ags_for_budget = ags.clone();
+                        let ts_for_budget = ts.clone();
+                        let spine_for_budget = spine.clone();
                         crate::nodes::coordinator::heartbeat::dispatch_batch_with_policy(
                             &ts,
                             batch,
@@ -10646,42 +10655,26 @@ fn register_node_type_handlers(
                             // monthly Allowance or explicitly hard-stopped
                             // (allowance = 0). Spend is the Operative's
                             // trailing-30-day cost from the metrics ledger.
+                            // Autonomous budget gate (relix-company-model
+                            // §3.6/§5.2D per-Operative Allowance + §6.6 Guild
+                            // budget): the per-Operative hard-stop is authoritative
+                            // and the Guild ceiling is ADDITIVE on top of it. Both
+                            // read the SAME metrics ledger + trailing-30-day window
+                            // the Action Center reports, and the Guild spend is
+                            // summed ONLY over the Brief's own Guild (tenant-safe).
                             move |card| {
-                                use crate::nodes::coordinator::heartbeat::{
-                                    allowance_admits, BudgetAdmission,
-                                };
-                                let Some(assignee) = card.assignee_agent_id.as_deref() else {
-                                    return BudgetAdmission::Allow;
-                                };
-                                let Some(agent) =
-                                    ags_for_budget.get_agent(assignee).ok().flatten()
-                                else {
-                                    return BudgetAdmission::Allow;
-                                };
-                                let cap = agent.monthly_allowance_cents;
-                                if cap.is_none() {
-                                    return BudgetAdmission::Allow;
-                                }
-                                let since_ms = std::time::SystemTime::now()
+                                let now_ms = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_millis() as i64)
-                                    .unwrap_or(0)
-                                    - 30 * 86_400 * 1000;
-                                let spend = mq
-                                    .as_ref()
-                                    .and_then(|q| q.cost_since(Some(assignee), since_ms).ok())
                                     .unwrap_or(0);
-                                match allowance_admits(cap, spend) {
-                                    BudgetAdmission::Allow => BudgetAdmission::Allow,
-                                    BudgetAdmission::Refuse { reason } => {
-                                        BudgetAdmission::Refuse {
-                                            reason: format!(
-                                                "budget_refused: agent_id={assignee} allowance={}c used={spend}u reason={reason}",
-                                                cap.unwrap_or(0)
-                                            ),
-                                        }
-                                    }
-                                }
+                                crate::nodes::coordinator::heartbeat::dispatch_budget_admits(
+                                    card,
+                                    &ts_for_budget,
+                                    &ags_for_budget,
+                                    spine_for_budget.as_deref(),
+                                    mq.as_ref(),
+                                    now_ms,
+                                )
                             },
                             |card| {
                                 let assignee = card.assignee_agent_id.as_deref()?;

@@ -1252,8 +1252,10 @@ impl TaskStore {
     }
 
     /// The Brief's own Guild/tenant (`COALESCE(tenant_id,'default')`), or
-    /// `None` when the Brief doesn't exist.
-    fn task_tenant(&self, task: &str) -> Result<Option<String>, CoordinatorError> {
+    /// `None` when the Brief doesn't exist. `pub` so the autonomous dispatch
+    /// gate (`controller_runtime` heartbeat) can resolve a Brief's Guild for the
+    /// Guild-budget hard-stop without leaking another tenant's spend.
+    pub fn task_tenant(&self, task: &str) -> Result<Option<String>, CoordinatorError> {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         conn.query_row(
             "SELECT COALESCE(tenant_id, 'default') FROM tasks WHERE task_id = ?1",

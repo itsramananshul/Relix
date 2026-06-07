@@ -120,10 +120,27 @@ pub struct DispatchRecord {
 pub enum BudgetAdmission {
     /// The Operative may run this Brief.
     Allow,
-    /// The Operative is over budget / hard-stopped. `reason` is the
-    /// operator-facing explanation chronicled on the Brief.
-    Refuse { reason: String },
+    /// The Operative (per-Operative Allowance) or the whole Guild (Guild
+    /// budget) is over budget / hard-stopped. `reason` is the operator-facing
+    /// explanation chronicled on the Brief; `event` is the Chronicle event type
+    /// recorded on refusal and `status` the durable refused-run status — these
+    /// distinguish a per-Operative Allowance stop (`brief.budget_refused` /
+    /// `over_allowance`) from a Guild-budget stop (`guild.budget_refused` /
+    /// `over_guild_budget`) in run history and the Action Center.
+    Refuse {
+        reason: String,
+        event: &'static str,
+        status: &'static str,
+    },
 }
+
+/// Chronicle event + refused-run status for a **per-Operative** Allowance stop.
+pub const OPERATIVE_BUDGET_EVENT: &str = "brief.budget_refused";
+pub const OPERATIVE_BUDGET_STATUS: &str = "over_allowance";
+/// Chronicle event + refused-run status for a **Guild-level** budget stop
+/// (relix-company-model §6.6 / §3.6 — the Guild ceiling binds autonomous spend).
+pub const GUILD_BUDGET_EVENT: &str = "guild.budget_refused";
+pub const GUILD_BUDGET_STATUS: &str = "over_guild_budget";
 
 /// One US cent expressed in micro-USD (the metrics cost unit).
 pub const MICROS_PER_CENT: u64 = 10_000;
@@ -145,6 +162,8 @@ pub fn allowance_admits(allowance_cents: Option<i64>, spend_micros: u64) -> Budg
         None => BudgetAdmission::Allow,
         Some(c) if c <= 0 => BudgetAdmission::Refuse {
             reason: "allowance=0 (hard-stopped)".to_string(),
+            event: OPERATIVE_BUDGET_EVENT,
+            status: OPERATIVE_BUDGET_STATUS,
         },
         Some(c) => {
             let cap_micros = (c as u64).saturating_mul(MICROS_PER_CENT);
@@ -153,11 +172,158 @@ pub fn allowance_admits(allowance_cents: Option<i64>, spend_micros: u64) -> Budg
                     reason: format!(
                         "over monthly allowance (used {spend_micros}u >= cap {cap_micros}u)"
                     ),
+                    event: OPERATIVE_BUDGET_EVENT,
+                    status: OPERATIVE_BUDGET_STATUS,
                 }
             } else {
                 BudgetAdmission::Allow
             }
         }
+    }
+}
+
+/// Pure **Guild-level** monthly budget verdict for the AUTONOMOUS dispatch path
+/// (relix-company-model §6.6 "Cost rollup & attribution" + §3.6 "Budgets" + §5.4
+/// the Board sets budgets). The per-Operative gate ([`allowance_admits`]) bounds
+/// ONE Operative; this gate bounds the WHOLE Guild's autonomous spend so a fleet
+/// of individually-in-budget Operatives can't collectively blow past the company
+/// ceiling. It is **additive** — the dispatch gate applies it only after the
+/// per-Operative check allows.
+///
+/// - `budget_cents`: the Guild's configured monthly budget
+///   (`Guild.monthly_allowance_cents`). `None` or `<= 0` = **no Guild cap set**,
+///   so this gate allows — matching the Action Center, which only surfaces a
+///   Guild budget signal when the budget is positive (a `0` here means "unset",
+///   NOT a company-wide hard-stop; that deliberately differs from the
+///   per-Operative `0` = hard-stop, because the Guild budget is an Option whose
+///   "unset" sentinel is `None`/`0`).
+/// - `guild_spend_micros`: the Guild's trailing-30-day spend in micro-USD — the
+///   SUM of THIS Guild's active Operatives' `cost_since` (never a cross-tenant
+///   `cost_since(None, …)`), the exact figure the Action Center's
+///   `company_spend_item` reports.
+///
+/// A positive budget refuses once Guild spend reaches it (`>=`), mirroring the
+/// per-Operative `over_allowance` threshold. Binds AUTONOMOUS dispatch only — a
+/// manual operator `brief.run` / `prime.start` never passes through this gate
+/// (the Board is sovereign).
+pub fn guild_allowance_admits(
+    budget_cents: Option<i64>,
+    guild_spend_micros: u64,
+) -> BudgetAdmission {
+    match budget_cents {
+        None => BudgetAdmission::Allow,
+        Some(c) if c <= 0 => BudgetAdmission::Allow,
+        Some(c) => {
+            let cap_micros = (c as u64).saturating_mul(MICROS_PER_CENT);
+            if guild_spend_micros >= cap_micros {
+                BudgetAdmission::Refuse {
+                    reason: format!(
+                        "over Guild budget (Guild used {guild_spend_micros}u >= cap {cap_micros}u)"
+                    ),
+                    event: GUILD_BUDGET_EVENT,
+                    status: GUILD_BUDGET_STATUS,
+                }
+            } else {
+                BudgetAdmission::Allow
+            }
+        }
+    }
+}
+
+/// Compose the autonomous-dispatch budget gate for one Brief: the per-Operative
+/// Allowance hard-stop ([`allowance_admits`], authoritative and unchanged)
+/// followed by the **additive** Guild-budget hard-stop ([`guild_allowance_admits`],
+/// relix-company-model §6.6). The Guild gate runs only when the per-Operative
+/// gate allows, so it can never weaken per-Operative enforcement.
+///
+/// **Tenant isolation:** the Guild spend is the SUM of the Brief's OWN Guild's
+/// active Operatives' trailing-30-day `cost_since` (resolved via
+/// `task_tenant` → `list_active_for_tenant`), never a cross-tenant
+/// `cost_since(None, …)` — so another Guild's spend can never trip this Guild's
+/// cap. This mirrors the Action Center's `company_spend_item` exactly.
+///
+/// `now_ms` is wall-clock unix-ms (the caller passes it so the function stays
+/// deterministic in tests). When `spine`/`metrics` is `None`, the Guild gate is
+/// inert (the per-Operative gate is still applied). Used ONLY on the autonomous
+/// path — a manual `brief.run` / `prime.start` never calls this (the Board is
+/// sovereign).
+pub fn dispatch_budget_admits(
+    card: &brief::BriefCard,
+    task_store: &TaskStore,
+    agent_store: &crate::nodes::coordinator::agent::store::AgentStore,
+    spine: Option<&crate::nodes::coordinator::spine::SpineStore>,
+    metrics: Option<&crate::metrics::MetricsQuery>,
+    now_ms: i64,
+) -> BudgetAdmission {
+    let Some(assignee) = card.assignee_agent_id.as_deref() else {
+        return BudgetAdmission::Allow;
+    };
+    let since_ms = now_ms - 30 * 86_400 * 1000;
+
+    // (1) Per-Operative Allowance hard-stop — authoritative, never weakened.
+    if let Some(agent) = agent_store.get_agent(assignee).ok().flatten() {
+        let cap = agent.monthly_allowance_cents;
+        if cap.is_some() {
+            let spend = metrics
+                .and_then(|q| q.cost_since(Some(assignee), since_ms).ok())
+                .unwrap_or(0);
+            if let BudgetAdmission::Refuse {
+                reason,
+                event,
+                status,
+            } = allowance_admits(cap, spend)
+            {
+                return BudgetAdmission::Refuse {
+                    reason: format!(
+                        "budget_refused: agent_id={assignee} allowance={}c used={spend}u reason={reason}",
+                        cap.unwrap_or(0)
+                    ),
+                    event,
+                    status,
+                };
+            }
+        }
+    }
+
+    // (2) Guild-level budget hard-stop — additive, tenant-scoped.
+    let (Some(spine), Some(metrics)) = (spine, metrics) else {
+        return BudgetAdmission::Allow;
+    };
+    // The Brief's OWN Guild — so the spend sum below stays tenant-isolated.
+    let Ok(Some(tenant)) = task_store.task_tenant(&card.task_id) else {
+        return BudgetAdmission::Allow;
+    };
+    let budget = spine
+        .get_guild(&tenant)
+        .ok()
+        .flatten()
+        .and_then(|g| g.monthly_allowance_cents)
+        .filter(|b| *b > 0);
+    let Some(budget) = budget else {
+        return BudgetAdmission::Allow;
+    };
+    let mut guild_spend: u64 = 0;
+    if let Ok(actives) = agent_store.list_active_for_tenant(&tenant) {
+        for a in &actives {
+            if let Ok(used) = metrics.cost_since(Some(&a.agent_id), since_ms) {
+                guild_spend = guild_spend.saturating_add(used);
+            }
+        }
+    }
+    match guild_allowance_admits(Some(budget), guild_spend) {
+        BudgetAdmission::Allow => BudgetAdmission::Allow,
+        BudgetAdmission::Refuse {
+            reason,
+            event,
+            status,
+        } => BudgetAdmission::Refuse {
+            reason: format!(
+                "guild_budget_refused: tenant={tenant} brief={} assignee={assignee} budget={budget}c guild_used={guild_spend}u reason={reason}",
+                card.task_id
+            ),
+            event,
+            status,
+        },
     }
 }
 
@@ -254,21 +420,30 @@ where
         // and do NOT silently skip — park it in `blocked` (visible to
         // the operator), chronicle WHY, finish the wakeup, and release
         // the Claim so the lease is not leaked.
-        if let BudgetAdmission::Refuse { reason } = admit_budget(&card) {
+        if let BudgetAdmission::Refuse {
+            reason,
+            event,
+            status,
+        } = admit_budget(&card)
+        {
             // `todo -> blocked` is illegal; mirror the dispatch path's
             // `todo -> in_progress -> blocked` so the park is valid.
             if card.board_status == "todo" {
                 store.set_board_status(&card.task_id, "in_progress")?;
             }
             store.set_board_status(&card.task_id, "blocked")?;
-            let _ = store.append_event(&card.task_id, "brief.budget_refused", &reason);
+            // `event` distinguishes the per-Operative Allowance stop
+            // (`brief.budget_refused`) from the Guild-budget stop
+            // (`guild.budget_refused`) so the Chronicle / Action Center reads
+            // honestly which ceiling refused the autonomous run.
+            let _ = store.append_event(&card.task_id, event, &reason);
             // Durable refused Shift so latest_run / run history explain WHY the
             // autonomous run didn't happen (no Rig resolved yet → empty).
             let _ = store.record_refused_run(
                 &card.task_id,
                 card.assignee_agent_id.as_deref().unwrap_or(""),
                 "",
-                "over_allowance",
+                status,
                 &reason,
                 "heartbeat",
             );
@@ -2557,6 +2732,8 @@ mod tests {
                         reason: "budget_refused: agent_id=agt_broke allowance=0c used=0u \
                                  reason=allowance=0 (hard-stopped)"
                             .to_string(),
+                        event: OPERATIVE_BUDGET_EVENT,
+                        status: OPERATIVE_BUDGET_STATUS,
                     }
                 } else {
                     BudgetAdmission::Allow
@@ -2607,6 +2784,344 @@ mod tests {
             s.board_status(&allowed).unwrap().as_deref(),
             Some("in_review")
         );
+    }
+
+    // ── Guild-level budget hard-stop (autonomous) — company-model §6.6 ──
+
+    #[test]
+    fn guild_allowance_admits_pure_verdicts() {
+        // No Guild budget set → no cap → allow (mirrors the Action Center,
+        // which only surfaces a Guild signal for a positive budget). A `0`/
+        // negative budget is "unset" here (NOT a company-wide hard-stop — that
+        // deliberately differs from the per-Operative `0` = hard-stop).
+        assert_eq!(
+            guild_allowance_admits(None, 999_999_999),
+            BudgetAdmission::Allow
+        );
+        assert_eq!(guild_allowance_admits(Some(0), 0), BudgetAdmission::Allow);
+        assert_eq!(
+            guild_allowance_admits(Some(-5), 999_999),
+            BudgetAdmission::Allow
+        );
+        // Positive budget: 100 cents = 1_000_000 micro-USD. Under → allow.
+        assert_eq!(
+            guild_allowance_admits(Some(100), 999_999),
+            BudgetAdmission::Allow
+        );
+        // At/over the budget → refuse, tagged as the Guild stop.
+        match guild_allowance_admits(Some(100), 1_000_000) {
+            BudgetAdmission::Refuse {
+                event, status, ..
+            } => {
+                assert_eq!(event, GUILD_BUDGET_EVENT);
+                assert_eq!(status, GUILD_BUDGET_STATUS);
+            }
+            other => panic!("expected Guild refusal, got {other:?}"),
+        }
+        assert!(matches!(
+            guild_allowance_admits(Some(100), 5_000_000),
+            BudgetAdmission::Refuse { .. }
+        ));
+    }
+
+    /// A priced AI invocation row attributed to `agent_id` in `tenant` — the
+    /// dispatch gate / Action Center count cost by the Operative's `agent_id`
+    /// (`agent_name` must equal `agent_id`) within the trailing-30d window.
+    fn guild_spend_row(
+        agent_id: &str,
+        tenant: &str,
+        ts_ms: i64,
+        cost_micros: u64,
+    ) -> crate::metrics::InvocationMetric {
+        crate::metrics::InvocationMetric {
+            agent_name: agent_id.to_string(),
+            tenant_id: tenant.to_string(),
+            peer_alias: "coord".to_string(),
+            method: "ai.chat".to_string(),
+            timestamp_ms: ts_ms,
+            latency_ms: 10,
+            success: true,
+            error_kind: None,
+            token_count: Some(100),
+            cost_micros: Some(cost_micros),
+            input_bytes: 0,
+            output_bytes: 0,
+            model: Some("mock".to_string()),
+            confidence_score: None,
+            routing_tier: None,
+            request_id: None,
+        }
+    }
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    /// A Brief assigned to `assignee` in Guild `tenant`, ready to run.
+    fn ready_brief_in_tenant(s: &TaskStore, title: &str, assignee: &str, tenant: &str) -> String {
+        let id = ready_brief(s, title, assignee);
+        s.set_task_tenant(&id, tenant).unwrap();
+        id
+    }
+
+    #[test]
+    fn dispatch_budget_admits_refuses_over_guild_budget_but_allows_under_it() {
+        use crate::nodes::coordinator::agent::store::AgentStore;
+        use crate::nodes::coordinator::spine::SpineStore;
+        let s = store();
+        let agents = AgentStore::in_memory().unwrap();
+        let spine = SpineStore::in_memory().unwrap();
+
+        // One active Operative in guild-a with NO per-Operative Allowance (so the
+        // per-Operative gate allows — the Guild gate is the decider).
+        let eng = agents
+            .ensure_starter_operative("engineer", "Eng A", "Operative", "echo", "guild-a")
+            .unwrap()
+            .0;
+        let brief = ready_brief_in_tenant(&s, "work", &eng, "guild-a");
+        let card = s.brief_card(&brief).unwrap().unwrap();
+
+        // Guild budget $200; the Guild has spent $250 → over.
+        spine.set_guild_allowance("guild-a", Some(20_000)).unwrap();
+        let mstore = crate::metrics::MetricsStore::in_memory().unwrap();
+        mstore
+            .insert_batch(&[guild_spend_row(&eng, "guild-a", now_ms() - 1_000, 250_000_000)])
+            .unwrap();
+        let mq = crate::metrics::MetricsQuery::new(mstore);
+
+        match dispatch_budget_admits(&card, &s, &agents, Some(&spine), Some(&mq), now_ms()) {
+            BudgetAdmission::Refuse {
+                event,
+                status,
+                reason,
+            } => {
+                assert_eq!(event, GUILD_BUDGET_EVENT, "tagged as the Guild stop");
+                assert_eq!(status, GUILD_BUDGET_STATUS);
+                assert!(reason.contains("guild_budget_refused"), "reason: {reason}");
+                assert!(reason.contains("guild-a"), "names the Guild: {reason}");
+            }
+            other => panic!("expected an over-Guild-budget refusal, got {other:?}"),
+        }
+
+        // Raise the budget above spend → the SAME autonomous dispatch is allowed.
+        spine.set_guild_allowance("guild-a", Some(1_000_000)).unwrap();
+        assert_eq!(
+            dispatch_budget_admits(&card, &s, &agents, Some(&spine), Some(&mq), now_ms()),
+            BudgetAdmission::Allow,
+            "under the Guild budget, autonomous dispatch runs as before"
+        );
+
+        // No Guild budget set at all → no cap → allow.
+        spine.set_guild_allowance("guild-a", None).unwrap();
+        assert_eq!(
+            dispatch_budget_admits(&card, &s, &agents, Some(&spine), Some(&mq), now_ms()),
+            BudgetAdmission::Allow,
+        );
+    }
+
+    #[test]
+    fn dispatch_budget_admits_per_operative_stop_takes_precedence_over_guild() {
+        use crate::nodes::coordinator::agent::store::AgentStore;
+        use crate::nodes::coordinator::spine::SpineStore;
+        let s = store();
+        let agents = AgentStore::in_memory().unwrap();
+        let spine = SpineStore::in_memory().unwrap();
+
+        let eng = agents
+            .ensure_starter_operative("engineer", "Eng A", "Operative", "echo", "guild-a")
+            .unwrap()
+            .0;
+        // Per-Operative Allowance $1 (100c) — the Operative is itself over.
+        agents.update_agent_field(&eng, "allowance", "100").unwrap();
+        let brief = ready_brief_in_tenant(&s, "work", &eng, "guild-a");
+        let card = s.brief_card(&brief).unwrap().unwrap();
+
+        // BOTH the Operative AND the Guild are over budget.
+        spine.set_guild_allowance("guild-a", Some(20_000)).unwrap();
+        let mstore = crate::metrics::MetricsStore::in_memory().unwrap();
+        mstore
+            .insert_batch(&[guild_spend_row(&eng, "guild-a", now_ms() - 1_000, 250_000_000)])
+            .unwrap();
+        let mq = crate::metrics::MetricsQuery::new(mstore);
+
+        // The per-Operative stop wins (authoritative, never weakened): the
+        // refusal is tagged `brief.budget_refused` / `over_allowance`, not the
+        // Guild stop.
+        match dispatch_budget_admits(&card, &s, &agents, Some(&spine), Some(&mq), now_ms()) {
+            BudgetAdmission::Refuse { event, status, .. } => {
+                assert_eq!(event, OPERATIVE_BUDGET_EVENT);
+                assert_eq!(status, OPERATIVE_BUDGET_STATUS);
+            }
+            other => panic!("expected a per-Operative refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_budget_admits_is_tenant_isolated() {
+        use crate::nodes::coordinator::agent::store::AgentStore;
+        use crate::nodes::coordinator::spine::SpineStore;
+        let s = store();
+        let agents = AgentStore::in_memory().unwrap();
+        let spine = SpineStore::in_memory().unwrap();
+
+        // guild-a: an Operative that has blown the SHARED metrics ledger.
+        let eng_a = agents
+            .ensure_starter_operative("engineer", "Eng A", "Operative", "echo", "guild-a")
+            .unwrap()
+            .0;
+        // guild-b: its own Operative with NO spend.
+        let eng_b = agents
+            .ensure_starter_operative("engineer", "Eng B", "Operative", "echo", "guild-b")
+            .unwrap()
+            .0;
+        let brief_b = ready_brief_in_tenant(&s, "work-b", &eng_b, "guild-b");
+        let card_b = s.brief_card(&brief_b).unwrap().unwrap();
+
+        // BOTH Guilds have a $200 budget; only guild-a has spent ($250).
+        spine.set_guild_allowance("guild-a", Some(20_000)).unwrap();
+        spine.set_guild_allowance("guild-b", Some(20_000)).unwrap();
+        let mstore = crate::metrics::MetricsStore::in_memory().unwrap();
+        mstore
+            .insert_batch(&[guild_spend_row(&eng_a, "guild-a", now_ms() - 1_000, 250_000_000)])
+            .unwrap();
+        let mq = crate::metrics::MetricsQuery::new(mstore);
+
+        // guild-b's Brief is NOT tripped by guild-a's spend — the Guild sum is
+        // computed over guild-b's OWN active Operatives only (never cross-tenant).
+        assert_eq!(
+            dispatch_budget_admits(&card_b, &s, &agents, Some(&spine), Some(&mq), now_ms()),
+            BudgetAdmission::Allow,
+            "another Guild's spend must not trip this Guild's cap"
+        );
+
+        // Sanity: guild-a's own Brief IS refused (proves the spend is real, not
+        // simply invisible everywhere).
+        let brief_a = ready_brief_in_tenant(&s, "work-a", &eng_a, "guild-a");
+        let card_a = s.brief_card(&brief_a).unwrap().unwrap();
+        assert!(matches!(
+            dispatch_budget_admits(&card_a, &s, &agents, Some(&spine), Some(&mq), now_ms()),
+            BudgetAdmission::Refuse { .. }
+        ));
+    }
+
+    #[test]
+    fn over_guild_budget_brief_is_parked_and_chronicled_as_guild_stop() {
+        use crate::rig::RigRegistry;
+        let (s, _tmp) = store_ws();
+        let reg = RigRegistry::with_builtins();
+        let refused = ready_brief(&s, "guild over-budget work", "agt_guild");
+
+        // The dispatch path records WHATEVER the budget gate reports — here a
+        // Guild stop — so run history / the Action Center read the right cause.
+        let records = dispatch_batch_with_policy(
+            &s,
+            50,
+            300,
+            None,
+            |_| true,
+            |_| 20,
+            |card: &brief::BriefCard| {
+                if card.assignee_agent_id.as_deref() == Some("agt_guild") {
+                    BudgetAdmission::Refuse {
+                        reason: "guild_budget_refused: tenant=default budget=100c guild_used=999u \
+                                 reason=over Guild budget"
+                            .to_string(),
+                        event: GUILD_BUDGET_EVENT,
+                        status: GUILD_BUDGET_STATUS,
+                    }
+                } else {
+                    BudgetAdmission::Allow
+                }
+            },
+            |_: &brief::BriefCard| reg.get("echo"),
+            |c: &brief::BriefCard| c.title.clone(),
+        )
+        .unwrap();
+
+        // Parked in `blocked`, never ran.
+        assert_eq!(
+            s.board_status(&refused).unwrap().as_deref(),
+            Some("blocked")
+        );
+        // Chronicled under the GUILD event type (not the per-Operative one).
+        let guild_ev = s
+            .query_events(
+                &refused,
+                0,
+                50,
+                Some(GUILD_BUDGET_EVENT),
+                crate::nodes::coordinator::EventOrder::Desc,
+            )
+            .unwrap();
+        assert_eq!(guild_ev.len(), 1, "exactly one guild.budget_refused event");
+        assert!(guild_ev[0].payload.contains("guild_budget_refused"));
+        // The per-Operative event was NOT used for this stop.
+        let op_ev = s
+            .query_events(
+                &refused,
+                0,
+                50,
+                Some(OPERATIVE_BUDGET_EVENT),
+                crate::nodes::coordinator::EventOrder::Desc,
+            )
+            .unwrap();
+        assert!(op_ev.is_empty(), "a Guild stop is not a per-Operative stop");
+        // Claim released; the record is a non-retryable failure.
+        assert!(s.claim_holder(&refused).unwrap().is_none());
+        assert!(records.iter().any(|r| r.brief_id == refused
+            && matches!(
+                r.outcome,
+                RigOutcome::Failed {
+                    retryable: false,
+                    ..
+                }
+            )));
+    }
+
+    #[test]
+    fn manual_run_is_sovereign_over_the_guild_budget_gate() {
+        use crate::nodes::coordinator::agent::store::AgentStore;
+        use crate::nodes::coordinator::spine::SpineStore;
+        use crate::rig::RigRegistry;
+        let (s, _tmp) = store_ws();
+        let agents = AgentStore::in_memory().unwrap();
+        let spine = SpineStore::in_memory().unwrap();
+        let reg = RigRegistry::with_builtins();
+
+        let eng = agents
+            .ensure_starter_operative("engineer", "Eng A", "Operative", "echo", "guild-a")
+            .unwrap()
+            .0;
+        let brief = ready_brief_in_tenant(&s, "work", &eng, "guild-a");
+        let card = s.brief_card(&brief).unwrap().unwrap();
+
+        // Guild is over budget → the autonomous gate refuses.
+        spine.set_guild_allowance("guild-a", Some(20_000)).unwrap();
+        let mstore = crate::metrics::MetricsStore::in_memory().unwrap();
+        mstore
+            .insert_batch(&[guild_spend_row(&eng, "guild-a", now_ms() - 1_000, 250_000_000)])
+            .unwrap();
+        let mq = crate::metrics::MetricsQuery::new(mstore);
+        assert!(
+            matches!(
+                dispatch_budget_admits(&card, &s, &agents, Some(&spine), Some(&mq), now_ms()),
+                BudgetAdmission::Refuse { .. }
+            ),
+            "autonomous dispatch is refused over the Guild budget"
+        );
+
+        // The manual operator path (`preflight_run`) takes NO budget gate — the
+        // Board is sovereign — so the SAME over-budget Brief commits to a run.
+        match preflight_run(&s, &reg, None, 300, &brief, Some("echo"), "go".to_string()).unwrap() {
+            Preflight::Ready(_) => {}
+            Preflight::Refused(r) => panic!(
+                "manual run must stay sovereign over the Guild cap, got refusal: {}",
+                r.status
+            ),
+        }
     }
 
     #[test]

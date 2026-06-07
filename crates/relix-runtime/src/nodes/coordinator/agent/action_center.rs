@@ -515,7 +515,8 @@ pub fn company_spend_item(spend_micros: u64, budget_cents: i64, over: bool) -> A
             "Guild spend over budget".to_string(),
             format!(
                 "the Guild has spent {} of its {} monthly budget ({pct}%) in the last 30 days — over \
-                 budget; raise the budget or trim Operative spend",
+                 budget; the autonomous dispatch gate now refuses this Guild's Briefs. Raise the \
+                 budget or trim Operative spend (manual runs stay sovereign)",
                 fmt_micros(spend_micros),
                 fmt_cents(budget_cents),
             ),
