@@ -181,6 +181,22 @@ pub const ANTI_THRASH_THRESHOLD: i64 = 3;
 /// exactly one place so the value + semantics never fork.
 pub const MAX_SUBBRIEF_DELEGATION_DEPTH: usize = 1024;
 
+/// Exactly-once plan decomposition (relix-execution-and-issue-design §1.7):
+/// how long an `in_progress` `brief_decomposition_claims` row may sit
+/// **untouched** (`updated_at`) before a *different* responder is allowed to
+/// **take over** the abandoned decomposition. This is a conservative
+/// stale-age threshold, NOT a real liveness probe: a `suggest_tasks` accept is
+/// an **operator-driven, synchronous** materialization, so the claim's `owner`
+/// is the accepter (audit), not a long-lived run with a heartbeat/lease (unlike
+/// the two-pointer Brief Claim). While the owner is the same responder it may
+/// always resume; a different responder is refused until the claim goes stale
+/// (the owner's process crashed mid-plan and never came back). True
+/// exactly-once safety is the in-process materialization lock, the durable
+/// cursor, and the fingerprint — the owner guard only stops a *second* operator
+/// from stepping on a decomposition another operator is (recently) driving.
+/// Named once so the value and semantics never fork.
+pub const DECOMPOSITION_OWNER_STALE_SECS: i64 = 15 * 60;
+
 /// Lightweight classification of why a flow failed. Written to
 /// `tasks.last_failure_class` by the bridge so operators (and any
 /// future auto-retry policy) can decide whether the failure is worth
@@ -2643,7 +2659,12 @@ impl TaskStore {
         //        recorded ordered ids (a duplicate accept never re-creates);
         //      • SAME fingerprint + status `in_progress` → resume from the
         //        recorded cursor.
-        let (mut created, prior_status): (Vec<String>, String) = {
+        let (mut created, prior_status, claim_owner, claim_updated_at): (
+            Vec<String>,
+            String,
+            String,
+            i64,
+        ) = {
             let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
             let now = unix_secs();
             // Claim it fresh. INSERT OR IGNORE so a racing second accept does
@@ -2664,12 +2685,13 @@ impl TaskStore {
                 ],
             )
             .map_err(CoordinatorError::Db)?;
-            let (fp, ids, status): (String, String, String) = conn
+            let (fp, ids, status, owner, updated_at): (String, String, String, String, i64) = conn
                 .query_row(
-                    "SELECT fingerprint, created_ids, status FROM brief_decomposition_claims
+                    "SELECT fingerprint, created_ids, status, owner, updated_at
+                     FROM brief_decomposition_claims
                      WHERE task_id = ?1 AND interaction_id = ?2",
                     params![task_id, interaction_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .map_err(CoordinatorError::Db)?;
             if fp != fingerprint {
@@ -2681,13 +2703,65 @@ impl TaskStore {
                 ));
             }
             let created = split_csv_ids(&ids);
-            (created, status)
+            (created, status, owner, updated_at)
         };
 
         // A completed claim: pure duplicate accept → no-op. Return the full
         // ordered ids exactly once (no new children, no duplicate events).
+        // Terminal claims are takeover-trivial: ANY responder gets the recorded
+        // plan back without re-creating a child.
         if prior_status == "complete" {
             return Ok(created);
+        }
+
+        // ── 2a. Owner guard + conservative stale takeover (§1.7). The accept is
+        //    operator-driven and synchronous, so `owner` is the accepter — NOT a
+        //    live run with a heartbeat. The TRUE exactly-once safety is the
+        //    in-process materialization lock + durable cursor + fingerprint
+        //    (already enforced above). This guard only stops a *second* operator
+        //    from stepping on an `in_progress` decomposition that ANOTHER
+        //    operator is (recently) driving:
+        //      • SAME owner → always resume (the original accepter retrying).
+        //      • DIFFERENT owner + claim still FRESH (touched within
+        //        DECOMPOSITION_OWNER_STALE_SECS) → refuse; the owner may still be
+        //        mid-plan or about to retry.
+        //      • DIFFERENT owner + claim STALE (untouched past the threshold ⇒
+        //        the owning process crashed and never resumed) → TAKE OVER:
+        //        reassign ownership, Chronicle it, and resume from the cursor.
+        //    The fingerprint check above runs FIRST, so a forked proposal still
+        //    refuses regardless of owner or staleness.
+        if claim_owner != responder {
+            let idle = unix_secs().saturating_sub(claim_updated_at);
+            if idle < DECOMPOSITION_OWNER_STALE_SECS {
+                return Err(CoordinatorError::Invalid(format!(
+                    "this plan decomposition is in progress under another responder \
+                     ({claim_owner}); only that owner may resume until the claim goes \
+                     stale (untouched for {DECOMPOSITION_OWNER_STALE_SECS}s)"
+                )));
+            }
+            // Stale owner → conservative takeover. Reassign ownership and
+            // Chronicle the handoff so the timeline is honest about who resumed.
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            let now = unix_secs();
+            conn.execute(
+                "UPDATE brief_decomposition_claims
+                 SET owner = ?1, updated_at = ?2
+                 WHERE task_id = ?3 AND interaction_id = ?4 AND status = 'in_progress'",
+                params![responder, now, task_id, interaction_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+            let _ = conn.execute(
+                "INSERT INTO task_events (task_id, ts, event_type, payload)
+                 VALUES (?1, ?2, 'brief.suggestion_taken_over', ?3)",
+                params![
+                    task_id,
+                    now,
+                    format!(
+                        "{responder}: took over stale decomposition from {claim_owner} \
+                         (idle {idle}s)"
+                    )
+                ],
+            );
         }
 
         // Read the parent's spine context once so each child inherits the SAFE
@@ -15732,8 +15806,16 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         --     resumes from exactly where it stopped, never re-creating a
         --     child. Bounded (≤ MAX_SUGGESTED_CHILDREN ids) — no raw prompt
         --     text is ever stored here.
-        --   `owner`        — who accepted (audit; future run-liveness
-        --     takeover gating — not enforced in this slice).
+        --   `owner`        — who accepted (the operator/Founder subject).
+        --     Used for audit AND the owner-takeover guard: the same owner may
+        --     always resume its `in_progress` claim; a different responder is
+        --     refused until the claim goes stale (untouched past
+        --     DECOMPOSITION_OWNER_STALE_SECS ⇒ the owning process crashed),
+        --     then may take over (reassigning `owner`). This is a stale-age
+        --     policy on `updated_at`, NOT a real run-liveness probe — the
+        --     accept is synchronous/operator-driven with no heartbeat; the
+        --     true exactly-once safety is the in-process lock + cursor +
+        --     fingerprint, the guard only stops a second operator racing in.
         --   `status`       — `in_progress` until the cursor reaches
         --     `plan_len` and the card finalizes, then `complete`.
         CREATE TABLE IF NOT EXISTS brief_decomposition_claims (
@@ -22428,6 +22510,32 @@ mod tests {
         .ok()
     }
 
+    // Helper: read a decomposition claim's (owner, updated_at) — used by the
+    // owner-takeover tests.
+    fn decomp_owner(s: &TaskStore, task: &str, iid: &str) -> Option<(String, i64)> {
+        let conn = s.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT owner, updated_at FROM brief_decomposition_claims
+             WHERE task_id = ?1 AND interaction_id = ?2",
+            rusqlite::params![task, iid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()
+    }
+
+    // Helper: backdate a claim's `updated_at` by `secs` so the stale-takeover
+    // threshold fires without sleeping (mirrors the direct-DB-seed pattern the
+    // other decomposition tests use).
+    fn backdate_claim(s: &TaskStore, task: &str, iid: &str, secs: i64) {
+        let conn = s.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE brief_decomposition_claims SET updated_at = updated_at - ?1
+             WHERE task_id = ?2 AND interaction_id = ?3",
+            rusqlite::params![secs, task, iid],
+        )
+        .unwrap();
+    }
+
     // Helper: count `brief.suggestion_materialized` Chronicle events on a Brief.
     fn materialized_count(s: &TaskStore, parent: &str) -> usize {
         s.query_events(
@@ -22711,6 +22819,185 @@ mod tests {
         assert_eq!(ids_after, ids_before, "cursor unchanged — no fork created");
         assert_eq!(status, "in_progress");
         assert_eq!(split_csv_ids(&ids_after).len(), 1, "only the original partial child");
+    }
+
+    // Owner takeover (§1.7): the SAME responder always resumes its own
+    // in_progress claim, fresh or stale (the owner is the original accepter
+    // retrying after a crash).
+    #[test]
+    fn decomposition_same_owner_resumes_in_progress_claim() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let id = open_plan(&s, &parent, &["A", "B", "C"]);
+        // Crash after one child → an in_progress claim owned by "founder".
+        let _ = s
+            .respond_suggestion_failing_after("acme", "subj", &parent, &id, "founder", &[], 1)
+            .unwrap_err();
+        let (_, ids, status) = decomp_claim(&s, &parent, &id).unwrap();
+        assert_eq!(status, "in_progress");
+        assert_eq!(split_csv_ids(&ids).len(), 1);
+        // The same owner resumes even while the claim is still FRESH.
+        let created = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
+            .unwrap();
+        assert_eq!(created.len(), 3, "same owner resumes to completion");
+        let (_, _, fstatus) = decomp_claim(&s, &parent, &id).unwrap();
+        assert_eq!(fstatus, "complete");
+        // No takeover event was emitted (same owner is never a takeover).
+        assert_eq!(
+            s.query_events(&parent, 0, 200, Some("brief.suggestion_taken_over"), EventOrder::Asc)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    // Owner guard (§1.7): a DIFFERENT responder cannot take over a FRESH
+    // in_progress claim — the original owner may still be mid-plan / about to
+    // retry. The refusal is typed and creates no further children.
+    #[test]
+    fn decomposition_different_owner_refused_on_fresh_claim() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let id = open_plan(&s, &parent, &["A", "B", "C"]);
+        // "founder" crashes after one child → fresh in_progress claim.
+        let _ = s
+            .respond_suggestion_failing_after("acme", "subj", &parent, &id, "founder", &[], 1)
+            .unwrap_err();
+        // A different responder is refused while the claim is fresh.
+        let err = s
+            .respond_suggestion("acme", "subj", &parent, &id, "intruder", true, &[])
+            .unwrap_err();
+        assert!(
+            matches!(err, CoordinatorError::Invalid(_)),
+            "a different owner cannot steal a fresh in_progress claim"
+        );
+        // The claim is untouched: still owned by founder, still one child, no
+        // new children materialized.
+        let (owner, _) = decomp_owner(&s, &parent, &id).unwrap();
+        assert_eq!(owner, "founder", "ownership unchanged by the refusal");
+        let (_, ids, status) = decomp_claim(&s, &parent, &id).unwrap();
+        assert_eq!(status, "in_progress");
+        assert_eq!(split_csv_ids(&ids).len(), 1, "no extra children created");
+    }
+
+    // Stale takeover (§1.7): once an in_progress claim has been untouched past
+    // DECOMPOSITION_OWNER_STALE_SECS (the owning process crashed and never
+    // resumed), a DIFFERENT responder may take it over — reassigning ownership,
+    // chronicling the handoff, and resuming from the durable cursor.
+    #[test]
+    fn decomposition_different_owner_takes_over_stale_claim() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let id = open_plan(&s, &parent, &["A", "B", "C"]);
+        // "founder" crashes after one child.
+        let _ = s
+            .respond_suggestion_failing_after("acme", "subj", &parent, &id, "founder", &[], 1)
+            .unwrap_err();
+        let partial = split_csv_ids(&decomp_claim(&s, &parent, &id).unwrap().1);
+        assert_eq!(partial.len(), 1);
+        // Age the claim past the stale threshold (no sleeping).
+        backdate_claim(&s, &parent, &id, DECOMPOSITION_OWNER_STALE_SECS + 1);
+        // A different responder now takes over and finishes the plan.
+        let created = s
+            .respond_suggestion("acme", "subj", &parent, &id, "rescuer", true, &[])
+            .unwrap();
+        assert_eq!(created.len(), 3, "takeover resumes to completion");
+        assert_eq!(created[0], partial[0], "the pre-crash child is reused");
+        // Ownership transferred + the handoff is chronicled exactly once.
+        let (owner, _) = decomp_owner(&s, &parent, &id).unwrap();
+        assert_eq!(owner, "rescuer", "ownership transferred to the taker");
+        assert_eq!(
+            s.query_events(&parent, 0, 200, Some("brief.suggestion_taken_over"), EventOrder::Asc)
+                .unwrap()
+                .len(),
+            1,
+            "exactly one takeover event"
+        );
+        // No duplicate children; the plan materialized exactly once.
+        assert_eq!(s.list_subbriefs(&parent).unwrap().len(), 3);
+        assert_eq!(materialized_count(&s, &parent), 1);
+    }
+
+    // Fingerprint mismatch still refuses even when the claim is STALE — the
+    // fork check runs before the owner/staleness logic, so a stale claim with a
+    // changed proposal cannot be taken over into a fork.
+    #[test]
+    fn decomposition_stale_takeover_still_refuses_fork() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let id = open_plan(&s, &parent, &["A", "B", "C"]);
+        let _ = s
+            .respond_suggestion_failing_after("acme", "subj", &parent, &id, "founder", &[], 1)
+            .unwrap_err();
+        let (fp_before, ids_before, _) = decomp_claim(&s, &parent, &id).unwrap();
+        // Age the claim past the stale threshold so takeover WOULD be allowed.
+        backdate_claim(&s, &parent, &id, DECOMPOSITION_OWNER_STALE_SECS + 1);
+        // Fork the stored proposal under the same card id.
+        let forked = serde_json::to_string(&brief::Proposal {
+            summary: "Break it down".into(),
+            children: vec![brief::ChildSpec {
+                title: "Totally different".into(),
+                priority: None,
+                after: None,
+                assignee_agent_id: None,
+                assignee_role: None,
+            }],
+        })
+        .unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE brief_interactions SET proposal = ?1 WHERE interaction_id = ?2",
+                rusqlite::params![forked, id],
+            )
+            .unwrap();
+        }
+        // A different responder taking over a STALE claim still cannot fork.
+        let err = s
+            .respond_suggestion("acme", "subj", &parent, &id, "rescuer", true, &[])
+            .unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)), "fork must refuse");
+        // Claim untouched: same fingerprint, same cursor, still owned by founder
+        // (the fork check refused BEFORE any takeover reassignment).
+        let (fp_after, ids_after, status) = decomp_claim(&s, &parent, &id).unwrap();
+        assert_eq!(fp_after, fp_before, "fingerprint unchanged");
+        assert_eq!(ids_after, ids_before, "cursor unchanged");
+        assert_eq!(status, "in_progress");
+        let (owner, _) = decomp_owner(&s, &parent, &id).unwrap();
+        assert_eq!(owner, "founder", "no takeover happened on a refused fork");
+    }
+
+    // Terminal takeover is trivial: ANY responder accepting an already-complete
+    // claim no-ops and gets the recorded ids back (no owner guard, no new work).
+    #[test]
+    fn decomposition_complete_claim_noops_for_any_owner() {
+        let s = TaskStore::in_memory().unwrap();
+        let parent = s
+            .create_brief("acme", "Epic", "subj", None, None, None, None)
+            .unwrap();
+        let id = open_plan(&s, &parent, &["A", "B"]);
+        let first = s
+            .respond_suggestion("acme", "subj", &parent, &id, "founder", true, &[])
+            .unwrap();
+        // A DIFFERENT responder accepting the completed plan gets the same ids,
+        // creates nothing, and the claim stays owned by the original accepter.
+        let second = s
+            .respond_suggestion("acme", "subj", &parent, &id, "someone-else", true, &[])
+            .unwrap();
+        assert_eq!(first, second, "completed claim no-ops for any responder");
+        assert_eq!(s.list_subbriefs(&parent).unwrap().len(), 2, "no new children");
+        assert_eq!(materialized_count(&s, &parent), 1);
+        let (owner, _) = decomp_owner(&s, &parent, &id).unwrap();
+        assert_eq!(owner, "founder", "a no-op never reassigns ownership");
     }
 
     // Governance: an invalid assignee hint refuses the WHOLE accept in the

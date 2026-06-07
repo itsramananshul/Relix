@@ -366,7 +366,18 @@ ledger entry or design section.
     materialization lock (one `Mutex<()>` per `(task_id, interaction_id)`, mirroring the per-Operative
     start lock) serializes the whole accept so two racing accepts/resumes can never interleave a
     child create with its cursor record — the loser blocks then no-ops or resumes, never leaving an
-    unlinked orphan child Brief (proven by a two-thread barrier race test). All prior governance
+    unlinked orphan child Brief (proven by a two-thread barrier race test). **Owner takeover is now
+    enforced (`execution §1.7`):** because the accept is **operator-driven and synchronous**, the
+    claim's `owner` is the **accepter** — not a live run with a heartbeat — so there is no real
+    liveness pointer to probe. The resume path enforces a **conservative owner guard with stale-age
+    takeover** (`DECOMPOSITION_OWNER_STALE_SECS`, 15 min): the **same** owner may always resume; a
+    **different** responder is **refused** on a still-**fresh** `in_progress` claim and may **take
+    over** only a **stale** one (untouched past the threshold ⇒ the owning process crashed) or a
+    **terminal** one (a `complete` claim no-ops for anyone). A takeover reassigns `owner` and
+    Chronicles `brief.suggestion_taken_over`; the **fingerprint check runs first**, so a forked plan
+    still refuses even when the claim is stale. Correctness never depends on the guard — the lock +
+    cursor + fingerprint already guarantee exactly-once; the guard only stops a *second* operator
+    from racing in on a decomposition another operator is actively driving. All prior governance
     (parent context inheritance, assign-Key-gated hints, tenant
     isolation, delegation-depth) is unchanged. **Approval-bound plan *confirm* is now BACKEND
     SHIPPED (first slice, `execution §1.8`):** a new `brief.plan_confirm_open` capability opens a
@@ -382,9 +393,11 @@ ledger entry or design section.
     workroom carries a **Request approval** control (against the latest `plan` Dossier), renders
     `expired` distinctly from `rejected`, and shows a "bound to plan" cue. *Still deferred:* tying
     that bound-plan approval into the decomposition trigger (decomposition still keys on the
-    `suggest_tasks` interaction id, **not** the bound plan revision), `owner`-liveness takeover
-    enforcement, and full issue **document authoring / per-doc revision-locking / forking**
-    (`execution §1.8`) plus wiring this into the autonomous planner flow.
+    `suggest_tasks` interaction id, **not** the bound plan revision), and full issue **document
+    authoring / per-doc revision-locking / forking** (`execution §1.8`) plus wiring this into the
+    autonomous planner flow. (The `owner`-liveness takeover gap is now **closed** — see the
+    owner-takeover note above; for these synchronous operator interactions the honest model is
+    operator-resumable with stale-age takeover, not a heartbeat-backed live run.)
 
 ---
 
