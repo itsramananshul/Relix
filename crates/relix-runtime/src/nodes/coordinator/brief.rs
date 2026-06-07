@@ -17,6 +17,13 @@ use serde::{Deserialize, Serialize};
 /// "Document" in the lexicon): a plan, a design, a note, a
 /// deliverable. Append-only and versioned by id, so the artifact
 /// trail of a Brief is auditable.
+///
+/// The authoring/revision/fork metadata (`author`, `revision_of_doc_id`,
+/// `forked_from_doc_id`, `revision_number`) is **additive** (§1.8): legacy
+/// rows and rows written by the original `brief.dossier_add` / plan-package
+/// paths carry `None` for the first three; `revision_number` is always
+/// derived in the read (the 1-based position of this row among the same
+/// Brief+kind, oldest first), so every Dossier — old or new — has one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dossier {
     pub doc_id: String,
@@ -26,6 +33,23 @@ pub struct Dossier {
     pub body: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Who authored this revision (`brief.dossier_author`); `None` for legacy
+    /// / `brief.dossier_add` / plan-package rows.
+    #[serde(default)]
+    pub author: Option<String>,
+    /// The immediate prior revision this row supersedes via the optimistic-lock
+    /// `revise` path; `None` for a first revision or an explicit fork.
+    #[serde(default)]
+    pub revision_of_doc_id: Option<String>,
+    /// The base Dossier this row was explicitly **forked** from; `None` unless
+    /// authored with `mode = fork`.
+    #[serde(default)]
+    pub forked_from_doc_id: Option<String>,
+    /// Derived: this row's 1-based revision number within its Brief+kind
+    /// (oldest = 1). Computed in the read, never stored, so it stays correct
+    /// for legacy rows too.
+    #[serde(default)]
+    pub revision_number: i64,
 }
 
 /// A lightweight Dossier listing row (metadata only, no body) for
@@ -37,6 +61,79 @@ pub struct DossierMeta {
     pub title: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Who authored this revision; `None` for legacy / non-authored rows.
+    #[serde(default)]
+    pub author: Option<String>,
+    /// The immediate prior revision this supersedes (revise path); `None`
+    /// otherwise.
+    #[serde(default)]
+    pub revision_of_doc_id: Option<String>,
+    /// The base Dossier this was forked from; `None` unless forked.
+    #[serde(default)]
+    pub forked_from_doc_id: Option<String>,
+    /// Derived 1-based revision number within the Brief+kind (oldest = 1).
+    #[serde(default)]
+    pub revision_number: i64,
+}
+
+/// How a `brief.dossier_author` write relates to existing revisions (§1.8):
+/// `Revise` writes the next linear revision under an optimistic lock (or the
+/// first revision of a kind); `Fork` explicitly branches a new line from a
+/// base Dossier even if a newer revision has since landed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DossierAuthorMode {
+    Revise,
+    Fork,
+}
+
+/// The result of a successful `brief.dossier_author` write (§1.8): the
+/// new append-only Dossier row plus its lineage. Returned to the operator /
+/// bridge so the editor can show "revision N of <kind>" and keep an
+/// `expected_latest_doc_id` for the next optimistic save.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DossierAuthored {
+    pub doc_id: String,
+    pub task_id: String,
+    pub kind: String,
+    pub title: String,
+    pub author: Option<String>,
+    /// `create` (first revision of a kind), `revise` (superseded a prior
+    /// revision under the optimistic lock), or `fork` (branched from a base).
+    pub mode: String,
+    /// The 1-based revision number of the new row within its Brief+kind.
+    pub revision_number: i64,
+    /// The prior revision this row supersedes (revise path); `None` for a
+    /// first `create` or a `fork`.
+    pub revision_of_doc_id: Option<String>,
+    /// The base Dossier this row forked from (`fork` only).
+    pub forked_from_doc_id: Option<String>,
+}
+
+/// A **stale-lock refusal** from `brief.dossier_author` (§1.8): the
+/// optimistic-concurrency check failed because the caller's
+/// `expected_latest_doc_id` no longer matches the current latest revision of
+/// that Brief+kind (a newer revision landed first). **Nothing is written** —
+/// the caller must reload (or explicitly `fork`). The `stale` discriminant is
+/// what the bridge inspects to map this onto an honest HTTP `409`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DossierStale {
+    /// Always `true` — the wire discriminant the bridge keys its 409 on.
+    pub stale: bool,
+    pub kind: String,
+    /// What the caller asserted was the latest revision.
+    pub expected_latest_doc_id: Option<String>,
+    /// What the latest revision actually is right now.
+    pub current_latest_doc_id: Option<String>,
+}
+
+/// The outcome of [`super::TaskStore::author_dossier`]: either a written
+/// revision or a no-write stale-lock refusal. Both are `Ok` (the capability
+/// succeeded in *deciding*); only `Authored` mutates.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DossierAuthorOutcome {
+    Authored(DossierAuthored),
+    Stale(DossierStale),
 }
 
 /// A **thread interaction** — an answerable card the agent (or

@@ -1845,6 +1845,223 @@ impl TaskStore {
         Ok(doc_id)
     }
 
+    /// §1.8: author a **Dossier revision** with optimistic locking / explicit
+    /// forking — the bounded v1 of issue-document authoring. Append-only (like
+    /// every Dossier write) and safe by construction:
+    ///
+    /// - **`Revise`** writes the next linear revision of `(brief, kind)`. When
+    ///   the caller supplies `expected_latest_doc_id`, it MUST still equal the
+    ///   current latest revision of that kind — otherwise a newer revision
+    ///   landed first and this is a stale edit: nothing is written and a
+    ///   [`brief::DossierStale`] is returned (the bridge maps it to `409`). When
+    ///   no revision of that kind exists yet, the first one is created with no
+    ///   expected id. When `expected_latest_doc_id` is omitted but a revision
+    ///   exists, the new row links the current latest as its
+    ///   `revision_of_doc_id` (an append on top; never an overwrite — the prior
+    ///   row stays).
+    /// - **`Fork`** requires `base_doc_id` to exist on the **same Brief** (and
+    ///   same kind); it writes a new append-only row carrying
+    ///   `forked_from_doc_id = base` **even if the latest has moved**. This is
+    ///   the deliberate "branch from a stale/base revision" escape hatch — never
+    ///   an accidental stale overwrite.
+    ///
+    /// Validation: `kind` is a short safe token, `title`/`body`/`author` are
+    /// non-empty and length-bounded. Tenant isolation is enforced at the handler
+    /// boundary (the owning Brief), like every other Dossier surface. Every
+    /// successful write Chronicles `brief.dossier_authored` (first revision),
+    /// `brief.dossier_revised`, or `brief.dossier_forked`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn author_dossier(
+        &self,
+        task_id: &str,
+        kind: &str,
+        title: &str,
+        body: &str,
+        author: &str,
+        mode: brief::DossierAuthorMode,
+        expected_latest_doc_id: Option<&str>,
+        base_doc_id: Option<&str>,
+    ) -> Result<brief::DossierAuthorOutcome, CoordinatorError> {
+        let kind = kind.trim();
+        let title = title.trim();
+        let author = author.trim();
+        if kind.is_empty() {
+            return Err(CoordinatorError::Invalid("dossier kind required".to_string()));
+        }
+        if !is_safe_dossier_kind(kind) {
+            return Err(CoordinatorError::Invalid(format!(
+                "dossier kind must be a short token of [a-zA-Z0-9_-], ≤{MAX_DOSSIER_KIND_LEN} chars"
+            )));
+        }
+        if title.is_empty() {
+            return Err(CoordinatorError::Invalid("dossier title required".to_string()));
+        }
+        if title.chars().count() > MAX_DOSSIER_TITLE_LEN {
+            return Err(CoordinatorError::Invalid(format!(
+                "dossier title too long (max {MAX_DOSSIER_TITLE_LEN} chars)"
+            )));
+        }
+        if author.is_empty() {
+            return Err(CoordinatorError::Invalid("dossier author required".to_string()));
+        }
+        if author.chars().count() > MAX_DOSSIER_AUTHOR_LEN {
+            return Err(CoordinatorError::Invalid(format!(
+                "dossier author too long (max {MAX_DOSSIER_AUTHOR_LEN} chars)"
+            )));
+        }
+        if body.trim().is_empty() {
+            return Err(CoordinatorError::Invalid("dossier body required".to_string()));
+        }
+        if body.len() > MAX_DOSSIER_BODY_BYTES {
+            return Err(CoordinatorError::Invalid(format!(
+                "dossier body too large (max {MAX_DOSSIER_BODY_BYTES} bytes)"
+            )));
+        }
+        let expected = expected_latest_doc_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let base = base_doc_id.map(str::trim).filter(|s| !s.is_empty());
+
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        if !task_row_exists(&conn, task_id)? {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        // The current latest revision of this kind (the lock target). The whole
+        // store shares one connection mutex, so this read + the insert below are
+        // effectively atomic — no other writer can interleave a revision.
+        let current_latest: Option<String> = conn
+            .query_row(
+                "SELECT doc_id FROM task_documents WHERE task_id = ?1 AND kind = ?2
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![task_id, kind],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+
+        // Decide the lineage + mode, refusing a stale revise BEFORE any write.
+        let (revision_of, forked_from, mode_label, event_type): (
+            Option<String>,
+            Option<String>,
+            &str,
+            &str,
+        ) = match mode {
+            brief::DossierAuthorMode::Fork => {
+                let base = base.ok_or_else(|| {
+                    CoordinatorError::Invalid(
+                        "fork requires base_doc_id (the revision to branch from)".to_string(),
+                    )
+                })?;
+                // The base must exist on THIS Brief and be the same kind.
+                let base_row: Option<(String, String)> = conn
+                    .query_row(
+                        "SELECT task_id, kind FROM task_documents WHERE doc_id = ?1",
+                        params![base],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(CoordinatorError::Db)?;
+                let (base_task, base_kind) = base_row.ok_or_else(|| {
+                    CoordinatorError::Invalid(format!("fork base not found: {base}"))
+                })?;
+                if base_task != task_id {
+                    return Err(CoordinatorError::Invalid(
+                        "fork base belongs to a different Brief".to_string(),
+                    ));
+                }
+                if base_kind != kind {
+                    return Err(CoordinatorError::Invalid(format!(
+                        "fork base is kind `{base_kind}`, not `{kind}`"
+                    )));
+                }
+                (None, Some(base.to_string()), "fork", "brief.dossier_forked")
+            }
+            brief::DossierAuthorMode::Revise => {
+                match (&expected, &current_latest) {
+                    // Caller asserts a base revision: it must still be latest.
+                    (Some(e), cur) if cur.as_deref() != Some(*e) => {
+                        return Ok(brief::DossierAuthorOutcome::Stale(brief::DossierStale {
+                            stale: true,
+                            kind: kind.to_string(),
+                            expected_latest_doc_id: Some((*e).to_string()),
+                            current_latest_doc_id: current_latest.clone(),
+                        }));
+                    }
+                    (Some(e), _) => (
+                        Some((*e).to_string()),
+                        None,
+                        "revise",
+                        "brief.dossier_revised",
+                    ),
+                    // No assertion: append on top of the current latest if one
+                    // exists, else this is the first revision of the kind.
+                    (None, Some(cur)) => (
+                        Some(cur.clone()),
+                        None,
+                        "revise",
+                        "brief.dossier_revised",
+                    ),
+                    (None, None) => (None, None, "create", "brief.dossier_authored"),
+                }
+            }
+        };
+
+        let doc_id = new_doc_id();
+        let now = unix_secs();
+        conn.execute(
+            "INSERT INTO task_documents
+                 (doc_id, task_id, kind, title, body, created_at, updated_at,
+                  author, revision_of_doc_id, forked_from_doc_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9)",
+            params![
+                doc_id,
+                task_id,
+                kind,
+                title,
+                body,
+                now,
+                author,
+                revision_of,
+                forked_from
+            ],
+        )
+        .map_err(CoordinatorError::Db)?;
+        // The new row is the newest of its kind, so its 1-based revision number
+        // (oldest first) equals the post-insert count of that kind.
+        let revision_number: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_documents WHERE task_id = ?1 AND kind = ?2",
+                params![task_id, kind],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
+        let payload = match (&revision_of, &forked_from) {
+            (_, Some(base)) => {
+                format!("{kind}: {title} (rev {revision_number}, forked from {base}, by {author})")
+            }
+            (Some(prev), _) => {
+                format!("{kind}: {title} (rev {revision_number}, supersedes {prev}, by {author})")
+            }
+            _ => format!("{kind}: {title} (rev {revision_number}, by {author})"),
+        };
+        let _ = conn.execute(
+            "INSERT INTO task_events (task_id, ts, event_type, payload)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![task_id, now, event_type, payload],
+        );
+        Ok(brief::DossierAuthorOutcome::Authored(brief::DossierAuthored {
+            doc_id,
+            task_id: task_id.to_string(),
+            kind: kind.to_string(),
+            title: title.to_string(),
+            author: Some(author.to_string()),
+            mode: mode_label.to_string(),
+            revision_number,
+            revision_of_doc_id: revision_of,
+            forked_from_doc_id: forked_from,
+        }))
+    }
+
     /// PHASE 5 (Brief): the most recent Dossier of `kind` on a Brief
     /// (full body). Dossiers are append-only/versioned, so this is
     /// "the current plan/spec" — the latest one wins. `None` when the
@@ -1859,9 +2076,14 @@ impl TaskStore {
             // `rowid` is the monotonic insert order — a reliable
             // tiebreak when several Dossiers share a created_at second
             // (doc_id is random, so it can't order by recency).
-            "SELECT doc_id, task_id, kind, title, body, created_at, updated_at
-             FROM task_documents WHERE task_id = ?1 AND kind = ?2
-             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            // `revision_number` is derived (1-based position within Brief+kind,
+            // oldest first) so legacy rows get one too — see DOSSIER_REVNUM_SQL.
+            &format!(
+                "SELECT doc_id, task_id, kind, title, body, created_at, updated_at,
+                        author, revision_of_doc_id, forked_from_doc_id, {DOSSIER_REVNUM_SQL}
+                 FROM task_documents WHERE task_id = ?1 AND kind = ?2
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1"
+            ),
             params![task_id, kind],
             |r| {
                 Ok(brief::Dossier {
@@ -1872,6 +2094,10 @@ impl TaskStore {
                     body: r.get(4)?,
                     created_at: r.get(5)?,
                     updated_at: r.get(6)?,
+                    author: r.get(7)?,
+                    revision_of_doc_id: r.get(8)?,
+                    forked_from_doc_id: r.get(9)?,
+                    revision_number: r.get(10)?,
                 })
             },
         ) {
@@ -1886,8 +2112,11 @@ impl TaskStore {
     pub fn get_dossier(&self, doc_id: &str) -> Result<Option<brief::Dossier>, CoordinatorError> {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         match conn.query_row(
-            "SELECT doc_id, task_id, kind, title, body, created_at, updated_at
-             FROM task_documents WHERE doc_id = ?1",
+            &format!(
+                "SELECT doc_id, task_id, kind, title, body, created_at, updated_at,
+                        author, revision_of_doc_id, forked_from_doc_id, {DOSSIER_REVNUM_SQL}
+                 FROM task_documents WHERE doc_id = ?1"
+            ),
             params![doc_id],
             |r| {
                 Ok(brief::Dossier {
@@ -1898,6 +2127,10 @@ impl TaskStore {
                     body: r.get(4)?,
                     created_at: r.get(5)?,
                     updated_at: r.get(6)?,
+                    author: r.get(7)?,
+                    revision_of_doc_id: r.get(8)?,
+                    forked_from_doc_id: r.get(9)?,
+                    revision_number: r.get(10)?,
                 })
             },
         ) {
@@ -1916,9 +2149,15 @@ impl TaskStore {
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let mut stmt = conn
             .prepare(
-                "SELECT doc_id, kind, title, created_at, updated_at
-                 FROM task_documents WHERE task_id = ?1
-                 ORDER BY created_at ASC, doc_id ASC",
+                &format!(
+                    // `rowid` (monotonic insert order) as the within-second
+                    // tiebreak so the list order matches `revision_number`
+                    // (which also tiebreaks on rowid) rather than random doc_id.
+                    "SELECT doc_id, kind, title, created_at, updated_at,
+                            author, revision_of_doc_id, forked_from_doc_id, {DOSSIER_REVNUM_SQL}
+                     FROM task_documents WHERE task_id = ?1
+                     ORDER BY created_at ASC, rowid ASC"
+                ),
             )
             .map_err(CoordinatorError::Db)?;
         let rows: Vec<brief::DossierMeta> = stmt
@@ -1929,6 +2168,10 @@ impl TaskStore {
                     title: r.get(2)?,
                     created_at: r.get(3)?,
                     updated_at: r.get(4)?,
+                    author: r.get(5)?,
+                    revision_of_doc_id: r.get(6)?,
+                    forked_from_doc_id: r.get(7)?,
+                    revision_number: r.get(8)?,
                 })
             })
             .map_err(CoordinatorError::Db)?
@@ -12213,6 +12456,19 @@ pub fn register(
             })),
         );
     }
+    // §1.8: author a Dossier revision with optimistic locking / explicit fork
+    // (bounded v1 of issue-document authoring). JSON arg; a stale-lock refusal
+    // is an `Ok` body the bridge maps onto a 409.
+    {
+        let s = store.clone();
+        bridge.register(
+            "brief.dossier_author",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_brief_dossier_author(&s, &ctx) }
+            })),
+        );
+    }
     // PHASE 1 (Brief): spine-field set + read (assignee, priority,
     // mandate/campaign links).
     {
@@ -14345,6 +14601,70 @@ fn handle_brief_dossier_get(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOu
         },
         Ok(None) => invalid(format!("brief.dossier_get: not found: {doc_id}")),
         Err(e) => map_edge_err("brief.dossier_get", e),
+    }
+}
+
+/// JSON arg for `brief.dossier_author` (§1.8). `mode` defaults to `revise`.
+#[derive(serde::Deserialize)]
+struct DossierAuthorArg {
+    task_id: String,
+    kind: String,
+    title: String,
+    body: String,
+    #[serde(default)]
+    author: String,
+    /// `revise` (default) or `fork`.
+    #[serde(default)]
+    mode: String,
+    /// Optimistic-lock base for `revise` — the doc_id the caller believes is
+    /// the current latest of this kind. Omit for a first revision.
+    #[serde(default)]
+    expected_latest_doc_id: Option<String>,
+    /// The base revision a `fork` branches from (required when `mode = fork`).
+    #[serde(default)]
+    base_doc_id: Option<String>,
+}
+
+/// `brief.dossier_author` — author a Dossier revision with optimistic locking
+/// (§1.8). JSON arg `{task_id, kind, title, body, author, mode?,
+/// expected_latest_doc_id?, base_doc_id?}`. On success returns the authored
+/// JSON (`{doc_id, kind, title, revision_number, mode, revision_of_doc_id?,
+/// forked_from_doc_id?, …}`); a stale-lock refusal returns an `Ok` JSON
+/// `{stale:true, …}` (nothing written) the bridge maps onto a `409`.
+/// Tenant-scoped on the owning Brief like every other Dossier surface.
+fn handle_brief_dossier_author(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let arg: DossierAuthorArg = match serde_json::from_slice(&ctx.args) {
+        Ok(a) => a,
+        Err(e) => return invalid(format!("brief.dossier_author arg: {e}")),
+    };
+    let task = arg.task_id.trim();
+    if let Some(out) = deny_cross_tenant(store, ctx, task, "brief.dossier_author") {
+        return out;
+    }
+    let mode = match arg.mode.trim() {
+        "" | "revise" => brief::DossierAuthorMode::Revise,
+        "fork" => brief::DossierAuthorMode::Fork,
+        other => {
+            return invalid(format!(
+                "brief.dossier_author: mode must be revise|fork, got `{other}`"
+            ));
+        }
+    };
+    match store.author_dossier(
+        task,
+        &arg.kind,
+        &arg.title,
+        &arg.body,
+        arg.author.trim(),
+        mode,
+        arg.expected_latest_doc_id.as_deref(),
+        arg.base_doc_id.as_deref(),
+    ) {
+        Ok(outcome) => match serde_json::to_vec(&outcome) {
+            Ok(b) => HandlerOutcome::Ok(b),
+            Err(e) => internal(format!("brief.dossier_author encode: {e}")),
+        },
+        Err(e) => map_edge_err("brief.dossier_author", e),
     }
 }
 
@@ -16632,6 +16952,21 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
             body       TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
+            -- Authoring / revision / fork tracking (execution-and-issue §1.8).
+            -- All NULLable + additive: legacy rows and rows written by
+            -- `brief.dossier_add` / the plan-package path carry NULL. Only the
+            -- governed `brief.dossier_author` path stamps them.
+            --   author              — who authored this revision.
+            --   revision_of_doc_id  — the immediate prior revision this row
+            --     supersedes via the optimistic-lock `revise` path.
+            --   forked_from_doc_id  — the base Dossier an explicit `fork`
+            --     branched from (set only on fork).
+            -- `revision_number` is NOT stored — it is derived in the read as the
+            -- 1-based position of a row among its Brief+kind (oldest first), so
+            -- it stays correct for every row including legacy ones.
+            author             TEXT,
+            revision_of_doc_id TEXT,
+            forked_from_doc_id TEXT,
             FOREIGN KEY (task_id) REFERENCES tasks(task_id)
         );
         CREATE INDEX IF NOT EXISTS task_documents_by_task
@@ -17139,6 +17474,14 @@ fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
         "ALTER TABLE brief_runs ADD COLUMN retry_budget_remaining INTEGER",
         "ALTER TABLE brief_runs ADD COLUMN recovery_action TEXT",
         "ALTER TABLE brief_runs ADD COLUMN recovery_route TEXT",
+        // DOSSIER AUTHORING / REVISION-LOCK / FORK (execution-and-issue §1.8):
+        // additive + nullable authoring metadata on Dossier rows. Legacy rows
+        // and `brief.dossier_add` / plan-package rows carry NULL; only the
+        // governed `brief.dossier_author` path stamps them. `revision_number`
+        // is derived in the read, not stored.
+        "ALTER TABLE task_documents ADD COLUMN author TEXT",
+        "ALTER TABLE task_documents ADD COLUMN revision_of_doc_id TEXT",
+        "ALTER TABLE task_documents ADD COLUMN forked_from_doc_id TEXT",
     ];
     // Apply additive ALTER TABLE migrations inside a transaction.
     // Duplicate-column errors (legacy boots that already added the
@@ -17400,6 +17743,39 @@ fn new_doc_id() -> String {
     let mut bytes = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     format!("doc_{}", hex::encode(bytes))
+}
+
+/// A correlated subquery that derives a Dossier row's **1-based revision
+/// number** within its Brief+kind (oldest = 1), used by the Dossier read
+/// methods (execution-and-issue §1.8). Computed instead of stored so it stays
+/// correct for legacy / `brief.dossier_add` / plan-package rows too. Ordering
+/// matches the rest of the module: `created_at` ascending, `rowid` (monotonic
+/// insert order) as the within-second tiebreak. Selected as the column alias
+/// `revision_number`.
+const DOSSIER_REVNUM_SQL: &str = "(SELECT COUNT(*) FROM task_documents d2 \
+     WHERE d2.task_id = task_documents.task_id AND d2.kind = task_documents.kind \
+       AND (d2.created_at < task_documents.created_at \
+            OR (d2.created_at = task_documents.created_at AND d2.rowid <= task_documents.rowid))) \
+     AS revision_number";
+
+/// Bounds for a `brief.dossier_author` write (execution-and-issue §1.8). The
+/// body cap is generous for an operational textarea (a real plan/spec) yet
+/// bounded so one row can't bloat the ledger; the others keep `kind`/`title`/
+/// `author` short and safe.
+const MAX_DOSSIER_BODY_BYTES: usize = 65_536;
+const MAX_DOSSIER_TITLE_LEN: usize = 200;
+const MAX_DOSSIER_KIND_LEN: usize = 40;
+const MAX_DOSSIER_AUTHOR_LEN: usize = 120;
+
+/// A Dossier `kind` must be a short, safe token — `[a-zA-Z0-9_-]`, non-empty,
+/// `≤ MAX_DOSSIER_KIND_LEN`. This keeps `kind` usable as a stable key (e.g.
+/// `plan`, `design`, `notes`) and prevents pipe/newline/JSON-hostile values.
+fn is_safe_dossier_kind(kind: &str) -> bool {
+    !kind.is_empty()
+        && kind.len() <= MAX_DOSSIER_KIND_LEN
+        && kind
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn new_interaction_id() -> String {
@@ -21177,6 +21553,262 @@ mod tests {
         assert!(s.get_dossier("missing").unwrap().is_none());
     }
 
+    // §1.8: a first `author` of a kind creates revision 1 with no prior link;
+    // a matching-expected revise appends rev 2 linking the previous; a stale
+    // expected refuses and writes nothing; a fork from a stale/base doc records
+    // `forked_from_doc_id` even though the latest moved.
+    #[test]
+    fn dossier_author_revise_lock_and_fork() {
+        use brief::{DossierAuthorMode, DossierAuthorOutcome};
+        let s = store();
+        let id = s
+            .create(
+                "brief",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // 1) First author → create, revision 1, no previous/fork link.
+        let r1 = s
+            .author_dossier(
+                &id,
+                "plan",
+                "Plan v1",
+                "first body",
+                "founder",
+                DossierAuthorMode::Revise,
+                None,
+                None,
+            )
+            .unwrap();
+        let v1 = match r1 {
+            DossierAuthorOutcome::Authored(a) => {
+                assert_eq!(a.mode, "create");
+                assert_eq!(a.revision_number, 1);
+                assert_eq!(a.revision_of_doc_id, None);
+                assert_eq!(a.forked_from_doc_id, None);
+                assert_eq!(a.author.as_deref(), Some("founder"));
+                a.doc_id
+            }
+            DossierAuthorOutcome::Stale(_) => panic!("first author must not be stale"),
+        };
+
+        // 2) Revise with the matching expected latest → revision 2 linking v1.
+        let r2 = s
+            .author_dossier(
+                &id,
+                "plan",
+                "Plan v2",
+                "second body",
+                "founder",
+                DossierAuthorMode::Revise,
+                Some(&v1),
+                None,
+            )
+            .unwrap();
+        let v2 = match r2 {
+            DossierAuthorOutcome::Authored(a) => {
+                assert_eq!(a.mode, "revise");
+                assert_eq!(a.revision_number, 2);
+                assert_eq!(a.revision_of_doc_id.as_deref(), Some(v1.as_str()));
+                a.doc_id
+            }
+            DossierAuthorOutcome::Stale(_) => panic!("matching expected must not be stale"),
+        };
+        // latest is now v2.
+        assert_eq!(s.latest_dossier(&id, "plan").unwrap().unwrap().doc_id, v2);
+
+        // 3) Stale revise: assert v1 is latest (it's not — v2 is) → refused, no
+        //    write, no event.
+        let before = s.list_dossiers(&id).unwrap().len();
+        let stale = s
+            .author_dossier(
+                &id,
+                "plan",
+                "Plan stale",
+                "stale body",
+                "founder",
+                DossierAuthorMode::Revise,
+                Some(&v1),
+                None,
+            )
+            .unwrap();
+        match stale {
+            DossierAuthorOutcome::Stale(st) => {
+                assert!(st.stale);
+                assert_eq!(st.expected_latest_doc_id.as_deref(), Some(v1.as_str()));
+                assert_eq!(st.current_latest_doc_id.as_deref(), Some(v2.as_str()));
+            }
+            DossierAuthorOutcome::Authored(_) => panic!("stale revise must not write"),
+        }
+        assert_eq!(s.list_dossiers(&id).unwrap().len(), before, "no row written");
+        // latest unchanged.
+        assert_eq!(s.latest_dossier(&id, "plan").unwrap().unwrap().doc_id, v2);
+
+        // 4) Fork from the STALE base v1 (latest is v2) → succeeds, records the
+        //    fork link, latest still moves to the fork (newest row).
+        let r4 = s
+            .author_dossier(
+                &id,
+                "plan",
+                "Plan forked from v1",
+                "forked body",
+                "lead",
+                DossierAuthorMode::Fork,
+                None,
+                Some(&v1),
+            )
+            .unwrap();
+        match r4 {
+            DossierAuthorOutcome::Authored(a) => {
+                assert_eq!(a.mode, "fork");
+                assert_eq!(a.forked_from_doc_id.as_deref(), Some(v1.as_str()));
+                assert_eq!(a.revision_of_doc_id, None);
+                assert_eq!(a.revision_number, 3);
+            }
+            DossierAuthorOutcome::Stale(_) => panic!("fork must not be stale"),
+        }
+
+        // Chronicle events: one create, one revise, one fork; the stale attempt
+        // wrote none.
+        let conn = s.conn.lock().unwrap();
+        let count = |et: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM task_events WHERE task_id = ?1 AND event_type = ?2",
+                params![id, et],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count("brief.dossier_authored"), 1);
+        assert_eq!(count("brief.dossier_revised"), 1);
+        assert_eq!(count("brief.dossier_forked"), 1);
+    }
+
+    // §1.8: author validation — empty kind/title/body and an unsafe kind token
+    // refuse; a missing Brief / cross-Brief or cross-kind fork base refuse.
+    #[test]
+    fn dossier_author_validation_and_fork_base_guards() {
+        use brief::{DossierAuthorMode, DossierAuthorOutcome};
+        let s = store();
+        let mk = |t: &str| {
+            s.create(
+                t,
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let a = mk("a");
+        let b = mk("b");
+        let bad = |r: Result<DossierAuthorOutcome, CoordinatorError>| {
+            assert!(matches!(r, Err(CoordinatorError::Invalid(_))));
+        };
+        bad(s.author_dossier(&a, "", "t", "body", "u", DossierAuthorMode::Revise, None, None));
+        bad(s.author_dossier(&a, "pl an", "t", "body", "u", DossierAuthorMode::Revise, None, None));
+        bad(s.author_dossier(&a, "plan", "", "body", "u", DossierAuthorMode::Revise, None, None));
+        bad(s.author_dossier(&a, "plan", "t", "", "u", DossierAuthorMode::Revise, None, None));
+        bad(s.author_dossier(&a, "plan", "t", "body", "", DossierAuthorMode::Revise, None, None));
+        // Missing Brief.
+        assert!(matches!(
+            s.author_dossier("nope", "plan", "t", "body", "u", DossierAuthorMode::Revise, None, None),
+            Err(CoordinatorError::NotFound(_))
+        ));
+        // Fork with no base id.
+        bad(s.author_dossier(&a, "plan", "t", "body", "u", DossierAuthorMode::Fork, None, None));
+
+        // Seed a plan on `a`; forking it from Brief `b` must refuse (cross-Brief
+        // base), and forking a different kind must refuse (cross-kind base).
+        let pa = match s
+            .author_dossier(&a, "plan", "P", "pbody", "u", DossierAuthorMode::Revise, None, None)
+            .unwrap()
+        {
+            DossierAuthorOutcome::Authored(x) => x.doc_id,
+            _ => unreachable!(),
+        };
+        bad(s.author_dossier(&b, "plan", "t", "body", "u", DossierAuthorMode::Fork, None, Some(&pa)));
+        bad(s.author_dossier(&a, "design", "t", "body", "u", DossierAuthorMode::Fork, None, Some(&pa)));
+    }
+
+    // §1.8: the new authoring metadata surfaces on the Dossier reads, and a
+    // legacy `add_dossier` row still reads back with a derived revision_number
+    // and null authoring metadata (back-compatible).
+    #[test]
+    fn dossier_reads_carry_revision_metadata() {
+        use brief::{DossierAuthorMode, DossierAuthorOutcome};
+        let s = store();
+        let id = s
+            .create(
+                "brief",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        // A legacy add (no authoring metadata) is revision 1 of `notes`.
+        let legacy = s.add_dossier(&id, "notes", "Note", "n").unwrap();
+        let lg = s.get_dossier(&legacy).unwrap().unwrap();
+        assert_eq!(lg.revision_number, 1);
+        assert_eq!(lg.author, None);
+        assert_eq!(lg.revision_of_doc_id, None);
+        assert_eq!(lg.forked_from_doc_id, None);
+
+        // Two authored plan revisions.
+        let v1 = match s
+            .author_dossier(&id, "plan", "P1", "b1", "founder", DossierAuthorMode::Revise, None, None)
+            .unwrap()
+        {
+            DossierAuthorOutcome::Authored(a) => a.doc_id,
+            _ => unreachable!(),
+        };
+        s.author_dossier(
+            &id,
+            "plan",
+            "P2",
+            "b2",
+            "founder",
+            DossierAuthorMode::Revise,
+            Some(&v1),
+            None,
+        )
+        .unwrap();
+        let latest = s.latest_dossier(&id, "plan").unwrap().unwrap();
+        assert_eq!(latest.title, "P2");
+        assert_eq!(latest.revision_number, 2);
+        assert_eq!(latest.author.as_deref(), Some("founder"));
+        assert_eq!(latest.revision_of_doc_id.as_deref(), Some(v1.as_str()));
+
+        // list_dossiers carries per-kind revision numbers (notes rev 1, plan
+        // rev 1 + 2).
+        let metas = s.list_dossiers(&id).unwrap();
+        let plan_revs: Vec<i64> = metas
+            .iter()
+            .filter(|m| m.kind == "plan")
+            .map(|m| m.revision_number)
+            .collect();
+        assert_eq!(plan_revs, vec![1, 2]);
+        let notes_rev = metas
+            .iter()
+            .find(|m| m.kind == "notes")
+            .map(|m| m.revision_number);
+        assert_eq!(notes_rev, Some(1));
+    }
+
     #[test]
     fn phase1_brief_spine_fields_set_and_read() {
         let s = store();
@@ -22680,6 +23312,38 @@ mod tests {
         ));
     }
 
+    // §1.8: the `brief.dossier_author` handler is tenant-scoped on the owning
+    // Brief exactly like the other Dossier surfaces — a cross-Guild author is
+    // refused; the same-Guild author returns the authored JSON.
+    #[test]
+    fn brief_dossier_author_denied_across_tenant() {
+        let s = TaskStore::in_memory().unwrap();
+        let a = s
+            .create_brief("acme", "Acme", "subj", None, None, None, None)
+            .unwrap();
+        let arg = serde_json::json!({
+            "task_id": a, "kind": "plan", "title": "P", "body": "b", "author": "founder"
+        })
+        .to_string();
+        // Cross-Guild author is refused.
+        assert!(matches!(
+            handle_brief_dossier_author(&s, &ctx_tenant(arg.as_bytes(), "globex")),
+            HandlerOutcome::Err(_)
+        ));
+        // Nothing was written.
+        assert!(s.list_dossiers(&a).unwrap().is_empty());
+        // Same-Guild author returns the authored JSON (create, rev 1).
+        match handle_brief_dossier_author(&s, &ctx_tenant(arg.as_bytes(), "acme")) {
+            HandlerOutcome::Ok(body) => {
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(v["mode"], "create");
+                assert_eq!(v["revision_number"], 1);
+                assert!(v.get("stale").is_none());
+            }
+            HandlerOutcome::Err(_) => panic!("same-tenant author errored"),
+        }
+    }
+
     // §1.9 (thread interactions): open → list → respond happy path,
     // including the Chronicle mirror on both the open and the answer.
     #[test]
@@ -22900,6 +23564,49 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    // §1.8: the SAME plan-bound stale protection holds when the newer plan
+    // revision is written through the NEW `author_dossier` path (not just
+    // `add_dossier`). Authoring a fresh `plan` revision makes the open
+    // plan-bound confirm stale; the accept refuses and never resolves approved.
+    #[test]
+    fn plan_confirm_stale_after_authored_plan_revision() {
+        use brief::DossierAuthorMode;
+        let s = TaskStore::in_memory().unwrap();
+        let b = s
+            .create_brief("acme", "Plan it", "subj", None, None, None, None)
+            .unwrap();
+        let v1 = s.add_dossier(&b, "plan", "Plan v1", "first").unwrap();
+        let id = s.open_plan_confirm(&b, "operative-1", "").unwrap();
+        // The plan is revised through the governed author path (optimistic lock
+        // satisfied: v1 is still latest at author time).
+        s.author_dossier(
+            &b,
+            "plan",
+            "Plan v2",
+            "second",
+            "founder",
+            DossierAuthorMode::Revise,
+            Some(&v1),
+            None,
+        )
+        .unwrap();
+        // Accepting the now-superseded confirm is refused as stale.
+        assert!(matches!(
+            s.respond_interaction(&b, &id, "founder", "resolved", "yes"),
+            Err(CoordinatorError::Invalid(_))
+        ));
+        let listed = s.list_interactions(&b).unwrap();
+        let card = listed.iter().find(|i| i.interaction_id == id).unwrap();
+        assert_eq!(card.status, "expired");
+        assert_eq!(card.response, None);
+        assert!(
+            s.query_events(&b, 0, 50, Some("brief.interaction_resolved"), EventOrder::Asc)
+                .unwrap()
+                .is_empty(),
+            "a stale plan must never resolve as approved"
         );
     }
 

@@ -2091,6 +2091,128 @@ pub async fn open_plan_package(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct AuthorDossierRequest {
+    /// Short safe token (e.g. `plan`, `design`, `notes`).
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    pub author: String,
+    /// `revise` (default) or `fork`.
+    #[serde(default)]
+    pub mode: String,
+    /// Optimistic-lock base for `revise`: the doc_id the caller believes is the
+    /// current latest of this kind. Omit for a first revision.
+    #[serde(default)]
+    pub expected_latest_doc_id: Option<String>,
+    /// The base revision a `fork` branches from (required when `mode = fork`).
+    #[serde(default)]
+    pub base_doc_id: Option<String>,
+}
+
+/// `POST /v1/spine/briefs/:id/dossiers/author` — author a Dossier revision with
+/// optimistic locking / explicit fork (relix-execution-and-issue-design §1.8).
+/// The bounded v1 of issue-document authoring: append-only, lock-safe. On
+/// success returns the authored JSON (`{doc_id, kind, title, revision_number,
+/// mode, revision_of_doc_id?, forked_from_doc_id?, …}`). A **stale-lock**
+/// refusal (a newer revision landed first) is surfaced as an honest **`409`**
+/// carrying the `{stale:true, expected_latest_doc_id, current_latest_doc_id}`
+/// body — never a `502` — so the editor can reload without losing the draft.
+/// "Never retry a 409" applies: reload (or `fork`) instead.
+pub async fn author_dossier(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AuthorDossierRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    if req.kind.trim().is_empty() {
+        return Err(bad("kind required"));
+    }
+    if req.title.trim().is_empty() {
+        return Err(bad("title required"));
+    }
+    if req.body.trim().is_empty() {
+        return Err(bad("body required"));
+    }
+    if req.author.trim().is_empty() {
+        return Err(bad("author required"));
+    }
+    let mode = req.mode.trim();
+    if !mode.is_empty() && mode != "revise" && mode != "fork" {
+        return Err(bad("mode must be revise or fork"));
+    }
+    if mode == "fork"
+        && req
+            .base_doc_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+    {
+        return Err(bad("fork requires base_doc_id"));
+    }
+    let arg = serde_json::json!({
+        "task_id": id,
+        "kind": req.kind.trim(),
+        "title": req.title.trim(),
+        "body": req.body,
+        "author": req.author.trim(),
+        "mode": mode,
+        "expected_latest_doc_id": req.expected_latest_doc_id,
+        "base_doc_id": req.base_doc_id,
+    });
+    let arg_bytes = serde_json::to_vec(&arg).map_err(|e| bad(&format!("encode: {e}")))?;
+    let body = call_peer(&state, "brief.dossier_author", &arg_bytes).await?;
+    dossier_author_response(body)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DossierLatestQuery {
+    pub kind: String,
+}
+
+/// `GET /v1/spine/briefs/:id/dossiers/latest?kind=<kind>` — the latest Dossier
+/// revision of a kind on a Brief, full body + authoring/revision metadata
+/// (relix-execution-and-issue-design §1.8). Proxies `brief.dossier_latest`; the
+/// body is `null` when the Brief has no Dossier of that kind. The Brief
+/// workroom's document editor uses this to load the current latest body before
+/// saving a revision (keeping the loaded `doc_id` as the optimistic-lock base).
+pub async fn dossier_latest(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<DossierLatestQuery>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let kind = q.kind.trim();
+    if kind.is_empty() {
+        return Err(bad("kind required"));
+    }
+    // `brief.dossier_latest` takes `task_id|kind`; the kind is a safe short
+    // token (the coordinator re-validates), so it carries no `|`.
+    if kind.contains('|') {
+        return Err(bad("kind must not contain `|`"));
+    }
+    let arg = format!("{id}|{kind}");
+    let body = call_peer(&state, "brief.dossier_latest", arg.as_bytes()).await?;
+    json_passthrough(body)
+}
+
+/// The `brief.dossier_author` body carries a `stale: true` discriminant when
+/// the optimistic lock failed (a newer revision landed first). Map that one
+/// case onto **409 Conflict** (carrying the structured body so the editor can
+/// reload to the current latest); every successful author passes through as
+/// `200`. Mirrors `run_report_response`'s "inspect the Ok body, map the one
+/// conflict case" pattern.
+fn dossier_author_response(body: Vec<u8>) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let is_stale = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("stale").and_then(serde_json::Value::as_bool))
+        == Some(true);
+    if is_stale {
+        json_with_status(StatusCode::CONFLICT, body)
+    } else {
+        json_passthrough(body)
+    }
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RespondPlanConfirmRequest {
     pub responder: String,
     /// `true` accepts (re-checks the plan is latest, then materializes the
@@ -2553,6 +2675,39 @@ mod tests {
     }
 
     #[test]
+    fn dossier_author_stale_is_a_409_authored_is_200() {
+        // execution-and-issue-design §1.8: a stale-lock refusal (a newer
+        // revision landed first) must surface as 409 Conflict carrying the
+        // structured body so the editor can reload — never a 502, and never a
+        // silently-retryable 200. A successful author is a plain 200.
+        let stale = dossier_author_response(
+            br#"{"stale":true,"kind":"plan",
+                 "expected_latest_doc_id":"doc_a","current_latest_doc_id":"doc_b"}"#
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            stale.status(),
+            StatusCode::CONFLICT,
+            "a stale-lock refusal must be 409"
+        );
+        assert_eq!(
+            stale.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let ok = dossier_author_response(
+            br#"{"doc_id":"doc_c","kind":"plan","title":"P","mode":"revise","revision_number":2}"#
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            ok.status(),
+            StatusCode::OK,
+            "a successful author must be 200"
+        );
+    }
+
+    #[test]
     fn run_report_real_outcomes_and_preconditions_stay_200() {
         // A live/terminal run is a 200 — the client polls /v1/runs for it.
         for status in ["running", "done", "failed", "continued"] {
@@ -2906,6 +3061,17 @@ mod tests {
             .route("/v1/spine/briefs/:id/snag", post(add_snag))
             .route("/v1/spine/briefs/:id/unsnag", post(remove_snag))
             .route("/v1/spine/briefs/:id/subbrief", post(add_subbrief))
+            // §1.8 Dossier authoring + latest-load — both static `dossiers/*`
+            // segments (no sibling conflict with the other `:id/...` routes;
+            // `author` and `latest` are static, not params).
+            .route(
+                "/v1/spine/briefs/:id/dossiers/author",
+                post(author_dossier),
+            )
+            .route(
+                "/v1/spine/briefs/:id/dossiers/latest",
+                get(dossier_latest),
+            )
             // First-run company surfaces + the Action Center (company-model
             // §8.2) — `/company` vs `/company/actions` vs `/company/init` must
             // not collide in matchit.

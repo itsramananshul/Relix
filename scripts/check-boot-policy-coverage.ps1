@@ -91,6 +91,8 @@ $RequiredCapabilities = @(
     # Bridge-back operative callbacks (per-Shift brt_* token at the bridge, but
     # the bridge still calls the mesh as chat-users, so each needs an allow rule)
     'brief.dossier_add', 'brief.set_snags', 'brief.clearance_request', 'bridge_back.authorize',
+    # Dossier authoring / revision-lock / fork (issue documents, §1.8)
+    'brief.dossier_author', 'brief.dossier_latest',
     # Agent roster: CRUD + hiring + clearances + standing approvals
     'agent.list', 'agent.get', 'agent.create', 'agent.update', 'agent.delete',
     'agent.approve_hire', 'agent.reject_hire', 'agent.operatives', 'agent.keys', 'agent.assign_check',

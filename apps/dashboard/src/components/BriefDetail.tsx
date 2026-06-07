@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   api,
+  ApiError,
   tryGet,
   tryGetReport,
   subscribeRunEvents,
@@ -10,10 +11,12 @@ import {
   briefInteractions,
   briefSuggestions,
   briefPlanConfirms,
+  briefDossiers,
   type RunDiff,
   type BriefInteraction,
   type InteractionStreamConn,
   type SuggestChild,
+  type DossierMeta,
 } from "../api";
 import { useAuth } from "../auth";
 import { Badge, useAsync } from "./common";
@@ -159,7 +162,7 @@ interface BriefDetailData {
   snags?: string[];
   blocking?: string[];
   parents?: string[];
-  dossiers?: { doc_id?: string; kind?: string; title?: string }[];
+  dossiers?: DossierMeta[];
   labels?: string[];
   pinned?: boolean;
   due_at?: number | null;
@@ -254,6 +257,22 @@ export function BriefDetail({
     setPlanChildren((cs) => cs.map((c) => (c.id === id ? { ...c, ...patch } : c)));
   const removeChild = (id: number) =>
     setPlanChildren((cs) => (cs.length === 1 ? cs : cs.filter((c) => c.id !== id)));
+
+  // Documents (Dossiers) editor state (§1.8). A minimal, append-only authoring
+  // surface — a kind/title/body textarea, NOT a rich-text editor. `docBaseId`
+  // is the loaded latest revision's id, held as the optimistic-lock base: a
+  // "Save revision" sends it as `expected_latest_doc_id`, so a save after a
+  // newer revision landed is refused (HTTP 409) and the draft is kept for a
+  // reload or an explicit fork. `null` base ⇒ authoring the first revision of a
+  // kind. `docStale` flags that the last save lost the lock (offer fork).
+  const [docOpen, setDocOpen] = useState(false);
+  const [docBusy, setDocBusy] = useState(false);
+  const [docKind, setDocKind] = useState("plan");
+  const [docTitle, setDocTitle] = useState("");
+  const [docBody, setDocBody] = useState("");
+  const [docBaseId, setDocBaseId] = useState<string | null>(null);
+  const [docBaseRev, setDocBaseRev] = useState<number | null>(null);
+  const [docStale, setDocStale] = useState(false);
 
   // Load the Brief detail AND the fuller Chronicle timeline together. The
   // detail carries only a bounded `chronicle.recent`; the dedicated `/events`
@@ -386,6 +405,16 @@ export function BriefDetail({
   const openPlanConfirm = interactions.find(
     (i) => i.status === "open" && i.kind === "confirm" && i.bound_doc_kind === "plan",
   );
+  // Documents (§1.8): the latest revision of each kind, for the editor list.
+  // The detail's `dossiers` array is oldest→newest, so the LAST entry of each
+  // kind is its latest; `revision_number` is the count for that kind.
+  const latestByKind = new Map<string, DossierMeta>();
+  for (const x of d.dossiers ?? []) {
+    if (x.kind) latestByKind.set(x.kind, x);
+  }
+  const dossierKinds = Array.from(latestByKind.values()).sort((a, b) =>
+    a.kind.localeCompare(b.kind),
+  );
 
   async function submitComment() {
     const text = comment.trim();
@@ -504,6 +533,148 @@ export function BriefDetail({
       });
     } finally {
       setComposerBusy(false);
+    }
+  }
+
+  // Load the latest revision of a kind into the editor (§1.8). Populates the
+  // title/body and keeps the loaded `doc_id` as the optimistic-lock base. An
+  // empty result (no Dossier of that kind yet) leaves the body blank with a
+  // null base — the next save authors the first revision.
+  async function loadDocLatest(kind: string) {
+    setDocBusy(true);
+    setBanner(null);
+    setDocStale(false);
+    try {
+      const doc = await briefDossiers.latest(briefId, kind);
+      setDocKind(kind);
+      if (doc && doc.doc_id) {
+        setDocTitle(doc.title ?? "");
+        setDocBody(doc.body ?? "");
+        setDocBaseId(doc.doc_id);
+        setDocBaseRev(doc.revision_number ?? null);
+      } else {
+        setDocTitle("");
+        setDocBody("");
+        setDocBaseId(null);
+        setDocBaseRev(null);
+        setBanner({ kind: "ok", msg: `No "${kind}" document yet — your save creates revision 1.` });
+      }
+      setDocOpen(true);
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Could not load the document" });
+    } finally {
+      setDocBusy(false);
+    }
+  }
+
+  // Start a fresh document of a kind (no base — authors revision 1, or revises
+  // the latest if one already exists and the save provides no expected id; the
+  // backend appends on top in that case).
+  function newDoc() {
+    setDocTitle("");
+    setDocBody("");
+    setDocBaseId(null);
+    setDocBaseRev(null);
+    setDocStale(false);
+    setDocOpen(true);
+  }
+
+  // Save a revision (§1.8). When a base revision is loaded, send it as
+  // `expected_latest_doc_id` so a stale save (a newer revision landed first) is
+  // refused with HTTP 409 — we DON'T clear the draft; we mark it stale and
+  // invite a reload or a fork. On success the editor rebases onto the new
+  // revision so a follow-up save chains cleanly.
+  async function saveDocRevision() {
+    const kind = docKind.trim();
+    const title = docTitle.trim();
+    const body = docBody.trim();
+    if (!kind || !title || !body) {
+      setBanner({ kind: "err", msg: "Document kind, title, and body are all required." });
+      return;
+    }
+    setDocBusy(true);
+    setBanner(null);
+    try {
+      const r = await briefDossiers.author(briefId, {
+        kind,
+        title,
+        body: docBody,
+        author: status?.username || "operator",
+        mode: "revise",
+        expected_latest_doc_id: docBaseId ?? undefined,
+      });
+      setDocBaseId(r.doc_id);
+      setDocBaseRev(r.revision_number);
+      setDocStale(false);
+      setBanner({
+        kind: "ok",
+        msg: `Saved "${kind}" revision ${r.revision_number}${
+          kind === "plan" ? " — any plan-bound approval is now stale until re-requested." : "."
+        }`,
+      });
+      reload();
+      invalidate(["briefs"], { briefId });
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        // Optimistic-lock conflict: a newer revision landed first. Keep the
+        // draft, mark it stale, and refresh the list so the operator sees the
+        // new latest — they can reload it or fork their draft. Never retry the
+        // 409 blindly.
+        setDocStale(true);
+        setBanner({
+          kind: "err",
+          msg:
+            "This document changed since you loaded it — your draft is kept. " +
+            "Reload the latest revision (losing your edits), or fork your draft as a new line.",
+        });
+        reload();
+      } else {
+        setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Could not save the revision" });
+      }
+    } finally {
+      setDocBusy(false);
+    }
+  }
+
+  // Fork the current draft as a new line from the loaded base revision (§1.8).
+  // Explicit branch — carries `forked_from_doc_id` and is NOT a stale overwrite
+  // (the base may be behind the latest). Requires a loaded base.
+  async function forkDocFromLoaded() {
+    const kind = docKind.trim();
+    const title = docTitle.trim();
+    const body = docBody.trim();
+    if (!docBaseId) {
+      setBanner({ kind: "err", msg: "Load a revision first to fork from it." });
+      return;
+    }
+    if (!kind || !title || !body) {
+      setBanner({ kind: "err", msg: "Document kind, title, and body are all required." });
+      return;
+    }
+    setDocBusy(true);
+    setBanner(null);
+    try {
+      const r = await briefDossiers.author(briefId, {
+        kind,
+        title,
+        body: docBody,
+        author: status?.username || "operator",
+        mode: "fork",
+        base_doc_id: docBaseId,
+      });
+      setDocBaseId(r.doc_id);
+      setDocBaseRev(r.revision_number);
+      setDocStale(false);
+      setBanner({
+        kind: "ok",
+        msg: `Forked "${kind}" as revision ${r.revision_number} (from ${r.forked_from_doc_id}).`,
+      });
+      reload();
+      invalidate(["briefs"], { briefId });
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Could not fork the document" });
+    } finally {
+      setDocBusy(false);
     }
   }
 
@@ -1085,6 +1256,143 @@ export function BriefDetail({
               }
             >
               {composerBusy ? "…" : "Create plan package"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Documents (§1.8; dashboard-design §7 work artifacts). An append-only
+          authoring surface — a kind/title/body textarea, NOT a rich editor —
+          for the Brief's Dossiers (plan/design/notes). Each kind shows its
+          latest revision; "Edit latest" loads it under an optimistic lock so a
+          "Save revision" after a newer one landed is refused (the draft is kept
+          for a reload or fork). Saving a new `plan` revision naturally makes any
+          plan-bound approval stale (the approval binds the latest plan id). */}
+      <div
+        className="row"
+        style={{ marginTop: 14, gap: 8, alignItems: "baseline", flexWrap: "wrap" }}
+      >
+        <strong style={{ fontSize: 12 }}>Documents</strong>
+        <span className="muted" style={{ fontSize: 11 }}>
+          {dossierKinds.length > 0
+            ? `${dossierKinds.length} kind${dossierKinds.length === 1 ? "" : "s"} · append-only revisions`
+            : "No documents yet — author a plan, design, or notes."}
+        </span>
+        <div className="spacer" style={{ flex: 1 }} />
+        <button className="btn ghost sm" onClick={() => setDocOpen((v) => !v)} aria-expanded={docOpen}>
+          {docOpen ? "Hide editor" : "New / edit document"}
+        </button>
+      </div>
+
+      {dossierKinds.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6 }}>
+          {dossierKinds.map((doc) => (
+            <div
+              key={doc.kind}
+              className="row wrap"
+              style={{ gap: 8, alignItems: "baseline", fontSize: 12 }}
+            >
+              <span className="mono" style={{ fontWeight: 600 }}>{doc.kind}</span>
+              <span>{doc.title}</span>
+              <span className="muted" style={{ fontSize: 11 }}>
+                rev {doc.revision_number ?? 1}
+                {doc.author ? ` · ${doc.author}` : ""}
+                {doc.forked_from_doc_id ? " · forked" : ""}
+              </span>
+              <div className="spacer" style={{ flex: 1 }} />
+              <button
+                className="btn ghost sm"
+                disabled={docBusy}
+                title={`Load the latest "${doc.kind}" revision for editing`}
+                onClick={() => loadDocLatest(doc.kind)}
+              >
+                Edit latest
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {docOpen && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
+          <div className="row wrap" style={{ gap: 6, alignItems: "center" }}>
+            <label style={{ display: "flex", flexDirection: "column", gap: 4, flex: "0 1 160px" }}>
+              <span className="muted" style={{ fontSize: 11 }}>Kind</span>
+              <input
+                className="input"
+                style={{ boxSizing: "border-box" }}
+                placeholder="plan"
+                value={docKind}
+                onChange={(e) => {
+                  setDocKind(e.target.value);
+                  // Changing the kind by hand drops the loaded base — the new
+                  // kind's latest is a different lock target. Use "Edit latest"
+                  // to rebase onto a kind's current revision.
+                  setDocBaseId(null);
+                  setDocBaseRev(null);
+                  setDocStale(false);
+                }}
+              />
+            </label>
+            <label style={{ display: "flex", flexDirection: "column", gap: 4, flex: "1 1 200px" }}>
+              <span className="muted" style={{ fontSize: 11 }}>Title</span>
+              <input
+                className="input"
+                style={{ boxSizing: "border-box" }}
+                placeholder="Document title"
+                value={docTitle}
+                onChange={(e) => setDocTitle(e.target.value)}
+              />
+            </label>
+            <button
+              className="btn ghost sm"
+              style={{ alignSelf: "flex-end" }}
+              onClick={newDoc}
+              disabled={docBusy}
+              title="Start a fresh draft (no loaded base)"
+            >
+              New
+            </button>
+          </div>
+          <span className="muted" style={{ fontSize: 11 }}>
+            {docBaseId
+              ? `Editing latest revision ${docBaseRev ?? "?"} (locked to this revision — a newer one rejects the save).`
+              : "New draft — saving authors the next revision of this kind."}
+          </span>
+          <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <span className="muted" style={{ fontSize: 11 }}>Body</span>
+            <textarea
+              className="input"
+              style={{ width: "100%", minHeight: 120, resize: "vertical", boxSizing: "border-box" }}
+              placeholder="Document body (plain text — append-only)…"
+              value={docBody}
+              onChange={(e) => setDocBody(e.target.value)}
+            />
+          </label>
+          <div className="row wrap" style={{ gap: 8, alignItems: "center" }}>
+            {docStale && (
+              <span style={{ color: "#c0392b", fontSize: 11 }}>
+                Stale — reload latest or fork your draft.
+              </span>
+            )}
+            <div className="spacer" style={{ flex: 1 }} />
+            {docBaseId && (
+              <button
+                className="btn ghost sm"
+                onClick={forkDocFromLoaded}
+                disabled={docBusy || !docTitle.trim() || !docBody.trim()}
+                title="Branch your draft as a new line from the loaded revision (not a stale overwrite)"
+              >
+                {docBusy ? "…" : "Fork from loaded revision"}
+              </button>
+            )}
+            <button
+              className="btn"
+              onClick={saveDocRevision}
+              disabled={docBusy || !docKind.trim() || !docTitle.trim() || !docBody.trim()}
+              title="Append a new revision (optimistic-locked to the loaded revision)"
+            >
+              {docBusy ? "…" : "Save revision"}
             </button>
           </div>
         </div>

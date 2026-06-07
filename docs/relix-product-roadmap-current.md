@@ -460,12 +460,32 @@ ledger entry or design section.
     proposal. Bridge routes `POST /v1/spine/briefs/:id/plan-package` + `…/plan-confirms/:cid/respond`
     and boot-policy allow rules/coverage shipped; the workroom routes a plan-package confirm (one
     carrying `bound_interaction_id`) through the safe response path so **Yes** triggers decomposition
-    exactly once. *Still deferred:* full issue **document authoring / per-doc revision-locking /
-    forking** (`execution §1.8`), a dashboard plan-package **editor** (only the safe response path
-    ships; the open route exists), and wiring this into an **autonomous (LLM) planner** flow (no
-    agent auto-authors the plan or auto-fires it). (The `owner`-liveness takeover gap is now **closed** — see the
-    owner-takeover note above; for these synchronous operator interactions the honest model is
-    operator-resumable with stale-age takeover, not a heartbeat-backed live run.)
+    exactly once. **Issue document authoring / per-doc revision-locking / forking is now BACKEND +
+    DASHBOARD SHIPPED (v1, `execution §1.8`):** a new **`brief.dossier_author`** capability authors a
+    Dossier revision with **optimistic concurrency** — additive nullable `author` /
+    `revision_of_doc_id` / `forked_from_doc_id` columns on `task_documents` (a derived 1-based
+    `revision_number` per Brief+kind in the read, so legacy / `brief.dossier_add` / plan-package rows
+    get one too). `mode=revise` (default) writes the next linear revision; when the caller passes
+    `expected_latest_doc_id` it MUST still equal the current latest of that kind, else the write is
+    refused as **stale** (a typed `{stale:true,…}` result, **nothing written** — Dossiers stay
+    immutable/append-only). `mode=fork` requires a `base_doc_id` on the **same Brief+kind** and writes
+    a new append-only row carrying `forked_from_doc_id` **even if the latest moved** (the deliberate
+    "branch from a stale/base revision" escape hatch, never an accidental overwrite). Every write
+    Chronicles `brief.dossier_authored` / `_revised` / `_forked`; `brief.dossiers` / `dossier_get` /
+    `dossier_latest` now carry the new metadata (existing clients unaffected). Bridge: a
+    `POST /v1/spine/briefs/:id/dossiers/author` route maps a stale-lock refusal to an honest **`409`**
+    (never a 502; "never retry a 409"), plus a `GET …/dossiers/latest?kind=` to load a body for
+    editing; both behind boot-policy allow rules/coverage. Dashboard: the Brief workroom gains a
+    compact **Documents** editor (kind/title/body textarea — no rich text) listing each kind's latest
+    revision with `Edit latest` (loads under the optimistic lock), `Save revision` (a 409 keeps the
+    draft + marks it stale), and `Fork from loaded revision`; saving a new `plan` revision naturally
+    makes any plan-bound approval stale (the approval binds the latest plan id). *Still deferred:* a
+    full rich-text editor / markdown renderer overhaul, a collaborative cursor, an external document
+    store, and wiring this into an **autonomous (LLM) planner** flow (no agent auto-authors the plan
+    or auto-fires it). The dashboard plan-package **composer** also ships (manual, not an editor).
+    (The `owner`-liveness takeover gap is **closed** — see the owner-takeover note above; for these
+    synchronous operator interactions the honest model is operator-resumable with stale-age takeover,
+    not a heartbeat-backed live run.)
 
 ---
 
@@ -783,9 +803,15 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
     minimal manual plan-package composer** (plan title/body + approval prompt + a child-task list with
     optional priority and an earlier-sibling `after` dependency) wired to `briefPlanConfirms.open`, so
     a human can open a plan package from the workroom; the created bound confirm is then approved
-    through the already-safe response path. *Still deferred:* full issue document authoring /
-    revision-locking / forking (§1.8) and an autonomous LLM planner — the composer is a manual editor,
-    not a full document editor or LLM planner.
+    through the already-safe response path. **Issue document authoring / per-doc revision-locking /
+    forking is now shipped (v1, §1.8):** `brief.dossier_author` writes an append-only Dossier revision
+    with optimistic concurrency (matching `expected_latest_doc_id` revises; a stale base is refused as
+    a typed `{stale:true}` no-write; `mode=fork` branches from a base via `forked_from_doc_id`), a
+    `POST …/dossiers/author` bridge route maps a stale lock to **409**, and the Brief workroom carries
+    a compact **Documents** editor (kind/title/body textarea, latest-per-kind list, Edit-latest under
+    the lock, Save-revision, Fork-from-loaded). *Still deferred:* a rich-text editor / markdown
+    overhaul, a collaborative cursor, an external document store, and an autonomous LLM planner — the
+    composer + editor are manual surfaces, not a full rich editor or LLM planner.
 
 > After completing a slice: re-open the cited section, update the implementation map /
 > divergence ledger in `product-spine-implementation.md`, and update this file's §2/§3 so

@@ -1436,6 +1436,14 @@ name = "spine_brief_dossier_add"
 method = "brief.dossier_add"
 allow_groups = ["chat-users"]
 [[rules]]
+name = "spine_brief_dossier_author"
+method = "brief.dossier_author"
+allow_groups = ["chat-users"]
+[[rules]]
+name = "spine_brief_dossier_latest"
+method = "brief.dossier_latest"
+allow_groups = ["chat-users"]
+[[rules]]
 name = "spine_brief_set_snags"
 method = "brief.set_snags"
 allow_groups = ["chat-users"]

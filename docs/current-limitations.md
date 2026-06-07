@@ -119,6 +119,35 @@ without a separate manual `brief.move done`. What it does **not** do:
 - **`git_worktree` / `git_checkout` workspace context is deferred** — only
   `empty` and the capped/filtered `copy_repo` snapshot ship today.
 
+### Issue documents (Dossiers) are append-only textareas, not a rich editor
+
+A Brief's documents (Dossiers — `plan` / `design` / `notes` / …) can now be
+**authored and revised** from the workroom (`brief.dossier_author` →
+`POST /v1/spine/briefs/:id/dossiers/author`, `relix-execution-and-issue-design`
+§1.8). Authoring is **append-only and optimistic-locked**: editing the latest
+revision sends its id as `expected_latest_doc_id`, so a save after a newer
+revision landed is refused (**HTTP 409**, nothing written) — the draft is kept
+for a reload or an explicit **fork** (which carries `forked_from_doc_id` and is
+never an accidental stale overwrite). A `revision_number` is derived per
+Brief+kind on read. What it does **not** do:
+
+- **No rich text / no markdown renderer.** The editor is a plain
+  kind/title/body **textarea**; the body is stored and shown verbatim. There is
+  no formatting toolbar, no markdown preview overhaul, no attachments.
+- **No collaborative editing.** There is no live cursor, presence, or operational
+  transform — two operators editing the same kind race on the optimistic lock
+  (the loser gets a 409 and reloads or forks). Single-operator-at-a-time by
+  design.
+- **No external document store.** Dossiers are rows in the coordinator's
+  `task_documents` ledger (append-only); there is no Google-Docs/Notion-style
+  external store, no per-doc binary blobs, and the body is byte-capped (64 KiB).
+- **No autonomous authoring.** No agent/LLM authors or revises a document on its
+  own — every author/revise/fork is an operator action through the governed
+  capability. The separate plan-package **composer** is likewise a manual surface.
+- **Locking is the revision lock + explicit fork**, not Paperclip's
+  "locked-flag → writes redirect to a new key" nicety; that auto-redirect is not
+  implemented.
+
 ### The Prime / company flow is governed + rule-based, not an autonomous CEO
 
 Relix models a company — Founder, Prime (planning lead), Crew, Mandates,

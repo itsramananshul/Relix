@@ -779,6 +779,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/spine/briefs/:id/plan-confirms/:cid/respond",
             post(spine::respond_plan_confirm),
         )
+        // §1.8 issue-document authoring: author a Dossier revision with
+        // optimistic locking / explicit fork (POST), and load the latest
+        // revision of a kind with its body (GET). Both static `dossiers/*`
+        // segments — no param conflict with the other `:id/...` routes.
+        .route(
+            "/v1/spine/briefs/:id/dossiers/author",
+            post(spine::author_dossier),
+        )
+        .route(
+            "/v1/spine/briefs/:id/dossiers/latest",
+            get(spine::dossier_latest),
+        )
         .route("/v1/spine/briefs/:id/due", post(spine::set_due))
         .route("/v1/spine/briefs/:id/set", post(spine::set_field))
         .route("/v1/spine/briefs/:id/snag", post(spine::add_snag))

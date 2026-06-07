@@ -374,6 +374,78 @@ export const briefPlanConfirms = {
     ),
 };
 
+// ── Brief Dossiers — issue documents (author / revision-lock / fork) ──────
+// A Dossier is a durable, append-only artifact on a Brief (plan/design/notes;
+// relix-execution-and-issue-design §1.8). v1 authoring: revise under an
+// optimistic lock, or explicitly fork a new line from a stale/base revision.
+// `revision_number` is derived (1-based within Brief+kind, oldest first).
+
+// A Dossier listing row (metadata only, no body) as carried on the Brief
+// detail's `dossiers` array.
+export interface DossierMeta {
+  doc_id: string;
+  kind: string;
+  title: string;
+  created_at?: number;
+  updated_at?: number;
+  author?: string | null;
+  revision_of_doc_id?: string | null;
+  forked_from_doc_id?: string | null;
+  revision_number?: number;
+}
+
+// A full Dossier (with body) — returned by the latest-load route.
+export interface Dossier extends DossierMeta {
+  task_id: string;
+  body: string;
+}
+
+// The successful-author result (mirrors the coordinator's DossierAuthored).
+export interface DossierAuthored {
+  doc_id: string;
+  task_id: string;
+  kind: string;
+  title: string;
+  author?: string | null;
+  mode: "create" | "revise" | "fork";
+  revision_number: number;
+  revision_of_doc_id?: string | null;
+  forked_from_doc_id?: string | null;
+}
+
+export const briefDossiers = {
+  // Load the latest revision of a kind (full body + metadata), or `null` when
+  // the Brief has no Dossier of that kind. The editor keeps the returned
+  // `doc_id` as the optimistic-lock base for the next save.
+  latest: (briefId: string, kind: string) =>
+    api.get<Dossier | null>(
+      `/v1/spine/briefs/${encodeURIComponent(briefId)}/dossiers/latest?kind=${encodeURIComponent(
+        kind,
+      )}`,
+    ),
+  // Author a Dossier revision. `mode` defaults to `revise`; pass
+  // `expected_latest_doc_id` to enforce the optimistic lock (a stale base — a
+  // newer revision landed first — rejects with **HTTP 409**, nothing written:
+  // the caller reloads or forks, and must NOT retry the 409 blindly). `mode:
+  // "fork"` branches a new line from `base_doc_id` even if the latest moved.
+  author: (
+    briefId: string,
+    body: {
+      kind: string;
+      title: string;
+      body: string;
+      author: string;
+      mode?: "revise" | "fork";
+      expected_latest_doc_id?: string;
+      base_doc_id?: string;
+    },
+  ) =>
+    api.post<DossierAuthored>(
+      `/v1/spine/briefs/${encodeURIComponent(briefId)}/dossiers/author`,
+      body,
+    ),
+};
+
 // ── Brief-tree cost rollup (brief.cost_rollup) ────────────────────────────
 // The §6.6 issue-tree cost rollup: sum the durable `brief_runs` ledger over a
 // Brief AND its same-Guild Sub-brief tree, with own-vs-descendant totals, tree
