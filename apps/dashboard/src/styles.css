@@ -585,6 +585,13 @@ a > .stat-card:hover { border-color: var(--text-faint); }
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px;
   line-height: 1.5; white-space: pre-wrap; word-break: break-word; color: var(--text);
 }
+/* The charter editor — same bounded, monospace surface as the read-only view,
+   but an editable textarea (Instructions tab, Edit mode). */
+.op-charter-edit {
+  min-height: 280px; max-height: 460px; resize: vertical;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px;
+  line-height: 1.5; white-space: pre-wrap; word-break: break-word; tab-size: 2;
+}
 
 /* Run transcript renderer (dashboard-design §8) — block-grouped "nice" view +
    compact "raw" dump, B&W with semantic-only color. Reused on the Runs page

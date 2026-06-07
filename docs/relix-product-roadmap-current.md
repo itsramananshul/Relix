@@ -372,25 +372,28 @@ ledger entry or design section.
    deep link, or `/agents?agent=<id>`) opens a prominent employee-record panel with five tabs —
    **Overview** (role/status/adapter/readiness, reports-to + clickable direct-reports, pressure
    summary, open assigned Briefs from the board fetch, recent Shifts), **Instructions** (the
-   Operative's charter / instruction bundle from the full-profile `agent.keys` read, rendered
-   read-only as bounded, scrollable preformatted text — never parsed as HTML — with a char/line
-   summary and an honest empty state when none is stored), **Permissions** (the intact
+   Operative's charter / instruction bundle from the full-profile `agent.keys` read — now **viewable
+   and editable**: view mode shows it as bounded, scrollable preformatted text — never parsed as
+   HTML — with a char/line summary and an honest empty state when none is stored; **Edit** opens a
+   bounded textarea and **Save** writes through the configure-gated `PATCH /v1/agents/:id
+   { instruction_bundle }`, where an empty draft **clears** the charter and Cancel restores the last
+   loaded value), **Permissions** (the intact
    Keys + capability-powers + standing-approvals governance face — nothing removed), **Runs**
    (this Operative's Shifts from the existing `/v1/runs` payload — status/trigger/rig/duration/
    started + deep links to `/runs?run=<id>`), **Budget** (committed Allowance / risk ceiling /
    concurrency / approval timeout, explicitly labelled *committed* not spent, with live spend
    routed to the Costs page — never fabricated), and **Configuration** (adapter + autonomy/
    heartbeat flags + org placement + identity + timestamps from `/v1/agents/:id`; the charter is
-   linked to the Instructions tab, and the copy notes model config + Skills are still not exposed
-   by the read API and that charter editing stays out of this surface). The tab is URL-driven (`&tab=<tab>`, default Overview, unknown value falls back
+   linked to the Instructions tab as viewable/editable, and the copy notes model config + Skills are
+   still not exposed by the read API). The tab is URL-driven (`&tab=<tab>`, default Overview, unknown value falls back
    safely) and Copy-link captures it; all five tabs reuse the page's existing fetches (the shared
    detail cache + `/v1/runs` + the board columns) — **no new backend route and no extra fetch
    loop**. *Remaining gap:* by design this stays the inline workbench on the Crew page (NOT a
    separate `/agents/:id` router route — the query-param deep link is canonical); the charter /
-   instruction-bundle is now surfaced **read-only** on the Instructions tab (via `agent.keys`), but
-   charter **authoring/editing**, the per-Operative **model lane**, and the **Skills** tab are still
-   not built (editing is configure-gated `PATCH /v1/agents/:id`; the read API exposes neither model
-   config nor Skills). **Full pan/zoom/pinch + Fit/Reset now ship** (the previously-deferred gap is
+   instruction-bundle is now **viewable and editable** on the Instructions tab (read via `agent.keys`,
+   written via the configure-gated `PATCH /v1/agents/:id { instruction_bundle }` — this writes the
+   instruction bundle only, NOT a config-history UI), but the per-Operative **model lane** and the
+   **Skills** tab are still not built (the read API exposes neither model config nor Skills). **Full pan/zoom/pinch + Fit/Reset now ship** (the previously-deferred gap is
    closed): the stage is one CSS `transform: translate() scale()` viewport driven by native
    PointerEvent (drag-pan + two-finger pinch) and a non-passive WheelEvent (cursor-anchored
    zoom), with explicit −/+/Fit/Reset controls, an auto-fit-once on first render (no jump on

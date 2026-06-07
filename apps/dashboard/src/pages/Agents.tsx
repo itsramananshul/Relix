@@ -2,6 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, tryGet } from "../api";
 import { asArray, Badge, Empty, extractList, Section, useAsync } from "../components/common";
+import { invalidate } from "../invalidate";
+
+// Frontend guard on the charter (instruction bundle) editor. Mirrors the
+// runtime cap (`MAX_BUNDLE = 64 * 1024`, store.rs `update_agent_field`) so the
+// editor refuses to POST an over-long payload; the backend's byte-level check
+// stays the real authority and any rejection is surfaced honestly. The guard
+// never silently truncates — it blocks Save and says why.
+const MAX_CHARTER = 64 * 1024;
 
 // One Operative's Keys (`/v1/spine/keys/:agent`) — the org/work permissions
 // + execution caps the legacy spine board surfaced. Rendered read-only here
@@ -229,6 +237,14 @@ export function Agents() {
   const [searchParams, setSearchParams] = useSearchParams();
   const openId = searchParams.get("agent");
   const [detailCache, setDetailCache] = useState<Record<string, OpDetail>>({});
+  // Instructions-tab charter editor state. `editing` opens the textarea in the
+  // Instructions tab; `draft` is its working copy (Cancel restores the last
+  // loaded value by re-opening from the cache); `saving` blocks the controls
+  // mid-write. Reset whenever the open Operative or the active tab changes so an
+  // in-progress edit never bleeds across Operatives/tabs.
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
   // The active workbench tab is URL-driven too (`?tab=runs`) so a deep link can
   // land on a specific tab and back/forward restore it. An unknown value falls
   // back to Overview without rewriting the URL (param safety).
@@ -293,8 +309,9 @@ export function Agents() {
   // null/empty fallback so one unavailable surface shows an honest empty state
   // instead of blanking the panel. Guarded by the cache + an in-flight set so a
   // URL-driven open and a row click never double-fetch.
-  async function loadDetail(agentId: string) {
-    if (!agentId || agentId in detailCache || inflightRef.current.has(agentId)) return;
+  async function loadDetail(agentId: string, force = false) {
+    if (!agentId || inflightRef.current.has(agentId)) return;
+    if (!force && agentId in detailCache) return;
     inflightRef.current.add(agentId);
     const enc = encodeURIComponent(agentId);
     const [keys, detail, standing] = await Promise.all([
@@ -307,6 +324,45 @@ export function Agents() {
       [agentId]: { keys, detail, standing: extractList<Standing>(standing, ["standing"]) },
     }));
     inflightRef.current.delete(agentId);
+  }
+
+  // Open the charter editor pre-filled with the last loaded value.
+  function beginEdit(current: string) {
+    setDraft(current);
+    setEditing(true);
+    setBanner(null);
+  }
+
+  // Write the charter (instruction bundle) through the existing configure-gated
+  // update path (`PATCH /v1/agents/:id { instruction_bundle }`). An empty draft
+  // CLEARS the charter (the backend allows it) — surfaced honestly. On success
+  // we force-refetch this Operative's detail so the new value (and the
+  // Configuration tab's `updated_at`) renders immediately, then invalidate the
+  // company-readiness surfaces. A configure-power denial (or any backend
+  // refusal) is shown verbatim — the gate is never bypassed.
+  async function saveCharter(agentId: string, value: string) {
+    if (value.length > MAX_CHARTER) {
+      setBanner({ kind: "err", msg: `Charter is too long (${value.length.toLocaleString()} chars; max ${MAX_CHARTER.toLocaleString()}).` });
+      return;
+    }
+    setSaving(true);
+    setBanner(null);
+    try {
+      await api.patch(`/v1/agents/${encodeURIComponent(agentId)}`, { instruction_bundle: value });
+      await loadDetail(agentId, true);
+      setEditing(false);
+      invalidate(["actions"]);
+      setBanner({
+        kind: "ok",
+        msg: value.trim()
+          ? "Charter saved — it is composed into this Operative's next Shift."
+          : "Charter cleared — this Operative now runs with no charter section.",
+      });
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Save failed" });
+    } finally {
+      setSaving(false);
+    }
   }
 
   // Toggle the governance panel through the URL: clicking View/Hide writes (or
@@ -323,6 +379,12 @@ export function Agents() {
     if (openId) loadDetail(openId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openId]);
+
+  // Cancel any in-progress charter edit when the open Operative or the active
+  // tab changes, so a half-typed draft never bleeds across surfaces.
+  useEffect(() => {
+    setEditing(false);
+  }, [openId, activeTab]);
 
   // Copy a shareable deep link to this Operative's workbench. The canonical
   // form stays `?agent=<id>`; the active tab is appended only when it isn't the
@@ -791,23 +853,69 @@ export function Agents() {
             </div>
           ) : activeTab === "instructions" ? (
             // Instructions — the Operative's charter / instruction bundle
-            // (company-model §4.5), read-only. Sourced from the full-profile
-            // `agent.keys` read; editing stays out of this slice (it flows
-            // through the configure-gated PATCH and has governance implications).
+            // (company-model §4.5; dashboard-design §9). Sourced from the
+            // full-profile `agent.keys` read and EDITABLE here through the
+            // existing configure-gated update path (PATCH /v1/agents/:id
+            // { instruction_bundle }). View mode shows the stored charter +
+            // a char/line summary; Edit opens a bounded textarea; Save writes
+            // (empty clears); Cancel restores the last loaded value. This writes
+            // the instruction bundle only — it is NOT a config-history UI.
             <div className="op-detail">
               <div className="op-group">
                 <div className="op-group-title">Charter (instruction bundle)</div>
-                {!charter ? (
-                  <div className="muted" style={{ fontSize: 12 }}>
-                    No charter stored for this Operative yet. A charter is operator-authored markdown
-                    (its job description) that, when set, is composed into the prompt of every Shift this
-                    Operative runs. Set one via <span className="mono">PATCH /v1/agents/:id</span>.
-                  </div>
-                ) : (
+                {editing ? (
+                  // Editor — a compact, bounded textarea in the same tab.
                   <>
                     <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>
-                      {charter.length.toLocaleString()} char{charter.length === 1 ? "" : "s"} · {charterLines} line{charterLines === 1 ? "" : "s"} ·
-                      injected into this Operative's Shifts as a trusted charter section.
+                      Operator-authored markdown composed into every Shift this Operative runs as a
+                      trusted charter section (placed ahead of the Brief body). Stored verbatim;
+                      never executed. Saving an empty charter clears it.
+                    </div>
+                    <textarea
+                      className="input op-charter-edit"
+                      value={draft}
+                      spellCheck={false}
+                      disabled={saving}
+                      onChange={(e) => setDraft(e.target.value)}
+                      placeholder={"# Role\nDescribe this Operative's job — what to do, how to decide, when to ask…"}
+                    />
+                    <div className="row" style={{ gap: 10, marginTop: 8, alignItems: "center", flexWrap: "wrap" }}>
+                      <button
+                        className="btn sm"
+                        disabled={saving || draft.length > MAX_CHARTER || draft === charter}
+                        title={draft === charter ? "No changes to save" : "Write the charter through the configure-gated update path"}
+                        onClick={() => saveCharter(id, draft)}
+                      >
+                        {saving ? "Saving…" : "Save charter"}
+                      </button>
+                      <button className="btn ghost sm" disabled={saving} onClick={() => setEditing(false)}>Cancel</button>
+                      <span className="spacer" style={{ flex: 1 }} />
+                      <span style={{ fontSize: 11, color: draft.length > MAX_CHARTER ? "var(--err)" : "var(--text-faint)" }}>
+                        {draft.length.toLocaleString()} / {MAX_CHARTER.toLocaleString()} chars
+                        {draft.length > MAX_CHARTER ? " — too long to save" : draft.trim() === "" ? " — saving clears the charter" : ""}
+                      </span>
+                    </div>
+                  </>
+                ) : !charter ? (
+                  // Honest empty state + an entry point to author one.
+                  <>
+                    <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+                      No charter stored for this Operative yet. A charter is operator-authored markdown
+                      (its job description) that, when set, is composed into the prompt of every Shift
+                      this Operative runs.
+                    </div>
+                    <button className="btn sm" onClick={() => beginEdit(charter)}>Set charter</button>
+                  </>
+                ) : (
+                  // View mode — the stored charter + a summary + an Edit button.
+                  <>
+                    <div className="row" style={{ gap: 10, marginBottom: 6, alignItems: "baseline", flexWrap: "wrap" }}>
+                      <div className="muted" style={{ fontSize: 11 }}>
+                        {charter.length.toLocaleString()} char{charter.length === 1 ? "" : "s"} · {charterLines} line{charterLines === 1 ? "" : "s"} ·
+                        injected into this Operative's Shifts as a trusted charter section.
+                      </div>
+                      <span className="spacer" style={{ flex: 1 }} />
+                      <button className="btn ghost sm" onClick={() => beginEdit(charter)}>Edit</button>
                     </div>
                     {/* Rendered as plain preformatted text — never as HTML — so a
                         charter can't inject markup. Bounded + scrollable when long. */}
@@ -909,11 +1017,12 @@ export function Agents() {
               <div className="op-group">
                 <div className="op-group-title">Charter &amp; model</div>
                 <p className="muted" style={{ fontSize: 12, margin: 0 }}>
-                  The instruction bundle (job description / charter) is now surfaced read-only on the{" "}
+                  The instruction bundle (job description / charter) is viewable and{" "}
+                  <strong>editable</strong> on the{" "}
                   <span className="link" onClick={() => setTab("instructions")}>Instructions</span> tab —
-                  the <span className="mono">agent.keys</span> read carries it. Per-Operative model config and
-                  Skills are not exposed by the read API yet, and editing the charter (governed by{" "}
-                  <span className="mono">PATCH /v1/agents/:id</span>, the configure gate) stays out of this surface.
+                  the <span className="mono">agent.keys</span> read carries it and edits flow through the
+                  configure-gated <span className="mono">PATCH /v1/agents/:id</span>. Per-Operative model
+                  config and Skills are not exposed by the read API yet.
                 </p>
               </div>
             </div>
