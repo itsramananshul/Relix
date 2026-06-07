@@ -1809,6 +1809,36 @@ pub fn preflight_run(
     let _start_guard = start_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Duplicate-start guard (execution-and-issue-design §1.4 idempotent
+    // self-ownership / §2.6 one run per issue): `claim_brief_for_run`
+    // intentionally lets the SAME Operative REFRESH a live Claim (so the
+    // wakeup/heartbeat/lease paths stay idempotent), and the start path always
+    // mints a NEW run id — so WITHOUT this guard, two manual/Prime starts by the
+    // same Operative for the same Brief would BOTH be accepted, opening
+    // duplicate run rows/workspaces. While holding the start lock (so concurrent
+    // same-Operative starts serialize and the loser observes the winner's run),
+    // refuse a new start when this Operative already has a LIVE, actually-running
+    // run on the Brief. (A stale Claim with no running run is NOT a duplicate —
+    // reclaiming that is stale-run adoption, a separate slice — so it does not
+    // match here.) The conflict surfaces as `already_running` → HTTP 409; the
+    // client must NEVER retry a 409 while the holder is live.
+    if store
+        .live_run_by_agent(&card.task_id, &assignee)?
+        .is_some()
+    {
+        return Ok(Preflight::Refused(RunReport {
+            brief_id: brief_id.to_string(),
+            status: "already_running".to_string(),
+            rig: rig.name().to_string(),
+            summary: "this Operative already has a live run on this Brief".to_string(),
+            install_hint: None,
+            run_id: None,
+            workspace: None,
+            workspace_context: None,
+            workspace_files: None,
+            workspace_bytes: None,
+        }));
+    }
     // Single-owner: claim the Brief so a duplicate concurrent run can't
     // start. A live claim by another run → refuse.
     let run_id = format!("run_{}", uuid::Uuid::new_v4());
@@ -3541,19 +3571,23 @@ mod tests {
 
     #[test]
     fn concurrent_runs_get_distinct_non_colliding_workspaces() {
-        // A different assignee can't steal the Claim → already_running.
+        // execution-and-issue-design §2.6: concurrency comes from having MANY
+        // Briefs (one run per issue), not from racing one Brief. The same
+        // Operative running two DIFFERENT Briefs at once gets distinct,
+        // non-colliding run ids + workspaces (the unique run id is the
+        // workspace key). (Two starts on the SAME Brief is the duplicate-start
+        // case — refused `already_running`, see
+        // `duplicate_same_operative_start_refused_already_running`.)
         let (s, _tmp) = store_ws();
         let reg = crate::rig::RigRegistry::with_builtins();
-        let id = ready_brief(&s, "dup", "agt_a");
-        let first = preflight_run(&s, &reg, None, 300, &id, Some("echo"), "x".into()).unwrap();
+        let id1 = ready_brief(&s, "dup-a", "agt_a");
+        let id2 = ready_brief(&s, "dup-b", "agt_a");
+        let first = preflight_run(&s, &reg, None, 300, &id1, Some("echo"), "x".into()).unwrap();
         let r1 = match first {
             Preflight::Ready(r) => *r,
             Preflight::Refused(r) => panic!("expected ready, got {r:?}"),
         };
-        // The SAME Operative re-claiming (the lease is per-agent + idempotent)
-        // still gets its OWN unique run_id + workspace — the unique run_id is
-        // the workspace key, so a second run never clobbers the first.
-        let second = preflight_run(&s, &reg, None, 300, &id, Some("echo"), "y".into()).unwrap();
+        let second = preflight_run(&s, &reg, None, 300, &id2, Some("echo"), "y".into()).unwrap();
         let r2 = match second {
             Preflight::Ready(r) => *r,
             Preflight::Refused(r) => panic!("expected ready, got {r:?}"),
@@ -3564,10 +3598,114 @@ mod tests {
         assert_ne!(w1, w2, "distinct workspace dirs — no collision");
         assert!(std::path::Path::new(&w1).is_dir());
         assert!(std::path::Path::new(&w2).is_dir());
-        // Two committed run records, both with their workspace recorded.
-        let runs = s.runs_for_brief(&id, 5).unwrap();
-        assert_eq!(runs.len(), 2);
-        assert!(runs.iter().all(|r| r.workspace.is_some()));
+        // One committed run record per Brief, each with its workspace recorded.
+        assert_eq!(s.runs_for_brief(&id1, 5).unwrap().len(), 1);
+        assert_eq!(s.runs_for_brief(&id2, 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn duplicate_same_operative_start_refused_already_running() {
+        // execution-and-issue-design §1.4 (idempotent self-ownership) / §2.6
+        // (one run per issue): two manual/Prime starts for the SAME Brief by
+        // the SAME assigned Operative must NOT both start. The lower-level
+        // `claim_brief_for_run` deliberately lets the same Operative refresh a
+        // live Claim (heartbeat/lease idempotency) and the start path mints a
+        // NEW run id each time, so the start-path guard is what prevents a
+        // duplicate run row/workspace. The first start is Ready+running; the
+        // second is refused `already_running` (→ HTTP 409) and opens NOTHING.
+        let (s, _tmp) = store_ws();
+        let reg = echo_registry();
+        let id = ready_brief(&s, "no double start", "agt_a");
+
+        let first = preflight_run(&s, &reg, None, 300, &id, Some("echo"), "x".into()).unwrap();
+        let r1 = match first {
+            Preflight::Ready(r) => *r,
+            Preflight::Refused(r) => panic!("expected the first start to be ready, got {r:?}"),
+        };
+        // The first start is durably `running` (the live-run evidence the guard
+        // keys on) and holds the Claim for its assignee.
+        let opened = s.runs_for_brief(&id, 10).unwrap();
+        assert_eq!(opened.len(), 1, "exactly one run row after the first start");
+        assert_eq!(opened[0].status, "running");
+        assert_eq!(s.claim_holder(&id).unwrap().unwrap().0, "agt_a");
+        let w1 = r1.workspace.clone().unwrap();
+
+        // Second start by the SAME Operative on the SAME Brief → conflict.
+        let second = preflight_run(&s, &reg, None, 300, &id, Some("echo"), "y".into()).unwrap();
+        let report = match second {
+            Preflight::Refused(r) => r,
+            Preflight::Ready(_) => panic!("the duplicate start must be refused, not ready"),
+        };
+        assert_eq!(report.status, "already_running", "got: {report:?}");
+        assert!(report.run_id.is_none(), "a conflict opens no run row");
+        assert!(report.workspace.is_none(), "a conflict opens no workspace");
+        // No SECOND run row / workspace was opened; the first run still owns it.
+        let after = s.runs_for_brief(&id, 10).unwrap();
+        assert_eq!(after.len(), 1, "no duplicate run row");
+        assert_eq!(after[0].run_id, r1.run_id);
+        assert_eq!(s.claim_holder(&id).unwrap().unwrap().0, "agt_a");
+
+        // Once the first run FINISHES (claim released, run no longer running),
+        // a fresh start IS allowed — the guard never blocks legitimate
+        // continuation, only an overlapping duplicate.
+        let _ = execute_ready(&s, None, r1);
+        assert!(s.live_run_by_agent(&id, "agt_a").unwrap().is_none());
+        let third = preflight_run(&s, &reg, None, 300, &id, Some("echo"), "z".into()).unwrap();
+        let r3 = match third {
+            Preflight::Ready(r) => *r,
+            Preflight::Refused(r) => panic!("a post-completion start must be allowed, got {r:?}"),
+        };
+        assert_ne!(r3.workspace.as_deref(), Some(w1.as_str()), "fresh workspace");
+        assert_eq!(s.runs_for_brief(&id, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn concurrent_same_operative_starts_one_wins_one_conflicts() {
+        // execution-and-issue-design §1.4/§2.6 + the per-Operative start lock:
+        // two starts race the SAME Brief with the SAME assigned Operative. The
+        // start lock serializes them; EXACTLY ONE wins (Ready+running) and the
+        // loser is refused `already_running` (→ HTTP 409). The loser must NEVER
+        // retry a 409 — a retry while the winner is live loses again.
+        let (s, _tmp) = store_ws();
+        let s = std::sync::Arc::new(s);
+        let reg = std::sync::Arc::new(echo_registry());
+        let id = ready_brief(&s, "self race", "agt_a");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for prompt in ["a", "b"] {
+            let s = s.clone();
+            let reg = reg.clone();
+            let id = id.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                preflight_run(&s, &reg, None, 300, &id, Some("echo"), prompt.into()).unwrap()
+            }));
+        }
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ready = outcomes
+            .iter()
+            .filter(|o| matches!(o, Preflight::Ready(_)))
+            .count();
+        let conflicts = outcomes
+            .iter()
+            .filter(|o| matches!(o, Preflight::Refused(r) if r.status == "already_running"))
+            .count();
+        assert_eq!(ready, 1, "exactly one start wins");
+        assert_eq!(conflicts, 1, "the other start conflicts");
+        // Exactly one run row / workspace was opened, despite the race.
+        let runs = s.runs_for_brief(&id, 10).unwrap();
+        assert_eq!(runs.len(), 1, "no duplicate run row from the race");
+        assert_eq!(runs[0].status, "running");
+
+        // NEVER retry a 409: another start while the winner is live conflicts again.
+        let retry = preflight_run(&s, &reg, None, 300, &id, Some("echo"), "retry".into()).unwrap();
+        assert!(
+            matches!(retry, Preflight::Refused(r) if r.status == "already_running"),
+            "a retry of a 409 conflict loses again — clients must not retry"
+        );
+        assert_eq!(s.runs_for_brief(&id, 10).unwrap().len(), 1, "still one run row");
     }
 
     #[test]

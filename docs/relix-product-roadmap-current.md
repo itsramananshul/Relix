@@ -98,9 +98,13 @@ the founder asked to be able to verify. Examples: `b5097fc3`/`8d6a083b`
 ### Briefs / Workroom (`relix-execution-and-issue-design.md` §1, §1.9)
 - **Two-pointer Claim** — `checkout_run` + `execution_run`, self-refresh, lease/release,
   lock clearing on assignee/state change (the LOCKED model, §7.1). A Claim **conflict** on
-  the run start path now returns **HTTP `409`** (never a retryable `200`), and an in-process
-  **per-Operative start lock** serializes concurrent starts (§1.4/§2.6). *Still partial:*
-  stale-run adoption by terminal evidence (see gaps / §5 slice 10).
+  the run start path now returns **HTTP `409`** (never a retryable `200`), an in-process
+  **per-Operative start lock** serializes concurrent starts, and a **same-Operative
+  duplicate-start guard** refuses a *new* start (`already_running` → `409`) when that
+  Operative already has a live, actually-running run on the same Brief — so a double-start
+  can no longer open two run rows/workspaces while the lower-level `claim_brief_for_run`
+  stays idempotent for wakeup/heartbeat/recovery (§1.4/§2.6). *Still partial:* stale-run
+  adoption by terminal evidence (see gaps / §5 slice 10).
 - **Entry guards** — `in_progress` requires assignee + no unresolved Snags; `in_review`
   requires a real reviewer.
 - **Brief detail API** — `brief.detail` returns the full product object (fields,
@@ -175,13 +179,16 @@ Tagged **[BE]** backend, **[FE]** frontend, **[DOC]** docs-only. Each cites the 
 ledger entry or design section.
 
 **P1 — correctness & governance honesty**
-1. **[BE] Claim stale-run adoption by terminal evidence** — the `409` conflict surface and
-   the per-Operative start lock **shipped** (roadmap §5 slice 1: `brief.run` maps a Claim
-   conflict `already_running` → HTTP `409`, never a retryable `200`; an in-process
-   per-Operative start lock serializes concurrent starts; "never retry a 409" pinned in
-   tests). What remains of the two-pointer Claim is **stale-run *adoption by terminal
-   evidence*** — see §5 slice 10 (`execution §1.4`/`§7.1` LOCKED; ledger "Claim HTTP 409 +
-   per-Operative start lock" = DONE, "stale-run adoption" = PARTIAL).
+1. **[BE] Claim stale-run adoption by terminal evidence** — the `409` conflict surface, the
+   per-Operative start lock, and the **same-Operative duplicate-start guard** **shipped**
+   (roadmap §5 slice 1: `brief.run` maps a Claim conflict `already_running` → HTTP `409`,
+   never a retryable `200`; an in-process per-Operative start lock serializes concurrent
+   starts; a new start by the same Operative on a Brief it is already running is refused
+   `already_running` instead of opening a second run row/workspace; "never retry a 409"
+   pinned in tests). What remains of the two-pointer Claim is **stale-run *adoption by
+   terminal evidence*** — see §5 slice 10 (`execution §1.4`/`§7.1` LOCKED; ledger "Claim HTTP
+   409 + per-Operative start lock + duplicate-start guard" = DONE, "stale-run adoption" =
+   PARTIAL).
 2. **[BE] Guild-level spend hard-stop** — only per-Operative Allowance is enforced; the
    Guild cap is **alert-only** today (`company-model §6.6`; ledger "Operative Allowance" &
    "Action Center" = PARTIAL). Manual `brief.run` is intentionally *not* Allowance-gated
@@ -243,16 +250,28 @@ instruction and a doc update.
 
 Each slice = one green, doc-conformant, pushable commit. Pick the top undone one.
 
-1. **Claim 409 + per-agent start lock** — `execution-and-issue-design.md §1.4/§7.1/§2.6`.
+1. **Claim 409 + per-agent start lock + same-Operative duplicate-start guard** —
+   `execution-and-issue-design.md §1.4/§7.1/§2.6`.
    **✅ DONE.** *Files changed:* `crates/relix-runtime/src/nodes/coordinator/mod.rs` (per-Operative
-   start-lock registry + `agent_start_lock` + tests), `…/coordinator/heartbeat.rs` (acquire the
-   start lock across the claim+commit in `preflight_run`; manual-path conflict + concurrent-start
+   start-lock registry + `agent_start_lock`; the read-only `live_run_by_agent(brief, agent)`
+   duplicate-start signal — live Claim by that Operative **and** running-run evidence; tests),
+   `…/coordinator/heartbeat.rs` (acquire the start lock across the claim+commit in `preflight_run`
+   **and**, before claiming, refuse `already_running` when `live_run_by_agent` shows a live run;
+   manual-path conflict + concurrent-start + sequential/concurrent same-Operative duplicate-start
    tests), `crates/relix-web-bridge/src/spine.rs` (`run_report_response`/`json_with_status`: a
    Claim conflict `already_running` → `409 Conflict` carrying the structured `RunReport`; real +
-   precondition statuses stay `200`; tests). *Pinned:* "never retry a 409" in test names/comments.
-   *Verified:* targeted + full `cargo test` on both touched crates green; `cargo check`/`clippy`
-   clean for the changes; `git diff --check` clean. *Remaining of this Claim line → slice 10
-   (stale-run adoption by terminal evidence).*
+   precondition statuses stay `200`; tests — **unchanged this slice**, the new refusal reuses the
+   same `already_running` status the bridge already maps to 409). *Why the guard:* the start lock
+   only serializes the critical section; `claim_brief_for_run` deliberately lets the same Operative
+   refresh a live Claim (wakeup/heartbeat idempotency) and `preflight_run` mints a new run id — so
+   without the guard two same-Operative starts would both open run rows/workspaces. The guard lives
+   only in the start path, so the lower-level idempotent API is untouched, and it never blocks a
+   continuation after a run finishes (Claim released + run terminal). *Pinned:* "never retry a 409";
+   "first Ready/running, second refused `already_running`, no second run row/workspace". *Verified:*
+   targeted + full `cargo test -p relix-runtime` green (3938 lib tests); `cargo check` clean;
+   `cargo clippy` clean on the touched code (pre-existing warnings only, unrelated files);
+   `git diff --check` clean. *Remaining of this Claim line → slice 10 (stale-run adoption by
+   terminal evidence).*
 
 2. **Guild-level spend hard-stop (autonomous)** — `company-model.md §6.6`.
    *Files:* `action_center.rs`, heartbeat dispatch in coordinator, `spine.rs`. *Adds:* a

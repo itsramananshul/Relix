@@ -3193,6 +3193,87 @@ impl TaskStore {
         Ok(true)
     }
 
+    /// Start-path duplicate guard (execution-and-issue-design §1.4 idempotent
+    /// self-ownership / §2.6 one run per issue): is there already a LIVE run by
+    /// `agent_id` on this Brief?
+    ///
+    /// [`claim_brief_for_run`] deliberately lets the SAME Operative *refresh* a
+    /// live Claim (so wakeup/heartbeat/lease paths stay idempotent), and the
+    /// manual/Prime start path always mints a NEW `run_id` — so a duplicate
+    /// start by the same Operative would otherwise re-claim and open a SECOND
+    /// run row/workspace. This is the signal the start path uses to refuse that
+    /// instead (`already_running` → HTTP 409).
+    ///
+    /// Returns the live run id only when BOTH hold:
+    ///   - the Brief's Claim is **live** (`claim_expires_at >= now`) and held by
+    ///     `agent_id`; and
+    ///   - there is **running-run evidence** — a `brief_runs` row in `running`
+    ///     for this Brief whose `run_id` matches the Claim's execution/checkout
+    ///     run pointer.
+    ///
+    /// A stale Claim with NO running run is NOT a duplicate start (the prior
+    /// owner is dead) — reclaiming that is *stale-run adoption*, a separate
+    /// concern — so it returns `None` here and never blocks a fresh start.
+    pub fn live_run_by_agent(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<Option<String>, CoordinatorError> {
+        let agent = agent_id.trim();
+        if agent.is_empty() {
+            return Ok(None);
+        }
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let claim = conn
+            .query_row(
+                "SELECT claim_agent_id, execution_run_id, checkout_run_id, claim_expires_at
+                 FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        let Some((holder, exec_run, checkout_run, expires)) = claim else {
+            return Ok(None);
+        };
+        // The Claim must be LIVE and held by THIS Operative.
+        let live = expires.is_some_and(|t| t >= now);
+        let held_by_agent = holder.as_deref().map(str::trim) == Some(agent);
+        if !live || !held_by_agent {
+            return Ok(None);
+        }
+        // Running-run evidence: a `running` row for this Brief whose id matches
+        // the Claim's execution/checkout run pointer. Without it the live Claim
+        // is stale (no run actually in flight) and must NOT block a fresh start.
+        for run in [exec_run, checkout_run].into_iter().flatten() {
+            let run = run.trim();
+            if run.is_empty() {
+                continue;
+            }
+            let running: Option<String> = conn
+                .query_row(
+                    "SELECT run_id FROM brief_runs
+                     WHERE run_id = ?1 AND brief_id = ?2 AND status = 'running'",
+                    params![run, task_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(CoordinatorError::Db)?;
+            if let Some(rid) = running {
+                return Ok(Some(rid));
+            }
+        }
+        Ok(None)
+    }
+
     /// PHASE 3 (Claim): extend the lease on a Brief the caller
     /// holds — the heartbeat that keeps a live claim alive. Returns
     /// true if extended, false if the claim was lost (expired, or
