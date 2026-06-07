@@ -450,6 +450,7 @@ pub fn clearances_fingerprint(serialized: &str) -> u64 {
 /// exactly like the polling list route, mirroring [`interactions_stream`].
 pub async fn clearances_stream(
     State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
 ) -> Result<
     Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
     (StatusCode, Json<ApiError>),
@@ -464,16 +465,17 @@ pub async fn clearances_stream(
     let stream_guard = state
         .stream_metrics
         .open("clearances".to_string(), opened_at);
+    let limit_arg = q.limit.unwrap_or(25).min(100).to_string();
 
     let s = stream! {
         let _live_guard = stream_guard;
         let mut last_fp: Option<u64> = None;
         loop {
-            // Same source of truth + limit default as the `…/clearances` list
-            // route (25), re-scoped to the captured tenant on every tick.
+            // Same source of truth + limit clamp as the `…/clearances` list
+            // route, re-scoped to the captured tenant on every tick.
             let fetch = CURRENT_TENANT.scope(
                 tenant_scope.clone(),
-                call_peer(&state, "coord.approval.pending", b"25"),
+                call_peer(&state, "coord.approval.pending", limit_arg.as_bytes()),
             );
             match fetch.await {
                 Ok(body) => {

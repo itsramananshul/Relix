@@ -916,7 +916,7 @@ export function subscribeClearances(
   const connect = () => {
     if (closed) return;
     onConn(attempts === 0 ? "connecting" : "reconnecting");
-    es = new EventSource("/v1/spine/clearances/stream", { withCredentials: true });
+    es = new EventSource("/v1/spine/clearances/stream?limit=50", { withCredentials: true });
     es.onopen = () => {
       attempts = 0;
       backoff = 1000;
