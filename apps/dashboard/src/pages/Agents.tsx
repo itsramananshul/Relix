@@ -454,6 +454,17 @@ export function Agents() {
     setEditing(false);
   }, [openId, activeTab]);
 
+  // Skills are scoped to the selected Operative. Clear the previous Operative's
+  // skills state immediately on selection change, even when the Skills tab is
+  // closed, so a stale tab badge/result can never bleed across Operatives.
+  useEffect(() => {
+    setSkillInput("");
+    setSkillQuery("");
+    setSkillData(null);
+    setSkillError(null);
+    setSkillLoading(false);
+  }, [openId]);
+
   // Load Skills only while the Skills tab is open — and refetch with a cleared
   // filter whenever the open Operative changes (or the tab is first opened), so
   // a closed tab costs nothing and switching Operatives never shows the prior
