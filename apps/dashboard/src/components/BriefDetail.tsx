@@ -13,6 +13,7 @@ import {
 } from "../api";
 import { useAuth } from "../auth";
 import { Badge, useAsync } from "./common";
+import { RunTranscript } from "./RunTranscript";
 import { invalidate, useInvalidate } from "../invalidate";
 
 // The structured result of starting a Shift (`POST …/briefs/:id/run`). Mirrors
@@ -182,6 +183,9 @@ export function BriefDetail({
   // safe-apply plan for the latest accepted run.
   const [runBusy, setRunBusy] = useState(false);
   const [diff, setDiff] = useState<RunDiff | null>(null);
+  // Force the embedded live-work transcript to refetch after a Shift mutation
+  // (run/re-run/review/apply/cancel) re-shapes the latest run.
+  const [txKey, setTxKey] = useState(0);
   // Thread-interaction state: which card is being answered, and the free-text
   // draft for open `ask` cards that have no fixed choices.
   const [ixBusy, setIxBusy] = useState<string | null>(null);
@@ -391,6 +395,7 @@ export function BriefDetail({
       if (r.install_hint) msg += ` (${r.install_hint})`;
       setBanner({ kind: accepted ? "ok" : refusal ? "info" : "err", msg });
       reload();
+      setTxKey((k) => k + 1);
       // Starting a Shift updates the board card's run badge + the Runs ledger.
       invalidate(["briefs", "runs"], { briefId });
     } catch (e) {
@@ -408,6 +413,7 @@ export function BriefDetail({
       await runControls.review(lr.run_id, decision);
       setBanner({ kind: "ok", msg: `Shift ${decision}.` });
       reload();
+      setTxKey((k) => k + 1);
       // Review verdict shows on the board card + the Runs ledger.
       invalidate(["briefs", "runs"], { briefId });
     } catch (e) {
@@ -428,6 +434,7 @@ export function BriefDetail({
           (r.brief_status === "done" ? " — Brief marked done." : "."),
       });
       reload();
+      setTxKey((k) => k + 1);
       // Apply can advance the Brief to done — refresh the board card + Runs.
       invalidate(["briefs", "runs"], { briefId });
       await loadDiff();
@@ -447,6 +454,7 @@ export function BriefDetail({
         msg: r.active ? "Cancellation signalled — the Shift will report cancelled." : `Cancel requested: ${r.note ?? "no live process"}`,
       });
       reload();
+      setTxKey((k) => k + 1);
       // A cancellation request shows on the board card + the Runs ledger.
       invalidate(["briefs", "runs"], { briefId });
     } catch (e) {
@@ -649,6 +657,16 @@ export function BriefDetail({
                   Refusing apply: {diff.plan.conflicts ?? 0} conflict(s), {diff.plan.blocked ?? 0} blocked. Resolve these before applying.
                 </div>
               )}
+            </div>
+          )}
+
+          {/* Live work — the Shift's run transcript merged into the workroom so
+              the agent's work is visible inside the Brief, not only on a
+              separate Runs page (dashboard-design §7/§8). Block-grouped + live-
+              tailed via the same renderer the Runs page uses; nice/raw toggle. */}
+          {lr.run_id && (
+            <div style={{ marginTop: 12 }}>
+              <RunTranscript runId={lr.run_id} status={lr.status} compact refreshKey={txKey} />
             </div>
           )}
         </div>

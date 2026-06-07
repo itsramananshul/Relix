@@ -160,7 +160,25 @@ export interface ApplyResult {
   brief_status?: string;
 }
 
+// One transcript event from the durable, capped, redacted `run_events`
+// table (`/v1/runs/:id/events`). `kind`/`source` classify the line; `message`
+// is the redacted, length-bounded text; `payload_json` is the optional bounded
+// detail (e.g. a tool-call's input). Shared by the Runs page and the Brief
+// workroom so the same transcript renders identically in both places.
+export interface RunEvent {
+  event_id?: number;
+  ts?: number;
+  kind?: string;
+  source?: string;
+  message?: string;
+  payload_json?: string;
+}
+
 export const runControls = {
+  // The chronological transcript for a run (oldest first). Optional surface →
+  // degrades to [] so an unavailable transcript never blanks the embedding view.
+  events: (runId: string) =>
+    tryGet<RunEvent[]>(`/v1/runs/${encodeURIComponent(runId)}/events`, []),
   // Record an operator accept/reject of a done run.
   review: (runId: string, decision: "accepted" | "rejected", note = "") =>
     api.post(`/v1/runs/${encodeURIComponent(runId)}/review`, { decision, note }),

@@ -1,7 +1,8 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { api, tryGet, subscribeRunEvents, type RunEventConn } from "../api";
+import { api, tryGet, subscribeRunEvents, type RunEvent, type RunEventConn } from "../api";
 import { Empty, Section, useAsync } from "../components/common";
+import { RunTranscript } from "../components/RunTranscript";
 import { invalidate } from "../invalidate";
 
 // Live run-event connection → a small honest status chip.
@@ -85,16 +86,6 @@ interface RunDiff {
   eligible?: boolean;
   reason?: string;
   plan?: ApplyPlan;
-}
-
-// One transcript event (`/v1/runs/:id/events`).
-interface RunEvent {
-  event_id?: number;
-  ts?: number;
-  kind?: string;
-  source?: string;
-  message?: string;
-  payload_json?: string;
 }
 
 // One changed file (`/v1/runs/:id/artifacts`).
@@ -208,20 +199,6 @@ const TONE: Record<string, string> = {
   continued: "todo",
 };
 
-// Transcript event kind → a small color cue (no theme change, just dots).
-const EVENT_TONE: Record<string, string> = {
-  error: "#c0392b",
-  permission_denied: "#c0392b",
-  failed: "#c0392b",
-  cancelled: "#c0392b",
-  cancel_requested: "#b9770e",
-  result: "#1e7e34",
-  assistant_message: "#2d6cdf",
-  tool_use: "#7d3cc0",
-  command: "#7d3cc0",
-  file_change: "#7d3cc0",
-};
-
 function fmtDuration(r: RunRecord): string {
   if (r.status === "running") {
     const s = Math.max(0, Math.floor(Date.now() / 1000) - (r.started_at ?? 0));
@@ -244,8 +221,12 @@ export function Runs() {
   // Start collapsed; the URL-sync effect below expands (and LOADS) the run
   // named in `?run=` on mount, so a deep link / refresh loads its data.
   const [expanded, setExpanded] = useState<string | null>(null);
+  // The expanded run's transcript is rendered by the reusable <RunTranscript>
+  // (block-grouped nice/raw, self-tailing). We keep the loaded events ONLY to
+  // drive the "Changes" scan-failed banner; `txKey` force-refreshes the
+  // transcript after a mutation (apply/cancel/discard) re-shapes the run.
   const [events, setEvents] = useState<RunEvent[]>([]);
-  const [eventsLoading, setEventsLoading] = useState(false);
+  const [txKey, setTxKey] = useState(0);
   const [artifacts, setArtifacts] = useState<RunArtifact[]>([]);
   const [preview, setPreview] = useState<{ id: number; data: ArtifactPreview } | null>(null);
   // Per-file unified diff (workspace output vs baseline), mutually exclusive
@@ -269,16 +250,6 @@ export function Runs() {
       storage: storage ?? null,
     };
   }, []);
-
-  async function loadEvents(runId: string) {
-    setEventsLoading(true);
-    try {
-      const ev = await tryGet<RunEvent[]>(`/v1/runs/${encodeURIComponent(runId)}/events`, []);
-      setEvents(Array.isArray(ev) ? ev : []);
-    } finally {
-      setEventsLoading(false);
-    }
-  }
 
   async function loadArtifacts(runId: string) {
     const a = await tryGet<RunArtifact[]>(`/v1/runs/${encodeURIComponent(runId)}/artifacts`, []);
@@ -323,7 +294,10 @@ export function Runs() {
       );
       setBanner(`Run discarded (${r.apply_status ?? "discarded"}). Its workspace will be reclaimed by cleanup.`);
       reload();
-      if (expanded === runId) await Promise.all([loadDiff(runId), loadEvents(runId)]);
+      if (expanded === runId) {
+        await loadDiff(runId);
+        setTxKey((k) => k + 1);
+      }
       // Discarding rejects the run — the board card + open Brief panel update (§11).
       invalidate(["briefs", "brief"], { briefId: data?.runs?.find((x) => x.run_id === runId)?.brief_id });
     } catch (e) {
@@ -346,7 +320,8 @@ export function Runs() {
     setDiffView(null);
     setDiff(null);
     setCopied(false);
-    await Promise.all([loadEvents(runId), loadArtifacts(runId), loadDiff(runId)]);
+    // The transcript self-loads on runId change; load the changes + apply plan.
+    await Promise.all([loadArtifacts(runId), loadDiff(runId)]);
   }
 
   function setRunParam(runId: string | null) {
@@ -382,25 +357,17 @@ export function Runs() {
 
   // Live updates: subscribe ONCE to the execution event stream. On any
   // transition (start / finish / refuse / recover / move / review / apply),
-  // debounce-refresh the runs list, and refresh the open run's transcript so
-  // an in-flight Shift updates without a manual click. Refs keep the
-  // subscription stable across re-renders (no reconnect churn).
+  // debounce-refresh the runs list so the table stays current without a manual
+  // click. The expanded run's transcript self-tails inside <RunTranscript>.
+  // Refs keep the subscription stable across re-renders (no reconnect churn).
   const reloadRef = useRef(reload);
   reloadRef.current = reload;
-  const expandedRef = useRef(expanded);
-  expandedRef.current = expanded;
-  const loadEventsRef = useRef(loadEvents);
-  loadEventsRef.current = loadEvents;
   useEffect(() => {
     let pending: ReturnType<typeof setTimeout> | null = null;
     const unsub = subscribeRunEvents(
       () => {
         if (pending) clearTimeout(pending);
-        pending = setTimeout(() => {
-          reloadRef.current();
-          const exp = expandedRef.current;
-          if (exp) void loadEventsRef.current(exp);
-        }, 500);
+        pending = setTimeout(() => reloadRef.current(), 500);
       },
       (state) => setLiveConn(state),
     );
@@ -437,7 +404,8 @@ export function Runs() {
           (r.brief_status === "done" ? " — Brief marked done." : "."),
       );
       reload();
-      await Promise.all([loadDiff(runId), loadEvents(runId)]);
+      await loadDiff(runId);
+      setTxKey((k) => k + 1);
       // Apply can advance the Brief to done — refresh the board card + the open
       // Brief panel on surfaces that show them (dashboard-design §11).
       invalidate(["briefs", "brief"], { briefId: data?.runs?.find((x) => x.run_id === runId)?.brief_id });
@@ -468,7 +436,7 @@ export function Runs() {
       );
       setBanner(r.active ? "Cancellation signalled — the run will report cancelled." : `Cancel requested: ${r.note ?? "no live process"}`);
       reload();
-      if (expanded === runId) await loadEvents(runId);
+      if (expanded === runId) setTxKey((k) => k + 1);
       invalidate(["briefs", "brief"], { briefId: data?.runs?.find((x) => x.run_id === runId)?.brief_id });
     } catch (e) {
       setBanner(e instanceof Error ? e.message : "Cancel failed");
@@ -649,32 +617,16 @@ export function Runs() {
                               )}
                               <Link to="/briefs" className="btn ghost sm" onClick={(e) => e.stopPropagation()}>← Briefs</Link>
                             </div>
-                            <div className="row" style={{ marginBottom: 6 }}>
-                              <strong style={{ fontSize: 12 }}>Transcript</strong>
-                              <div className="spacer" style={{ flex: 1 }} />
-                              <button className="btn ghost sm" onClick={(e) => { e.stopPropagation(); loadEvents(rid); }}>Refresh</button>
-                              {r.status === "running" && (
-                                <button className="btn sm" style={{ marginLeft: 6 }} onClick={(e) => { e.stopPropagation(); cancel(rid); }}>Cancel run</button>
-                              )}
-                            </div>
-                            {r.workspace && <div className="muted mono" style={{ fontSize: 11, marginBottom: 6 }}>workspace: {r.workspace}</div>}
-                            {eventsLoading ? (
-                              <div className="loading">Loading transcript…</div>
-                            ) : events.length === 0 ? (
-                              <div className="muted" style={{ fontSize: 12 }}>No transcript events recorded.</div>
-                            ) : (
-                              <div style={{ maxHeight: 320, overflow: "auto", fontSize: 12 }}>
-                                {events.map((ev, j) => (
-                                  <div key={ev.event_id ?? j} style={{ padding: "2px 0", borderBottom: "1px solid var(--border-soft)" }}>
-                                    <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 4, marginRight: 6, background: EVENT_TONE[ev.kind ?? ""] ?? "#999" }} />
-                                    <span className="muted" style={{ fontSize: 10 }}>{ev.ts ? new Date(ev.ts * 1000).toLocaleTimeString() : ""}</span>{" "}
-                                    <span className="mono" style={{ fontSize: 11 }}>{ev.source}/{ev.kind}</span>{" — "}
-                                    <span style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{ev.message}</span>
-                                    {ev.payload_json && <div className="muted mono" style={{ fontSize: 10, paddingLeft: 14, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{ev.payload_json}</div>}
-                                  </div>
-                                ))}
+                            {r.status === "running" && (
+                              <div className="row" style={{ marginBottom: 6 }}>
+                                <div className="spacer" style={{ flex: 1 }} />
+                                <button className="btn sm" onClick={(e) => { e.stopPropagation(); cancel(rid); }}>Cancel run</button>
                               </div>
                             )}
+                            {r.workspace && <div className="muted mono" style={{ fontSize: 11, marginBottom: 6 }}>workspace: {r.workspace}</div>}
+                            <div onClick={(e) => e.stopPropagation()}>
+                              <RunTranscript runId={rid} status={r.status} refreshKey={txKey} onEvents={setEvents} />
+                            </div>
 
                             {/* Changes / artifacts */}
                             <div className="row" style={{ marginTop: 12, marginBottom: 6 }}>

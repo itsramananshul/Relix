@@ -476,3 +476,40 @@ a > .stat-card:hover { border-color: var(--text-faint); }
   color: var(--text-faint); margin-bottom: 6px;
 }
 .op-group .pill-row { gap: 4px; }
+
+/* Run transcript renderer (dashboard-design §8) — block-grouped "nice" view +
+   compact "raw" dump, B&W with semantic-only color. Reused on the Runs page
+   and embedded in the Brief workroom. */
+.xtr { margin-top: 4px; }
+.xtr-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.xtr-scroll { overflow: auto; font-size: 12px; }
+.xtr-nice { display: flex; flex-direction: column; gap: 8px; }
+.xtr-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: middle; flex: 0 0 auto; }
+
+/* assistant / result message — a readable card; result is faintly emphasized. */
+.xtr-msg { border: 1px solid var(--border-soft); border-radius: 6px; padding: 8px 10px; background: var(--bg-raised); }
+.xtr-msg-result { border-color: rgba(63,185,80,0.35); }
+.xtr-msg-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; }
+.xtr-msg-body { white-space: pre-wrap; word-break: break-word; font-size: 12.5px; line-height: 1.45; }
+
+/* grouped tool actions — a collapsible accordion (progressive disclosure). */
+.xtr-tool { border: 1px solid var(--border-soft); border-radius: 6px; overflow: hidden; }
+.xtr-acc-head { display: flex; align-items: center; gap: 6px; width: 100%; text-align: left; background: var(--bg-elev); color: var(--text-dim); border: none; cursor: pointer; padding: 5px 9px; font: inherit; }
+.xtr-acc-head:hover { color: var(--text); }
+.xtr-caret { width: 12px; color: var(--text-faint); }
+.xtr-acc-body { padding: 4px 9px 6px; }
+.xtr-tool-row { padding: 3px 0; border-bottom: 1px solid var(--border-soft); word-break: break-word; }
+.xtr-tool-row:last-child { border-bottom: none; }
+.xtr-payload { margin: 4px 0 2px; padding: 6px 8px; background: var(--bg-elev); border-radius: 4px; max-height: 160px; overflow: auto; font-size: 10.5px; white-space: pre-wrap; word-break: break-word; color: var(--text-dim); }
+
+/* permission-denied / error callouts reuse the .banner palette, denser. */
+.xtr-callout { margin-bottom: 0; font-size: 12px; padding: 7px 10px; }
+.xtr-usage { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* lifecycle rail — thin system-note rows. */
+.xtr-life { display: flex; flex-direction: column; }
+.xtr-life-row { padding: 2px 0; word-break: break-word; }
+
+/* raw dump — every event verbatim. */
+.xtr-raw { display: flex; flex-direction: column; }
+.xtr-raw-row { padding: 2px 0; border-bottom: 1px solid var(--border-soft); word-break: break-word; }

@@ -284,11 +284,18 @@ ledger entry or design section.
    text in the Action Center `reason`), so per-agent observed spend is shown from the
    observability **metrics window** (24h/7d/30d), explicitly distinguished from the governance
    calendar-month; metrics↔Operative join is best-effort by agent name/id.
-6. **[FE] Run transcript renderer** — block-grouped "nice"/"raw" transcript view, live-tailed
-   (`dashboard-design §8`). SSE + `run_events` exist; the rich renderer does not.
-7. **[FE] Streaming Brief thread** — the workroom is request/response; the design wants the
-   thread to merge **live** run transcript + **streamed** interaction cards via one socket
-   (`dashboard-design §7/§8`; ledger "Brief workroom interactions" = static cards only).
+6. **[FE] Run transcript renderer** — **FRONTEND SHIPPED** (`dashboard-design §8`).
+   `apps/dashboard/src/components/RunTranscript.tsx`: block-grouped "nice"/"raw" view over the
+   real `/v1/runs/:id/events` stream (lifecycle rail, assistant/result cards, collapsible tool
+   groups, denied/error callouts, usage/cost chip), live-tailed via the run-event SSE with a
+   polling fallback + honest connection chip. Used on the Runs page and embedded in the Brief
+   workroom.
+7. **[FE] Streaming Brief thread** — **FRONTEND SHIPPED (partial)** (`dashboard-design §7/§8`).
+   The Brief workroom embeds the live run transcript inline (`<RunTranscript>` Live-work block);
+   interaction cards refresh on the run-event SSE via the detail's existing `reload()`.
+   *Honest gap:* no **dedicated** interaction-card SSE — a card raised without a run transition
+   surfaces on the next run event / manual refresh, not instantly (the design's "one socket
+   streams cards" remains future).
 8. **[FE] Approvals + Settings hubs** — full Approvals surface with spend-enforcement
    controls and a real Settings hub (`dashboard-design §10`; Settings.tsx is a stub).
 
@@ -418,15 +425,33 @@ Each slice = one green, doc-conformant, pushable commit. Pick the top undone one
    diff --check` clean.
 
 5. **Run transcript renderer (nice/raw)** — `dashboard-design.md §8`.
-   *Files:* `apps/dashboard/src/pages/Runs.tsx` + new transcript component; reads
-   `run_events` + SSE (`subscribeRunEvents`). *Adds:* block grouping (assistant/tool/diff/
-   event), nice↔raw toggle, live tail. *Verify:* rebuild dist; live Claude/echo run shows a
-   readable transcript.
+   **✅ DONE.** *Files changed:* new `apps/dashboard/src/components/RunTranscript.tsx`
+   (reusable block-grouping renderer), `apps/dashboard/src/api.ts` (shared `RunEvent` type +
+   `runControls.events`), `apps/dashboard/src/pages/Runs.tsx` (uses `<RunTranscript>` in the
+   expanded run; dropped the flat per-event dump + local event state/loader), `styles.css`
+   (`.xtr-*` B&W transcript blocks), rebuilt `dashboard-dist`. *Adds:* folds the real
+   `/v1/runs/:id/events` stream into typed blocks — lifecycle rail, assistant/result message
+   cards, **collapsible** grouped tool actions, permission-denied + error/stderr callouts, a
+   usage/cost chip — with a **nice↔raw** segmented toggle (raw = compact verbatim dump). Live-
+   tails the selected run via the existing run-event SSE (`subscribeRunEvents`) while it is
+   `running`, with an honest live/reconnecting/**polling** chip and a 4s polling fallback when
+   the stream is unavailable. Color is semantic-only; no fabricated cards. *Verify:* `npm run
+   build` green; dist rebuilt + committed (parity gate); `git diff --check` clean.
 
 6. **Streamed Brief thread + interaction cards** — `dashboard-design.md §7/§8`.
-   *Files:* `BriefDetail.tsx`, `api.ts` (SSE subscription), `invalidate.ts`. *Adds:* live
-   run transcript inline in the Conversation; interaction cards refresh on stream, not just
-   on open. *Verify:* rebuild dist; ledger "Brief workroom" static→streaming.
+   **✅ DONE (partial — honest).** *Files changed:* `apps/dashboard/src/components/BriefDetail.tsx`
+   (embeds `<RunTranscript>` as a **Live work** block in the Latest-Shift section so the agent's
+   run is visible inside the workroom, not only on the Runs page; a `txKey` re-fetches it after a
+   Shift mutation), rebuilt `dashboard-dist`. *Adds:* the active/latest run's transcript streams
+   inline in the Brief; interaction cards already **refresh on the run-event SSE** because
+   BriefDetail's existing subscription calls `reload()` (which refetches `interactions`) on any
+   execution transition for this Brief. Existing answer/accept/reject controls and the
+   invalidation-bus wiring are preserved unchanged. *Partial (honest gap):* there is **no
+   dedicated interaction-card SSE** — a card raised by an agent **without** an accompanying run
+   transition appears on the next run event or a manual Refresh, not instantly. The transcript
+   itself is keyed by Brief (not run) on the stream, so it refetches on any transition while the
+   Shift is `running`. *Verify:* `npm run build` green; dist rebuilt + committed; `git diff
+   --check` clean.
 
 7. **Approvals hub** — `dashboard-design.md §10`.
    *Files:* new `apps/dashboard/src/pages/Approvals.tsx`, `nav.ts`; reads
