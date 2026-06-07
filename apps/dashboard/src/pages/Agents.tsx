@@ -20,6 +20,11 @@ interface Keys {
   wake_on_timer?: boolean;
   wake_on_demand?: boolean;
   secret_allowlist?: string[];
+  // The Operative's charter — markdown instruction bundle (company-model §4.5).
+  // `agent.keys` serializes the full AgentProfile, so this read carries it even
+  // though the pipe-delimited `/v1/agents/:id` detail does not. Operator-authored
+  // trusted text composed into the agent's Shift prompt; surfaced read-only.
+  instruction_bundle?: string;
 }
 
 // Guild-committed Allowance (`/v1/spine/allowance/committed`). Field name
@@ -169,10 +174,11 @@ const WORK_COLUMNS = ["todo", "in_progress", "in_review"];
 
 // The Operative-detail workbench tabs (dashboard-design §9). Overview is the
 // default; an unknown `?tab=` value falls back to it (param safety).
-const TABS = ["overview", "permissions", "runs", "budget", "configuration"] as const;
+const TABS = ["overview", "instructions", "permissions", "runs", "budget", "configuration"] as const;
 type Tab = (typeof TABS)[number];
 const TAB_LABEL: Record<Tab, string> = {
   overview: "Overview",
+  instructions: "Instructions",
   permissions: "Permissions",
   runs: "Runs",
   budget: "Budget",
@@ -651,6 +657,10 @@ export function Agents() {
     const wakeTimer = detail?.wake_on_timer ?? keys?.wake_on_timer ?? false;
     const wakeDemand = detail?.wake_on_demand ?? keys?.wake_on_demand ?? false;
     const roleLabel = a.role ?? detail?.role ?? a.title ?? "operative";
+    // The Operative's charter (instruction bundle), surfaced read-only from the
+    // full-profile `agent.keys` read. Empty string when none is stored yet.
+    const charter = keys?.instruction_bundle ?? "";
+    const charterLines = charter ? charter.split("\n").length : 0;
 
     const briefLink = (c: Card) => {
       const bid = c.task_id ?? c.id ?? "";
@@ -779,6 +789,33 @@ export function Agents() {
                 )}
               </div>
             </div>
+          ) : activeTab === "instructions" ? (
+            // Instructions — the Operative's charter / instruction bundle
+            // (company-model §4.5), read-only. Sourced from the full-profile
+            // `agent.keys` read; editing stays out of this slice (it flows
+            // through the configure-gated PATCH and has governance implications).
+            <div className="op-detail">
+              <div className="op-group">
+                <div className="op-group-title">Charter (instruction bundle)</div>
+                {!charter ? (
+                  <div className="muted" style={{ fontSize: 12 }}>
+                    No charter stored for this Operative yet. A charter is operator-authored markdown
+                    (its job description) that, when set, is composed into the prompt of every Shift this
+                    Operative runs. Set one via <span className="mono">PATCH /v1/agents/:id</span>.
+                  </div>
+                ) : (
+                  <>
+                    <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>
+                      {charter.length.toLocaleString()} char{charter.length === 1 ? "" : "s"} · {charterLines} line{charterLines === 1 ? "" : "s"} ·
+                      injected into this Operative's Shifts as a trusted charter section.
+                    </div>
+                    {/* Rendered as plain preformatted text — never as HTML — so a
+                        charter can't inject markup. Bounded + scrollable when long. */}
+                    <pre className="op-charter">{charter}</pre>
+                  </>
+                )}
+              </div>
+            </div>
           ) : activeTab === "runs" ? (
             <div className="op-detail">
               <div className="op-group">
@@ -872,9 +909,11 @@ export function Agents() {
               <div className="op-group">
                 <div className="op-group-title">Charter &amp; model</div>
                 <p className="muted" style={{ fontSize: 12, margin: 0 }}>
-                  The instruction bundle (job description / charter) and per-Operative model config are not exposed by
-                  the read API yet — only writable through <span className="mono">PATCH /v1/agents/:id</span>. They'll
-                  surface here once the detail read carries them.
+                  The instruction bundle (job description / charter) is now surfaced read-only on the{" "}
+                  <span className="link" onClick={() => setTab("instructions")}>Instructions</span> tab —
+                  the <span className="mono">agent.keys</span> read carries it. Per-Operative model config and
+                  Skills are not exposed by the read API yet, and editing the charter (governed by{" "}
+                  <span className="mono">PATCH /v1/agents/:id</span>, the configure gate) stays out of this surface.
                 </p>
               </div>
             </div>

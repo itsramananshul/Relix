@@ -371,20 +371,26 @@ ledger entry or design section.
    expansion** (Crew/Operative detail slice): selecting an Operative (any Open button, a Lattice
    deep link, or `/agents?agent=<id>`) opens a prominent employee-record panel with five tabs —
    **Overview** (role/status/adapter/readiness, reports-to + clickable direct-reports, pressure
-   summary, open assigned Briefs from the board fetch, recent Shifts), **Permissions** (the intact
+   summary, open assigned Briefs from the board fetch, recent Shifts), **Instructions** (the
+   Operative's charter / instruction bundle from the full-profile `agent.keys` read, rendered
+   read-only as bounded, scrollable preformatted text — never parsed as HTML — with a char/line
+   summary and an honest empty state when none is stored), **Permissions** (the intact
    Keys + capability-powers + standing-approvals governance face — nothing removed), **Runs**
    (this Operative's Shifts from the existing `/v1/runs` payload — status/trigger/rig/duration/
    started + deep links to `/runs?run=<id>`), **Budget** (committed Allowance / risk ceiling /
    concurrency / approval timeout, explicitly labelled *committed* not spent, with live spend
    routed to the Costs page — never fabricated), and **Configuration** (adapter + autonomy/
-   heartbeat flags + org placement + identity + timestamps from `/v1/agents/:id`, with an honest
-   empty state for the charter/instruction-bundle + model config the read API does not yet
-   expose). The tab is URL-driven (`&tab=<tab>`, default Overview, unknown value falls back
+   heartbeat flags + org placement + identity + timestamps from `/v1/agents/:id`; the charter is
+   linked to the Instructions tab, and the copy notes model config + Skills are still not exposed
+   by the read API and that charter editing stays out of this surface). The tab is URL-driven (`&tab=<tab>`, default Overview, unknown value falls back
    safely) and Copy-link captures it; all five tabs reuse the page's existing fetches (the shared
    detail cache + `/v1/runs` + the board columns) — **no new backend route and no extra fetch
    loop**. *Remaining gap:* by design this stays the inline workbench on the Crew page (NOT a
-   separate `/agents/:id` router route — the query-param deep link is canonical); model lane /
-   instruction-bundle authoring is still not exposed by the agent read API. **Full pan/zoom/pinch + Fit/Reset now ship** (the previously-deferred gap is
+   separate `/agents/:id` router route — the query-param deep link is canonical); the charter /
+   instruction-bundle is now surfaced **read-only** on the Instructions tab (via `agent.keys`), but
+   charter **authoring/editing**, the per-Operative **model lane**, and the **Skills** tab are still
+   not built (editing is configure-gated `PATCH /v1/agents/:id`; the read API exposes neither model
+   config nor Skills). **Full pan/zoom/pinch + Fit/Reset now ship** (the previously-deferred gap is
    closed): the stage is one CSS `transform: translate() scale()` viewport driven by native
    PointerEvent (drag-pan + two-finger pinch) and a non-passive WheelEvent (cursor-anchored
    zoom), with explicit −/+/Fit/Reset controls, an auto-fit-once on first render (no jump on

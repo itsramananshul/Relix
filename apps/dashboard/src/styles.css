@@ -577,6 +577,14 @@ a > .stat-card:hover { border-color: var(--text-faint); }
   padding: 5px 0; border-bottom: 1px solid var(--border-soft);
 }
 .op-line:last-child { border-bottom: none; }
+/* The Operative charter (instruction bundle) — read-only preformatted markdown
+   text on the Instructions tab. Bounded + scrollable when long; never parsed. */
+.op-charter {
+  margin: 0; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; max-height: 420px; overflow: auto;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px;
+  line-height: 1.5; white-space: pre-wrap; word-break: break-word; color: var(--text);
+}
 
 /* Run transcript renderer (dashboard-design §8) — block-grouped "nice" view +
    compact "raw" dump, B&W with semantic-only color. Reused on the Runs page
