@@ -20,6 +20,7 @@ use crate::nodes::coordinator::agent::store::{
     AgentProfile, AgentStore, AgentStoreError, ApprovalStatus, StandingApprovalCreate,
     default_approval_categories,
 };
+use crate::nodes::coordinator::brief::PrimeDossierOutcome;
 use crate::nodes::coordinator::spine::SpineStore;
 use crate::nodes::coordinator::spine::store::{
     OrchestrationRunRecord, SpineStoreError, TeamPlanRecord,
@@ -2905,6 +2906,39 @@ fn orchestration_signature(
 /// one assigned (assign-Key gated via `enforce_assign_key`). A changed
 /// active agent yields a new subject Brief while the role track is reused.
 /// Every run is persisted via `record_orchestration_run`.
+/// Build the JSON note recorded for one Prime-governed Dossier write attempt
+/// during `mandate.orchestrate`. Carries the short `outcome` label plus the
+/// distinguishing field (doc id / lock owner / preserved author) so the run
+/// result is honest about a skip without dumping any document body.
+fn prime_dossier_note(
+    task_id: &str,
+    kind: &str,
+    outcome: &PrimeDossierOutcome,
+) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "task_id": task_id,
+        "kind": kind,
+        "outcome": outcome.label(),
+    });
+    match outcome {
+        PrimeDossierOutcome::Authored(a) => {
+            v["doc_id"] = serde_json::json!(a.doc_id);
+            v["author"] = serde_json::json!(a.author);
+        }
+        PrimeDossierOutcome::AlreadyPresent { doc_id, .. } => {
+            v["doc_id"] = serde_json::json!(doc_id);
+        }
+        PrimeDossierOutcome::LockedByOther { locked_by, .. } => {
+            v["locked_by"] = serde_json::json!(locked_by);
+        }
+        PrimeDossierOutcome::SkippedHumanOwned { author, .. } => {
+            v["author"] = serde_json::json!(author);
+        }
+        PrimeDossierOutcome::Stale { .. } => {}
+    }
+    v
+}
+
 pub fn handle_orchestrate(
     task_store: &TaskStore,
     agent_store: &AgentStore,
@@ -3176,6 +3210,11 @@ pub fn handle_orchestrate_with_blueprint(
     let mut subject_briefs_existing: Vec<serde_json::Value> = Vec::new();
     let mut placeholder_tracks_created: Vec<serde_json::Value> = Vec::new();
     let mut placeholder_tracks_existing: Vec<serde_json::Value> = Vec::new();
+    // Prime-governed Dossier authoring outcomes (authored / already_present /
+    // locked_by_other / skipped_human_owned / stale), so a lock or a
+    // human-owned doc that Prime declined to clobber is reported honestly in
+    // the orchestration result instead of being silently dropped.
+    let mut dossier_notes: Vec<serde_json::Value> = Vec::new();
 
     // The company's reviewer for every Brief this run materialises: the
     // Founder/Board (company-model §5.4 / §12.6). Mirrors prime.approve —
@@ -3281,7 +3320,20 @@ pub fn handle_orchestrate_with_blueprint(
         let body = blueprint
             .and_then(|b| b.parent_dossier_body())
             .unwrap_or(det_body);
-        let _ = task_store.add_dossier(parent_id, "orchestration", "Orchestration plan", &body);
+        // Persist through the governed, lock-aware, Prime-stamped path (not the
+        // legacy author-less `add_dossier`) so the orchestration plan is owned
+        // by `__relix_autonomous_prime__` and a locked/human-owned doc is never
+        // clobbered (company-model §12.5F; execution-and-issue §1.8).
+        match task_store.author_prime_dossier(
+            parent_id,
+            "orchestration",
+            "Orchestration plan",
+            &body,
+        ) {
+            Ok(o) => dossier_notes.push(prime_dossier_note(parent_id, "orchestration", &o)),
+            Err(e) => skipped
+                .push(serde_json::json!({"task_id": parent_id, "reason": format!("dossier: {e}")})),
+        }
     }
 
     // Active role-track Briefs under the parent (marker
@@ -3318,7 +3370,17 @@ pub fn handle_orchestrate_with_blueprint(
                 .and_then(|b| b.role(&role_key))
                 .and_then(super::prime_orchestration::PrimeOrchestrationItem::dossier_body)
         {
-            let _ = task_store.add_dossier(&role_id, "orchestration", "Work track plan", &body);
+            match task_store.author_prime_dossier(
+                &role_id,
+                "orchestration",
+                "Work track plan",
+                &body,
+            ) {
+                Ok(o) => dossier_notes.push(prime_dossier_note(&role_id, "orchestration", &o)),
+                Err(e) => skipped.push(
+                    serde_json::json!({"task_id": role_id, "reason": format!("dossier: {e}")}),
+                ),
+            }
         }
         // Title lifecycle: when a role that was a placeholder becomes
         // active, promote its auto-generated `… track blocked:` title to
@@ -3372,7 +3434,13 @@ pub fn handle_orchestrate_with_blueprint(
                 .and_then(|b| b.subject(agent_id))
                 .and_then(super::prime_orchestration::PrimeOrchestrationItem::dossier_body)
         {
-            let _ = task_store.add_dossier(&subject_id, "execution", "Execution plan", &body);
+            match task_store.author_prime_dossier(&subject_id, "execution", "Execution plan", &body)
+            {
+                Ok(o) => dossier_notes.push(prime_dossier_note(&subject_id, "execution", &o)),
+                Err(e) => skipped.push(
+                    serde_json::json!({"task_id": subject_id, "reason": format!("dossier: {e}")}),
+                ),
+            }
         }
 
         // Assignment lands on the subject Brief (assign_ready only); the
@@ -3435,17 +3503,24 @@ pub fn handle_orchestrate_with_blueprint(
             if let Some((ref parent_id, _, _, _)) = parent {
                 let _ = task_store.link_subbrief(parent_id, role_id);
             }
-            // On first creation, record WHY the track is blocked.
+            // On first creation, record WHY the track is blocked — through the
+            // same governed, Prime-stamped, lock-aware path.
             if !was_existing {
-                let _ = task_store.add_dossier(
+                let blocker_body = format!(
+                    "Role '{role}' is not ready ({reason}). No execution Brief is \
+                     created until the role is staffed and active."
+                );
+                match task_store.author_prime_dossier(
                     role_id,
                     "blocker",
                     "Placeholder track",
-                    &format!(
-                        "Role '{role}' is not ready ({reason}). No execution Brief is \
-                         created until the role is staffed and active."
+                    &blocker_body,
+                ) {
+                    Ok(o) => dossier_notes.push(prime_dossier_note(role_id, "blocker", &o)),
+                    Err(e) => skipped.push(
+                        serde_json::json!({"task_id": role_id, "reason": format!("dossier: {e}")}),
                     ),
-                );
+                }
             }
         }
     }
@@ -3559,6 +3634,12 @@ pub fn handle_orchestrate_with_blueprint(
         "subject_briefs_existing": subject_briefs_existing,
         "assigned_briefs": assigned_briefs,
         "skipped": skipped,
+        // Prime-governed Dossier authoring outcomes for this run (one entry per
+        // attempted parent/role/subject/blocker doc): `authored` /
+        // `already_present` / `locked_by_other` / `skipped_human_owned` /
+        // `stale`. A locked or human-owned doc Prime declined to overwrite is
+        // visible here, not silently dropped.
+        "dossier_notes": dossier_notes,
         "source_markers": markers_used,
         "next_actions": next_actions,
         // Backward-compatible flat views.
@@ -9392,6 +9473,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(latest.status, "assigned");
+    }
+
+    // The orchestration parent Dossier is now persisted through the governed,
+    // lock-aware path and stamped with the synthetic autonomous-Prime authority
+    // (NOT a legacy author-less `add_dossier` row) — and a rerun never appends a
+    // duplicate revision (company-model §12.5F; execution-and-issue §1.8).
+    #[test]
+    fn orchestrate_parent_dossier_is_prime_authored_and_idempotent() {
+        let tasks = TaskStore::in_memory().unwrap();
+        let agents = store();
+        let spine = SpineStore::in_memory().unwrap();
+        let (m, _agent_id) = ready_team(&agents, &spine, "engineer");
+        let prime = crate::nodes::coordinator::agent::prime_driver::AUTONOMOUS_PRIME_AUTHORITY;
+
+        let v = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        let parent_id = v["parent_brief"]["task_id"].as_str().unwrap();
+        // The parent orchestration Dossier exists and is Prime-owned.
+        let dossier = tasks
+            .latest_dossier(parent_id, "orchestration")
+            .unwrap()
+            .unwrap();
+        assert_eq!(dossier.author.as_deref(), Some(prime));
+        assert_eq!(dossier.revision_number, 1);
+        // The run result reports the governed write outcome honestly.
+        let notes = v["dossier_notes"].as_array().unwrap();
+        assert!(notes.iter().any(|n| {
+            n["task_id"] == parent_id
+                && n["kind"] == "orchestration"
+                && n["outcome"] == "authored"
+                && n["author"] == prime
+        }));
+
+        // Rerun: the parent Brief is reused (existing) so no duplicate Dossier
+        // revision is appended — still exactly one revision of the kind.
+        let _ = orchestrate(&tasks, &agents, &spine, &format!("{m}|assign_ready"));
+        let metas = tasks.list_dossiers(parent_id).unwrap();
+        assert_eq!(
+            metas.iter().filter(|d| d.kind == "orchestration").count(),
+            1,
+            "rerun must not append a duplicate orchestration Dossier"
+        );
+        assert_eq!(
+            tasks
+                .latest_dossier(parent_id, "orchestration")
+                .unwrap()
+                .unwrap()
+                .author
+                .as_deref(),
+            Some(prime)
+        );
     }
 
     #[test]

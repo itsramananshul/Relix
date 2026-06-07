@@ -2082,6 +2082,93 @@ impl TaskStore {
         ))
     }
 
+    /// **Prime-governed, lock-aware, idempotent Dossier authoring** for the
+    /// company orchestration/strategy paths (relix-company-model §12.5;
+    /// relix-execution-and-issue-design §1.8). This is the SINGLE place the
+    /// Prime/orchestration flow persists its generated plan text, so the
+    /// lock/skip/idempotency rules live in one helper instead of being scattered
+    /// across the handler. It writes through the governed append-only
+    /// [`Self::author_dossier`] path, stamping the author as the synthetic
+    /// autonomous-Prime authority
+    /// ([`agent::prime_driver::AUTONOMOUS_PRIME_AUTHORITY`],
+    /// `__relix_autonomous_prime__`), and:
+    ///
+    /// - **never appends a duplicate** when Prime already owns the latest
+    ///   revision of this kind ([`brief::PrimeDossierOutcome::AlreadyPresent`])
+    ///   — a rerun of `mandate.orchestrate` is idempotent;
+    /// - **never clobbers** a human/editor (or legacy author-less) latest
+    ///   revision ([`brief::PrimeDossierOutcome::SkippedHumanOwned`]) — hand
+    ///   edits are preserved, in the same spirit as the orchestration
+    ///   title-promotion only touching machine-written placeholder titles;
+    /// - **respects explicit locks** — a kind locked by a *different* subject is
+    ///   refused by `author_dossier` and surfaced as
+    ///   [`brief::PrimeDossierOutcome::LockedByOther`] (nothing written, no
+    ///   silent overwrite);
+    /// - reports a concurrent-write [`brief::PrimeDossierOutcome::Stale`]
+    ///   without writing.
+    ///
+    /// Only the first, Prime-owned `create` revision is ever written here; the
+    /// helper deliberately does NOT push a fresh Prime revision on top of an
+    /// existing one (no agent overwrite of already-stored document text). The
+    /// `kind` names (`orchestration` / `execution` / `blocker` / …) are the
+    /// flow's existing, stable kinds — this helper never renames them.
+    ///
+    /// Tenant isolation is enforced at the handler boundary (the owning Brief),
+    /// exactly like every other Dossier surface.
+    pub fn author_prime_dossier(
+        &self,
+        task_id: &str,
+        kind: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<brief::PrimeDossierOutcome, CoordinatorError> {
+        let prime = agent::prime_driver::AUTONOMOUS_PRIME_AUTHORITY;
+        let kind_label = kind.trim().to_string();
+        // Idempotency + hand-edit preservation: inspect the current latest
+        // revision of this kind BEFORE writing anything.
+        if let Some(latest) = self.latest_dossier(task_id, kind)? {
+            return Ok(match latest.author.as_deref() {
+                // Prime already owns the latest revision — never append a
+                // duplicate row (rerun-idempotent).
+                Some(a) if a == prime => brief::PrimeDossierOutcome::AlreadyPresent {
+                    kind: kind_label,
+                    doc_id: latest.doc_id,
+                },
+                // Human/editor-authored, or a legacy (author-less) `add_dossier`
+                // row — preserve it, never clobber.
+                other => brief::PrimeDossierOutcome::SkippedHumanOwned {
+                    kind: kind_label,
+                    author: other.map(str::to_string),
+                },
+            });
+        }
+        // No revision of this kind yet → write the first Prime-owned revision
+        // through the governed, lock-aware append-only path.
+        Ok(
+            match self.author_dossier(
+                task_id,
+                kind,
+                title,
+                body,
+                prime,
+                brief::DossierAuthorMode::Revise,
+                None,
+                None,
+            )? {
+                brief::DossierAuthorOutcome::Authored(a) => brief::PrimeDossierOutcome::Authored(a),
+                brief::DossierAuthorOutcome::Locked(l) => {
+                    brief::PrimeDossierOutcome::LockedByOther {
+                        kind: l.kind,
+                        locked_by: l.locked_by,
+                    }
+                }
+                brief::DossierAuthorOutcome::Stale(s) => {
+                    brief::PrimeDossierOutcome::Stale { kind: s.kind }
+                }
+            },
+        )
+    }
+
     /// §1.8 document locking: **lock** a logical Dossier (this Brief + `kind`)
     /// so concurrent authors don't race. While the lock is held, only
     /// `subject` may author a revision of that kind (every other write is
@@ -23209,6 +23296,169 @@ mod tests {
             .find(|m| m.kind == "notes")
             .map(|m| m.revision_number);
         assert_eq!(notes_rev, Some(1));
+    }
+
+    // Prime governed Dossier authoring (company-model §12.5F): the helper that
+    // the orchestration path uses writes a FIRST revision stamped as the
+    // synthetic autonomous-Prime authority, is rerun-idempotent, never clobbers
+    // a human/legacy doc, and refuses a lock held by someone else.
+    #[test]
+    fn author_prime_dossier_creates_prime_owned_then_idempotent() {
+        let s = store();
+        let id = s
+            .create(
+                "brief",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        let prime = agent::prime_driver::AUTONOMOUS_PRIME_AUTHORITY;
+
+        // First write → a Prime-owned `create` revision through author_dossier.
+        match s
+            .author_prime_dossier(&id, "orchestration", "Orchestration plan", "body v1")
+            .unwrap()
+        {
+            brief::PrimeDossierOutcome::Authored(a) => {
+                assert_eq!(a.mode, "create");
+                assert_eq!(a.revision_number, 1);
+                assert_eq!(a.author.as_deref(), Some(prime));
+            }
+            other => panic!("expected Authored, got {}", other.label()),
+        }
+        // The latest revision is stamped as the autonomous-Prime author (NOT a
+        // legacy author-less `add_dossier` row).
+        let latest = s.latest_dossier(&id, "orchestration").unwrap().unwrap();
+        assert_eq!(latest.author.as_deref(), Some(prime));
+
+        // Rerun is idempotent: no duplicate revision is appended.
+        match s
+            .author_prime_dossier(&id, "orchestration", "Orchestration plan", "body v2")
+            .unwrap()
+        {
+            brief::PrimeDossierOutcome::AlreadyPresent { kind, doc_id } => {
+                assert_eq!(kind, "orchestration");
+                assert_eq!(doc_id, latest.doc_id);
+            }
+            other => panic!("expected AlreadyPresent, got {}", other.label()),
+        }
+        // Exactly one revision of this kind exists, with the original body.
+        let metas = s.list_dossiers(&id).unwrap();
+        assert_eq!(
+            metas.iter().filter(|m| m.kind == "orchestration").count(),
+            1
+        );
+        assert_eq!(
+            s.latest_dossier(&id, "orchestration")
+                .unwrap()
+                .unwrap()
+                .body,
+            "body v1"
+        );
+    }
+
+    #[test]
+    fn author_prime_dossier_preserves_human_and_legacy_docs() {
+        use brief::DossierAuthorMode;
+        let s = store();
+        let id = s
+            .create(
+                "brief",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // A human authored the `orchestration` kind first.
+        s.author_dossier(
+            &id,
+            "orchestration",
+            "Hand-written plan",
+            "human body",
+            "founder",
+            DossierAuthorMode::Revise,
+            None,
+            None,
+        )
+        .unwrap();
+        // Prime must NOT clobber it — skipped, human-owned, nothing appended.
+        match s
+            .author_prime_dossier(&id, "orchestration", "Orchestration plan", "prime body")
+            .unwrap()
+        {
+            brief::PrimeDossierOutcome::SkippedHumanOwned { kind, author } => {
+                assert_eq!(kind, "orchestration");
+                assert_eq!(author.as_deref(), Some("founder"));
+            }
+            other => panic!("expected SkippedHumanOwned, got {}", other.label()),
+        }
+        let latest = s.latest_dossier(&id, "orchestration").unwrap().unwrap();
+        assert_eq!(latest.author.as_deref(), Some("founder"));
+        assert_eq!(latest.body, "human body");
+
+        // A legacy author-less `add_dossier` row is likewise preserved.
+        s.add_dossier(&id, "execution", "Legacy exec", "legacy body")
+            .unwrap();
+        match s
+            .author_prime_dossier(&id, "execution", "Execution plan", "prime body")
+            .unwrap()
+        {
+            brief::PrimeDossierOutcome::SkippedHumanOwned { author, .. } => {
+                assert_eq!(author, None);
+            }
+            other => panic!("expected SkippedHumanOwned, got {}", other.label()),
+        }
+        assert_eq!(
+            s.latest_dossier(&id, "execution").unwrap().unwrap().body,
+            "legacy body"
+        );
+    }
+
+    #[test]
+    fn author_prime_dossier_refuses_lock_held_by_other() {
+        let s = store();
+        let id = s
+            .create(
+                "brief",
+                "flows/none.sol",
+                "{}",
+                "subj",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        // A human locks the `orchestration` kind before Prime writes anything.
+        match s
+            .lock_dossier(&id, "orchestration", "founder", Some("editing"))
+            .unwrap()
+        {
+            brief::DossierLockOutcome::Locked(_) => {}
+            brief::DossierLockOutcome::Conflict(_) => panic!("first lock must not conflict"),
+        }
+        // Prime's governed write is refused — nothing written, no overwrite.
+        match s
+            .author_prime_dossier(&id, "orchestration", "Orchestration plan", "prime body")
+            .unwrap()
+        {
+            brief::PrimeDossierOutcome::LockedByOther { kind, locked_by } => {
+                assert_eq!(kind, "orchestration");
+                assert_eq!(locked_by, "founder");
+            }
+            other => panic!("expected LockedByOther, got {}", other.label()),
+        }
+        assert!(s.latest_dossier(&id, "orchestration").unwrap().is_none());
     }
 
     #[test]

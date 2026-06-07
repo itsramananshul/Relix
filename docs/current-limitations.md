@@ -213,9 +213,29 @@ Brief+kind on read. What it does **not** do:
 - **No external document store.** Dossiers are rows in the coordinator's
   `task_documents` ledger (append-only); there is no Google-Docs/Notion-style
   external store, no per-doc binary blobs, and the body is byte-capped (64 KiB).
-- **No autonomous authoring.** No agent/LLM authors or revises a document on its
-  own — every author/revise/fork is an operator action through the governed
-  capability. The separate plan-package **composer** is likewise a manual surface.
+- **Bounded autonomous authoring — Prime persists its own generated orchestration
+  text through the governed Dossier path (v1).** The operator-facing workroom
+  author/revise/fork remains a human action through the governed capability, and
+  there is still **no arbitrary/freeform agent document editing**: no model-chosen
+  `create_document`, no model authoring or revising an *operator's* Dossier, and no
+  raw JSON doc write. What changed: the **company orchestration path**
+  (`mandate.orchestrate`, the parent / role-track / subject-execution and
+  placeholder plan Dossiers) now persists Prime's own deterministic-or-generated
+  plan text through the **governed, append-only, lock-aware** `author_dossier` path
+  (a single `TaskStore::author_prime_dossier` helper) instead of the legacy
+  author-less `add_dossier`. Those writes are stamped with the synthetic
+  autonomous-Prime authority `__relix_autonomous_prime__`, and the helper is
+  **idempotent** (a rerun never appends a duplicate revision — `already_present`),
+  **lock-aware** (a kind locked by a different subject is refused, never
+  overwritten — `locked_by_other`), and **hand-edit-preserving** (a human/editor or
+  legacy author-less latest revision is never clobbered — `skipped_human_owned`);
+  only the first, Prime-owned `create` revision of a stable kind
+  (`orchestration` / `execution` / `blocker`) is ever written, and the per-doc
+  outcome is reported on the orchestration result's `dossier_notes`. The kinds are
+  the flow's existing names — none are renamed. The separate plan-package
+  **composer** is likewise still a manual surface. So Prime may author its own
+  bounded, generated plan Dossiers under governance, but it still does not freely
+  edit arbitrary documents.
 - **Explicit document locking (v1) — SHIPPED, owner-or-nobody, refuse-not-redirect.**
   A logical Dossier (a Brief + `kind`, e.g. `plan`) can now be **locked** so
   concurrent authors don't race: `brief.dossier_lock` /

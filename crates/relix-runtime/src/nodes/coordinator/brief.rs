@@ -153,6 +153,52 @@ pub enum DossierAuthorOutcome {
     Locked(DossierLocked),
 }
 
+/// The outcome of [`super::TaskStore::author_prime_dossier`] — the
+/// Prime-governed, lock-aware, idempotent Dossier-authoring wrapper used by the
+/// company orchestration/strategy paths (relix-company-model §12.5;
+/// relix-execution-and-issue-design §1.8). It composes the append-only
+/// [`super::TaskStore::author_dossier`] write with a pre-check that (a) never
+/// appends a duplicate when Prime already authored the kind and (b) never
+/// clobbers a human/editor (or legacy author-less) revision. Every variant is
+/// `Ok` (the helper succeeded in *deciding*); only `Authored` mutates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrimeDossierOutcome {
+    /// A fresh, Prime-owned first revision of this kind was written through the
+    /// governed `author_dossier` path.
+    Authored(DossierAuthored),
+    /// Prime already owns the latest revision of this kind — left untouched, so
+    /// a rerun of `mandate.orchestrate` never appends a duplicate row.
+    AlreadyPresent { kind: String, doc_id: String },
+    /// The logical Dossier (this Brief + kind) is locked by a *different*
+    /// subject — `author_dossier` refused the write, nothing was overwritten.
+    LockedByOther { kind: String, locked_by: String },
+    /// The latest revision of this kind was authored by a non-Prime subject (a
+    /// human/editor, or a legacy author-less `add_dossier` row) — preserved, not
+    /// clobbered.
+    SkippedHumanOwned {
+        kind: String,
+        author: Option<String>,
+    },
+    /// A concurrent revision landed first (optimistic-lock stale) — nothing was
+    /// written.
+    Stale { kind: String },
+}
+
+impl PrimeDossierOutcome {
+    /// A short, stable label for the persisted/returned note (tests assert on
+    /// it). One of `authored` / `already_present` / `locked_by_other` /
+    /// `skipped_human_owned` / `stale`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            PrimeDossierOutcome::Authored(_) => "authored",
+            PrimeDossierOutcome::AlreadyPresent { .. } => "already_present",
+            PrimeDossierOutcome::LockedByOther { .. } => "locked_by_other",
+            PrimeDossierOutcome::SkippedHumanOwned { .. } => "skipped_human_owned",
+            PrimeDossierOutcome::Stale { .. } => "stale",
+        }
+    }
+}
+
 /// A **lock** held on a logical Dossier (a Brief's document `kind`, e.g.
 /// `plan`) — §1.8 document locking. While a lock exists, only `locked_by` may
 /// author a new revision of that `kind`; any other author's write is refused

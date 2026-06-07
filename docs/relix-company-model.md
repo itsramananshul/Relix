@@ -883,6 +883,22 @@ NOT the permission system**, exactly as in §C/§D/§E:
   text is byte-for-byte the deterministic v1, and the **direct one-click**
   `mandate.orchestrate` / `prime.advance {action:"orchestrate_assign_ready"}` route stays
   deterministic (it never builds a blueprint).
+- **Governed Dossier persistence (whichever path authored the text).** Whether the
+  parent / role-track / subject-execution / placeholder plan text is the deterministic
+  default or model-authored, the orchestration path now persists it through the
+  **governed, append-only, lock-aware** Dossier-authoring path (`author_dossier`, via a
+  single `TaskStore::author_prime_dossier` helper) rather than the legacy author-less
+  `add_dossier`. The write is stamped with the synthetic autonomous-Prime authority
+  `__relix_autonomous_prime__`, is **idempotent** (a rerun never appends a duplicate
+  revision), **respects explicit Dossier locks** (a kind locked by a different subject is
+  refused, never overwritten), and **never clobbers a human/editor (or legacy
+  author-less) latest revision** — only the first, Prime-owned `create` revision of each
+  stable kind (`orchestration` / `execution` / `blocker`, none renamed) is ever written.
+  The per-doc outcome (`authored` / `already_present` / `locked_by_other` /
+  `skipped_human_owned` / `stale`) is reported on the orchestration result's
+  `dossier_notes`. This makes Prime's own generated plan text first-class governed
+  document state, not an off-to-the-side raw insert — without granting any freeform
+  agent document editing (an operator's Dossier is never agent-authored).
 
 ### G. Prime Shift Disposition v1 — autonomous review-accept + apply (opt-in, grant-gated)
 
