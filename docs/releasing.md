@@ -7,6 +7,11 @@ Relix ships through two release channels, both produced by the same
 The **channel is derived from the shape of the git tag** — there is no
 separate workflow to maintain.
 
+The release workflow uses the same pinned Rust toolchain as
+`rust-toolchain.toml` and the local release gate. Do not switch it back to a
+floating `stable`; a moving compiler can make packaging behave differently
+from the checkout you validated.
+
 | Channel | Tag shape | GitHub release | Marked "Latest" |
 |---|---|---|---|
 | **Stable** | `vMAJOR.MINOR.PATCH` (e.g. `v0.4.3`) | normal release | yes |
