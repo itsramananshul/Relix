@@ -166,6 +166,69 @@ relix status   # is it up? print the topology table.
 relix stop     # kill the controllers + bridge by name.
 ```
 
+## Log in to the dashboard
+
+The operator dashboard at `http://127.0.0.1:19791/dashboard` uses a
+**username + password** login — *not* a pasted bridge token. The
+credential is a single local admin account stored (Argon2id-hashed) at
+`~/.relix/dashboard-admin.json`.
+
+- **First run:** open `/dashboard` and the app shows a one-time **create
+  admin** form (pick a username + password, min 8 chars). Submitting it
+  creates the account and logs you straight in.
+- **Prefer the CLI?** Pre-create (or reset) the credential locally:
+
+  ```powershell
+  .\scripts\relix-dashboard-admin-reset.ps1            # generates a password, prints it once
+  .\scripts\relix-dashboard-admin-reset.ps1 -Username ops -Password 'my-strong-pass'
+  ```
+
+  ```sh
+  ./scripts/relix-dashboard-admin-reset.sh             # POSIX equivalent
+  ```
+
+  Restart the bridge after a reset for the new credential to take effect.
+
+A successful login sets an HTTP-only `relix_session` cookie; **every**
+dashboard API call rides that cookie automatically — there is no token to
+copy into the UI. (The bridge bearer token in `~/.relix/bridge-token` is
+only for raw HTTP / OpenAI-compatible clients, covered under *First chat*
+below.)
+
+Forgot the password? Re-run the reset script above — it is a local
+filesystem operation only; there is no network reset path.
+
+## Verify the first release (one command)
+
+To prove a fresh checkout actually **boots, authenticates, exposes the
+core APIs, and runs one product flow** — without any external model spend —
+run the live boot smoke:
+
+```powershell
+.\scripts\smoke-first-release.ps1
+```
+
+It builds the binaries, boots a fully isolated mesh (its own temp
+`~/.relix` and a dedicated run label + ports, so your real config and any
+running mesh are untouched), then over real HTTP it:
+
+1. waits for the bridge to become ready (bounded — never hangs);
+2. logs in via the dashboard **session** path (`/v1/auth/setup` →
+   `relix_session` cookie, no token paste);
+3. reaches the core dashboard APIs through that session without 401/502 —
+   `/v1/info`, `/v1/spine/board`, `/v1/adapters`, `/v1/config/providers`,
+   `/v1/tasks`, `/v1/cron/jobs`, `/v1/spine/company` — and confirms the
+   same routes are **rejected without a session** (auth is enforced);
+4. runs one real Brief end-to-end on the safe local **echo** Rig
+   (starter-crew → create Brief → assign → run → poll the run ledger to a
+   terminal `done` → read the Chronicle);
+5. prints a concise PASS/FAIL report and stops exactly the processes it
+   started.
+
+Flags: `-SkipBuild` (reuse existing binaries), `-RequireEchoFlow` (fail the
+smoke if the echo flow doesn't fully pass), `-KeepUp` (leave the mesh
+running so you can open the dashboard yourself).
+
 ## First chat
 
 Once the dashboard is up, point any OpenAI-compatible client at
