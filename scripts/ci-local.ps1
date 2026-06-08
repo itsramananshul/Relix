@@ -69,6 +69,20 @@ $Steps = @(
         # cargo-deny`.
         Name   = 'cargo deny check --all-features'
         Script = { cargo deny check --all-features }
+    },
+    @{
+        # LIVE first-release boot smoke. This is the release gate the GitHub
+        # matrix deliberately does NOT run: it boots a real isolated mesh +
+        # bridge over HTTP, authenticates the dashboard session path, hits the
+        # core dashboard APIs (with a no-session negative control), and runs one
+        # real Brief end-to-end on the safe local echo Rig — zero external model
+        # spend. -SkipBuild reuses the binaries the serial test gate above just
+        # built; -RequireEchoFlow makes the echo product flow a hard failure, so
+        # a regression that breaks the first user-visible loop fails CI here.
+        # Kept local (not in ci.yml) because a live multi-process mesh boot is
+        # not a reliable hosted-runner gate; see docs/ci-strategy.md.
+        Name   = 'first-release live smoke (smoke-first-release.ps1 -SkipBuild -RequireEchoFlow)'
+        Script = { & (Join-Path $RepoRoot 'scripts/smoke-first-release.ps1') -SkipBuild -RequireEchoFlow }
     }
 )
 
@@ -87,5 +101,5 @@ if ($null -ne $Failed) {
     Write-Host "CI-LOCAL: FAIL  (first failing gate: $Failed)" -ForegroundColor Red
     exit 1
 }
-Write-Host 'CI-LOCAL: PASS  (fmt + clippy + serial test + deny all green)' -ForegroundColor Green
+Write-Host 'CI-LOCAL: PASS  (fmt + clippy + serial test + deny + first-release live smoke all green)' -ForegroundColor Green
 exit 0

@@ -202,10 +202,19 @@ filesystem operation only; there is no network reset path.
 
 To prove a fresh checkout actually **boots, authenticates, exposes the
 core APIs, and runs one product flow** — without any external model spend —
-run the live boot smoke:
+run the live boot smoke. It is portable: a PowerShell script and a POSIX peer
+that mirror each other step for step.
+
+**Windows (PowerShell):**
 
 ```powershell
-.\scripts\smoke-first-release.ps1
+.\scripts\smoke-first-release.ps1 -RequireEchoFlow
+```
+
+**Mac / Linux (POSIX shell):**
+
+```sh
+./scripts/smoke-first-release.sh --require-echo-flow
 ```
 
 It builds the binaries, boots a fully isolated mesh (its own temp
@@ -225,9 +234,39 @@ running mesh are untouched), then over real HTTP it:
 5. prints a concise PASS/FAIL report and stops exactly the processes it
    started.
 
-Flags: `-SkipBuild` (reuse existing binaries), `-RequireEchoFlow` (fail the
-smoke if the echo flow doesn't fully pass), `-KeepUp` (leave the mesh
-running so you can open the dashboard yourself).
+Flags (PowerShell / POSIX): `-SkipBuild` / `--skip-build` (reuse existing
+binaries), `-RequireEchoFlow` / `--require-echo-flow` (fail the smoke if the
+echo flow doesn't fully pass), `-KeepUp` / `--keep-up` (leave the mesh running
+so you can open the dashboard yourself).
+
+**What PASS means:** on this machine, right now, Relix builds, the mesh and
+bridge come up, the dashboard's username/password session auth works, the core
+operator APIs answer through that session (and are refused without it), and one
+real Brief runs to a terminal `done` on the echo Rig with a recorded
+Chronicle. **What it does not prove:** anything about a real model provider
+(it uses the no-spend `mock`/`echo` path, never a live Claude/Codex/Gemini/
+OpenAI call), nor production hardening, multi-node deployment, the messaging
+channels, or any path beyond the core boot-and-use loop it exercises.
+
+### As a release gate
+
+The live smoke is wired into the local release gate. Before tagging a release,
+run the full local CI on a dev box — it runs fmt, clippy, the serial workspace
+test, `cargo deny`, and then this live smoke (with `-SkipBuild
+-RequireEchoFlow`) as the final gate:
+
+```powershell
+.\scripts\ci-local.ps1
+```
+
+There is no POSIX peer of `ci-local.ps1` today (it is a Windows dev-box
+script); on POSIX, run the standard `cargo fmt` / `clippy` / `test` / `deny`
+set and then `./scripts/smoke-first-release.sh --require-echo-flow` directly.
+The live boot smoke is deliberately **not** part of GitHub Actions: a
+multi-process mesh bring-up over real ports is too slow and timing-sensitive
+to be a reliable hosted-runner gate, so GitHub CI stays unit/build/dist only
+and the live boot-and-use proof is the operator's local release gate. See
+[`ci-strategy.md`](ci-strategy.md).
 
 ## First chat
 

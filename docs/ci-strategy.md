@@ -80,6 +80,36 @@ exception is recorded in two coordinated places:
 No silent suppressions. Every entry has a removal condition (for example,
 "remove after libp2p reaches 0.55").
 
+## Local release gate: the first-release live smoke
+
+`scripts/ci-local.ps1` runs one gate that the GitHub matrix deliberately does
+**not**: the first-release live boot smoke (`scripts/smoke-first-release.ps1`,
+with the POSIX peer `scripts/smoke-first-release.sh`). It boots a real,
+fully isolated mesh + web bridge as separate processes, authenticates the
+dashboard session path over HTTP, hits the core dashboard APIs (with a
+no-session negative control proving auth is enforced), and runs one real Brief
+end-to-end on the safe local **echo** Rig — zero external model spend. In
+`ci-local.ps1` it runs last, with `-SkipBuild` (reusing the binaries the
+serial test gate just built) and `-RequireEchoFlow` (the echo product flow
+becomes a hard failure), so a regression that breaks the first user-visible
+loop fails the local release gate.
+
+It is the **local** release gate on purpose, and is intentionally absent from
+`ci.yml`. A live multi-process mesh bring-up — binding several ports, racing
+process readiness, and exercising the full governed product path over HTTP —
+is exactly the kind of slow, port-bound, timing-sensitive check this strategy
+keeps off the per-push hosted-runner path (the same reason the `heavy-ci.yml`
+end-to-end demo is dispatch/label only). Hosted runners give no reliability
+benefit here and would add flake to a required gate. GitHub CI therefore stays
+unit/build/dist only (clippy + `cargo test` per OS, dashboard-dist parity,
+boot-policy parity, `cargo deny`); the live boot-and-use proof is the
+operator's local release gate before tagging.
+
+Run it directly any time:
+
+- **Windows:** `.\scripts\smoke-first-release.ps1 -RequireEchoFlow`
+- **POSIX:** `./scripts/smoke-first-release.sh --require-echo-flow`
+
 ## Local-first workflow
 
 The required gate mirrors the recommended local pre-push order:
@@ -92,7 +122,8 @@ cargo deny check
 ```
 
 Running these locally catches issues before they consume Actions minutes.
-`scripts/ci-local.ps1` runs the same set on a Windows dev box.
+`scripts/ci-local.ps1` runs the same set on a Windows dev box, then finishes
+with the first-release live smoke described above as the release gate.
 
 ## Toolchain
 
