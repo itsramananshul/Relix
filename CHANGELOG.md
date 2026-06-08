@@ -7,6 +7,14 @@ once a stable release is cut.
 
 ## [Unreleased]
 
+### Added
+
+- **Release readiness CLI.** `relix release readiness` now prints the
+  local first-release gate, current binary version, expected tag shape,
+  and can run the full Windows-local release gate with
+  `--run-local-gate` without enabling GitHub Actions or spending model
+  provider credits.
+
 ### Documentation
 
 - Recorded the operator-console redesign that shipped in **v0.3.0**
@@ -414,7 +422,9 @@ First public alpha. Everything below is real and ships.
   `scripts/relix-mesh-up.sh` (POSIX), with `relix-mesh-down.sh` for
   shutdown.
 
-[Unreleased]: https://github.com/itsramananshul/Relix/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/itsramananshul/Relix/compare/v0.4.3-beta.1...HEAD
+[0.4.3-beta.1]: https://github.com/itsramananshul/Relix/releases/tag/v0.4.3-beta.1
+[0.4.2]: https://github.com/itsramananshul/Relix/releases/tag/v0.4.2
 [0.4.1]: https://github.com/itsramananshul/Relix/releases/tag/v0.4.1
 [0.4.0]: https://github.com/itsramananshul/Relix/releases/tag/v0.4.0
 [0.1.5]: https://github.com/itsramananshul/Relix/releases/tag/v0.1.5

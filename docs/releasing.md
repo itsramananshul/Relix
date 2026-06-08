@@ -1,6 +1,6 @@
 # Releasing — beta & stable channels
 
-_Version: 0.4.1_
+_Current workspace version: 0.4.3-beta.1_
 
 Relix ships through two release channels, both produced by the same
 `.github/workflows/release.yml` build (all five targets, cosign-signed).
@@ -9,12 +9,25 @@ separate workflow to maintain.
 
 | Channel | Tag shape | GitHub release | Marked "Latest" |
 |---|---|---|---|
-| **Stable** | `vMAJOR.MINOR.PATCH` (e.g. `v0.4.2`) | normal release | yes |
-| **Beta** | pre-release suffix (e.g. `v0.4.2-beta.1`, `-rc.1`, `-alpha.1`) | **pre-release** | no |
+| **Stable** | `vMAJOR.MINOR.PATCH` (e.g. `v0.4.3`) | normal release | yes |
+| **Beta** | pre-release suffix (e.g. `v0.4.3-beta.2`, `-rc.1`, `-alpha.1`) | **pre-release** | no |
 
-The workspace version in `Cargo.toml` is the stable version. Beta tags
-carry a `-beta.N` (or `-rc`/`-alpha`) suffix on top of the next target
-version.
+The workspace version in `Cargo.toml` is the binary-reported version.
+Keep it in lockstep with the release tag. A beta build reports the
+pre-release suffix too (`0.4.3-beta.2` -> tag `v0.4.3-beta.2`); a stable
+build reports the clean version (`0.4.3` -> tag `v0.4.3`).
+
+Before tagging, run the local release gate:
+
+```powershell
+relix release readiness --run-local-gate
+```
+
+This runs the Windows-local gate (`scripts/ci-local.ps1`): boot-policy
+coverage, fmt, clippy, dashboard dist parity, serial workspace tests,
+`cargo deny`, and the isolated first-release live smoke with the no-spend
+echo Rig. It does **not** enable GitHub Actions, create a tag, or call a
+model provider.
 
 ## Cut a beta (default path for testing new changes)
 
@@ -22,9 +35,14 @@ Beta is where new changes go first. Tag the commit you want to test with
 a pre-release suffix and push the tag:
 
 ```sh
-git tag v0.4.2-beta.1
-git push origin v0.4.2-beta.1
+git tag v0.4.3-beta.2
+git push origin v0.4.3-beta.2
 ```
+
+If the current checkout still reports an older beta (`relix release readiness`
+prints the exact tag shape), bump `Cargo.toml` first so the binary-reported
+version and tag match. Do not reuse an already-published beta tag for new
+commits.
 
 `release.yml` builds + signs all five targets and publishes a GitHub
 **pre-release**. Pre-releases are never shown as "Latest", so installers
@@ -37,14 +55,14 @@ When a beta is good, promote it by cutting the **clean** version tag (no
 suffix):
 
 ```sh
-git tag v0.4.2
-git push origin v0.4.2
+git tag v0.4.3
+git push origin v0.4.3
 ```
 
 This rebuilds + signs from source and publishes a stable release marked
-"Latest". (Bump `[workspace.package] version` in `Cargo.toml` to match
-the stable tag before promoting, the same as any stable release — see
-the version note in the root `Cargo.toml`.)
+"Latest". (Bump `[workspace.package] version` and the internal workspace
+dependency version pins in `Cargo.toml` to match the tag before promoting,
+then re-run `relix release readiness --run-local-gate`.)
 
 > The promotion rebuilds from source rather than copying the beta's
 > binaries, so make sure the commit you tag `vX.Y.Z` is the same commit
@@ -59,7 +77,7 @@ env vars; an explicit `RELIX_VERSION` always wins over `RELIX_CHANNEL`.
 |---|---|---|
 | Latest **stable** (default) | `curl -fsSL …/install.sh \| bash` | `irm …/install.ps1 \| iex` |
 | Latest **beta** | `curl -fsSL …/install.sh \| RELIX_CHANNEL=beta bash` | `$env:RELIX_CHANNEL='beta'; irm …/install.ps1 \| iex` |
-| **Exact** tag | `curl -fsSL …/install.sh \| RELIX_VERSION=v0.4.2-beta.1 bash` | `$env:RELIX_VERSION='v0.4.2-beta.1'; irm …/install.ps1 \| iex` |
+| **Exact** tag | `curl -fsSL …/install.sh \| RELIX_VERSION=v0.4.3-beta.2 bash` | `$env:RELIX_VERSION='v0.4.3-beta.2'; irm …/install.ps1 \| iex` |
 
 (`…` = `https://raw.githubusercontent.com/itsramananshul/Relix/main`.)
 
@@ -81,8 +99,18 @@ re-uploaded with `--clobber`.
 
 ## CI
 
-CI (`ci.yml`) is the required gate. It runs on every push to `main` and
-every pull request: `cargo fmt --check`, `cargo clippy -D warnings` and
-`cargo test` on the ubuntu + macOS + windows matrix, plus `cargo deny check`.
-Run the same set locally with `scripts/ci-local.ps1` before tagging a
-release.
+CI (`ci.yml`) is the required gate when repository workflows are enabled.
+It runs on every push to `main` and every pull request: `cargo fmt --check`,
+`cargo clippy -D warnings` and `cargo test` on the ubuntu + macOS + windows
+matrix, plus `cargo deny check`.
+
+For the operator-controlled release path, the local gate is mandatory even
+when hosted workflows are disabled to save minutes:
+
+```powershell
+relix release readiness --run-local-gate
+```
+
+If workflows are manually disabled in GitHub, enable the **Release** workflow
+only when you are ready to push the tag (or run it via `workflow_dispatch`),
+then disable it again after the assets are published.

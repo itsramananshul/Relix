@@ -86,18 +86,18 @@ $env:RELIX_CHANNEL = 'beta'; irm https://raw.githubusercontent.com/itsramananshu
 ### Pin an exact version
 
 `RELIX_VERSION` installs one specific tag — stable (`v0.4.2`) or beta
-(`v0.4.2-beta.1`) — and always wins over the channel.
+(`v0.4.3-beta.1`) — and always wins over the channel.
 
 **Mac / Linux:**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/itsramananshul/Relix/main/install.sh | RELIX_VERSION=v0.4.2 bash
+curl -fsSL https://raw.githubusercontent.com/itsramananshul/Relix/main/install.sh | RELIX_VERSION=v0.4.3-beta.1 bash
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-$env:RELIX_VERSION = 'v0.4.2'; irm https://raw.githubusercontent.com/itsramananshul/Relix/main/install.ps1 | iex
+$env:RELIX_VERSION = 'v0.4.3-beta.1'; irm https://raw.githubusercontent.com/itsramananshul/Relix/main/install.ps1 | iex
 ```
 
 The same per-OS binaries are built for both channels (Linux x86_64/arm64,

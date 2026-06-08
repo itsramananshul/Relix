@@ -34,7 +34,7 @@ Both installers do the same four things:
 4. Save your configuration to `~/.relix/config.toml`.
 
 Set `RELIX_INSTALL_DIR=/opt/relix/bin` or
-`RELIX_VERSION=v0.4.1` before piping if you want to override
+`RELIX_VERSION=v0.4.3-beta.1` before piping if you want to override
 defaults.
 
 ## The setup wizard
@@ -67,7 +67,7 @@ The pages are:
 ```
 ╔══════════════════════════════════════════╗
 ║      RELIX — Relay Intelligence          ║
-║              Exchange  v0.4.1            ║
+║              Exchange  v0.4.3-beta.1     ║
 ║                                          ║
 ║         The OS for AI Agents             ║
 ║                                          ║

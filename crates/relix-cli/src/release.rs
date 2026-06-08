@@ -82,7 +82,11 @@ fn readiness(args: ReadinessArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_readiness_plan(repo: &Path, gate: &Path) {
+    let version = env!("CARGO_PKG_VERSION");
+    let channel = release_channel_for_version(version);
     println!("relix release readiness");
+    println!("version: {version} ({})", channel.label());
+    println!("tag shape: {}", channel.tag_hint(version));
     println!("repo: {}", repo.display());
     println!("gate: {}", gate.display());
     println!();
@@ -94,6 +98,36 @@ fn print_readiness_plan(repo: &Path, gate: &Path) {
     println!("  5. cargo test --workspace (serial)");
     println!("  6. cargo deny check");
     println!("  7. live first-release smoke with echo Rig");
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseChannel {
+    Stable,
+    Beta,
+}
+
+impl ReleaseChannel {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta/pre-release",
+        }
+    }
+
+    fn tag_hint(self, version: &str) -> String {
+        match self {
+            Self::Stable => format!("v{version}"),
+            Self::Beta => format!("v{version} (GitHub pre-release, not Latest)"),
+        }
+    }
+}
+
+fn release_channel_for_version(version: &str) -> ReleaseChannel {
+    if version.contains('-') {
+        ReleaseChannel::Beta
+    } else {
+        ReleaseChannel::Stable
+    }
 }
 
 fn canonicalize_repo(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -171,6 +205,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let err = canonicalize_repo(tmp.path()).unwrap_err().to_string();
         assert!(err.contains("not a Relix repo root"));
+    }
+
+    #[test]
+    fn release_channel_tracks_semver_suffix() {
+        assert_eq!(release_channel_for_version("0.4.3"), ReleaseChannel::Stable);
+        assert_eq!(
+            release_channel_for_version("0.4.3-beta.2"),
+            ReleaseChannel::Beta
+        );
+        assert_eq!(
+            ReleaseChannel::Beta.tag_hint("0.4.3-beta.2"),
+            "v0.4.3-beta.2 (GitHub pre-release, not Latest)"
+        );
     }
 
     #[cfg(windows)]
