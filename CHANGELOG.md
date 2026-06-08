@@ -10,10 +10,10 @@ once a stable release is cut.
 ### Added
 
 - **Release readiness CLI.** `relix release readiness` now prints the
-  local first-release gate, current binary version, expected tag shape,
-  and can run the full Windows-local release gate with
-  `--run-local-gate` without enabling GitHub Actions or spending model
-  provider credits.
+  local first-release gate, current binary version, expected tag, git
+  HEAD, clean/dirty state, and local/origin tag presence; it can run the
+  full Windows-local release gate with `--require-clean --run-local-gate`
+  without enabling GitHub Actions or spending model provider credits.
 
 ### Documentation
 

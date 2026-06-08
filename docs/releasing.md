@@ -25,14 +25,16 @@ build reports the clean version (`0.4.3` -> tag `v0.4.3`).
 Before tagging, run the local release gate:
 
 ```powershell
-relix release readiness --run-local-gate
+relix release readiness --require-clean --run-local-gate
 ```
 
 This runs the Windows-local gate (`scripts/ci-local.ps1`): boot-policy
 coverage, fmt, clippy, dashboard dist parity, serial workspace tests,
 `cargo deny`, and the isolated first-release live smoke with the no-spend
 echo Rig. It does **not** enable GitHub Actions, create a tag, or call a
-model provider.
+model provider. The command also prints the current binary version, expected
+tag, current git HEAD, working-tree status, and whether that tag already
+exists locally or on `origin`.
 
 ## Cut a beta (default path for testing new changes)
 
@@ -45,9 +47,9 @@ git push origin v0.4.3-beta.2
 ```
 
 If the current checkout still reports an older beta (`relix release readiness`
-prints the exact tag shape), bump `Cargo.toml` first so the binary-reported
-version and tag match. Do not reuse an already-published beta tag for new
-commits.
+prints the exact tag and checks whether it already exists), bump `Cargo.toml`
+first so the binary-reported version and tag match. Do not reuse an
+already-published beta tag for new commits.
 
 `release.yml` builds + signs all five targets and publishes a GitHub
 **pre-release**. Pre-releases are never shown as "Latest", so installers
@@ -113,7 +115,7 @@ For the operator-controlled release path, the local gate is mandatory even
 when hosted workflows are disabled to save minutes:
 
 ```powershell
-relix release readiness --run-local-gate
+relix release readiness --require-clean --run-local-gate
 ```
 
 If workflows are manually disabled in GitHub, enable the **Release** workflow
