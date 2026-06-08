@@ -164,6 +164,7 @@ the vector store.
 | `setup` | Re-run the interactive wizard (provider, API key, channels) |
 | `doctor` | Bridge health check; exits 1 on any FAIL |
 | `update` | Self-update to the latest GitHub release |
+| `release readiness` | Print or run the local first-release gate |
 | `identity` | Org keypair generation, bundle minting, session tokens |
 | `ping` | Raw libp2p health check against any peer |
 | `task` | Coordinator Task ledger — create, list, get, watch, retry, export |

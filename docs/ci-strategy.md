@@ -82,9 +82,11 @@ No silent suppressions. Every entry has a removal condition (for example,
 
 ## Local release gate: the first-release live smoke
 
-`scripts/ci-local.ps1` runs one gate that the GitHub matrix deliberately does
-**not**: the first-release live boot smoke (`scripts/smoke-first-release.ps1`,
-with the POSIX peer `scripts/smoke-first-release.sh`). It boots a real,
+`relix release readiness --run-local-gate` is the CLI front door for the local
+release gate; under the hood it runs `scripts/ci-local.ps1`. That gate includes
+one check that the GitHub matrix deliberately does **not**: the first-release
+live boot smoke (`scripts/smoke-first-release.ps1`, with the POSIX peer
+`scripts/smoke-first-release.sh`). It boots a real,
 fully isolated mesh + web bridge as separate processes, authenticates the
 dashboard session path over HTTP, hits the core dashboard APIs (with a
 no-session negative control proving auth is enforced), and runs one real Brief
@@ -110,6 +112,12 @@ Run it directly any time:
 - **Windows:** `.\scripts\smoke-first-release.ps1 -RequireEchoFlow`
 - **POSIX:** `./scripts/smoke-first-release.sh --require-echo-flow`
 
+To run the whole Windows-local gate from the product CLI:
+
+```powershell
+relix release readiness --run-local-gate
+```
+
 ## Local-first workflow
 
 The required gate mirrors the recommended local pre-push order:
@@ -122,8 +130,9 @@ cargo deny check
 ```
 
 Running these locally catches issues before they consume Actions minutes.
-`scripts/ci-local.ps1` runs the same set on a Windows dev box, then finishes
-with the first-release live smoke described above as the release gate.
+`relix release readiness --run-local-gate` runs the same set on a Windows dev
+box, then finishes with the first-release live smoke described above as the
+release gate.
 
 ## Toolchain
 

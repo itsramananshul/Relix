@@ -229,6 +229,19 @@ Operative's adapter.
 
 ## Verify the first release (one command)
 
+From a source checkout, the CLI front door is:
+
+```powershell
+relix release readiness              # prints the gate and what it proves
+relix release readiness --run-local-gate
+```
+
+`--run-local-gate` runs the same Windows-local release gate as
+`.\scripts\ci-local.ps1`: fmt, clippy, dashboard dist parity, the serial
+workspace test, `cargo deny`, and the live first-release smoke. It does not
+enable GitHub Actions, does not create a tag, and does not call Claude or any
+model provider.
+
 To prove a fresh checkout actually **boots, authenticates, exposes the
 core APIs, and runs one product flow** — without any external model spend —
 run the live boot smoke. It is portable: a PowerShell script and a POSIX peer
@@ -287,9 +300,10 @@ the adapter probe reports it ready.
 ### As a release gate
 
 The live smoke is wired into the local release gate. Before tagging a release,
-run the full local CI on a dev box — it runs fmt, clippy, the serial workspace
-test, `cargo deny`, and then this live smoke (with `-SkipBuild
--RequireEchoFlow`) as the final gate:
+run the full local CI on a dev box — either through
+`relix release readiness --run-local-gate` or directly through the script. It
+runs fmt, clippy, the serial workspace test, `cargo deny`, and then this live
+smoke (with `-SkipBuild -RequireEchoFlow`) as the final gate:
 
 ```powershell
 .\scripts\ci-local.ps1

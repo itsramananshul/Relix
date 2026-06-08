@@ -50,6 +50,7 @@ mod ping;
 mod planning;
 mod provenance;
 mod reasoning;
+mod release;
 mod router;
 mod routing;
 mod secret_input;
@@ -489,6 +490,14 @@ enum Cmd {
     /// download + replace if a newer version exists.
     Update(update::UpdateArgs),
 
+    /// First-release readiness gates. `relix release readiness` prints the
+    /// local release gate; `--run-local-gate` runs it without enabling hosted
+    /// workflows or spending model credits.
+    Release {
+        #[command(subcommand)]
+        cmd: release::Cmd,
+    },
+
     /// Dependency auto-install. `relix install` (or
     /// `relix install --check`) prints a table of every
     /// dependency Relix needs (Docker, Ollama, Qdrant) with
@@ -626,6 +635,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Status(args) => mesh::status(args).await,
         Cmd::Dashboard { cmd } => dashboard::run(cmd).await,
         Cmd::Update(args) => update::run(args).await,
+        Cmd::Release { cmd } => release::run(cmd).await,
         Cmd::Install(args) => install::run(args).await,
         Cmd::Export(args) => export::run(args).await,
         Cmd::Souls { cmd } => souls::run(cmd),
