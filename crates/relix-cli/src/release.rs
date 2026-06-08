@@ -97,7 +97,7 @@ fn print_readiness_plan(repo: &Path, gate: &Path) {
 }
 
 fn canonicalize_repo(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let repo = path.canonicalize()?;
+    let repo = normalize_for_shell(path.canonicalize()?);
     if repo.join("Cargo.toml").exists() && repo.join("scripts").join("ci-local.ps1").exists() {
         Ok(repo)
     } else {
@@ -110,7 +110,7 @@ fn canonicalize_repo(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>>
 }
 
 fn find_repo_root(start: &Path) -> Option<PathBuf> {
-    let mut cur = start.canonicalize().ok()?;
+    let mut cur = normalize_for_shell(start.canonicalize().ok()?);
     loop {
         if cur.join("Cargo.toml").exists() && cur.join("scripts").join("ci-local.ps1").exists() {
             return Some(cur);
@@ -119,6 +119,20 @@ fn find_repo_root(start: &Path) -> Option<PathBuf> {
             return None;
         }
     }
+}
+
+fn normalize_for_shell(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
 }
 
 fn powershell_command(script: &Path) -> Command {
@@ -146,7 +160,10 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
 
         let found = find_repo_root(&nested).unwrap();
-        assert_eq!(found, tmp.path().canonicalize().unwrap());
+        assert_eq!(
+            found,
+            normalize_for_shell(tmp.path().canonicalize().unwrap())
+        );
     }
 
     #[test]
@@ -154,5 +171,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let err = canonicalize_repo(tmp.path()).unwrap_err().to_string();
         assert!(err.contains("not a Relix repo root"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_for_shell_strips_windows_verbatim_prefix() {
+        assert_eq!(
+            normalize_for_shell(PathBuf::from(r"\\?\D:\repo\Relix")),
+            PathBuf::from(r"D:\repo\Relix")
+        );
+        assert_eq!(
+            normalize_for_shell(PathBuf::from(r"\\?\UNC\server\share\Relix")),
+            PathBuf::from(r"\\server\share\Relix")
+        );
     }
 }
