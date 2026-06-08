@@ -419,7 +419,7 @@ last line";
 
     #[test]
     fn guarded_runs_an_allowlisted_interpreter() {
-        let spec = cmd_spec(if cfg!(windows) { "echo ok" } else { "echo ok" }, 64);
+        let spec = cmd_spec("echo ok", 64);
         let allow = if cfg!(windows) { "cmd" } else { "sh" };
         let r = run_macro_guarded(&spec, &[allow]).expect("allowed");
         assert!(r.success, "stderr: {}", r.stderr);

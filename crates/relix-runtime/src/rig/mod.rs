@@ -3591,7 +3591,7 @@ mod tests {
             "claude",
             &[path_dir.path().to_path_buf()],
             &exts,
-            &[fb.clone()],
+            std::slice::from_ref(&fb),
         )
         .unwrap();
         assert_eq!(
@@ -3643,7 +3643,7 @@ mod tests {
             "claude",
             &[path_dir.path().to_path_buf()],
             &exts,
-            &[real.clone()],
+            std::slice::from_ref(&real),
         )
         .unwrap();
         assert_eq!(
@@ -3903,14 +3903,14 @@ mod tests {
     // A representative `codex exec --json` JSONL stream: thread/turn
     // bookkeeping, an interim item, the final agent_message, turn done.
     fn codex_jsonl(agent_message: &str) -> String {
+        let agent_message = serde_json::to_string(agent_message).unwrap();
         format!(
             "{}\n{}\n{}\n{}\n{}\n",
             r#"{"type":"thread.started","thread_id":"t1"}"#,
             r#"{"type":"turn.started"}"#,
             r#"{"type":"item.completed","item":{"id":"i0","type":"reasoning","text":"thinking"}}"#,
-            format!(
-                r#"{{"type":"item.completed","item":{{"id":"i1","type":"agent_message","text":{}}}}}"#,
-                serde_json::to_string(agent_message).unwrap()
+            format_args!(
+                r#"{{"type":"item.completed","item":{{"id":"i1","type":"agent_message","text":{agent_message}}}}}"#
             ),
             r#"{"type":"turn.completed","usage":{"input_tokens":26335,"output_tokens":21}}"#,
         )

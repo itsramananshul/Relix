@@ -7769,7 +7769,7 @@ mod tests {
         let v = json_of(ok_body(handle_prime_status(
             &agents,
             &spine,
-            &(*task),
+            &task,
             &fake_ctx(pid.as_bytes()),
         )));
         assert_eq!(
@@ -7966,7 +7966,7 @@ mod tests {
         let v = json_of(ok_body(handle_company_actions(
             &agents,
             &spine,
-            &(*task),
+            &task,
             &fake_ctx(b""),
         )));
         let actions = v["actions"].as_array().unwrap();
@@ -7988,7 +7988,7 @@ mod tests {
         let v2 = json_of(ok_body(handle_company_actions(
             &agents,
             &spine,
-            &(*task),
+            &task,
             &fake_ctx(b""),
         )));
         assert!(

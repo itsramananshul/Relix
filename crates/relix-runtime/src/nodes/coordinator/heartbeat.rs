@@ -3568,8 +3568,11 @@ mod tests {
     /// A Rig that records the model/effort hints on the request it is asked
     /// to run, so a test can prove the stored preference flows through the
     /// dispatch chokepoint into the [`RigRunRequest`].
+    type CapturedRigHints =
+        std::sync::Arc<std::sync::Mutex<Option<(Option<String>, Option<String>)>>>;
+
     struct CaptureRig {
-        seen: std::sync::Arc<std::sync::Mutex<Option<(Option<String>, Option<String>)>>>,
+        seen: CapturedRigHints,
     }
     impl Rig for CaptureRig {
         fn name(&self) -> &str {
@@ -6682,6 +6685,7 @@ mod tests {
 
     /// Record one artifact; writes its source file into the workspace when
     /// `content` is `Some` (created/modified), leaving baseline as given.
+    #[allow(clippy::too_many_arguments)]
     fn put_artifact(
         s: &TaskStore,
         run_id: &str,

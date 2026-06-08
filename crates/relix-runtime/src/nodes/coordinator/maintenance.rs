@@ -224,7 +224,7 @@ pub fn prune_run_workspaces(
     };
     // Newest-first so `keep_latest` protects the most recently used N.
     let mut entries = scan.entries.clone();
-    entries.sort_by(|a, b| b.modified.cmp(&a.modified));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.modified));
     let cutoff = now_secs - (policy.older_than_days as i64).max(0) * 86_400;
     for (i, e) in entries.iter().enumerate() {
         if running.contains(&e.run_id) {
@@ -604,7 +604,7 @@ mod tests {
             vec![
                 entry("run_old", now - 30 * DAY),
                 entry("run_live", now - 30 * DAY), // old but running
-                entry("run_new", now - 1 * DAY),   // recent
+                entry("run_new", now - DAY),       // recent
             ],
         );
         let running: HashSet<String> = ["run_live".to_string()].into_iter().collect();

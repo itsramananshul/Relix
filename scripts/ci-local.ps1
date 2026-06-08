@@ -62,13 +62,14 @@ $Steps = @(
         Script = { $env:CARGO_BUILD_JOBS = '1'; cargo test --workspace -- --test-threads=1 }
     },
     @{
-        # Supply-chain gate. --all-features matches what ci.yml's manual
-        # `deny` job and the release path check, so license / advisory
-        # rejections (e.g. a feature-gated GPL/MPL dependency) surface
-        # here BEFORE tagging, not after. Requires `cargo install
-        # cargo-deny`.
-        Name   = 'cargo deny check --all-features'
-        Script = { cargo deny check --all-features }
+        # Supply-chain gate for the default first-release graph. Deferred
+        # optional feature families (browser-headless-chrome,
+        # browser-webdriver, terminal-pty) currently pull policy-blocked
+        # transitives and are documented in docs/dependency-policy.md; do not
+        # ship them until their dependency review/replacement work is closed.
+        # Requires `cargo install cargo-deny`.
+        Name   = 'cargo deny check'
+        Script = { cargo deny check }
     },
     @{
         # LIVE first-release boot smoke. This is the release gate the GitHub

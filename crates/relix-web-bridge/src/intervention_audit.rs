@@ -414,7 +414,7 @@ mod tests {
             "provider_test",
             "openai",
             "ok",
-            &format!("tried {fake_key}"),
+            format!("tried {fake_key}"),
         );
         let snap = a.snapshot();
         assert!(

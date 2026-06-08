@@ -67,6 +67,24 @@ Three trigger points:
 2. **Per-milestone (manual):** before pushing a milestone commit, run the full `cargo deny check` and `cargo audit` locally.
 3. **Nightly (automated):** `nightly-security.yml` runs `cargo deny check` (all categories, hard gates) and `cargo audit` (hard gate) against `main`. New advisories surface within 24 hours.
 
+## Deferred optional feature graph
+
+The first release ships the default feature graph. `cargo deny check` is the
+release supply-chain gate and is expected to pass there.
+
+Do **not** use `cargo deny --all-features check` as a release blocker until the
+deferred optional feature families below are reviewed or replaced:
+
+| Feature family | Current blocker | Release status |
+|----------------|-----------------|----------------|
+| `browser-headless-chrome` | `headless_chrome -> auto_generate_cdp`, whose synthesized license metadata resolves to `GPL-3.0-or-later`. GPL-family licenses are not allowed for Relix without an explicit legal/product decision. | Deferred; not in the default first-release graph. |
+| `browser-webdriver` | `fantoccini -> webdriver`, licensed `MPL-2.0`, which is not currently in the allowlist. | Deferred; not in the default first-release graph. |
+| `terminal-pty` | `portable-pty -> serial`, flagged by `RUSTSEC-2017-0008` as unmaintained. | Deferred; not in the default first-release graph. |
+
+The correct fix is dependency replacement, feature redesign, or an explicit
+documented approval. Do not broaden `deny.toml` just to make
+`--all-features` green.
+
 ## Why libp2p ecosystems naturally create version skew
 
 libp2p 0.54 bundles dozens of small protocol crates (`libp2p-tcp`, `libp2p-noise`, `libp2p-yamux`, `libp2p-kad`, `libp2p-request-response`, `libp2p-dns`, `libp2p-allow-block-list`, ...). Each of these has its own dependency tree. The libp2p organization releases them on a coordinated schedule but with different acceleration rates — e.g., `yamux` 0.12 and 0.13 both ship in different sub-crates because the breaking-change migration is mid-flight.

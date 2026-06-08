@@ -22407,7 +22407,7 @@ mod tests {
 
         let rows = s.list_brief_wakeups(&id, 10).unwrap();
         assert_eq!(rows[0].status, "running");
-        assert_eq!(rows[0].started_at.is_some(), true);
+        assert!(rows[0].started_at.is_some());
     }
 
     #[test]
@@ -23795,11 +23795,11 @@ mod tests {
             "only the open same-Guild blocker, by ref"
         );
         assert!(
-            !w.blocked_by.iter().any(|r| *r == resolved),
+            !w.blocked_by.contains(&resolved),
             "resolved blocker dropped"
         );
         assert!(
-            !w.blocked_by.iter().any(|r| *r == foreign),
+            !w.blocked_by.contains(&foreign),
             "cross-Guild blocker not leaked"
         );
 

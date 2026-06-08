@@ -10959,11 +10959,11 @@ fn register_node_type_handlers(
                                     format!("scheduled cleanup is enabled in REAL-DELETE mode (every {}h, older than {}d, keep {}) — old workspaces are removed automatically", autoprune.interval_secs / 3600, autoprune.older_than_days, autoprune.keep_latest)}));
                             }
                             let last_prune = st.list_maintenance_audit(1).ok().and_then(|v| v.into_iter().next());
-                            if let Some(lp) = &last_prune {
-                                if lp.status == "refused" || lp.status == "failed" {
-                                    warnings.push(serde_json::json!({"level":"error","message":
-                                        format!("the last cleanup ({}) {}: {}", lp.trigger, lp.status, lp.note.clone().unwrap_or_default())}));
-                                }
+                            if let Some(lp) = &last_prune
+                                && (lp.status == "refused" || lp.status == "failed")
+                            {
+                                warnings.push(serde_json::json!({"level":"error","message":
+                                    format!("the last cleanup ({}) {}: {}", lp.trigger, lp.status, lp.note.clone().unwrap_or_default())}));
                             }
                             let body = serde_json::json!({
                                 "workspace": {

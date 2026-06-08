@@ -7627,6 +7627,7 @@ in force.\n";
     /// Run `handle_prime_autonomy_tick_now_with_ai` for `tenant` as `role` with an
     /// explicit optional decider + the deliberation switch. Returns the raw
     /// outcome so the deny-path test can assert POLICY_DENIED.
+    #[allow(clippy::too_many_arguments)]
     fn tick_now_ai_raw(
         agents: &AgentStore,
         spine: &SpineStore,
@@ -8982,7 +8983,7 @@ in force.\n";
             .unwrap();
         tasks.record_run_finish(&run2, "failed", "boom").unwrap();
         assert!(
-            disposition_candidate(&tasks, "default", &[brief.clone()]).is_none(),
+            disposition_candidate(&tasks, "default", std::slice::from_ref(&brief)).is_none(),
             "a failed latest run is never a disposition candidate"
         );
         // And a still-running latest run is likewise invisible.
@@ -9022,7 +9023,7 @@ in force.\n";
         // The helper guards each run with `run_belongs_to_tenant`: a "default"
         // view never sees Guild "other"'s run.
         assert!(
-            disposition_candidate(&tasks, "default", &[brief.clone()]).is_none(),
+            disposition_candidate(&tasks, "default", std::slice::from_ref(&brief)).is_none(),
             "cross-tenant run is invisible to a different Guild's disposition"
         );
         assert_eq!(
