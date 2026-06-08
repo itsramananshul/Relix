@@ -323,6 +323,33 @@ Brief+kind on read. What it does **not** do:
       integration-tested in CI (the validator + deterministic fallback + the
       trigger / eligibility / dedup / tenant / exactly-once paths are fully
       unit/loop tested with scripted output).
+    - **End-to-end autonomy smoke (v1) — SHIPPED, what it proves.** A release-grade
+      backend smoke (`prime_driver::tests::prime_autonomy_e2e_*`, run by
+      `cargo test -p relix-runtime --lib prime_driver::tests::prime_autonomy_e2e`)
+      drives the REAL `autonomous_prime_tick` repeatedly with a bounded `max`, the
+      `before_execute` trigger, plan-package authoring on, and the
+      `prime.plan_package.approve` standing grant, asserting the chain is real and
+      governed end-to-end (not isolated helper tests): a tick **opens** the plan
+      package before the raw start and **holds** it; a later tick **accepts/
+      materializes** the Prime-authored package through the existing confirm +
+      exactly-once decomposition ledger (children appear exactly once, the bounded
+      grant is consumed exactly once); a re-tick duplicates neither the package,
+      the approval, nor the children; and once the human **assignment** gate is
+      passed (a human assigns the proposed children to an active Operative) the loop
+      **starts** them as durable Shifts on the safe `echo` Rig (heartbeat-trigger
+      runs) and then **honestly stops** at the next governance gate (run review —
+      no `prime.run.review_accept` grant). What it still does **not** prove: a
+      **live** provider/bridge round trip (the smoke uses the safe `echo` Rig and a
+      scripted decider, never a real model or remote Rig), and **autonomous
+      assignment** of Prime-decomposed children — Prime never assigns, and
+      `orchestrate_assign_ready` builds its own skeleton and does not adopt the
+      decomposed children, so without a human assignment the loop parks honestly at
+      the assignment gate (a no-op orchestration is now reported `skipped` with no
+      action consumed and no Chronicle event, instead of the prior livelock that
+      re-ran orchestration every tick and falsely claimed `advanced`). Autonomous
+      Chronicle events for a Mandate now land on a **stable anchor Brief**
+      (`mandate_chronicle_anchor` — a top-level Brief, lowest task id) rather than
+      the most-recently-updated Brief, so an action's provenance is deterministic.
 - **Explicit document locking (v1) — SHIPPED, owner-or-nobody, refuse-not-redirect.**
   A logical Dossier (a Brief + `kind`, e.g. `plan`) can now be **locked** so
   concurrent authors don't race: `brief.dossier_lock` /

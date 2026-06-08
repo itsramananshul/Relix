@@ -2795,15 +2795,46 @@ pub(crate) fn autonomous_prime_ctx(tenant: &str, args: Vec<u8>) -> InvocationCtx
     }
 }
 
+/// The STABLE Chronicle anchor Brief for a Mandate: a top-level (non-Sub-brief)
+/// Brief chosen deterministically (lowest `task_id`) so EVERY autonomous event
+/// for the Mandate lands on the SAME Brief across ticks. The natural
+/// `list_briefs_by_mandate` order is `updated_at DESC` — the most-recently-touched
+/// Brief, with arbitrary tie-breaking inside a second — so anchoring on its first
+/// row scattered an action's Chronicle onto whatever Sub-brief happened to be
+/// written last (e.g. a just-materialized decomposition child), making provenance
+/// non-deterministic. Restricting to top-level Briefs keeps the anchor on the
+/// Mandate's parent/orchestration-root across decomposition and orchestration (a
+/// Sub-brief never captures it); the `min` tie-break is stable as task ids are
+/// immutable. Falls back to the lowest-id Brief if every Brief is somehow a
+/// Sub-brief. `None` when the Mandate has no Brief yet.
+pub(crate) fn mandate_chronicle_anchor(task_store: &TaskStore, mandate_id: &str) -> Option<String> {
+    let briefs = task_store.list_briefs_by_mandate(mandate_id, 500).ok()?;
+    let mut top_level: Vec<String> = Vec::new();
+    let mut all: Vec<String> = Vec::new();
+    for c in &briefs {
+        all.push(c.task_id.clone());
+        let is_sub = task_store
+            .parent_briefs(&c.task_id)
+            .map(|p| !p.is_empty())
+            .unwrap_or(false);
+        if !is_sub {
+            top_level.push(c.task_id.clone());
+        }
+    }
+    if !top_level.is_empty() {
+        top_level.into_iter().min()
+    } else {
+        all.into_iter().min()
+    }
+}
+
 /// Append ONE Chronicle event for an actual autonomous action onto the Mandate's
-/// first (parent / orchestration-root) Brief — sparingly, only when a Brief
-/// exists. No Brief yet (e.g. a team-plan before orchestration) → record-only,
-/// no event, so an idle loop never spams the Chronicle.
+/// stable anchor Brief ([`mandate_chronicle_anchor`]) — sparingly, only when a
+/// Brief exists. No Brief yet (e.g. a team-plan before orchestration) →
+/// record-only, no event, so an idle loop never spams the Chronicle.
 fn chronicle_autonomous(task_store: &TaskStore, mandate_id: &str, event_type: &str, detail: &str) {
-    if let Ok(briefs) = task_store.list_briefs_by_mandate(mandate_id, 1)
-        && let Some(first) = briefs.first()
-    {
-        let _ = task_store.append_event(&first.task_id, event_type, detail);
+    if let Some(anchor) = mandate_chronicle_anchor(task_store, mandate_id) {
+        let _ = task_store.append_event(&anchor, event_type, detail);
     }
 }
 
@@ -3334,23 +3365,54 @@ fn process_candidate_inner(
                 blueprint.as_ref(),
             ) {
                 HandlerOutcome::Ok(_) => {
-                    *actions += 1;
-                    chronicle_autonomous(
-                        task_store,
-                        &mid,
-                        "prime.autonomous_advance",
-                        &format!(
-                            "autonomous Prime advanced `{action}` on mandate {mid} (text: {})",
-                            orch_mode.as_str()
-                        ),
-                    );
-                    let mut rec = mk(
-                        phase,
-                        action,
-                        "advanced",
-                        format!("ran governed `{action}` ({} text)", orch_mode.as_str()),
-                        Some(mid),
-                    );
+                    // Idempotent no-op detection. An `assign_ready` run that made
+                    // no structural change did no real work this tick. Without this
+                    // guard the autonomous loop re-runs orchestration EVERY tick —
+                    // taking false `advanced` credit, spending an action, and
+                    // appending a Chronicle event each time — whenever the Mandate
+                    // carries unassigned Briefs the orchestration skeleton does not
+                    // own (e.g. Prime-decomposed child Briefs, which open unassigned
+                    // and are NOT picked up by `assign_ready`). That is a livelock
+                    // with misleading provenance. Real progress = a new Brief was
+                    // created OR the unassigned count fell; the result body's
+                    // `assigned_briefs` is NOT a reliable signal (it also reports an
+                    // already-assigned subject as an idempotent re-assert). Compare
+                    // the Mandate's brief shape before/after instead. A no-op run is
+                    // `skipped` (no action consumed, no Chronicle event), so the
+                    // Mandate parks honestly at the assignment gate, not spinning.
+                    let after_ids: Vec<String> = task_store
+                        .list_briefs_by_mandate(&mid, 500)
+                        .map(|cards| cards.into_iter().map(|c| c.task_id).collect())
+                        .unwrap_or_default();
+                    let after = brief_counts(agent_store, task_store, tenant, &after_ids);
+                    let progressed = after.total > step.counts.total
+                        || after.unassigned < step.counts.unassigned;
+                    let (outcome, reason) = if !progressed {
+                        (
+                            "skipped",
+                            "orchestration is idempotent this tick — no Brief was \
+                             created and no unassigned Brief was assigned; any \
+                             remaining unassigned Briefs (e.g. Prime-decomposed \
+                             children) await assignment"
+                                .to_string(),
+                        )
+                    } else {
+                        *actions += 1;
+                        chronicle_autonomous(
+                            task_store,
+                            &mid,
+                            "prime.autonomous_advance",
+                            &format!(
+                                "autonomous Prime advanced `{action}` on mandate {mid} (text: {})",
+                                orch_mode.as_str()
+                            ),
+                        );
+                        (
+                            "advanced",
+                            format!("ran governed `{action}` ({} text)", orch_mode.as_str()),
+                        )
+                    };
+                    let mut rec = mk(phase, action, outcome, reason, Some(mid));
                     rec.orchestration_ai_mode = Some(orch_mode.as_str().to_string());
                     rec.orchestration_ai_reason = orch_reason;
                     rec
@@ -9898,5 +9960,299 @@ in force.\n";
         );
         // Still exactly the two children — no duplication.
         assert_eq!(tasks.list_subbriefs(&brief).unwrap().len(), 2);
+    }
+
+    /// Count the Mandate's autonomous Chronicle events of one type, read from the
+    /// SAME stable anchor Brief the driver writes them to
+    /// ([`mandate_chronicle_anchor`]).
+    fn chronicle_count(tasks: &TaskStore, mandate: &str, event_type: &str) -> usize {
+        let anchor = mandate_chronicle_anchor(tasks, mandate).expect("mandate has a Brief");
+        tasks
+            .list_events_after(&anchor, 0, 500)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == event_type)
+            .count()
+    }
+
+    // E2E-1) Release-grade autonomous Prime END-TO-END smoke: the new active-planner
+    //        chain drives ALL THE WAY to real execution on the safe `echo` Rig
+    //        through the existing governed APIs — and is exactly-once / idempotent
+    //        at every hop. This is NOT an isolated helper test: it runs the real
+    //        `autonomous_prime_tick` repeatedly with a bounded `max`, the
+    //        `before_execute` active-planner trigger, master plan-package authoring
+    //        on, and the `prime.plan_package.approve` standing authority, asserting
+    //        the whole chain is real and governed:
+    //          1. tick OPENS a plan package BEFORE the raw start and HOLDS it;
+    //          2. a later tick ACCEPTS/materializes the Prime-authored package
+    //             through the EXISTING confirm/decomposition ledger — children exist
+    //             exactly once, the bounded grant is consumed exactly once;
+    //          3. a re-tick neither duplicates the package, the approval, nor the
+    //             children, and consumes no second grant;
+    //          4. once the human ASSIGNMENT gate is passed (a human assigns the
+    //             proposed children to the active echo Operative) the loop STARTS
+    //             them as durable Shifts on the `echo` Rig;
+    //          5. the loop then HONESTLY STOPS at the next governance gate
+    //             (run review — no `prime.run.review_accept` authority), opening no
+    //             duplicate runs.
+    //        The Chronicle records each real action (`plan_package`,
+    //        `plan_package_approve`, the Mandate start) and is NOT spammed.
+    #[tokio::test]
+    async fn prime_autonomy_e2e_plan_package_to_execution() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = ready_bare_mandate(&agents, &spine, &tasks, "default");
+        let brief = lone_brief(&tasks, &m);
+        // The active, runnable echo Operative the lone leaf is already assigned to.
+        let eng = tasks
+            .brief_card(&brief)
+            .unwrap()
+            .unwrap()
+            .assignee_agent_id
+            .unwrap();
+        let decider = ScriptedDecider {
+            reply: Ok(pp_reply()),
+        };
+        // Enable ONLY the standing authority the chain needs: plan-package approval
+        // (bounded to a single materialization). Orchestration / start auto-advance
+        // through the shared guarded pipeline; no other standing grant is given, so
+        // every human gate the loop reaches is honoured, not bypassed.
+        let _grant = grant_standing(&agents, "default", CATEGORY_PLAN_PACKAGE_APPROVE, Some(1));
+
+        // ── Tick 1 — before_execute OPENS a *proposed* package and HOLDS the raw
+        //    start. No children, no run: the undecomposed leaf is NOT started.
+        let r1 = tick_pp_trig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            5,
+            Some("default"),
+            Some(&decider),
+            PrimePlanPackageTrigger::BeforeExecute,
+        );
+        let open = r1
+            .iter()
+            .find(|r| r.target_id == m && r.action == "plan_package")
+            .expect("tick 1 opens the plan package before the raw start");
+        assert_eq!(open.outcome, "advanced");
+        assert_eq!(open.phase, "ready_to_start", "the start is preempted");
+        let confirm = open.confirm_id.clone().expect("the package has a confirm");
+        assert_eq!(open_interactions(&tasks, &brief), (1, 1));
+        assert!(
+            tasks.list_subbriefs(&brief).unwrap().is_empty(),
+            "no children before approval"
+        );
+        assert!(
+            tasks
+                .list_runs_for_tenant("default", 100)
+                .unwrap()
+                .is_empty(),
+            "the raw leaf is HELD, not started, while the package is pending"
+        );
+
+        // ── Tick 2 — the pending Prime-authored package is ACCEPTED through the
+        //    existing plan-confirm path + exactly-once decomposition ledger.
+        let r2 = tick_pp_trig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            5,
+            Some("default"),
+            Some(&decider),
+            PrimePlanPackageTrigger::BeforeExecute,
+        );
+        let appr = r2
+            .iter()
+            .find(|r| r.target_id == m && r.action == "plan_package_approve")
+            .expect("tick 2 approves the pending package with the standing grant");
+        assert_eq!(appr.outcome, "advanced");
+        assert_eq!(appr.confirm_id.as_deref(), Some(confirm.as_str()));
+        assert_eq!(appr.child_count, Some(2));
+        // Children materialized through the ledger; the confirm is resolved.
+        assert_eq!(tasks.list_subbriefs(&brief).unwrap().len(), 2);
+        assert_eq!(open_interactions(&tasks, &brief), (0, 0));
+        // The bounded (max_calls=1) grant is consumed exactly once.
+        assert!(
+            !standing_active(&agents, "default", CATEGORY_PLAN_PACKAGE_APPROVE, 0),
+            "the bounded grant is consumed exactly once on materialization"
+        );
+
+        // ── Pass the human ASSIGNMENT gate: a human assigns the proposed children
+        //    to the active echo Operative (the same `assignee` primitive the
+        //    governed orchestration uses). Prime itself never assigns.
+        let kids = tasks.list_subbriefs(&brief).unwrap();
+        for k in &kids {
+            tasks.set_brief_field(k, "assignee", &eng).unwrap();
+        }
+
+        // ── Tick 3 — the children are now assigned + ready: the loop STARTS them as
+        //    durable Shifts on the `echo` Rig (heartbeat-trigger runs, not manual).
+        //    This is also a re-tick: no duplicate package, no second approval, no
+        //    duplicate children, no second grant.
+        let r3 = tick_pp_trig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            5,
+            Some("default"),
+            Some(&decider),
+            PrimePlanPackageTrigger::BeforeExecute,
+        );
+        assert!(
+            r3.iter()
+                .all(|r| r.action != "plan_package" && r.action != "plan_package_approve"),
+            "no duplicate package or approval after materialization"
+        );
+        assert_eq!(
+            tasks.list_subbriefs(&brief).unwrap().len(),
+            2,
+            "still exactly two children"
+        );
+        let started = r3
+            .iter()
+            .find(|r| r.target_id == m && r.outcome == "started")
+            .expect("tick 3 starts the assigned children");
+        assert_eq!(started.phase, "ready_to_start");
+        assert_eq!(started.action, "start_mandate");
+        let runs = tasks.list_runs_for_tenant("default", 100).unwrap();
+        assert_eq!(runs.len(), 2, "exactly the two child Shifts run");
+        assert!(
+            runs.iter().all(|r| r.rig == "echo"),
+            "the child Shifts run on the safe echo Rig"
+        );
+        assert!(
+            runs.iter()
+                .all(|r| r.trigger.as_deref() == Some("heartbeat")),
+            "autonomous starts stamp a heartbeat-trigger run, not dashboard manual"
+        );
+
+        // ── Tick 4 — the completed echo Shifts now await review; with no
+        //    `prime.run.review_accept` authority the loop HONESTLY STOPS at that
+        //    governance gate and opens no duplicate run.
+        let r5 = tick_pp_trig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            5,
+            Some("default"),
+            Some(&decider),
+            PrimePlanPackageTrigger::BeforeExecute,
+        );
+        assert!(
+            r5.iter()
+                .any(|r| r.target_id == m && r.phase == "needs_review" && r.outcome == "blocked"),
+            "the loop parks honestly at the run-review gate"
+        );
+        assert_eq!(
+            tasks.list_runs_for_tenant("default", 100).unwrap().len(),
+            2,
+            "no duplicate run is opened after the children have started"
+        );
+
+        // ── Chronicle: the real actions are recorded exactly once each (on the
+        //    Mandate's stable anchor Brief), and the Chronicle is not spammed.
+        assert_eq!(
+            chronicle_count(&tasks, &m, "prime.autonomous_plan_package"),
+            1,
+            "the plan-package open is Chronicled exactly once"
+        );
+        assert_eq!(
+            chronicle_count(&tasks, &m, "prime.autonomous_plan_package_approve"),
+            1,
+            "the plan-package approval is Chronicled exactly once"
+        );
+        assert_eq!(
+            chronicle_count(&tasks, &m, "prime.autonomous_mandate_start"),
+            1,
+            "the Mandate start is Chronicled exactly once"
+        );
+    }
+
+    // E2E-2) Regression for the liveness gap this smoke found: when the autonomous
+    //        loop materializes a Prime-decomposed package but the children are left
+    //        UNASSIGNED (Prime never assigns; no human passes the assignment gate),
+    //        the Mandate sits at `needs_orchestration`. The governed
+    //        `orchestrate_assign_ready` builds its own skeleton ONCE but cannot
+    //        assign the decomposed children, so without the idempotent-no-op guard
+    //        the loop would re-run orchestration EVERY tick — taking false
+    //        `advanced` credit and spamming the Chronicle forever (a livelock). The
+    //        guard makes the loop HONEST: the first orchestration advances, then
+    //        every further tick is `skipped` (no action, no Chronicle event), the
+    //        children stay exactly two, and the raw undecomposed leaf is never run.
+    #[tokio::test]
+    async fn prime_autonomy_e2e_orchestration_no_op_is_honest() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = ready_bare_mandate(&agents, &spine, &tasks, "default");
+        let brief = lone_brief(&tasks, &m);
+        let decider = ScriptedDecider {
+            reply: Ok(pp_reply()),
+        };
+        let _grant = grant_standing(&agents, "default", CATEGORY_PLAN_PACKAGE_APPROVE, Some(1));
+
+        // Tick 1 opens, tick 2 materializes the two unassigned children.
+        for _ in 0..2 {
+            tick_pp_trig(
+                &agents,
+                &spine,
+                &tasks,
+                &reg,
+                5,
+                Some("default"),
+                Some(&decider),
+                PrimePlanPackageTrigger::BeforeExecute,
+            );
+        }
+        assert_eq!(tasks.list_subbriefs(&brief).unwrap().len(), 2);
+
+        // Drive several more ticks. Exactly ONE must really advance orchestration;
+        // the rest must be honest no-ops.
+        let mut advanced = 0usize;
+        let mut skipped = 0usize;
+        for _ in 0..6 {
+            let recs = tick_pp_trig(
+                &agents,
+                &spine,
+                &tasks,
+                &reg,
+                5,
+                Some("default"),
+                Some(&decider),
+                PrimePlanPackageTrigger::BeforeExecute,
+            );
+            for r in recs
+                .iter()
+                .filter(|r| r.target_id == m && r.action == "orchestrate_assign_ready")
+            {
+                match r.outcome {
+                    "advanced" => advanced += 1,
+                    "skipped" => skipped += 1,
+                    other => panic!("unexpected orchestration outcome: {other}"),
+                }
+            }
+        }
+        assert_eq!(advanced, 1, "orchestration does real work exactly once");
+        assert!(
+            skipped >= 4,
+            "the rest are honest no-ops, not false advances"
+        );
+
+        // Children are untouched and the raw undecomposed leaf is never started.
+        assert_eq!(tasks.list_subbriefs(&brief).unwrap().len(), 2);
+        assert!(
+            tasks
+                .list_runs_for_tenant("default", 100)
+                .unwrap()
+                .is_empty(),
+            "no Shift runs while the decomposed children await assignment"
+        );
+        // The Chronicle is not spammed: exactly one orchestration advance event.
+        assert_eq!(chronicle_count(&tasks, &m, "prime.autonomous_advance"), 1);
     }
 }
