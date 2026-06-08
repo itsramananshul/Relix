@@ -97,8 +97,10 @@ interface AgentDetail {
 // `StandingRow` carries the full scope: the capability category/method it
 // unlocks, what it is bound to (task/session/method-prefix/workspace path),
 // its expiry, and the call/spend ceilings + usage the admission gate enforces.
-// Rendered read-only here; per-grant revoke lives on the Settings → Prime
-// standing-authority panel (so it is not duplicated on this surface).
+// Each grant is also individually revocable from this panel through the existing
+// `DELETE /v1/standing-approvals/:id` route (the same route Settings → Prime uses
+// for the synthetic autonomous-Prime authority) — the backend
+// `agent.standing_approval.revoke` gate stays the authority on who may revoke.
 interface Standing {
   standing_id?: string;
   match_category?: string;
@@ -336,6 +338,10 @@ export function Agents() {
   const [modelDraft, setModelDraft] = useState("");
   const [effortDraft, setEffortDraft] = useState("");
   const [savingModel, setSavingModel] = useState(false);
+  // The standing-approval row currently being revoked (its `standing_id`), so the
+  // Permissions-tab table can disable that row's Revoke button mid-write while a
+  // delete is in flight. Null when no revoke is running.
+  const [revokingId, setRevokingId] = useState<string | null>(null);
   // Skills-tab state (read-only procedural memory for the open Operative).
   // `skillInput` is the live filter box; `skillQuery` is the committed search
   // term (only submitted on Enter / Search, never per-keystroke). `skillData`
@@ -534,6 +540,35 @@ export function Agents() {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Save failed" });
     } finally {
       setSavingModel(false);
+    }
+  }
+
+  // Revoke one individual standing approval from this Operative's Permissions
+  // panel through the EXISTING `DELETE /v1/standing-approvals/:id` route (the
+  // same route the Settings → Prime panel uses for the synthetic authority). This
+  // is per-grant revoke for the arbitrary grants listed on the Operative — NOT
+  // the autonomous-Prime synthetic-authority controls (those stay on Settings).
+  // The backend `agent.standing_approval.revoke` gate is the authority on who may
+  // revoke; any denial is surfaced verbatim. A confirm guards against an
+  // accidental one-click destructive revoke. On success we force-refetch this
+  // Operative's detail so the grant's removal renders immediately.
+  async function revokeStanding(agentId: string, s: Standing) {
+    const sid = s.standing_id;
+    if (!sid) return;
+    const label = s.match_category || SCOPE_LABEL[s.scope_kind || ""] || s.scope_kind || "this grant";
+    if (!confirm(`Revoke the standing approval for "${label}"? This Operative will prompt for a fresh clearance on the next matching action.`)) {
+      return;
+    }
+    setRevokingId(sid);
+    setBanner(null);
+    try {
+      await api.del(`/v1/standing-approvals/${encodeURIComponent(sid)}`);
+      await loadDetail(agentId, true);
+      setBanner({ kind: "ok", msg: `Standing approval revoked — ${label} now requires a fresh clearance.` });
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Revoke failed" });
+    } finally {
+      setRevokingId(null);
     }
   }
 
@@ -862,8 +897,9 @@ export function Agents() {
         </div>
 
         {/* Standing approvals — pre-granted clearances, the scope they unlock,
-            and their live usage. Read-only here; per-grant revoke lives on the
-            Settings → Prime standing-authority panel (not duplicated). */}
+            and their live usage. Each grant is individually revocable here via the
+            existing DELETE /v1/standing-approvals/:id route (backend-gated); the
+            Settings → Prime panel keeps the SEPARATE synthetic-authority controls. */}
         <div className="op-group">
           <div className="op-group-title">Standing approvals{standing.length ? ` (${standing.length})` : ""}</div>
           {standingError ? (
@@ -875,7 +911,7 @@ export function Agents() {
           ) : (
             <div className="table-scroll">
               <table className="table" style={{ fontSize: 12 }}>
-                <thead><tr><th>Status</th><th>Unlocks</th><th>Scope</th><th>Calls</th><th>Spend</th><th>Expires</th><th>Granted by</th></tr></thead>
+                <thead><tr><th>Status</th><th>Unlocks</th><th>Scope</th><th>Calls</th><th>Spend</th><th>Expires</th><th>Granted by</th><th></th></tr></thead>
                 <tbody>
                   {standing.map((s, i) => {
                     const st = standingState(s, nowSecs);
@@ -896,6 +932,20 @@ export function Agents() {
                         <td className="muted">{hasSpend ? `${fmtMicros(s.cost_used_micros ?? 0)} / ${s.max_cost_micros != null ? fmtMicros(s.max_cost_micros) : "∞"}` : "—"}</td>
                         <td className="muted">{fmtWhen(s.expires_at)}</td>
                         <td className="muted">{s.granted_by ? s.granted_by.slice(0, 12) : "—"}</td>
+                        <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+                          {s.standing_id ? (
+                            <button
+                              className="btn ghost sm"
+                              disabled={revokingId !== null}
+                              title="Revoke this standing approval (the backend gate authorizes the revoke)"
+                              onClick={() => void revokeStanding(agentId, s)}
+                            >
+                              {revokingId === s.standing_id ? "…" : "Revoke"}
+                            </button>
+                          ) : (
+                            <span className="muted">—</span>
+                          )}
+                        </td>
                       </tr>
                     );
                   })}
