@@ -190,6 +190,15 @@ interface Agent {
 interface Adapter {
   name?: string;
   display_name?: string;
+  // Billing shape the backend already serializes (RigInfo.billing): how the
+  // Rig is paid for and, for subscription CLIs, the declared quota window.
+  // Surfaced on the per-Operative "Backed by" line (adapters §7).
+  billing?: {
+    mode?: string; // "subscription" | "metered" | "none"
+    provider?: string | null;
+    subscription_included?: boolean;
+    quota_window?: string | null;
+  };
   probe?: { status?: string; detail?: string; install_hint?: string | null };
 }
 interface CompanyStatus {
@@ -839,6 +848,58 @@ export function Agents() {
     );
   }
 
+  // A compact at-a-glance readiness badge for the identity header — "✓" when
+  // the adapter probes available, otherwise the friendly blocked label
+  // ("needs login", "not installed", …) so a not-logged-in Operative stands
+  // out without opening the workbench (adapters §7).
+  function rigBadge(rig?: string | null) {
+    if (!rig) return null;
+    const status = byName.get(rig)?.probe?.status ?? "unknown";
+    const ok = status === "available";
+    return (
+      <span className={"badge " + (ok ? "done" : "blocked")} style={{ fontSize: 9, marginLeft: 6 }}>
+        {ok ? "✓" : STATUS_LABEL[status] ?? status}
+      </span>
+    );
+  }
+
+  // The adapters §7 per-Operative "backend" line: which Rig backs this
+  // Operative, how it is billed, whether it is actually logged in, and the
+  // declared quota window — so a not-authenticated adapter is obvious instead
+  // of silently broken, and the "run `claude login`" hint is right there. This
+  // reads ONLY what the live probe reports; it deliberately does not fabricate
+  // a usage percentage ("60% of weekly window") — live quota polling is Phase
+  // A1 / adapters §9 open-decision #4, so we show the declared window, not an
+  // invented number.
+  function backedByLine(rig?: string | null) {
+    if (!rig) return <span className="muted">no adapter — assign a Rig in Configuration</span>;
+    const a = byName.get(rig);
+    if (!a) return <span className="muted">adapter {rig} — unknown to this mesh</span>;
+    const status = a.probe?.status ?? "unknown";
+    const ok = status === "available";
+    const b = a.billing;
+    const bill =
+      b?.mode === "subscription"
+        ? `subscription${b.provider ? ` (${b.provider})` : ""}`
+        : b?.mode === "metered"
+          ? `metered${b.provider ? ` (${b.provider})` : ""}`
+          : null;
+    // "logged in ✓" reads right only for auth-bearing backends; the built-in
+    // echo / no-billing Rigs need no login, so they read "ready ✓".
+    const readyLabel = ok ? (bill ? "logged in ✓" : "ready ✓") : STATUS_LABEL[status] ?? status;
+    return (
+      <span style={{ display: "inline-flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <span>Backed by <strong>{a.display_name || a.name || rig}</strong></span>
+        {bill && <span className="muted">· {bill}</span>}
+        <span className={"badge " + (ok ? "done" : "blocked")} style={{ fontSize: 9 }}>{readyLabel}</span>
+        {ok && b?.quota_window && <span className="muted">· {b.quota_window} window</span>}
+        {!ok && a.probe?.install_hint && (
+          <span className="muted" style={{ fontSize: 11 }}>· {a.probe.install_hint}</span>
+        )}
+      </span>
+    );
+  }
+
   // Read-only render of one Operative's governance panel — the §9 per-agent
   // permission "face on machinery that already exists": Keys (org/work powers +
   // caps), Capability powers (risk ceiling + category/secret/surface gates the
@@ -1018,7 +1079,7 @@ export function Agents() {
                   <span className="link" onClick={() => setOpen(a.reports_to ?? null)}>{nameOf(a.reports_to)}</span>
                 </span>
               )}
-              <span>adapter {a.rig || "(none)"}</span>
+              <span>adapter {a.rig || "(none)"}{rigBadge(a.rig)}</span>
             </div>
           </div>
           <div className="row" style={{ gap: 6 }}>
@@ -1059,8 +1120,7 @@ export function Agents() {
                   <div className="kv"><span className="muted">Role</span><span>{roleLabel}</span></div>
                   <div className="kv"><span className="muted">Title</span><span>{a.title || detail?.title || "—"}</span></div>
                   <div className="kv"><span className="muted">Status</span><span><Badge status={a.status ?? "active"} /></span></div>
-                  <div className="kv"><span className="muted">Adapter (Rig)</span><span>{a.rig || "(none)"}</span></div>
-                  <div className="kv"><span className="muted">Readiness</span><span>{rigStatusCell(a.rig)}</span></div>
+                  <div className="kv"><span className="muted">Backed by</span><span>{backedByLine(a.rig)}</span></div>
                   <div className="kv"><span className="muted">Reports to</span><span>{a.reports_to ? <span className="link" onClick={() => setOpen(a.reports_to ?? null)}>{nameOf(a.reports_to)}</span> : "—"}</span></div>
                   <div className="kv"><span className="muted">Direct reports</span><span>{directReports.length}</span></div>
                   <div className="kv"><span className="muted">Pressure</span><span>{openCount} open · {runningCount} running</span></div>

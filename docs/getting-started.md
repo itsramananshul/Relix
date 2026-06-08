@@ -277,6 +277,13 @@ Chronicle. **What it does not prove:** anything about a real model provider
 OpenAI call), nor production hardening, multi-node deployment, the messaging
 channels, or any path beyond the core boot-and-use loop it exercises.
 
+To move an Operative from the no-spend echo Rig to a real subscription CLI,
+install and log in to that CLI outside Relix first (`claude auth login` or
+`codex login`). Then open **Agents -> Operative -> Configuration**, choose the
+Rig, and check the **Backed by** line on the Operative overview. It shows the
+live probe state and any setup hint; Relix does not treat a CLI as ready unless
+the adapter probe reports it ready.
+
 ### As a release gate
 
 The live smoke is wired into the local release gate. Before tagging a release,
