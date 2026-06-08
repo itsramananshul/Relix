@@ -28,21 +28,29 @@ Set-Location $RepoRoot
 $Dist = 'crates/relix-web-bridge/dashboard-dist'
 $App = 'apps/dashboard'
 
-$npm = Get-Command npm -ErrorAction SilentlyContinue
+$npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+if (-not $npm) {
+    $npm = Get-Command npm -ErrorAction SilentlyContinue
+}
 if (-not $npm) {
     Write-Host 'dashboard dist parity: SKIP/FAIL — npm not found.' -ForegroundColor Red
     Write-Host 'Install Node.js (npm) to build + verify the React dashboard bundle.' -ForegroundColor Yellow
     exit 2
 }
 
+function Invoke-Npm {
+    param([Parameter(ValueFromRemainingArguments = $true)] [string[]]$NpmArgs)
+    & $npm.Source @NpmArgs
+}
+
 Push-Location $App
 try {
     if (-not (Test-Path 'node_modules')) {
         Write-Host '==> dashboard deps missing — installing (npm ci)' -ForegroundColor Cyan
-        npm ci
+        Invoke-Npm ci
         if ($LASTEXITCODE -ne 0) {
             Write-Host '    npm ci failed; falling back to npm install' -ForegroundColor Yellow
-            npm install
+            Invoke-Npm install
             if ($LASTEXITCODE -ne 0) { throw 'npm install failed' }
         }
     }
@@ -50,7 +58,7 @@ try {
         Write-Host '==> dashboard deps present — skipping install (non-destructive)' -ForegroundColor Cyan
     }
     Write-Host '==> npm run build' -ForegroundColor Cyan
-    npm run build
+    Invoke-Npm run build
     if ($LASTEXITCODE -ne 0) { throw 'dashboard build failed' }
 }
 finally {
