@@ -198,6 +198,35 @@ below.)
 Forgot the password? Re-run the reset script above — it is a local
 filesystem operation only; there is no network reset path.
 
+## Your first Shift (from the dashboard)
+
+The first time you open the dashboard against a fresh, initialized company,
+the **Overview** page shows a **"Run your first Shift"** on-ramp card. One
+click runs the safe local path end-to-end, using only built-in routes and the
+no-spend **echo** adapter:
+
+1. **Set up a safe local crew (echo)** — provisions the Founder plus a couple
+   of clearly-labelled local *echo* Operatives (`company.starter_crew`).
+2. **Create your first Brief** — a plainly-titled Brief ("First Shift — local
+   echo demo"), assigned to one of those Operatives in the same call
+   (`brief.create`).
+3. **Run the Shift (echo)** — runs the Brief through the built-in echo Rig
+   (`brief.run`), so you watch a real Shift reach `running`/`done` without
+   installing any external coding agent.
+
+Each step shows live progress; on completion the card deep-links to the run
+(`/runs`), the Brief (`/briefs`), and the crew (`/agents`). The card appears
+only while the company has no Briefs and no Mandates yet, and disappears once
+real work exists. Prefer to plan a real goal instead? The card also links to
+**Plan with Prime** (Chat).
+
+**What this proves:** the local execution loop — governed crew → Brief →
+scoped run → transcript → review/apply — is reachable and works from the UI.
+**What it does not prove:** anything about a real model provider. The echo
+adapter is a built-in stand-in; it makes no external model call. To run real
+work, install + log in to a coding-agent CLI on **Settings** and switch an
+Operative's adapter.
+
 ## Verify the first release (one command)
 
 To prove a fresh checkout actually **boots, authenticates, exposes the

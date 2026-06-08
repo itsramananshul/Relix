@@ -1177,7 +1177,14 @@ Relix *feels like a real product, not a mock-up*, when all of these are true (fr
 
 - **Time-to-first-success < 5 min** — a fresh user boots, logs in, and watches a Brief reach
   `done` without reading docs (live-smoke already proves the path exists; it must be
-  *discoverable in the UI*, not just via HTTP).
+  *discoverable in the UI*, not just via HTTP). **Shipped (frontend):** the **Overview**
+  page now renders a compact **"Run your first Shift"** on-ramp for an initialized company
+  with no work yet — one click chains the existing `company.starter_crew` (echo) →
+  `brief.create` (assigned) → `brief.run` (echo) routes end-to-end and deep-links to the
+  run/Brief/crew, so the safe-local first success is discoverable from the dashboard (no new
+  backend; echo only, no real provider). See `product-spine-implementation.md` "Dashboard
+  first-run on-ramp". *Still partial:* it proves the **local echo** loop only; the
+  real-provider first-success path still routes through Settings + a coding-agent CLI.
 - **The org is visible** — the Lattice shows the company as a company; the Roster shows Keys
   and Allowance per Operative.
 - **Work reads as a goal-facing plan** — Briefs render as numbered workflow checklists with

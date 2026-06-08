@@ -222,6 +222,12 @@ export function Overview() {
   // load state and only updates on a SUCCESSFUL fetch, so a transient blip can
   // never blank it. The rest of the Overview stays a mount-load snapshot.
   const [liveActions, setLiveActions] = useState<CompanyActions | null>(null);
+  // Latch the first-run on-ramp open once the operator starts it: a successful
+  // run reloads the page (so the counters refresh) which would otherwise flip
+  // `isFresh` false and unmount the panel before its result + deep links are
+  // seen. Latched state survives the reload; a fresh mount with real work never
+  // sets it, so the panel still disappears for an established company.
+  const [onRampLatched, setOnRampLatched] = useState(false);
   // Refetch ONLY the Action Center feed (success-only → never clobber with
   // null, so a transient blip can't blank it). Shared by the SSE/poll effect
   // below AND the inline Approve/Reject handlers, so acting on a hire updates
@@ -272,6 +278,14 @@ export function Overview() {
   const initialized = company.initialized ?? crew > 0;
   const running = runs.filter((r) => r.status === "running").length;
   const inReview = board.in_review ?? 0;
+  // First-run on-ramp gate (roadmap §6 DoD "Time-to-first-success … discoverable
+  // in the UI"): the company is initialized but has done no work yet — no Briefs
+  // and no Mandates. Guarded on a clean core read so a down coordinator never
+  // masquerades as a fresh company. Latches open once started so the result
+  // survives the post-run reload.
+  const isFresh =
+    initialized && !data?.coreError && totalBriefs === 0 && (data?.mandates?.length ?? 0) === 0;
+  const showOnRamp = initialized && !data?.coreError && (isFresh || onRampLatched);
 
   // System warnings — actionable, ranked. Each can carry a "next action".
   const warnings: Warn[] = [];
@@ -287,7 +301,11 @@ export function Overview() {
         cta: "Open Settings",
       });
     }
-    if (initialized && (data?.mandates?.length ?? 0) === 0 && totalBriefs === 0) {
+    if (showOnRamp) {
+      // The first-run on-ramp panel supersedes the generic "no Mandates / no
+      // Briefs yet" nudges — don't double them up as warnings (design §5: one
+      // scannable card, not a tower of banners).
+    } else if (initialized && (data?.mandates?.length ?? 0) === 0 && totalBriefs === 0) {
       warnings.push({ tone: "info", msg: "No Mandates yet — turn a big goal into a Brief tree, or create Briefs by hand.", to: "/mandates", cta: "Create a Mandate" });
     } else if (initialized && totalBriefs === 0) {
       warnings.push({ tone: "info", msg: "No Briefs yet — create your first unit of work.", to: "/briefs", cta: "Create a Brief" });
@@ -417,6 +435,16 @@ export function Overview() {
           <span>Some Command Center data failed to load: {data.coreError}</span>
           <span className="banner-cta" onClick={reload} style={{ cursor: "pointer" }}>Retry →</span>
         </div>
+      )}
+      {/* First-run on-ramp — the smallest discoverable path to a positive
+          Shift for a fresh, initialized company (roadmap §6 DoD; company-model
+          §12.6). One click provisions a safe-local echo crew, creates + assigns
+          a first Brief, and runs it end-to-end through the built-in echo Rig. */}
+      {showOnRamp && (
+        <FirstRunOnRamp
+          onStarted={() => setOnRampLatched(true)}
+          onChanged={() => { void refreshActions(); reload(); }}
+        />
       )}
       {/* Company operating status — the cockpit: Prime's ONE next safe step
           (guided driver) + a live pressure strip, so the operator knows what to
@@ -667,6 +695,208 @@ const PRESSURES: [string, string, string, string][] = [
   ["needs_review", "review", "/runs", "in_review"],
   ["ready_to_start", "ready", "/briefs", "todo"],
 ];
+
+// ── First-run on-ramp ──────────────────────────────────────────────────────
+// The smallest discoverable path from a fresh-but-initialized company to a
+// positive Shift (roadmap §6 DoD "Time-to-first-success … discoverable in the
+// UI"; product-spine-implementation.md First-Run Starter Crew Pack;
+// company-model §12.6). It chains THREE existing routes — no new backend:
+//   1. `company.starter_crew` (echo)  → a couple of safe-local Operatives,
+//   2. `brief.create` (with `assignee`) → a first Brief assigned to one of them,
+//   3. `brief.run` (echo)             → a real Shift through the built-in echo Rig.
+// It NEVER calls a real model provider (echo is the built-in safe stand-in), and
+// every step shows honest progress; a refusal/failure surfaces the real reason.
+const ONRAMP_BRIEF_TITLE = "First Shift — local echo demo";
+const ONRAMP_PLAN = [
+  "Set up a safe local crew (echo)",
+  "Create your first Brief",
+  "Run the Shift (echo)",
+];
+type OnRampStepState = "todo" | "run" | "ok" | "err";
+const STEP_TONE: Record<OnRampStepState, string> = {
+  todo: "backlog",
+  run: "in_progress",
+  ok: "done",
+  err: "blocked",
+};
+const STEP_LABEL: Record<OnRampStepState, string> = {
+  todo: "step",
+  run: "…",
+  ok: "done",
+  err: "failed",
+};
+// Plain-language mapping for the `brief.run` outcome on the safe-local path.
+const ONRAMP_REFUSALS: Record<string, string> = {
+  unassigned: "the Brief had no Operative to run it",
+  no_adapter: "no adapter is configured for the assigned Operative",
+  adapter_unavailable: "the echo adapter isn't available",
+  already_running: "this Brief is already running",
+  not_found: "the Brief could not be found",
+  workspace_error: "a run workspace could not be prepared",
+  failed: "the run failed",
+};
+
+interface StarterCrewResult {
+  founder?: { agent_id?: string; name?: string } | null;
+  founder_created?: boolean;
+  rig?: string;
+  safe_local?: boolean;
+  crew?: { agent_id?: string; role?: string; name?: string; created?: boolean }[];
+}
+interface CreateBriefResult { task_id?: string }
+interface OnRampRunReport {
+  brief_id?: string;
+  status?: string;
+  rig?: string;
+  summary?: string;
+  install_hint?: string | null;
+  run_id?: string | null;
+}
+
+function FirstRunOnRamp({
+  onStarted,
+  onChanged,
+}: {
+  onStarted: () => void;
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [steps, setSteps] = useState<{ s: OnRampStepState; note?: string }[] | null>(null);
+  const [result, setResult] = useState<{ briefId: string; runId?: string; status?: string; summary?: string } | null>(null);
+  const [fatal, setFatal] = useState<string | null>(null);
+
+  const setStep = (i: number, s: OnRampStepState, note?: string) =>
+    setSteps((prev) => (prev ? prev.map((x, idx) => (idx === i ? { s, note } : x)) : prev));
+
+  async function runFirstShift() {
+    setBusy(true);
+    setFatal(null);
+    setResult(null);
+    setSteps(ONRAMP_PLAN.map(() => ({ s: "todo" as OnRampStepState })));
+    onStarted(); // latch the panel open so the result survives the post-run reload
+    try {
+      // 1) Ensure a safe-local echo crew (idempotent; returns the crew + ids).
+      setStep(0, "run");
+      const crew = await api.post<StarterCrewResult>("/v1/spine/company/starter-crew", { rig: "echo" });
+      const worker = (crew.crew ?? []).find((c) => c.agent_id);
+      const assignee = worker?.agent_id ?? crew.founder?.agent_id;
+      const who = worker?.name ?? crew.founder?.name ?? "the Founder";
+      if (!assignee) throw new Error("No safe-local Operative was available to run the Brief.");
+      setStep(0, "ok", `${who} ready on the echo adapter.`);
+
+      // 2) Create the first Brief, assigned to that Operative in one call.
+      setStep(1, "run");
+      const created = await api.post<CreateBriefResult>("/v1/spine/briefs", {
+        title: ONRAMP_BRIEF_TITLE,
+        priority: "normal",
+        assignee,
+      });
+      const briefId = created.task_id;
+      if (!briefId) throw new Error("The Brief was created but no id was returned.");
+      setStep(1, "ok", `Brief created and assigned to ${who}.`);
+
+      // 3) Run it through the built-in echo Rig.
+      setStep(2, "run");
+      const run = await api.post<OnRampRunReport>(
+        `/v1/spine/briefs/${encodeURIComponent(briefId)}/run`,
+        { rig: "echo" },
+      );
+      const ran = run.status === "running" || run.status === "done";
+      if (ran) {
+        setStep(2, "ok", run.status === "done" ? "Shift complete." : "Shift started — executing now.");
+      } else {
+        // Honest: the run path refused — show the real reason + any install hint.
+        const why = ONRAMP_REFUSALS[run.status ?? ""] ?? run.status ?? "the run did not start";
+        setStep(2, "err", run.install_hint ? `${why} (${run.install_hint})` : why);
+      }
+      setResult({ briefId, runId: run.run_id ?? undefined, status: run.status, summary: run.summary });
+      onChanged();
+      // Other surfaces (board, Action Center, Mandates) now have a Brief/run.
+      invalidate(["briefs", "actions", "mandates"]);
+    } catch (e) {
+      // Mark whichever step was mid-flight as failed and surface the real error.
+      setSteps((prev) => (prev ? prev.map((x) => (x.s === "run" ? { s: "err" } : x)) : prev));
+      setFatal(e instanceof Error ? e.message : "Could not complete the first Shift.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const done = result?.status === "done";
+  return (
+    <div className="card setup-card">
+      <div className="setup-step">Get started · safe local path</div>
+      <h2 style={{ margin: "4px 0 8px" }}>Run your first Shift</h2>
+      <p className="muted" style={{ maxWidth: 620 }}>
+        Your company is set up but hasn't done any work yet. In one click, Relix will
+        provision a couple of safe, local <em>echo</em> Operatives, create a first{" "}
+        <strong>Brief</strong>, assign it, and run it end-to-end through the built-in
+        echo adapter — so you can watch a Shift reach <strong>done</strong> without
+        installing any external coding agent.
+      </p>
+      {fatal && (
+        <div className="banner err" style={{ fontSize: 12 }}>
+          {fatal} — you can retry, or set up the crew by hand on{" "}
+          <Link to="/agents" className="link">Crew</Link>.
+        </div>
+      )}
+      <div className="row" style={{ marginTop: 12, gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+        <button className="btn" disabled={busy} onClick={runFirstShift}>
+          {busy ? "Running…" : steps ? "Run again →" : "Run a first local Shift →"}
+        </button>
+        <Link to="/chat" className="link" style={{ fontSize: 12 }}>
+          or plan a real goal with Prime →
+        </Link>
+      </div>
+      {steps && (
+        <ol className="next-steps" style={{ marginTop: 12 }}>
+          {steps.map((st, i) => (
+            <li key={i} style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+              <span
+                className={"badge " + STEP_TONE[st.s]}
+                style={{ fontSize: 9, minWidth: 44, textAlign: "center" }}
+              >
+                {STEP_LABEL[st.s]}
+              </span>
+              <span>
+                {ONRAMP_PLAN[i]}
+                {st.note && <span className="muted" style={{ marginLeft: 6, fontSize: 12 }}>— {st.note}</span>}
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
+      {result && (
+        <div className={"banner " + (result.status === "err" ? "err" : "ok")} style={{ fontSize: 12 }}>
+          {done
+            ? "First Shift complete."
+            : result.status === "running"
+              ? "First Shift is running."
+              : "First Shift opened."}
+          {result.summary ? ` ${result.summary}` : ""}
+          {result.runId && (
+            <Link to={`/runs?run=${encodeURIComponent(result.runId)}`} className="link" style={{ marginLeft: 8 }}>
+              Open the run →
+            </Link>
+          )}
+          {result.briefId && (
+            <Link to={`/briefs?brief=${encodeURIComponent(result.briefId)}`} className="link" style={{ marginLeft: 12 }}>
+              View the Brief →
+            </Link>
+          )}
+          <Link to="/agents" className="link" style={{ marginLeft: 12 }}>See the crew →</Link>
+        </div>
+      )}
+      <p className="muted" style={{ fontSize: 11, marginTop: 10, maxWidth: 620 }}>
+        This proves the local execution loop — governed crew → Brief → scoped run →
+        transcript → review/apply — end-to-end. It does <strong>not</strong> call a real
+        model provider: the echo adapter is a built-in stand-in. To run real work,
+        install + log in to a coding-agent CLI on{" "}
+        <Link to="/settings" className="link">Settings</Link> and switch an Operative's adapter.
+      </p>
+    </div>
+  );
+}
 
 // A compact, read-only operations snapshot sourced from `company.operations`
 // (dashboard-design §5). One flat card (no nested cards) with three glance
