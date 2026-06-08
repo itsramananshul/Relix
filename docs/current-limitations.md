@@ -323,33 +323,57 @@ Brief+kind on read. What it does **not** do:
       integration-tested in CI (the validator + deterministic fallback + the
       trigger / eligibility / dedup / tenant / exactly-once paths are fully
       unit/loop tested with scripted output).
+    - **Autonomous assignment of Prime-decomposed children is now possible, but
+      ONLY under an explicit standing grant (Prime-Decomposed Child Assignment —
+      Standing Authority v1).** Materializing a Prime-authored package leaves its
+      children **unassigned** (decompositions never inherit the parent's assignee
+      by default), and `orchestrate_assign_ready` cannot adopt them — so before
+      this slice the loop parked at the assignment gate until a human assigned. With
+      the Board-granted `prime.brief.assign_decomposed` standing authority active for
+      the Guild, the tick will — *before* the orchestration no-op — assign those
+      unassigned children to the **parent Brief's own current assignee**, through the
+      EXISTING `set_brief_field` `assignee` primitive (the same one the governed
+      assignment paths use). It is a **narrow deterministic rule**, not a free
+      assignment engine: it acts ONLY on the children of a parent whose plan-package
+      `confirm` autonomous Prime itself authored and materialized (a human/other-actor
+      decomposition is never touched); it assigns ONLY to the parent's current
+      assignee and ONLY when that assignee is an **active, same-Guild Operative with a
+      known Rig** (the model never picks an agent); it never scans arbitrary
+      unassigned Briefs; it is tenant-scoped; it consumes one bounded grant call only
+      when ≥1 child is actually assigned; and it is idempotent (once assigned the
+      children leave the unassigned set, so a re-tick neither reassigns nor consumes a
+      second grant). No parent assignee / inactive / unknown-Rig / cross-Guild assignee
+      records an honest `blocked` with no assignment and no consume. With **no** grant
+      the children stay unassigned and the loop parks honestly at the assignment gate
+      exactly as before.
     - **End-to-end autonomy smoke (v1) — SHIPPED, what it proves.** A release-grade
       backend smoke (`prime_driver::tests::prime_autonomy_e2e_*`, run by
       `cargo test -p relix-runtime --lib prime_driver::tests::prime_autonomy_e2e`)
       drives the REAL `autonomous_prime_tick` repeatedly with a bounded `max`, the
       `before_execute` trigger, plan-package authoring on, and the
-      `prime.plan_package.approve` standing grant, asserting the chain is real and
-      governed end-to-end (not isolated helper tests): a tick **opens** the plan
-      package before the raw start and **holds** it; a later tick **accepts/
-      materializes** the Prime-authored package through the existing confirm +
-      exactly-once decomposition ledger (children appear exactly once, the bounded
-      grant is consumed exactly once); a re-tick duplicates neither the package,
-      the approval, nor the children; and once the human **assignment** gate is
-      passed (a human assigns the proposed children to an active Operative) the loop
-      **starts** them as durable Shifts on the safe `echo` Rig (heartbeat-trigger
-      runs) and then **honestly stops** at the next governance gate (run review —
-      no `prime.run.review_accept` grant). What it still does **not** prove: a
-      **live** provider/bridge round trip (the smoke uses the safe `echo` Rig and a
-      scripted decider, never a real model or remote Rig), and **autonomous
-      assignment** of Prime-decomposed children — Prime never assigns, and
-      `orchestrate_assign_ready` builds its own skeleton and does not adopt the
-      decomposed children, so without a human assignment the loop parks honestly at
-      the assignment gate (a no-op orchestration is now reported `skipped` with no
-      action consumed and no Chronicle event, instead of the prior livelock that
-      re-ran orchestration every tick and falsely claimed `advanced`). Autonomous
-      Chronicle events for a Mandate now land on a **stable anchor Brief**
-      (`mandate_chronicle_anchor` — a top-level Brief, lowest task id) rather than
-      the most-recently-updated Brief, so an action's provenance is deterministic.
+      `prime.plan_package.approve` + `prime.brief.assign_decomposed` standing grants,
+      asserting the chain is real and governed end-to-end (not isolated helper tests):
+      a tick **opens** the plan package before the raw start and **holds** it; a later
+      tick **accepts/materializes** the Prime-authored package through the existing
+      confirm + exactly-once decomposition ledger (children appear exactly once, the
+      bounded grant is consumed exactly once); a re-tick duplicates neither the
+      package, the approval, nor the children; a further tick **autonomously assigns**
+      the unassigned Prime-decomposed children to the parent's own active echo
+      assignee (no human assignment, the assignment grant consumed exactly once, a
+      re-tick neither reassigns nor consumes again); the loop then **starts** them as
+      durable Shifts on the safe `echo` Rig (heartbeat-trigger runs) and **honestly
+      stops** at the next governance gate (run review — no `prime.run.review_accept`
+      grant). What it still does **not** prove: a **live** provider/bridge round trip
+      (the smoke uses the safe `echo` Rig and a scripted decider, never a real model or
+      remote Rig); and autonomous assignment remains bounded to the narrow rule above
+      — with **no** `prime.brief.assign_decomposed` grant, or a parent with no valid
+      active assignee, the loop still parks honestly at the assignment gate (a no-op
+      orchestration is reported `skipped` with no action consumed and no Chronicle
+      event, not the prior livelock that re-ran orchestration every tick and falsely
+      claimed `advanced`), and a human/other-actor decomposition is never auto-assigned.
+      Autonomous Chronicle events for a Mandate land on a **stable anchor Brief**
+      (`mandate_chronicle_anchor` — a top-level Brief, lowest task id) rather than the
+      most-recently-updated Brief, so an action's provenance is deterministic.
 - **Explicit document locking (v1) — SHIPPED, owner-or-nobody, refuse-not-redirect.**
   A logical Dossier (a Brief + `kind`, e.g. `plan`) can now be **locked** so
   concurrent authors don't race: `brief.dossier_lock` /
@@ -598,7 +622,19 @@ the approved work is already ready. What it does **not** do:
     accepts a **Prime-authored package only** — a human/other-actor package is never
     auto-approved. With no grant the confirm stays OPEN, so a pending `before_execute`
     package keeps holding the start; once accepted the confirm is `resolved`, so a
-    re-tick neither duplicates children nor consumes a second grant). Each autonomous approval **consumes** one
+    re-tick neither duplicates children nor consumes a second grant). The eighth
+    category is `prime.brief.assign_decomposed` (autonomously **assign the unassigned
+    child Briefs of a Prime-authored decomposition** to the **parent Brief's own
+    current assignee**, through the existing `set_brief_field` `assignee` primitive,
+    and ONLY when that assignee is an active same-Guild Operative with a known Rig —
+    the model never picks an agent; it runs **before** the orchestration no-op, acts
+    on Prime-decomposed children only — a human/other-actor decomposition is never
+    touched — never scans arbitrary unassigned Briefs, and consumes one bounded grant
+    call only when ≥1 child is actually assigned. With no grant the children stay
+    unassigned and the loop parks honestly at the assignment gate; once assigned the
+    children leave the unassigned set, so a re-tick neither reassigns nor consumes a
+    second grant; an absent/inactive/unknown-Rig parent assignee records an honest
+    `blocked` with no assignment and no consume). Each autonomous approval **consumes** one
     call of a bounded grant (`max_calls` / `max_cost_micros`); an unlimited grant
     is not decremented (existing standing-approval semantics). It is **tenant-safe**
     (a grant in Guild A never approves Guild B's proposal/hire/Clearance/strategy — the
@@ -608,7 +644,7 @@ the approved work is already ready. What it does **not** do:
     (`POST`/`DELETE /v1/agents/__relix_autonomous_prime__/standing-approvals`) —
     the same routes real Operatives use, so **no duplicate approval system was
     invented**. **The Settings page is now an operator control surface, not
-    read-only:** each of the seven categories shows enabled/disabled with a
+    read-only:** each of the eight categories shows enabled/disabled with a
     **Grant** (when disabled) / **Revoke** (when enabled) button. Granting creates
     a bounded standing approval for the synthetic authority (default `expires_at =
     now + 24h`, `max_calls = 25`, no cost cap); revoking deletes every row for that

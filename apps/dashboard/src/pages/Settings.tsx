@@ -748,6 +748,7 @@ const CATEGORY_LABELS: Record<string, string> = {
   "prime.strategy.approve": "Approve proposed strategies",
   "prime.run.review_accept": "Accept completed Shifts",
   "prime.run.apply": "Apply accepted Shifts",
+  "prime.brief.assign_decomposed": "Assign Prime-decomposed children",
 };
 function categoryLabel(cat: string): string {
   return CATEGORY_LABELS[cat] ?? cat;

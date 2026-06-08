@@ -90,6 +90,10 @@ const ACTION_APPLY_RUN: &str = "apply_run";
 /// The autonomous plan-package approval action (accept/materialize a
 /// Prime-authored plan package through the existing plan-confirm path).
 const ACTION_PLAN_PACKAGE_APPROVE: &str = "plan_package_approve";
+/// The autonomous Prime-decomposed child assignment action (assign the
+/// unassigned children of a Prime-authored decomposition to the parent Brief's
+/// own active assignee, through the existing assignee primitive).
+const ACTION_ASSIGN_DECOMPOSED: &str = "assign_decomposed_children";
 
 // ── PRIME STANDING AUTHORITY (v1) ──────────────────────────────────────────
 // The Board can grant the autonomous Prime loop bounded power to take specific
@@ -148,8 +152,21 @@ pub const CATEGORY_RUN_APPLY: &str = "prime.run.apply";
 /// second grant. With no grant the loop leaves the confirm OPEN exactly as
 /// before (the pending package keeps holding a `before_execute` start).
 pub const CATEGORY_PLAN_PACKAGE_APPROVE: &str = "prime.plan_package.approve";
+/// Standing-authority category: autonomous ASSIGNMENT of the unassigned child
+/// Briefs that autonomous Prime's OWN plan-package materialization created
+/// (author = [`AUTONOMOUS_PRIME_AUTHORITY`]). Narrow + deterministic: it assigns
+/// such a child ONLY to its parent Brief's CURRENT assignee, and ONLY when that
+/// assignee is an active, same-Guild Operative with a known Rig — the model
+/// never picks an agent. It acts through the EXISTING `set_brief_field`
+/// `assignee` primitive (the same one the governed assignment paths use), never
+/// scans arbitrary unassigned Briefs, and never touches a human/other-actor
+/// decomposition (those keep their human assignment gate). With no grant the
+/// children stay unassigned and the
+/// loop parks honestly at the assignment gate exactly as before; one bounded
+/// grant call is consumed only when at least one child is actually assigned.
+pub const CATEGORY_ASSIGN_DECOMPOSED: &str = "prime.brief.assign_decomposed";
 
-/// The seven standing-authority categories, in display order.
+/// The eight standing-authority categories, in display order.
 pub const STANDING_AUTHORITY_CATEGORIES: &[&str] = &[
     CATEGORY_PROPOSAL_APPROVE,
     CATEGORY_HIRE_APPROVE,
@@ -158,6 +175,7 @@ pub const STANDING_AUTHORITY_CATEGORIES: &[&str] = &[
     CATEGORY_RUN_REVIEW_ACCEPT,
     CATEGORY_RUN_APPLY,
     CATEGORY_PLAN_PACKAGE_APPROVE,
+    CATEGORY_ASSIGN_DECOMPOSED,
 ];
 
 /// Default safe Rig the autonomous hire-approve binds when
@@ -1247,6 +1265,216 @@ fn try_approve_prime_plan_package_for_mandate(
     }
 }
 
+// The next safe slice of autonomy after self-approval: let the loop ASSIGN the
+// unassigned children that Prime's OWN plan-package materialization created, but
+// ONLY when the Board has granted the explicit `prime.brief.assign_decomposed`
+// standing authority for the Guild, and ONLY to the parent Brief's own active
+// assignee. It is NOT a free assignment engine — it never scans arbitrary
+// unassigned Briefs, never lets the model pick an agent, and never touches a
+// human/other-actor decomposition. This closes the last E2E caveat ("no
+// autonomous assignment of Prime-decomposed children") in the common safe case.
+
+/// Try to ASSIGN the unassigned child Briefs that autonomous Prime's OWN
+/// plan-package materialization created under `mandate_id`, returning
+/// `Some(record)` when this step HANDLED the candidate (assigned ≥1 child, or
+/// honestly reported a budget / no-safe-assignee block) — the caller returns it
+/// verbatim — and `None` when there is nothing to assign OR no standing grant
+/// (the caller proceeds with its normal flow: orchestration parks honestly at
+/// the assignment gate exactly as before). Runs BEFORE the orchestration advance
+/// (which cannot adopt Prime-decomposed children and only no-ops), so a freshly
+/// materialized Prime-decomposed child set is assigned the moment the grant
+/// exists and subsequent ticks can start the child Shifts.
+///
+/// Strictly bounded — the narrow deterministic rule:
+/// - **Prime-decomposed only** — acts ONLY on the unassigned Sub-briefs of a
+///   parent Brief whose plan-package `confirm` was authored by
+///   [`AUTONOMOUS_PRIME_AUTHORITY`] AND is `resolved` (Prime opened the package
+///   AND its decomposition materialized). A human/other-actor decomposition has
+///   a different `author` and is invisible here (returns `None`).
+/// - **Parent's own assignee only** — children are assigned to the parent
+///   Brief's CURRENT assignee, NEVER a model-picked agent, and ONLY when that
+///   assignee is an active, same-Guild Operative with a known Rig (the shape the
+///   run path expects). No parent assignee / inactive / unknown-Rig / cross-Guild
+///   assignee → no assignment, an honest `blocked` record, no grant consumed.
+/// - **Grant-gated** — with no live `prime.brief.assign_decomposed` standing
+///   grant in `tenant` it takes NO side effect and consumes NO grant (`None`),
+///   leaving the children unassigned exactly as before.
+/// - **Existing primitive** — assignment flows through
+///   [`TaskStore::set_brief_field`] `assignee` (the same primitive the governed
+///   assignment paths use), which resets any stale Claim and Chronicles the
+///   assignment; no hand-rolled bypass of a permission-sensitive invariant.
+/// - **Bounded + idempotent** — ONE tick action + ONE bounded grant call are
+///   consumed only when ≥1 child is actually assigned (a batch counts once). Once
+///   assigned the children leave the unassigned set, so a re-tick finds none and
+///   neither reassigns nor consumes a second grant.
+#[allow(clippy::too_many_arguments)]
+fn try_assign_decomposed_children_for_mandate(
+    agent_store: &AgentStore,
+    task_store: &TaskStore,
+    tenant: &str,
+    mandate_id: &str,
+    now_ms: i64,
+    actions: &mut usize,
+    max: usize,
+    phase: &str,
+    mk: &dyn Fn(String, &'static str, &'static str, String, Option<String>) -> PrimeAutonomyRecord,
+) -> Option<PrimeAutonomyRecord> {
+    // Find the parent Brief whose plan package autonomous Prime ITSELF authored
+    // AND materialized: a `resolved` `confirm` bound to a `plan` Dossier WITH a
+    // linked proposal, authored by the synthetic autonomous-Prime authority. A
+    // human/other-actor decomposition (any other author) is deliberately invisible
+    // — this authority touches Prime-decomposed children only.
+    let briefs = task_store.list_briefs_by_mandate(mandate_id, 500).ok()?;
+    let mut parent_id: Option<String> = None;
+    for b in &briefs {
+        if !task_store
+            .task_in_tenant(&b.task_id, tenant)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let ix = task_store.list_interactions(&b.task_id).ok()?;
+        let prime_authored = ix.iter().any(|i| {
+            i.kind == "confirm"
+                && i.status == "resolved"
+                && i.bound_doc_kind.as_deref() == Some("plan")
+                && i.bound_interaction_id
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                && i.author == AUTONOMOUS_PRIME_AUTHORITY
+        });
+        if prime_authored {
+            parent_id = Some(b.task_id.clone());
+            break;
+        }
+    }
+    let parent_id = parent_id?;
+
+    // The UNASSIGNED Sub-briefs of that Prime-decomposed parent (same Guild, no
+    // assignee). None unassigned → nothing to do (an idempotent re-tick).
+    let kids = task_store.list_subbriefs(&parent_id).ok()?;
+    let mut unassigned: Vec<String> = Vec::new();
+    for k in &kids {
+        if !task_store.task_in_tenant(k, tenant).unwrap_or(false) {
+            continue;
+        }
+        let has_assignee = task_store
+            .brief_card(k)
+            .ok()
+            .flatten()
+            .and_then(|c| c.assignee_agent_id)
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_assignee {
+            unassigned.push(k.clone());
+        }
+    }
+    if unassigned.is_empty() {
+        return None;
+    }
+
+    // A Prime-decomposed child set awaits assignment. Whether we act depends
+    // SOLELY on the standing grant: with none, take NO side effect and let the
+    // caller's normal flow park honestly at the assignment gate.
+    let now_secs = now_secs_from_ms(now_ms);
+    if !standing_active(agent_store, tenant, CATEGORY_ASSIGN_DECOMPOSED, now_secs) {
+        return None;
+    }
+
+    // The parent's CURRENT assignee — the ONLY agent these children may inherit.
+    // The model never picks; an absent assignee blocks honestly.
+    let parent_assignee = task_store
+        .brief_card(&parent_id)
+        .ok()
+        .flatten()
+        .and_then(|c| c.assignee_agent_id)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let Some(assignee) = parent_assignee else {
+        return Some(mk(
+            phase.to_string(),
+            ACTION_ASSIGN_DECOMPOSED,
+            "blocked",
+            format!(
+                "Prime-decomposed children on brief {parent_id} await assignment but the parent \
+                 Brief has no assignee to inherit — leaving them unassigned"
+            ),
+            Some(mandate_id.to_string()),
+        ));
+    };
+    // The parent assignee must be an ACTIVE, same-Guild Operative with a known
+    // Rig (the same shape the run path expects). Otherwise block honestly — never
+    // assign work to an inactive / un-rigged / cross-Guild subject.
+    let runnable = agent_store
+        .get_agent_for_tenant(&assignee, tenant)
+        .ok()
+        .flatten()
+        .filter(|a| a.status == "active")
+        .and_then(|a| a.rig)
+        .is_some_and(|r| crate::rig::is_known_rig(&r));
+    if !runnable {
+        return Some(mk(
+            phase.to_string(),
+            ACTION_ASSIGN_DECOMPOSED,
+            "blocked",
+            format!(
+                "parent assignee `{assignee}` is not an active same-Guild Operative with a known \
+                 Rig — leaving the Prime-decomposed children unassigned"
+            ),
+            Some(mandate_id.to_string()),
+        ));
+    }
+
+    if *actions >= max {
+        return Some(mk(
+            phase.to_string(),
+            ACTION_ASSIGN_DECOMPOSED,
+            "skipped",
+            "tick action budget reached".into(),
+            Some(mandate_id.to_string()),
+        ));
+    }
+
+    // Assign every unassigned Prime-decomposed child to the parent's assignee
+    // through the EXISTING assignee primitive (resets any stale Claim, Chronicles
+    // the assignment). Count ONE tick action + consume ONE bounded grant call for
+    // the whole batch, only when ≥1 child was actually assigned.
+    let mut assigned = 0usize;
+    for k in &unassigned {
+        if task_store.set_brief_field(k, "assignee", &assignee).is_ok() {
+            assigned += 1;
+        }
+    }
+    if assigned == 0 {
+        return Some(mk(
+            phase.to_string(),
+            ACTION_ASSIGN_DECOMPOSED,
+            "blocked",
+            "no Prime-decomposed child Brief could be assigned".into(),
+            Some(mandate_id.to_string()),
+        ));
+    }
+    *actions += 1;
+    let _ = consume_standing(agent_store, tenant, CATEGORY_ASSIGN_DECOMPOSED, now_secs);
+    chronicle_autonomous(
+        task_store,
+        mandate_id,
+        "prime.autonomous_assign_decomposed",
+        &format!(
+            "autonomous Prime assigned {assigned} Prime-decomposed child Brief(s) on brief \
+             {parent_id} to the parent assignee {assignee}"
+        ),
+    );
+    Some(mk(
+        phase.to_string(),
+        ACTION_ASSIGN_DECOMPOSED,
+        "advanced",
+        format!(
+            "assigned {assigned} Prime-decomposed child Brief(s) to parent assignee {assignee}"
+        ),
+        Some(mandate_id.to_string()),
+    ))
+}
+
 /// Compute the next governed step for a proposal or a mandate. Returns
 /// `Err(HandlerOutcome)` for an invalid arg / not-found target so a caller can
 /// return it verbatim.
@@ -1970,6 +2198,7 @@ pub fn handle_prime_standing_authority(
         "Autonomously accept a completed Shift's review for a Brief in this Guild's own Mandate/proposal set, through the existing review path (only a done + pending_review run; this never applies).",
         "Autonomously apply an already-accepted run through the existing safe apply machinery (run_apply_eligibility, conflict/baseline checks, review-to-done); a conflicted/failed apply never marks the Brief done.",
         "Autonomously accept/materialize an OPEN plan-package confirm that autonomous Prime itself authored, through the existing plan-confirm path + exactly-once decomposition ledger (Prime-authored packages only; a human/other-actor package is never auto-approved).",
+        "Autonomously assign the unassigned child Briefs of a Prime-authored decomposition to the parent Brief's own active assignee (a known-Rig, same-Guild Operative), through the existing assignee primitive (Prime-decomposed children only; the model never picks an agent and a human/other-actor decomposition is never touched).",
     ];
     let categories: Vec<Value> = STANDING_AUTHORITY_CATEGORIES
         .iter()
@@ -3348,6 +3577,29 @@ fn process_candidate_inner(
                     None,
                 );
             };
+            // (A2-pre) Prime-Decomposed Child Assignment — Standing Authority v1.
+            // BEFORE running orchestration (which builds its own skeleton and
+            // canNOT adopt Prime-decomposed children, so it only no-ops here), if
+            // this Mandate carries unassigned child Briefs under a parent whose
+            // plan package autonomous Prime ITSELF authored AND the Board granted
+            // `prime.brief.assign_decomposed`, assign those children to the
+            // parent's own active assignee through the existing assignee primitive.
+            // With no grant this is a no-op (`None`) and orchestration parks
+            // honestly at the assignment gate exactly as before; a human/other-actor
+            // decomposition is never touched. Never lets the model pick an agent.
+            if let Some(rec) = try_assign_decomposed_children_for_mandate(
+                agent_store,
+                task_store,
+                tenant,
+                &mid,
+                now_ms,
+                actions,
+                max,
+                &phase,
+                &mk,
+            ) {
+                return rec;
+            }
             let (blueprint, orch_mode, orch_reason) = author_orchestration_blueprint(
                 ai,
                 agent_store,
@@ -9989,14 +10241,20 @@ in force.\n";
     //             exactly once, the bounded grant is consumed exactly once;
     //          3. a re-tick neither duplicates the package, the approval, nor the
     //             children, and consumes no second grant;
-    //          4. once the human ASSIGNMENT gate is passed (a human assigns the
-    //             proposed children to the active echo Operative) the loop STARTS
-    //             them as durable Shifts on the `echo` Rig;
-    //          5. the loop then HONESTLY STOPS at the next governance gate
+    //          4. with the `prime.brief.assign_decomposed` standing grant, a tick
+    //             AUTONOMOUSLY assigns the unassigned Prime-decomposed children to
+    //             the parent Brief's own active echo assignee (no human assignment),
+    //             through the existing assignee primitive — the bounded grant is
+    //             consumed exactly once and a re-tick neither reassigns nor consumes
+    //             a second grant;
+    //          5. once the children are assigned + ready the loop STARTS them as
+    //             durable Shifts on the `echo` Rig (heartbeat-trigger runs);
+    //          6. the loop then HONESTLY STOPS at the next governance gate
     //             (run review — no `prime.run.review_accept` authority), opening no
     //             duplicate runs.
     //        The Chronicle records each real action (`plan_package`,
-    //        `plan_package_approve`, the Mandate start) and is NOT spammed.
+    //        `plan_package_approve`, the child assignment, the Mandate start) and is
+    //        NOT spammed.
     #[tokio::test]
     async fn prime_autonomy_e2e_plan_package_to_execution() {
         let (agents, spine, tasks) = stores();
@@ -10014,11 +10272,13 @@ in force.\n";
         let decider = ScriptedDecider {
             reply: Ok(pp_reply()),
         };
-        // Enable ONLY the standing authority the chain needs: plan-package approval
-        // (bounded to a single materialization). Orchestration / start auto-advance
-        // through the shared guarded pipeline; no other standing grant is given, so
-        // every human gate the loop reaches is honoured, not bypassed.
+        // Enable ONLY the two standing authorities the chain needs, each bounded to a
+        // SINGLE call: plan-package approval (one materialization) and decomposed-child
+        // assignment (one assignment batch). Orchestration / start auto-advance through
+        // the shared guarded pipeline; no run-review / apply grant is given, so the loop
+        // still honours that human gate at the tail, not bypassed.
         let _grant = grant_standing(&agents, "default", CATEGORY_PLAN_PACKAGE_APPROVE, Some(1));
+        let _assign_grant = grant_standing(&agents, "default", CATEGORY_ASSIGN_DECOMPOSED, Some(1));
 
         // ── Tick 1 — before_execute OPENS a *proposed* package and HOLDS the raw
         //    start. No children, no run: the undecomposed leaf is NOT started.
@@ -10080,18 +10340,13 @@ in force.\n";
             "the bounded grant is consumed exactly once on materialization"
         );
 
-        // ── Pass the human ASSIGNMENT gate: a human assigns the proposed children
-        //    to the active echo Operative (the same `assignee` primitive the
-        //    governed orchestration uses). Prime itself never assigns.
-        let kids = tasks.list_subbriefs(&brief).unwrap();
-        for k in &kids {
-            tasks.set_brief_field(k, "assignee", &eng).unwrap();
-        }
-
-        // ── Tick 3 — the children are now assigned + ready: the loop STARTS them as
-        //    durable Shifts on the `echo` Rig (heartbeat-trigger runs, not manual).
-        //    This is also a re-tick: no duplicate package, no second approval, no
-        //    duplicate children, no second grant.
+        // ── Tick 3 — AUTONOMOUS ASSIGNMENT gate (no human assigns). With the
+        //    `prime.brief.assign_decomposed` grant, the loop assigns the unassigned
+        //    Prime-decomposed children to the parent Brief's OWN active echo
+        //    assignee through the existing assignee primitive — before the
+        //    orchestration no-op. It does NOT start them this tick (one governed
+        //    step per candidate per tick). This is also a re-tick: no duplicate
+        //    package, no second approval, no duplicate children.
         let r3 = tick_pp_trig(
             &agents,
             &spine,
@@ -10107,15 +10362,71 @@ in force.\n";
                 .all(|r| r.action != "plan_package" && r.action != "plan_package_approve"),
             "no duplicate package or approval after materialization"
         );
+        let assign = r3
+            .iter()
+            .find(|r| r.target_id == m && r.action == "assign_decomposed_children")
+            .expect("tick 3 autonomously assigns the Prime-decomposed children");
+        assert_eq!(assign.outcome, "advanced");
         assert_eq!(
             tasks.list_subbriefs(&brief).unwrap().len(),
             2,
             "still exactly two children"
         );
-        let started = r3
+        // Both children are now assigned to the parent's own echo Operative —
+        // Prime never picked an agent, it inherited the parent assignee.
+        let kids = tasks.list_subbriefs(&brief).unwrap();
+        for k in &kids {
+            assert_eq!(
+                tasks
+                    .brief_card(k)
+                    .unwrap()
+                    .unwrap()
+                    .assignee_agent_id
+                    .as_deref(),
+                Some(eng.as_str()),
+                "the child inherited the parent Brief's active assignee"
+            );
+        }
+        // The bounded (max_calls=1) assignment grant is consumed exactly once.
+        assert!(
+            !standing_active(&agents, "default", CATEGORY_ASSIGN_DECOMPOSED, 0),
+            "the bounded assignment grant is consumed exactly once on the batch"
+        );
+        // No Shift has started yet — assignment is its own governed step.
+        assert!(
+            tasks
+                .list_runs_for_tenant("default", 100)
+                .unwrap()
+                .is_empty(),
+            "the assignment tick assigns but does not start the children"
+        );
+
+        // ── Tick 4 — the children are now assigned + ready: the loop STARTS them as
+        //    durable Shifts on the `echo` Rig (heartbeat-trigger runs, not manual).
+        //    This is also a re-tick proving assignment idempotency: the assignment
+        //    grant is NOT consumed a second time and no child is reassigned.
+        let r4 = tick_pp_trig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            5,
+            Some("default"),
+            Some(&decider),
+            PrimePlanPackageTrigger::BeforeExecute,
+        );
+        assert!(
+            r4.iter().all(|r| r.action != "assign_decomposed_children"),
+            "no second assignment after the children are already assigned"
+        );
+        assert!(
+            !standing_active(&agents, "default", CATEGORY_ASSIGN_DECOMPOSED, 0),
+            "the assignment grant stays consumed exactly once (no second consume)"
+        );
+        let started = r4
             .iter()
             .find(|r| r.target_id == m && r.outcome == "started")
-            .expect("tick 3 starts the assigned children");
+            .expect("tick 4 starts the assigned children");
         assert_eq!(started.phase, "ready_to_start");
         assert_eq!(started.action, "start_mandate");
         let runs = tasks.list_runs_for_tenant("default", 100).unwrap();
@@ -10130,7 +10441,7 @@ in force.\n";
             "autonomous starts stamp a heartbeat-trigger run, not dashboard manual"
         );
 
-        // ── Tick 4 — the completed echo Shifts now await review; with no
+        // ── Tick 5 — the completed echo Shifts now await review; with no
         //    `prime.run.review_accept` authority the loop HONESTLY STOPS at that
         //    governance gate and opens no duplicate run.
         let r5 = tick_pp_trig(
@@ -10165,6 +10476,11 @@ in force.\n";
             chronicle_count(&tasks, &m, "prime.autonomous_plan_package_approve"),
             1,
             "the plan-package approval is Chronicled exactly once"
+        );
+        assert_eq!(
+            chronicle_count(&tasks, &m, "prime.autonomous_assign_decomposed"),
+            1,
+            "the decomposed-child assignment is Chronicled exactly once"
         );
         assert_eq!(
             chronicle_count(&tasks, &m, "prime.autonomous_mandate_start"),
@@ -10254,5 +10570,389 @@ in force.\n";
         );
         // The Chronicle is not spammed: exactly one orchestration advance event.
         assert_eq!(chronicle_count(&tasks, &m, "prime.autonomous_advance"), 1);
+    }
+
+    // ── PRIME-DECOMPOSED CHILD ASSIGNMENT — STANDING AUTHORITY v1 ─────────────
+    // Focused unit coverage for the narrow `prime.brief.assign_decomposed`
+    // authority, on top of the E2E chain above.
+
+    /// Drive a `ready_bare_mandate` in `tenant` through the autonomous OPEN +
+    /// MATERIALIZE of a Prime-authored plan package, returning
+    /// `(mandate_id, parent_brief_id, parent_assignee)` with TWO UNASSIGNED
+    /// Prime-decomposed children under the parent (the parent keeps its active
+    /// echo assignee). Consumes the bounded `prime.plan_package.approve` grant;
+    /// creates NO assignment grant (each test decides that).
+    fn prime_decomposed_unassigned(
+        agents: &AgentStore,
+        spine: &SpineStore,
+        tasks: &Arc<TaskStore>,
+        tenant: &str,
+    ) -> (String, String, String) {
+        let reg = echo_registry();
+        let m = ready_bare_mandate(agents, spine, tasks, tenant);
+        let brief = lone_brief(tasks, &m);
+        let eng = tasks
+            .brief_card(&brief)
+            .unwrap()
+            .unwrap()
+            .assignee_agent_id
+            .unwrap();
+        let decider = ScriptedDecider {
+            reply: Ok(pp_reply()),
+        };
+        let _grant = grant_standing(agents, tenant, CATEGORY_PLAN_PACKAGE_APPROVE, Some(1));
+        // Tick 1 opens the package; tick 2 materializes the two unassigned children.
+        for _ in 0..2 {
+            tick_pp_trig(
+                agents,
+                spine,
+                tasks,
+                &reg,
+                5,
+                Some(tenant),
+                Some(&decider),
+                PrimePlanPackageTrigger::BeforeExecute,
+            );
+        }
+        assert_eq!(tasks.list_subbriefs(&brief).unwrap().len(), 2);
+        (m, brief, eng)
+    }
+
+    fn child_assignees(tasks: &Arc<TaskStore>, parent: &str) -> Vec<Option<String>> {
+        tasks
+            .list_subbriefs(parent)
+            .unwrap()
+            .into_iter()
+            .map(|k| tasks.brief_card(&k).unwrap().unwrap().assignee_agent_id)
+            .collect()
+    }
+
+    // AD1) No grant: a materialized Prime-decomposed child set stays UNASSIGNED —
+    //      the loop never assigns and no assignment grant is consumed (there is
+    //      none); the chain parks honestly at the assignment gate.
+    #[tokio::test]
+    async fn assign_decomposed_no_grant_leaves_children_unassigned() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief, _eng) = prime_decomposed_unassigned(&agents, &spine, &tasks, "default");
+        let decider = ScriptedDecider {
+            reply: Ok(pp_reply()),
+        };
+
+        // No `prime.brief.assign_decomposed` grant.
+        let recs = tick_pp_trig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            5,
+            Some("default"),
+            Some(&decider),
+            PrimePlanPackageTrigger::BeforeExecute,
+        );
+        assert!(
+            recs.iter()
+                .all(|r| r.action != "assign_decomposed_children"),
+            "with no grant the loop never assigns Prime-decomposed children"
+        );
+        assert!(
+            child_assignees(&tasks, &brief).iter().all(Option::is_none),
+            "the children stay unassigned without the grant"
+        );
+        assert_eq!(
+            chronicle_count(&tasks, &m, "prime.autonomous_assign_decomposed"),
+            0
+        );
+        assert!(
+            tasks
+                .list_runs_for_tenant("default", 100)
+                .unwrap()
+                .is_empty(),
+            "no Shift runs while the children await assignment"
+        );
+    }
+
+    // AD2) With the grant and a parent assigned to an active echo Operative: the
+    //      materialized children are assigned to the PARENT's assignee, the
+    //      bounded grant is consumed exactly once, and a re-tick neither reassigns
+    //      nor consumes a second grant.
+    #[tokio::test]
+    async fn assign_decomposed_with_grant_assigns_to_parent_assignee_once() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief, eng) = prime_decomposed_unassigned(&agents, &spine, &tasks, "default");
+        let decider = ScriptedDecider {
+            reply: Ok(pp_reply()),
+        };
+        let _ag = grant_standing(&agents, "default", CATEGORY_ASSIGN_DECOMPOSED, Some(1));
+
+        let r1 = tick_pp_trig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            5,
+            Some("default"),
+            Some(&decider),
+            PrimePlanPackageTrigger::BeforeExecute,
+        );
+        let rec = r1
+            .iter()
+            .find(|r| r.target_id == m && r.action == "assign_decomposed_children")
+            .expect("the loop autonomously assigns the Prime-decomposed children");
+        assert_eq!(rec.outcome, "advanced");
+        // Every child inherited the parent's OWN active assignee (no model pick).
+        assert!(
+            child_assignees(&tasks, &brief)
+                .iter()
+                .all(|a| a.as_deref() == Some(eng.as_str())),
+            "each child is assigned to the parent Brief's assignee"
+        );
+        assert!(
+            !standing_active(&agents, "default", CATEGORY_ASSIGN_DECOMPOSED, 0),
+            "the bounded grant is consumed exactly once on the batch"
+        );
+        assert_eq!(
+            chronicle_count(&tasks, &m, "prime.autonomous_assign_decomposed"),
+            1
+        );
+
+        // Re-tick: no second assignment, no second consume (the children left the
+        // unassigned set, so the assignment step is not even reached again).
+        let r2 = tick_pp_trig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            5,
+            Some("default"),
+            Some(&decider),
+            PrimePlanPackageTrigger::BeforeExecute,
+        );
+        assert!(
+            r2.iter().all(|r| r.action != "assign_decomposed_children"),
+            "no second assignment after the children are already assigned"
+        );
+        assert_eq!(
+            chronicle_count(&tasks, &m, "prime.autonomous_assign_decomposed"),
+            1,
+            "the assignment is Chronicled exactly once"
+        );
+        assert!(
+            child_assignees(&tasks, &brief)
+                .iter()
+                .all(|a| a.as_deref() == Some(eng.as_str())),
+            "the re-tick does not reassign the children"
+        );
+    }
+
+    // AD3) A HUMAN/other-actor decomposition is NEVER auto-assigned, even with the
+    //      grant active — the authority touches Prime-authored children only, so
+    //      the grant is left untouched.
+    #[tokio::test]
+    async fn assign_decomposed_ignores_human_authored_decomposition() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let m = ready_bare_mandate(&agents, &spine, &tasks, "default");
+        let brief = lone_brief(&tasks, &m);
+
+        // A HUMAN opens + materializes a plan package on the leaf (author "operator").
+        let mk_child = |title: &str| crate::nodes::coordinator::brief::ChildSpec {
+            title: title.to_string(),
+            priority: None,
+            after: None,
+            assignee_agent_id: None,
+            assignee_role: None,
+        };
+        let pkg = tasks
+            .open_plan_package(
+                &brief,
+                "operator",
+                "Manual plan",
+                "# Do it manually",
+                "split the work",
+                &[mk_child("part a"), mk_child("part b")],
+                "approve?",
+            )
+            .unwrap();
+        let res = tasks
+            .respond_plan_confirm(
+                "default",
+                "operator",
+                &brief,
+                &pkg.confirm_id,
+                "operator",
+                true,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(res.created.len(), 2);
+        assert_eq!(tasks.list_subbriefs(&brief).unwrap().len(), 2);
+
+        // Even WITH the grant, Prime never assigns a human-authored decomposition.
+        let _ag = grant_standing(&agents, "default", CATEGORY_ASSIGN_DECOMPOSED, Some(1));
+        let decider = ScriptedDecider {
+            reply: Ok(pp_reply()),
+        };
+        let recs = tick_pp_trig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            5,
+            Some("default"),
+            Some(&decider),
+            PrimePlanPackageTrigger::BeforeExecute,
+        );
+        assert!(
+            recs.iter()
+                .all(|r| r.action != "assign_decomposed_children"),
+            "a human/other-actor decomposition is never auto-assigned"
+        );
+        assert!(
+            child_assignees(&tasks, &brief).iter().all(Option::is_none),
+            "the human-authored children stay unassigned"
+        );
+        assert!(
+            standing_active(&agents, "default", CATEGORY_ASSIGN_DECOMPOSED, 0),
+            "the grant is not consumed on a non-Prime decomposition"
+        );
+    }
+
+    // AD4) Tenant isolation: an assignment grant in Guild A cannot assign Guild B's
+    //      Prime-decomposed children.
+    #[tokio::test]
+    async fn assign_decomposed_is_tenant_isolated() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (_mb, brief_b, _eng) = prime_decomposed_unassigned(&agents, &spine, &tasks, "tb");
+        let decider = ScriptedDecider {
+            reply: Ok(pp_reply()),
+        };
+
+        // Grant the assignment authority in a DIFFERENT Guild only.
+        let _ag = grant_standing(&agents, "ta", CATEGORY_ASSIGN_DECOMPOSED, Some(1));
+
+        // Tick Guild tb — its children must NOT be assigned by Guild ta's grant.
+        let recs = tick_pp_trig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            5,
+            Some("tb"),
+            Some(&decider),
+            PrimePlanPackageTrigger::BeforeExecute,
+        );
+        assert!(
+            recs.iter()
+                .all(|r| r.action != "assign_decomposed_children"),
+            "a grant in another Guild cannot assign this Guild's children"
+        );
+        assert!(
+            child_assignees(&tasks, &brief_b)
+                .iter()
+                .all(Option::is_none),
+            "Guild tb's children stay unassigned"
+        );
+        assert!(
+            standing_active(&agents, "ta", CATEGORY_ASSIGN_DECOMPOSED, 0),
+            "Guild ta's grant is untouched"
+        );
+    }
+
+    // AD5) Missing/invalid parent assignee: with the grant active but the parent
+    //      Brief carrying no (usable) assignee, the step records an honest
+    //      `blocked`, assigns nothing, and consumes NO grant.
+    #[tokio::test]
+    async fn assign_decomposed_blocked_on_missing_parent_assignee() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief, _eng) = prime_decomposed_unassigned(&agents, &spine, &tasks, "default");
+        // Clear the parent Brief's assignee — there is no subject to inherit.
+        tasks.set_brief_field(&brief, "assignee", "").unwrap();
+
+        let _ag = grant_standing(&agents, "default", CATEGORY_ASSIGN_DECOMPOSED, Some(1));
+        let decider = ScriptedDecider {
+            reply: Ok(pp_reply()),
+        };
+        let recs = tick_pp_trig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            5,
+            Some("default"),
+            Some(&decider),
+            PrimePlanPackageTrigger::BeforeExecute,
+        );
+        let blocked = recs
+            .iter()
+            .find(|r| r.target_id == m && r.action == "assign_decomposed_children")
+            .expect("the assignment step records an honest result");
+        assert_eq!(blocked.outcome, "blocked");
+        assert!(
+            child_assignees(&tasks, &brief).iter().all(Option::is_none),
+            "no child is assigned when there is no safe parent assignee"
+        );
+        assert!(
+            standing_active(&agents, "default", CATEGORY_ASSIGN_DECOMPOSED, 0),
+            "no grant is consumed on a no-safe-assignee block"
+        );
+        assert_eq!(
+            chronicle_count(&tasks, &m, "prime.autonomous_assign_decomposed"),
+            0
+        );
+    }
+
+    // AD6) Invalid parent assignee: a parent pointed at an UNKNOWN / non-active
+    //      subject (not a same-Guild active Operative with a known Rig) is not a
+    //      safe subject — the step blocks honestly and consumes no grant. (The
+    //      active echo crew stays in place so team readiness is unchanged and the
+    //      tick still reaches the assignment step.)
+    #[tokio::test]
+    async fn assign_decomposed_blocked_on_invalid_parent_assignee() {
+        let (agents, spine, tasks) = stores();
+        let tasks = Arc::new(tasks);
+        let reg = echo_registry();
+        let (m, brief, _eng) = prime_decomposed_unassigned(&agents, &spine, &tasks, "default");
+        // Repoint the parent at a subject that is not an active same-Guild
+        // Operative — assignment must refuse to inherit it.
+        tasks
+            .set_brief_field(&brief, "assignee", "ghost-agent-not-real")
+            .unwrap();
+
+        let _ag = grant_standing(&agents, "default", CATEGORY_ASSIGN_DECOMPOSED, Some(1));
+        let decider = ScriptedDecider {
+            reply: Ok(pp_reply()),
+        };
+        let recs = tick_pp_trig(
+            &agents,
+            &spine,
+            &tasks,
+            &reg,
+            5,
+            Some("default"),
+            Some(&decider),
+            PrimePlanPackageTrigger::BeforeExecute,
+        );
+        let blocked = recs
+            .iter()
+            .find(|r| r.target_id == m && r.action == "assign_decomposed_children")
+            .expect("the assignment step records an honest result");
+        assert_eq!(blocked.outcome, "blocked");
+        assert!(
+            child_assignees(&tasks, &brief).iter().all(Option::is_none),
+            "no child is assigned to an invalid parent assignee"
+        );
+        assert!(
+            standing_active(&agents, "default", CATEGORY_ASSIGN_DECOMPOSED, 0),
+            "no grant is consumed when the parent assignee is invalid"
+        );
     }
 }
