@@ -18,6 +18,13 @@
 #         GET /v1/spine/company         (company status)
 #      Plus a NEGATIVE control: the same protected route with NO session must
 #      be rejected (proves auth is genuinely enforced, not wide open).
+#   4b. Prove PROVIDER / CHAT READINESS - the seam the dashboard Chat companion
+#      ("Use AI") and Prime "Use AI" ride on. Drive ONE real ai.chat round trip
+#      over HTTP (POST /v1/spine/companion {mode:"ai"}) and assert the AI peer
+#      ANSWERED. With the mock provider (zero spend) a reachable peer reports
+#      ai_mode="fallback"; an UNREACHABLE peer reports ai_mode="unavailable" -
+#      that distinction catches the dashboard chat failure class a green board
+#      read would otherwise hide.
 #   5. Run ONE real product flow on the safe local echo Rig (zero model spend):
 #         starter-crew (echo) -> create Brief -> assign -> run -> poll runs ->
 #         read the Chronicle, and verify a visible terminal result.
@@ -245,6 +252,52 @@ try {
         $ok = ($r.Status -ge 200 -and $r.Status -lt 300)
         Record $e.Name $ok ("GET {0} -> {1}" -f $e.Path, $r.Status)
     }
+
+    # -- 4b) provider / chat readiness - the dashboard chat companion seam --
+    # The core-read checks above prove the board APIs answer, and the echo flow
+    # below proves the Rig path - but NEITHER exercises the AI provider seam the
+    # dashboard's Chat companion ("Use AI") and Prime "Use AI" both ride on
+    # (relix-dashboard-design.md SS13). A broken / unreachable AI peer leaves
+    # every read green while the chat surface dies with 502 / "ai peer
+    # unreachable", so we drive ONE real ai.chat round trip over HTTP and assert
+    # the AI peer ANSWERED.
+    #
+    # With the safe mock provider (zero model spend) a reachable AI peer returns
+    # a deterministic reply that does not validate as an action, so the companion
+    # honestly reports ai_mode="fallback" (model answered, choice unusable). An
+    # UNREACHABLE AI peer instead reports ai_mode="unavailable". That distinction
+    # IS the readiness signal: "fallback"/"llm_used" = the provider/chat seam is
+    # live; "unavailable" (or a 5xx) = the dashboard chat failure class. A bounded
+    # retry tolerates the AI node coming up a beat after the bridge.
+    Write-Host ""
+    Write-Host "Proving provider / chat readiness (mock ai.chat round trip, no model spend) ..." -ForegroundColor Cyan
+    $chatBody = @{ message = 'what needs attention'; mode = 'ai' } | ConvertTo-Json -Compress
+    $aiMode = ''
+    $aiReason = ''
+    $chatStatus = 0
+    $cdeadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $cdeadline) {
+        $chat = Invoke-Http -Client $client -Method POST -Path '/v1/spine/companion' -JsonBody $chatBody
+        $chatStatus = $chat.Status
+        if ($chat.Status -ge 200 -and $chat.Status -lt 300) {
+            try {
+                $parsed = $chat.Body | ConvertFrom-Json
+                $aiMode = if ($parsed.ai_mode) { [string]$parsed.ai_mode } else { '' }
+                $aiReason = if ($parsed.ai_reason) { [string]$parsed.ai_reason } else { '' }
+            } catch { $aiMode = ''; $aiReason = '' }
+            if ($aiMode -eq 'fallback' -or $aiMode -eq 'llm_used') { break }
+        }
+        Start-Sleep -Milliseconds 750
+    }
+    $chatOk = ($chatStatus -ge 200 -and $chatStatus -lt 300)
+    Record 'chat.companion' $chatOk "POST /v1/spine/companion {mode:ai} -> $chatStatus (chat companion reachable)"
+
+    # The AI peer answered iff ai_mode is a model-answered verdict. "unavailable"
+    # (or an empty body / a 5xx above) means the provider/chat seam is NOT ready.
+    $providerReady = ($aiMode -eq 'fallback' -or $aiMode -eq 'llm_used')
+    $rdetail = "ai_mode=$(if ($aiMode) { $aiMode } else { '(none)' })"
+    if (-not $providerReady -and $aiReason) { $rdetail += " reason: $aiReason" }
+    Record 'chat.provider_ready' $providerReady "$rdetail (AI peer answered ai.chat; not 'unavailable')"
 
     # -- 5) one real product flow on the safe local echo Rig ---------
     Write-Host ""

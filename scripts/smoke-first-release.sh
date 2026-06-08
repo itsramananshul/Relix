@@ -22,6 +22,13 @@
 #         GET /v1/spine/company         (company status)
 #      Plus a NEGATIVE control: the same protected route with NO session must
 #      be rejected (proves auth is genuinely enforced, not wide open).
+#   4b. Prove PROVIDER / CHAT READINESS - the seam the dashboard Chat companion
+#      ("Use AI") and Prime "Use AI" ride on. Drive ONE real ai.chat round trip
+#      over HTTP (POST /v1/spine/companion {mode:"ai"}) and assert the AI peer
+#      ANSWERED. With the mock provider (zero spend) a reachable peer reports
+#      ai_mode="fallback"; an UNREACHABLE peer reports ai_mode="unavailable" -
+#      that distinction catches the dashboard chat failure class a green board
+#      read would otherwise hide.
 #   5. (with --require-echo-flow, or best-effort otherwise) run ONE real product
 #      flow on the safe local echo Rig (zero model spend):
 #         starter-crew (echo) -> create Brief -> assign -> run -> poll runs ->
@@ -309,6 +316,43 @@ for i in "${!core_names[@]}"; do
     if [[ "$HTTP_STATUS" -ge 200 && "$HTTP_STATUS" -lt 300 ]]; then ok=1; else ok=0; fi
     record "${core_names[$i]}" "$ok" "GET ${core_paths[$i]} -> $HTTP_STATUS"
 done
+
+# ---- 4b) provider / chat readiness - the dashboard chat companion seam ----
+# The core-read checks prove the board APIs answer and the echo flow proves the
+# Rig path - but NEITHER exercises the AI provider seam the dashboard's Chat
+# companion ("Use AI") and Prime "Use AI" both ride on (relix-dashboard-design
+# SS13). A broken / unreachable AI peer leaves every read green while the chat
+# surface dies with 502 / "ai peer unreachable", so we drive ONE real ai.chat
+# round trip over HTTP and assert the AI peer ANSWERED. With the safe mock
+# provider (zero model spend) a reachable peer yields ai_mode="fallback"
+# (answered, choice unusable); an UNREACHABLE peer yields ai_mode="unavailable".
+# That distinction is the readiness signal. A bounded retry tolerates the AI
+# node coming up a beat after the bridge.
+echo
+echo "Proving provider / chat readiness (mock ai.chat round trip, no model spend) ..."
+ai_mode=""
+ai_reason=""
+chat_status=0
+cdeadline=$(( $(date +%s) + 20 ))
+while [[ "$(date +%s)" -lt "$cdeadline" ]]; do
+    http_call POST /v1/spine/companion '{"message":"what needs attention","mode":"ai"}'
+    chat_status="$HTTP_STATUS"
+    if [[ "$HTTP_STATUS" -ge 200 && "$HTTP_STATUS" -lt 300 ]]; then
+        ai_mode="$(json_str ai_mode "$HTTP_BODY")"
+        ai_reason="$(json_str ai_reason "$HTTP_BODY")"
+        if [[ "$ai_mode" == "fallback" || "$ai_mode" == "llm_used" ]]; then break; fi
+    fi
+    sleep 0.75
+done
+if [[ "$chat_status" -ge 200 && "$chat_status" -lt 300 ]]; then ok=1; else ok=0; fi
+record 'chat.companion' "$ok" "POST /v1/spine/companion {mode:ai} -> $chat_status (chat companion reachable)"
+
+# The AI peer answered iff ai_mode is a model-answered verdict. "unavailable"
+# (or an empty body / a 5xx above) means the provider/chat seam is NOT ready.
+if [[ "$ai_mode" == "fallback" || "$ai_mode" == "llm_used" ]]; then chat_ready=1; else chat_ready=0; fi
+rdetail="ai_mode=${ai_mode:-(none)}"
+if [[ "$chat_ready" -ne 1 && -n "$ai_reason" ]]; then rdetail="$rdetail reason: $ai_reason"; fi
+record 'chat.provider_ready' "$chat_ready" "$rdetail (AI peer answered ai.chat; not 'unavailable')"
 
 # ---- 5) one real product flow on the safe local echo Rig ----
 echo

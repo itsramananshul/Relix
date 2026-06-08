@@ -38,6 +38,34 @@ allow rule**. The live smoke does — see the note at the end.
    (`starter_crew_closes_the_positive_local_loop_through_prime_start`) now
    asserts the same `done → accept → applied → Brief done` tail.
 
+## Provider / chat readiness (the first-release boot smoke, step 4b)
+
+`scripts/smoke-first-release.{ps1,sh}` add one check the broader Shift loop
+above does **not** cover: the **AI provider seam** the dashboard's Chat
+companion ("Use AI") and Prime "Use AI" ride on (`relix-dashboard-design.md`
+§13). The core read routes and the **echo** Rig flow can all be green while the
+`ai` peer is down or misconfigured — and then the chat surface dies with
+`502 / "ai peer unreachable"`. A green board read hides that whole class.
+
+So the smoke drives **one real `ai.chat` round trip over HTTP** and asserts the
+AI peer **answered**:
+
+```
+#   POST /v1/spine/companion  {"message":"what needs attention","mode":"ai"}
+#         -> 200, ai_mode in {fallback, llm_used}   (the AI peer answered)
+```
+
+With `-Provider mock` (zero model spend) the `ai` peer returns a deterministic
+reply that does **not** validate as a companion action, so the companion
+honestly reports `ai_mode="fallback"` (model answered, choice unusable) and
+falls back to the rule-based parser. An **unreachable** `ai` peer instead
+reports `ai_mode="unavailable"`. That `fallback`-vs-`unavailable` distinction is
+the readiness signal: `chat.provider_ready` PASSes only when the peer answered,
+so a dead AI seam **fails** the gate (a bounded ~20s retry tolerates the AI node
+coming up a beat after the bridge). The `ai.chat` capability already carries its
+boot-policy allow rule in both `relix-mesh-up.ps1` and `relix-mesh-up.sh`, so no
+new capability is introduced.
+
 ## Isolation (do not touch the operator's real state)
 
 - Point `USERPROFILE` (and `HOME`) at a throwaway dir before boot, so the
