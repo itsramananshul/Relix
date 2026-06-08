@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { api, skills as skillsApi, tryGet, type SkillSearchResult, type SkillSummary } from "../api";
+import { api, skills as skillsApi, tryGet, tryGetReport, type SkillSearchResult, type SkillSummary } from "../api";
 import { asArray, Badge, Empty, extractList, Section, useAsync } from "../components/common";
 import { invalidate } from "../invalidate";
 
@@ -93,27 +93,37 @@ interface AgentDetail {
 }
 
 // One standing approval (`/v1/agents/:id/standing-approvals`) — a pre-granted
-// clearance so a matching action proceeds without a fresh gate, with its scope,
-// expiry, and usage. Rendered read-only (granting/revoking stays out of slice).
+// clearance so a matching action proceeds without a fresh gate. The bridge
+// `StandingRow` carries the full scope: the capability category/method it
+// unlocks, what it is bound to (task/session/method-prefix/workspace path),
+// its expiry, and the call/spend ceilings + usage the admission gate enforces.
+// Rendered read-only here; per-grant revoke lives on the Settings → Prime
+// standing-authority panel (so it is not duplicated on this surface).
 interface Standing {
   standing_id?: string;
   match_category?: string;
   match_path_glob?: string | null;
   scope_kind?: string;
+  task_id?: string | null;
+  session_id?: string | null;
   method_prefix?: string | null;
   workspace_path_glob?: string | null;
   expires_at?: number;
   granted_by?: string;
   max_calls?: number | null;
   calls_used?: number;
+  max_cost_micros?: number | null;
+  cost_used_micros?: number;
   note?: string;
 }
 
 // The three governance reads for one Operative, fetched together on expand.
+// `standingError` distinguishes "no grants" from "the list could not load".
 interface OpDetail {
   keys: Keys | null;
   detail: AgentDetail | null;
   standing: Standing[];
+  standingError: string | null;
 }
 
 // Render epoch-seconds as a short local date; "—" when absent/zero.
@@ -121,6 +131,49 @@ function fmtWhen(secs?: number): string {
   if (!secs) return "—";
   const d = new Date(secs * 1000);
   return Number.isNaN(d.getTime()) ? "—" : d.toLocaleDateString();
+}
+
+// Standing-approval spend ceilings are micro-USD (1,000,000 micros = $1); "—"
+// when no cap/usage is recorded. Mirrors the Costs page `fmtMicros`.
+function fmtMicros(m?: number | null): string {
+  if (m == null) return "—";
+  return "$" + (m / 1_000_000).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+// Friendly labels for the standing-approval `scope_kind` wire values.
+const SCOPE_LABEL: Record<string, string> = {
+  agent_category: "category",
+  task: "task",
+  session: "session",
+  method_prefix: "method",
+  workspace_path: "workspace",
+};
+
+// A standing approval's live status. The bridge keeps expired/exhausted rows
+// until they are revoked, so a grant appearing in the list does not by itself
+// mean it still unlocks anything — derive the honest state from expiry plus the
+// call/spend ceilings the admission gate actually enforces.
+function standingState(s: Standing, nowSecs: number): { label: string; tone: string } {
+  if (s.expires_at != null && s.expires_at > 0 && s.expires_at <= nowSecs)
+    return { label: "expired", tone: "backlog" };
+  if (s.max_calls != null && (s.calls_used ?? 0) >= s.max_calls)
+    return { label: "exhausted", tone: "blocked" };
+  if (s.max_cost_micros != null && (s.cost_used_micros ?? 0) >= s.max_cost_micros)
+    return { label: "spent", tone: "blocked" };
+  return { label: "active", tone: "done" };
+}
+
+// The concrete thing a grant is bound to beyond its capability category — the
+// pointer that matches its scope_kind, or any path glob. Null = category-wide
+// (the whole capability family for this Operative, in any workspace).
+function standingScopeRef(s: Standing): string | null {
+  switch (s.scope_kind) {
+    case "task": return s.task_id ? `task ${s.task_id}` : null;
+    case "session": return s.session_id ? `session ${s.session_id}` : null;
+    case "method_prefix": return s.method_prefix ? `${s.method_prefix}*` : null;
+    case "workspace_path": return s.workspace_path_glob || null;
+    default: return s.workspace_path_glob || s.match_path_glob || null;
+  }
 }
 
 interface Agent {
@@ -364,14 +417,19 @@ export function Agents() {
     if (!force && agentId in detailCache) return;
     inflightRef.current.add(agentId);
     const enc = encodeURIComponent(agentId);
-    const [keys, detail, standing] = await Promise.all([
+    const [keys, detail, standingRep] = await Promise.all([
       tryGet<Keys | null>(`/v1/spine/keys/${enc}`, null),
       tryGet<AgentDetail | null>(`/v1/agents/${enc}`, null),
-      tryGet<unknown>(`/v1/agents/${enc}/standing-approvals`, {}),
+      tryGetReport<unknown>(`/v1/agents/${enc}/standing-approvals`, {}),
     ]);
     setDetailCache((m) => ({
       ...m,
-      [agentId]: { keys, detail, standing: extractList<Standing>(standing, ["standing"]) },
+      [agentId]: {
+        keys,
+        detail,
+        standing: extractList<Standing>(standingRep.data, ["standing"]),
+        standingError: standingRep.error,
+      },
     }));
     inflightRef.current.delete(agentId);
   }
@@ -754,7 +812,8 @@ export function Agents() {
   function operativeDetail(agentId: string) {
     const d = detailCache[agentId];
     if (!d) return <div className="loading" style={{ fontSize: 12 }}>Loading permissions…</div>;
-    const { keys: k, detail, standing } = d;
+    const { keys: k, detail, standing, standingError } = d;
+    const nowSecs = Math.floor(Date.now() / 1000);
     const flag = (on?: boolean, scope?: string) =>
       on ? <span className="badge done" style={{ fontSize: 9 }}>yes{scope ? ` · ${scope}` : ""}</span> : <span className="badge backlog" style={{ fontSize: 9 }}>no</span>;
     // Render a category/tag set as small chips, or an em-dash when empty.
@@ -802,25 +861,44 @@ export function Agents() {
           )}
         </div>
 
-        {/* Standing approvals — pre-granted clearances + their usage. */}
+        {/* Standing approvals — pre-granted clearances, the scope they unlock,
+            and their live usage. Read-only here; per-grant revoke lives on the
+            Settings → Prime standing-authority panel (not duplicated). */}
         <div className="op-group">
           <div className="op-group-title">Standing approvals{standing.length ? ` (${standing.length})` : ""}</div>
-          {standing.length === 0 ? (
+          {standingError ? (
+            <div className="muted" style={{ fontSize: 12 }}>
+              Standing approvals unavailable — <span className="mono">GET /v1/agents/:id/standing-approvals</span>: {standingError}
+            </div>
+          ) : standing.length === 0 ? (
             <div className="muted" style={{ fontSize: 12 }}>No standing approvals — every gated action prompts for a fresh clearance.</div>
           ) : (
             <div className="table-scroll">
               <table className="table" style={{ fontSize: 12 }}>
-                <thead><tr><th>Category</th><th>Scope</th><th>Used</th><th>Expires</th><th>Granted by</th></tr></thead>
+                <thead><tr><th>Status</th><th>Unlocks</th><th>Scope</th><th>Calls</th><th>Spend</th><th>Expires</th><th>Granted by</th></tr></thead>
                 <tbody>
-                  {standing.map((s, i) => (
-                    <tr key={s.standing_id || i}>
-                      <td>{s.match_category || "—"}{s.method_prefix ? <div className="mono" style={{ fontSize: 10 }}>{s.method_prefix}</div> : null}</td>
-                      <td className="dim">{s.scope_kind || "—"}{s.workspace_path_glob ? <div className="muted" style={{ fontSize: 10 }}>{s.workspace_path_glob}</div> : null}</td>
-                      <td>{s.calls_used ?? 0}{s.max_calls != null ? ` / ${s.max_calls}` : ""}</td>
-                      <td className="muted">{fmtWhen(s.expires_at)}</td>
-                      <td className="muted">{s.granted_by ? s.granted_by.slice(0, 12) : "—"}</td>
-                    </tr>
-                  ))}
+                  {standing.map((s, i) => {
+                    const st = standingState(s, nowSecs);
+                    const ref = standingScopeRef(s);
+                    const hasSpend = s.max_cost_micros != null || (s.cost_used_micros ?? 0) > 0;
+                    return (
+                      <tr key={s.standing_id || i} title={s.note || undefined}>
+                        <td><span className={"badge " + st.tone} style={{ fontSize: 9 }}>{st.label}</span></td>
+                        <td>
+                          {s.match_category || "—"}
+                          {s.note ? <div className="muted" style={{ fontSize: 10 }}>{s.note}</div> : null}
+                        </td>
+                        <td className="dim">
+                          {SCOPE_LABEL[s.scope_kind || ""] || s.scope_kind || "—"}
+                          {ref ? <div className="mono muted" style={{ fontSize: 10 }}>{ref}</div> : null}
+                        </td>
+                        <td>{s.calls_used ?? 0}{s.max_calls != null ? ` / ${s.max_calls}` : " / ∞"}</td>
+                        <td className="muted">{hasSpend ? `${fmtMicros(s.cost_used_micros ?? 0)} / ${s.max_cost_micros != null ? fmtMicros(s.max_cost_micros) : "∞"}` : "—"}</td>
+                        <td className="muted">{fmtWhen(s.expires_at)}</td>
+                        <td className="muted">{s.granted_by ? s.granted_by.slice(0, 12) : "—"}</td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
